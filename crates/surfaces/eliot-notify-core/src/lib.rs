@@ -10,6 +10,11 @@
 
 use std::fmt::Write as _;
 
+use eliot_contracts::{RequestMetadata, StateFence};
+use eliot_kernel_core::{
+    DeliveryChannel, DeliveryState, Notification, NotificationDraft, NotificationError,
+    ResolutionAuthorization,
+};
 use eliot_platform::{
     NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
     PortOutcome, ProviderError, ProviderErrorCode, UnknownReason,
@@ -54,6 +59,7 @@ pub enum ProviderId {
     WatchdogSignature,
     DeliveryReceipt,
     OneShotLedger,
+    CanonicalNotificationState,
     P01Platform,
 }
 
@@ -87,6 +93,7 @@ pub struct Recipient {
 #[serde(deny_unknown_fields)]
 pub struct NotificationEnvelope {
     pub notification_id: PlatformHandle,
+    pub canonical: NotificationDraft,
     pub subject: String,
     pub summary: String,
     pub recipients: Vec<Recipient>,
@@ -95,8 +102,17 @@ pub struct NotificationEnvelope {
 
 impl NotificationEnvelope {
     fn validate_shape(&self) -> Result<(), NotifyError> {
+        self.canonical
+            .validate()
+            .map_err(notification_schema_error)?;
+        if self.canonical.notification_id != self.notification_id {
+            return Err(NotifyError::InvalidEnvelope("canonical.notification_id"));
+        }
         validate_text(&self.subject, "subject")?;
         validate_text(&self.summary, "summary")?;
+        if self.canonical.subject != self.subject || self.canonical.summary != self.summary {
+            return Err(NotifyError::RequestEnvelopeMismatch);
+        }
         if self.recipients.is_empty() {
             return Err(NotifyError::InvalidEnvelope("recipients"));
         }
@@ -428,6 +444,163 @@ pub trait DeliveryReceiptPort {
     ) -> PortOutcome<ReceiptEnvelope>;
 }
 
+/// Versioned transport selector used by the notification surface.
+///
+/// The surface supplies only inert notification data and already verified
+/// evidence. The authenticated Kernel provider owns operation identity,
+/// authority, fencing, canonical persistence, and the response receipt.
+pub const NOTIFICATION_STATE_SELECTOR: &str = "eliot.notify.state.v1";
+/// Canonical store operation name carried by the committed response receipt.
+///
+/// This is deliberately distinct from [`NOTIFICATION_STATE_SELECTOR`]: the
+/// former is the notification transport route, while the latter is the
+/// canonical store transition admitted behind that route.
+pub const NOTIFICATION_STATE_RECEIPT_OPERATION: &str = "store.apply.notification_state";
+
+/// The canonical state mutation sent through the existing Kernel/store owner.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
+pub enum NotificationStateMutation {
+    /// Creates or coalesces one I11.5 record before a P-01 attempt.
+    Upsert {
+        record: NotificationDraft,
+        source_receipt: ReceiptEnvelope,
+    },
+    /// Records a verified delivery observation or a typed adapter failure.
+    Delivery {
+        notification_id: PlatformHandle,
+        channel: DeliveryChannel,
+        delivery: DeliveryState,
+    },
+    /// Records operator acknowledgement without resolving the record.
+    Acknowledge {
+        notification_id: PlatformHandle,
+        principal: String,
+    },
+    /// Records a protected, evidence-backed terminal disposition.
+    Resolve {
+        notification_id: PlatformHandle,
+        disposition: String,
+        authorization: ResolutionAuthorization,
+    },
+}
+
+impl NotificationStateMutation {
+    fn notification_id(&self) -> &PlatformHandle {
+        match self {
+            Self::Upsert { record, .. } => &record.notification_id,
+            Self::Delivery {
+                notification_id, ..
+            }
+            | Self::Acknowledge {
+                notification_id, ..
+            }
+            | Self::Resolve {
+                notification_id, ..
+            } => notification_id,
+        }
+    }
+
+    /// Returns the predecessor receipt used to bind the child operation.
+    #[must_use]
+    pub fn prior_receipt_digest(&self) -> Option<&str> {
+        match self {
+            Self::Upsert { source_receipt, .. } => Some(source_receipt.canonical_sha256()),
+            Self::Delivery { .. } | Self::Acknowledge { .. } => None,
+            Self::Resolve { authorization, .. } => Some(authorization.receipt.canonical_sha256()),
+        }
+    }
+}
+
+/// Request envelope for the canonical notification owner.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationStateRequest {
+    pub context: RequestMetadata,
+    pub state_fence: StateFence,
+    pub mutation: NotificationStateMutation,
+}
+
+impl NotificationStateRequest {
+    fn validate(&self) -> Result<(), NotifyError> {
+        if self.context.state_fence != self.state_fence {
+            return Err(NotifyError::InvalidReceiptBinding);
+        }
+        match &self.mutation {
+            NotificationStateMutation::Upsert {
+                record,
+                source_receipt,
+            } => {
+                record.validate().map_err(notification_schema_error)?;
+                if record.state_fence != self.state_fence {
+                    return Err(NotifyError::InvalidReceiptBinding);
+                }
+                validate_receipt_internal_context(source_receipt, ProviderId::G08Problem)?;
+                if source_receipt.core.request.metadata != self.context {
+                    return Err(NotifyError::InvalidReceiptBinding);
+                }
+            }
+            NotificationStateMutation::Delivery { delivery, .. } => {
+                if matches!(delivery, DeliveryState::Pending) {
+                    return Err(NotifyError::InvalidEnvelope("delivery.state"));
+                }
+                delivery.validate().map_err(notification_schema_error)?;
+            }
+            NotificationStateMutation::Acknowledge { principal, .. } => {
+                validate_text(principal, "principal")?;
+            }
+            NotificationStateMutation::Resolve {
+                disposition,
+                authorization,
+                ..
+            } => {
+                validate_text(disposition, "disposition")?;
+                validate_receipt_internal_context(
+                    &authorization.receipt,
+                    ProviderId::CanonicalNotificationState,
+                )?;
+                if authorization.receipt.core.request.metadata != self.context
+                    || authorization.receipt.core.request.state_fence != self.state_fence
+                {
+                    return Err(NotifyError::InvalidReceiptBinding);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_for_parent(&self, parent: &NotificationRequest) -> Result<(), NotifyError> {
+        validate_platform_request(parent)?;
+        if self.context != parent.context
+            || self.state_fence != parent.context.state_fence
+            || self.mutation.notification_id() != &parent.notification
+        {
+            return Err(NotifyError::RequestEnvelopeMismatch);
+        }
+        self.validate()
+    }
+}
+
+/// Canonical store response. The receipt is returned by the protected owner;
+/// the notification process never fabricates it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationStateResponse {
+    pub record: Notification,
+    pub receipt: ReceiptEnvelope,
+    pub replayed: bool,
+}
+
+/// Authenticated canonical notification-state provider. Implementations must
+/// route to the existing Kernel/store path and must not keep a surface store.
+pub trait NotificationStatePort {
+    fn mutate(
+        &mut self,
+        parent: &NotificationRequest,
+        request: &NotificationStateRequest,
+    ) -> PortOutcome<NotificationStateResponse>;
+}
+
 /// Durable reservation intent. A different request ID may replay only when the
 /// provider establishes the same key and claim digest.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -497,6 +670,7 @@ pub struct VerificationPorts {
     pub watchdog: Option<Box<dyn WatchdogSignaturePort>>,
     pub delivery_receipt: Option<Box<dyn DeliveryReceiptPort>>,
     pub ledger: Option<Box<dyn OneShotLedgerPort>>,
+    pub notification_state: Option<Box<dyn NotificationStatePort>>,
 }
 
 /// Immutable result of one verified delivery or a durable replay.
@@ -720,6 +894,10 @@ pub enum NotifyError {
     LedgerConflict,
     #[error("durable ledger commit became unavailable after a verified external effect")]
     LedgerCommitUncertain(Box<DeliveryObservation>),
+    #[error("canonical notification state response is invalid")]
+    CanonicalStateInvalid,
+    #[error("canonical notification state became uncertain after a verified external effect")]
+    CanonicalStateCommitUncertain(Box<DeliveryObservation>),
     #[error("delivery payload could not be decoded: {0}")]
     Decode(String),
 }
@@ -788,6 +966,8 @@ where
             return Err(NotifyError::InvalidReceiptBinding);
         }
 
+        self.persist_canonical_upsert(&envelope.canonical, &verified, request)?;
+
         self.deliver_verified_source(
             DeliverySourceKind::G08,
             &envelope.notification_id,
@@ -795,6 +975,7 @@ where
             &verified,
             request,
             &envelope.recipients,
+            Some(&envelope.canonical),
         )
     }
 
@@ -863,7 +1044,40 @@ where
             &verified,
             request,
             &[],
+            None,
         )
+    }
+
+    fn persist_canonical_upsert(
+        &mut self,
+        draft: &NotificationDraft,
+        source_receipt: &ReceiptEnvelope,
+        request: &NotificationRequest,
+    ) -> Result<NotificationStateResponse, NotifyError> {
+        let mutation = NotificationStateMutation::Upsert {
+            record: draft.clone(),
+            source_receipt: source_receipt.clone(),
+        };
+        let state_request = NotificationStateRequest {
+            context: request.context.clone(),
+            state_fence: request.context.state_fence.clone(),
+            mutation,
+        };
+        state_request.validate_for_parent(request)?;
+        let state = self
+            .ports
+            .notification_state
+            .as_mut()
+            .ok_or(NotifyError::PlanGap {
+                provider: ProviderId::CanonicalNotificationState,
+                reason: "canonical notification state port is missing",
+            })?;
+        let response = require_known(
+            state.mutate(request, &state_request),
+            ProviderId::CanonicalNotificationState,
+        )?;
+        validate_state_response(&state_request, &response)?;
+        Ok(response)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -875,6 +1089,7 @@ where
         source_receipt: &ReceiptEnvelope,
         request: &NotificationRequest,
         normal_candidates: &[Recipient],
+        canonical: Option<&NotificationDraft>,
     ) -> Result<DeliveryObservation, NotifyError> {
         let admission_request = AdmissionRequest {
             platform_request: request,
@@ -902,6 +1117,19 @@ where
             return Err(NotifyError::RecipientMismatch);
         }
 
+        if self.ports.delivery_receipt.is_none() {
+            return Err(NotifyError::PlanGap {
+                provider: ProviderId::DeliveryReceipt,
+                reason: "delivery receipt verification port is missing",
+            });
+        }
+        if canonical.is_some() && self.ports.notification_state.is_none() {
+            return Err(NotifyError::PlanGap {
+                provider: ProviderId::CanonicalNotificationState,
+                reason: "canonical notification state port is missing",
+            });
+        }
+
         let one_shot_key = admission_request.one_shot_key(&admission.recipient)?;
         let claim_digest = admission_request.claim_digest(&admission.recipient)?;
         let admission_artifact =
@@ -927,35 +1155,46 @@ where
             request_id: PlatformHandle::new(request.context.request_id.as_str())
                 .map_err(NotifyError::Port)?,
         };
-        let ledger = self.ports.ledger.as_mut().ok_or(NotifyError::PlanGap {
-            provider: ProviderId::OneShotLedger,
-            reason: "durable one-shot ledger port is missing",
-        })?;
-        let reservation = match ledger.reserve(&ledger_intent, request) {
-            LedgerReserveOutcome::Reserved { reservation } => {
-                if reservation.one_shot_key != one_shot_key
-                    || reservation.claim_digest != claim_digest
-                {
-                    return Err(NotifyError::LedgerConflict);
+        let reservation = {
+            let ledger = self.ports.ledger.as_mut().ok_or(NotifyError::PlanGap {
+                provider: ProviderId::OneShotLedger,
+                reason: "durable one-shot ledger port is missing",
+            })?;
+            match ledger.reserve(&ledger_intent, request) {
+                LedgerReserveOutcome::Reserved { reservation } => {
+                    if reservation.one_shot_key != one_shot_key
+                        || reservation.claim_digest != claim_digest
+                    {
+                        return Err(NotifyError::LedgerConflict);
+                    }
+                    reservation
                 }
-                reservation
-            }
-            LedgerReserveOutcome::Replay { mut observation } => {
-                observation.validate()?;
-                if observation.one_shot_key != one_shot_key
-                    || observation.claim_digest != claim_digest
-                {
-                    return Err(NotifyError::LedgerConflict);
+                LedgerReserveOutcome::Replay { mut observation } => {
+                    observation.validate()?;
+                    if observation.one_shot_key != one_shot_key
+                        || observation.claim_digest != claim_digest
+                    {
+                        return Err(NotifyError::LedgerConflict);
+                    }
+                    if canonical.is_some() {
+                        self.persist_delivery_state(
+                            notification_id,
+                            source_kind,
+                            delivery_state_from_observation(&observation),
+                            request,
+                            Some(&observation),
+                        )?;
+                    }
+                    observation.deduplicated = true;
+                    return Ok(*observation);
                 }
-                observation.deduplicated = true;
-                return Ok(*observation);
-            }
-            LedgerReserveOutcome::Conflict => return Err(NotifyError::LedgerConflict),
-            LedgerReserveOutcome::Unavailable => {
-                return Err(NotifyError::PlanGap {
-                    provider: ProviderId::OneShotLedger,
-                    reason: "durable one-shot ledger is unavailable",
-                });
+                LedgerReserveOutcome::Conflict => return Err(NotifyError::LedgerConflict),
+                LedgerReserveOutcome::Unavailable => {
+                    return Err(NotifyError::PlanGap {
+                        provider: ProviderId::OneShotLedger,
+                        reason: "durable one-shot ledger is unavailable",
+                    });
+                }
             }
         };
 
@@ -975,9 +1214,34 @@ where
             }
             PortOutcome::Unknown(reason) => DeliveryProviderEvidence::Unknown { reason },
             PortOutcome::Error(PortError::Provider(error)) => {
+                let failure = DeliveryState::Failed {
+                    reason: format!("notification adapter failed: {error:?}"),
+                };
+                if canonical.is_some() {
+                    self.persist_delivery_state(
+                        notification_id,
+                        source_kind,
+                        failure,
+                        request,
+                        None,
+                    )?;
+                }
                 return Err(map_provider_error(ProviderId::P01Platform, error));
             }
-            PortOutcome::Error(error) => return Err(NotifyError::Port(error)),
+            PortOutcome::Error(error) => {
+                if canonical.is_some() {
+                    self.persist_delivery_state(
+                        notification_id,
+                        source_kind,
+                        DeliveryState::Failed {
+                            reason: format!("notification adapter error: {error}"),
+                        },
+                        request,
+                        None,
+                    )?;
+                }
+                return Err(NotifyError::Port(error));
+            }
         };
 
         let receipt_evidence = DeliveryReceiptEvidence {
@@ -988,19 +1252,38 @@ where
             claim_digest: &claim_digest,
             provider_evidence: &provider_evidence,
         };
-        let receipt_port = self
-            .ports
-            .delivery_receipt
-            .as_mut()
-            .ok_or(NotifyError::PlanGap {
-                provider: ProviderId::DeliveryReceipt,
-                reason: "delivery receipt verification port is missing",
-            })?;
-        let delivery_receipt = require_known(
-            receipt_port.verify_delivery(&receipt_evidence),
-            ProviderId::DeliveryReceipt,
-        )?;
-        validate_receipt_structure(
+        let delivery_receipt = match self.ports.delivery_receipt.as_mut() {
+            Some(receipt_port) => match require_known(
+                receipt_port.verify_delivery(&receipt_evidence),
+                ProviderId::DeliveryReceipt,
+            ) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    self.persist_unknown_delivery_state(
+                        source_kind,
+                        notification_id,
+                        request,
+                        canonical,
+                        format!("delivery receipt verification failed: {error}"),
+                    )?;
+                    return Err(error);
+                }
+            },
+            None => {
+                self.persist_unknown_delivery_state(
+                    source_kind,
+                    notification_id,
+                    request,
+                    canonical,
+                    "delivery receipt verification port is missing".to_owned(),
+                )?;
+                return Err(NotifyError::PlanGap {
+                    provider: ProviderId::DeliveryReceipt,
+                    reason: "delivery receipt verification port is missing",
+                });
+            }
+        };
+        if let Err(error) = validate_receipt_structure(
             &delivery_receipt,
             source_receipt,
             &ReceiptExpectation {
@@ -1013,7 +1296,16 @@ where
                 proof: provider_evidence.expected_proof(),
                 artifact_digest: body_digest,
             },
-        )?;
+        ) {
+            self.persist_unknown_delivery_state(
+                source_kind,
+                notification_id,
+                request,
+                canonical,
+                format!("delivery receipt failed validation: {error}"),
+            )?;
+            return Err(error);
+        }
 
         let (confidence, delivered) = match provider_evidence {
             DeliveryProviderEvidence::Known { delivered } => {
@@ -1038,10 +1330,25 @@ where
             deduplicated: false,
             source_receipt: source_receipt.clone(),
             admission_receipt: admission.receipt,
-            delivery_receipt,
+            delivery_receipt: delivery_receipt.clone(),
         };
         observation.validate()?;
 
+        let delivery_state = delivery_state_for(&provider_evidence);
+        if canonical.is_some() {
+            self.persist_delivery_state(
+                notification_id,
+                source_kind,
+                delivery_state,
+                request,
+                Some(&observation),
+            )?;
+        }
+
+        let ledger = self.ports.ledger.as_mut().ok_or(NotifyError::PlanGap {
+            provider: ProviderId::OneShotLedger,
+            reason: "durable one-shot ledger is missing",
+        })?;
         match ledger.commit(&reservation, &observation, request) {
             LedgerCommitOutcome::Committed => Ok(observation),
             LedgerCommitOutcome::Replay {
@@ -1062,6 +1369,74 @@ where
             }
         }
     }
+
+    fn persist_delivery_state(
+        &mut self,
+        notification_id: &PlatformHandle,
+        source_kind: DeliverySourceKind,
+        state: DeliveryState,
+        request: &NotificationRequest,
+        observation: Option<&DeliveryObservation>,
+    ) -> Result<(), NotifyError> {
+        let mutation = NotificationStateMutation::Delivery {
+            notification_id: notification_id.clone(),
+            channel: match source_kind {
+                DeliverySourceKind::G08 => DeliveryChannel::NativeToast,
+                DeliverySourceKind::WatchdogFallback => DeliveryChannel::RecoveryFallback,
+            },
+            delivery: state,
+        };
+        let state_request = NotificationStateRequest {
+            context: request.context.clone(),
+            state_fence: request.context.state_fence.clone(),
+            mutation,
+        };
+        let result = (|| {
+            state_request.validate_for_parent(request)?;
+            let state_port =
+                self.ports
+                    .notification_state
+                    .as_mut()
+                    .ok_or(NotifyError::PlanGap {
+                        provider: ProviderId::CanonicalNotificationState,
+                        reason: "canonical notification state port is missing",
+                    })?;
+            let response = require_known(
+                state_port.mutate(request, &state_request),
+                ProviderId::CanonicalNotificationState,
+            )?;
+            validate_state_response(&state_request, &response)
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(_error) => match observation {
+                Some(observation) => Err(NotifyError::CanonicalStateCommitUncertain(Box::new(
+                    observation.clone(),
+                ))),
+                None => Err(_error),
+            },
+        }
+    }
+
+    fn persist_unknown_delivery_state(
+        &mut self,
+        source_kind: DeliverySourceKind,
+        notification_id: &PlatformHandle,
+        request: &NotificationRequest,
+        canonical: Option<&NotificationDraft>,
+        reason: String,
+    ) -> Result<(), NotifyError> {
+        if canonical.is_some() {
+            self.persist_delivery_state(
+                notification_id,
+                source_kind,
+                DeliveryState::Unknown { reason },
+                request,
+                None,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 struct ReceiptExpectation<'a> {
@@ -1073,6 +1448,143 @@ struct ReceiptExpectation<'a> {
     disposition: ReceiptDispositionKind,
     proof: ProofCeiling,
     artifact_digest: &'a str,
+}
+
+fn delivery_state_for(evidence: &DeliveryProviderEvidence) -> DeliveryState {
+    match evidence {
+        DeliveryProviderEvidence::Known { delivered: true } => DeliveryState::Delivered,
+        DeliveryProviderEvidence::Known { delivered: false } => DeliveryState::Failed {
+            reason: "notification adapter reported delivery failure".to_owned(),
+        },
+        DeliveryProviderEvidence::Partial { missing, .. } => DeliveryState::Partial {
+            reason: if missing.is_empty() {
+                "delivery evidence is partial".to_owned()
+            } else {
+                format!(
+                    "delivery evidence is missing {} observation(s)",
+                    missing.len()
+                )
+            },
+        },
+        DeliveryProviderEvidence::Unknown { reason } => DeliveryState::Unknown {
+            reason: reason.to_string(),
+        },
+    }
+}
+
+fn delivery_state_from_observation(observation: &DeliveryObservation) -> DeliveryState {
+    match (observation.confidence, observation.delivered) {
+        (DeliveryConfidence::Known, Some(true)) => DeliveryState::Delivered,
+        (DeliveryConfidence::Known, Some(false)) => DeliveryState::Failed {
+            reason: "notification adapter reported delivery failure".to_owned(),
+        },
+        (DeliveryConfidence::Partial, Some(_)) => DeliveryState::Partial {
+            reason: "delivery evidence was recovered from the durable ledger".to_owned(),
+        },
+        (DeliveryConfidence::Unknown, _) | (_, None) => DeliveryState::Unknown {
+            reason: "delivery outcome was recovered from the durable ledger".to_owned(),
+        },
+    }
+}
+
+fn validate_state_response(
+    request: &NotificationStateRequest,
+    response: &NotificationStateResponse,
+) -> Result<(), NotifyError> {
+    response
+        .record
+        .validate()
+        .map_err(notification_schema_error)?;
+    response
+        .receipt
+        .validate()
+        .map_err(|error| receipt_error(ProviderId::CanonicalNotificationState, error))?;
+    if response.record.notification_id != *request.mutation.notification_id()
+        || response.record.state_fence != request.state_fence
+        || !receipt_context_matches_request(&response.receipt, &request.context)
+        || response.receipt.core.work_scope.state_fence != request.state_fence
+        || response.receipt.core.operation.state_fence != request.state_fence
+        || response.receipt.core.authority.state_fence != request.state_fence
+        || response.receipt.core.operation.operation_kind != NOTIFICATION_STATE_RECEIPT_OPERATION
+        || response.receipt.core.operation.effect != EffectClass::ReversibleMutation
+    {
+        return Err(NotifyError::CanonicalStateInvalid);
+    }
+    if !matches!(
+        response.receipt.core.kind,
+        ReceiptKind::Operation | ReceiptKind::Verification
+    ) || !matches!(
+        response.receipt.core.authority.allowed_effect,
+        EffectClass::ReversibleMutation | EffectClass::ExternalEffect
+    ) || response.receipt.core.authority.proof_ceiling < ProofCeiling::ScopedVerification
+        || !matches!(
+            response.receipt.core.disposition,
+            ReceiptDisposition::Success { proof } if proof >= ProofCeiling::ScopedVerification
+        )
+    {
+        return Err(NotifyError::CanonicalStateInvalid);
+    }
+    match &request.mutation {
+        NotificationStateMutation::Upsert { record, .. } => {
+            if !response.record.matches_draft(record) {
+                return Err(NotifyError::CanonicalStateInvalid);
+            }
+        }
+        NotificationStateMutation::Delivery {
+            channel, delivery, ..
+        } => {
+            if response.record.delivery != *delivery
+                || !response.record.delivery_channels.contains(channel)
+            {
+                return Err(NotifyError::CanonicalStateInvalid);
+            }
+        }
+        NotificationStateMutation::Acknowledge { principal, .. } => {
+            if !response.record.is_unresolved()
+                || response
+                    .record
+                    .acknowledgement
+                    .as_ref()
+                    .is_none_or(|ack| ack.principal != *principal)
+            {
+                return Err(NotifyError::CanonicalStateInvalid);
+            }
+        }
+        NotificationStateMutation::Resolve {
+            disposition,
+            authorization,
+            ..
+        } => {
+            let Some(resolution) = response.record.resolution_ref.as_ref() else {
+                return Err(NotifyError::CanonicalStateInvalid);
+            };
+            if resolution.disposition != *disposition
+                || resolution.receipt_id != authorization.receipt.identity.receipt_id.as_str()
+            {
+                return Err(NotifyError::CanonicalStateInvalid);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn receipt_context_matches_request(
+    receipt: &ReceiptEnvelope,
+    request: &eliot_contracts::RequestMetadata,
+) -> bool {
+    let metadata = &receipt.core.request.metadata;
+    metadata.product_id == request.product_id
+        && metadata.source_id == request.source_id
+        && metadata.session_id == request.session_id
+        && metadata.task_id == request.task_id
+        && metadata.state_fence == request.state_fence
+        && receipt.core.request.state_fence == request.state_fence
+        && receipt.core.work_scope.product_id == request.product_id
+        && receipt.core.work_scope.state_fence == request.state_fence
+}
+
+fn notification_schema_error(_error: NotificationError) -> NotifyError {
+    NotifyError::CanonicalStateInvalid
 }
 
 fn validate_source_for_request(
@@ -1390,6 +1902,7 @@ mod tests {
         Good,
         ForceSuccess,
         Underproof,
+        Unknown,
     }
 
     fn proof_name(proof: ProofCeiling) -> &'static str {
@@ -1526,7 +2039,10 @@ mod tests {
                 "product_id": "product-1",
                 "source_id": "notify-test",
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1,
+                    },
                     "resource_generation": 1,
                     "task_revision": 1,
                     "policy_revision": 1,
@@ -1581,9 +2097,24 @@ mod tests {
             request.body_digest.as_str(),
         );
         request.canonical_request_hash = PlatformHandle::new(receipt.canonical_sha256()).unwrap();
+        let canonical = NotificationDraft {
+            notification_id: notification.clone(),
+            severity: eliot_kernel_core::NotificationSeverity::ActionRequired,
+            subject: "Attention required".to_owned(),
+            summary: "Inspect canonical evidence".to_owned(),
+            evidence_handles: vec!["evidence-1".to_owned()],
+            affected_scope: "notify-test-scope".to_owned(),
+            owner: "G-08".to_owned(),
+            required_action: "Inspect the canonical evidence".to_owned(),
+            deadline_or_review: None,
+            dedup_key: "notification-1".to_owned(),
+            delivery_channels: vec![DeliveryChannel::ControlBoard, DeliveryChannel::NativeToast],
+            state_fence: request.context.state_fence.clone(),
+        };
         (
             NotificationEnvelope {
                 notification_id: notification,
+                canonical,
                 subject: "Attention required".to_owned(),
                 summary: "Inspect canonical evidence".to_owned(),
                 recipients: vec![Recipient {
@@ -1754,6 +2285,9 @@ mod tests {
                     disposition = DispositionSpec::Success;
                     proof = ProofCeiling::ScopedVerification;
                 }
+                DeliveryReceiptMode::Unknown => {
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                }
             }
             PortOutcome::Known(receipt_for(
                 evidence.platform_request,
@@ -1765,6 +2299,132 @@ mod tests {
                 proof,
                 evidence.platform_request.body_digest.as_str(),
             ))
+        }
+    }
+
+    #[derive(Default)]
+    struct CanonicalStateFake {
+        store: eliot_kernel_core::NotificationStore,
+        mutation_log: Option<Arc<Mutex<Vec<NotificationStateMutation>>>>,
+    }
+
+    impl NotificationStatePort for CanonicalStateFake {
+        fn mutate(
+            &mut self,
+            parent: &NotificationRequest,
+            request: &NotificationStateRequest,
+        ) -> PortOutcome<NotificationStateResponse> {
+            if let Some(mutation_log) = &self.mutation_log {
+                mutation_log.lock().unwrap().push(request.mutation.clone());
+            }
+            let record = match &request.mutation {
+                NotificationStateMutation::Upsert { record, .. } => {
+                    match self.store.upsert(record.clone()) {
+                        Ok(record) => record.clone(),
+                        Err(_) => {
+                            return PortOutcome::Error(PortError::Provider(ProviderError {
+                                code: ProviderErrorCode::InvalidRequest,
+                                retryable: false,
+                            }));
+                        }
+                    }
+                }
+                NotificationStateMutation::Delivery {
+                    notification_id,
+                    channel,
+                    delivery,
+                } => {
+                    let Some(dedup_key) = self
+                        .store
+                        .iter()
+                        .find(|record| {
+                            record.notification_id == *notification_id
+                                && record.delivery_channels.contains(channel)
+                        })
+                        .map(|record| record.dedup_key.clone())
+                    else {
+                        return PortOutcome::Error(PortError::Provider(ProviderError {
+                            code: ProviderErrorCode::InvalidRequest,
+                            retryable: false,
+                        }));
+                    };
+                    match self.store.record_delivery(&dedup_key, delivery.clone()) {
+                        Ok(record) => record.clone(),
+                        Err(_) => {
+                            return PortOutcome::Error(PortError::Provider(ProviderError {
+                                code: ProviderErrorCode::InvalidRequest,
+                                retryable: false,
+                            }));
+                        }
+                    }
+                }
+                NotificationStateMutation::Acknowledge {
+                    notification_id,
+                    principal,
+                } => {
+                    let Some(dedup_key) = self
+                        .store
+                        .iter()
+                        .find(|record| record.notification_id == *notification_id)
+                        .map(|record| record.dedup_key.clone())
+                    else {
+                        return PortOutcome::Error(PortError::Provider(ProviderError {
+                            code: ProviderErrorCode::InvalidRequest,
+                            retryable: false,
+                        }));
+                    };
+                    match self.store.acknowledge(&dedup_key, principal) {
+                        Ok(record) => record.clone(),
+                        Err(_) => {
+                            return PortOutcome::Error(PortError::Provider(ProviderError {
+                                code: ProviderErrorCode::InvalidRequest,
+                                retryable: false,
+                            }));
+                        }
+                    }
+                }
+                NotificationStateMutation::Resolve {
+                    notification_id,
+                    disposition,
+                    authorization,
+                } => {
+                    let Some(dedup_key) = self
+                        .store
+                        .iter()
+                        .find(|record| record.notification_id == *notification_id)
+                        .map(|record| record.dedup_key.clone())
+                    else {
+                        return PortOutcome::Error(PortError::Provider(ProviderError {
+                            code: ProviderErrorCode::InvalidRequest,
+                            retryable: false,
+                        }));
+                    };
+                    match self.store.resolve(&dedup_key, disposition, authorization) {
+                        Ok(record) => record.clone(),
+                        Err(_) => {
+                            return PortOutcome::Error(PortError::Provider(ProviderError {
+                                code: ProviderErrorCode::InvalidRequest,
+                                retryable: false,
+                            }));
+                        }
+                    }
+                }
+            };
+            let receipt = receipt_for(
+                parent,
+                NOTIFICATION_STATE_RECEIPT_OPERATION,
+                &format!("state:{}:{}", record.notification_id, record.revision),
+                "kernel-notification-state",
+                EffectClass::ReversibleMutation,
+                DispositionSpec::Success,
+                ProofCeiling::ScopedVerification,
+                parent.body_digest.as_str(),
+            );
+            PortOutcome::Known(NotificationStateResponse {
+                record,
+                receipt,
+                replayed: false,
+            })
         }
     }
 
@@ -1871,6 +2531,7 @@ mod tests {
                 mode: delivery_mode,
             })),
             ledger: ledger.map(|value| Box::new(value) as Box<dyn OneShotLedgerPort>),
+            notification_state: Some(Box::new(CanonicalStateFake::default())),
         }
     }
 
@@ -1936,6 +2597,96 @@ mod tests {
             })
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn missing_canonical_state_is_plan_gap_before_platform_effect() {
+        let (envelope, request) = normal_input("request-missing-canonical");
+        let (platform, calls) = counting_platform(known_delivery());
+        let mut verification = ports(
+            Some(DurableLedger::default()),
+            AdmissionMode::Good,
+            DeliveryReceiptMode::Good,
+        );
+        verification.notification_state = None;
+        let mut core = NotifyCore::new(platform, verification);
+
+        assert_eq!(
+            core.deliver(&envelope, &request),
+            Err(NotifyError::PlanGap {
+                provider: ProviderId::CanonicalNotificationState,
+                reason: "canonical notification state port is missing",
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn notification_state_mutation_legs_validate_and_round_trip() {
+        let (envelope, request) = normal_input("request-state-legs");
+        let notification_id = envelope.canonical.notification_id.clone();
+        let authorization = ResolutionAuthorization {
+            receipt: receipt_for(
+                &request,
+                NOTIFICATION_STATE_RECEIPT_OPERATION,
+                "notification-state-resolution",
+                "kernel-notification-state",
+                EffectClass::ReversibleMutation,
+                DispositionSpec::Success,
+                ProofCeiling::ScopedVerification,
+                request.body_digest.as_str(),
+            ),
+            evidence_handles: vec!["evidence-1".to_owned()],
+        };
+        let cases = [
+            (
+                NotificationStateMutation::Upsert {
+                    record: envelope.canonical.clone(),
+                    source_receipt: envelope.source_receipt.clone(),
+                },
+                "UPSERT",
+            ),
+            (
+                NotificationStateMutation::Delivery {
+                    notification_id: notification_id.clone(),
+                    channel: DeliveryChannel::NativeToast,
+                    delivery: DeliveryState::Delivered,
+                },
+                "DELIVERY",
+            ),
+            (
+                NotificationStateMutation::Acknowledge {
+                    notification_id: notification_id.clone(),
+                    principal: "human-1".to_owned(),
+                },
+                "ACKNOWLEDGE",
+            ),
+            (
+                NotificationStateMutation::Resolve {
+                    notification_id,
+                    disposition: "operator-reviewed".to_owned(),
+                    authorization,
+                },
+                "RESOLVE",
+            ),
+        ];
+
+        for (mutation, expected_kind) in cases {
+            let state_request = NotificationStateRequest {
+                context: request.context.clone(),
+                state_fence: request.context.state_fence.clone(),
+                mutation,
+            };
+            state_request
+                .validate_for_parent(&request)
+                .expect("notification mutation leg validates against parent");
+            let encoded = serde_json::to_value(&state_request).expect("mutation serializes");
+            assert_eq!(encoded["mutation"]["kind"], expected_kind);
+            assert!(encoded["mutation"].get("authorized").is_none());
+            let decoded: NotificationStateRequest =
+                serde_json::from_value(encoded).expect("mutation deserializes");
+            assert_eq!(decoded, state_request);
+        }
     }
 
     #[test]
@@ -2078,8 +2829,11 @@ mod tests {
         );
         changed_request.canonical_request_hash =
             PlatformHandle::new(changed_receipt.canonical_sha256()).unwrap();
+        let mut changed_canonical = envelope.canonical.clone();
+        changed_canonical.state_fence = changed_request.context.state_fence.clone();
         let changed_envelope = NotificationEnvelope {
             notification_id: changed_notification,
+            canonical: changed_canonical,
             subject: "Attention required".to_owned(),
             summary: "Inspect canonical evidence".to_owned(),
             recipients: envelope.recipients.clone(),
@@ -2098,6 +2852,46 @@ mod tests {
             Err(NotifyError::LedgerConflict)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unknown_delivery_verifier_persists_unknown_canonical_state() {
+        let (envelope, request) = normal_input("request-delivery-verifier-gap");
+        let (platform, calls) = counting_platform(known_delivery());
+        let mutation_log = Arc::new(Mutex::new(Vec::new()));
+        let mut verification = ports(
+            Some(DurableLedger::default()),
+            AdmissionMode::Good,
+            DeliveryReceiptMode::Unknown,
+        );
+        verification.notification_state = Some(Box::new(CanonicalStateFake {
+            store: eliot_kernel_core::NotificationStore::default(),
+            mutation_log: Some(Arc::clone(&mutation_log)),
+        }));
+        let mut core = NotifyCore::new(platform, verification);
+
+        assert_eq!(
+            core.deliver(&envelope, &request),
+            Err(NotifyError::VerificationUnknown {
+                provider: ProviderId::DeliveryReceipt,
+                reason: UnknownReason::Indeterminate,
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mutation_log = mutation_log.lock().unwrap();
+        assert_eq!(mutation_log.len(), 2);
+        assert!(matches!(
+            &mutation_log[0],
+            NotificationStateMutation::Upsert { .. }
+        ));
+        assert!(matches!(
+            &mutation_log[1],
+            NotificationStateMutation::Delivery {
+                delivery: DeliveryState::Unknown { reason },
+                ..
+            } if reason.contains("verification failed")
+        ));
     }
 
     #[test]
@@ -2180,6 +2974,7 @@ mod tests {
                 mode: DeliveryReceiptMode::Good,
             })),
             ledger: Some(Box::new(ledger)),
+            notification_state: None,
         }
     }
 

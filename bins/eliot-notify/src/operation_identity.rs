@@ -62,7 +62,8 @@ const MAX_CLOCK_AGE_MS: u64 = 60_000;
 /// Selectors match the provider bundle in `super::KERNEL_VERIFICATION_OPERATIONS`.
 /// Each step owns a fixed effect ceiling: verification steps observe (`READ`);
 /// admission, delivery verification and ledger steps decide durable or
-/// externally visible outcomes (`EXTERNAL_EFFECT`).
+/// externally visible outcomes; canonical notification state is a reversible
+/// mutation owned by the Kernel/store path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum NotifyOperation {
     /// `eliot.notify.g08.verify` — G-08 source verification (`READ`).
@@ -77,6 +78,8 @@ pub enum NotifyOperation {
     LedgerReserve,
     /// `eliot.notify.ledger.commit` — one-shot ledger commit (durable, `EXTERNAL_EFFECT` ceiling).
     LedgerCommit,
+    /// `eliot.notify.state.v1` — canonical notification-state mutation.
+    NotificationState,
 }
 
 impl NotifyOperation {
@@ -90,6 +93,7 @@ impl NotifyOperation {
             Self::DeliveryVerify => "eliot.notify.delivery.verify",
             Self::LedgerReserve => "eliot.notify.ledger.reserve",
             Self::LedgerCommit => "eliot.notify.ledger.commit",
+            Self::NotificationState => eliot_notify_core::NOTIFICATION_STATE_SELECTOR,
         }
     }
 
@@ -103,6 +107,7 @@ impl NotifyOperation {
             Self::DeliveryVerify => "delivery-verify",
             Self::LedgerReserve => "ledger-reserve",
             Self::LedgerCommit => "ledger-commit",
+            Self::NotificationState => "notification-state",
         }
     }
 
@@ -111,16 +116,16 @@ impl NotifyOperation {
     pub const fn effect_ceiling(self) -> &'static str {
         match self {
             Self::G08Verify | Self::WatchdogVerify => "READ",
-            Self::A08Admit
-            | Self::DeliveryVerify
-            | Self::LedgerReserve
-            | Self::LedgerCommit => "EXTERNAL_EFFECT",
+            Self::A08Admit | Self::DeliveryVerify | Self::LedgerReserve | Self::LedgerCommit => {
+                "EXTERNAL_EFFECT"
+            }
+            Self::NotificationState => "REVERSIBLE_MUTATION",
         }
     }
 
-    /// All six closed steps in pipeline order.
+    /// All seven closed steps in pipeline order.
     #[must_use]
-    pub const fn all() -> [Self; 6] {
+    pub const fn all() -> [Self; 7] {
         [
             Self::G08Verify,
             Self::A08Admit,
@@ -128,6 +133,7 @@ impl NotifyOperation {
             Self::DeliveryVerify,
             Self::LedgerReserve,
             Self::LedgerCommit,
+            Self::NotificationState,
         ]
     }
 }
@@ -194,10 +200,14 @@ pub enum OperationIdentityError {
 impl fmt::Display for OperationIdentityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidParent(detail) => write!(f, "parent notification request is invalid: {detail}"),
+            Self::InvalidParent(detail) => {
+                write!(f, "parent notification request is invalid: {detail}")
+            }
             Self::InvalidClock => write!(f, "operation clock observation is invalid"),
             Self::Encoding(detail) => write!(f, "operation payload encoding failed: {detail}"),
-            Self::InvalidIdentity(detail) => write!(f, "minted child identity is invalid: {detail}"),
+            Self::InvalidIdentity(detail) => {
+                write!(f, "minted child identity is invalid: {detail}")
+            }
             Self::IdentityConflict(detail) => write!(f, "idempotency identity conflict: {detail}"),
         }
     }
@@ -267,7 +277,13 @@ impl NotifyIdentityIssuer {
         payload: &Value,
         now_unix_ms: u64,
     ) -> Result<IssuedIdentity, OperationIdentityError> {
-        self.issue(parent, NotifyOperation::G08Verify, payload, None, now_unix_ms)
+        self.issue(
+            parent,
+            NotifyOperation::G08Verify,
+            payload,
+            None,
+            now_unix_ms,
+        )
     }
 
     /// Issues (or exactly retries) the A-08 admission child. The prior
@@ -295,7 +311,13 @@ impl NotifyIdentityIssuer {
         payload: &Value,
         now_unix_ms: u64,
     ) -> Result<IssuedIdentity, OperationIdentityError> {
-        self.issue(parent, NotifyOperation::WatchdogVerify, payload, None, now_unix_ms)
+        self.issue(
+            parent,
+            NotifyOperation::WatchdogVerify,
+            payload,
+            None,
+            now_unix_ms,
+        )
     }
 
     /// Issues (or exactly retries) the delivery-verification child. The prior
@@ -354,6 +376,23 @@ impl NotifyIdentityIssuer {
         )
     }
 
+    /// Issues (or exactly retries) the canonical notification-state child.
+    pub fn issue_notification_state(
+        &mut self,
+        parent: &NotificationRequest,
+        payload: &Value,
+        prior_receipt_digest: Option<&str>,
+        now_unix_ms: u64,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        self.issue(
+            parent,
+            NotifyOperation::NotificationState,
+            payload,
+            prior_receipt_digest,
+            now_unix_ms,
+        )
+    }
+
     /// Issues with an explicit transport idempotency key. A key already bound
     /// to different canonical bytes (or a different step) fails with identity
     /// conflict; the same key with identical bytes returns the exact prior
@@ -367,9 +406,7 @@ impl NotifyIdentityIssuer {
         prior_receipt_digest: Option<&str>,
         now_unix_ms: u64,
     ) -> Result<IssuedIdentity, OperationIdentityError> {
-        if idempotency_key.trim().is_empty()
-            || idempotency_key.chars().any(char::is_control)
-        {
+        if idempotency_key.trim().is_empty() || idempotency_key.chars().any(char::is_control) {
             return Err(OperationIdentityError::InvalidParent(
                 "idempotency_key".to_owned(),
             ));
@@ -379,12 +416,7 @@ impl NotifyIdentityIssuer {
         let parent_hash = parent.canonical_request_hash.as_str().to_owned();
         let parent_request_id = parent.context.request_id.as_str().to_owned();
         let prior = normalize_prior(prior_receipt_digest)?;
-        let key = ledger_key(
-            &parent_hash,
-            operation,
-            &canonical_digest,
-            prior.as_deref(),
-        );
+        let key = ledger_key(&parent_hash, operation, &canonical_digest, prior.as_deref());
         if let Some(entry) = self.ledger.get(&key) {
             if self
                 .by_idempotency
@@ -547,9 +579,7 @@ fn ledger_key(
     )
 }
 
-fn normalize_prior(
-    prior: Option<&str>,
-) -> Result<Option<String>, OperationIdentityError> {
+fn normalize_prior(prior: Option<&str>) -> Result<Option<String>, OperationIdentityError> {
     match prior {
         None => Ok(None),
         Some(digest) => {
@@ -670,8 +700,7 @@ fn build_identity(
 ) -> Result<RequestIdentity, OperationIdentityError> {
     use eliot_contracts::RequestId;
 
-    let now_i64 =
-        i64::try_from(now_unix_ms).map_err(|_| OperationIdentityError::InvalidClock)?;
+    let now_i64 = i64::try_from(now_unix_ms).map_err(|_| OperationIdentityError::InvalidClock)?;
     let child_id = RequestId::new(child_request_id)
         .map_err(|error| OperationIdentityError::InvalidIdentity(error.to_string()))?;
     let mut metadata = parent.context.clone();
@@ -707,14 +736,11 @@ mod tests {
     use std::num::NonZeroU64;
 
     const NOW: u64 = 1_786_000_000_000;
-    const PARENT_HASH: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PARENT_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn test_fence() -> StateFence {
-        let lineage =
-            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage");
-        let epoch =
-            EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
         StateFence::new(epoch, ResourceGeneration::genesis())
     }
 
@@ -749,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn six_steps_carry_distinct_versioned_children() {
+    fn seven_steps_carry_distinct_versioned_children() {
         let mut issuer = NotifyIdentityIssuer::new();
         let p = parent("parent-1");
         let g08 = issuer.issue_g08(&p, &payload("g08"), NOW).expect("g08");
@@ -768,6 +794,9 @@ mod tests {
         let commit = issuer
             .issue_commit(&p, &payload("commit"), Some("reservation-digest"), NOW)
             .expect("commit");
+        let state = issuer
+            .issue_notification_state(&p, &payload("state"), Some("source-digest"), NOW)
+            .expect("notification state");
 
         let ids = [
             g08.request_id.as_str(),
@@ -776,11 +805,12 @@ mod tests {
             delivery.request_id.as_str(),
             reserve.request_id.as_str(),
             commit.request_id.as_str(),
+            state.request_id.as_str(),
         ];
         let mut distinct = ids.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 6, "every step owns a distinct child");
+        assert_eq!(distinct.len(), 7, "every step owns a distinct child");
 
         let keys = [
             g08.identity.idempotency_key.as_str(),
@@ -789,11 +819,12 @@ mod tests {
             delivery.identity.idempotency_key.as_str(),
             reserve.identity.idempotency_key.as_str(),
             commit.identity.idempotency_key.as_str(),
+            state.identity.idempotency_key.as_str(),
         ];
         let mut distinct_keys = keys.to_vec();
         distinct_keys.sort_unstable();
         distinct_keys.dedup();
-        assert_eq!(distinct_keys.len(), 6);
+        assert_eq!(distinct_keys.len(), 7);
 
         let cancels = [
             g08.identity.cancellation_id.as_str(),
@@ -802,20 +833,25 @@ mod tests {
             delivery.identity.cancellation_id.as_str(),
             reserve.identity.cancellation_id.as_str(),
             commit.identity.cancellation_id.as_str(),
+            state.identity.cancellation_id.as_str(),
         ];
         let mut distinct_cancels = cancels.to_vec();
         distinct_cancels.sort_unstable();
         distinct_cancels.dedup();
-        assert_eq!(distinct_cancels.len(), 6);
+        assert_eq!(distinct_cancels.len(), 7);
 
-        for issued in [&g08, &a08, &delivery, &reserve, &commit] {
+        for issued in [&g08, &a08, &watchdog, &delivery, &reserve, &commit, &state] {
             issued.identity.validate().expect("child validates");
             assert_eq!(issued.parent_hash, PARENT_HASH);
             assert_eq!(issued.parent_request_id, "parent-1");
         }
         assert_ne!(reserve.request_id, commit.request_id);
-        assert_eq!(issuer.issued_count(), 6);
-        assert_eq!(issuer.lineage().len(), 6);
+        assert_eq!(
+            state.operation.selector(),
+            eliot_notify_core::NOTIFICATION_STATE_SELECTOR
+        );
+        assert_eq!(issuer.issued_count(), 7);
+        assert_eq!(issuer.lineage().len(), 7);
     }
 
     #[test]
@@ -856,10 +892,7 @@ mod tests {
             NOW,
         );
         assert!(
-            matches!(
-                conflict,
-                Err(OperationIdentityError::IdentityConflict(_))
-            ),
+            matches!(conflict, Err(OperationIdentityError::IdentityConflict(_))),
             "cross-step reuse must conflict, got {conflict:?}"
         );
         assert_eq!(issuer.issued_count(), 1);

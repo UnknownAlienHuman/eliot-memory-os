@@ -18,7 +18,8 @@ use eliot_notify_core::{
     A08AdmissionPort, AdmissionRequest, AdmissionResult, DeliveryObservation,
     DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort, G08NotificationPort,
     LedgerCommitOutcome, LedgerIntent, LedgerReservation, LedgerReserveOutcome,
-    NotificationEnvelope, NotifyCore, OneShotLedgerPort, SignedWatchdogFallbackEnvelope,
+    NotificationEnvelope, NotificationStatePort, NotificationStateRequest,
+    NotificationStateResponse, NotifyCore, OneShotLedgerPort, SignedWatchdogFallbackEnvelope,
     VerificationPorts, WATCHDOG_PRODUCT_ID, WATCHDOG_SIGNATURE_ALGORITHM,
     WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID, WatchdogSignaturePort, watchdog_notification_id,
     watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
@@ -34,9 +35,7 @@ use eliot_platform_windows::{
     register_interactive_watchdog_task, run_registered_watchdog_task, validate_pinned_artifact,
 };
 use eliot_protocol::RequestIdentity;
-use eliot_receipts::{
-    EffectClass, ProofCeiling, ReceiptEnvelope, contract_identity,
-};
+use eliot_receipts::{EffectClass, ProofCeiling, ReceiptEnvelope, contract_identity};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -191,6 +190,7 @@ pub const KERNEL_VERIFICATION_OPERATIONS: &[&str] = &[
     DELIVERY_VERIFY_OPERATION,
     LEDGER_RESERVE_OPERATION,
     LEDGER_COMMIT_OPERATION,
+    eliot_notify_core::NOTIFICATION_STATE_SELECTOR,
 ];
 
 trait NotifyKernelExchange: Send {
@@ -286,6 +286,9 @@ where
                 operation_identity::NotifyOperation::LedgerCommit => {
                     issuer.issue_commit(parent, &payload, prior_receipt_digest, now)
                 }
+                operation_identity::NotifyOperation::NotificationState => {
+                    issuer.issue_notification_state(parent, &payload, prior_receipt_digest, now)
+                }
             },
             Err(_) => {
                 return PortOutcome::Error(PortError::Provider(ProviderError {
@@ -307,11 +310,9 @@ where
             }
         };
         let result = match self.exchange.lock() {
-            Ok(mut exchange) => exchange.transact_with_identity(
-                &issued.identity,
-                operation.selector(),
-                payload,
-            ),
+            Ok(mut exchange) => {
+                exchange.transact_with_identity(&issued.identity, operation.selector(), payload)
+            }
             Err(_) => {
                 return PortOutcome::Error(PortError::Provider(ProviderError {
                     code: ProviderErrorCode::Failed,
@@ -530,6 +531,32 @@ struct KernelLedger<E> {
     port: KernelPort<E>,
 }
 
+struct KernelNotificationState<E> {
+    port: KernelPort<E>,
+}
+
+impl<E> NotificationStatePort for KernelNotificationState<E>
+where
+    E: NotifyKernelExchange,
+{
+    fn mutate(
+        &mut self,
+        parent: &NotificationRequest,
+        request: &NotificationStateRequest,
+    ) -> PortOutcome<NotificationStateResponse> {
+        self.port.execute_for(
+            parent,
+            operation_identity::NotifyOperation::NotificationState,
+            json!({
+                "context": &request.context,
+                "state_fence": &request.state_fence,
+                "mutation": &request.mutation,
+            }),
+            request.mutation.prior_receipt_digest(),
+        )
+    }
+}
+
 impl<E> OneShotLedgerPort for KernelLedger<E>
 where
     E: NotifyKernelExchange,
@@ -626,8 +653,14 @@ where
         })),
         ledger: Some(Box::new(KernelLedger {
             port: KernelPort {
-                exchange,
-                issuer,
+                exchange: Arc::clone(&exchange),
+                issuer: Arc::clone(&issuer),
+            },
+        })),
+        notification_state: Some(Box::new(KernelNotificationState {
+            port: KernelPort {
+                exchange: Arc::clone(&exchange),
+                issuer: Arc::clone(&issuer),
             },
         })),
     }
@@ -654,6 +687,7 @@ const DELIVERY_OWNER: &str = "delivery-receipt-verifier";
 
 mod fallback_verification;
 pub mod operation_identity;
+pub mod quiet_hours;
 #[cfg(test)]
 use fallback_verification::sha256_hex;
 use fallback_verification::{
@@ -1620,6 +1654,7 @@ fn load_fallback_verification_ports(root: &Path) -> Result<VerificationPorts, No
         })),
         delivery_receipt: Some(Box::new(LocalFallbackReceipt { material })),
         ledger: Some(Box::new(ledger)),
+        notification_state: None,
     })
 }
 
@@ -1672,11 +1707,10 @@ mod tests {
             operation: &str,
             payload: Value,
         ) -> Result<Value, KernelClientError> {
-            self.calls.lock().unwrap().push((
-                operation.to_owned(),
-                identity.clone(),
-                payload,
-            ));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((operation.to_owned(), identity.clone(), payload));
             Ok(self.response.clone())
         }
     }
@@ -1744,6 +1778,61 @@ mod tests {
         assert!(ports.watchdog.is_some());
         assert!(ports.delivery_receipt.is_some());
         assert!(ports.ledger.is_some());
+        assert!(ports.notification_state.is_some());
+        assert_eq!(
+            KERNEL_VERIFICATION_OPERATIONS.last(),
+            Some(&eliot_notify_core::NOTIFICATION_STATE_SELECTOR)
+        );
+    }
+
+    #[test]
+    fn notification_state_exchange_uses_versioned_selector_and_nested_mutation() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let exchange = RecordingExchange {
+            calls: Arc::clone(&calls),
+            response: serde_json::json!({
+                "kind": "UNKNOWN",
+                "reason": "INDETERMINATE"
+            }),
+        };
+        let shared = Arc::new(Mutex::new(exchange));
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
+        let mut state = KernelNotificationState {
+            port: KernelPort {
+                exchange: shared,
+                issuer,
+            },
+        };
+        let parent = request("request-notification-state");
+        let state_request: NotificationStateRequest = serde_json::from_value(serde_json::json!({
+            "context": parent.context.clone(),
+            "state_fence": parent.context.state_fence.clone(),
+            "mutation": {
+                "kind": "DELIVERY",
+                "notification_id": "notification-1",
+                "channel": "NATIVE_TOAST",
+                "delivery": { "kind": "DELIVERED" }
+            }
+        }))
+        .expect("valid notification-state delivery request");
+
+        let outcome = state.mutate(&parent, &state_request);
+        assert!(matches!(
+            outcome,
+            PortOutcome::Unknown(UnknownReason::Indeterminate)
+        ));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, eliot_notify_core::NOTIFICATION_STATE_SELECTOR);
+        assert_eq!(calls[0].2["mutation"]["kind"], "DELIVERY");
+        assert_eq!(calls[0].2["mutation"]["notification_id"], "notification-1");
+        assert_eq!(calls[0].2["mutation"]["delivery"]["kind"], "DELIVERED");
+        assert_eq!(
+            calls[0].2["state_fence"],
+            serde_json::to_value(&state_request.state_fence).unwrap()
+        );
     }
 
     #[test]
@@ -2122,6 +2211,7 @@ mod tests {
             })),
             delivery_receipt: Some(Box::new(LocalFallbackReceipt { material })),
             ledger: Some(ledger),
+            notification_state: None,
         }
     }
 
