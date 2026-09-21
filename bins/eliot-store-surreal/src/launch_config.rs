@@ -47,14 +47,9 @@ pub struct StoreLaunchConfig {
     pub query_timeout_ms: u64,
     /// Kernel-configured store transaction limit bounding canonical-write
     /// concurrency (I5.7, issue #1933). `None` keeps the I5.7 desktop default;
-    /// an explicit value must be non-zero. Absent on the wire means default.
-    /// Shape-validated here; digest binding is deliberately deferred (see
-    /// `launch_config_digest`): the approved digest must stay identical to
-    /// the installer-duplicated projection, and binding a knob no producer
-    /// sets yet would force reissue of every existing config for zero
-    /// current benefit. The first producer that issues an explicit limit
-    /// MUST bind it in `launch_config_digest` jointly with the installer
-    /// projection (`PlannerOperationalConfig`), or installations split.
+    /// an explicit value must be non-zero and is digest-bound below. Absent
+    /// on the wire means default; both approved-digest projections omit an
+    /// unset knob identically, so legacy approvals stay byte-stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_transaction_limit: Option<usize>,
     pub schema_generation: String,
@@ -243,6 +238,11 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         username: &'a str,
         connect_timeout_ms: u64,
         query_timeout_ms: u64,
+        // Omitted when unset so legacy approved bytes stay unchanged; an
+        // explicit limit is encoded identically here and in the installer
+        // projection (`PlannerOperationalConfig`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        store_transaction_limit: Option<usize>,
         schema_generation: &'a str,
         blob_root: &'a str,
         instance_id: &'a str,
@@ -262,6 +262,7 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         username: &config.username,
         connect_timeout_ms: config.connect_timeout_ms,
         query_timeout_ms: config.query_timeout_ms,
+        store_transaction_limit: config.store_transaction_limit,
         schema_generation: &config.schema_generation,
         blob_root: &config.blob_root,
         instance_id: &config.instance_id,
