@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod candidate_adaptation;
+pub mod lifecycle;
 
 /// Constructs an inert observed/withheld proposal using the private resolver.
 pub fn propose_observed_candidate(
