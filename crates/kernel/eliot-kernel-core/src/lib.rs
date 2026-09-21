@@ -93,6 +93,10 @@ pub use user_automation::{
     UserAutomationQueryKind, UserAutomationRevision, UserAutomationTrigger,
     UserAutomationTriggerOrigin, user_automation_contract_identity,
 };
+pub use module::runtime_health::{
+    CURRENT_ARCHITECTURE_SOURCE_DIGEST, CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
+    CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence,
+};
 
 /// Result of releasing a pre-effect process-start replay reservation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
