@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod reactive_context_delivery;
 pub mod runtime_control;
 
 mod service;
@@ -21,6 +22,18 @@ pub use service::{
     BoundedRestartOutcome, HostChildExecutor, HostDependencyPlan, HostFailure,
     HostManagedChildBinding, HostService, HostServiceError, HostServiceState, KernelStartReceipt,
     ManagedChildLiveness, ManagedChildReconcileOutcome, ServiceStopReceipt,
+};
+
+pub use reactive_context_delivery::{
+    DeliveryDisposition, DrainOutcome, HostDeliveryAdmission, HostDeliveryState,
+    ReactiveContextAcknowledgementReceipt, ReactiveContextCancelOutcome,
+    ReactiveContextCancelRequest, ReactiveContextChannelCloseOutcome, ReactiveContextClock,
+    ReactiveContextCloseChannelRequest, ReactiveContextDelivery, ReactiveContextDeliveryError,
+    ReactiveContextDeliveryLimits, ReactiveContextDeliveryReceipt, ReactiveContextDeliveryRequest,
+    ReactiveContextEndpointResolution, ReactiveContextQueryOutcome, ReactiveContextQueryRequest,
+    ReactiveContextResolveRequest, ReactiveContextResolvedEndpoint, ReactiveContextSendOutcome,
+    ReactiveContextSendRequest, ReactiveContextTransportError, ReactiveContextTransportPort,
+    ReactiveContextTransportReceipt, RestartReconciliation, SystemReactiveContextClock,
 };
 
 use eliot_contracts::{
