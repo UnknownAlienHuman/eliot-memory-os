@@ -1052,6 +1052,7 @@ const A08_OWNER: &str = "A-08";
 const DELIVERY_OPERATION: &str = "notification_delivery";
 const DELIVERY_OWNER: &str = "delivery-receipt-verifier";
 
+pub mod automation_notification_adapter;
 mod fallback_verification;
 pub mod operation_identity;
 pub mod quiet_hours;
