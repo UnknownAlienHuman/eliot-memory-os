@@ -9,11 +9,18 @@
 //! Design rules enforced here:
 //!
 //! * Every operation runs through the injected [`ProcessRunner`] port. The
-//!   production binding of this port is the shared `ProcessExecutor`; this
-//!   crate never spawns private launch/retry semantics and never shells out
-//!   except through the port. [`StdProcessRunner`] is the local
-//!   `std::process`-backed port implementation used by tests and standalone
-//!   hosts.
+//!   production binding is [`ExecutorRunner`]: the shared governed executor
+//!   (`WindowsProcessExecutor`, the sole P-04 implementation of the
+//!   `ProcessExecutor` contract) behind per-call authorized requests minted
+//!   by the composition root through [`ExecutorRequestPort`]. This crate
+//!   never mints dispatch authority, never spawns private launch/retry
+//!   semantics, and never shells out except through the port.
+//!   [`StdProcessRunner`] is the local `std::process`-backed port
+//!   implementation used by tests, standalone hosts, and the stdin-fed patch
+//!   path (P-03 carries no stdin channel, so patch check/apply stay local).
+//!   Exact exit codes of completed bound runs are recovered through the
+//!   serialized exit observation, following the established `successful_exit`
+//!   precedent in `eliot-instrument-runner`.
 //! * Every request carries a declared execution identity ([`ExecutionIdentity`]
 //!   / SID) and a resource root ([`RepoRoot`]). User-owned roots are served
 //!   only through a broker-launched scoped [`Lease`] unless an explicit
@@ -40,10 +47,20 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
+
+use eliot_process::{
+    ExitDisposition as KernelExitDisposition, ExitStatus, ProcessEvidenceSink, ProcessExecutor,
+    ProcessRequest,
+};
+use eliot_process_executor::{CapturedStream, WindowsProcessExecutor};
 
 // ---------------------------------------------------------------------------
 // Identity, ownership, leases
@@ -305,6 +322,235 @@ impl ProcessRunner for StdProcessRunner {
             stdout: output.stdout,
             stderr: output.stderr,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Executor binding: shared ProcessExecutor behind the ProcessRunner port
+// ---------------------------------------------------------------------------
+
+/// Compile-time proof that the bound executor implements the shared
+/// [`ProcessExecutor`] contract: if P-04 ever stops implementing P-03, the
+/// binding fails to build instead of silently targeting a fork.
+const _: fn() = || {
+    fn requires_shared_contract<E: ProcessExecutor>() {}
+    requires_shared_contract::<WindowsProcessExecutor>();
+};
+
+/// Composition-root seam minting authorized [`ProcessRequest`] values.
+///
+/// Mirrors `InstrumentRequestPort` in `eliot-instrument-runner`: dispatch
+/// permits are Kernel-issued authority, so the bridge never mints requests
+/// itself. The production implementation belongs to the runtime composition
+/// root; tests play that role with test authority.
+pub trait ExecutorRequestPort: Send + Sync {
+    /// Binds one invocation to exactly one authorized process request.
+    ///
+    /// # Errors
+    /// Returns a message when the request cannot be minted for this call.
+    fn bind(&self, exe: &str, args: &[&str], cwd: &Path) -> Result<ProcessRequest, String>;
+}
+
+/// Default bound for the terminal-lifecycle wait (matches the `s04` executor
+/// test precedent of a 30-second horizon with 25 ms polls).
+pub const BOUND_RUN_DEADLINE: Duration = Duration::from_secs(30);
+/// Poll interval for the terminal-lifecycle wait.
+const BOUND_RUN_POLL: Duration = Duration::from_millis(25);
+
+/// [`ProcessRunner`] implemented by the shared governed executor.
+///
+/// The runner is deliberately concrete over [`WindowsProcessExecutor`], the
+/// sole physical P-04 implementation: the provider-neutral [`ProcessExecutor`]
+/// trait carries launch/inspect/cancel/reconcile but no output readback, so a
+/// generic binding could not preserve command-output handles without
+/// inventing a shadow seam. Construction mirrors
+/// `InstrumentRunner::new`: the composition root supplies the executor, the
+/// request-minting port, and the evidence sink; the runner owns no authority.
+///
+/// Boundaries (fail-closed, documented):
+///
+/// * P-03 carries no stdin channel, so stdin-fed invocations (patch check /
+///   apply) are refused here; those operations stay on the local port.
+/// * Truncated or incomplete stream captures are refused: typed parsing needs
+///   full streams, and a partial parse must never pose as complete.
+/// * Non-completed terminal dispositions, missing exit observations, and
+///   deadline overruns surface as runner errors naming the disposition;
+///   no synthetic exit code is ever fabricated.
+/// * Exact numeric codes of completed exits are recovered through the
+///   serialized `code` field, following the established `successful_exit`
+///   precedent in `eliot-instrument-runner`.
+pub struct ExecutorRunner {
+    executor: Arc<WindowsProcessExecutor>,
+    port: Arc<dyn ExecutorRequestPort>,
+    sink: Arc<dyn ProcessEvidenceSink>,
+    deadline: Duration,
+}
+
+impl ExecutorRunner {
+    /// Binds the runner to a shared executor, a request-minting port, and an
+    /// evidence sink.
+    pub fn new(
+        executor: Arc<WindowsProcessExecutor>,
+        port: Arc<dyn ExecutorRequestPort>,
+        sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Self {
+        Self {
+            executor,
+            port,
+            sink,
+            deadline: BOUND_RUN_DEADLINE,
+        }
+    }
+
+    /// Overrides the terminal-lifecycle wait bound.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// Returns the bound shared executor.
+    pub fn executor(&self) -> &Arc<WindowsProcessExecutor> {
+        &self.executor
+    }
+}
+
+impl std::fmt::Debug for ExecutorRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutorRunner")
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExecutorRunner {
+    fn run_via_executor(
+        &self,
+        exe: &str,
+        args: &[&str],
+        cwd: &Path,
+    ) -> Result<ProcessOutcome, String> {
+        let request = self
+            .port
+            .bind(exe, args, cwd)
+            .map_err(|e| format!("executor request binding failed: {e}"))?;
+        request
+            .validate()
+            .map_err(|e| format!("bound request failed validation: {e}"))?;
+        let operation = request.operation_id().clone();
+        let digest = request.invocation_digest().to_owned();
+        let generation = request.generation().get();
+        let receipt = block_on(self.executor.start(request, self.sink.clone()))
+            .map_err(|e| format!("executor start failed: {e}"))?;
+        if receipt.operation_id() != &operation
+            || receipt.request_digest() != digest
+            || receipt.accepted_generation().get() != generation
+        {
+            return Err("executor start receipt does not preserve the bound request".to_owned());
+        }
+        let started = Instant::now();
+        let view = loop {
+            let view = block_on(self.executor.inspect(operation.clone()))
+                .map_err(|e| format!("executor inspect failed: {e}"))?;
+            if view.operation_id() != &operation || view.request_digest() != digest {
+                return Err("executor observation does not preserve the bound request".to_owned());
+            }
+            if view.lifecycle().is_terminal() {
+                break view;
+            }
+            if started.elapsed() >= self.deadline {
+                return Err(format!(
+                    "executor run timed out after {}s waiting for terminal lifecycle",
+                    self.deadline.as_secs()
+                ));
+            }
+            std::thread::sleep(BOUND_RUN_POLL);
+        };
+        let exit = view.exit().ok_or_else(|| {
+            "executor reported a terminal lifecycle without an exit observation".to_owned()
+        })?;
+        let code = exit_code_of(exit)?;
+        let (stdout, stderr) = self
+            .executor
+            .captured_output(&operation)
+            .map_err(|e| format!("executor stream readback failed: {e}"))?;
+        Ok(ProcessOutcome {
+            code,
+            stdout: captured_bytes(stdout, "stdout")?,
+            stderr: captured_bytes(stderr, "stderr")?,
+        })
+    }
+}
+
+impl ProcessRunner for ExecutorRunner {
+    fn run(
+        &self,
+        exe: &str,
+        args: &[&str],
+        cwd: &Path,
+        stdin: &[u8],
+    ) -> Result<ProcessOutcome, String> {
+        validate_invocation(exe, args).map_err(|e| e.to_string())?;
+        if !stdin.is_empty() {
+            return Err("executor binding refuses stdin-fed invocations: P-03 carries no stdin channel; patch operations stay on the local port"
+                .to_owned());
+        }
+        self.run_via_executor(exe, args, cwd)
+    }
+}
+
+/// Recovers the exact numeric exit code of a completed exit.
+///
+/// Follows the established `successful_exit` precedent in
+/// `eliot-instrument-runner`: the code is read from the serialized exit
+/// observation because the typed contract exposes only the coarse
+/// disposition. Anything but `Completed` has no meaningful git exit code
+/// and is refused fail-closed with the disposition named.
+fn exit_code_of(exit: &ExitStatus) -> Result<i32, String> {
+    if !matches!(exit.disposition(), KernelExitDisposition::Completed) {
+        return Err(format!(
+            "executor reports a non-completed exit disposition: {:?}",
+            exit.disposition()
+        ));
+    }
+    serde_json::to_value(exit)
+        .ok()
+        .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
+        .and_then(|code| i32::try_from(code).ok())
+        .ok_or_else(|| "executor completed exit carries no numeric code".to_owned())
+}
+
+/// Extracts full stream bytes, refusing partial captures fail-closed.
+fn captured_bytes(stream: CapturedStream, name: &'static str) -> Result<Vec<u8>, String> {
+    if !stream.captured {
+        return Err(format!("executor captured no {name} handle"));
+    }
+    if !stream.complete {
+        return Err(format!("executor {name} capture ended before EOF"));
+    }
+    if stream.truncated {
+        return Err(format!(
+            "executor {name} output exceeded the capture ceiling"
+        ));
+    }
+    Ok(stream.bytes)
+}
+
+/// Drives one executor future to completion on the calling thread.
+///
+/// Established precedent: the production `block_on_sink` drain path and the
+/// `block_on` test driver in `eliot-process-executor` spin a noop waker with
+/// `yield_now`. P-04 futures complete without a reactor; this performs no
+/// sleeping, no retry, and no I/O of its own.
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
     }
 }
 
@@ -760,7 +1006,7 @@ impl<R: ProcessRunner> GitBridge<R> {
 
     // -- internals ---------------------------------------------------------
 
-    fn resolve_root(&self, root: &RepoRoot) -> Result<PathBuf, BridgeError> {
+    fn resolve_root(root: &RepoRoot) -> Result<PathBuf, BridgeError> {
         match std::fs::canonicalize(&root.path) {
             Ok(p) => Ok(p),
             Err(e) if root.path.exists() => Err(BridgeError::Runner(format!(
@@ -777,20 +1023,17 @@ impl<R: ProcessRunner> GitBridge<R> {
     ///
     /// Returns the resolved root and the lease the receipt must carry.
     fn admit(
-        &self,
         identity: &ExecutionIdentity,
         root: &RepoRoot,
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
         worktree: Option<&Path>,
     ) -> Result<(PathBuf, Option<Lease>), BridgeError> {
-        let resolved = self.resolve_root(root)?;
+        let resolved = Self::resolve_root(root)?;
         if !resolved.exists() {
             return Err(BridgeError::RootNotFound(resolved));
         }
-        let admitted = admission
-            .map(|a| a.admits_service_identity)
-            .unwrap_or(false);
+        let admitted = admission.is_some_and(|a| a.admits_service_identity);
         if root.owner == OwnerKind::User && !admitted {
             let lease = lease.ok_or(BridgeError::BrokerLeaseRequired)?;
             if lease.sid() != identity.sid() {
@@ -830,15 +1073,15 @@ impl<R: ProcessRunner> GitBridge<R> {
         } else {
             // A presented lease is receipt identity: it must belong to the
             // requesting SID even where no broker lease is required.
-            if let Some(lease) = lease {
-                if lease.sid() != identity.sid() {
-                    return Err(BridgeError::LeaseScopeMismatch(format!(
-                        "lease {} is issued to '{}', request runs as '{}'",
-                        lease.id(),
-                        lease.sid(),
-                        identity.sid()
-                    )));
-                }
+            if let Some(lease) = lease
+                && lease.sid() != identity.sid()
+            {
+                return Err(BridgeError::LeaseScopeMismatch(format!(
+                    "lease {} is issued to '{}', request runs as '{}'",
+                    lease.id(),
+                    lease.sid(),
+                    identity.sid()
+                )));
             }
             Ok((resolved, lease.cloned()))
         }
@@ -854,13 +1097,13 @@ impl<R: ProcessRunner> GitBridge<R> {
             args,
             cwd: cwd.to_owned(),
         };
-        let argv: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
-        validate_invocation(&invocation.exe, &argv)?;
+        let arg_slices: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
+        validate_invocation(&invocation.exe, &arg_slices)?;
         let outcome = self
             .runner
             .run(
                 &invocation.exe,
-                &argv,
+                &arg_slices,
                 &invocation.cwd,
                 // stdin is supplied via exec_stdin; plain exec sends none.
                 &[],
@@ -884,11 +1127,11 @@ impl<R: ProcessRunner> GitBridge<R> {
             args,
             cwd: cwd.to_owned(),
         };
-        let argv: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
-        validate_invocation(&invocation.exe, &argv)?;
+        let arg_slices: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
+        validate_invocation(&invocation.exe, &arg_slices)?;
         let outcome = self
             .runner
-            .run(&invocation.exe, &argv, &invocation.cwd, stdin)
+            .run(&invocation.exe, &arg_slices, &invocation.cwd, stdin)
             .map_err(BridgeError::Runner)?;
         let exit = ExitDisposition {
             code: outcome.code,
@@ -899,7 +1142,6 @@ impl<R: ProcessRunner> GitBridge<R> {
 
     #[allow(clippy::too_many_arguments)]
     fn common(
-        &self,
         identity: &ExecutionIdentity,
         root: PathBuf,
         worktree: Option<PathBuf>,
@@ -922,11 +1164,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         }
     }
 
-    fn check_success(
-        &self,
-        outcome: &ProcessOutcome,
-        invocation: &Invocation,
-    ) -> Result<(), BridgeError> {
+    fn check_success(outcome: &ProcessOutcome, invocation: &Invocation) -> Result<(), BridgeError> {
         if outcome.code == 0 {
             return Ok(());
         }
@@ -945,8 +1183,8 @@ impl<R: ProcessRunner> GitBridge<R> {
             "--untracked-files=normal".to_owned(),
         ];
         let (outcome, invocation, _) = self.exec(args, cwd)?;
-        self.check_success(&outcome, &invocation)?;
-        Ok(!outcome.stdout.iter().all(|b| b.is_ascii_whitespace()))
+        Self::check_success(&outcome, &invocation)?;
+        Ok(!outcome.stdout.iter().all(u8::is_ascii_whitespace))
     }
 
     // -- typed operations --------------------------------------------------
@@ -962,7 +1200,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<StatusReceipt, BridgeError> {
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         let args = vec![
             "status".to_owned(),
             "--porcelain=v1".to_owned(),
@@ -970,7 +1208,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             "--untracked-files=normal".to_owned(),
         ];
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
+        Self::check_success(&outcome, &invocation)?;
         let text = String::from_utf8_lossy(&outcome.stdout);
         let mut branch_line = None;
         let mut entries = Vec::new();
@@ -988,7 +1226,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             });
         }
         let dirty = !entries.is_empty();
-        let common = self.common(
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(StatusReceipt {
@@ -1010,7 +1248,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<BranchReceipt, BridgeError> {
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let args = vec![
             "branch".to_owned(),
@@ -1018,7 +1256,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             "--no-color".to_owned(),
         ];
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
+        Self::check_success(&outcome, &invocation)?;
         let text = String::from_utf8_lossy(&outcome.stdout);
         let mut current = None;
         let mut branches = Vec::new();
@@ -1039,7 +1277,7 @@ impl<R: ProcessRunner> GitBridge<R> {
                 branches.push(trimmed.to_owned());
             }
         }
-        let common = self.common(
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(BranchReceipt {
@@ -1063,7 +1301,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         lease: Option<&Lease>,
     ) -> Result<CommitReceipt, BridgeError> {
         reject_option_like(rev, "rev")?;
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let args = vec![
             "show".to_owned(),
@@ -1073,14 +1311,14 @@ impl<R: ProcessRunner> GitBridge<R> {
             rev.to_owned(),
         ];
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
+        Self::check_success(&outcome, &invocation)?;
         let text = String::from_utf8_lossy(&outcome.stdout);
         let mut lines = text.lines();
         let hash = lines.next().unwrap_or("").to_owned();
         let author = lines.next().unwrap_or("").to_owned();
         let date = lines.next().unwrap_or("").to_owned();
         let subject = lines.next().unwrap_or("").to_owned();
-        let common = self.common(
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(CommitReceipt {
@@ -1109,7 +1347,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         if let Some(range) = rev_range {
             reject_option_like(range, "rev_range")?;
         }
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let mut args = vec![
             "diff".to_owned(),
@@ -1126,7 +1364,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             }
         }
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
+        Self::check_success(&outcome, &invocation)?;
         let text = String::from_utf8_lossy(&outcome.stdout);
         let mut files = Vec::new();
         for line in text.lines() {
@@ -1139,7 +1377,7 @@ impl<R: ProcessRunner> GitBridge<R> {
                 path: path.to_owned(),
             });
         }
-        let common = self.common(
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(DiffReceipt { common, files })
@@ -1171,8 +1409,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             return Err(BridgeError::RootNotAbsolute(worktree_path.to_owned()));
         }
         reject_option_like(rev, "rev")?;
-        let (resolved, lease) =
-            self.admit(identity, root, admission, lease, Some(worktree_path))?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, Some(worktree_path))?;
         let dirty = self.is_dirty(&resolved)?;
         if dirty && require_clean {
             return Err(BridgeError::DirtyWorktree(format!(
@@ -1188,7 +1425,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             rev.to_owned(),
         ];
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
+        Self::check_success(&outcome, &invocation)?;
         let Some(lease) = lease else {
             // Service-owned roots without a presented lease still receive a
             // receipt-bound scope record minted locally (never broker-forged:
@@ -1202,7 +1439,7 @@ impl<R: ProcessRunner> GitBridge<R> {
                 worktree: Some(worktree_path.to_owned()),
                 issued_by: "bridge-local".to_owned(),
             };
-            let common = self.common(
+            let common = Self::common(
                 identity,
                 resolved,
                 Some(worktree_path.to_owned()),
@@ -1219,7 +1456,7 @@ impl<R: ProcessRunner> GitBridge<R> {
                 lease: local,
             });
         };
-        let common = self.common(
+        let common = Self::common(
             identity,
             resolved,
             Some(worktree_path.to_owned()),
@@ -1253,8 +1490,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<WorktreeRemoveReceipt, BridgeError> {
-        let (resolved, lease) =
-            self.admit(identity, root, admission, lease, Some(worktree_path))?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, Some(worktree_path))?;
         // Removal is always lease-aware: without a validated lease covering
         // this exact worktree there is no receipt to carry, so refuse — even
         // for service-owned roots.
@@ -1266,8 +1502,8 @@ impl<R: ProcessRunner> GitBridge<R> {
             worktree_path.to_string_lossy().into_owned(),
         ];
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
-        let common = self.common(
+        Self::check_success(&outcome, &invocation)?;
+        let common = Self::common(
             identity,
             resolved,
             Some(worktree_path.to_owned()),
@@ -1299,12 +1535,12 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<PatchCheckReceipt, BridgeError> {
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let args = vec!["apply".to_owned(), "--check".to_owned(), "-v".to_owned()];
         let (outcome, invocation, exit) = self.exec_stdin(args, &resolved, patch)?;
         let applicable = outcome.code == 0;
-        let common = self.common(
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(PatchCheckReceipt { common, applicable })
@@ -1329,7 +1565,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<PatchApplyReceipt, BridgeError> {
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         if dirty && require_clean {
             return Err(BridgeError::DirtyWorktree(format!(
@@ -1346,8 +1582,8 @@ impl<R: ProcessRunner> GitBridge<R> {
         }
         let args = vec!["apply".to_owned(), "-v".to_owned()];
         let (outcome, invocation, exit) = self.exec_stdin(args, &resolved, patch)?;
-        self.check_success(&outcome, &invocation)?;
-        let common = self.common(
+        Self::check_success(&outcome, &invocation)?;
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(PatchApplyReceipt {
@@ -1372,7 +1608,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         if let Some(rev) = rev {
             reject_option_like(rev, "rev")?;
         }
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let mut args = vec!["blame".to_owned(), "--line-porcelain".to_owned()];
         if let Some(rev) = rev {
@@ -1381,7 +1617,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         args.push("--".to_owned());
         args.push(path.to_owned());
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
+        Self::check_success(&outcome, &invocation)?;
         let text = String::from_utf8_lossy(&outcome.stdout);
         let mut lines = Vec::new();
         let mut current_rev = String::new();
@@ -1395,10 +1631,13 @@ impl<R: ProcessRunner> GitBridge<R> {
                     content: rest.to_owned(),
                 });
             } else if is_hex_prefix(raw) {
-                current_rev = raw.split_whitespace().next().unwrap_or("").to_owned();
+                raw.split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .clone_into(&mut current_rev);
             }
         }
-        let common = self.common(
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(BlameReceipt {
@@ -1421,7 +1660,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<LogReceipt, BridgeError> {
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let mut args = vec![
             "log".to_owned(),
@@ -1434,7 +1673,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             args.push(path.to_owned());
         }
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
+        Self::check_success(&outcome, &invocation)?;
         let text = String::from_utf8_lossy(&outcome.stdout);
         let mut entries = Vec::new();
         for record in text.split('\x1e') {
@@ -1455,7 +1694,7 @@ impl<R: ProcessRunner> GitBridge<R> {
                 subject: subject.trim_end().to_owned(),
             });
         }
-        let common = self.common(
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(LogReceipt { common, entries })
@@ -1477,7 +1716,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<CochangeReceipt, BridgeError> {
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let args = vec![
             "log".to_owned(),
@@ -1489,7 +1728,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             path.to_owned(),
         ];
         let (outcome, invocation, exit) = self.exec(args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
+        Self::check_success(&outcome, &invocation)?;
         let text = String::from_utf8_lossy(&outcome.stdout);
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
         let mut current_files: Vec<String> = Vec::new();
@@ -1510,9 +1749,7 @@ impl<R: ProcessRunner> GitBridge<R> {
                 flush(&current_files, touched_target, &mut counts);
                 current_files.clear();
                 touched_target = false;
-            } else if line.is_empty() {
-                continue;
-            } else {
+            } else if !line.is_empty() {
                 if line == path {
                     touched_target = true;
                 }
@@ -1523,7 +1760,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         let mut cochanged: Vec<(String, u64)> = counts.into_iter().collect();
         cochanged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         cochanged.truncate(16);
-        let common = self.common(
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(CochangeReceipt {
@@ -1544,7 +1781,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<ChangeManifestReceipt, BridgeError> {
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         // Single status probe serves both parsing and the receipt invocation,
         // so the receipt cannot disagree with the parsed entries. A failed
         // probe is a git failure like every other typed operation.
@@ -1554,7 +1791,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             "--untracked-files=normal".to_owned(),
         ];
         let (outcome, invocation, exit) = self.exec(status_args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
+        Self::check_success(&outcome, &invocation)?;
         let numstat_args = vec![
             "diff".to_owned(),
             "--no-color".to_owned(),
@@ -1596,7 +1833,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             });
         }
         let dirty = !entries.is_empty();
-        let common = self.common(
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(ChangeManifestReceipt {
@@ -1621,7 +1858,7 @@ impl<R: ProcessRunner> GitBridge<R> {
     ) -> Result<BaseDriftReceipt, BridgeError> {
         reject_option_like(base, "base")?;
         reject_option_like(head, "head")?;
-        let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        let (resolved, lease) = Self::admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let mb_args = vec!["merge-base".to_owned(), base.to_owned(), head.to_owned()];
         let (mb_outcome, _, _) = self.exec(mb_args, &resolved)?;
@@ -1629,11 +1866,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             let s = String::from_utf8_lossy(&mb_outcome.stdout)
                 .trim()
                 .to_owned();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+            if s.is_empty() { None } else { Some(s) }
         } else {
             None
         };
@@ -1644,12 +1877,12 @@ impl<R: ProcessRunner> GitBridge<R> {
             format!("{base}...{head}"),
         ];
         let (outcome, invocation, exit) = self.exec(count_args, &resolved)?;
-        self.check_success(&outcome, &invocation)?;
+        Self::check_success(&outcome, &invocation)?;
         let text = String::from_utf8_lossy(&outcome.stdout);
         let mut parts = text.split_whitespace();
         let behind = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let ahead = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let common = self.common(
+        let common = Self::common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
         Ok(BaseDriftReceipt {
@@ -1693,23 +1926,74 @@ fn is_hex_prefix(line: &str) -> bool {
     head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
+const SHA256_K: [u32; 64] = [
+    0x428a_2f98,
+    0x7137_4491,
+    0xb5c0_fbcf,
+    0xe9b5_dba5,
+    0x3956_c25b,
+    0x59f1_11f1,
+    0x923f_82a4,
+    0xab1c_5ed5,
+    0xd807_aa98,
+    0x1283_5b01,
+    0x2431_85be,
+    0x550c_7dc3,
+    0x72be_5d74,
+    0x80de_b1fe,
+    0x9bdc_06a7,
+    0xc19b_f174,
+    0xe49b_69c1,
+    0xefbe_4786,
+    0x0fc1_9dc6,
+    0x240c_a1cc,
+    0x2de9_2c6f,
+    0x4a74_84aa,
+    0x5cb0_a9dc,
+    0x76f9_88da,
+    0x983e_5152,
+    0xa831_c66d,
+    0xb003_27c8,
+    0xbf59_7fc7,
+    0xc6e0_0bf3,
+    0xd5a7_9147,
+    0x06ca_6351,
+    0x1429_2967,
+    0x27b7_0a85,
+    0x2e1b_2138,
+    0x4d2c_6dfc,
+    0x5338_0d13,
+    0x650a_7354,
+    0x766a_0abb,
+    0x81c2_c92e,
+    0x9272_2c85,
+    0xa2bf_e8a1,
+    0xa81a_664b,
+    0xc24b_8b70,
+    0xc76c_51a3,
+    0xd192_e819,
+    0xd699_0624,
+    0xf40e_3585,
+    0x106a_a070,
+    0x19a4_c116,
+    0x1e37_6c08,
+    0x2748_774c,
+    0x34b0_bcb5,
+    0x391c_0cb3,
+    0x4ed8_aa4a,
+    0x5b9c_ca4f,
+    0x682e_6ff3,
+    0x748f_82ee,
+    0x78a5_636f,
+    0x84c8_7814,
+    0x8cc7_0208,
+    0x90be_fffa,
+    0xa450_6ceb,
+    0xbef9_a3f7,
+    0xc671_78f2,
+];
+
+fn sha256_pad(data: &[u8]) -> Vec<u8> {
     let mut msg = data.to_vec();
     let bitlen = (data.len() as u64).wrapping_mul(8);
     msg.push(0x80);
@@ -1717,58 +2001,85 @@ fn sha256_hex(data: &[u8]) -> String {
         msg.push(0);
     }
     msg.extend_from_slice(&bitlen.to_be_bytes());
+    msg
+}
+
+fn sha256_compress(digest: &mut [u32; 8], chunk: &[u8]) {
+    let mut sched = [0u32; 64];
+    for round in 0..16 {
+        sched[round] = u32::from_be_bytes([
+            chunk[4 * round],
+            chunk[4 * round + 1],
+            chunk[4 * round + 2],
+            chunk[4 * round + 3],
+        ]);
+    }
+    for round in 16..64 {
+        let s0 = sched[round - 15].rotate_right(7)
+            ^ sched[round - 15].rotate_right(18)
+            ^ (sched[round - 15] >> 3);
+        let s1 = sched[round - 2].rotate_right(17)
+            ^ sched[round - 2].rotate_right(19)
+            ^ (sched[round - 2] >> 10);
+        sched[round] = sched[round - 16]
+            .wrapping_add(s0)
+            .wrapping_add(sched[round - 7])
+            .wrapping_add(s1);
+    }
+    let (mut h0, mut h1, mut h2, mut h3, mut h4, mut h5, mut h6, mut h7) = (
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    );
+    for round in 0..64 {
+        let s1 = h4.rotate_right(6) ^ h4.rotate_right(11) ^ h4.rotate_right(25);
+        let ch = (h4 & h5) ^ ((!h4) & h6);
+        let t1 = h7
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(SHA256_K[round])
+            .wrapping_add(sched[round]);
+        let s0 = h0.rotate_right(2) ^ h0.rotate_right(13) ^ h0.rotate_right(22);
+        let maj = (h0 & h1) ^ (h0 & h2) ^ (h1 & h2);
+        let t2 = s0.wrapping_add(maj);
+        h7 = h6;
+        h6 = h5;
+        h5 = h4;
+        h4 = h3.wrapping_add(t1);
+        h3 = h2;
+        h2 = h1;
+        h1 = h0;
+        h0 = t1.wrapping_add(t2);
+    }
+    digest[0] = digest[0].wrapping_add(h0);
+    digest[1] = digest[1].wrapping_add(h1);
+    digest[2] = digest[2].wrapping_add(h2);
+    digest[3] = digest[3].wrapping_add(h3);
+    digest[4] = digest[4].wrapping_add(h4);
+    digest[5] = digest[5].wrapping_add(h5);
+    digest[6] = digest[6].wrapping_add(h6);
+    digest[7] = digest[7].wrapping_add(h7);
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut digest: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    let msg = sha256_pad(data);
     for chunk in msg.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                chunk[4 * i],
-                chunk[4 * i + 1],
-                chunk[4 * i + 2],
-                chunk[4 * i + 3],
-            ]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
+        sha256_compress(&mut digest, chunk);
     }
     let mut out = String::with_capacity(64);
-    for word in h {
-        out.push_str(&format!("{word:08x}"));
+    for word in digest {
+        use std::fmt::Write as _;
+        // Appending hex into a `String` cannot fail short of allocation
+        // failure; the result is intentionally unchecked.
+        let _ = write!(out, "{word:08x}");
     }
     out
 }
@@ -1797,9 +2108,12 @@ mod unit_tests {
         }
 
         fn record(&self, exe: &str, args: &[&str]) {
-            let mut argv = vec![exe.to_owned()];
-            argv.extend(args.iter().map(ToString::to_string));
-            self.invocations.lock().expect("lock").push(argv);
+            let mut command = vec![exe.to_owned()];
+            command.extend(args.iter().map(ToString::to_string));
+            let Ok(mut invocations) = self.invocations.lock() else {
+                panic!("invocations lock poisoned");
+            };
+            invocations.push(command);
         }
     }
 
@@ -1874,9 +2188,15 @@ mod unit_tests {
     fn user_root_without_lease_is_refused() {
         let tmp = std::env::temp_dir();
         let bridge = GitBridge::new(FakeRunner::new(""));
-        let id = ExecutionIdentity::new("sid-user").expect("sid");
-        let root = RepoRoot::new(tmp, OwnerKind::User).expect("root");
-        let err = bridge.status(&id, &root, None, None).expect_err("lease");
+        let Ok(id) = ExecutionIdentity::new("sid-user") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new(tmp, OwnerKind::User) else {
+            panic!("root")
+        };
+        let Err(err) = bridge.status(&id, &root, None, None) else {
+            panic!("lease")
+        };
         assert_eq!(err, BridgeError::BrokerLeaseRequired);
     }
 
@@ -1884,14 +2204,20 @@ mod unit_tests {
     fn lease_scope_mismatch_is_refused() {
         let tmp = std::env::temp_dir();
         let bridge = GitBridge::new(FakeRunner::new(""));
-        let id = ExecutionIdentity::new("sid-a").expect("sid");
-        let root = RepoRoot::new(tmp.clone(), OwnerKind::User).expect("root");
-        let other = ExecutionIdentity::new("sid-b").expect("sid");
+        let Ok(id) = ExecutionIdentity::new("sid-a") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new(tmp.clone(), OwnerKind::User) else {
+            panic!("root")
+        };
+        let Ok(other) = ExecutionIdentity::new("sid-b") else {
+            panic!("sid")
+        };
         let broker = Broker::new();
         let lease = broker.issue_repo_lease(&other, &root);
-        let err = bridge
-            .status(&id, &root, None, Some(&lease))
-            .expect_err("scope");
+        let Err(err) = bridge.status(&id, &root, None, Some(&lease)) else {
+            panic!("scope")
+        };
         assert!(matches!(err, BridgeError::LeaseScopeMismatch(_)));
     }
 
@@ -1899,11 +2225,15 @@ mod unit_tests {
     fn patch_apply_refuses_dirty_when_clean_required() {
         let tmp = std::env::temp_dir();
         let bridge = GitBridge::new(FakeRunner::new(" M dirty.txt\n"));
-        let id = ExecutionIdentity::new("sid-svc").expect("sid");
-        let root = RepoRoot::new(tmp, OwnerKind::Service).expect("root");
-        let err = bridge
-            .patch_apply(&id, &root, b"patch", true, None, None)
-            .expect_err("dirty");
+        let Ok(id) = ExecutionIdentity::new("sid-svc") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new(tmp, OwnerKind::Service) else {
+            panic!("root")
+        };
+        let Err(err) = bridge.patch_apply(&id, &root, b"patch", true, None, None) else {
+            panic!("dirty")
+        };
         assert!(matches!(err, BridgeError::DirtyWorktree(_)));
     }
 
@@ -1913,11 +2243,15 @@ mod unit_tests {
         let mut runner = FakeRunner::new("");
         runner.fail_check = true;
         let bridge = GitBridge::new(runner);
-        let id = ExecutionIdentity::new("sid-svc").expect("sid");
-        let root = RepoRoot::new(tmp, OwnerKind::Service).expect("root");
-        let err = bridge
-            .patch_apply(&id, &root, b"bogus", false, None, None)
-            .expect_err("check");
+        let Ok(id) = ExecutionIdentity::new("sid-svc") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new(tmp, OwnerKind::Service) else {
+            panic!("root")
+        };
+        let Err(err) = bridge.patch_apply(&id, &root, b"bogus", false, None, None) else {
+            panic!("check")
+        };
         assert!(matches!(err, BridgeError::PatchCheckFailed(_)));
     }
 
@@ -1927,11 +2261,15 @@ mod unit_tests {
         let mut runner = FakeRunner::new("");
         runner.fail_status = true;
         let bridge = GitBridge::new(runner);
-        let id = ExecutionIdentity::new("sid-svc").expect("sid");
-        let root = RepoRoot::new(tmp, OwnerKind::Service).expect("root");
-        let err = bridge
-            .change_manifest(&id, &root, None, None)
-            .expect_err("status failure must error");
+        let Ok(id) = ExecutionIdentity::new("sid-svc") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new(tmp, OwnerKind::Service) else {
+            panic!("root")
+        };
+        let Err(err) = bridge.change_manifest(&id, &root, None, None) else {
+            panic!("status failure must error")
+        };
         assert!(matches!(err, BridgeError::GitFailed { .. }));
     }
 
@@ -1939,16 +2277,23 @@ mod unit_tests {
     fn local_worktree_leases_are_unique_per_create() {
         let tmp = std::env::temp_dir();
         let bridge = GitBridge::new(FakeRunner::new(""));
-        let id = ExecutionIdentity::new("sid-svc").expect("sid");
-        let root = RepoRoot::new(tmp.clone(), OwnerKind::Service).expect("root");
+        let Ok(id) = ExecutionIdentity::new("sid-svc") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new(tmp.clone(), OwnerKind::Service) else {
+            panic!("root")
+        };
         let first_path = tmp.join("eliot-1830-local-a");
         let second_path = tmp.join("eliot-1830-local-b");
-        let first = bridge
-            .worktree_create(&id, &root, &first_path, "HEAD", false, None, None)
-            .expect("first create");
-        let second = bridge
-            .worktree_create(&id, &root, &second_path, "HEAD", false, None, None)
-            .expect("second create");
+        let Ok(first) = bridge.worktree_create(&id, &root, &first_path, "HEAD", false, None, None)
+        else {
+            panic!("first create")
+        };
+        let Ok(second) =
+            bridge.worktree_create(&id, &root, &second_path, "HEAD", false, None, None)
+        else {
+            panic!("second create")
+        };
         assert_ne!(
             first.lease.id(),
             second.lease.id(),
@@ -1966,14 +2311,20 @@ mod unit_tests {
     fn service_root_rejects_cross_sid_lease() {
         let tmp = std::env::temp_dir();
         let bridge = GitBridge::new(FakeRunner::new(""));
-        let id = ExecutionIdentity::new("sid-a").expect("sid");
-        let root = RepoRoot::new(tmp.clone(), OwnerKind::Service).expect("root");
-        let other = ExecutionIdentity::new("sid-b").expect("sid");
+        let Ok(id) = ExecutionIdentity::new("sid-a") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new(tmp.clone(), OwnerKind::Service) else {
+            panic!("root")
+        };
+        let Ok(other) = ExecutionIdentity::new("sid-b") else {
+            panic!("sid")
+        };
         let broker = Broker::new();
         let lease = broker.issue_repo_lease(&other, &root);
-        let err = bridge
-            .status(&id, &root, None, Some(&lease))
-            .expect_err("cross-SID lease");
+        let Err(err) = bridge.status(&id, &root, None, Some(&lease)) else {
+            panic!("cross-SID lease")
+        };
         assert!(matches!(err, BridgeError::LeaseScopeMismatch(_)));
     }
 
@@ -1981,56 +2332,69 @@ mod unit_tests {
     fn option_like_revisions_are_refused_before_exec() {
         let tmp = std::env::temp_dir();
         let bridge = GitBridge::new(FakeRunner::new(""));
-        let id = ExecutionIdentity::new("sid-svc").expect("sid");
-        let root = RepoRoot::new(tmp.clone(), OwnerKind::Service).expect("root");
-        let err = bridge
-            .inspect_commit(&id, &root, "--all", None, None)
-            .expect_err("rev");
+        let Ok(id) = ExecutionIdentity::new("sid-svc") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new(tmp.clone(), OwnerKind::Service) else {
+            panic!("root")
+        };
+        let Err(err) = bridge.inspect_commit(&id, &root, "--all", None, None) else {
+            panic!("rev")
+        };
         assert!(matches!(err, BridgeError::InvalidArgument(_)));
-        let err = bridge
-            .diff(&id, &root, Some("--no-index"), &[], None, None)
-            .expect_err("range");
+        let Err(err) = bridge.diff(&id, &root, Some("--no-index"), &[], None, None) else {
+            panic!("range")
+        };
         assert!(matches!(err, BridgeError::InvalidArgument(_)));
-        let err = bridge
-            .blame(&id, &root, "a.txt", Some("--all"), None, None)
-            .expect_err("blame rev");
+        let Err(err) = bridge.blame(&id, &root, "a.txt", Some("--all"), None, None) else {
+            panic!("blame rev")
+        };
         assert!(matches!(err, BridgeError::InvalidArgument(_)));
-        let err = bridge
-            .base_drift(&id, &root, "--all", "HEAD", None, None)
-            .expect_err("base");
+        let Err(err) = bridge.base_drift(&id, &root, "--all", "HEAD", None, None) else {
+            panic!("base")
+        };
         assert!(matches!(err, BridgeError::InvalidArgument(_)));
-        let err = bridge
-            .base_drift(&id, &root, "HEAD", "--all", None, None)
-            .expect_err("head");
+        let Err(err) = bridge.base_drift(&id, &root, "HEAD", "--all", None, None) else {
+            panic!("head")
+        };
         assert!(matches!(err, BridgeError::InvalidArgument(_)));
-        let err = bridge
-            .worktree_create(&id, &root, &tmp.join("wt"), "--force", false, None, None)
-            .expect_err("worktree rev");
+        let Err(err) =
+            bridge.worktree_create(&id, &root, &tmp.join("wt"), "--force", false, None, None)
+        else {
+            panic!("worktree rev")
+        };
         assert!(matches!(err, BridgeError::InvalidArgument(_)));
         // Refusal happens before admission and launch: no git invocation ran.
-        assert!(bridge.runner().invocations.lock().expect("lock").is_empty());
+        let Ok(invocations) = bridge.runner().invocations.lock() else {
+            panic!("invocations lock poisoned");
+        };
+        assert!(invocations.is_empty());
     }
 
     #[test]
     fn broker_instances_never_collide_on_lease_identity() {
         let tmp = std::env::temp_dir();
-        let id = ExecutionIdentity::new("sid-shared").expect("sid");
-        let root = RepoRoot::new(tmp, OwnerKind::Service).expect("root");
+        let Ok(id) = ExecutionIdentity::new("sid-shared") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new(tmp, OwnerKind::Service) else {
+            panic!("root")
+        };
         let first = Broker::new();
         let second = Broker::new();
         assert_ne!(first.domain(), second.domain());
         // Same SID, same sequence position, different brokers: IDs differ.
-        let a = first.issue_repo_lease(&id, &root);
-        let b = second.issue_repo_lease(&id, &root);
-        assert_ne!(a.id(), b.id());
-        let c = first.issue_worktree_lease(&id, &root, "C:/wt-a");
-        let d = second.issue_worktree_lease(&id, &root, "C:/wt-b");
-        assert_ne!(c.id(), d.id());
+        let first_lease = first.issue_repo_lease(&id, &root);
+        let second_lease = second.issue_repo_lease(&id, &root);
+        assert_ne!(first_lease.id(), second_lease.id());
+        let third_lease = first.issue_worktree_lease(&id, &root, "C:/wt-a");
+        let fourth_lease = second.issue_worktree_lease(&id, &root, "C:/wt-b");
+        assert_ne!(third_lease.id(), fourth_lease.id());
         // A default-constructed broker gets a fresh domain, not a constant.
         let third = Broker::default();
-        let e = third.issue_repo_lease(&id, &root);
-        assert_ne!(e.id(), a.id());
-        assert_ne!(e.id(), b.id());
+        let fifth_lease = third.issue_repo_lease(&id, &root);
+        assert_ne!(fifth_lease.id(), first_lease.id());
+        assert_ne!(fifth_lease.id(), second_lease.id());
         // Many rapidly created instances (wall clock and PID effectively
         // constant across the loop) still hold pairwise-distinct domains,
         // proving the mechanism is monotonic generation, not time/PID-derived.
@@ -2043,5 +2407,115 @@ mod unit_tests {
             assert!(lease_ids.insert(lease.id().to_owned()));
         }
         assert!(domains.insert(Broker::default().domain()));
+    }
+
+    #[test]
+    fn bound_exit_codes_follow_completed_disposition() {
+        let Ok(ok) = ExitStatus::new(KernelExitDisposition::Completed, Some(0), None, 1) else {
+            panic!("exit")
+        };
+        assert_eq!(exit_code_of(&ok), Ok(0));
+        let Ok(diff) = ExitStatus::new(KernelExitDisposition::Completed, Some(1), None, 1) else {
+            panic!("exit")
+        };
+        assert_eq!(exit_code_of(&diff), Ok(1));
+        let Ok(failed) = ExitStatus::new(KernelExitDisposition::Completed, Some(128), None, 1)
+        else {
+            panic!("exit")
+        };
+        assert_eq!(exit_code_of(&failed), Ok(128));
+        for disposition in [
+            KernelExitDisposition::Cancelled,
+            KernelExitDisposition::ResourceLimit,
+            KernelExitDisposition::Unknown,
+        ] {
+            let Ok(exit) = ExitStatus::new(disposition, None, None, 1) else {
+                panic!("exit")
+            };
+            assert!(
+                exit_code_of(&exit).is_err(),
+                "non-completed exits have no git exit code"
+            );
+        }
+        let Ok(signalled) = ExitStatus::new(KernelExitDisposition::Signalled, None, Some(15), 1)
+        else {
+            panic!("exit")
+        };
+        assert!(exit_code_of(&signalled).is_err());
+    }
+
+    /// Authority port that must never be contacted: every test below fails
+    /// before the executor is reached, so any call is a test failure.
+    struct UnreachedPort;
+
+    impl eliot_process_executor::DispatchValidationPort for UnreachedPort {
+        fn validate_and_consume(
+            &self,
+            _request: ProcessRequest,
+            _observed: eliot_process::SuspendedProcessIdentity,
+        ) -> Result<eliot_process::ValidatedDispatch, eliot_process::ProcessExecutionError>
+        {
+            panic!("bound refusal tests must not reach the executor");
+        }
+    }
+
+    /// Evidence sink that accepts and drops everything.
+    #[derive(Default)]
+    struct DropSink;
+
+    impl ProcessEvidenceSink for DropSink {
+        fn record(
+            &self,
+            _evidence: eliot_process::ProcessEvidence,
+        ) -> Result<(), eliot_process::EvidenceSinkError> {
+            Ok(())
+        }
+    }
+
+    /// Request port that refuses every binding.
+    struct RefusingPort(&'static str);
+
+    impl ExecutorRequestPort for RefusingPort {
+        fn bind(&self, _exe: &str, _args: &[&str], _cwd: &Path) -> Result<ProcessRequest, String> {
+            Err(self.0.to_owned())
+        }
+    }
+
+    fn unreached_runner(port: RefusingPort) -> ExecutorRunner {
+        let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(UnreachedPort)));
+        ExecutorRunner::new(executor, Arc::new(port), Arc::new(DropSink))
+    }
+
+    #[test]
+    fn bound_runner_refuses_stdin_before_executor_contact() {
+        let tmp = std::env::temp_dir();
+        let runner = unreached_runner(RefusingPort("unused"));
+        let Err(err) = runner.run("git", &["apply", "--check", "-v"], &tmp, b"patch") else {
+            panic!("stdin")
+        };
+        assert!(
+            err.contains("stdin"),
+            "refusal must name the stdin boundary: {err}"
+        );
+    }
+
+    #[test]
+    fn bound_runner_keeps_the_invocation_guard() {
+        let tmp = std::env::temp_dir();
+        let runner = unreached_runner(RefusingPort("unused"));
+        let Err(err) = runner.run("git", &["reset", "--hard"], &tmp, &[]) else {
+            panic!("reset")
+        };
+        assert!(err.contains("destructive operation rejected"));
+    }
+
+    #[test]
+    fn bound_runner_maps_bind_failures() {
+        let tmp = std::env::temp_dir();
+        let runner = unreached_runner(RefusingPort("no authority in unit scope"));
+        let Err(err) = runner.run("git", &["status", "--porcelain=v1"], &tmp, &[]) else {
+            panic!("bind")
+        };
+        assert!(err.contains("binding failed"));
     }
 }

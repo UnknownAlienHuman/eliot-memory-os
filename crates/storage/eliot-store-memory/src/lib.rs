@@ -194,7 +194,11 @@ const CAPABILITY_EVIDENCE_PAYLOAD_VERSION: u32 = 1;
 /// A deterministic reference store with no external authority or I/O.
 ///
 /// `MemoryStore` intentionally does not implement `Clone`; use [`MemoryStore::snapshot`]
-/// when a value projection is needed.
+/// when a value projection is needed. Issue 883 disposition is removal of the
+/// unused deep-copy contract: independent models reuse `MemoryStore::new`
+/// construction plus snapshot comparison, with no `Arc`, shared state, global,
+/// or explicitly-named fork. The absent-`Clone` proof lives in
+/// `tests/memory_store_clone.rs` over `tests/data/memory_store_clone_cases.json`.
 ///
 /// ```compile_fail
 /// use eliot_store_memory::MemoryStore;

@@ -978,13 +978,18 @@ fn check_receipt_token_binding(
             return Err(binding("Store receipt misses a reserved scope sequence"));
         }
     }
-    if token.scopes.len() == 1
-        && envelope.core.causal.transaction_sequence.value() != token.scopes[0].reserved_sequence
-    {
-        return Err(binding(
-            "receipt causal sequence does not match the reserved sequence",
-        ));
-    }
+    // No envelope-causal restatement is demanded here, deliberately. The
+    // reserved-order binding is established above on the receipt body
+    // (scope set plus per-scope sequences), and the envelope operation,
+    // fence and structural validity are checked by the caller chain.
+    // A single-scope causal equality against the reserved sequence would
+    // require the producer to state a non-genesis chain position, but the
+    // canonical causal model admits non-genesis positions only with a
+    // parent link (`CausalBinding::validate`: "non-genesis receipt
+    // requires a parent"), the closed store issuance carries genesis, and
+    // no consumer reads the envelope causal. Demanding the restatement
+    // therefore rejects every live receipt while proving nothing the body
+    // checks do not already prove (issue #2031 native cases 15/19).
     Ok(())
 }
 

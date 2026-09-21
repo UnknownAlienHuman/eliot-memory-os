@@ -4,6 +4,8 @@
 //! set-permutation stability, duplicate collapse, vector preservation,
 //! explicit gaps with no fallback, and fail-closed bounds/digest validation.
 
+mod support;
+
 use std::num::NonZeroU64;
 
 use eliot_dreamer_contracts::{
@@ -12,10 +14,11 @@ use eliot_dreamer_contracts::{
     EffectDimension, FeasibilityDimension, GapUpdateMeaning, HumanAttentionDimension,
     InformationDimension, InquiryAffordanceDescriptor, InquiryAffordanceDescriptorParams,
     InquiryAffordanceSet, InquiryAffordanceSetParams, LatencyDimension, MaterialClaimRef,
-    PossibleResultSchema, PossibleResultValue, PrivacyDimension, ProbeObjectiveRef, ProbeOwnerRef,
-    ResourceDimension, ResultBranch, ResultTarget, ResultUpdate, ReversibilityDimension,
-    RivalCoverageStatus, RivalCoverageSummary, RivalDeclarationSetRef, RivalModelSet,
-    RivalModelSetParams, RivalPredictionRef, ValidatedDreamDraft, ValidationReceipt,
+    PossibleResultSchema, PossibleResultValue, PrivacyDimension, ProbeObjectiveRef,
+    ProbeOrderingPolicy, ProbeOwnerRef, ResourceDimension, ResultBranch, ResultTarget,
+    ResultUpdate, ReversibilityDimension, RivalCoverageStatus, RivalCoverageSummary,
+    RivalDeclarationSetRef, RivalModelRef, RivalModelSet, RivalModelSetParams, RivalPredictionRef,
+    RivalUpdateMeaning, ValidatedDreamDraft, ValidationReceipt,
     grounding::canonical::{
         ArtifactId, EpochId, EpochLineageId, Precision, PropositionId, ResourceGeneration,
         StateFence, TaskId, ValidityBounds, sha256_hex,
@@ -116,7 +119,7 @@ fn rivals() -> RivalModelSet {
         scope: "scope-1".to_owned(),
         state_fence: fence(),
         bundle_digest: digest("bundle"),
-        validated_input_digest: digest("validated"),
+        validated_input_digest: digest("validator-input"),
         declaration_set: RivalDeclarationSetRef {
             set_id: artifact("rival-decl-1"),
             digest: digest("decl"),
@@ -144,24 +147,120 @@ fn objective(id: &str) -> ProbeObjectiveRef {
     }
 }
 
-fn result_schema(id: &str, objective_id: &str) -> PossibleResultSchema {
-    let target = objective(objective_id);
-    must(PossibleResultSchema::new(
-        artifact(id),
-        vec![ResultTarget::Gap {
-            objective: target.clone(),
-        }],
-        vec![ResultBranch {
-            result_id: artifact(&format!("{id}-branch")),
-            value: PossibleResultValue::Unknown {
-                reason: "outcome not yet observed".to_owned(),
-            },
-            updates: vec![ResultUpdate::Gap {
-                objective: target,
-                meaning: GapUpdateMeaning::RemainsOpen,
-            }],
-        }],
-    ))
+fn rival_model(id: &str) -> RivalModelRef {
+    RivalModelRef {
+        model_id: artifact(id),
+        model_revision: 1,
+        declaration_digest: digest(id),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture enumerates the complete typed result matrix"
+)]
+fn result_schema_for_target(id: &str, target: &AffordanceTarget) -> PossibleResultSchema {
+    let (targets, branches) = match target {
+        AffordanceTarget::RivalPredictions { left, right } => {
+            let left_model = rival_model(&format!("{id}-left-model"));
+            let right_model = rival_model(&format!("{id}-right-model"));
+            let targets = vec![
+                ResultTarget::Rival {
+                    model: left_model.clone(),
+                    prediction: Some(left.clone()),
+                },
+                ResultTarget::Rival {
+                    model: right_model.clone(),
+                    prediction: Some(right.clone()),
+                },
+            ];
+            let value = |result_id: String, left_meaning, right_meaning| ResultBranch {
+                result_id: artifact(&result_id),
+                value: PossibleResultValue::Unknown {
+                    reason: "outcome not yet observed".to_owned(),
+                },
+                updates: vec![
+                    ResultUpdate::Rival {
+                        model: left_model.clone(),
+                        prediction: Some(left.clone()),
+                        meaning: left_meaning,
+                    },
+                    ResultUpdate::Rival {
+                        model: right_model.clone(),
+                        prediction: Some(right.clone()),
+                        meaning: right_meaning,
+                    },
+                ],
+            };
+            (
+                targets,
+                vec![
+                    value(
+                        format!("{id}-branch-left"),
+                        RivalUpdateMeaning::Strengthened,
+                        RivalUpdateMeaning::Weakened,
+                    ),
+                    value(
+                        format!("{id}-branch-right"),
+                        RivalUpdateMeaning::Weakened,
+                        RivalUpdateMeaning::Strengthened,
+                    ),
+                ],
+            )
+        }
+        AffordanceTarget::EvidenceGap { .. } | AffordanceTarget::Assumption { .. } => {
+            let target = objective(&format!("{id}-objective"));
+            let result_target = ResultTarget::Gap {
+                objective: target.clone(),
+            };
+            let branch = |result_id: String, meaning| ResultBranch {
+                result_id: artifact(&result_id),
+                value: PossibleResultValue::Unknown {
+                    reason: "outcome not yet observed".to_owned(),
+                },
+                updates: vec![ResultUpdate::Gap {
+                    objective: target.clone(),
+                    meaning,
+                }],
+            };
+            (
+                vec![result_target],
+                vec![
+                    branch(
+                        format!("{id}-branch-addressed"),
+                        GapUpdateMeaning::Addressed,
+                    ),
+                    branch(format!("{id}-branch-open"), GapUpdateMeaning::RemainsOpen),
+                ],
+            )
+        }
+        AffordanceTarget::Objective { objective: target } => {
+            let result_target = ResultTarget::Gap {
+                objective: target.clone(),
+            };
+            let branch = |result_id: String, meaning| ResultBranch {
+                result_id: artifact(&result_id),
+                value: PossibleResultValue::Unknown {
+                    reason: "outcome not yet observed".to_owned(),
+                },
+                updates: vec![ResultUpdate::Gap {
+                    objective: target.clone(),
+                    meaning,
+                }],
+            };
+            (
+                vec![result_target],
+                vec![
+                    branch(
+                        format!("{id}-branch-addressed"),
+                        GapUpdateMeaning::Addressed,
+                    ),
+                    branch(format!("{id}-branch-open"), GapUpdateMeaning::RemainsOpen),
+                ],
+            )
+        }
+    };
+    support::schema_with_acceptance(id, targets, branches)
 }
 
 fn prediction(id: &str) -> RivalPredictionRef {
@@ -187,6 +286,12 @@ fn rival_target(left: &str, right: &str) -> AffordanceTarget {
 }
 
 fn gap_target(id: &str) -> AffordanceTarget {
+    AffordanceTarget::Objective {
+        objective: objective(id),
+    }
+}
+
+fn evidence_gap_target(id: &str) -> AffordanceTarget {
     AffordanceTarget::EvidenceGap { claim: claim(id) }
 }
 
@@ -200,16 +305,20 @@ fn assumption_target(id: &str) -> AffordanceTarget {
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the fixture transfers the owned target into the descriptor"
+)]
 fn descriptor_params(id: &str, target: AffordanceTarget) -> InquiryAffordanceDescriptorParams {
     InquiryAffordanceDescriptorParams {
         affordance_id: artifact(id),
         kind: AffordanceKind::EvidenceInspection,
-        target,
+        target: target.clone(),
         applicability: bounds(),
         owner: ProbeOwnerRef::Unavailable {
             reason: "owner withheld for planning".to_owned(),
         },
-        result_schema: result_schema(&format!("{id}-schema"), &format!("{id}-objective")),
+        result_schema: result_schema_for_target(&format!("{id}-schema"), &target),
         information: InformationDimension::High {
             detail: "splits the named disagreement".to_owned(),
         },
@@ -250,9 +359,22 @@ fn descriptor_params(id: &str, target: AffordanceTarget) -> InquiryAffordanceDes
 }
 
 fn descriptor(id: &str, target: AffordanceTarget) -> InquiryAffordanceDescriptor {
-    must(InquiryAffordanceDescriptor::new(descriptor_params(
-        id, target,
-    )))
+    descriptor_from_params(descriptor_params(id, target))
+}
+
+fn descriptor_from_params(
+    params: InquiryAffordanceDescriptorParams,
+) -> InquiryAffordanceDescriptor {
+    let target = params.target.clone();
+    let descriptor = must(InquiryAffordanceDescriptor::new(params));
+    let ready_target = matches!(
+        &target,
+        AffordanceTarget::RivalPredictions { .. } | AffordanceTarget::Objective { .. }
+    );
+    if ready_target && let Some(semantics) = support::ready_semantics(&target) {
+        return must(descriptor.with_planning_semantics(semantics));
+    }
+    descriptor
 }
 
 fn affordance_set(descriptors: Vec<InquiryAffordanceDescriptor>) -> InquiryAffordanceSet {
@@ -288,12 +410,17 @@ fn limits(candidates: Option<u64>) -> BudgetLimits {
     }
 }
 
+fn ordering_policy() -> ProbeOrderingPolicy {
+    must(ProbeOrderingPolicy::v1())
+}
+
 fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u64>) -> ProbePlan {
     let bundle = bundle();
     let draft = draft();
     let rivals = rivals();
     let affordances = affordance_set(descriptors);
     let limits = limits(candidates);
+    let policy = ordering_policy();
     must(ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
         bundle: &bundle,
@@ -301,6 +428,7 @@ fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u6
         rivals: &rivals,
         affordances: &affordances,
         limits: &limits,
+        policy: &policy,
     }))
 }
 
@@ -311,14 +439,14 @@ fn probe_names_its_discriminator_or_unknown_target() {
     let plan = plan_for(
         vec![
             descriptor("aff-rival", rival_target("pred-left", "pred-right")),
-            descriptor("aff-gap", gap_target("claim-7")),
+            descriptor("aff-gap", evidence_gap_target("claim-7")),
             descriptor("aff-assumption", assumption_target("assume-3")),
         ],
         Some(16),
     );
     must(plan.validate());
-    assert_eq!(plan.probes.len(), 3);
-    assert!(plan.omissions.is_empty());
+    assert_eq!(plan.probes.len(), 1);
+    assert_eq!(plan.omissions.len(), 2);
 
     let rival = plan
         .probes
@@ -336,30 +464,36 @@ fn probe_names_its_discriminator_or_unknown_target() {
     assert!(rival.expected_discrimination.contains("pred-right"));
 
     let gap = plan
-        .probes
+        .omissions
         .iter()
-        .find(|probe| probe.probe_id.as_str() == "aff-gap")
-        .unwrap_or_else(|| panic!("gap probe must be planned"));
+        .find(|omission| omission.affordance.affordance_id.as_str() == "aff-gap")
+        .unwrap_or_else(|| panic!("evidence gap must be retained as an omission"));
+    assert_eq!(gap.kind, OmissionKind::Unprobeable);
     match &gap.target {
         ProbeTarget::EvidenceUnknown { claim } => {
             assert_eq!(claim.claim_id.as_str(), "claim-7");
         }
-        other => panic!("gap probe must name an unknown, got {other:?}"),
+        other => panic!("gap omission must name an unknown, got {other:?}"),
     }
-    assert!(gap.expected_discrimination.contains("claim-7"));
+    assert!(gap.reason.contains("exact canonical objective linkage"));
 
     let assumption = plan
-        .probes
+        .omissions
         .iter()
-        .find(|probe| probe.probe_id.as_str() == "aff-assumption")
-        .unwrap_or_else(|| panic!("assumption probe must be planned"));
+        .find(|omission| omission.affordance.affordance_id.as_str() == "aff-assumption")
+        .unwrap_or_else(|| panic!("assumption must be retained as an omission"));
+    assert_eq!(assumption.kind, OmissionKind::Unprobeable);
     match &assumption.target {
         ProbeTarget::AssumptionUnknown { assumption, .. } => {
             assert_eq!(assumption.assumption_id.as_str(), "assume-3");
         }
-        other => panic!("assumption probe must name an unknown, got {other:?}"),
+        other => panic!("assumption omission must name an unknown, got {other:?}"),
     }
-    assert!(assumption.expected_discrimination.contains("assume-3"));
+    assert!(
+        assumption
+            .reason
+            .contains("exact canonical objective linkage")
+    );
 }
 
 // (b) Deterministic ordering with set-permutation stability.
@@ -373,12 +507,12 @@ fn ordering_is_deterministic_and_permutation_stable() {
     pricey_params.cost = CostDimension::High {
         detail: "wide retained scan".to_owned(),
     };
-    let pricey = must(InquiryAffordanceDescriptor::new(pricey_params));
+    let pricey = descriptor_from_params(pricey_params);
     let mut unknown_params = descriptor_params("aff-unknown", gap_target("claim-unknown"));
     unknown_params.information = InformationDimension::Unknown {
         reason: "gain not yet characterized".to_owned(),
     };
-    let unknown = must(InquiryAffordanceDescriptor::new(unknown_params));
+    let unknown = descriptor_from_params(unknown_params);
 
     let forward = plan_for(
         vec![cheap.clone(), pricey.clone(), unknown.clone()],
@@ -408,35 +542,52 @@ fn ordering_is_deterministic_and_permutation_stable() {
     assert_eq!(forward.digest, again.digest);
 }
 
-// (c) Duplicate probes collapse onto the lowest affordance identity.
+// (c) Semantically distinct affordances remain separate even when their
+// target is shared; exact-equivalent collapse is covered by case 610/28.
 // WORK_UNIT_CASE: 610/5
 #[test]
-fn duplicate_probes_collapse() {
+fn distinct_semantic_variants_stay_separate() {
     let first = descriptor("aff-dup-a", gap_target("claim-same"));
     let mut params = descriptor_params("aff-dup-b", gap_target("claim-same"));
     params.cost = CostDimension::Moderate {
         detail: "same channel, costlier read".to_owned(),
     };
-    let second = must(InquiryAffordanceDescriptor::new(params));
+    let second = descriptor_from_params(params);
 
     let plan = plan_for(vec![second, first], Some(16));
     must(plan.validate());
-    assert_eq!(plan.probes.len(), 1);
-    let probe = &plan.probes[0];
-    assert_eq!(probe.probe_id.as_str(), "aff-dup-a");
-    assert_eq!(probe.affordance.affordance_id.as_str(), "aff-dup-a");
-    let merged: Vec<&str> = probe
-        .merged_affordances
+    assert_eq!(plan.probes.len(), 2);
+    assert!(plan.omissions.is_empty());
+    let ids: Vec<&str> = plan
+        .probes
         .iter()
-        .map(ArtifactId::as_str)
+        .map(|probe| probe.probe_id.as_str())
         .collect();
-    assert_eq!(merged, vec!["aff-dup-b"]);
-    match &probe.target {
-        ProbeTarget::EvidenceUnknown { claim } => {
-            assert_eq!(claim.claim_id.as_str(), "claim-same");
-        }
-        other => panic!("collapsed probe must keep its target, got {other:?}"),
-    }
+    assert_eq!(ids, vec!["aff-dup-a", "aff-dup-b"]);
+    assert!(
+        plan.probes
+            .iter()
+            .all(|probe| probe.merged_affordances.is_empty())
+    );
+    assert!(
+        plan.probes
+            .iter()
+            .all(|probe| matches!(probe.target, ProbeTarget::ObjectiveUnknown { .. }))
+    );
+
+    let same_id_a = descriptor("aff-same-id", gap_target("claim-a"));
+    let same_id_b = descriptor("aff-same-id", gap_target("claim-b"));
+    assert!(
+        InquiryAffordanceSet::new(InquiryAffordanceSetParams {
+            set_id: artifact("affordance-same-id"),
+            task_id: task(),
+            scope: "scope-1".to_owned(),
+            state_fence: fence(),
+            descriptors: vec![same_id_a, same_id_b],
+        })
+        .is_err(),
+        "changed declarations cannot share one affordance identity"
+    );
 }
 
 // (d) Cost, risk, and authority vectors are preserved verbatim, never scalar-hidden.
@@ -462,31 +613,34 @@ fn cost_risk_authority_vectors_are_preserved() {
 
     let plan = plan_for(vec![risky], Some(16));
     must(plan.validate());
-    assert_eq!(plan.probes.len(), 1);
-    let probe = &plan.probes[0];
-    match &probe.dimensions.cost {
+    assert!(plan.probes.is_empty());
+    assert_eq!(plan.omissions.len(), 1);
+    let omission = &plan.omissions[0];
+    assert_eq!(omission.kind, OmissionKind::AuthorityBlocked);
+    assert_eq!(omission.affordance.affordance_id.as_str(), "aff-risky");
+    match &omission.dimensions.cost {
         CostDimension::High { detail } => assert_eq!(detail.as_str(), "wide retained scan"),
         other => panic!("cost vector must stay visible, got {other:?}"),
     }
-    match &probe.dimensions.effect {
+    match &omission.dimensions.effect {
         EffectDimension::StateChanging { detail } => {
             assert_eq!(detail.as_str(), "touches scratch state");
         }
         other => panic!("effect vector must stay visible, got {other:?}"),
     }
-    match &probe.dimensions.reversibility {
+    match &omission.dimensions.reversibility {
         ReversibilityDimension::Irreversible { reason } => {
             assert_eq!(reason.as_str(), "scratch write cannot be undone");
         }
         other => panic!("reversibility vector must stay visible, got {other:?}"),
     }
-    match &probe.dimensions.privacy {
+    match &omission.dimensions.privacy {
         PrivacyDimension::Elevated { reason } => {
             assert_eq!(reason.as_str(), "names a principal");
         }
         other => panic!("privacy vector must stay visible, got {other:?}"),
     }
-    match &probe.dimensions.authority {
+    match &omission.dimensions.authority {
         AuthorityDimension::Permitted { detail } => {
             assert_eq!(detail.as_str(), "standing supplied");
         }
@@ -605,6 +759,7 @@ fn binding_mismatches_fail_the_planner_closed() {
         rivals: &rivals,
         affordances: &wrong_scope,
         limits: &limits,
+        policy: &ordering_policy(),
     });
     assert!(scoped.is_err());
 
@@ -618,8 +773,35 @@ fn binding_mismatches_fail_the_planner_closed() {
         rivals: &rivals,
         affordances: &affordances,
         limits: &limits,
+        policy: &ordering_policy(),
     });
     assert!(fenced.is_err());
+
+    let mut wrong_job_draft = bound_draft.clone();
+    wrong_job_draft.receipt.job_id = "job-2".to_owned();
+    let wrong_job = ProbePlan::new(ProbePlanParams {
+        plan_id: artifact("plan-1"),
+        bundle: &bundle,
+        draft: &wrong_job_draft,
+        rivals: &rivals,
+        affordances: &affordances,
+        limits: &limits,
+        policy: &ordering_policy(),
+    });
+    assert!(wrong_job.is_err());
+
+    let mut wrong_manifest_bundle = bundle.clone();
+    wrong_manifest_bundle.manifest_digest = digest("manifest-other");
+    let wrong_manifest = ProbePlan::new(ProbePlanParams {
+        plan_id: artifact("plan-1"),
+        bundle: &wrong_manifest_bundle,
+        draft: &bound_draft,
+        rivals: &rivals,
+        affordances: &affordances,
+        limits: &limits,
+        policy: &ordering_policy(),
+    });
+    assert!(wrong_manifest.is_err());
 
     let mut over = limits;
     over.candidates = Some(17);
@@ -630,6 +812,7 @@ fn binding_mismatches_fail_the_planner_closed() {
         rivals: &rivals,
         affordances: &affordances,
         limits: &over,
+        policy: &ordering_policy(),
     });
     assert!(budgeted.is_err());
 }

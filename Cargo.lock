@@ -575,9 +575,12 @@ dependencies = [
  "anyhow",
  "clap",
  "eliot-agent-api",
+ "eliot-backup",
  "eliot-bootstrap",
  "eliot-cli",
+ "eliot-config",
  "eliot-contracts",
+ "eliot-doctor",
  "eliot-governor",
  "eliot-host-state",
  "eliot-installation",
@@ -657,6 +660,7 @@ dependencies = [
  "eliot-process",
  "eliot-protocol",
  "eliot-skill",
+ "eliot-types",
  "serde",
  "serde_json",
  "thiserror",
@@ -1074,6 +1078,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-evaluation-contracts",
  "eliot-evidence",
+ "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-protocol",
  "eliot-receipts",
@@ -1478,6 +1483,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-evidence",
+ "eliot-security-contracts",
  "schemars",
  "serde",
 ]
@@ -1509,7 +1515,10 @@ dependencies = [
 name = "eliot-dreamer-probe-plan"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-dreamer-contracts",
+ "eliot-evaluation-contracts",
+ "eliot-receipts",
  "schemars",
  "serde",
 ]
@@ -1695,6 +1704,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-git-bridge"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-platform",
+ "eliot-process",
+ "eliot-process-executor",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "eliot-governor"
 version = "0.1.0"
 dependencies = [
@@ -1765,6 +1786,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-windows-ipc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2303,6 +2325,8 @@ dependencies = [
 name = "eliot-notify-core"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
+ "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-receipts",
@@ -2629,11 +2653,13 @@ dependencies = [
  "eliot-evidence",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-ipc",
  "eliot-observation-contracts",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
+ "eliot-protocol",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
  "eliot-store-api",
@@ -3015,9 +3041,11 @@ dependencies = [
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-watchdog-core",
+ "eliot-windows-ipc",
  "redb",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tracing",
@@ -3058,6 +3086,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",
+ "eliot-config",
  "eliot-contracts",
  "eliot-controlboard",
  "eliot-doctor-core",
