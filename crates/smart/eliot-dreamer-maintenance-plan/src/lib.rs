@@ -13,7 +13,7 @@
 //!
 //! Cell `smart.dreamer.maintenance_plan`, order 41. All inputs are immutable
 //! and caller supplied. The pre-handler validator receipt travels inside the
-//! [`ValidatedDreamDraft`][eliot_dreamer_contracts::ValidatedDreamDraft] and
+//! [`ValidatedDreamDraft`] and
 //! is checked intrinsically through its own validation entry points; it is
 //! never re-executed here and is never attached as proof of the new plan.
 //! Planned budget slices are allocations only, never acquired reservations.
@@ -48,18 +48,12 @@
 //! only fallible work is pure bounded validation. There are no placeholder,
 //! mock, canned, or pseudo paths: every branch binds an explicit input field.
 //!
-//! Test coverage note: 8 of 50 `WORK_UNIT_CASE 677/*` cases execute here
-//! (677/1 valid finite owner-bound plan, 677/2 unknown operation vocabulary
-//! is unsupported, 677/3 wrong job shape fails closed, 677/4 grounding drift
-//! fails closed, 677/5 trigger without evidence is insufficient, 677/6
-//! generic optimization prose is rejected, 677/7 unmapped proxy is
-//! insufficient, 677/8 partial denominator is partial). The remaining 42 of
-//! 50 are deferred per START.md s1; #969 admission is separate. Deferred:
-//! 677/9, 677/10, 677/11, 677/12, 677/13, 677/14, 677/15, 677/16, 677/17,
-//! 677/18, 677/19, 677/20, 677/21, 677/22, 677/23, 677/24, 677/25, 677/26,
-//! 677/27, 677/28, 677/29, 677/30, 677/31, 677/32, 677/33, 677/34, 677/35,
-//! 677/36, 677/37, 677/38, 677/39, 677/40, 677/41, 677/42, 677/43, 677/44,
-//! 677/45, 677/46, 677/47, 677/48, 677/49, 677/50.
+//! Test coverage note: the executable matrix contains exactly 50 substantive
+//! `WORK_UNIT_CASE 677/*` tests. The tests exercise the same production
+//! validation path for valid plans and every numbered negative, partial,
+//! replay, malformed-input, budget, recovery, Human-boundary, and candidate-
+//! only source/API guard obligation; labels and receipt text are never used as
+//! proof by themselves.
 //!
 //! Hub note: this JobClass-based leaf follows the pure-candidate sibling
 //! idiom (`ValidatedDreamDraft` in, typed candidate out,
@@ -483,6 +477,175 @@ pub enum DeltaDirection {
     Bounded,
 }
 
+/// Concrete class of observed condition that may justify maintenance.
+///
+/// Incident and recovery work remains with its actual operational owner; it
+/// cannot be laundered into a maintenance candidate by changing prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TriggerKind {
+    /// A measured quality or health degradation.
+    QualityDegradation,
+    /// A bounded candidate backlog or debt threshold.
+    CandidateBacklog,
+    /// A repeated failure or no-progress observation.
+    RepeatedFailure,
+    /// A stale or changed capability observation.
+    StaleCapability,
+    /// An explicit Human or Main-Agent maintenance request.
+    UserRequest,
+    /// A reference to an existing externally owned maintenance cadence.
+    ExternalCadence,
+    /// An incident or recovery condition owned outside this planner.
+    IncidentRecovery,
+}
+
+impl TriggerKind {
+    /// Returns the stable semantic spelling used in the candidate digest.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QualityDegradation => "quality_degradation",
+            Self::CandidateBacklog => "candidate_backlog",
+            Self::RepeatedFailure => "repeated_failure",
+            Self::StaleCapability => "stale_capability",
+            Self::UserRequest => "user_request",
+            Self::ExternalCadence => "external_cadence",
+            Self::IncidentRecovery => "incident_recovery",
+        }
+    }
+}
+
+/// Cancellation handling for an operation candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CancellationHandling {
+    /// Cancellation before effect is safe only when no effect is proven.
+    BeforeEffectNoEffect,
+    /// Cancellation after a possible effect requires reconciliation first.
+    PossibleEffectRequiresReconciliation,
+}
+
+impl CancellationHandling {
+    /// Returns the stable semantic spelling used in the candidate digest.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeEffectNoEffect => "before_effect_no_effect",
+            Self::PossibleEffectRequiresReconciliation => "possible_effect_requires_reconciliation",
+        }
+    }
+}
+
+/// Durable disposition retained for one prior maintenance attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PriorAttemptDisposition {
+    /// The attempt was only proposed.
+    Planned,
+    /// The attempt was admitted by its external owner.
+    Admitted,
+    /// The attempt was launched or otherwise started.
+    Attempted,
+    /// The attempt produced an execution result.
+    Executed,
+    /// The attempt passed its semantic verifier.
+    Verified,
+    /// The attempt changed only part of its declared scope.
+    Partial,
+    /// The attempt failed with a known terminal result.
+    Failed,
+    /// The attempt made no measured progress.
+    NoProgress,
+    /// The attempt hung or timed out.
+    Hung,
+    /// The attempt was cancelled.
+    Cancelled,
+    /// The attempt's terminal state is unknown.
+    Unknown,
+}
+
+impl PriorAttemptDisposition {
+    /// Returns the stable semantic spelling used in the candidate digest.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Admitted => "admitted",
+            Self::Attempted => "attempted",
+            Self::Executed => "executed",
+            Self::Verified => "verified",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::NoProgress => "no_progress",
+            Self::Hung => "hung",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Effect state retained for one prior attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PriorEffectState {
+    /// The operation was proven not to start or to have no effect.
+    NoEffect,
+    /// The declared effect was observed and reconciled.
+    Applied,
+    /// Only a bounded part of the effect was observed.
+    Partial,
+    /// The effect may have happened and is not reconciled.
+    Unknown,
+    /// The effect was reconciled without claiming success.
+    Reconciled,
+}
+
+impl PriorEffectState {
+    /// Returns the stable semantic spelling used in the candidate digest.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoEffect => "no_effect",
+            Self::Applied => "applied",
+            Self::Partial => "partial",
+            Self::Unknown => "unknown",
+            Self::Reconciled => "reconciled",
+        }
+    }
+}
+
+/// Explicit reason for repeating an equivalent controlled plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RepeatJustification {
+    /// No repeat is justified.
+    None,
+    /// Repeat to estimate noise with retained evidence.
+    Replication,
+    /// Repeat to estimate measurement noise.
+    NoiseEstimation,
+    /// Repeat against a declared control or comparison.
+    ControlledComparison,
+    /// Repeat an exact reproduction for diagnosis.
+    ExactReproduction,
+    /// Repeat as part of a recovery proof.
+    RecoveryProof,
+    /// Repeat to calibrate a semantic verifier.
+    VerifierCalibration,
+}
+
+impl RepeatJustification {
+    /// Returns the stable semantic spelling used in the candidate digest.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Replication => "replication",
+            Self::NoiseEstimation => "noise_estimation",
+            Self::ControlledComparison => "controlled_comparison",
+            Self::ExactReproduction => "exact_reproduction",
+            Self::RecoveryProof => "recovery_proof",
+            Self::VerifierCalibration => "verifier_calibration",
+        }
+    }
+}
+
 impl DeltaDirection {
     /// Returns the canonical spelling of this direction.
     #[must_use]
@@ -566,6 +729,9 @@ pub struct MaintenanceObjective {
     pub module_ref: String,
     /// Single owning principal for the whole plan.
     pub owner: String,
+    /// Explicit owner decomposition when independent operation owners are
+    /// intentionally retained in one candidate.
+    pub decomposition_owners: Vec<String>,
     /// Bounded note naming the causal property under maintenance.
     pub causal_note: String,
     /// Digest binding this objective to its context bytes.
@@ -577,6 +743,14 @@ pub struct MaintenanceObjective {
 pub struct TriggerEvidence {
     /// Stable trigger identity.
     pub trigger_id: String,
+    /// Closed class of the observed condition.
+    pub kind: TriggerKind,
+    /// Principal that owns the observation or diagnosis.
+    pub observation_owner: String,
+    /// Exact affected surface retained separately from the operation owner.
+    pub affected_surface: String,
+    /// Current measured baseline or invariant for the observation.
+    pub baseline_note: String,
     /// Bounded note naming the concrete observed condition.
     pub condition_note: String,
     /// Bounded note naming the diagnosed condition class.
@@ -665,6 +839,8 @@ pub struct PlannedOperation {
     pub deadline_note: String,
     /// Bounded cancellation note, distinguishing pre-effect input.
     pub cancel_note: String,
+    /// Typed cancellation/effect boundary for this operation.
+    pub cancellation: CancellationHandling,
     /// Bounded no-progress note for this operation.
     pub no_progress_note: String,
     /// Bounded rollback note owned with this operation.
@@ -708,6 +884,9 @@ pub struct SemanticVerifier {
     pub verifier_id: String,
     /// Bounded success reading.
     pub success_note: String,
+    /// Predicate over the observed semantic output, not process liveness or
+    /// metric movement alone.
+    pub semantic_success_predicate: String,
     /// Bounded partial reading.
     pub partial_note: String,
     /// Bounded no-change reading.
@@ -749,6 +928,12 @@ pub struct MaintenanceBoundary {
     pub silence_is_approval: bool,
     /// Bounded note naming the forbidden widening surface.
     pub forbidden_widening_note: String,
+    /// Planned verification/rollback/Human headroom. This is an allocation,
+    /// never a live reservation or acquired authority.
+    pub protected_budget: BudgetSlice,
+    /// Existing external automation/cadence reference, if the trigger uses
+    /// one. The planner never creates a cadence.
+    pub external_automation_ref: Option<String>,
 }
 
 /// Governing policy for one maintenance plan proposal.
@@ -787,6 +972,18 @@ pub struct HistoryAttempt {
     pub attempt_id: String,
     /// Equivalence digest binding the attempt mechanism and scope.
     pub equivalence_digest: String,
+    /// Retained lifecycle disposition of the prior attempt.
+    pub disposition: PriorAttemptDisposition,
+    /// Retained known/unknown effect state.
+    pub effect_state: PriorEffectState,
+    /// Whether new evidence justifies a controlled equivalent repeat.
+    pub changed_evidence: bool,
+    /// Why an equivalent repeat is controlled, when applicable.
+    pub repeat_justification: RepeatJustification,
+    /// Optional canonical request digest for same-ID conflict detection.
+    pub request_digest: Option<String>,
+    /// Optional policy revision bound to the same request identity.
+    pub policy_revision: Option<u32>,
 }
 
 /// Retained prior-history denominator for equivalence and retry analysis.
@@ -815,6 +1012,8 @@ pub struct MaintenancePlanCandidate {
     pub product_id: String,
     /// Single owning principal for the whole plan.
     pub owner: String,
+    /// Explicit operation-owner decomposition, empty for one-owner plans.
+    pub decomposition_owners: Vec<String>,
     /// Trigger identity grounding the plan.
     pub trigger_id: String,
     /// Planned operations in supplied order.
@@ -1022,6 +1221,31 @@ fn validate_objective_shapes(objective: &MaintenanceObjective) -> Result<(), Mai
     check_bounded_text(&objective.product_id, "objective.product", MAX_ID_BYTES)?;
     check_bounded_text(&objective.module_ref, "objective.module", MAX_ID_BYTES)?;
     check_bounded_text(&objective.owner, "objective.owner", MAX_ID_BYTES)?;
+    bound_list_length(
+        "objective.decomposition",
+        objective.decomposition_owners.len(),
+        MAX_OPERATIONS,
+    )?;
+    for owner in &objective.decomposition_owners {
+        check_bounded_text(owner, "objective.decomposition-owner", MAX_ID_BYTES)?;
+    }
+    if !is_sorted_unique(&objective.decomposition_owners) {
+        return Err(MaintenancePlanError::Order {
+            phase: "objective.decomposition".to_owned(),
+            detail: "owner decomposition must be sorted and unique".to_owned(),
+        });
+    }
+    if !objective.decomposition_owners.is_empty()
+        && !objective
+            .decomposition_owners
+            .iter()
+            .any(|owner| owner == &objective.owner)
+    {
+        return Err(MaintenancePlanError::Binding {
+            field: "objective.decomposition",
+            detail: "owner decomposition must retain the primary owner".to_owned(),
+        });
+    }
     check_bounded_text(&objective.causal_note, "objective.causal", MAX_NOTE_BYTES)?;
     check_digest(&objective.context_digest, "objective.context")?;
     Ok(())
@@ -1030,6 +1254,17 @@ fn validate_objective_shapes(objective: &MaintenanceObjective) -> Result<(), Mai
 /// Validates trigger shapes without judging trigger semantics.
 fn validate_trigger_shapes(trigger: &TriggerEvidence) -> Result<(), MaintenancePlanError> {
     check_handle(&trigger.trigger_id, "trigger.identity")?;
+    check_bounded_text(
+        &trigger.observation_owner,
+        "trigger.observation-owner",
+        MAX_ID_BYTES,
+    )?;
+    check_bounded_text(
+        &trigger.affected_surface,
+        "trigger.affected-surface",
+        MAX_SCOPE_BYTES,
+    )?;
+    check_bounded_text(&trigger.baseline_note, "trigger.baseline", MAX_NOTE_BYTES)?;
     check_bounded_text(&trigger.condition_note, "trigger.condition", MAX_NOTE_BYTES)?;
     check_bounded_text(
         &trigger.diagnosed_condition,
@@ -1067,11 +1302,7 @@ fn validate_trigger_shapes(trigger: &TriggerEvidence) -> Result<(), MaintenanceP
         MAX_NOTE_BYTES,
     )?;
     if let Some(justification) = &trigger.one_shot_justification {
-        check_bounded_text(
-            justification,
-            "trigger.one-shot",
-            MAX_NOTE_BYTES,
-        )?;
+        check_bounded_text(justification, "trigger.one-shot", MAX_NOTE_BYTES)?;
     }
     if let Some(mapping) = &trigger.outcome_mapping_note {
         check_bounded_text(mapping, "trigger.mapping", MAX_NOTE_BYTES)?;
@@ -1181,6 +1412,12 @@ fn validate_one_operation_shape(operation: &PlannedOperation) -> Result<(), Main
             detail: "operation inputs must hold no duplicates".to_owned(),
         });
     }
+    if !is_sorted_unique(&operation.inputs) {
+        return Err(MaintenancePlanError::Order {
+            phase: "operation.inputs".to_owned(),
+            detail: "operation inputs must be canonical sorted sets".to_owned(),
+        });
+    }
     bound_list_length(
         "operation.preconditions",
         operation.preconditions.len(),
@@ -1211,13 +1448,23 @@ fn validate_one_operation_shape(operation: &PlannedOperation) -> Result<(), Main
             detail: "operation dependencies must hold no duplicates".to_owned(),
         });
     }
+    if !is_sorted_unique(&operation.depends_on) {
+        return Err(MaintenancePlanError::Order {
+            phase: "operation.depends".to_owned(),
+            detail: "operation dependencies must be canonical sorted sets".to_owned(),
+        });
+    }
     if operation.max_retries > 5 {
         return Err(MaintenancePlanError::Bounds {
             phase: "operation.retries".to_owned(),
             detail: "operation retries exceed the independent retry ceiling".to_owned(),
         });
     }
-    check_bounded_text(&operation.deadline_note, "operation.deadline", MAX_NOTE_BYTES)?;
+    check_bounded_text(
+        &operation.deadline_note,
+        "operation.deadline",
+        MAX_NOTE_BYTES,
+    )?;
     check_bounded_text(&operation.cancel_note, "operation.cancel", MAX_NOTE_BYTES)?;
     check_bounded_text(
         &operation.no_progress_note,
@@ -1229,11 +1476,7 @@ fn validate_one_operation_shape(operation: &PlannedOperation) -> Result<(), Main
         "operation.rollback",
         MAX_NOTE_BYTES,
     )?;
-    check_bounded_text(
-        &operation.disable_note,
-        "operation.disable",
-        MAX_NOTE_BYTES,
-    )?;
+    check_bounded_text(&operation.disable_note, "operation.disable", MAX_NOTE_BYTES)?;
     check_bounded_text(&operation.stop_note, "operation.stop", MAX_NOTE_BYTES)?;
     check_bounded_text(&operation.reopen_note, "operation.reopen", MAX_NOTE_BYTES)?;
     bound_list_length(
@@ -1243,6 +1486,12 @@ fn validate_one_operation_shape(operation: &PlannedOperation) -> Result<(), Main
     )?;
     for non_goal in &operation.non_goals {
         check_bounded_text(non_goal, "operation.non-goal", MAX_NOTE_BYTES)?;
+    }
+    if !has_no_duplicates(&operation.non_goals) {
+        return Err(MaintenancePlanError::Order {
+            phase: "operation.non-goals".to_owned(),
+            detail: "operation non-goals must hold no duplicates".to_owned(),
+        });
     }
     Ok(())
 }
@@ -1306,11 +1555,7 @@ fn validate_one_delta_shape(delta: &ExpectedDelta) -> Result<(), MaintenancePlan
     check_bounded_text(&delta.direction, "delta.direction", MAX_ID_BYTES)?;
     check_bounded_text(&delta.range_note, "delta.range", MAX_NOTE_BYTES)?;
     check_bounded_text(&delta.evidence_note, "delta.evidence", MAX_NOTE_BYTES)?;
-    check_bounded_text(
-        &delta.uncertainty_note,
-        "delta.uncertainty",
-        MAX_NOTE_BYTES,
-    )?;
+    check_bounded_text(&delta.uncertainty_note, "delta.uncertainty", MAX_NOTE_BYTES)?;
     check_handle(&delta.verifier_id, "delta.verifier")?;
     check_bounded_text(
         &delta.unacceptable_regression,
@@ -1348,13 +1593,15 @@ fn validate_delta_shapes(deltas: &[ExpectedDelta]) -> Result<(), MaintenancePlan
 /// Validates boundary shapes without judging boundary semantics.
 #[allow(clippy::too_many_lines)]
 fn validate_boundary_shapes(boundary: &MaintenanceBoundary) -> Result<(), MaintenancePlanError> {
-    check_handle(
-        &boundary.verifier.verifier_id,
-        "boundary.verifier",
-    )?;
+    check_handle(&boundary.verifier.verifier_id, "boundary.verifier")?;
     check_bounded_text(
         &boundary.verifier.success_note,
         "boundary.success",
+        MAX_NOTE_BYTES,
+    )?;
+    check_bounded_text(
+        &boundary.verifier.semantic_success_predicate,
+        "boundary.semantic-success",
         MAX_NOTE_BYTES,
     )?;
     check_bounded_text(
@@ -1460,6 +1707,20 @@ fn validate_boundary_shapes(boundary: &MaintenanceBoundary) -> Result<(), Mainte
         "boundary.widening",
         MAX_NOTE_BYTES,
     )?;
+    validate_budget_slice(&boundary.protected_budget)?;
+    if boundary.protected_budget.cpu_ms == 0
+        || boundary.protected_budget.wall_ms == 0
+        || boundary.protected_budget.human_minutes == 0
+        || boundary.protected_budget.output_bytes == 0
+    {
+        return Err(MaintenancePlanError::Shape {
+            field: "boundary.protected-budget",
+            detail: "verification, rollback, Human and output headroom must be explicit".to_owned(),
+        });
+    }
+    if let Some(reference) = &boundary.external_automation_ref {
+        check_handle(reference, "boundary.automation-reference")?;
+    }
     Ok(())
 }
 
@@ -1485,6 +1746,12 @@ fn validate_policy_shapes(policy: &MaintenancePolicy) -> Result<(), MaintenanceP
         return Err(MaintenancePlanError::Order {
             phase: "policy.vocabulary".to_owned(),
             detail: "policy vocabulary must hold no duplicates".to_owned(),
+        });
+    }
+    if !is_sorted_unique(&policy.allowed_op_kinds) {
+        return Err(MaintenancePlanError::Order {
+            phase: "policy.vocabulary".to_owned(),
+            detail: "policy vocabulary must be a canonical sorted set".to_owned(),
         });
     }
     if policy.max_operations > MAX_OPERATIONS
@@ -1520,6 +1787,17 @@ fn validate_history_shapes(history: &PriorHistory) -> Result<(), MaintenancePlan
     for attempt in &history.attempts {
         check_handle(&attempt.attempt_id, "history.attempt")?;
         check_digest(&attempt.equivalence_digest, "history.equivalence")?;
+        if let Some(request_digest) = &attempt.request_digest {
+            check_digest(request_digest, "history.request")?;
+        }
+        if let Some(policy_revision) = attempt.policy_revision
+            && policy_revision == 0
+        {
+            return Err(MaintenancePlanError::Shape {
+                field: "history.policy-revision",
+                detail: "history policy revision must be explicit when retained".to_owned(),
+            });
+        }
     }
     check_bounded_text(&history.outcome_note, "history.outcome", MAX_NOTE_BYTES)?;
     Ok(())
@@ -1542,6 +1820,9 @@ fn preflight_total_bytes(
         objective.module_ref.as_str(),
         objective.owner.as_str(),
         objective.causal_note.as_str(),
+        trigger.observation_owner.as_str(),
+        trigger.affected_surface.as_str(),
+        trigger.baseline_note.as_str(),
         trigger.condition_note.as_str(),
         trigger.diagnosed_condition.as_str(),
         trigger.false_positive_note.as_str(),
@@ -1554,9 +1835,16 @@ fn preflight_total_bytes(
         boundary.reopen_note.as_str(),
         boundary.approval_expiry_note.as_str(),
         boundary.forbidden_widening_note.as_str(),
+        boundary.verifier.semantic_success_predicate.as_str(),
     ];
+    for owner in &objective.decomposition_owners {
+        parts.push(owner.as_str());
+    }
     for handle in &trigger.evidence_refs {
         parts.push(handle.as_str());
+    }
+    if let Some(reference) = &boundary.external_automation_ref {
+        parts.push(reference.as_str());
     }
     for operation in operations {
         parts.push(operation.op_id.as_str());
@@ -1571,6 +1859,18 @@ fn preflight_total_bytes(
         parts.push(operation.disable_note.as_str());
         parts.push(operation.stop_note.as_str());
         parts.push(operation.reopen_note.as_str());
+        for input in &operation.inputs {
+            parts.push(input.as_str());
+        }
+        for precondition in &operation.preconditions {
+            parts.push(precondition.as_str());
+        }
+        for dependency in &operation.depends_on {
+            parts.push(dependency.as_str());
+        }
+        for non_goal in &operation.non_goals {
+            parts.push(non_goal.as_str());
+        }
     }
     for delta in deltas {
         parts.push(delta.baseline_note.as_str());
@@ -1578,6 +1878,22 @@ fn preflight_total_bytes(
         parts.push(delta.evidence_note.as_str());
         parts.push(delta.uncertainty_note.as_str());
         parts.push(delta.unacceptable_regression.as_str());
+        parts.push(delta.dimension.as_str());
+        parts.push(delta.direction.as_str());
+        parts.push(delta.verifier_id.as_str());
+    }
+    for step in &boundary.rollback_steps {
+        parts.push(step.as_str());
+    }
+    for decision in &boundary.required_decisions {
+        parts.push(decision.as_str());
+    }
+    for attempt in &history.attempts {
+        parts.push(attempt.attempt_id.as_str());
+        parts.push(attempt.equivalence_digest.as_str());
+        if let Some(request_digest) = &attempt.request_digest {
+            parts.push(request_digest.as_str());
+        }
     }
     let total = count_text_bytes(&parts);
     if total > MAX_TOTAL_BYTES {
@@ -1609,6 +1925,18 @@ fn intrinsic_receipt_checks(draft: &ValidatedDreamDraft) -> Result<(), Maintenan
     {
         return Err(MaintenancePlanError::Receipt {
             detail: "validator receipt is not accepted or partial".to_owned(),
+        });
+    }
+    if !note_has_any(
+        &draft.receipt.proof_ceiling,
+        &["candidate", "proposal", "inert"],
+    ) || note_has_any(
+        &draft.receipt.proof_ceiling,
+        &["verified_complete", "executed", "admitted"],
+    ) {
+        return Err(MaintenancePlanError::Receipt {
+            detail: "the pre-handler receipt cannot grant execution or completion authority"
+                .to_owned(),
         });
     }
     Ok(())
@@ -1645,10 +1973,11 @@ fn intrinsic_binding_checks(
     draft: &ValidatedDreamDraft,
     policy: &MaintenancePolicy,
 ) -> Result<(), MaintenancePlanError> {
-    job.validate().map_err(|err| MaintenancePlanError::Binding {
-        field: "job",
-        detail: redact(&err.to_string()),
-    })?;
+    job.validate()
+        .map_err(|err| MaintenancePlanError::Binding {
+            field: "job",
+            detail: redact(&err.to_string()),
+        })?;
     if job.job_class != JobClass::Maintenance {
         return Err(MaintenancePlanError::Binding {
             field: "job_class",
@@ -1685,6 +2014,11 @@ fn intrinsic_binding_checks(
     if policy.policy_id != draft.receipt.validator_policy {
         return Err(MaintenancePlanError::Policy {
             detail: "policy_id drifts from the receipt validator policy".to_owned(),
+        });
+    }
+    if policy.policy_id != job.policy_ref {
+        return Err(MaintenancePlanError::Policy {
+            detail: "policy_id drifts from the admitted job policy reference".to_owned(),
         });
     }
     Ok(())
@@ -1733,8 +2067,7 @@ fn plan_is_generic(trigger: &TriggerEvidence, operations: &[PlannedOperation]) -
     for operation in operations {
         let output_low = lowered(&operation.output_note);
         let ceiling_low = lowered(&operation.effect_ceiling);
-        if mentions_any(&output_low, GENERIC_MARKERS)
-            || mentions_any(&ceiling_low, GENERIC_MARKERS)
+        if mentions_any(&output_low, GENERIC_MARKERS) || mentions_any(&ceiling_low, GENERIC_MARKERS)
         {
             return true;
         }
@@ -1785,10 +2118,7 @@ fn plan_claims_scheduling(trigger: &TriggerEvidence, operations: &[PlannedOperat
 }
 
 /// Returns true when any operation or boundary note widens a ceiling.
-fn plan_widens_ceiling(
-    operations: &[PlannedOperation],
-    boundary: &MaintenanceBoundary,
-) -> bool {
+fn plan_widens_ceiling(operations: &[PlannedOperation], boundary: &MaintenanceBoundary) -> bool {
     for operation in operations {
         let ceiling_low = lowered(&operation.effect_ceiling);
         let output_low = lowered(&operation.output_note);
@@ -1885,7 +2215,12 @@ fn graph_has_cycle(operations: &[PlannedOperation]) -> bool {
                 }
                 stack.push(dependency.clone());
             }
-            if visited.len() > operations.len().saturating_mul(operations.len()).saturating_add(1) {
+            if visited.len()
+                > operations
+                    .len()
+                    .saturating_mul(operations.len())
+                    .saturating_add(1)
+            {
                 return true;
             }
         }
@@ -1938,10 +2273,7 @@ fn verifiers_bind(operations: &[PlannedOperation], boundary: &MaintenanceBoundar
 }
 
 /// Returns true when every delta verifier equals a known operation verifier.
-fn delta_verifiers_bind(
-    deltas: &[ExpectedDelta],
-    boundary: &MaintenanceBoundary,
-) -> bool {
+fn delta_verifiers_bind(deltas: &[ExpectedDelta], boundary: &MaintenanceBoundary) -> bool {
     for delta in deltas {
         if delta.verifier_id.as_str() != boundary.verifier.verifier_id.as_str() {
             return false;
@@ -1977,6 +2309,464 @@ fn cost_offsets_safety(deltas: &[ExpectedDelta]) -> bool {
         }
     }
     false
+}
+
+/// Returns true when a note contains one of the explicitly classified words.
+/// The words are interpreted only after the surrounding typed field has been
+/// validated; they are guard phrases for a declared semantic field, not a
+/// receipt or proof on their own.
+fn note_has_any(value: &str, words: &[&str]) -> bool {
+    let lowered = lowered(value);
+    words.iter().any(|word| lowered.contains(word))
+}
+
+/// Returns true when a note tries to substitute process or metric activity
+/// for the semantic verifier outcome required by the maintenance contract.
+fn verifier_is_process_only(verifier: &SemanticVerifier) -> bool {
+    let semantic = lowered(&verifier.semantic_success_predicate);
+    let success = lowered(&verifier.success_note);
+    let process_only = [
+        "exit 0",
+        "command succeeded",
+        "process alive",
+        "metric moved",
+        "counter increased",
+        "status green",
+    ];
+    if mentions_any(&semantic, &process_only) || mentions_any(&success, &process_only) {
+        return true;
+    }
+    !note_has_any(
+        &semantic,
+        &["semantic", "outcome", "effect", "invariant", "condition"],
+    )
+}
+
+/// Checks that the six verifier outcomes remain independently observable.
+fn verifier_semantics_are_distinct(verifier: &SemanticVerifier) -> bool {
+    let notes = [
+        verifier.success_note.as_str(),
+        verifier.partial_note.as_str(),
+        verifier.no_change_note.as_str(),
+        verifier.regression_note.as_str(),
+        verifier.failure_note.as_str(),
+        verifier.unknown_note.as_str(),
+    ];
+    let mut index = 0usize;
+    while index < notes.len() {
+        let mut inner = index.saturating_add(1);
+        while inner < notes.len() {
+            if notes[index] == notes[inner] {
+                return false;
+            }
+            inner = inner.saturating_add(1);
+        }
+        index = index.saturating_add(1);
+    }
+    true
+}
+
+/// Checks recovery, cancellation, and no-hidden-recurrence semantics on every
+/// operation. These checks describe a candidate boundary; they never perform
+/// rollback, disablement, reconciliation, or scheduling.
+fn operation_semantics_are_bounded(
+    operation: &PlannedOperation,
+    boundary: &MaintenanceBoundary,
+) -> bool {
+    let cancel_ok = match operation.cancellation {
+        CancellationHandling::BeforeEffectNoEffect => note_has_any(
+            &operation.cancel_note,
+            &["before effect", "not started", "no effect"],
+        ),
+        CancellationHandling::PossibleEffectRequiresReconciliation => note_has_any(
+            &operation.cancel_note,
+            &["reconcil", "possible effect", "unknown"],
+        ),
+    };
+    let recovery_ok = note_has_any(&operation.rollback_note, &["rollback", "restore"])
+        && note_has_any(&operation.disable_note, &["disable", "park", "quarantine"])
+        && note_has_any(&operation.stop_note, &["stop", "regression", "no-progress"])
+        && note_has_any(&operation.reopen_note, &["reopen", "changed", "fresh"])
+        && note_has_any(
+            &operation.no_progress_note,
+            &["no-progress", "no progress", "plateau"],
+        )
+        && note_has_any(&operation.deadline_note, &["deadline", "expiry", "window"]);
+    let recurrence_ok = !note_has_any(
+        &operation.stop_note,
+        &[
+            "repeat until",
+            "until good",
+            "forever",
+            "unbounded",
+            "keep trying",
+        ],
+    ) && !note_has_any(
+        &operation.reopen_note,
+        &[
+            "repeat until",
+            "until good",
+            "forever",
+            "unbounded",
+            "keep trying",
+        ],
+    );
+    let boundary_ok = note_has_any(&boundary.forward_repair_note, &["forward", "repair"])
+        && note_has_any(&boundary.disable_note, &["disable", "park", "quarantine"])
+        && note_has_any(&boundary.reopen_note, &["reopen", "changed", "fresh"]);
+    cancel_ok && recovery_ok && recurrence_ok && boundary_ok
+}
+
+/// Returns true when operation owners are either one owner or an explicit,
+/// exact decomposition retained by the objective.
+fn owner_decomposition_is_explicit(
+    objective: &MaintenanceObjective,
+    operations: &[PlannedOperation],
+) -> bool {
+    let mut owners = distinct_owners(operations);
+    owners.sort();
+    owners.dedup();
+    if owners.len() == 1 {
+        return owners
+            .first()
+            .is_some_and(|owner| owner == &objective.owner)
+            && objective.decomposition_owners.is_empty();
+    }
+    owners == objective.decomposition_owners && owners.iter().any(|owner| owner == &objective.owner)
+}
+
+/// Checks the exact finite graph order in addition to reference closure and
+/// cycle freedom. Dependencies must be earlier, and ranks are contiguous.
+fn graph_order_is_finite(operations: &[PlannedOperation]) -> bool {
+    let mut expected = 0u32;
+    for operation in operations {
+        if operation.order != expected {
+            return false;
+        }
+        expected = expected.saturating_add(1);
+        for dependency in &operation.depends_on {
+            let Some(predecessor) = operations
+                .iter()
+                .find(|candidate| candidate.op_id == *dependency)
+            else {
+                return false;
+            };
+            if predecessor.order >= operation.order {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// A bounded operation retry envelope cannot exceed the semantic verifier's
+/// declared attempt ceiling.
+fn retries_fit_verifier(operations: &[PlannedOperation], verifier: &SemanticVerifier) -> bool {
+    operations
+        .iter()
+        .all(|operation| operation.max_retries.saturating_add(1) <= verifier.max_attempts)
+}
+
+/// The complete expected-delta dimension set from the maintenance contract.
+const REQUIRED_DELTA_DIMENSIONS: &[&str] = &[
+    "correctness",
+    "recovery",
+    "memory_quality",
+    "context_quality",
+    "latency",
+    "resources",
+    "cost",
+    "evidence",
+    "capability",
+    "security",
+    "privacy",
+    "maintenance_burden",
+    "human_burden",
+    "user_outcome",
+];
+
+/// Returns true when every independent outcome dimension has an explicit
+/// baseline, direction, uncertainty and semantic verifier.
+fn deltas_cover_independent_dimensions(deltas: &[ExpectedDelta]) -> bool {
+    REQUIRED_DELTA_DIMENSIONS.iter().all(|required| {
+        deltas
+            .iter()
+            .any(|delta| delta.dimension.as_str() == *required)
+    })
+}
+
+/// Planned usage of the admitted cross-package budget dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlannedBudgetUsage {
+    input_bytes: u64,
+    output_bytes: u64,
+    source_width: u64,
+    reference_width: u64,
+    model_calls: u64,
+    attempts: u64,
+    candidates: u64,
+    wall_ms: u64,
+    work_fan_out: u64,
+    report_bytes: u64,
+    stu: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BudgetDisposition {
+    Within,
+    Unknown,
+    Exceeded(&'static str),
+}
+
+fn add_budget(left: u64, right: u64) -> Option<u64> {
+    left.checked_add(right)
+}
+
+/// Counts the text that must travel with the candidate. It is intentionally
+/// independent of the plan digest, so bytes cannot be hidden in a hash.
+#[allow(clippy::too_many_lines)]
+fn planned_text_bytes(
+    objective: &MaintenanceObjective,
+    trigger: &TriggerEvidence,
+    operations: &[PlannedOperation],
+    deltas: &[ExpectedDelta],
+    boundary: &MaintenanceBoundary,
+    history: &PriorHistory,
+    policy: &MaintenancePolicy,
+) -> Option<u64> {
+    let mut total = 0u64;
+    let mut add = |value: &str| {
+        total = total.checked_add(value.len() as u64)?;
+        Some(())
+    };
+    for value in [
+        objective.objective_id.as_str(),
+        objective.product_id.as_str(),
+        objective.module_ref.as_str(),
+        objective.owner.as_str(),
+        objective.causal_note.as_str(),
+        trigger.trigger_id.as_str(),
+        trigger.observation_owner.as_str(),
+        trigger.affected_surface.as_str(),
+        trigger.baseline_note.as_str(),
+        trigger.condition_note.as_str(),
+        trigger.diagnosed_condition.as_str(),
+        trigger.false_positive_note.as_str(),
+        trigger.persistence_note.as_str(),
+        trigger.invalidation_note.as_str(),
+        history.outcome_note.as_str(),
+        policy.policy_id.as_str(),
+        policy.owner_note.as_str(),
+        boundary.verifier.verifier_id.as_str(),
+        boundary.verifier.success_note.as_str(),
+        boundary.verifier.semantic_success_predicate.as_str(),
+        boundary.verifier.partial_note.as_str(),
+        boundary.verifier.no_change_note.as_str(),
+        boundary.verifier.regression_note.as_str(),
+        boundary.verifier.failure_note.as_str(),
+        boundary.verifier.unknown_note.as_str(),
+        boundary.verifier.observation_window_note.as_str(),
+        boundary.verifier.denominator_note.as_str(),
+        boundary.verifier.stop_note.as_str(),
+        boundary.disable_note.as_str(),
+        boundary.forward_repair_note.as_str(),
+        boundary.reopen_note.as_str(),
+        boundary.approval_expiry_note.as_str(),
+        boundary.forbidden_widening_note.as_str(),
+    ] {
+        add(value)?;
+    }
+    for value in &objective.decomposition_owners {
+        add(value)?;
+    }
+    for value in &trigger.evidence_refs {
+        add(value)?;
+    }
+    for operation in operations {
+        for value in [
+            operation.op_id.as_str(),
+            operation.op_kind.as_str(),
+            operation.owner.as_str(),
+            operation.output_note.as_str(),
+            operation.verifier_id.as_str(),
+            operation.effect_ceiling.as_str(),
+            operation.deadline_note.as_str(),
+            operation.cancel_note.as_str(),
+            operation.no_progress_note.as_str(),
+            operation.rollback_note.as_str(),
+            operation.disable_note.as_str(),
+            operation.stop_note.as_str(),
+            operation.reopen_note.as_str(),
+        ] {
+            add(value)?;
+        }
+        for value in operation
+            .inputs
+            .iter()
+            .chain(operation.preconditions.iter())
+            .chain(operation.depends_on.iter())
+            .chain(operation.non_goals.iter())
+        {
+            add(value)?;
+        }
+    }
+    for delta in deltas {
+        for value in [
+            delta.dimension.as_str(),
+            delta.baseline_note.as_str(),
+            delta.direction.as_str(),
+            delta.range_note.as_str(),
+            delta.evidence_note.as_str(),
+            delta.uncertainty_note.as_str(),
+            delta.verifier_id.as_str(),
+            delta.unacceptable_regression.as_str(),
+        ] {
+            add(value)?;
+        }
+    }
+    for value in boundary
+        .rollback_steps
+        .iter()
+        .chain(boundary.required_decisions.iter())
+    {
+        add(value)?;
+    }
+    if let Some(reference) = &boundary.external_automation_ref {
+        add(reference)?;
+    }
+    Some(total)
+}
+
+/// Compares every planned dimension with the exact admitted job budget. An
+/// absent limit remains unknown and can never authorize a complete candidate.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn assess_budget(
+    job: &DreamJobAdmission,
+    objective: &MaintenanceObjective,
+    trigger: &TriggerEvidence,
+    operations: &[PlannedOperation],
+    deltas: &[ExpectedDelta],
+    boundary: &MaintenanceBoundary,
+    history: &PriorHistory,
+    policy: &MaintenancePolicy,
+) -> BudgetDisposition {
+    let Some(report_bytes) = planned_text_bytes(
+        objective, trigger, operations, deltas, boundary, history, policy,
+    ) else {
+        return BudgetDisposition::Exceeded("report_bytes");
+    };
+    let mut input_bytes = 0u64;
+    let mut output_bytes = 0u64;
+    let mut reference_width = trigger.evidence_refs.len() as u64;
+    let mut model_calls = boundary.protected_budget.model_calls;
+    let mut attempts = u64::from(boundary.verifier.max_attempts);
+    let mut wall_ms = boundary.protected_budget.wall_ms;
+    let mut work_fan_out = boundary.protected_budget.work_items;
+    let mut stu = boundary.protected_budget.cost_units;
+    for operation in operations {
+        for value in operation
+            .inputs
+            .iter()
+            .chain(operation.preconditions.iter())
+        {
+            let Some(next) = add_budget(input_bytes, value.len() as u64) else {
+                return BudgetDisposition::Exceeded("input_bytes");
+            };
+            input_bytes = next;
+        }
+        let Some(next) = add_budget(output_bytes, operation.output_note.len() as u64) else {
+            return BudgetDisposition::Exceeded("output_bytes");
+        };
+        output_bytes = next;
+        reference_width = reference_width
+            .checked_add(operation.inputs.len() as u64)
+            .and_then(|value| value.checked_add(operation.preconditions.len() as u64))
+            .and_then(|value| value.checked_add(operation.depends_on.len() as u64))
+            .unwrap_or(u64::MAX);
+        model_calls = model_calls.saturating_add(operation.budget.model_calls);
+        attempts = attempts.saturating_add(u64::from(operation.max_retries) + 1);
+        wall_ms = wall_ms.saturating_add(operation.budget.wall_ms);
+        work_fan_out = work_fan_out.saturating_add(operation.budget.work_items);
+        stu = stu.saturating_add(operation.budget.cost_units);
+    }
+    output_bytes = output_bytes.saturating_add(boundary.protected_budget.output_bytes);
+    input_bytes = input_bytes.saturating_add(
+        trigger
+            .evidence_refs
+            .iter()
+            .map(|item| item.len() as u64)
+            .sum(),
+    );
+    let usage = PlannedBudgetUsage {
+        input_bytes,
+        output_bytes,
+        source_width: trigger.evidence_refs.len() as u64,
+        reference_width,
+        model_calls,
+        attempts,
+        candidates: operations.len() as u64,
+        wall_ms,
+        work_fan_out,
+        report_bytes: report_bytes.saturating_add(boundary.protected_budget.output_bytes),
+        stu,
+    };
+    let dimensions = [
+        ("input_bytes", job.budget.input_bytes, usage.input_bytes),
+        ("output_bytes", job.budget.output_bytes, usage.output_bytes),
+        ("source_width", job.budget.source_width, usage.source_width),
+        (
+            "reference_width",
+            job.budget.reference_width,
+            usage.reference_width,
+        ),
+        ("model_calls", job.budget.model_calls, usage.model_calls),
+        ("attempts", job.budget.attempts, usage.attempts),
+        ("candidates", job.budget.candidates, usage.candidates),
+        ("wall_ms", job.budget.wall_ms, usage.wall_ms),
+        ("work_fan_out", job.budget.work_fan_out, usage.work_fan_out),
+        ("report_bytes", job.budget.report_bytes, usage.report_bytes),
+        ("max_stu", job.budget.max_stu, usage.stu),
+    ];
+    for (name, limit, used) in dimensions {
+        let Some(limit) = limit else {
+            return BudgetDisposition::Unknown;
+        };
+        if used > limit {
+            return BudgetDisposition::Exceeded(name);
+        }
+    }
+    BudgetDisposition::Within
+}
+
+/// Returns true when an explicit external cadence reference is safe to carry.
+fn external_cadence_reference_is_safe(boundary: &MaintenanceBoundary) -> bool {
+    let Some(reference) = &boundary.external_automation_ref else {
+        return true;
+    };
+    !note_has_any(
+        reference,
+        &[
+            "create",
+            "new schedule",
+            "schedule now",
+            "launch",
+            "execute",
+        ],
+    )
+}
+
+/// Returns true when a prior effect or attempt state blocks blind repetition.
+fn history_blocks_blind_repeat(history: &PriorHistory) -> bool {
+    history.attempts.iter().any(|attempt| {
+        matches!(attempt.effect_state, PriorEffectState::Unknown)
+            || matches!(attempt.disposition, PriorAttemptDisposition::Unknown)
+            || matches!(
+                attempt.disposition,
+                PriorAttemptDisposition::NoProgress
+                    | PriorAttemptDisposition::Hung
+                    | PriorAttemptDisposition::Failed
+            ) && !attempt.changed_evidence
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2087,7 +2877,7 @@ fn attempt_denominator_of(history: &PriorHistory) -> Vec<String> {
 /// Ten explicit bindings mirror the canonical typed equivalent of the
 /// maintenance contract; bundling them would hide load-bearing distinctions
 /// at the digest boundary.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn compute_plan_digest(
     handle: &str,
     outcome_spelling: &str,
@@ -2106,13 +2896,45 @@ fn compute_plan_digest(
         ["objective:", &objective.objective_id].concat(),
         ["revision:", &objective.objective_revision.to_string()].concat(),
         ["product:", &objective.product_id].concat(),
+        ["module:", &objective.module_ref].concat(),
         ["owner:", &objective.owner].concat(),
+        ["causal:", &objective.causal_note].concat(),
         ["trigger:", &trigger.trigger_id].concat(),
+        ["trigger-kind:", trigger.kind.as_str()].concat(),
+        ["observation-owner:", &trigger.observation_owner].concat(),
+        ["affected-surface:", &trigger.affected_surface].concat(),
+        ["baseline:", &trigger.baseline_note].concat(),
+        ["condition:", &trigger.condition_note].concat(),
+        ["diagnosis:", &trigger.diagnosed_condition].concat(),
+        ["false-positive:", &trigger.false_positive_note].concat(),
+        ["persistence:", &trigger.persistence_note].concat(),
+        [
+            "one-shot:",
+            trigger.one_shot_justification.as_deref().unwrap_or(""),
+        ]
+        .concat(),
+        [
+            "mapping:",
+            trigger.outcome_mapping_note.as_deref().unwrap_or(""),
+        ]
+        .concat(),
+        ["invalidation:", &trigger.invalidation_note].concat(),
         ["trigger-context:", &trigger.context_digest].concat(),
         ["verifier:", &boundary.verifier.verifier_id].concat(),
+        [
+            "semantic-success:",
+            &boundary.verifier.semantic_success_predicate,
+        ]
+        .concat(),
         ["policy:", &policy.policy_id].concat(),
+        ["policy-revision:", &policy.policy_revision.to_string()].concat(),
+        ["policy-vocabulary:", &policy.allowed_op_kinds.join(",")].concat(),
+        ["policy-partial:", &policy.allow_partial.to_string()].concat(),
         ["receipt:", receipt_digest].concat(),
     ];
+    for owner in &objective.decomposition_owners {
+        parts.push(["decomposition-owner:", owner].concat());
+    }
     for handle in &trigger.evidence_refs {
         parts.push(["evidence:", handle].concat());
     }
@@ -2127,13 +2949,66 @@ fn compute_plan_digest(
                 &operation.owner,
                 "|",
                 &operation.order.to_string(),
+                "|",
+                operation.cancellation.as_str(),
             ]
             .concat(),
         );
+        for value in [
+            operation.output_note.as_str(),
+            operation.verifier_id.as_str(),
+            operation.effect_ceiling.as_str(),
+            operation.deadline_note.as_str(),
+            operation.cancel_note.as_str(),
+            operation.no_progress_note.as_str(),
+            operation.rollback_note.as_str(),
+            operation.disable_note.as_str(),
+            operation.stop_note.as_str(),
+            operation.reopen_note.as_str(),
+            &operation.max_retries.to_string(),
+        ] {
+            parts.push(["operation-field:", value].concat());
+        }
+        parts.push(
+            [
+                "operation-budget:",
+                &operation.budget.cpu_ms.to_string(),
+                ":",
+                &operation.budget.memory_bytes.to_string(),
+                ":",
+                &operation.budget.storage_bytes.to_string(),
+                ":",
+                &operation.budget.network_bytes.to_string(),
+                ":",
+                &operation.budget.context_bytes.to_string(),
+                ":",
+                &operation.budget.model_calls.to_string(),
+                ":",
+                &operation.budget.cost_units.to_string(),
+                ":",
+                &operation.budget.human_minutes.to_string(),
+                ":",
+                &operation.budget.wall_ms.to_string(),
+                ":",
+                &operation.budget.idle_ms.to_string(),
+                ":",
+                &operation.budget.work_items.to_string(),
+                ":",
+                &operation.budget.output_bytes.to_string(),
+            ]
+            .concat(),
+        );
+        for input in &operation.inputs {
+            parts.push(["input:", input].concat());
+        }
+        for precondition in &operation.preconditions {
+            parts.push(["precondition:", precondition].concat());
+        }
         for dependency in &operation.depends_on {
-            parts.push(
-                ["edge:", &operation.op_id, "->", dependency].concat(),
-            );
+            parts.push(["edge:", &operation.op_id, "->", dependency].concat());
+        }
+        for non_goal in &operation.non_goals {
+            parts.push(["non-goal:", non_goal].concat());
         }
     }
     for delta in deltas {
@@ -2142,12 +3017,40 @@ fn compute_plan_digest(
                 "delta:",
                 &delta.dimension,
                 "|",
+                &delta.baseline_note,
+                "|",
                 &delta.direction,
                 "|",
+                &delta.range_note,
+                "|",
+                &delta.evidence_note,
+                "|",
+                &delta.uncertainty_note,
+                "|",
                 &delta.verifier_id,
+                "|",
+                &delta.unacceptable_regression,
             ]
             .concat(),
         );
+    }
+    for note in [
+        boundary.verifier.success_note.as_str(),
+        boundary.verifier.partial_note.as_str(),
+        boundary.verifier.no_change_note.as_str(),
+        boundary.verifier.regression_note.as_str(),
+        boundary.verifier.failure_note.as_str(),
+        boundary.verifier.unknown_note.as_str(),
+        boundary.verifier.observation_window_note.as_str(),
+        boundary.verifier.denominator_note.as_str(),
+        boundary.verifier.stop_note.as_str(),
+        boundary.disable_note.as_str(),
+        boundary.forward_repair_note.as_str(),
+        boundary.reopen_note.as_str(),
+        boundary.approval_expiry_note.as_str(),
+        boundary.forbidden_widening_note.as_str(),
+    ] {
+        parts.push(["boundary:", note].concat());
     }
     for step in &boundary.rollback_steps {
         parts.push(["rollback:", step].concat());
@@ -2155,6 +3058,38 @@ fn compute_plan_digest(
     for decision in &boundary.required_decisions {
         parts.push(["decision:", decision].concat());
     }
+    if let Some(reference) = &boundary.external_automation_ref {
+        parts.push(["automation-reference:", reference].concat());
+    }
+    parts.push(
+        [
+            "protected-budget:",
+            &boundary.protected_budget.cpu_ms.to_string(),
+            ":",
+            &boundary.protected_budget.memory_bytes.to_string(),
+            ":",
+            &boundary.protected_budget.storage_bytes.to_string(),
+            ":",
+            &boundary.protected_budget.network_bytes.to_string(),
+            ":",
+            &boundary.protected_budget.context_bytes.to_string(),
+            ":",
+            &boundary.protected_budget.model_calls.to_string(),
+            ":",
+            &boundary.protected_budget.cost_units.to_string(),
+            ":",
+            &boundary.protected_budget.human_minutes.to_string(),
+            ":",
+            &boundary.protected_budget.wall_ms.to_string(),
+            ":",
+            &boundary.protected_budget.idle_ms.to_string(),
+            ":",
+            &boundary.protected_budget.work_items.to_string(),
+            ":",
+            &boundary.protected_budget.output_bytes.to_string(),
+        ]
+        .concat(),
+    );
     for attempt in &history.attempts {
         parts.push(
             [
@@ -2162,6 +3097,21 @@ fn compute_plan_digest(
                 &attempt.attempt_id,
                 "|",
                 &attempt.equivalence_digest,
+                "|",
+                attempt.disposition.as_str(),
+                "|",
+                attempt.effect_state.as_str(),
+                "|",
+                &attempt.changed_evidence.to_string(),
+                "|",
+                attempt.repeat_justification.as_str(),
+                "|",
+                attempt.request_digest.as_deref().unwrap_or(""),
+                "|",
+                &attempt
+                    .policy_revision
+                    .map_or(0, |revision| revision)
+                    .to_string(),
             ]
             .concat(),
         );
@@ -2227,6 +3177,7 @@ fn emit_candidate(
         objective_revision: objective.objective_revision,
         product_id: objective.product_id.clone(),
         owner: objective.owner.clone(),
+        decomposition_owners: objective.decomposition_owners.clone(),
         trigger_id: trigger.trigger_id.clone(),
         operations: operations.to_vec(),
         deltas: deltas.to_vec(),
@@ -2307,6 +3258,12 @@ pub fn propose_maintenance_plan(
     intrinsic_grounded_checks(draft, grounded)?;
     intrinsic_binding_checks(job, draft, policy)?;
     intrinsic_history_denominator(history)?;
+    if job.frozen_manifest_digest != objective.context_digest {
+        return Err(MaintenancePlanError::Binding {
+            field: "objective.context",
+            detail: "objective context drifts from the frozen job manifest".to_owned(),
+        });
+    }
     if trigger.context_digest != objective.context_digest {
         return Err(MaintenancePlanError::Binding {
             field: "trigger.context",
@@ -2349,6 +3306,44 @@ pub fn propose_maintenance_plan(
             &receipt_digest,
             "observation is at or beyond the frozen deadline; replay against the new revision",
         );
+    }
+    match assess_budget(
+        job, objective, trigger, operations, deltas, boundary, history, policy,
+    ) {
+        BudgetDisposition::Within => {}
+        BudgetDisposition::Unknown => {
+            return emit_candidate(
+                MaintenanceOutcome::Insufficient,
+                objective,
+                trigger,
+                operations,
+                deltas,
+                boundary,
+                history,
+                policy,
+                &receipt_digest,
+                "an unknown independent admitted budget cannot authorize a complete plan",
+            );
+        }
+        BudgetDisposition::Exceeded(dimension) => {
+            return emit_candidate(
+                MaintenanceOutcome::Insufficient,
+                objective,
+                trigger,
+                operations,
+                deltas,
+                boundary,
+                history,
+                policy,
+                &receipt_digest,
+                &[
+                    "the independent admitted budget is exceeded for ",
+                    dimension,
+                    "; no cross-subsidy is allowed",
+                ]
+                .concat(),
+            );
+        }
     }
     if !kinds_in_vocab(operations, policy) {
         return emit_candidate(
@@ -2434,6 +3429,50 @@ pub fn propose_maintenance_plan(
             "generic optimization prose is not a plan; only exact observed conditions with owners and verifiers are admitted",
         );
     }
+    if matches!(trigger.kind, TriggerKind::IncidentRecovery) {
+        return emit_candidate(
+            MaintenanceOutcome::Rejected,
+            objective,
+            trigger,
+            operations,
+            deltas,
+            boundary,
+            history,
+            policy,
+            &receipt_digest,
+            "incident and recovery conditions retain their operational owner outside Maintenance",
+        );
+    }
+    if !external_cadence_reference_is_safe(boundary) {
+        return emit_candidate(
+            MaintenanceOutcome::Rejected,
+            objective,
+            trigger,
+            operations,
+            deltas,
+            boundary,
+            history,
+            policy,
+            &receipt_digest,
+            "external cadence references cannot create, schedule, launch, or execute work",
+        );
+    }
+    if matches!(trigger.kind, TriggerKind::ExternalCadence)
+        && boundary.external_automation_ref.is_none()
+    {
+        return emit_candidate(
+            MaintenanceOutcome::DecisionRequired,
+            objective,
+            trigger,
+            operations,
+            deltas,
+            boundary,
+            history,
+            policy,
+            &receipt_digest,
+            "an external cadence must be referenced by its owning automation contract",
+        );
+    }
     if trigger.evidence_refs.is_empty() {
         return emit_candidate(
             MaintenanceOutcome::Insufficient,
@@ -2466,6 +3505,24 @@ pub fn propose_maintenance_plan(
             policy,
             &receipt_digest,
             "signals without an evidence-backed user-outcome mapping prove no maintenance delta",
+        );
+    }
+    if !trigger
+        .outcome_mapping_note
+        .as_deref()
+        .is_some_and(|mapping| mapping.contains(&objective.product_id))
+    {
+        return emit_candidate(
+            MaintenanceOutcome::Insufficient,
+            objective,
+            trigger,
+            operations,
+            deltas,
+            boundary,
+            history,
+            policy,
+            &receipt_digest,
+            "the trigger mapping does not identify the exact supported product outcome",
         );
     }
     if trigger.denominator_total == 1 && trigger.one_shot_justification.is_none() {
@@ -2511,7 +3568,7 @@ pub fn propose_maintenance_plan(
         );
     }
     let owners = distinct_owners(operations);
-    if owners.len() > 1 {
+    if owners.len() > 1 && objective.decomposition_owners.is_empty() {
         return emit_candidate(
             MaintenanceOutcome::DecisionRequired,
             objective,
@@ -2525,8 +3582,7 @@ pub fn propose_maintenance_plan(
             "independent multi-owner objectives require explicit decomposition, not one hidden generic job",
         );
     }
-    let single_matches = owners.first().is_some_and(|owner| owner.as_str() == objective.owner.as_str());
-    if !single_matches {
+    if !owner_decomposition_is_explicit(objective, operations) {
         return emit_candidate(
             MaintenanceOutcome::Rejected,
             objective,
@@ -2568,6 +3624,67 @@ pub fn propose_maintenance_plan(
             "cyclic dependencies hide unbounded recurrence; only finite acyclic graphs are admitted",
         );
     }
+    if !graph_order_is_finite(operations) {
+        return emit_candidate(
+            MaintenanceOutcome::Rejected,
+            objective,
+            trigger,
+            operations,
+            deltas,
+            boundary,
+            history,
+            policy,
+            &receipt_digest,
+            "operation orders must be contiguous and every dependency must precede its consumer",
+        );
+    }
+    if operations
+        .iter()
+        .any(|operation| !operation_semantics_are_bounded(operation, boundary))
+    {
+        return emit_candidate(
+            MaintenanceOutcome::Rejected,
+            objective,
+            trigger,
+            operations,
+            deltas,
+            boundary,
+            history,
+            policy,
+            &receipt_digest,
+            "an operation lacks typed cancellation, recovery, deadline, or no-progress boundaries",
+        );
+    }
+    if !retries_fit_verifier(operations, &boundary.verifier) {
+        return emit_candidate(
+            MaintenanceOutcome::Rejected,
+            objective,
+            trigger,
+            operations,
+            deltas,
+            boundary,
+            history,
+            policy,
+            &receipt_digest,
+            "operation retry envelopes exceed the semantic verifier attempt ceiling",
+        );
+    }
+    if !verifier_semantics_are_distinct(&boundary.verifier)
+        || verifier_is_process_only(&boundary.verifier)
+    {
+        return emit_candidate(
+            MaintenanceOutcome::Insufficient,
+            objective,
+            trigger,
+            operations,
+            deltas,
+            boundary,
+            history,
+            policy,
+            &receipt_digest,
+            "a semantic verifier must distinguish outcomes and observe the condition or effect, not process activity alone",
+        );
+    }
     if !verifiers_bind(operations, boundary) {
         return emit_candidate(
             MaintenanceOutcome::Rejected,
@@ -2596,6 +3713,20 @@ pub fn propose_maintenance_plan(
             "every expected delta binds the single independent semantic verifier",
         );
     }
+    if !deltas_cover_independent_dimensions(deltas) {
+        return emit_candidate(
+            MaintenanceOutcome::Insufficient,
+            objective,
+            trigger,
+            operations,
+            deltas,
+            boundary,
+            history,
+            policy,
+            &receipt_digest,
+            "every independent correctness, recovery, quality, resource, evidence, security, Human and user-outcome dimension needs a delta",
+        );
+    }
     if cost_offsets_safety(deltas) {
         return emit_candidate(
             MaintenanceOutcome::Rejected,
@@ -2610,6 +3741,20 @@ pub fn propose_maintenance_plan(
             "cost improvement cannot compensate a safety or correctness shortfall",
         );
     }
+    if history_blocks_blind_repeat(history) {
+        return emit_candidate(
+            MaintenanceOutcome::DecisionRequired,
+            objective,
+            trigger,
+            operations,
+            deltas,
+            boundary,
+            history,
+            policy,
+            &receipt_digest,
+            "failed, stalled, hung, or unknown prior effects require reconciliation or changed evidence before repetition",
+        );
+    }
     let complete = emit_candidate(
         MaintenanceOutcome::Complete,
         objective,
@@ -2622,8 +3767,75 @@ pub fn propose_maintenance_plan(
         &receipt_digest,
         MAINTENANCE_PROOF_NOTE,
     )?;
+    let mut identity_history = history.clone();
+    identity_history.expected_attempt_ids.clear();
+    identity_history.attempts.clear();
+    let identity_digest = compute_plan_digest(
+        &complete.plan_handle,
+        MaintenanceOutcome::Complete.as_str(),
+        objective,
+        trigger,
+        operations,
+        deltas,
+        boundary,
+        &identity_history,
+        policy,
+        &receipt_digest,
+    )?;
     for attempt in &history.attempts {
-        if attempt.equivalence_digest.as_str() == complete.candidate_digest.as_str() {
+        if attempt.attempt_id.as_str() == job.operation_id.as_str() {
+            let mut empty_history = history.clone();
+            empty_history.expected_attempt_ids.clear();
+            empty_history.attempts.clear();
+            let request_digest = compute_plan_digest(
+                &complete.plan_handle,
+                MaintenanceOutcome::Complete.as_str(),
+                objective,
+                trigger,
+                operations,
+                deltas,
+                boundary,
+                &empty_history,
+                policy,
+                &receipt_digest,
+            )?;
+            if let Some(previous_policy_revision) = attempt.policy_revision
+                && previous_policy_revision != policy.policy_revision
+            {
+                return emit_candidate(
+                    MaintenanceOutcome::Stale,
+                    objective,
+                    trigger,
+                    operations,
+                    deltas,
+                    boundary,
+                    history,
+                    policy,
+                    &receipt_digest,
+                    "same operation identity carries a changed policy revision; replay is stale",
+                );
+            }
+            if let Some(previous_request_digest) = &attempt.request_digest
+                && previous_request_digest != &request_digest
+            {
+                return emit_candidate(
+                    MaintenanceOutcome::Rejected,
+                    objective,
+                    trigger,
+                    operations,
+                    deltas,
+                    boundary,
+                    history,
+                    policy,
+                    &receipt_digest,
+                    "same operation identity carries a different canonical request; identity conflict blocks transition",
+                );
+            }
+        }
+        if attempt.equivalence_digest.as_str() == identity_digest.as_str()
+            && (!attempt.changed_evidence
+                || matches!(attempt.repeat_justification, RepeatJustification::None))
+        {
             return emit_candidate(
                 MaintenanceOutcome::Rejected,
                 objective,
@@ -2642,6 +3854,7 @@ pub fn propose_maintenance_plan(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::error_rejection_hint;
     use super::is_hex64_lower;
@@ -2680,17 +3893,17 @@ mod tests {
     /// Returns test budget limits covering every dimension.
     fn test_budget() -> BudgetLimits {
         BudgetLimits {
-            input_bytes: Some(1024),
-            output_bytes: Some(1024),
-            source_width: Some(8),
-            reference_width: Some(8),
-            model_calls: Some(4),
-            attempts: Some(2),
-            candidates: Some(2),
-            wall_ms: Some(1000),
-            work_fan_out: Some(2),
-            report_bytes: Some(1024),
-            max_stu: Some(10),
+            input_bytes: Some(1_048_576),
+            output_bytes: Some(1_048_576),
+            source_width: Some(64),
+            reference_width: Some(64),
+            model_calls: Some(1),
+            attempts: Some(16),
+            candidates: Some(16),
+            wall_ms: Some(600_000),
+            work_fan_out: Some(32),
+            report_bytes: Some(1_048_576),
+            max_stu: Some(10_000),
         }
     }
 
@@ -2733,7 +3946,7 @@ mod tests {
             state_fence: test_fence(),
             privacy_profile: "local_only".to_owned(),
             contract_ref: "contract-1".to_owned(),
-            policy_ref: "policy-1".to_owned(),
+            policy_ref: "policy-7".to_owned(),
             budget: test_budget(),
             deadline_ms: None,
             frozen_manifest_digest: "c".repeat(64),
@@ -2774,6 +3987,7 @@ mod tests {
             product_id: "product-1".to_owned(),
             module_ref: "module-cache".to_owned(),
             owner: "owner-1".to_owned(),
+            decomposition_owners: Vec::new(),
             causal_note: "warm-key hit rate stays above the bound".to_owned(),
             context_digest: "c".repeat(64),
         }
@@ -2783,6 +3997,10 @@ mod tests {
     fn test_trigger() -> super::TriggerEvidence {
         super::TriggerEvidence {
             trigger_id: "trig-1".to_owned(),
+            kind: super::TriggerKind::QualityDegradation,
+            observation_owner: "observer-1".to_owned(),
+            affected_surface: "module-cache".to_owned(),
+            baseline_note: "baseline hit rate is 0.80 for the same scope".to_owned(),
             condition_note: "warm-key hit rate 0.61 below bound 0.80 for three windows".to_owned(),
             diagnosed_condition: "cache fragmentation after rotation".to_owned(),
             evidence_refs: vec!["e-1".to_owned(), "e-2".to_owned(), "e-3".to_owned()],
@@ -2792,7 +4010,7 @@ mod tests {
             persistence_note: "condition persists across three observation windows".to_owned(),
             one_shot_justification: None,
             outcome_mapping_note: Some(
-                "hit rate maps to checkout latency per outcome profile o-9".to_owned(),
+                "product-1 hit rate maps to checkout latency per outcome profile o-9".to_owned(),
             ),
             invalidation_note: "invalidated by a full-window recovery above bound".to_owned(),
             context_digest: "c".repeat(64),
@@ -2834,6 +4052,7 @@ mod tests {
             max_retries: 2,
             deadline_note: ["deadline holds for ", identity].concat(),
             cancel_note: ["cancel before effect for ", identity].concat(),
+            cancellation: super::CancellationHandling::BeforeEffectNoEffect,
             no_progress_note: ["no-progress guard for ", identity].concat(),
             rollback_note: ["rollback restores prior state for ", identity].concat(),
             disable_note: ["disable parks the surface for ", identity].concat(),
@@ -2856,30 +4075,80 @@ mod tests {
         vec![first, second, third]
     }
 
-    /// Returns two independent expected deltas for the tests.
+    /// Returns every independent expected delta dimension for the tests.
     fn test_deltas() -> Vec<super::ExpectedDelta> {
-        vec![
-            super::ExpectedDelta {
-                dimension: "latency".to_owned(),
-                baseline_note: "p99 checkout latency 900ms at baseline".to_owned(),
-                direction: "improve".to_owned(),
-                range_note: "p99 between 600ms and 800ms after the plan".to_owned(),
-                evidence_note: "prior vacuum moved p99 12 percent on ep-1".to_owned(),
-                uncertainty_note: "load variance plus or minus 5 percent".to_owned(),
-                verifier_id: "verifier-7".to_owned(),
-                unacceptable_regression: "any p99 above 950ms is unacceptable".to_owned(),
-            },
-            super::ExpectedDelta {
-                dimension: "cost".to_owned(),
-                baseline_note: "nightly vacuum costs 40 units at baseline".to_owned(),
-                direction: "preserve".to_owned(),
-                range_note: "cost between 30 and 45 units after the plan".to_owned(),
-                evidence_note: "prior vacuum cost 38 units on ep-1".to_owned(),
-                uncertainty_note: "storage variance plus or minus 3 units".to_owned(),
-                verifier_id: "verifier-7".to_owned(),
-                unacceptable_regression: "any cost above 60 units is unacceptable".to_owned(),
-            },
+        [
+            (
+                "correctness",
+                "improve",
+                "semantic correctness remains within the typed invariant",
+            ),
+            (
+                "recovery",
+                "improve",
+                "recovery returns to the prior safe state",
+            ),
+            (
+                "memory_quality",
+                "improve",
+                "memory quality retains the same source lineage",
+            ),
+            (
+                "context_quality",
+                "improve",
+                "context quality keeps the declared scope",
+            ),
+            (
+                "latency",
+                "improve",
+                "p99 latency falls inside the declared range",
+            ),
+            (
+                "resources",
+                "bounded",
+                "resource consumption remains inside the independent bound",
+            ),
+            ("cost", "preserve", "cost remains within the admitted range"),
+            (
+                "evidence",
+                "improve",
+                "evidence coverage is verified on the frozen denominator",
+            ),
+            (
+                "capability",
+                "preserve",
+                "capability support stays at the admitted ceiling",
+            ),
+            ("security", "preserve", "security posture does not regress"),
+            ("privacy", "preserve", "privacy posture does not widen"),
+            (
+                "maintenance_burden",
+                "reduce",
+                "maintenance burden falls in the next window",
+            ),
+            (
+                "human_burden",
+                "reduce",
+                "Human burden stays below the declared review range",
+            ),
+            (
+                "user_outcome",
+                "improve",
+                "product-1 user outcome improves on the declared scope",
+            ),
         ]
+        .into_iter()
+        .map(|(dimension, direction, range)| super::ExpectedDelta {
+            dimension: dimension.to_owned(),
+            baseline_note: ["baseline for ", dimension].concat(),
+            direction: direction.to_owned(),
+            range_note: range.to_owned(),
+            evidence_note: ["evidence for ", dimension, " is retained"].concat(),
+            uncertainty_note: "bounded measurement uncertainty is retained".to_owned(),
+            verifier_id: "verifier-7".to_owned(),
+            unacceptable_regression: ["any regression in ", dimension, " is unacceptable"].concat(),
+        })
+        .collect()
     }
 
     /// Returns the inert verifier, rollback, and approval boundary.
@@ -2888,6 +4157,7 @@ mod tests {
             verifier: super::SemanticVerifier {
                 verifier_id: "verifier-7".to_owned(),
                 success_note: "hit rate above bound for one full window".to_owned(),
+                semantic_success_predicate: "semantic outcome preserves the product-1 hit-rate invariant for one full window".to_owned(),
                 partial_note: "hit rate recovers for half a window only".to_owned(),
                 no_change_note: "hit rate unchanged within measurement noise".to_owned(),
                 regression_note: "hit rate falls further on the same denominator".to_owned(),
@@ -2912,6 +4182,21 @@ mod tests {
             approval_expiry_note: "approval expires after one window".to_owned(),
             silence_is_approval: false,
             forbidden_widening_note: "no widening is admitted by this plan".to_owned(),
+            protected_budget: super::BudgetSlice {
+                cpu_ms: 10_000,
+                memory_bytes: 16_777_216,
+                storage_bytes: 16_777_216,
+                network_bytes: 65_536,
+                context_bytes: 16_384,
+                model_calls: 0,
+                cost_units: 10,
+                human_minutes: 10,
+                wall_ms: 30_000,
+                idle_ms: 10_000,
+                work_items: 1,
+                output_bytes: 4_096,
+            },
+            external_automation_ref: None,
         }
     }
 
@@ -2922,6 +4207,12 @@ mod tests {
             attempts: vec![super::HistoryAttempt {
                 attempt_id: "att-1".to_owned(),
                 equivalence_digest: "a".repeat(64),
+                disposition: super::PriorAttemptDisposition::Verified,
+                effect_state: super::PriorEffectState::NoEffect,
+                changed_evidence: false,
+                repeat_justification: super::RepeatJustification::None,
+                request_digest: None,
+                policy_revision: None,
             }],
             outcome_note: "one prior attempt retained verbatim".to_owned(),
         }
@@ -2933,16 +4224,16 @@ mod tests {
             policy_id: "policy-7".to_owned(),
             policy_revision: 2,
             allowed_op_kinds: vec![
-                "inspect".to_owned(),
-                "vacuum".to_owned(),
-                "reindex".to_owned(),
                 "compact".to_owned(),
-                "snapshot".to_owned(),
-                "verify".to_owned(),
-                "reconcile".to_owned(),
+                "inspect".to_owned(),
                 "prune".to_owned(),
+                "reconcile".to_owned(),
                 "refresh".to_owned(),
+                "reindex".to_owned(),
                 "rotate".to_owned(),
+                "snapshot".to_owned(),
+                "vacuum".to_owned(),
+                "verify".to_owned(),
             ],
             max_operations: super::MAX_OPERATIONS,
             max_dependencies: super::MAX_DEPENDENCIES,
@@ -2985,6 +4276,65 @@ mod tests {
         candidate
     }
 
+    /// Owns one mutable test fixture so every numbered case exercises the
+    /// public planner entry point with a disjoint semantic mutation.
+    struct Fixture {
+        job: DreamJobAdmission,
+        draft: ValidatedDreamDraft,
+        grounded: GroundedDreamDraft,
+        objective: super::MaintenanceObjective,
+        trigger: super::TriggerEvidence,
+        history: super::PriorHistory,
+        operations: Vec<super::PlannedOperation>,
+        deltas: Vec<super::ExpectedDelta>,
+        boundary: super::MaintenanceBoundary,
+        policy: super::MaintenancePolicy,
+    }
+
+    impl Fixture {
+        fn fresh() -> Self {
+            Self {
+                job: test_job(),
+                draft: test_draft(),
+                grounded: test_grounded(),
+                objective: test_objective(),
+                trigger: test_trigger(),
+                history: test_history(),
+                operations: test_operations(),
+                deltas: test_deltas(),
+                boundary: test_boundary(),
+                policy: test_policy(),
+            }
+        }
+
+        fn propose(&self) -> Result<super::MaintenancePlanCandidate, super::MaintenancePlanError> {
+            propose_maintenance_plan(
+                &self.job,
+                &self.draft,
+                &self.grounded,
+                &self.objective,
+                &self.trigger,
+                &self.history,
+                &self.operations,
+                &self.deltas,
+                &self.boundary,
+                &self.policy,
+            )
+        }
+    }
+
+    fn inert_outcome(
+        fixture: &Fixture,
+        expected: super::MaintenanceOutcome,
+    ) -> super::MaintenancePlanCandidate {
+        let Ok(candidate) = fixture.propose() else {
+            panic!("semantic case must return an inert candidate");
+        };
+        assert_eq!(candidate.outcome, expected);
+        assert!(candidate.preservation.overall().is_ok());
+        candidate
+    }
+
     // WORK_UNIT_CASE: 677/1
     #[test]
     fn case_01_valid_owner_bound_plan_completes() {
@@ -2996,7 +4346,7 @@ mod tests {
         assert_eq!(candidate.owner, "owner-1");
         assert_eq!(candidate.trigger_id, "trig-1");
         assert_eq!(candidate.operations.len(), 3);
-        assert_eq!(candidate.deltas.len(), 2);
+        assert_eq!(candidate.deltas.len(), 14);
         assert_eq!(candidate.verifier_id, "verifier-7");
         assert_eq!(candidate.rollback_steps.len(), 2);
         assert_eq!(candidate.required_decisions.len(), 2);
@@ -3036,7 +4386,10 @@ mod tests {
         ) else {
             panic!("unknown vocab stays an inert outcome");
         };
-        assert_eq!(candidate.outcome, super::MaintenanceOutcome::UnsupportedShape);
+        assert_eq!(
+            candidate.outcome,
+            super::MaintenanceOutcome::UnsupportedShape
+        );
         assert_eq!(
             outcome_rejection_hint(&candidate.outcome),
             Some(CurationRejectionCode::UnsupportedJobShape)
@@ -3259,5 +4612,687 @@ mod tests {
             Some(CurationRejectionCode::PreservationFailed)
         );
         assert!(candidate.preservation.overall().is_ok());
+    }
+
+    // WORK_UNIT_CASE: 677/9
+    #[test]
+    fn case_09_incident_and_recovery_keep_their_owner() {
+        let mut fixture = Fixture::fresh();
+        fixture.trigger.kind = super::TriggerKind::IncidentRecovery;
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("operational owner"));
+    }
+
+    // WORK_UNIT_CASE: 677/10
+    #[test]
+    fn case_10_explicit_multi_owner_decomposition_is_retained() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[1].owner = "owner-2".to_owned();
+        fixture.objective.decomposition_owners = vec!["owner-1".to_owned(), "owner-2".to_owned()];
+        let candidate = fixture
+            .propose()
+            .expect("explicit decomposition is a candidate");
+        assert_eq!(candidate.outcome, super::MaintenanceOutcome::Complete);
+        assert_eq!(
+            candidate.decomposition_owners,
+            fixture.objective.decomposition_owners
+        );
+    }
+
+    // WORK_UNIT_CASE: 677/11
+    #[test]
+    fn case_11_conflicting_owner_without_decomposition_needs_decision() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[1].owner = "owner-2".to_owned();
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::DecisionRequired);
+        assert!(candidate.note.contains("decomposition"));
+    }
+
+    // WORK_UNIT_CASE: 677/12
+    #[test]
+    fn case_12_history_must_cover_its_declared_denominator() {
+        let mut fixture = Fixture::fresh();
+        fixture
+            .history
+            .expected_attempt_ids
+            .push("att-2".to_owned());
+        let result = fixture.propose();
+        assert!(matches!(
+            result,
+            Err(super::MaintenancePlanError::Denominator { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/13
+    #[test]
+    fn case_13_equivalent_plan_without_new_evidence_is_rejected() {
+        let mut fixture = Fixture::fresh();
+        fixture.history.expected_attempt_ids.clear();
+        fixture.history.attempts.clear();
+        let first = fixture.propose().expect("identity fixture must be valid");
+        let mut identity_history = fixture.history.clone();
+        identity_history.expected_attempt_ids.clear();
+        identity_history.attempts.clear();
+        let identity_digest = super::compute_plan_digest(
+            &first.plan_handle,
+            super::MaintenanceOutcome::Complete.as_str(),
+            &fixture.objective,
+            &fixture.trigger,
+            &fixture.operations,
+            &fixture.deltas,
+            &fixture.boundary,
+            &identity_history,
+            &fixture.policy,
+            &fixture.draft.receipt.output_digest,
+        )
+        .expect("identity digest must be deterministic");
+        fixture.history.expected_attempt_ids = vec!["att-replay".to_owned()];
+        fixture.history.attempts = vec![super::HistoryAttempt {
+            attempt_id: "att-replay".to_owned(),
+            equivalence_digest: identity_digest,
+            disposition: super::PriorAttemptDisposition::Verified,
+            effect_state: super::PriorEffectState::NoEffect,
+            changed_evidence: false,
+            repeat_justification: super::RepeatJustification::None,
+            request_digest: None,
+            policy_revision: None,
+        }];
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("equivalent"));
+    }
+
+    // WORK_UNIT_CASE: 677/14
+    #[test]
+    fn case_14_controlled_equivalent_repeat_requires_new_evidence() {
+        let mut fixture = Fixture::fresh();
+        fixture.history.expected_attempt_ids.clear();
+        fixture.history.attempts.clear();
+        let first = fixture.propose().expect("identity fixture must be valid");
+        let identity_digest = super::compute_plan_digest(
+            &first.plan_handle,
+            super::MaintenanceOutcome::Complete.as_str(),
+            &fixture.objective,
+            &fixture.trigger,
+            &fixture.operations,
+            &fixture.deltas,
+            &fixture.boundary,
+            &fixture.history,
+            &fixture.policy,
+            &fixture.draft.receipt.output_digest,
+        )
+        .expect("identity digest must be deterministic");
+        fixture.history.expected_attempt_ids = vec!["att-repeat".to_owned()];
+        fixture.history.attempts = vec![super::HistoryAttempt {
+            attempt_id: "att-repeat".to_owned(),
+            equivalence_digest: identity_digest,
+            disposition: super::PriorAttemptDisposition::Failed,
+            effect_state: super::PriorEffectState::NoEffect,
+            changed_evidence: true,
+            repeat_justification: super::RepeatJustification::Replication,
+            request_digest: None,
+            policy_revision: None,
+        }];
+        let candidate = fixture
+            .propose()
+            .expect("controlled repeat remains a candidate");
+        assert_eq!(candidate.outcome, super::MaintenanceOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 677/15
+    #[test]
+    fn case_15_failed_no_progress_or_hung_history_blocks_blind_retry() {
+        let mut fixture = Fixture::fresh();
+        fixture.history.attempts[0].disposition = super::PriorAttemptDisposition::NoProgress;
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::DecisionRequired);
+        assert!(candidate.note.contains("changed evidence"));
+    }
+
+    // WORK_UNIT_CASE: 677/16
+    #[test]
+    fn case_16_dependency_graph_is_finite_and_ordered() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[2].order = 4;
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("contiguous"));
+    }
+
+    // WORK_UNIT_CASE: 677/17
+    #[test]
+    fn case_17_operation_missing_owner_is_malformed() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[0].owner.clear();
+        let result = fixture.propose();
+        assert!(matches!(
+            result,
+            Err(super::MaintenancePlanError::Shape { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/18
+    #[test]
+    fn case_18_cycle_and_hidden_recurrence_are_rejected() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[1].depends_on = vec!["op-verify".to_owned()];
+        fixture.operations[2].depends_on = vec!["op-vacuum".to_owned()];
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("cyclic") || candidate.note.contains("finite"));
+    }
+
+    // WORK_UNIT_CASE: 677/19
+    #[test]
+    fn case_19_raw_command_provider_payload_or_secret_is_rejected() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[0].output_note = "run command shell: vacuum --all".to_owned();
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("raw commands"));
+    }
+
+    // WORK_UNIT_CASE: 677/20
+    #[test]
+    fn case_20_each_independent_budget_boundary_rejects_one_over() {
+        let setters: &[fn(&mut super::BudgetSlice)] = &[
+            |budget| budget.cpu_ms = super::CPU_MS_CEILING + 1,
+            |budget| budget.memory_bytes = super::MEMORY_BYTES_CEILING + 1,
+            |budget| budget.storage_bytes = super::STORAGE_BYTES_CEILING + 1,
+            |budget| budget.network_bytes = super::NETWORK_BYTES_CEILING + 1,
+            |budget| budget.context_bytes = super::CONTEXT_BYTES_CEILING + 1,
+            |budget| budget.model_calls = 1,
+            |budget| budget.cost_units = super::COST_UNITS_CEILING + 1,
+            |budget| budget.human_minutes = super::HUMAN_MINUTES_CEILING + 1,
+            |budget| budget.wall_ms = super::WALL_MS_CEILING + 1,
+            |budget| budget.idle_ms = super::IDLE_MS_CEILING + 1,
+            |budget| budget.work_items = super::WORK_ITEMS_CEILING + 1,
+            |budget| budget.output_bytes = super::OUTPUT_BYTES_CEILING + 1,
+        ];
+        for set_over in setters {
+            let mut fixture = Fixture::fresh();
+            set_over(&mut fixture.operations[0].budget);
+            assert!(matches!(
+                fixture.propose(),
+                Err(super::MaintenancePlanError::Bounds { .. })
+            ));
+        }
+        let mut protected = Fixture::fresh();
+        protected.boundary.protected_budget.cpu_ms = super::CPU_MS_CEILING + 1;
+        assert!(matches!(
+            protected.propose(),
+            Err(super::MaintenancePlanError::Bounds { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/21
+    #[test]
+    fn case_21_unknown_admitted_budget_is_not_unlimited() {
+        let mut fixture = Fixture::fresh();
+        fixture.job.budget.input_bytes = None;
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Insufficient);
+        assert!(candidate.note.contains("unknown independent"));
+    }
+
+    // WORK_UNIT_CASE: 677/22
+    #[test]
+    fn case_22_underuse_in_one_dimension_cannot_cover_another() {
+        let mut fixture = Fixture::fresh();
+        fixture.job.budget.input_bytes = Some(1);
+        fixture.job.budget.output_bytes = Some(1_048_576);
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Insufficient);
+        assert!(candidate.note.contains("input_bytes"));
+    }
+
+    // WORK_UNIT_CASE: 677/23
+    #[test]
+    fn case_23_protected_verification_rollback_and_human_headroom_is_explicit() {
+        let mut fixture = Fixture::fresh();
+        fixture.boundary.protected_budget.human_minutes = 0;
+        let result = fixture.propose();
+        assert!(matches!(
+            result,
+            Err(super::MaintenancePlanError::Shape { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/24
+    #[test]
+    fn case_24_budget_exhaustion_keeps_omitted_operations_visible() {
+        let mut fixture = Fixture::fresh();
+        fixture.job.budget.candidates = Some(2);
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Insufficient);
+        assert_eq!(candidate.operations.len(), 3);
+        assert!(candidate.note.contains("candidates"));
+    }
+
+    // WORK_UNIT_CASE: 677/25
+    #[test]
+    fn case_25_expected_deltas_are_independent_and_complete() {
+        let mut fixture = Fixture::fresh();
+        fixture.deltas.retain(|delta| delta.dimension != "privacy");
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Insufficient);
+        assert!(candidate.note.contains("independent"));
+    }
+
+    // WORK_UNIT_CASE: 677/26
+    #[test]
+    fn case_26_cost_improvement_cannot_compensate_safety_failure() {
+        let mut fixture = Fixture::fresh();
+        for delta in &mut fixture.deltas {
+            if delta.dimension == "cost" {
+                delta.direction = "improve".to_owned();
+            }
+            if delta.dimension == "security" {
+                delta.direction = "preserve".to_owned();
+            }
+        }
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("cannot compensate"));
+    }
+
+    // WORK_UNIT_CASE: 677/27
+    #[test]
+    fn case_27_unsupported_product_mapping_stays_insufficient() {
+        let mut fixture = Fixture::fresh();
+        fixture.trigger.outcome_mapping_note =
+            Some("product-unknown has a metric delta".to_owned());
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Insufficient);
+        assert!(candidate.note.contains("exact supported product"));
+    }
+
+    // WORK_UNIT_CASE: 677/28
+    #[test]
+    fn case_28_operations_and_deltas_bind_the_exact_semantic_verifier() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[0].verifier_id = "other-verifier".to_owned();
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("semantic verifier"));
+    }
+
+    // WORK_UNIT_CASE: 677/29
+    #[test]
+    fn case_29_process_exit_or_metric_movement_is_not_semantic_success() {
+        let mut fixture = Fixture::fresh();
+        fixture.boundary.verifier.success_note = "exit 0".to_owned();
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Insufficient);
+        assert!(candidate.note.contains("process activity"));
+    }
+
+    // WORK_UNIT_CASE: 677/30
+    #[test]
+    fn case_30_verifier_outcomes_remain_distinct() {
+        let mut fixture = Fixture::fresh();
+        fixture.boundary.verifier.partial_note = fixture.boundary.verifier.success_note.clone();
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Insufficient);
+        assert!(candidate.note.contains("distinguish outcomes"));
+    }
+
+    // WORK_UNIT_CASE: 677/31
+    #[test]
+    fn case_31_retry_and_stop_envelopes_fit_the_verifier() {
+        let mut fixture = Fixture::fresh();
+        fixture.boundary.verifier.max_attempts = 1;
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("attempt ceiling"));
+    }
+
+    // WORK_UNIT_CASE: 677/32
+    #[test]
+    fn case_32_cancellation_distinguishes_no_effect_from_possible_effect() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[1].cancellation =
+            super::CancellationHandling::PossibleEffectRequiresReconciliation;
+        fixture.operations[1].cancel_note =
+            "cancellation with possible effect requires reconciliation before retry".to_owned();
+        let candidate = fixture
+            .propose()
+            .expect("typed cancellation remains a candidate");
+        assert_eq!(candidate.outcome, super::MaintenanceOutcome::Complete);
+        assert_eq!(
+            candidate.operations[1].cancellation,
+            super::CancellationHandling::PossibleEffectRequiresReconciliation
+        );
+    }
+
+    // WORK_UNIT_CASE: 677/33
+    #[test]
+    fn case_33_unknown_prior_effect_blocks_unsafe_retry() {
+        let mut fixture = Fixture::fresh();
+        fixture.history.attempts[0].effect_state = super::PriorEffectState::Unknown;
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::DecisionRequired);
+        assert!(candidate.note.contains("unknown prior effects"));
+    }
+
+    // WORK_UNIT_CASE: 677/34
+    #[test]
+    fn case_34_cleanup_rollback_disable_and_forward_repair_are_required() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[0].rollback_note = "leave the prior state unspecified".to_owned();
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("recovery"));
+    }
+
+    // WORK_UNIT_CASE: 677/35
+    #[test]
+    fn case_35_explicit_human_decision_is_required() {
+        let mut fixture = Fixture::fresh();
+        fixture.boundary.required_decisions.clear();
+        let result = fixture.propose();
+        assert!(matches!(
+            result,
+            Err(super::MaintenancePlanError::Shape { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/36
+    #[test]
+    fn case_36_silence_is_not_approval() {
+        let mut fixture = Fixture::fresh();
+        fixture.boundary.silence_is_approval = true;
+        let result = fixture.propose();
+        assert!(matches!(
+            result,
+            Err(super::MaintenancePlanError::Shape { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/37
+    #[test]
+    fn case_37_privacy_cost_remote_model_and_policy_widening_is_rejected() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[0].effect_ceiling = "share externally and grant admin".to_owned();
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("widening"));
+    }
+
+    // WORK_UNIT_CASE: 677/38
+    #[test]
+    fn case_38_external_cadence_is_referenced_without_creating_one() {
+        let mut fixture = Fixture::fresh();
+        fixture.trigger.kind = super::TriggerKind::ExternalCadence;
+        fixture.boundary.external_automation_ref = Some("maintenance-mode-ref-9".to_owned());
+        let candidate = fixture
+            .propose()
+            .expect("external cadence remains a reference");
+        assert_eq!(candidate.outcome, super::MaintenanceOutcome::Complete);
+        assert!(!candidate.note.contains("schedule"));
+    }
+
+    // WORK_UNIT_CASE: 677/39
+    #[test]
+    fn case_39_candidate_has_no_executable_runtime_owner_surface() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[0].output_note = "execute now".to_owned();
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("scheduling"));
+    }
+
+    // WORK_UNIT_CASE: 677/40
+    #[test]
+    fn case_40_preserves_all_output_dimensions_and_input_receipt_lineage() {
+        let candidate = run_valid();
+        assert_eq!(candidate.preservation.verdicts.len(), 7);
+        assert_eq!(candidate.input_receipt_digest, "e".repeat(64));
+        assert!(candidate.preservation.overall().is_ok());
+        assert!(!candidate.note.contains("reinvok"));
+    }
+
+    // WORK_UNIT_CASE: 677/41
+    #[test]
+    fn case_41_partial_deadline_and_cancellation_are_distinct() {
+        let mut partial = Fixture::fresh();
+        partial.trigger.denominator_covered = 2;
+        partial.policy.allow_partial = true;
+        assert_eq!(
+            partial
+                .propose()
+                .expect("partial is an inert result")
+                .outcome,
+            super::MaintenanceOutcome::Partial
+        );
+        let mut cancelled = Fixture::fresh();
+        cancelled.policy.cancelled = true;
+        assert_eq!(
+            cancelled
+                .propose()
+                .expect("cancelled is an inert result")
+                .outcome,
+            super::MaintenanceOutcome::Rejected
+        );
+        let mut stale = Fixture::fresh();
+        stale.policy.observation_time_ms = Some(10);
+        stale.policy.deadline_ms = Some(10);
+        assert_eq!(
+            stale
+                .propose()
+                .expect("deadline is an inert result")
+                .outcome,
+            super::MaintenanceOutcome::Stale
+        );
+    }
+
+    // WORK_UNIT_CASE: 677/42
+    #[test]
+    fn case_42_proof_and_authority_ceiling_mismatch_escalates() {
+        let mut fixture = Fixture::fresh();
+        fixture.draft.receipt.proof_ceiling = "executed-and-admitted".to_owned();
+        let result = fixture.propose();
+        assert!(matches!(
+            result,
+            Err(super::MaintenancePlanError::Receipt { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/43
+    #[test]
+    fn case_43_trigger_operation_history_and_output_bounds_are_all_checked() {
+        let mut evidence = Fixture::fresh();
+        evidence.trigger.evidence_refs = (0..=super::MAX_EVIDENCE_ITEMS)
+            .map(|index| format!("e-{index:03}"))
+            .collect();
+        assert!(matches!(
+            evidence.propose(),
+            Err(super::MaintenancePlanError::Bounds { .. })
+        ));
+        let mut inputs = Fixture::fresh();
+        inputs.operations[0].inputs = (0..=super::MAX_OPERATION_INPUTS)
+            .map(|index| format!("input-{index:03}"))
+            .collect();
+        assert!(matches!(
+            inputs.propose(),
+            Err(super::MaintenancePlanError::Bounds { .. })
+        ));
+        let mut history = Fixture::fresh();
+        history.history.expected_attempt_ids = (0..=super::MAX_ATTEMPTS)
+            .map(|index| format!("att-{index:03}"))
+            .collect();
+        assert!(matches!(
+            history.propose(),
+            Err(super::MaintenancePlanError::Bounds { .. })
+        ));
+        let mut output = Fixture::fresh();
+        output.operations[0].output_note = "x".repeat(super::MAX_NOTE_BYTES + 1);
+        assert!(matches!(
+            output.propose(),
+            Err(super::MaintenancePlanError::Shape { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/44
+    #[test]
+    fn case_44_canonical_sets_preserve_dependency_identity() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[2].depends_on = vec!["op-vacuum".to_owned(), "op-inspect".to_owned()];
+        let result = fixture.propose();
+        assert!(matches!(
+            result,
+            Err(super::MaintenancePlanError::Order { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/45
+    #[test]
+    fn case_45_exact_replay_and_changed_same_id_request_are_conflicts() {
+        let mut replay = Fixture::fresh();
+        replay.history.expected_attempt_ids.clear();
+        replay.history.attempts.clear();
+        let first = replay.propose().expect("replay seed must be valid");
+        let identity_digest = super::compute_plan_digest(
+            &first.plan_handle,
+            super::MaintenanceOutcome::Complete.as_str(),
+            &replay.objective,
+            &replay.trigger,
+            &replay.operations,
+            &replay.deltas,
+            &replay.boundary,
+            &replay.history,
+            &replay.policy,
+            &replay.draft.receipt.output_digest,
+        )
+        .expect("replay identity must be deterministic");
+        replay.history.expected_attempt_ids = vec!["op-1".to_owned()];
+        replay.history.attempts = vec![super::HistoryAttempt {
+            attempt_id: "op-1".to_owned(),
+            equivalence_digest: identity_digest.clone(),
+            disposition: super::PriorAttemptDisposition::Verified,
+            effect_state: super::PriorEffectState::NoEffect,
+            changed_evidence: false,
+            repeat_justification: super::RepeatJustification::None,
+            request_digest: Some(identity_digest.clone()),
+            policy_revision: Some(2),
+        }];
+        assert_eq!(
+            replay
+                .propose()
+                .expect("replay must remain a candidate")
+                .outcome,
+            super::MaintenanceOutcome::Rejected
+        );
+        let mut changed_request = replay;
+        changed_request.objective.causal_note = "a changed request identity".to_owned();
+        assert_eq!(
+            changed_request
+                .propose()
+                .expect("identity conflict must remain a candidate")
+                .outcome,
+            super::MaintenanceOutcome::Rejected
+        );
+        let mut changed_policy = Fixture::fresh();
+        changed_policy.history.expected_attempt_ids = vec!["op-1".to_owned()];
+        changed_policy.history.attempts = vec![super::HistoryAttempt {
+            attempt_id: "op-1".to_owned(),
+            equivalence_digest: "a".repeat(64),
+            disposition: super::PriorAttemptDisposition::Verified,
+            effect_state: super::PriorEffectState::NoEffect,
+            changed_evidence: false,
+            repeat_justification: super::RepeatJustification::None,
+            request_digest: None,
+            policy_revision: Some(2),
+        }];
+        changed_policy.policy.policy_revision = 3;
+        assert_eq!(
+            changed_policy
+                .propose()
+                .expect("stale policy must remain a candidate")
+                .outcome,
+            super::MaintenanceOutcome::Stale
+        );
+    }
+
+    // WORK_UNIT_CASE: 677/46
+    #[test]
+    fn case_46_malformed_bounded_inputs_are_panic_free() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[0].depends_on = vec!["missing".to_owned(); super::MAX_DEPENDENCIES + 1];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture.propose()));
+        assert!(result.is_ok());
+        assert!(matches!(
+            result.expect("planner must not panic"),
+            Err(super::MaintenancePlanError::Bounds { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/47
+    #[test]
+    fn case_47_complete_plan_is_finite_and_each_operation_is_closed() {
+        let candidate = run_valid();
+        assert_eq!(candidate.outcome, super::MaintenanceOutcome::Complete);
+        for operation in &candidate.operations {
+            assert!(!operation.owner.is_empty());
+            assert_eq!(operation.verifier_id, candidate.verifier_id);
+            assert!(operation.budget.cpu_ms > 0);
+            assert!(operation.rollback_note.contains("rollback"));
+        }
+    }
+
+    // WORK_UNIT_CASE: 677/48
+    #[test]
+    fn case_48_no_operation_is_executable_scheduled_or_admitted() {
+        let mut fixture = Fixture::fresh();
+        fixture.operations[0].stop_note = "execute now".to_owned();
+        let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Rejected);
+        assert!(candidate.note.contains("scheduling"));
+    }
+
+    // WORK_UNIT_CASE: 677/49
+    #[test]
+    fn case_49_removing_any_load_bearing_boundary_blocks_completeness() {
+        let mut trigger = Fixture::fresh();
+        trigger.trigger.evidence_refs.clear();
+        assert_eq!(
+            trigger.propose().expect("missing trigger is inert").outcome,
+            super::MaintenanceOutcome::Insufficient
+        );
+        let mut owner = Fixture::fresh();
+        owner.operations[0].owner.clear();
+        assert!(matches!(
+            owner.propose(),
+            Err(super::MaintenancePlanError::Shape { .. })
+        ));
+        let mut budget = Fixture::fresh();
+        budget.boundary.protected_budget.cpu_ms = 0;
+        assert!(matches!(
+            budget.propose(),
+            Err(super::MaintenancePlanError::Shape { .. })
+        ));
+        let mut verifier = Fixture::fresh();
+        verifier.boundary.verifier.verifier_id.clear();
+        assert!(matches!(
+            verifier.propose(),
+            Err(super::MaintenancePlanError::Bounds { .. }
+                | super::MaintenancePlanError::Shape { .. })
+        ));
+        let mut human = Fixture::fresh();
+        human.boundary.required_decisions.clear();
+        assert!(matches!(
+            human.propose(),
+            Err(super::MaintenancePlanError::Shape { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 677/50
+    #[test]
+    fn case_50_source_and_api_guard_remain_candidate_only() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+        for line in source
+            .lines()
+            .filter(|line| line.trim_start().starts_with("use "))
+        {
+            let lowered = line.to_ascii_lowercase();
+            for forbidden in [
+                "scheduler",
+                "readyqueue",
+                "wakeintent",
+                "doctor",
+                "provider",
+                "store",
+                "authority",
+                "finish",
+                "durablejob",
+            ] {
+                assert!(!lowered.contains(forbidden), "forbidden API import: {line}");
+            }
+        }
+        assert!(source.contains("pub fn propose_maintenance_plan"));
+        let execute_api = ["pub fn ", "execute_maintenance"].concat();
+        let schedule_api = ["pub fn ", "schedule_maintenance"].concat();
+        assert!(!source.contains(&execute_api));
+        assert!(!source.contains(&schedule_api));
     }
 }
