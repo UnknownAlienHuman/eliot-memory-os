@@ -182,7 +182,10 @@ pub fn admit_forward_revision(
 /// re-links every receipt via `link_audit` (digest recompute) and
 /// re-verifies the full chain, so only a completely audit-linked,
 /// original-preserving chain returns. A receipt with no emitted event
-/// fails with `AuditUnlinked`: curation never invents audit identity.
+/// fails with `AuditUnlinked`, and a receipt whose preset disagrees with
+/// the emitted event fails with `AuditEventMismatch`: curation never
+/// invents audit identity and never silently re-points a preset linkage.
+/// Re-linking the already-preset event is digest-stable by construction.
 pub fn bind_emitted_audit_events(
     chain: &[CurationAdmission],
     emitted: &[(ArtifactId, ArtifactId)],
@@ -195,6 +198,13 @@ pub fn bind_emitted_audit_events(
             .find(|(receipt_id, _)| *receipt_id == admission.receipt.receipt_id)
             .map(|(_, event)| event.clone())
             .ok_or(AdmissionError::AuditUnlinked)?;
+        if let Some(preset) = &admission.receipt.audit_event_id
+            && *preset != event
+        {
+            return Err(AdmissionError::AuditEventMismatch {
+                receipt: admission.receipt.receipt_id.as_str().to_owned(),
+            });
+        }
         linked.push(CurationAdmission {
             operation: admission.operation,
             receipt: admission.receipt.link_audit(event)?,
@@ -467,6 +477,33 @@ mod tests {
             ),
             "revision projects as Store-minted linkage evidence, never fake fields"
         );
+
+        // Preset guard: re-linking the preset event is digest-stable, while
+        // a divergent emitted event is refused instead of silently
+        // re-pointing the linkage.
+        let digest_before = view.ordered[2].receipt.digest.clone();
+        let rebound = bind_emitted_audit_events(
+            &view.ordered,
+            &[
+                (id("receipt:capture"), id("audit:capture")),
+                (id("receipt:correction"), id("audit:correction")),
+                (id("receipt:claim"), id("audit:claim")),
+            ],
+        )
+        .expect("preset re-link verifies");
+        assert_eq!(rebound.ordered[2].receipt.digest, digest_before);
+        assert_eq!(rebound.original_input, id("obs:raw-1"));
+        assert!(matches!(
+            bind_emitted_audit_events(
+                &view.ordered,
+                &[
+                    (id("receipt:capture"), id("audit:capture")),
+                    (id("receipt:correction"), id("audit:WRONG")),
+                    (id("receipt:claim"), id("audit:claim")),
+                ],
+            ),
+            Err(AdmissionError::AuditEventMismatch { .. })
+        ));
 
         let refused = admit_forward_revision(
             &view.ordered[..1],
