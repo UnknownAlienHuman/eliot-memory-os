@@ -19,6 +19,8 @@ eliot-profile-d2-operational = []
 eliot-profile-full-composition = []
 
 [dependencies]
+eliot-process-executor.workspace = true
+eliot-process.workspace = true
 eliot-runtime.workspace = true
 eliot-wasm-runtime.workspace = true
 wasmtime.workspace = true

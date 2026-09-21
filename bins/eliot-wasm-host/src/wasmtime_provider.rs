@@ -16,8 +16,8 @@ use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsB
 use crate::shadow::{enforce_shadow_no_effect, shadow_port_error};
 
 const WASMTIME_VERSION: &str = "47.0.4";
-const WIT_VERSION: &str = "1.0.0";
-const WIT_WORLD: &str = "eliot:wasm/guest";
+pub(crate) const WIT_VERSION: &str = "1.0.0";
+pub(crate) const WIT_WORLD: &str = "eliot:wasm/guest";
 const RUN_EXPORT: &str = "run";
 /// Fixture-scoped engine identity bytes (NOT a measured production engine
 /// artifact: Wasmtime links statically). Names the exact pinned
@@ -25,7 +25,7 @@ const RUN_EXPORT: &str = "run";
 /// recomputed, never pasted; production engine-artifact provenance is not
 /// claimed by carrying it.
 const ENGINE_FIXTURE_IDENTITY: &[u8] = b"wasmtime-component/47.0.4";
-const PROVIDER_STACK_SIZE: usize = 8 * 1024;
+pub(crate) const PROVIDER_STACK_SIZE: usize = 8 * 1024;
 const EPOCH_DRIVER_THREAD_PREFIX: &str = "eliot-wasm-epoch";
 #[cfg(test)]
 const COMPONENT_CONFIGURATION: &[u8] =
