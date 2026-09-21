@@ -336,6 +336,32 @@ pub struct ReactiveCueActivation {
 }
 
 impl ReactiveCueActivation {
+    /// Assemble an evaluated request/result pair against the live view.
+    ///
+    /// Production input assembly: fills the view-identity joins
+    /// (`expected_view_id`, `expected_admitted_set_digest`) mechanically
+    /// from the live view and validates the complete join. Target bindings
+    /// stay EMPTY: only whoever knows both the A10 target namespace and
+    /// the A15 atom namespace may bind them (string equality across those
+    /// namespaces would be invented authority). Unbound targets remain
+    /// activation frontier evidence through the planner — visible
+    /// degradation, never silent emission.
+    pub fn assemble_for_view(
+        request: ActivationRequest,
+        result: ActivationResult,
+        view: &ContextPlanningView,
+    ) -> Result<Self, ReactiveInputError> {
+        let assembled = Self {
+            request,
+            result,
+            expected_view_id: Some(view.view_id.clone()),
+            expected_admitted_set_digest: Some(view.admitted_canonical_sha256.clone()),
+            target_bindings: Vec::new(),
+        };
+        assembled.validate_against(view)?;
+        Ok(assembled)
+    }
+
     /// Check the exact A10 request/result pair without a view join.
     ///
     /// Production pair-integrity gate: the evaluated result must belong to

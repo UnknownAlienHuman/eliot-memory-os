@@ -432,3 +432,70 @@ fn activation_pair_check_rejects_mismatched_request() {
         Err(eliot_context_contracts::ReactiveInputError::BindingMismatch { .. })
     ));
 }
+
+#[test]
+fn activation_assembles_against_live_view() {
+    let (view, activation, _, _, _, _) = feed_inputs(false, false);
+    let assembled = eliot_reactive_context_plan::ReactiveCueActivation::assemble_for_view(
+        activation.request,
+        activation.result,
+        &view,
+    )
+    .expect("evaluated pair assembles against its view");
+    assert_eq!(assembled.expected_view_id, Some(view.view_id.clone()));
+    assert_eq!(
+        assembled.expected_admitted_set_digest,
+        Some(view.admitted_canonical_sha256.clone())
+    );
+    assert!(
+        assembled.target_bindings.is_empty(),
+        "no binding authority is invented across namespaces"
+    );
+    assembled
+        .validate_against(&view)
+        .expect("assembled activation validates against the live view");
+}
+
+#[test]
+fn activation_assembly_rejects_mismatched_pair() {
+    let (view, mut activation, _, _, _, _) = feed_inputs(false, false);
+    activation.request.cancelled = true;
+    let result = eliot_reactive_context_plan::ReactiveCueActivation::assemble_for_view(
+        activation.request,
+        activation.result,
+        &view,
+    );
+    assert!(matches!(
+        result,
+        Err(eliot_context_contracts::ReactiveInputError::BindingMismatch { .. })
+    ));
+}
+
+#[test]
+fn unbound_activation_yields_frontier_without_emission() {
+    let (view, activation, session, attention, coverage, policy) = feed_inputs(false, false);
+    let assembled = eliot_reactive_context_plan::ReactiveCueActivation::assemble_for_view(
+        activation.request,
+        activation.result,
+        &view,
+    )
+    .expect("evaluated pair assembles against its view");
+    let inputs = drive_inputs(&view, &assembled, &session, &attention, &coverage, &policy);
+    let outcome = produce_settled_plan_feed(inputs).expect("unbound activation must feed");
+    match outcome {
+        SettledPlanFeedOutcome::NoSettledPlan(disposition) => {
+            assert!(
+                disposition
+                    .frontier
+                    .iter()
+                    .any(|entry| entry.starts_with("activation:unmapped:")),
+                "unbound targets stay frontier evidence, got {:?}",
+                disposition.frontier
+            );
+        }
+        SettledPlanFeedOutcome::Ready(feed) => panic!(
+            "unbound activation must not emit instructions, got {}",
+            feed.batch.items.len()
+        ),
+    }
+}
