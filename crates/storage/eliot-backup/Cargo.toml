@@ -7,7 +7,7 @@ license.workspace = true
 description = "Governed ECXF logical backup and isolated restore contracts"
 
 [package.metadata.eliot]
-workspace_admission = "unreachable pending explicit owner disposition per #1716 (governed export path: #1871; recoverability evidence: #1873); not a selectable production fallback"
+workspace_admission = "admitted bounded non-runtime product surface per #1873 (operator CLI previews/coverage plus isolated rehearsal runner; governed export path: #1871); production execution/cutover stays with #960/#961 owners; not a selectable storage fallback"
 
 [dependencies]
 eliot-blob-api.workspace = true

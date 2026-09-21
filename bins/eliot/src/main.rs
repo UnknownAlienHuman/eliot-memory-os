@@ -30,6 +30,7 @@ use eliot_platform_windows::{
 };
 use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
+mod backup_entry;
 #[cfg(windows)]
 mod legacy_governor_config;
 use serde_json::json;
@@ -48,6 +49,7 @@ mod controlboard_status;
 mod first_run_flow;
 mod plugin_preview;
 mod source_bundle_materializer;
+mod update_installer;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INVALID_REQUEST_EXIT: i32 = 2;
@@ -115,6 +117,11 @@ enum Command {
     ControlBoard {
         #[command(subcommand)]
         command: ControlBoardCommand,
+    },
+    /// Preview backup creation/restore plans and key coverage (#1873; preview-only, no execution).
+    Backup {
+        #[command(subcommand)]
+        command: backup_entry::BackupCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -304,6 +311,42 @@ enum InstallationCommand {
         profile_anchor_root: PathBuf,
         #[arg(long)]
         installation_key: Option<String>,
+    },
+    /// Stage one update package into a new versioned directory without
+    /// overwriting the running executable. `eliot-kernel` and `eliot-host`
+    /// are release-level and require `--release-approved`; optional modules
+    /// stage as generation updates with rollback metadata.
+    StageUpdate {
+        /// Absolute installation root; `<root>/<package>/<version>` is created new.
+        #[arg(long, value_parser = absolute_path)]
+        install_root: PathBuf,
+        /// Package (binary) name.
+        #[arg(long)]
+        package: String,
+        /// Version label; becomes the new versioned directory name.
+        #[arg(long)]
+        version: String,
+        /// Declared update channel (`stable`, `preview`, or `local-dev`).
+        #[arg(long, value_parser = parse_update_channel)]
+        channel: update_installer::UpdateChannel,
+        /// Lowercase hex SHA-256 of the payload file.
+        #[arg(long)]
+        artifact_sha256: String,
+        /// Absolute payload executable file staged into the versioned directory.
+        #[arg(long, value_parser = absolute_path)]
+        payload: PathBuf,
+        /// Optional running executable; staging fails closed on collision.
+        #[arg(long, value_parser = absolute_path)]
+        running_exe: Option<PathBuf>,
+        /// Optional previous versioned directory recorded for module rollback.
+        #[arg(long, value_parser = absolute_path)]
+        previous_version_dir: Option<PathBuf>,
+        /// Required for Kernel/Host release-level updates.
+        #[arg(long)]
+        release_approved: bool,
+        /// Absolute create-new update record JSON path.
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
     },
 }
 
@@ -527,6 +570,7 @@ fn run() -> Result<i32> {
         Command::Plugin { command } => run_plugin(command),
         Command::Doctor { command } => run_doctor(command),
         Command::ControlBoard { command } => run_controlboard(command),
+        Command::Backup { command } => backup_entry::run_backup(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
@@ -1552,7 +1596,163 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             agent_bridge_exe,
             agent_bridge_account,
         ),
+        InstallationCommand::StageUpdate {
+            install_root,
+            package,
+            version,
+            channel,
+            artifact_sha256,
+            payload,
+            running_exe,
+            previous_version_dir,
+            release_approved,
+            output,
+        } => run_installation_stage_update(
+            &install_root,
+            package,
+            version,
+            channel,
+            artifact_sha256,
+            &payload,
+            running_exe.as_deref(),
+            previous_version_dir.as_deref(),
+            release_approved,
+            &output,
+        ),
     }
+}
+
+fn parse_update_channel(
+    value: &str,
+) -> std::result::Result<update_installer::UpdateChannel, String> {
+    value
+        .parse::<update_installer::UpdateChannel>()
+        .map_err(|error| error.to_string())
+}
+
+fn update_installer_error_code(error: &update_installer::UpdateInstallerError) -> &'static str {
+    match error {
+        update_installer::UpdateInstallerError::UnknownChannel { .. }
+        | update_installer::UpdateInstallerError::InvalidPackage { .. } => {
+            "INSTALLATION_UPDATE_REJECTED"
+        }
+        update_installer::UpdateInstallerError::RunningBinaryWouldBeOverwritten { .. } => {
+            "INSTALLATION_UPDATE_RUNNING_GUARD"
+        }
+        update_installer::UpdateInstallerError::VersionedDirExists { .. } => {
+            "INSTALLATION_UPDATE_VERSION_EXISTS"
+        }
+        update_installer::UpdateInstallerError::ReleaseApprovalRequired => {
+            "INSTALLATION_UPDATE_RELEASE_APPROVAL_REQUIRED"
+        }
+        update_installer::UpdateInstallerError::StagingFailed { .. } => {
+            "INSTALLATION_UPDATE_STAGING_FAILED"
+        }
+    }
+}
+
+fn write_update_record_artifact(
+    path: &Path,
+    record: &update_installer::UpdateRecord,
+) -> Result<(), std::io::Error> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "update record output must be absolute",
+        ));
+    }
+    let mut bytes = serde_json::to_vec_pretty(record)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    bytes.push(b'\n');
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let readback = fs::read(path)?;
+    if readback != bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "update record output readback differs from the exact written bytes",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_installation_stage_update(
+    install_root: &Path,
+    package: String,
+    version: String,
+    channel: update_installer::UpdateChannel,
+    artifact_sha256: String,
+    payload: &Path,
+    running_exe: Option<&Path>,
+    previous_version_dir: Option<&Path>,
+    release_approved: bool,
+    output: &Path,
+) -> Result<i32> {
+    let payload_bytes = match load_input(payload) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_installation_error("INSTALLATION_UPDATE_PAYLOAD_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let metadata = update_installer::PackageMetadata {
+        name: package,
+        version,
+        channel,
+        artifact_sha256,
+    };
+    let payload_digest = format!("{:x}", Sha256::digest(&payload_bytes));
+    if payload_digest != metadata.artifact_sha256 {
+        write_installation_error(
+            "INSTALLATION_UPDATE_DIGEST_MISMATCH",
+            "payload SHA-256 differs from the declared update package metadata",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    let request = update_installer::InstallUpdateRequest {
+        install_root,
+        running_executable: running_exe,
+        package: &metadata,
+        payload: &payload_bytes,
+        previous_version_dir,
+        release_approved,
+    };
+    let record = match update_installer::install_update(&request) {
+        Ok(record) => record,
+        Err(error) => {
+            write_installation_error(update_installer_error_code(&error), &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    if let Err(error) = write_update_record_artifact(output, &record) {
+        write_installation_error("INSTALLATION_UPDATE_OUTPUT_REJECTED", &error.to_string());
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": "STAGED",
+            "package": record.package_name,
+            "version": record.version,
+            "channel": record.channel.as_str(),
+            "kind": record.kind.as_str(),
+            "release_approval_required": record.kind.requires_release_approval(),
+            "installed_dir": record.installed_dir,
+            "executable": record.executable_path,
+            "generation": record.generation,
+            "rollback_from": record.rollback_from,
+            "scope": INSTALLATION_SCOPE,
+        }))?
+    );
+    Ok(0)
 }
 
 #[derive(Debug)]
