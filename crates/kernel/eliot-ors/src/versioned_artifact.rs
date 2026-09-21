@@ -261,6 +261,48 @@ impl VersionedArtifactCutoverRecord {
     }
 }
 
+/// Typed retirement handoff for the file-deletion consumer.
+///
+/// Emitted only when a drained generation retires bound to the exact cutover
+/// record that demoted it. The Host file owner deletes the named bytes; ORS
+/// state no longer tracks them afterwards.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionedArtifactRetirement {
+    pub module_id: String,
+    pub generation: u64,
+    pub artifact_hash: String,
+    pub artifact_path: String,
+    /// Digest of the demoting cutover record this retirement is bound to.
+    pub cutover_record_sha256: String,
+    /// Always true on emission: only drained generations retire.
+    pub drained: bool,
+}
+
+impl VersionedArtifactRetirement {
+    /// Validates the retirement shape. The cutover binding itself is checked
+    /// at emission (`retire_with_receipt`); this rejects malformed carriers.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.module_id, "artifact_retirement_module_id")?;
+        if self.generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "artifact_retirement_generation",
+                reason: "generation must be non-zero",
+            });
+        }
+        validate_digest(&self.artifact_hash, "artifact_retirement_hash")?;
+        validate_text(&self.artifact_path, "artifact_retirement_path")?;
+        validate_digest(
+            &self.cutover_record_sha256,
+            "artifact_retirement_cutover",
+        )?;
+        if !self.drained {
+            return Err(OrsError::VersionedArtifactNotDrained);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RetainedEntry {
     artifact: VersionedArtifact,
@@ -439,6 +481,45 @@ impl VersionedArtifactRegistry {
             .remove(&key)
             .ok_or(OrsError::VersionedArtifactNotFound)?;
         Ok(entry.artifact)
+    }
+
+    /// Retires a drained generation bound to the exact cutover record that
+    /// demoted it, returning the typed retirement handoff for the file-deletion
+    /// consumer (Host owns artifact bytes; ORS never deletes files).
+    ///
+    /// The record must validate and name this exact generation, hash, and path
+    /// as its demoted side; a mismatched record fails WITHOUT removing the
+    /// entry, so a wrong receipt can never silently release bytes.
+    pub fn retire_with_receipt(
+        &mut self,
+        module_id: &str,
+        generation: u64,
+        record: &VersionedArtifactCutoverRecord,
+    ) -> Result<VersionedArtifactRetirement, OrsError> {
+        record.validate()?;
+        let key = (module_id.to_owned(), generation);
+        let entry = self
+            .retained
+            .get(&key)
+            .ok_or(OrsError::VersionedArtifactNotFound)?;
+        if record.old_generation != Some(generation)
+            || record.old_artifact_hash.as_deref() != Some(entry.artifact.artifact_hash.as_str())
+            || record.old_artifact_path.as_deref() != Some(entry.artifact.artifact_path.as_str())
+        {
+            return Err(OrsError::InvalidField {
+                field: "artifact_retirement_cutover",
+                reason: "retirement must name the cutover that demoted this generation",
+            });
+        }
+        let artifact = self.retire(module_id, generation)?;
+        Ok(VersionedArtifactRetirement {
+            module_id: module_id.to_owned(),
+            generation: artifact.generation,
+            artifact_hash: artifact.artifact_hash,
+            artifact_path: artifact.artifact_path,
+            cutover_record_sha256: record.record_sha256.clone(),
+            drained: true,
+        })
     }
 
     /// Returns the active generation's exact artifact hash and path.
@@ -716,6 +797,104 @@ mod tests {
                 .expect("active status present")
                 .generation,
             1
+        );
+    }
+
+    fn two_generation_registry() -> (
+        VersionedArtifactRegistry,
+        VersionedArtifactCutoverRecord,
+    ) {
+        let hash_gen1 = "aa".repeat(32);
+        let hash_gen2 = "bb".repeat(32);
+        let mut registry = VersionedArtifactRegistry::new();
+        registry
+            .install_candidate(artifact("mod-sweeper", 1, &hash_gen1))
+            .expect("stage gen1");
+        registry
+            .activate("mod-sweeper", 1, &hash_gen1, &COMPATIBLE)
+            .expect("activate gen1");
+        registry
+            .install_candidate(artifact("mod-sweeper", 2, &hash_gen2))
+            .expect("stage gen2");
+        let cutover = registry
+            .activate("mod-sweeper", 2, &hash_gen2, &COMPATIBLE)
+            .expect("activate gen2");
+        (registry, cutover)
+    }
+
+    #[test]
+    fn retire_with_receipt_releases_only_cutover_bound_drained_generations() {
+        let (mut registry, cutover) = two_generation_registry();
+        // Still draining without the drained mark: no receipt, entry kept.
+        assert!(matches!(
+            registry.retire_with_receipt("mod-sweeper", 1, &cutover),
+            Err(OrsError::VersionedArtifactNotDrained)
+        ));
+        assert!(registry.retained_state("mod-sweeper", 1).is_some());
+        registry
+            .mark_drained("mod-sweeper", 1)
+            .expect("drain prior generation");
+        let retirement = registry
+            .retire_with_receipt("mod-sweeper", 1, &cutover)
+            .expect("retire drained with receipt");
+        retirement
+            .validate()
+            .expect("retirement handoff validates");
+        assert_eq!(retirement.generation, 1);
+        assert_eq!(retirement.artifact_hash, "aa".repeat(32));
+        assert_eq!(retirement.cutover_record_sha256, cutover.record_sha256);
+        assert!(retirement.drained);
+        // The bytes are released exactly once: the entry is gone afterwards.
+        assert!(registry.retained_state("mod-sweeper", 1).is_none());
+        // The active generation still reports its exact identity.
+        let active = registry
+            .active_status("mod-sweeper")
+            .expect("active status present");
+        assert_eq!(active.generation, 2);
+    }
+
+    #[test]
+    fn retire_with_receipt_rejects_foreign_cutover_without_removal() {
+        let (mut registry, _) = two_generation_registry();
+        registry
+            .mark_drained("mod-sweeper", 1)
+            .expect("drain prior generation");
+        // A well-formed cutover record from another lineage names different
+        // hashes: it must not release these bytes.
+        let (_, foreign_cutover) = (|| {
+            let hash_a = "cc".repeat(32);
+            let hash_b = "dd".repeat(32);
+            let mut other = VersionedArtifactRegistry::new();
+            other
+                .install_candidate(artifact("mod-sweeper", 1, &hash_a))
+                .expect("stage gen1");
+            other
+                .activate("mod-sweeper", 1, &hash_a, &COMPATIBLE)
+                .expect("activate gen1");
+            other
+                .install_candidate(artifact("mod-sweeper", 2, &hash_b))
+                .expect("stage gen2");
+            let cutover = other
+                .activate("mod-sweeper", 2, &hash_b, &COMPATIBLE)
+                .expect("activate gen2");
+            (other, cutover)
+        })();
+        assert!(registry
+            .retire_with_receipt("mod-sweeper", 1, &foreign_cutover)
+            .is_err());
+        assert!(registry.retained_state("mod-sweeper", 1).is_some());
+        // Retiring the active generation itself is rejected (no cutover can
+        // name an active generation as demoted) and the active entry survives.
+        let (_, own_cutover) = two_generation_registry();
+        assert!(registry
+            .retire_with_receipt("mod-sweeper", 2, &own_cutover)
+            .is_err());
+        assert_eq!(
+            registry
+                .active_status("mod-sweeper")
+                .expect("active status present")
+                .generation,
+            2
         );
     }
 }
