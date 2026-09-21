@@ -950,4 +950,159 @@ mod tests {
             },
         }
     }
+
+    fn conformance_framed_input(seed: u64) -> Vec<u8> {
+        // Shared conformance corpus: the seed travels as the first 8 input
+        // bytes (the guest ABI carries input only), and the guest replicates
+        // the declared reference transform byte for byte inside Wasmtime.
+        let mut framed = seed.to_le_bytes().to_vec();
+        framed.extend_from_slice(b"lc-conformance-1956");
+        framed
+    }
+
+    fn conformance_engine(
+        fixture: &str,
+    ) -> Result<(WasmtimeComponentEngine, Sha256Digest), String> {
+        let artifact = wat::parse_file(format!("tests/fixtures/{fixture}"))
+            .map_err(|error| error.to_string())?;
+        let digest = Sha256Digest::of_bytes(&artifact);
+        let engine = WasmtimeComponentEngine::new(
+            binding(),
+            digest.clone(),
+            &artifact,
+            COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| error.to_string())?;
+        // Artifact identity proves the WASM provider: exact implementation,
+        // pinned engine version, and digest-bound artifact bytes.
+        assert_eq!(engine.binding().implementation_id, "wasmtime-component");
+        assert_eq!(engine.binding().exact_version, "47.0.4");
+        Ok((engine, digest))
+    }
+
+    #[test]
+    fn actual_guest_conformance_against_declared_reference() -> Result<(), String> {
+        use eliot_wasm_runtime::lifecycle::{
+            DeterministicEchoCore, DivergenceKind, SemanticCore, build_activation_record,
+            compare_conformance, core_outcome_from_report, reconcile_shadow,
+        };
+
+        let seed = 0x1956_u64;
+        let framed = conformance_framed_input(seed);
+        let (engine, digest) = conformance_engine("guest-conformance.wat")?;
+        let limits = test_limits(digest.clone());
+        let request_digest = Sha256Digest::of_bytes(b"conformance-1956");
+        let report = engine
+            .invoke_component(&request_digest, &limits, &framed, true)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(report.termination, EngineTermination::Completed);
+        // The ABI truth about this guest: no state touched, nothing
+        // proposed, no host called. The harness must observe exactly that.
+        assert!(report.observed_state_delta.is_empty());
+        assert!(report.proposed_effects.is_empty());
+        assert!(report.host_calls.is_empty());
+        // Known result: real guest bytes equal the declared reference.
+        let reference =
+            DeterministicEchoCore::new("component-1956-conformance").invoke(&framed, seed);
+        assert_eq!(report.output, reference.result);
+        let wasm = core_outcome_from_report(&report);
+        let repeat_report = engine
+            .invoke_component(&request_digest, &limits, &framed, true)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(repeat_report.termination, EngineTermination::Completed);
+        let wasm_repeat = core_outcome_from_report(&repeat_report);
+        assert_eq!(wasm_repeat.result, reference.result);
+
+        let comparison = compare_conformance(&wasm, &reference, &wasm_repeat);
+        assert!(comparison.result_match);
+        assert!(comparison.error_class_match);
+        assert!(comparison.effects_match);
+        assert!(comparison.state_delta_match);
+        assert!(comparison.determinism_match);
+        // Honest non-green: engine-observed resources cannot confirm the
+        // unobserved reference envelope, so overall identical stays false
+        // while every acceptance leg holds.
+        assert!(!comparison.envelope_match);
+        assert!(!comparison.identical());
+        let record = build_activation_record(
+            "component-1956-conformance",
+            3,
+            seed,
+            &framed,
+            &wasm,
+            &reference,
+            &wasm_repeat,
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(!record.conformance.identical());
+
+        let shadow = reconcile_shadow(&wasm, &wasm_repeat, &reference);
+        assert_eq!(shadow.external_effects_emitted, 0);
+        assert!(!shadow.scheduler_influenced);
+        assert!(shadow.comparator.semantic_match);
+        assert_eq!(
+            shadow.comparator.divergences,
+            vec![DivergenceKind::HostCall, DivergenceKind::Memory]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_guest_is_rejected_by_identity_and_comparison() -> Result<(), String> {
+        use eliot_wasm_runtime::lifecycle::{
+            DeterministicEchoCore, LifecycleError, SemanticCore, build_activation_record,
+            compare_conformance, core_outcome_from_report,
+        };
+
+        let seed = 0x1956_u64;
+        let framed = conformance_framed_input(seed);
+        let reference =
+            DeterministicEchoCore::new("component-1956-conformance").invoke(&framed, seed);
+        let (_, digest) = conformance_engine("guest-conformance.wat")?;
+        // Changed guest: different artifact bytes, different identity,
+        // different output. The harness must reject conformance.
+        let (divergent_engine, divergent_digest) =
+            conformance_engine("guest-conformance-divergent.wat")?;
+        assert_ne!(divergent_digest, digest);
+        let request_digest = Sha256Digest::of_bytes(b"conformance-1956");
+        let divergent_report = divergent_engine
+            .invoke_component(
+                &request_digest,
+                &test_limits(divergent_digest),
+                &framed,
+                true,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(divergent_report.termination, EngineTermination::Completed);
+        let divergent = core_outcome_from_report(&divergent_report);
+        assert_ne!(divergent.result, reference.result);
+        let bad = compare_conformance(&divergent, &reference, &divergent);
+        assert!(!bad.result_match);
+        assert!(!bad.identical());
+        assert_eq!(
+            build_activation_record(
+                "component-1956-conformance",
+                3,
+                seed,
+                &framed,
+                &divergent,
+                &reference,
+                &divergent,
+            ),
+            Err(LifecycleError::ConformanceNotSatisfied)
+        );
+        // Tampered digest is rejected before any guest executes.
+        let artifact = wat::parse_file("tests/fixtures/guest-conformance.wat")
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            WasmtimeComponentEngine::new(
+                binding(),
+                Sha256Digest::of_bytes(b"tampered"),
+                &artifact,
+                COMPONENT_CONFIGURATION
+            ),
+            Err(WasmtimeBuildError::ArtifactDigestMismatch)
+        ));
+        Ok(())
+    }
 }

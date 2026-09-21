@@ -27,7 +27,7 @@ primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues
 [documentation]
 release = ["docs/release/WINDOWS_X64_RELEASE.md"]
 implementation = [
-  "docs/architecture/I01-02-mandatory-runtime-processes.md#i12-mandatory-runtime-processes",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md#i12-required-processes-of-the-first-complete-runtime",
   "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
   "docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
   "docs/architecture/I03-10-immutable-config-and-policy-snapshots.md#i310-immutable-config-and-policy-snapshots",

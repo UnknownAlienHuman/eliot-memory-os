@@ -48,7 +48,8 @@ pub use assembly::{
     result_schema_version,
 };
 pub use budget::{
-    BudgetDimension, BudgetLimits, BudgetUsage, DEX_BUDGET_DIMENSIONS, check_no_cross_subsidy,
+    BudgetDemand, BudgetDimension, BudgetLimits, BudgetUsage, DEX_BUDGET_DIMENSIONS,
+    check_no_cross_subsidy,
 };
 pub use bundle::{
     BundleCompleteness, BundleMaterial, BundleStatus, DreamInputBundle, OmissionHandle,
@@ -120,17 +121,21 @@ pub use model_route::{
     ModelRouteRequest, bundle_digest_of,
 };
 pub use probe::{
-    AffordanceKind, AffordanceTarget, AuthorityDimension, ConsentDimension, ContextDimension,
-    CostDimension, EffectDimension, FeasibilityDimension, GapUpdateMeaning,
-    HumanAttentionDimension, INQUIRY_AFFORDANCE_SCHEMA_VERSION,
-    INQUIRY_AFFORDANCE_SET_SCHEMA_VERSION, InformationDimension, InquiryAffordanceDescriptor,
-    InquiryAffordanceDescriptorParams, InquiryAffordanceSet, InquiryAffordanceSetParams,
-    LatencyDimension, PROBE_INPUT_SCHEMA_VERSION, PossibleResultSchema, PossibleResultValue,
-    PrivacyDimension, ProbeAffordanceRef, ProbeCapabilityAvailability, ProbeExternalOwners,
-    ProbeGroundingRef, ProbeInput, ProbeInputParams, ProbeInputRef, ProbeLifecycle, ProbeObjective,
-    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef, ProbeParam,
-    ProbeRepeatRef, ProbeSourceRef, ResourceDimension, ResultBranch, ResultTarget, ResultUpdate,
-    ResultUpdateDiscriminability, ReversibilityDimension, RivalUpdateMeaning, update_sets_equal,
+    AffordanceKind, AffordanceTarget, AuthorityDimension, BranchEvidenceAcceptance,
+    CausalProbeRequirements, ConsentDimension, ContextDimension, CostDimension, EffectDimension,
+    FeasibilityDimension, GapUpdateMeaning, HumanAttentionDimension,
+    INQUIRY_AFFORDANCE_SCHEMA_VERSION, INQUIRY_AFFORDANCE_SET_SCHEMA_VERSION, InformationDimension,
+    InquiryAffordanceDescriptor, InquiryAffordanceDescriptorParams, InquiryAffordanceSet,
+    InquiryAffordanceSetParams, LatencyDimension, PROBE_INPUT_SCHEMA_VERSION,
+    PROBE_ORDERING_POLICY_SCHEMA_VERSION, PossibleResultSchema, PossibleResultValue,
+    PrivacyDimension, ProbeAffordanceRef, ProbeAffordanceSemantics, ProbeCapabilityAvailability,
+    ProbeExternalOwners, ProbeGroundingRef, ProbeInput, ProbeInputParams, ProbeInputRef,
+    ProbeLifecycle, ProbeObjective, ProbeObjectiveBinding, ProbeObjectiveMateriality,
+    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveResolution, ProbeObjectiveTarget,
+    ProbeOrderingDimension, ProbeOrderingPolicy, ProbeOrderingTieBreak, ProbeOwnerRef, ProbeParam,
+    ProbeRepeatRef, ProbeSourceRef, ResourceDimension, ResultBranch, ResultBranchAcceptance,
+    ResultTarget, ResultUpdate, ResultUpdateDiscriminability, ReversibilityDimension,
+    RivalUpdateMeaning, update_sets_equal,
 };
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
