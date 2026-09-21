@@ -211,6 +211,8 @@ fn runtime_launch() -> RuntimeLaunchDescriptor {
         testd_artifact_digest: handle("6".repeat(64)),
         native_worker_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-native-worker.exe"),
         native_worker_artifact_digest: handle("7".repeat(64)),
+        wasm_host_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-wasm-host.exe"),
+        wasm_host_artifact_digest: handle("f".repeat(64)),
         descriptor_digest: handle("0".repeat(64)),
     };
     descriptor = descriptor.with_computed_digest().unwrap();
