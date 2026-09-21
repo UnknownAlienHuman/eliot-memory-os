@@ -29,6 +29,50 @@
 //! is never read as a result cost — relabelling provider usage as measured
 //! bytes would fabricate measurement the tree cannot verify.
 //!
+//! ## Render-time support matrix
+//!
+//! Verified on current main: no tokenizer implementation exists anywhere
+//! (no tokenizer dependency in `Cargo.lock`, no encode calls outside
+//! framing/base64), and no route adapter counts exact rendered bytes.
+//! Every route therefore withholds, each for its exact documented reason;
+//! the wire stays ready for the first adapter that measures at render time
+//! and emits v1 attestations bound to the exact counted bytes:
+//!
+//! ```text
+//! codex     turn-level native usage only; translate_result leaves evidence
+//!           unbound and the route Unobserved
+//!           (crates/agent/eliot-agent-codex/src/lib.rs:1050,1671,1676)
+//!           → withhold: no byte-bound count exists.
+//! claude    usage None/None with no production source
+//!           (crates/agent/eliot-agent-claude/src/execution.rs:1413-1416)
+//!           → withhold: unknown preserved, never zero.
+//! acp       usage None/None, asserted by its own tests
+//!           (crates/agent/eliot-agent-acp/src/lib.rs:1343-1345,2161-2162)
+//!           → withhold: explicit unknown.
+//! opencode  assistant/step usage at turn/step level
+//!           (crates/agent/eliot-agent-opencode/src/client.rs:1407,1414)
+//!           → withhold: usage is not measurement.
+//! smart     owner observations validated, never counted
+//!           (measure_serialized_context); STU is a normative estimate,
+//!           never token proof → withhold: nothing counted here either.
+//! wasm      child fuel/memory metering, B2 scope
+//!           (bins/eliot-wasm-host/src/child_engine.rs)
+//!           → withhold: metering is not tokens; foreign scope.
+//! ledger    aggregate run counters, daemon/app scope (Halley owner;
+//!           crates/eliot-app/src/mcp_stdio/autonomy.rs:274)
+//!           → withhold: aggregate, not per-byte; foreign scope.
+//! bridge    Invoke path carries bytes plus disposition only, A3 BIN scope
+//!           (bins/eliot-agent-bridge/src/main.rs handle_invocation and
+//!           record_invocation_delivery) → withhold: no evidence to bind.
+//! notify    no token-cost shape exists in DeliveryReceiptEvidence or
+//!           ReceiptCore (notify lane owner) → withhold: shape absent here,
+//!           never shadow-invented.
+//! ```
+//!
+//! A route graduates from this matrix only by emitting versioned
+//! attestations bound to the exact bytes it counted with its actual
+//! tokenizer; the intake below verifies every axis before a count passes.
+//!
 //! Route identity reuses the shared [`crate::RouteFingerprint`] contract.
 //! Tokenizer provenance is the validated observed route itself: the tree
 //! attests no standalone tokenizer builds or model-to-tokenizer registry,
