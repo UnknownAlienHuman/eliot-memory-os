@@ -1,0 +1,47 @@
+{
+  "issue": 832,
+  "package": "eliot-context",
+  "current_owner": "A-10 eliot-cue-contracts",
+  "current_revision": "2.0.0",
+  "historical_variants": [
+    "PATH",
+    "SYMBOL",
+    "ERROR",
+    "COMMAND",
+    "SERVICE",
+    "TASK_CLASS",
+    "CONCEPT",
+    "PROBLEM"
+  ],
+  "current_variants": [
+    "file_path",
+    "dir_path",
+    "symbol",
+    "error_signature",
+    "command_pattern",
+    "dependency",
+    "api_surface",
+    "task_class",
+    "subsystem",
+    "concept"
+  ],
+  "exact_one_to_one": {
+    "SYMBOL": "symbol",
+    "TASK_CLASS": "task_class",
+    "CONCEPT": "concept"
+  },
+  "ambiguous_split": ["PATH"],
+  "unsupported_legacy": ["ERROR", "COMMAND", "SERVICE", "PROBLEM"],
+  "normalization_rule": {
+    "trim_only": ["file_path", "dir_path", "symbol"],
+    "collapse": [
+      "error_signature",
+      "command_pattern",
+      "dependency",
+      "api_surface",
+      "task_class",
+      "subsystem",
+      "concept"
+    ]
+  }
+}
