@@ -91,8 +91,20 @@ const PAYLOAD_MARKERS: [&str; 7] = [
 ];
 
 /// Returns true when the value carries secret or payload-bearing content.
+///
+/// In addition to the local substring markers below, any value the shared
+/// telemetry field-policy library recognises as a secret
+/// ([`eliot_observability::field_policy::looks_like_secret`]: AWS key IDs,
+/// provider tokens, chatops tokens, PEM headers and related shapes) is denied
+/// here, so the daemon emission boundary enforces the same recognisable-secret
+/// rule the policy library applies to span and metric labels (issue #1842,
+/// I16.3/I15.4). Denied values record [`REDACTED`] before formatting, never
+/// after.
 #[must_use]
 pub fn carries_denied_content(value: &str) -> bool {
+    if eliot_observability::field_policy::looks_like_secret(value) {
+        return true;
+    }
     let lowered = value.to_lowercase();
     SECRET_MARKERS
         .iter()

@@ -14,6 +14,73 @@
 use std::sync::{Arc, RwLock};
 
 /// Readiness data emitted by the process entrypoint.
+///
+/// I1.5 (#1750) verification contract for every field. This cell is
+/// Watchdog-local state: the Host has no transport that reads it, so no Host
+/// path may treat SCM `Running` — or any projection it cannot observe —
+/// as supervised coverage. There is deliberately no Host-side heartbeat
+/// validator: an uncalled validator would be dead code, and the admitted ORS
+/// snapshot cannot substitute for heartbeat recency — it carries lease
+/// currency (the epoch pair plus the `issued/expires/renew-before` validity
+/// window) but no heartbeat observation (no authority state, no coverage
+/// flag, no tick interval, no last-beat timestamp). Liveness from the
+/// snapshot alone would conflate Kernel-renewal currency with a fresh
+/// Watchdog heartbeat, so no such check is claimed.
+///
+/// Heartbeat transport (transport1750, landed on this line via PR 2203;
+/// the earlier "not implemented in this slice" remainder is closed, not
+/// dropped: this cell stays Watchdog-local state and the Host still has
+/// no transport that reads it, only the pipe wire messages below). The writer
+/// side lives in `crate::heartbeat_transport`: the Watchdog process
+/// entrypoint loads the Host-issued rendezvous (per-instance pipe name plus
+/// 256-bit challenge, bound to the installer-approved bootstrap contour),
+/// writes one fence announce at sequence zero, and emits one
+/// `AdmittedHeartbeat` message per admitted Kernel heartbeat at the tick
+/// cadence with a strictly increasing sequence. The Host listener records
+/// its own receive time per read and the admission path consumes only the
+/// derived Host observation (epochs, receive time, freshness deadline,
+/// coverage, guid). Until a fresh admitted heartbeat is observed, every
+/// supervision claim that would need it still fails closed (A0.3).
+///
+/// The current shape carries no emission timestamp, so the freshness bound
+/// is expressed by the Host receive time against `tick_interval_ms` (see
+/// the reader contract below), not by a writer clock.
+///
+/// Field contract the future reader must apply before treating a delivered
+/// projection as coverage (enforced by the Host admission validator):
+/// - `authority_state` / `coverage_claimed`: require `AdmittedHeartbeat` with
+///   `coverage_claimed == true`. `RunningNoAuthority` is an explicit gap-only
+///   signal (the SCM sibling is alive but no current Host-issued lease has
+///   been admitted for heartbeat authority), never coverage.
+/// - `kernel_epoch` / `watchdog_epoch`: the exact admitted lease pair,
+///   rotated atomically under one lock so a reader can never combine epochs
+///   from different leases. The Host verifies them against the current
+///   activation's supervision incarnation. A zero epoch is never published as
+///   coverage: the cell below fails closed into the no-authority projection.
+/// - `tick_interval_ms`: the bounded supervision tick, i.e. the
+///   responsiveness bound. A projection older than a small multiple of this
+///   interval without a fresh admitted heartbeat must be treated as
+///   unresponsive, never as current coverage.
+/// - `service_instance_guid` / `host_challenge_nonce`: the Host-issued pipe
+///   instance identity echoed verbatim. The Host requires byte equality
+///   with its per-instance rendezvous; a mismatch fails closed. The nonce
+///   rides the pipe wire message only and is never serialized below: the
+///   readiness log stream carries no challenge material.
+/// - `watchdog_readiness_sequence`: zero for fence announces, strictly
+///   increasing across admitted emissions. The Host requires continuity
+///   against its persisted observation and treats a gap as PARTIAL.
+///
+/// Binding a projection to its exact lease (lease identity plus ORS receipt
+/// digest) is owned by the supervision-claim path, not by this shape: the
+/// Host persists a watchdog-branch evidence ref naming the exact admitted
+/// lease id, receipt digest, publication digest, and epoch, all derived from
+/// the single Kernel-renewed `ORS` snapshot via the provisioned admission
+/// template (no caller-supplied identity),
+/// the Kernel `ProbeReady` gate enforces exact epoch equality against the
+/// renewed ORS head, publication exactness against the ORS head is verified
+/// at publish time, and governance stays degraded until a proven-ready
+/// transition. SCM liveness alone (this projection unread, or
+/// `RunningNoAuthority`) never satisfies that path.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct WatchdogReadiness {
     pub service: &'static str,
@@ -23,6 +90,13 @@ pub struct WatchdogReadiness {
     pub kernel_epoch: u64,
     pub watchdog_epoch: u64,
     pub tick_interval_ms: u128,
+    pub service_instance_guid: String,
+    /// Host-issued 256-bit challenge echo for the pipe wire message the
+    /// Host byte-compares. Skipped on serialization so the 256-bit secret
+    /// never reaches the readiness log stream (`runtime_loop` stdout JSON).
+    #[serde(skip_serializing)]
+    pub host_challenge_nonce: String,
+    pub watchdog_readiness_sequence: u64,
 }
 
 /// Separates SCM/process liveness from admitted heartbeat authority.

@@ -21,6 +21,7 @@ parse_workflow_events = vgw.parse_workflow_events
 check_workflows = vgw.check_workflows
 check_python_requirements = vgw.check_python_requirements
 check_nuget_lock = vgw.check_nuget_lock
+check_pip_install_lock = vgw.check_pip_install_lock
 verify_all = vgw.verify_all
 
 
@@ -105,6 +106,63 @@ class TestVerifyGithubWorkflows(unittest.TestCase):
             (op_dir / "Eliot.Operator.csproj").write_text("<Project><PropertyGroup></PropertyGroup></Project>", encoding="utf-8")
             findings = check_nuget_lock(root)
             self.assertTrue(any(f.code == "GWF-005" for f in findings))
+
+    def test_nuget_harness_lock_missing_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            harness_dir = root / "tests" / "Eliot.Operator.Tests"
+            harness_dir.mkdir(parents=True)
+            (harness_dir / "Eliot.Operator.Tests.csproj").write_text(
+                "<Project><PropertyGroup></PropertyGroup></Project>", encoding="utf-8"
+            )
+            findings = check_nuget_lock(root)
+            self.assertTrue(
+                any(f.code == "GWF-005" and "Eliot.Operator.Tests" in f.path for f in findings)
+            )
+
+    def test_nuget_harness_locked_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            harness_dir = root / "tests" / "Eliot.Operator.Tests"
+            harness_dir.mkdir(parents=True)
+            (harness_dir / "Eliot.Operator.Tests.csproj").write_text(
+                "<Project><PropertyGroup><RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>"
+                "</PropertyGroup></Project>",
+                encoding="utf-8",
+            )
+            (harness_dir / "packages.lock.json").write_text(
+                '{"version": 1, "dependencies": {"net10.0": {}}}', encoding="utf-8"
+            )
+            findings = check_nuget_lock(root)
+            self.assertEqual(findings, [])
+
+    def test_pip_install_unhashed_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            wf_dir = root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            (wf_dir / "test.yml").write_text(
+                "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n"
+                "    runs-on: windows-latest\n    steps:\n"
+                "      - run: python -m pip install -r scripts/requirements.txt\n",
+                encoding="utf-8",
+            )
+            findings = check_pip_install_lock(root)
+            self.assertTrue(any(f.code == "GWF-009" for f in findings))
+
+    def test_pip_install_hash_locked_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            wf_dir = root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            (wf_dir / "test.yml").write_text(
+                "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n"
+                "    runs-on: windows-latest\n    steps:\n"
+                "      - run: python -m pip install --require-hashes -r scripts/requirements-verification.txt\n",
+                encoding="utf-8",
+            )
+            findings = check_pip_install_lock(root)
+            self.assertEqual(findings, [])
 
     def test_current_repository_passes(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]

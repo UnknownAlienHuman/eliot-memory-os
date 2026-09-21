@@ -18,7 +18,7 @@ use eliot_protocol::{
     AgentActivationInvalidTicket, AgentActivationResolutionDisposition,
     AgentActivationResolutionResult, AgentActivationResolutionTicket,
 };
-use eliotd::{classify_claimed_ticket_value, terminal_for_invalid_ticket, ActivationClaim};
+use eliotd::{ActivationClaim, classify_claimed_ticket_value, terminal_for_invalid_ticket};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 

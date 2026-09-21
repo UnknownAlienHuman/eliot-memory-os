@@ -18,6 +18,8 @@ use thiserror::Error;
 
 mod record_family_v2;
 pub use record_family_v2::*;
+mod source_handles;
+pub use source_handles::*;
 
 /// Stable wire name for this C0-11 contract family.
 pub const CONTRACT_NAME: &str = "eliot.foundation.observation-contracts";
