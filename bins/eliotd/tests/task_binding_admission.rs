@@ -5,9 +5,10 @@
 //! `TASK_SELECTION_REQUIRED`; wrong-scope evidence rejects with
 //! `TASK_SCOPE_INCOMPATIBLE` and changes nothing.
 
+use eliot_observation::TaskSelectionEvidence;
 use eliotd::task_binding_admission::{
     CaptureAdmission, CompatibilityDisposition, TASK_SCOPE_INCOMPATIBLE, TASK_SELECTION_REQUIRED,
-    TaskSelectionEvidence, admit_capture, admit_task_bound,
+    admit_capture, admit_task_bound,
 };
 
 fn fence() -> eliot_contracts::StateFence {
@@ -18,15 +19,15 @@ fn fence() -> eliot_contracts::StateFence {
     eliot_contracts::StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
-fn evidence(task: &str, scope: &str, fence: &eliot_contracts::StateFence) -> TaskSelectionEvidence {
+fn evidence(task: &str, scope: &str) -> TaskSelectionEvidence {
     TaskSelectionEvidence {
         task_ref: task.to_owned(),
-        task_contract_revision: "7".to_owned(),
+        task_revision: 7,
         acceptance_digest: "a".repeat(64),
         work_scope_ref: scope.to_owned(),
         selection_source_ref: "owner-selection".to_owned(),
         evidence_ref: "evidence-1".to_owned(),
-        state_fence: fence.clone(),
+        contamination_flags: Vec::new(),
     }
 }
 
@@ -51,7 +52,7 @@ fn unbound_observation_is_retained_cold_without_task_effects() {
     let ambiguous = admit_capture(
         "candidate-1929-2".to_owned(),
         fence(),
-        Some(&evidence("task-a", "scope-a", &fence())),
+        Some(&evidence("task-a", "scope-a")),
         2,
         CompatibilityDisposition::Compatible,
     )
@@ -75,7 +76,7 @@ fn promotion_without_evidence_returns_selection_required() {
 #[test]
 fn wrong_scope_evidence_returns_incompatible_without_changing_tasks() {
     let fence = fence();
-    let other_scope = evidence("task-a", "scope-other", &fence);
+    let other_scope = evidence("task-a", "scope-other");
     let before = other_scope.clone();
     let error = admit_task_bound(
         Some(&other_scope),
@@ -87,4 +88,30 @@ fn wrong_scope_evidence_returns_incompatible_without_changing_tasks() {
     .expect_err("wrong-scope evidence must reject");
     assert_eq!(error.code(), TASK_SCOPE_INCOMPATIBLE);
     assert_eq!(other_scope, before, "rejection mutates nothing");
+}
+
+#[test]
+fn contaminated_selection_never_promotes() {
+    let mut tainted = evidence("task-a", "scope-a");
+    tainted.contamination_flags = vec!["crossover-suspect".to_owned()];
+    // Capture stays cold instead of binding the tainted selection.
+    let cold = admit_capture(
+        "candidate-1929-3".to_owned(),
+        fence(),
+        Some(&tainted),
+        1,
+        CompatibilityDisposition::Compatible,
+    )
+    .expect("contaminated selection stays cold");
+    assert!(matches!(cold, CaptureAdmission::ColdUnbound(_)));
+    // Promotion rejects tainted evidence as non-current.
+    let error = admit_task_bound(
+        Some(&tainted),
+        "task-a",
+        "scope-a",
+        &fence(),
+        CompatibilityDisposition::Compatible,
+    )
+    .expect_err("contaminated promotion must reject");
+    assert_eq!(error.code(), TASK_SELECTION_REQUIRED);
 }

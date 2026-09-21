@@ -8,11 +8,11 @@
 //!   task activation, support/influence promotion, or finish relevance.
 //! - Every task-relative reusable/control transition (`UpdateTaskState` and any
 //!   `CaptureObservation` that names a task) requires the exact binding: the
-//!   context and transition task identities agree, the fences agree, and the
-//!   admitted proof refs carry the exact `TaskContract` revision plus acceptance
-//!   digest for the same `WorkScope`. Absence rejects with
-//!   `TASK_SELECTION_REQUIRED`; a different/incompatible scope rejects with
-//!   `TASK_SCOPE_INCOMPATIBLE`.
+//!   context and transition task identities agree, the fences agree, and at
+//!   least two distinct exact evidence handles are present (the revision
+//!   evidence and the digest evidence, whose values were verified upstream).
+//!   Absence rejects with `TASK_SELECTION_REQUIRED`; a different/incompatible
+//!   scope rejects with `TASK_SCOPE_INCOMPATIBLE`.
 //! - There is no latest-task, open-task, or resolver-guess fallback: ambiguity
 //!   stays cold, mismatch fails closed.
 //!
@@ -31,15 +31,6 @@ use eliot_store_api::{NamedMutationOperation, PreparedTransition, RequestMeta, S
 pub const TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
 /// Stable rejection code when evidence names another/incompatible `WorkScope`.
 pub const TASK_SCOPE_INCOMPATIBLE: &str = "TASK_SCOPE_INCOMPATIBLE";
-
-/// Where the admitted proof refs must bind the exact task evidence.
-///
-/// Proof handles are opaque exact strings admitted upstream. The bridge does
-/// not parse their internals; it only requires that both the `TaskContract`
-/// revision handle and the acceptance-digest handle are present and bound to
-/// the same task, so a bare `task_id` can never promote by itself.
-const TASK_CONTRACT_REVISION_MARKER: &str = "task-contract-revision:";
-const ACCEPTANCE_DIGEST_MARKER: &str = "acceptance-digest:";
 
 /// Outcome of the pre-provider task-binding gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,26 +118,33 @@ fn operations_of(transition: &PreparedTransition) -> Vec<NamedMutationOperation>
         .collect()
 }
 
-fn has_exact_binding_refs(transition: &PreparedTransition, task_id: &str) -> bool {
-    let revision_handle = transition
-        .required_proof_and_approval_refs
-        .iter()
-        .any(|handle| {
-            handle.starts_with(TASK_CONTRACT_REVISION_MARKER)
-                && handle.contains(task_id)
-                && handle.trim().len() == handle.len()
-                && !handle.trim().is_empty()
-        });
-    let digest_handle = transition
-        .required_proof_and_approval_refs
-        .iter()
-        .any(|handle| {
-            handle.starts_with(ACCEPTANCE_DIGEST_MARKER)
-                && handle.contains(task_id)
-                && handle.trim().len() == handle.len()
-                && !handle.trim().is_empty()
-        });
-    revision_handle && digest_handle
+/// Requires the exact evidence handles for one task-bound transition.
+///
+/// Proof handles are opaque exact strings admitted upstream at eliotd /
+/// Governor admission, where the `TaskContract` revision value, acceptance
+/// digest value, and scope binding are verified against canonical evidence.
+/// The bridge parses no handle internals and invents no marker syntax: it
+/// requires at least two DISTINCT exact handles (the revision evidence and
+/// the digest evidence), each non-blank, trimmed, and control-free per the
+/// canonical text rules, so a bare `task_id` can never promote by itself.
+/// Role verification stays upstream; presence, exactness, and task/fence
+/// agreement are enforced here before any provider I/O.
+fn has_exact_binding_refs(transition: &PreparedTransition) -> bool {
+    fn exact(handle: &str) -> bool {
+        !handle.trim().is_empty()
+            && handle.trim().len() == handle.len()
+            && !handle.chars().any(char::is_control)
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for handle in &transition.required_proof_and_approval_refs {
+        if !exact(handle) {
+            return false;
+        }
+        if !seen.contains(&handle.as_str()) {
+            seen.push(handle.as_str());
+        }
+    }
+    seen.len() >= 2
 }
 
 /// Gates one prepared transition before any provider I/O.
@@ -157,10 +155,10 @@ fn has_exact_binding_refs(transition: &PreparedTransition, task_id: &str) -> boo
 /// - `CaptureObservation` naming a task, and every `UpdateTaskState`, require
 ///   exact binding: context/transition task identities present and equal,
 ///   fences equal, `WorkScope` (transition `scope_id`) consistent with the
-///   context fence, and exact contract-revision plus acceptance-digest proof
-///   refs for that task. Missing binding rejects with
-///   `TASK_SELECTION_REQUIRED`; a task/scope mismatch rejects with
-///   `TASK_SCOPE_INCOMPATIBLE`.
+///   context fence, and at least two distinct exact evidence handles covering
+///   the revision and digest evidence verified upstream. Missing binding
+///   rejects with `TASK_SELECTION_REQUIRED`; a task/scope mismatch rejects
+///   with `TASK_SCOPE_INCOMPATIBLE`.
 /// - All other operations are [`GateDisposition::NotTaskRelative`].
 pub fn gate_apply(
     context: &RequestMeta,
@@ -230,9 +228,9 @@ fn require_exact_binding(
             "task binding handle is blank",
         ));
     }
-    if !has_exact_binding_refs(transition, task_id) {
+    if !has_exact_binding_refs(transition) {
         return Err(TaskBindingRejection::selection_required(
-            "task-bound transition requires exact TaskContract revision and acceptance digest handles",
+            "task-bound transition requires exact revision and digest evidence handles",
         ));
     }
     Ok(())
@@ -241,12 +239,6 @@ fn require_exact_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn binding_markers_require_both_handles_for_the_same_task() {
-        assert!(TASK_CONTRACT_REVISION_MARKER.starts_with("task-contract"));
-        assert!(ACCEPTANCE_DIGEST_MARKER.starts_with("acceptance"));
-    }
 
     #[test]
     fn rejection_mapping_preserves_exact_stable_codes() {

@@ -40,11 +40,12 @@ fn context(task: Option<&str>) -> RequestMeta {
     }
 }
 
-fn binding_refs(task: &str) -> Vec<String> {
-    vec![
-        format!("task-contract-revision:{task}:7"),
-        format!("acceptance-digest:{task}:{}", "a".repeat(64)),
-    ]
+fn binding_refs(_task: &str) -> Vec<String> {
+    // Opaque exact handles admitted upstream (revision evidence + digest
+    // evidence); the bridge parses no internals and invents no marker syntax.
+    // Handles carry no task text: task binding comes from the agreed
+    // context/transition identities, never from substring matching.
+    vec!["evidence-ref-1".to_owned(), "evidence-ref-2".to_owned()]
 }
 
 fn transition(
@@ -171,4 +172,39 @@ fn production_mapping_carries_exact_stable_codes() {
             reason: TASK_SCOPE_INCOMPATIBLE,
         }
     );
+}
+
+#[test]
+fn inexact_handles_reject_without_task_effects() {
+    // One handle is not both evidence pieces.
+    let single = gate_apply(
+        &context(Some("task-a")),
+        &control(Some("task-a"), vec!["evidence-ref-1".to_owned()]),
+    )
+    .expect_err("single handle must reject");
+    assert_eq!(single.code(), TASK_SELECTION_REQUIRED);
+    // Duplicates are one handle, not two.
+    let duplicate = gate_apply(
+        &context(Some("task-a")),
+        &control(
+            Some("task-a"),
+            vec!["evidence-ref-1".to_owned(), "evidence-ref-1".to_owned()],
+        ),
+    )
+    .expect_err("duplicate handles must reject");
+    assert_eq!(duplicate.code(), TASK_SELECTION_REQUIRED);
+    // Blank, padded, and control-character handles are not exact.
+    let bad_handles = [
+        " ".to_owned(),
+        "evidence-ref-1 ".to_owned(),
+        "evidence-ref-2\n".to_owned(),
+    ];
+    for bad in bad_handles {
+        let error = gate_apply(
+            &context(Some("task-a")),
+            &control(Some("task-a"), vec![bad, "evidence-ref-2".to_owned()]),
+        )
+        .expect_err("inexact handle must reject");
+        assert_eq!(error.code(), TASK_SELECTION_REQUIRED);
+    }
 }
