@@ -2068,11 +2068,16 @@ dependencies = [
 name = "eliot-kernel-service"
 version = "0.1.0"
 dependencies = [
+ "eliot-canonical",
  "eliot-contracts",
  "eliot-doctor-core",
+ "eliot-epistemic",
+ "eliot-epistemic-contracts",
+ "eliot-evidence",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-mcp",
+ "eliot-memory-curation",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",

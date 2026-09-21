@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod candidate_admission;
 
 use std::collections::{BTreeMap, BTreeSet};
 

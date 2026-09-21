@@ -29,6 +29,9 @@ mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
 mod lifecycle;
+mod lifecycle_persist;
+#[cfg(test)]
+mod lifecycle_persist_tests;
 mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
@@ -80,6 +83,12 @@ pub use eliot_protocol::{
 pub use host_request_binding::{AuthenticatedHostSession, KernelHostRequestBinder};
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
+};
+pub use lifecycle_persist::{
+    AuthenticatedLifecycleSession, BuiltLeg, BuiltLegKind, HopMutation, HopMutationInput,
+    LifecyclePersistError, LifecyclePersistRequest, LifecyclePersistResponse,
+    LifecycleServiceContext, LinkAuditBinding, PersistedHop, PersistedMutation,
+    build_persist_transitions, handle_lifecycle_persist_request,
 };
 pub use notification_state::{
     AuthenticatedNotificationSession, NotificationMetrics, NotificationServiceContext,
