@@ -2595,6 +2595,16 @@ pub enum OrsError {
         stream_id: String,
         after_sequence: u64,
     },
+    #[error("versioned artifact conflicts with durable generation state")]
+    VersionedArtifactConflict,
+    #[error("in-place replacement of an active executable is rejected")]
+    ActiveExecutableReplacement,
+    #[error("versioned artifact generation was not found")]
+    VersionedArtifactNotFound,
+    #[error("generation must drain before it can retire")]
+    VersionedArtifactNotDrained,
+    #[error("candidate artifact is incompatible with durable formats or epoch lineage")]
+    IncompatibleArtifact,
     #[error("durable ORS storage failed: {0}")]
     Storage(String),
     #[error("durable ORS encoding failed: {0}")]

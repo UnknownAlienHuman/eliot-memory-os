@@ -25,6 +25,19 @@ pub use model::{
     ProbeTarget,
 };
 
+/// Canonical pure planning operation for A-17b.
+///
+/// The parameter bundle makes the plan identity, exact budget limits, and
+/// versioned presentation policy explicit while keeping every input borrowed
+/// and immutable.  This function performs no I/O, reservation, execution, or
+/// evidence acquisition; it is the named operation for callers that do not
+/// need the constructor spelling.
+pub fn plan_discriminative_probes(
+    params: ProbePlanParams<'_>,
+) -> Result<ProbePlan, ContractViolation> {
+    ProbePlan::new(params)
+}
+
 /// Re-exported contract inputs consumed by the planner.
 pub use eliot_dreamer_contracts::{
     BudgetLimits, DreamInputBundle, InquiryAffordanceSet, RivalModelSet, ValidatedDreamDraft,

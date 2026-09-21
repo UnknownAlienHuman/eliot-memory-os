@@ -575,8 +575,10 @@ dependencies = [
  "anyhow",
  "clap",
  "eliot-agent-api",
+ "eliot-backup",
  "eliot-bootstrap",
  "eliot-cli",
+ "eliot-config",
  "eliot-contracts",
  "eliot-doctor",
  "eliot-governor",
@@ -658,6 +660,7 @@ dependencies = [
  "eliot-process",
  "eliot-protocol",
  "eliot-skill",
+ "eliot-types",
  "serde",
  "serde_json",
  "thiserror",
@@ -1075,6 +1078,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-evaluation-contracts",
  "eliot-evidence",
+ "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-protocol",
  "eliot-receipts",
@@ -1511,7 +1515,10 @@ dependencies = [
 name = "eliot-dreamer-probe-plan"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-dreamer-contracts",
+ "eliot-evaluation-contracts",
+ "eliot-receipts",
  "schemars",
  "serde",
 ]
@@ -2318,6 +2325,8 @@ dependencies = [
 name = "eliot-notify-core"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
+ "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-receipts",
@@ -3075,6 +3084,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",
+ "eliot-config",
  "eliot-contracts",
  "eliot-controlboard",
  "eliot-doctor-core",
