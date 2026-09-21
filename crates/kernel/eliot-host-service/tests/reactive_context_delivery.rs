@@ -46,20 +46,46 @@ use eliot_receipts::{
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+fn must_ok<T, E>(result: Result<T, E>, message: &str) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            drop(error);
+            panic!("{message}");
+        }
+    }
+}
+
+fn must_some<T>(value: Option<T>, message: &str) -> T {
+    match value {
+        Some(value) => value,
+        None => panic!("{message}"),
+    }
+}
+
+fn must_err<T, E>(result: Result<T, E>, message: &str) -> E {
+    match result {
+        Ok(_) => panic!("{message}"),
+        Err(error) => error,
+    }
+}
+
 fn handle(value: &str) -> PlatformHandle {
-    PlatformHandle::new(value.to_owned()).expect("valid handle")
+    must_ok(PlatformHandle::new(value.to_owned()), "valid handle")
 }
 
 fn lineage(value: &str) -> EpochLineageId {
-    EpochLineageId::new(value).expect("valid lineage")
+    must_ok(EpochLineageId::new(value), "valid lineage")
 }
 
 fn epoch(lineage_name: &str, sequence: u64) -> EpochId {
-    EpochId::new(
-        lineage(lineage_name),
-        NonZeroU64::new(sequence).expect("non-zero epoch"),
+    must_ok(
+        EpochId::new(
+            lineage(lineage_name),
+            must_some(NonZeroU64::new(sequence), "non-zero epoch"),
+        ),
+        "valid epoch",
     )
-    .expect("valid epoch")
 }
 
 fn transition(lineage_name: &str, sequence: u64) -> EpochTransition {
@@ -152,15 +178,19 @@ fn activation_record(
 
 fn active_journal() -> HostStateJournal<MemoryBackend> {
     let host = host();
-    let journal = HostStateJournal::open(MemoryBackend::default(), host.clone()).expect("open");
+    let journal = must_ok(
+        HostStateJournal::open(MemoryBackend::default(), host.clone()),
+        "open",
+    );
     for (state, name) in [
         (ActivationState::Starting, "activation-start"),
         (ActivationState::ControlReady, "activation-ready"),
         (ActivationState::Active, "activation-active"),
     ] {
-        journal
-            .append(activation_record(&host, state, name))
-            .expect("activation transition");
+        must_ok(
+            journal.append(activation_record(&host, state, name)),
+            "activation transition",
+        );
     }
     journal
 }
@@ -168,21 +198,24 @@ fn active_journal() -> HostStateJournal<MemoryBackend> {
 fn protocol_fence() -> StateFence {
     StateFence::new(
         epoch("550e8400-e29b-41d4-a716-446655440000", 1),
-        ResourceGeneration::new(1).expect("generation"),
+        must_ok(ResourceGeneration::new(1), "generation"),
     )
 }
 
 fn content(name: &str) -> ReactiveContextContentRef {
     ReactiveContextContentRef {
         contract: ContractIdentity {
-            name: ContractId::new(format!("owner.{name}")).expect("contract"),
+            name: must_ok(ContractId::new(format!("owner.{name}")), "contract"),
             version: ContractVersion::new(1, 0, 0),
             shape_sha256: "0".repeat(64),
         },
         source_revision: format!("source-{name}"),
         content_sha256: "1".repeat(64),
         byte_length: Some(1),
-        artifact_id: Some(ArtifactId::new(format!("artifact-{name}")).expect("artifact")),
+        artifact_id: Some(must_ok(
+            ArtifactId::new(format!("artifact-{name}")),
+            "artifact",
+        )),
     }
 }
 
@@ -194,21 +227,21 @@ fn payload(
     attempt: &str,
 ) -> ReactiveContextPayload {
     let fence = protocol_fence();
-    let contract = reactive_context_contract_identity().expect("reactive contract");
+    let contract = must_ok(reactive_context_contract_identity(), "reactive contract");
     let mut representation = content(&format!("representation-{key}"));
     representation.byte_length = Some(16);
     ReactiveContextPayload {
         contract,
-        operation_id: OperationId::new(format!("operation-{key}")).expect("operation"),
-        request_id: RequestId::new(format!("request-{key}")).expect("request"),
+        operation_id: must_ok(OperationId::new(format!("operation-{key}")), "operation"),
+        request_id: must_ok(RequestId::new(format!("request-{key}")), "request"),
         idempotency_key: format!("idempotency-{key}"),
-        task_id: TaskId::new(format!("task-{key}")).expect("task"),
-        attempt_id: AgentAttemptId::new(attempt.to_owned()).expect("attempt"),
-        producer_generation: ResourceGeneration::new(1).expect("producer generation"),
+        task_id: must_ok(TaskId::new(format!("task-{key}")), "task"),
+        attempt_id: must_ok(AgentAttemptId::new(attempt.to_owned()), "attempt"),
+        producer_generation: must_ok(ResourceGeneration::new(1), "producer generation"),
         work_scope: WorkScopeBinding {
-            scope_id: WorkScopeId::new("reactive-test-scope").expect("scope"),
-            product_id: ProductId::new("eliot-memory-os").expect("product"),
-            resource_generation: ResourceGeneration::new(1).expect("resource generation"),
+            scope_id: must_ok(WorkScopeId::new("reactive-test-scope"), "scope"),
+            product_id: must_ok(ProductId::new("eliot-memory-os"), "product"),
+            resource_generation: must_ok(ResourceGeneration::new(1), "resource generation"),
             state_fence: fence.clone(),
         },
         planner: ReactiveContextPlannerBinding {
@@ -217,14 +250,14 @@ fn payload(
             receipt: content(&format!("planner-receipt-{key}")),
         },
         recipient: ReactiveContextRecipient {
-            session_id: SessionId::new(format!("session-{key}")).expect("session"),
+            session_id: must_ok(SessionId::new(format!("session-{key}")), "session"),
             runtime_id: format!("runtime-{key}"),
-            runtime_generation: ResourceGeneration::new(1).expect("runtime generation"),
+            runtime_generation: must_ok(ResourceGeneration::new(1), "runtime generation"),
             route: format!("route-{key}"),
         },
         view: ReactiveContextViewBinding {
-            view_id: ArtifactId::new(format!("view-{key}")).expect("view"),
-            view_generation: ResourceGeneration::new(1).expect("view generation"),
+            view_id: must_ok(ArtifactId::new(format!("view-{key}")), "view"),
+            view_generation: must_ok(ResourceGeneration::new(1), "view generation"),
             admitted_set: content(&format!("admitted-{key}")),
             recipe: content(&format!("recipe-{key}")),
             assembly_receipt: content(&format!("assembly-{key}")),
@@ -367,13 +400,15 @@ fn delivery(
     transport: TransportSpy,
     clock: TestClock,
 ) -> ReactiveContextDelivery<HostStateJournal<MemoryBackend>, TransportSpy, TestClock> {
-    ReactiveContextDelivery::new(
-        active_journal(),
-        transport,
-        clock,
-        ReactiveContextDeliveryLimits::default(),
+    must_ok(
+        ReactiveContextDelivery::new(
+            active_journal(),
+            transport,
+            clock,
+            ReactiveContextDeliveryLimits::default(),
+        ),
+        "valid delivery limits",
     )
-    .expect("valid delivery limits")
 }
 
 fn request(value: ReactiveContextPayload) -> ReactiveContextDeliveryRequest {
@@ -586,10 +621,11 @@ fn deliver_one(
 }
 
 fn assert_fixture_denominator() {
-    let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("data/reactive-context-delivery/cases.json"))
-            .expect("valid case fixture");
-    assert_eq!(fixture.as_array().expect("array").len(), 38);
+    let fixture: serde_json::Value = must_ok(
+        serde_json::from_str(include_str!("data/reactive-context-delivery/cases.json")),
+        "valid case fixture",
+    );
+    assert_eq!(must_some(fixture.as_array(), "array").len(), 38);
 }
 
 // WORK_UNIT_CASE: 798/1
@@ -675,9 +711,10 @@ fn replay_and_changed_content_conflict() -> TestResult {
     delivery.deliver(&admission, request(value.clone()))?;
     let mut changed = value.clone();
     changed.view.view_id = ArtifactId::new("changed-view")?;
-    let error = delivery
-        .deliver(&admission, request(changed))
-        .expect_err("identity conflict");
+    let error = must_err(
+        delivery.deliver(&admission, request(changed)),
+        "identity conflict",
+    );
     assert!(matches!(
         error,
         eliot_host_service::ReactiveContextDeliveryError::Queue(
@@ -686,9 +723,10 @@ fn replay_and_changed_content_conflict() -> TestResult {
     ));
     let mut changed_admission = admission.clone();
     changed_admission.endpoint_ref = handle("changed-endpoint");
-    let error = delivery
-        .deliver(&changed_admission, request(value))
-        .expect_err("endpoint identity conflict");
+    let error = must_err(
+        delivery.deliver(&changed_admission, request(value)),
+        "endpoint identity conflict",
+    );
     assert!(matches!(
         error,
         eliot_host_service::ReactiveContextDeliveryError::Queue(
@@ -748,7 +786,7 @@ fn queue_capacity_and_cas() -> TestResult {
 
 // WORK_UNIT_CASE: 798/7
 #[test]
-fn host_admission_states() -> TestResult {
+fn host_admission_states() {
     for state in [
         HostDeliveryState::Draining,
         HostDeliveryState::DegradedRecovery,
@@ -768,7 +806,6 @@ fn host_admission_states() -> TestResult {
             Err(eliot_host_service::ReactiveContextDeliveryError::HostAdmission { .. })
         ));
     }
-    Ok(())
 }
 
 // WORK_UNIT_CASE: 798/8
@@ -819,7 +856,7 @@ fn unknown_send_intent_blocks_transport() -> TestResult {
         queue,
         TransportSpy::default(),
         TestClock::new(50),
-        Default::default(),
+        ReactiveContextDeliveryLimits::default(),
     )?;
     let adm = admission(&value, HostDeliveryState::Active);
     assert!(delivery.deliver(&adm, request(value)).is_err());
@@ -925,7 +962,7 @@ fn same_operation_replay() -> TestResult {
 
 // WORK_UNIT_CASE: 798/16
 #[test]
-fn retry_deadline_cancel_fence_bounds() -> TestResult {
+fn retry_deadline_cancel_fence_bounds() {
     let value = payload(16, "stream-16", 1, Vec::new(), "attempt-16");
     let adm = admission(&value, HostDeliveryState::Active);
     let mut delivery = delivery(TransportSpy::default(), TestClock::new(100));
@@ -933,7 +970,6 @@ fn retry_deadline_cancel_fence_bounds() -> TestResult {
         delivery.deliver(&adm, request(value)),
         Err(eliot_host_service::ReactiveContextDeliveryError::DeadlineExceeded)
     ));
-    Ok(())
 }
 
 // WORK_UNIT_CASE: 798/17
@@ -1076,7 +1112,7 @@ fn cancellation_before_and_after_send() -> TestResult {
         journal,
         TransportSpy::default(),
         TestClock::new(50),
-        Default::default(),
+        ReactiveContextDeliveryLimits::default(),
     )?;
     let cancelled = delivery.cancel(operation_for(&value))?;
     assert_eq!(
@@ -1299,7 +1335,7 @@ fn deterministic_receipt() -> TestResult {
 
 // WORK_UNIT_CASE: 798/33
 #[test]
-fn malformed_port_result_bounded() -> TestResult {
+fn malformed_port_result_bounded() {
     let value = payload(35, "stream-35", 1, Vec::new(), "attempt-35");
     let mut spy = TransportSpy::default();
     spy.resolve_overrides
@@ -1315,8 +1351,7 @@ fn malformed_port_result_bounded() -> TestResult {
         delivery.deliver(&adm, request(value))
     }));
     assert!(result.is_ok());
-    assert!(result.expect("no panic").is_err());
-    Ok(())
+    assert!(must_ok(result, "no panic").is_err());
 }
 
 // WORK_UNIT_CASE: 798/34
