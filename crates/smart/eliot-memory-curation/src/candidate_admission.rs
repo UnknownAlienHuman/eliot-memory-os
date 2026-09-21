@@ -14,10 +14,10 @@
 //!
 //! Time, fence, and audit-event identity are caller-supplied: curation
 //! never mints clocks, fences, or Store envelopes. Persistence stays with
-//! the Store owner; [`StoreAdmissionProjection`] documents the exact 1:1
-//! mapping of an admission onto a Store `NamedMutationRequest`
-//! (`operation` + string `parameters`), so the Store caller persists
-//! without any new shapes. No Store, Kernel, or Host file is touched here.
+//! the Store owner; [`project_for_store`] maps an admission onto the exact
+//! declared catalogue shape — submittable `CaptureObservation{subject}`
+//! parameters, or linkage evidence where the operation is Store-minted —
+//! with no invented fields. No Store, Kernel, or Host file is touched here.
 
 use std::collections::BTreeMap;
 
@@ -184,45 +184,67 @@ pub fn admit_forward_revision(
 /// `NamedMutationRequest` parameters and `AppendAuditEvent` linkage. The
 /// Store mints `operation_id`, envelope, and audit event ids; curation
 /// never does.
+///
+/// Only `CaptureObservation` has a curation-fillable declared shape
+/// (`CAPTURE_OBSERVATION_PARAMETERS{subject}`): the persisted subject is
+/// the retained raw output handle. Every other admission-path operation
+/// is Store-minted by contract:
+/// - `ApplyEpistemicRevision` requires `EPISTEMIC_REVISION_PARAMETERS
+///   {revision: EpistemicRevision}` — the Governor-owned epistemic
+///   position payload, not a lifecycle receipt;
+/// - `ApplyLifecyclePolicy` requires the skill-lifecycle six-field
+///   package (`action`, `base_view_digest`, `candidate_digest`,
+///   `candidate_package_digest`, `skill_id`, `verifier_ref`);
+/// - `AppendAuditEvent` requires the six Store envelope fields
+///   (`operation_id`, `idempotency_key`, `session_id`, `access_digest`,
+///   `action_digest`, `expected_revision`).
+///
+/// Projecting receipt fields into those tables would be a fake-field
+/// assumption, so those admissions project as linkage evidence only: the
+/// Store consumer binds the stable receipt id/digest/output and the real
+/// emitted audit event id at its own persist call-site.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoreAdmissionProjection {
-    /// Canonical mutation wire name from the closed catalogue.
-    pub operation: &'static str,
-    /// Stable receipt id, linked through `AppendAuditEvent`.
-    pub receipt_id: String,
-    /// Frozen receipt digest.
-    pub receipt_digest: String,
-    /// Output record handle produced by the transition.
-    pub output_record_id: String,
-    /// Store-minted audit event, when already recorded.
-    pub audit_event_id: Option<String>,
-    /// String `parameters` entries for the Store `NamedMutationRequest`.
-    pub fields: BTreeMap<String, String>,
+pub enum StoreProjection {
+    /// Submittable `CaptureObservation{subject}` parameters.
+    SubmittableCapture {
+        /// Canonical mutation wire name from the closed catalogue.
+        operation: &'static str,
+        /// Exact declared parameters: `subject` only.
+        fields: BTreeMap<String, String>,
+    },
+    /// Store-minted operation: linkage evidence for the Store consumer.
+    StoreMinted {
+        /// Canonical mutation wire name from the closed catalogue.
+        operation: &'static str,
+        /// Stable receipt id, linked through `AppendAuditEvent`.
+        receipt_id: String,
+        /// Frozen receipt digest.
+        receipt_digest: String,
+        /// Output record handle produced by the transition.
+        output_record_id: String,
+        /// Real emitted audit event, when already recorded by the Store.
+        audit_event_id: Option<String>,
+    },
 }
 
 /// Projects one admission onto the Store persist contract.
-pub fn project_for_store(admission: &CurationAdmission) -> StoreAdmissionProjection {
+pub fn project_for_store(admission: &CurationAdmission) -> StoreProjection {
+    let receipt = &admission.receipt;
     let operation = match admission.operation {
         CurationMutationOperation::CaptureObservation => "CaptureObservation",
         CurationMutationOperation::ApplyEpistemicRevision => "ApplyEpistemicRevision",
         CurationMutationOperation::ApplyLifecyclePolicy => "ApplyLifecyclePolicy",
         CurationMutationOperation::AppendAuditEvent => "AppendAuditEvent",
     };
-    let receipt = &admission.receipt;
-    let mut fields = BTreeMap::new();
-    fields.insert(
-        "receipt_id".to_owned(),
-        receipt.receipt_id.as_str().to_owned(),
-    );
-    fields.insert("receipt_digest".to_owned(), receipt.digest.clone());
-    fields.insert(
-        "output_record_id".to_owned(),
-        receipt.output_record_id.as_str().to_owned(),
-    );
-    if let Some(event) = &receipt.audit_event_id {
-        fields.insert("audit_event_id".to_owned(), event.as_str().to_owned());
+    if admission.operation == CurationMutationOperation::CaptureObservation {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "subject".to_owned(),
+            receipt.output_record_id.as_str().to_owned(),
+        );
+        return StoreProjection::SubmittableCapture { operation, fields };
     }
-    StoreAdmissionProjection {
+    StoreProjection::StoreMinted {
         operation,
         receipt_id: receipt.receipt_id.as_str().to_owned(),
         receipt_digest: receipt.digest.clone(),
@@ -231,7 +253,6 @@ pub fn project_for_store(admission: &CurationAdmission) -> StoreAdmissionProject
             .audit_event_id
             .as_ref()
             .map(|id| id.as_str().to_owned()),
-        fields,
     }
 }
 
@@ -291,10 +312,12 @@ mod tests {
     }
 
     /// #1905 acceptance, smallest proof: one captured raw observation
-    /// stays inspectable from candidate retention through an admitted
-    /// forward revision to a stable audit-linked receipt, the original
-    /// reconstructible — while a model paraphrase claiming proof standing
-    /// without an independent basis is refused, never promoted.
+    /// stays inspectable from candidate retention through a forward
+    /// correction and an admitted revision to a stable audit-linked
+    /// receipt, the original reconstructible — while a model paraphrase
+    /// claiming proof standing without an independent basis is refused,
+    /// never promoted.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn raw_observation_to_stable_receipt_with_paraphrase_refusal() {
         let genesis = admit_observation_genesis(ObservationGenesisParams {
@@ -313,12 +336,49 @@ mod tests {
             genesis.receipt.proposed_role,
             LifecycleRole::ObservationCandidate
         );
+        let genesis_projected = project_for_store(&genesis);
+        assert!(
+            matches!(
+                &genesis_projected,
+                StoreProjection::SubmittableCapture { fields, .. }
+                if fields.get("subject").map(String::as_str) == Some("obs:raw-1")
+            ),
+            "genesis projects exactly CaptureObservation{{subject}}"
+        );
 
-        let view = admit_forward_revision(
+        let corrected = admit_forward_revision(
             &[genesis],
             ForwardRevisionParams {
-                receipt_id: id("receipt:claim"),
+                receipt_id: id("receipt:correction"),
                 input_record_ids: vec![id("obs:raw-1")],
+                source_anchor: anchor(),
+                prior_role: LifecycleRole::ObservationCandidate,
+                proposed_role: LifecycleRole::ObservationCandidate,
+                prior_status: EpistemicStatus::Observed,
+                proposed_status: EpistemicStatus::Observed,
+                actor: actor(ActorKind::HumanOperator),
+                scope: "scope".to_owned(),
+                clock: clock(),
+                state_fence: fence(),
+                evidence_refs: vec![id("obs:raw-1")],
+                counterevidence_refs: Vec::new(),
+                outcome: AdmissionOutcome::CorrectedForward,
+                qualifying_basis: None,
+                supersedes: vec![id("obs:raw-1")],
+                output_record_id: id("obs:raw-2"),
+                proof_digest: sha256_hex(b"correction-proof"),
+                audit_event_id: Some(id("audit:correction")),
+            },
+        )
+        .expect("correction admission");
+        assert_eq!(corrected.original_input, id("obs:raw-1"));
+        assert_eq!(corrected.current_output, id("obs:raw-2"));
+
+        let view = admit_forward_revision(
+            &corrected.ordered,
+            ForwardRevisionParams {
+                receipt_id: id("receipt:claim"),
+                input_record_ids: vec![id("obs:raw-2")],
                 source_anchor: anchor(),
                 prior_role: LifecycleRole::ObservationCandidate,
                 proposed_role: LifecycleRole::Claim,
@@ -328,7 +388,7 @@ mod tests {
                 scope: "scope".to_owned(),
                 clock: clock(),
                 state_fence: fence(),
-                evidence_refs: vec![id("obs:raw-1")],
+                evidence_refs: vec![id("obs:raw-2")],
                 counterevidence_refs: Vec::new(),
                 outcome: AdmissionOutcome::Admitted,
                 qualifying_basis: None,
@@ -341,11 +401,20 @@ mod tests {
         .expect("revision admission");
         assert_eq!(view.original_input, id("obs:raw-1"));
         assert_eq!(view.current_output, id("claim:1"));
-        assert_eq!(view.ordered.len(), 2);
+        assert_eq!(view.ordered.len(), 3);
         assert!(view.ordered.iter().all(CurationAdmission::is_audit_linked));
-        let projected = project_for_store(&view.ordered[1]);
-        assert_eq!(projected.operation, "ApplyEpistemicRevision");
-        assert_eq!(projected.audit_event_id.as_deref(), Some("audit:claim"));
+        let revision_projected = project_for_store(&view.ordered[2]);
+        assert!(
+            matches!(
+                &revision_projected,
+                StoreProjection::StoreMinted {
+                    operation: "ApplyEpistemicRevision",
+                    audit_event_id: Some(event),
+                    ..
+                } if event.as_str() == "audit:claim"
+            ),
+            "revision projects as Store-minted linkage evidence, never fake fields"
+        );
 
         let refused = admit_forward_revision(
             &view.ordered[..1],
