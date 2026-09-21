@@ -10,6 +10,31 @@
 //! fails closed with [`PortGrantError`]: the host constructs no engine,
 //! admits no invocation, and performs no component call. A grant is never
 //! fabricated from ambient caller input.
+//!
+//! Required grant hook (Ramu lane — Kernel `daemon_request_dispatch` owner):
+//! the legitimate grant arrives as an authenticated Kernel-issued
+//! [`RuntimePorts`] bundle (Governor + Authority + source + promotion +
+//! P-03 + verifier ports, engine slot filled by this host's
+//! `with_wasmtime_engine`). Nearest in-tree anchors for the handshake
+//! shape (different domain — Kernel service lifecycle, NOT a ports grant):
+//! `KernelComposition::execute_daemon_request`
+//! (`bins/eliot-kernel/src/daemon_request_dispatch.rs`), and the host
+//! admission receipt family
+//! (`crates/kernel/eliot-kernel-service/src/lifecycle.rs`,
+//! `reconcile_host_request_admission` /
+//! `reconcile_native_worker_claim_admission`). No callable hook yielding a
+//! `RuntimePorts` grant exists in-tree as of this write: `execute_daemon_request`
+//! serves async session-bound lifecycle frames, and the lifecycle
+//! reconciliation functions prove receipt/envelope binding without issuing
+//! ports. Calling either as a grant source would misappropriate another
+//! domain's authority, so this gate keeps returning `NoAdmissionChannel`
+//! (→ `Unavailable`/`PlanGap` downstream; `UnknownOutcome` preserved where
+//! the runtime already reports it) until Ramu's lane delivers the real
+//! call. The required call, when it lands, is exactly:
+//! `resolve_kernel_port_grant()` → Ramu's
+//! `fn (authenticated_kernel_channel) -> Result<RuntimePorts, GrantError>`
+//! with the error mapped to [`PortGrantError`]; nothing else in this
+//! binary changes shape.
 
 use std::fmt;
 

@@ -4,7 +4,7 @@ use std::io::{self, Write};
 
 use eliot_wasm_host::{
     CliError, TypedWorld, default_experimental_limits, execute_describe_experimental, parse_args,
-    read_bounded_artifact, resolve_kernel_port_grant,
+    read_bounded_artifact, resolve_kernel_port_grant, run_guest_exec,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -55,6 +55,15 @@ fn main() {
             std::process::exit(INVALID_ARGUMENT_EXIT);
         }
     };
+
+    // One-shot P03-admitted guest execution: the reaped child runs the
+    // admitted guest inside containment and emits raw output bytes on
+    // stdout. This branch runs before anything else once parsed: no
+    // experimental describe, no grant path, and no other output may
+    // contaminate stdout.
+    if let Some(guest) = &config.guest_exec {
+        std::process::exit(run_guest_exec(guest));
+    }
 
     if let (Some(component_path), Some(world_name)) = (
         config.experimental_typed_component,

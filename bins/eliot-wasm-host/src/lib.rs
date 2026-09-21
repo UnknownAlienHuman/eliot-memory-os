@@ -23,6 +23,7 @@ mod admission;
 mod artifact_preflight;
 mod cli_contract;
 mod contour;
+mod guest_exec;
 mod shadow;
 mod typed_bindings;
 mod typed_execution;
@@ -32,13 +33,17 @@ pub use admission::{PortGrantError, resolve_kernel_port_grant};
 pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
-pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
+pub use cli_contract::{CliConfig, CliError, GuestExecArgs, Profile, Transport, parse_args};
 pub use contour::{
     AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, Contour, ContourGateError,
     FS_CAPABILITY, GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY,
     PINNED_WASMTIME_VERSION, PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET,
     STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
     authorize_host_call, check_activation_imports, check_admitted_request,
+};
+pub use guest_exec::{
+    EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED, GuestExecRejection,
+    GuestExecRequest, run_guest_exec, validate_request,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
