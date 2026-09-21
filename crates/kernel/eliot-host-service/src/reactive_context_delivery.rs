@@ -1,6 +1,6 @@
 //! Host-owned orchestration for outbound reactive Context delivery.
 //!
-//! This module owns the sequencing between the typed #800 HostState queue and
+//! This module owns the sequencing between the typed `#800` `HostState` queue and
 //! an injected transport owner.  It does not assemble Context, select a
 //! provider, open a socket, mutate active Context, or infer acknowledgement
 //! phases.  The queue remains the only durable operation authority; this
@@ -44,8 +44,9 @@ impl ReactiveContextClock for SystemReactiveContextClock {
     fn now_unix_ms(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-            .unwrap_or(0)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            })
     }
 }
 
@@ -530,10 +531,15 @@ where
         request: ReactiveContextDeliveryRequest,
     ) -> Result<ReactiveContextDeliveryReceipt, ReactiveContextDeliveryError> {
         self.validate_admission(admission, &request)?;
-        let operation = operation_identity(&request.payload)?;
+        let ReactiveContextDeliveryRequest {
+            payload,
+            owner_receipt,
+            control,
+        } = request;
+        let operation = operation_identity(&payload)?;
         let existing = self.find_operation(&operation)?;
         let (entry, replay) = if let Some(entry) = existing {
-            if entry.payload != request.payload
+            if entry.payload != payload
                 || entry.fence != admission.fence
                 || entry.endpoint_ref != admission.endpoint_ref
             {
@@ -543,15 +549,15 @@ where
             }
             (entry, true)
         } else {
-            self.enforce_new_capacity(request.control)?;
-            let revision = self.queue_revision(&request.payload)?;
+            self.enforce_new_capacity(control)?;
+            let revision = self.queue_revision(&payload)?;
             let prepared = self
                 .queue
                 .prepare_or_replay(ReactiveContextPrepareRequest {
                     fence: admission.fence.clone(),
-                    payload: request.payload.clone(),
+                    payload: payload.clone(),
                     endpoint_ref: admission.endpoint_ref.clone(),
-                    owner_receipt: request.owner_receipt.clone(),
+                    owner_receipt,
                     expected_queue_revision: revision,
                 })?;
             match prepared {
@@ -564,7 +570,7 @@ where
 
         match entry.stage {
             ReactiveContextStage::EnqueuedPersisted => {
-                let mut result = self.drive_enqueued(entry)?;
+                let mut result = self.drive_enqueued(&entry)?;
                 if replay && result.disposition == DeliveryDisposition::Queued {
                     result.disposition = DeliveryDisposition::Replay;
                 }
@@ -573,25 +579,17 @@ where
             ReactiveContextStage::DeliveryAttempted | ReactiveContextStage::UnknownDelivery => {
                 self.reconcile_entry(entry)
             }
-            stage
-                if matches!(
-                    stage,
-                    ReactiveContextStage::DeliveredToExactEndpoint
-                        | ReactiveContextStage::RecipientReceived
-                        | ReactiveContextStage::RecipientDurable
-                        | ReactiveContextStage::NormalizedProjection
-                        | ReactiveContextStage::AppliedProjection
-                ) =>
-            {
-                Ok(ReactiveContextDeliveryReceipt {
-                    disposition: if stage == ReactiveContextStage::DeliveredToExactEndpoint {
-                        DeliveryDisposition::Delivered
-                    } else {
-                        DeliveryDisposition::AlreadyAcknowledged
-                    },
-                    entry,
-                })
-            }
+            ReactiveContextStage::DeliveredToExactEndpoint => Ok(ReactiveContextDeliveryReceipt {
+                disposition: DeliveryDisposition::Delivered,
+                entry,
+            }),
+            ReactiveContextStage::RecipientReceived
+            | ReactiveContextStage::RecipientDurable
+            | ReactiveContextStage::NormalizedProjection
+            | ReactiveContextStage::AppliedProjection => Ok(ReactiveContextDeliveryReceipt {
+                disposition: DeliveryDisposition::AlreadyAcknowledged,
+                entry,
+            }),
             _ => Ok(ReactiveContextDeliveryReceipt {
                 disposition: DeliveryDisposition::AlreadyTerminal,
                 entry,
@@ -605,12 +603,12 @@ where
         operation: IdempotencyIdentity,
         evidence: ReactiveContextAckEvidence,
     ) -> Result<ReactiveContextAcknowledgementReceipt, ReactiveContextDeliveryError> {
-        let entry = self.queue.query_operation(ReactiveContextOperationQuery {
-            operation: operation.clone(),
-        })?;
+        let entry = self
+            .queue
+            .query_operation(ReactiveContextOperationQuery { operation })?;
         if let Err(error) = evidence.validate_against(&entry.payload) {
             return Err(ReactiveContextDeliveryError::InvalidAcknowledgement {
-                reason: bounded_reason(&error.to_string())?,
+                reason: bounded_reason(error.to_string())?,
             });
         }
         let mut replay_ledger = entry.ack_ledger.clone();
@@ -618,26 +616,27 @@ where
             Ok(disposition) => disposition,
             Err(error) => {
                 return Err(ReactiveContextDeliveryError::InvalidAcknowledgement {
-                    reason: bounded_reason(&error.to_string())?,
+                    reason: bounded_reason(error.to_string())?,
                 });
             }
         };
         if disposition == ReactiveContextAckDisposition::DuplicateHistorical {
             return Ok(ReactiveContextAcknowledgementReceipt { entry, disposition });
         }
+        let proof_sha256 = evidence.proof_sha256.clone();
         let next_stage = stage_for_ack(evidence.observed_phase);
         let reconciliation_ref = (evidence.observed_phase == eliot_protocol::AckPhase::Unknown)
-            .then(|| make_handle(&format!("ack-reconcile-{}", evidence.proof_sha256)))
+            .then(|| make_handle(format!("ack-reconcile-{proof_sha256}")))
             .transpose()?;
         let updated = self.transition(
             &entry,
             next_stage,
             ReactiveContextTransitionEvidence {
-                ack: Some(evidence.clone()),
+                ack: Some(evidence),
                 reconciliation_ref,
                 ..ReactiveContextTransitionEvidence::default()
             },
-            &format!("ack-{}", evidence.proof_sha256),
+            &format!("ack-{proof_sha256}"),
         )?;
         Ok(ReactiveContextAcknowledgementReceipt {
             entry: updated,
@@ -657,26 +656,17 @@ where
             ReactiveContextStage::DeliveryAttempted | ReactiveContextStage::UnknownDelivery => {
                 self.reconcile_entry(entry)
             }
-            stage if stage == ReactiveContextStage::DeliveredToExactEndpoint => {
-                Ok(ReactiveContextDeliveryReceipt {
-                    entry,
-                    disposition: DeliveryDisposition::Delivered,
-                })
-            }
-            stage
-                if matches!(
-                    stage,
-                    ReactiveContextStage::RecipientReceived
-                        | ReactiveContextStage::RecipientDurable
-                        | ReactiveContextStage::NormalizedProjection
-                        | ReactiveContextStage::AppliedProjection
-                ) =>
-            {
-                Ok(ReactiveContextDeliveryReceipt {
-                    entry,
-                    disposition: DeliveryDisposition::AlreadyAcknowledged,
-                })
-            }
+            ReactiveContextStage::DeliveredToExactEndpoint => Ok(ReactiveContextDeliveryReceipt {
+                entry,
+                disposition: DeliveryDisposition::Delivered,
+            }),
+            ReactiveContextStage::RecipientReceived
+            | ReactiveContextStage::RecipientDurable
+            | ReactiveContextStage::NormalizedProjection
+            | ReactiveContextStage::AppliedProjection => Ok(ReactiveContextDeliveryReceipt {
+                entry,
+                disposition: DeliveryDisposition::AlreadyAcknowledged,
+            }),
             stage => Err(ReactiveContextDeliveryError::NotEligible {
                 action: "reconcile",
                 stage,
@@ -706,7 +696,10 @@ where
         ) {
             entry = self.reconcile_entry(entry)?.entry;
             if entry.stage == ReactiveContextStage::UnknownDelivery {
-                return Err(self.unknown_error(&entry, "expiry is blocked by unknown delivery"));
+                return Err(Self::unknown_error(
+                    &entry,
+                    "expiry is blocked by unknown delivery",
+                ));
             }
         }
         if !matches!(
@@ -744,7 +737,7 @@ where
         let entry = self
             .queue
             .query_operation(ReactiveContextOperationQuery { operation })?;
-        let cancellation_ref = make_handle(&format!("cancel-{}", entry.payload.cancellation_id))?;
+        let cancellation_ref = make_handle(format!("cancel-{}", entry.payload.cancellation_id))?;
         if entry.stage == ReactiveContextStage::EnqueuedPersisted {
             let updated = self.transition(
                 &entry,
@@ -808,7 +801,7 @@ where
                 reconciliation,
                 reason,
             } => {
-                let reason = bounded_reason(&reason)?;
+                let reason = bounded_reason(reason)?;
                 if entry.stage == ReactiveContextStage::DeliveryAttempted {
                     let updated = self.transition(
                         &entry,
@@ -826,7 +819,7 @@ where
                         disposition: DeliveryDisposition::DeliveryUnknown,
                     });
                 }
-                Err(self.unknown_error(&entry, "cancellation remains unknown"))
+                Err(Self::unknown_error(&entry, "cancellation remains unknown"))
             }
         }
     }
@@ -837,7 +830,7 @@ where
         operation: IdempotencyIdentity,
         reason: String,
     ) -> Result<ReactiveContextDeliveryReceipt, ReactiveContextDeliveryError> {
-        let reason = bounded_reason(&reason)?;
+        let reason = bounded_reason(reason)?;
         let mut entry = self
             .queue
             .query_operation(ReactiveContextOperationQuery { operation })?;
@@ -847,9 +840,10 @@ where
         ) {
             entry = self.reconcile_entry(entry)?.entry;
             if entry.stage == ReactiveContextStage::UnknownDelivery {
-                return Err(
-                    self.unknown_error(&entry, "supersession is blocked by unknown delivery")
-                );
+                return Err(Self::unknown_error(
+                    &entry,
+                    "supersession is blocked by unknown delivery",
+                ));
             }
         }
         if entry.is_terminal() {
@@ -942,7 +936,7 @@ where
                 })? {
                 ReactiveContextChannelCloseOutcome::Closed => closed_attempts += 1,
                 ReactiveContextChannelCloseOutcome::Unknown { .. } => {
-                    unknown_attempts.push(attempt_id)
+                    unknown_attempts.push(attempt_id);
                 }
             }
         }
@@ -1050,7 +1044,7 @@ where
 
     fn drive_enqueued(
         &mut self,
-        entry: ReactiveContextQueueEntry,
+        entry: &ReactiveContextQueueEntry,
     ) -> Result<ReactiveContextDeliveryReceipt, ReactiveContextDeliveryError> {
         let resolution = self
             .transport
@@ -1074,10 +1068,10 @@ where
             }
             ReactiveContextEndpointResolution::NotAttempted { reason } => {
                 let updated = self.transition(
-                    &entry,
+                    entry,
                     ReactiveContextStage::RejectedNotAttempted,
                     ReactiveContextTransitionEvidence {
-                        reason: Some(bounded_reason(&reason)?),
+                        reason: Some(bounded_reason(reason)?),
                         ..ReactiveContextTransitionEvidence::default()
                     },
                     "resolve-rejected",
@@ -1090,12 +1084,12 @@ where
             ReactiveContextEndpointResolution::Unknown { reason, .. } => {
                 return Err(ReactiveContextDeliveryError::Unknown {
                     operation: operation_text(&entry.operation),
-                    reason: bounded_reason(&reason)?,
+                    reason: bounded_reason(reason)?,
                 });
             }
         };
         let attempted = self.transition(
-            &entry,
+            entry,
             ReactiveContextStage::DeliveryAttempted,
             ReactiveContextTransitionEvidence {
                 transport_ref: Some(endpoint.transport_operation.clone()),
@@ -1109,11 +1103,20 @@ where
             envelope: attempted.envelope.clone(),
             endpoint: endpoint.clone(),
         })?;
+        self.finish_send(&attempted, endpoint, outcome)
+    }
+
+    fn finish_send(
+        &mut self,
+        attempted: &ReactiveContextQueueEntry,
+        endpoint: ReactiveContextResolvedEndpoint,
+        outcome: ReactiveContextSendOutcome,
+    ) -> Result<ReactiveContextDeliveryReceipt, ReactiveContextDeliveryError> {
         match outcome {
             ReactiveContextSendOutcome::Delivered(receipt) => {
-                let receipt = self.validate_transport_receipt(&attempted, &endpoint, receipt)?;
+                let receipt = Self::validate_transport_receipt(attempted, &endpoint, receipt)?;
                 let updated = self.transition(
-                    &attempted,
+                    attempted,
                     ReactiveContextStage::DeliveredToExactEndpoint,
                     ReactiveContextTransitionEvidence {
                         owner_receipt: Some(receipt.owner_receipt),
@@ -1130,11 +1133,11 @@ where
             ReactiveContextSendOutcome::NotAttempted { reason }
             | ReactiveContextSendOutcome::Rejected { reason } => {
                 let updated = self.transition(
-                    &attempted,
+                    attempted,
                     ReactiveContextStage::UnavailableFenced,
                     ReactiveContextTransitionEvidence {
                         transport_ref: Some(endpoint.transport_operation),
-                        reason: Some(bounded_reason(&reason)?),
+                        reason: Some(bounded_reason(reason)?),
                         ..ReactiveContextTransitionEvidence::default()
                     },
                     "send-rejected",
@@ -1149,12 +1152,12 @@ where
                 reason,
             } => {
                 let updated = self.transition(
-                    &attempted,
+                    attempted,
                     ReactiveContextStage::UnknownDelivery,
                     ReactiveContextTransitionEvidence {
                         transport_ref: Some(endpoint.transport_operation),
                         reconciliation_ref: Some(reconciliation),
-                        reason: Some(bounded_reason(&reason)?),
+                        reason: Some(bounded_reason(reason)?),
                         ..ReactiveContextTransitionEvidence::default()
                     },
                     "send-unknown",
@@ -1185,7 +1188,7 @@ where
         })?;
         match outcome {
             ReactiveContextQueryOutcome::Delivered(receipt) => {
-                let receipt = self.validate_transport_receipt(
+                let receipt = Self::validate_transport_receipt(
                     &entry,
                     &ReactiveContextResolvedEndpoint {
                         endpoint_ref: entry.endpoint_ref.clone(),
@@ -1216,7 +1219,7 @@ where
                     ReactiveContextStage::UnavailableFenced,
                     ReactiveContextTransitionEvidence {
                         transport_ref: Some(transport_operation),
-                        reason: Some(bounded_reason(&reason)?),
+                        reason: Some(bounded_reason(reason)?),
                         ..ReactiveContextTransitionEvidence::default()
                     },
                     "reconciled-rejected",
@@ -1237,7 +1240,7 @@ where
                         ReactiveContextTransitionEvidence {
                             transport_ref: Some(transport_operation),
                             reconciliation_ref: Some(reconciliation),
-                            reason: Some(bounded_reason(&reason)?),
+                            reason: Some(bounded_reason(reason)?),
                             ..ReactiveContextTransitionEvidence::default()
                         },
                         "reconciled-unknown",
@@ -1256,7 +1259,6 @@ where
     }
 
     fn validate_transport_receipt(
-        &self,
         entry: &ReactiveContextQueueEntry,
         endpoint: &ReactiveContextResolvedEndpoint,
         receipt: ReactiveContextTransportReceipt,
@@ -1375,7 +1377,6 @@ where
     }
 
     fn unknown_error(
-        &self,
         entry: &ReactiveContextQueueEntry,
         reason: &str,
     ) -> ReactiveContextDeliveryError {
@@ -1422,7 +1423,8 @@ fn make_handle(value: impl Into<String>) -> Result<PlatformHandle, ReactiveConte
     })
 }
 
-fn bounded_reason(value: &str) -> Result<String, ReactiveContextDeliveryError> {
+fn bounded_reason(value: impl Into<String>) -> Result<String, ReactiveContextDeliveryError> {
+    let value = value.into();
     if value.trim().is_empty()
         || value.len() > MAX_DELIVERY_REASON_BYTES
         || value.chars().any(char::is_control)
@@ -1432,7 +1434,7 @@ fn bounded_reason(value: &str) -> Result<String, ReactiveContextDeliveryError> {
             "reason is empty, oversized, or contains control text",
         ));
     }
-    Ok(value.to_owned())
+    Ok(value)
 }
 
 fn stage_for_ack(phase: eliot_protocol::AckPhase) -> ReactiveContextStage {
