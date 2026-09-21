@@ -1280,10 +1280,7 @@ impl DurableJobResponse {
 
     /// Binds response content to one closed operation: job/scope/revision,
     /// published outcome, reconciled disposition, and selection coverage.
-    fn validate_response_operation(
-        &self,
-        operation: &JobOperation,
-    ) -> Result<(), DurableJobError> {
+    fn validate_response_operation(&self, operation: &JobOperation) -> Result<(), DurableJobError> {
         match operation {
             JobOperation::Submit { submission } => {
                 if self.job_id != submission.job_id || self.attempt_id != submission.attempt_id {

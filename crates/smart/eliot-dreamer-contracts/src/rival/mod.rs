@@ -10,6 +10,7 @@ mod validation;
 pub mod model;
 pub mod prediction;
 pub mod projection;
+pub mod set;
 
 pub use model::{
     ClaimDeclarations, CommonModeDisclosure, CurrentPositionAvailability, CurrentPositionBinding,
