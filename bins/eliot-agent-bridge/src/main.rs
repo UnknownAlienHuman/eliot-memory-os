@@ -147,6 +147,8 @@ enum Response {
         reactive: Option<ReactiveStatusView>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resources: Option<ResourceRegistryView>,
     },
     Attached {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,6 +214,17 @@ struct ReactiveStatusView {
     pending: usize,
     attention_item_ids: Vec<String>,
     attention_truncated: bool,
+}
+
+/// Attach-scoped resource projection summary for the Status frame.
+///
+/// `entries` counts the immutable snapshots retained for the live attach;
+/// content bytes are never carried here — previews ride hot responses and
+/// full bytes require explicit expansion through the owning reader.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceRegistryView {
+    entries: usize,
 }
 
 /// Original identity of one durable in-flight delivery pending at Stop.
@@ -834,6 +847,7 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             recovery: "attach and activate before host requests; reconnect requires a live attach",
             reactive: None,
             bootstrap: None,
+            resources: None,
         },
         Some(view) => Response::Status {
             profile: Profile::as_str(profile),
@@ -850,6 +864,7 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             recovery: "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; stale targets fail closed",
             reactive: Some(reactive_status_view(runner)),
             bootstrap: None,
+            resources: Some(resource_status_view(runner)),
         },
     }
 }
@@ -870,6 +885,16 @@ fn reactive_status_view(runner: &BridgeRunner) -> ReactiveStatusView {
             .map(|item| item.item_id.clone())
             .collect(),
         attention_truncated: truncated,
+    }
+}
+
+/// Projects the attach-scoped resource projection summary for Status.
+///
+/// Read-only: counts retained immutable snapshots. Never touches dispatch,
+/// activation, transport, or registry state.
+fn resource_status_view(runner: &BridgeRunner) -> ResourceRegistryView {
+    ResourceRegistryView {
+        entries: runner.resource_registry_len(),
     }
 }
 
@@ -1388,12 +1413,18 @@ mod tests {
         assert_eq!(view.pending, 0);
         assert!(view.attention_item_ids.is_empty());
         assert!(!view.attention_truncated);
+        let resources = resource_status_view(&runner);
+        assert_eq!(resources.entries, 0);
         let response = status_response(Profile::SpineFunctional, &runner);
         let value = serde_json::to_value(&response).expect("status must serialize");
         assert_eq!(value["attached"], Value::Bool(false));
         assert!(
             value.get("reactive").is_none(),
             "detached status carries no reactive key"
+        );
+        assert!(
+            value.get("resources").is_none(),
+            "detached status carries no resources key"
         );
     }
 
