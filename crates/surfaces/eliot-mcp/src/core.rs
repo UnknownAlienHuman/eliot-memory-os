@@ -352,10 +352,7 @@ pub fn plan_evidence_pack_query(
         ));
     }
     let bound: u32 = max_records.trim().parse().map_err(|_| {
-        BridgeError::invalid(
-            "query.max_records",
-            "must be a positive decimal bound",
-        )
+        BridgeError::invalid("query.max_records", "must be a positive decimal bound")
     })?;
     if bound == 0 {
         return Err(BridgeError::invalid(
@@ -778,11 +775,16 @@ pub struct McpCore;
 
 impl McpCore {
     /// Returns a non-binding initialize projection.
+    ///
+    /// The advertised tool count is derived from the single versioned semantic
+    /// owner (one registered profile per method identity and version), never
+    /// from a name list: a method without a profile is absent from the
+    /// advertised surface, so the count follows the owner.
     #[must_use]
-    pub const fn initialize(request: InitializeRequest) -> InitializeResponse {
+    pub fn initialize(request: InitializeRequest) -> InitializeResponse {
         InitializeResponse {
             protocol_version: request.protocol_version,
-            canonical_tool_count: crate::CANONICAL_TOOL_NAMES.len(),
+            canonical_tool_count: canonical_tool_count(),
             structured_response_limit_bytes: HARD_STRUCTURED_RESPONSE_BYTES,
             application_binding_created: false,
         }
@@ -1104,6 +1106,7 @@ fn validate_application_request(request: &ApplicationRequest) -> Result<(), Brid
         ));
     }
     request.tool.validate().map_err(contract_violation)?;
+    validate_tool_semantic_owner(&request.tool)?;
     if let ToolRequest::Finish(draft) = &request.tool {
         let metadata_task = request.identity.request.metadata.task_id.as_ref();
         if !matches!(metadata_task, Some(value) if value.as_str() == draft.task_id.as_str()) {
@@ -1129,6 +1132,32 @@ fn contract_violation(value: ContractViolation) -> BridgeError {
     match value {
         ContractViolation::InvalidField { field, reason } => BridgeError::invalid(field, reason),
     }
+}
+
+/// Number of methods owned by the single versioned semantic registry.
+///
+/// Fails closed to zero when the canonical owner cannot be built (unreachable
+/// for the literal canonical data; any build failure is a code defect, and a
+/// defect must never advertise tools).
+fn canonical_tool_count() -> usize {
+    crate::canonical_known_tools().map_or(0, |tools| tools.len())
+}
+
+/// Resolves the single versioned semantic owner for the requested tool on the
+/// normal admission path (I7.24).
+///
+/// Every admitted request joins its method identity and version to exactly one
+/// registered [`crate::ToolSemanticProfile`] before any port call; a method
+/// with no owner fails closed here. Routing behavior is read from the profile
+/// by downstream consumers, never inferred from the tool name.
+fn validate_tool_semantic_owner(tool: &ToolRequest) -> Result<(), BridgeError> {
+    crate::validate_tool_request_owner(tool).map_err(|error| {
+        BridgeError::invalid(
+            "tool.name",
+            format!("no registered semantic owner: {error}"),
+        )
+    })?;
+    Ok(())
 }
 
 fn validate_active_session_binding(
@@ -1782,10 +1811,7 @@ mod evidence_pack_query_plan_tests {
         assert_eq!(plan.subject, "evidence-alpha");
         assert_eq!(plan.max_records, "10");
         assert_eq!(plan.scope_id, "scope-evidence");
-        assert_eq!(
-            EvidencePackQueryPlan::operation_name(),
-            "GetEvidencePack"
-        );
+        assert_eq!(EvidencePackQueryPlan::operation_name(), "GetEvidencePack");
     }
 
     #[test]
@@ -1798,8 +1824,12 @@ mod evidence_pack_query_plan_tests {
             QueryMode::ChangeImpact,
             QueryMode::ContextReconstruction,
         ] {
-            plan_evidence_pack_query(&input(mode, "subject:evidence-alpha"), "scope-evidence", "8")
-                .expect("verification family admits GetEvidencePack");
+            plan_evidence_pack_query(
+                &input(mode, "subject:evidence-alpha"),
+                "scope-evidence",
+                "8",
+            )
+            .expect("verification family admits GetEvidencePack");
         }
         match plan_evidence_pack_query(
             &input(QueryMode::CurrentPosition, "subject:evidence-alpha"),
@@ -1866,7 +1896,11 @@ mod evidence_pack_query_plan_tests {
         let projection = project_evidence_pack_projection(&plan, payload.clone());
         assert_eq!(projection.kind, ProjectionKind::Projection);
         assert_eq!(projection.proof_ceiling, ProofCeiling::ScopedVerification);
-        assert!(projection.proof_ceiling.is_at_most(ProofCeiling::ScopedVerification));
+        assert!(
+            projection
+                .proof_ceiling
+                .is_at_most(ProofCeiling::ScopedVerification)
+        );
         assert_eq!(projection.content["operation"], "GetEvidencePack");
         assert_eq!(projection.content["subject"], "evidence-alpha");
         assert_eq!(projection.content["scope_id"], "scope-evidence");
@@ -2051,7 +2085,11 @@ mod context_reconstruction_query_plan_tests {
         let projection = project_context_reconstruction_projection(&plan, payload.clone());
         assert_eq!(projection.kind, ProjectionKind::Projection);
         assert_eq!(projection.proof_ceiling, ProofCeiling::ScopedVerification);
-        assert!(projection.proof_ceiling.is_at_most(ProofCeiling::ScopedVerification));
+        assert!(
+            projection
+                .proof_ceiling
+                .is_at_most(ProofCeiling::ScopedVerification)
+        );
         assert_eq!(projection.content["operation"], "ContextReconstruction");
         assert_eq!(projection.content["task_id"], "task-7");
         assert_eq!(projection.content["scope_id"], "scope-task");
