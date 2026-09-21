@@ -46,7 +46,7 @@ fn planner_epoch(sequence: u64) -> EpochId {
 /// are live Host-owned handoff material and cannot be represented by an
 /// installer candidate. Destination file identities are observed after
 /// Phase B materialization and are not part of this immutable inventory.
-pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 12] = [
+pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 13] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
@@ -56,6 +56,7 @@ pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 12] = [
     ("eliot-doctor.exe", true),
     ("eliot-testd.exe", true),
     ("eliot-native-worker.exe", true),
+    ("eliot-wasm-host.exe", true),
     ("generation.json", false),
     ("eliotd-governor.json", false),
     ("eliotd.json", false),
@@ -148,13 +149,13 @@ const CANARY_ARTIFACT_SET_EVIDENCE_DOMAIN: &[u8] =
 /// `generation.json` contains the resulting `RuntimeLaunchDescriptor`, while
 /// `eliotd.json` contains the same launch nonce.  Including either file in the
 /// derivation input would create a cryptographic self-reference.  The complete
-/// twelve-role artifact evidence remains separate and continues to bind both
+/// thirteen-role artifact evidence remains separate and continues to bind both
 /// files byte-for-byte.
 // This is a package-planner derivation domain, not a registry wire revision:
 // RegistryWireV10 decoding and its explicit active-Phase-B migration rules
 // remain unchanged by this non-recursive template split.
 const PHASE_A_TEMPLATE_CONTENT_DOMAIN: &[u8] = b"eliot.runtime-live.phase-a-template-content.v1";
-const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 10] = [
+const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 11] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
@@ -164,6 +165,7 @@ const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 10] = [
     ("eliot-doctor.exe", true),
     ("eliot-testd.exe", true),
     ("eliot-native-worker.exe", true),
+    ("eliot-wasm-host.exe", true),
     ("eliotd-governor.json", false),
 ];
 
@@ -309,7 +311,7 @@ fn append_evidence_text(bytes: &mut Vec<u8>, value: &str) {
 /// Derive the Runtime Live canary artifact-set evidence reference.
 ///
 /// The reference is a domain-separated SHA-256 over the canonical generation
-/// and the complete, fixed-order twelve-file Phase-A inventory.  Each fact contains
+/// and the complete, fixed-order thirteen-file Phase-A inventory.  Each fact contains
 /// the validated relative path, executable bit, exact byte size, and lowercase
 /// SHA-256.  Source identities and other volatile filesystem observations are
 /// deliberately excluded; the retained-source and destination receipt gates
@@ -322,7 +324,7 @@ pub(crate) fn artifact_set_evidence_digest(
         || expected.len() != REQUIRED_PACKAGE_ROLES.len()
     {
         return Err(InstallationError::IncompleteObservation(
-            "canary artifact evidence requires the complete twelve-file Phase-A runtime inventory"
+            "canary artifact evidence requires the complete thirteen-file Phase-A runtime inventory"
                 .to_owned(),
         ));
     }
@@ -518,6 +520,11 @@ fn expected_role_map(candidate: &CandidateManifest) -> Vec<(String, bool, String
             candidate.native_worker_artifact_digest.as_str().to_owned(),
         ),
         (
+            file_name(&candidate.wasm_host_executable_path),
+            true,
+            candidate.wasm_host_artifact_digest.as_str().to_owned(),
+        ),
+        (
             file_name(&candidate.config_path),
             false,
             candidate.config_digest.as_str().to_owned(),
@@ -643,7 +650,7 @@ fn validate_candidate_package_binding(
 
 pub(crate) fn strict_role_bindings(
     candidate: &CandidateManifest,
-) -> [(&'static str, bool, &PlatformHandle, &PlatformHandle); 12] {
+) -> [(&'static str, bool, &PlatformHandle, &PlatformHandle); 13] {
     let runtime = &candidate.runtime_launch;
     [
         (
@@ -701,6 +708,12 @@ pub(crate) fn strict_role_bindings(
             &candidate.native_worker_artifact_digest,
         ),
         (
+            "eliot-wasm-host.exe",
+            true,
+            &candidate.wasm_host_executable_path,
+            &candidate.wasm_host_artifact_digest,
+        ),
+        (
             "generation.json",
             false,
             &candidate.config_path,
@@ -724,7 +737,7 @@ pub(crate) fn strict_role_bindings(
 /// Validate the complete production package bijection.
 ///
 /// This boundary is intentionally independent of the caller's manifest and
-/// expected-digest vectors. It binds all twelve canonical Phase-A role names and
+/// expected-digest vectors. It binds all thirteen canonical Phase-A role names and
 /// requires every `CandidateManifest` path/digest to participate exactly once.
 pub(crate) fn validate_exact_candidate_package_binding(
     candidate: &CandidateManifest,
@@ -735,7 +748,7 @@ pub(crate) fn validate_exact_candidate_package_binding(
     }
     if manifest.files.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "package manifest must contain the complete twelve-file Phase-A runtime inventory"
+            "package manifest must contain the complete thirteen-file Phase-A runtime inventory"
                 .to_owned(),
         ));
     }
@@ -815,7 +828,7 @@ pub(crate) fn validate_exact_expected_file_digests(
     validate_exact_candidate_package_binding(candidate, manifest)?;
     if expected.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "expected package digest set must contain all twelve Phase-A runtime files".to_owned(),
+            "expected package digest set must contain all thirteen Phase-A runtime files".to_owned(),
         ));
     }
     let bindings = strict_role_bindings(candidate);
@@ -978,7 +991,7 @@ pub struct GenerationPackagePlanInput {
 pub struct GenerationPackagePlanner;
 
 impl GenerationPackagePlanner {
-    /// Computes the canonical full twelve-role artifact evidence reference.
+    /// Computes the canonical full thirteen-role artifact evidence reference.
     ///
     /// This associated wrapper is the single public entry point for producers
     /// that materialize the retained source bundle before invoking
@@ -1033,7 +1046,7 @@ impl GenerationPackagePlanner {
     /// immutable `PLANNED` transaction.
     ///
     /// The source is opened and observed independently of every manifest claim.
-    /// The exact twelve-file Phase-A inventory is then used to construct all
+    /// The exact thirteen-file Phase-A inventory is then used to construct all
     /// canonical destination paths, descriptor/config bindings and artifact
     /// digests before the single transaction constructor is called.
     #[allow(
@@ -1185,6 +1198,7 @@ impl GenerationPackagePlanner {
         let doctor_path = destination("eliot-doctor.exe")?;
         let testd_path = destination("eliot-testd.exe")?;
         let native_worker_path = destination("eliot-native-worker.exe")?;
+        let wasm_host_path = destination("eliot-wasm-host.exe")?;
         let config_path = destination("generation.json")?;
         let eliotd_config_path = destination("eliotd-governor.json")?;
         let eliotd_descriptor_path = destination("eliotd.json")?;
@@ -1200,6 +1214,7 @@ impl GenerationPackagePlanner {
             (&doctor_path, "generation.doctor_path"),
             (&testd_path, "generation.testd_path"),
             (&native_worker_path, "generation.native_worker_path"),
+            (&wasm_host_path, "generation.wasm_host_path"),
             (&config_path, "generation.config_path"),
             (&eliotd_config_path, "generation.eliotd_config_path"),
             (&eliotd_descriptor_path, "generation.eliotd_descriptor_path"),
@@ -1246,6 +1261,7 @@ impl GenerationPackagePlanner {
         let doctor_digest = digest_for("eliot-doctor.exe")?;
         let testd_digest = digest_for("eliot-testd.exe")?;
         let native_worker_digest = digest_for("eliot-native-worker.exe")?;
+        let wasm_host_digest = digest_for("eliot-wasm-host.exe")?;
         let config_digest = digest_for("generation.json")?;
         let eliotd_config_digest = digest_for("eliotd-governor.json")?;
         let eliotd_descriptor_digest = digest_for("eliotd.json")?;
@@ -1468,9 +1484,11 @@ impl GenerationPackagePlanner {
             doctor_artifact_digest: doctor_digest.clone(),
             testd_artifact_digest: testd_digest.clone(),
             native_worker_artifact_digest: native_worker_digest.clone(),
+            wasm_host_artifact_digest: wasm_host_digest.clone(),
             doctor_executable_path: doctor_path.clone(),
             testd_executable_path: testd_path.clone(),
             native_worker_executable_path: native_worker_path.clone(),
+            wasm_host_executable_path: wasm_host_path.clone(),
             descriptor_digest: PlatformHandle::new("0".repeat(64)).map_err(|error| {
                 InstallationError::InvalidField {
                     field: "generation.descriptor_digest".to_owned(),
@@ -1501,6 +1519,7 @@ impl GenerationPackagePlanner {
             doctor_artifact_digest: doctor_digest,
             testd_artifact_digest: testd_digest,
             native_worker_artifact_digest: native_worker_digest,
+            wasm_host_artifact_digest: wasm_host_digest,
             kernel_executable_path: kernel_path,
             store_bridge_executable_path: store_bridge_path,
             canonical_store_executable_path: canonical_store_path,
@@ -1508,6 +1527,7 @@ impl GenerationPackagePlanner {
             doctor_executable_path: doctor_path,
             testd_executable_path: testd_path,
             native_worker_executable_path: native_worker_path,
+            wasm_host_executable_path: wasm_host_path,
             config_path,
             dependency_closure_refs: vec![
                 PlatformHandle::new(format!("evidence:phase-a-content:{phase_a_content_digest}"))
@@ -1887,7 +1907,7 @@ fn validate_exact_source_inventory(
 ) -> Result<(), InstallationError> {
     if observed.files.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "trusted source must contain exactly twelve Phase-A runtime files".to_owned(),
+            "trusted source must contain exactly thirteen Phase-A runtime files".to_owned(),
         ));
     }
     let expected = REQUIRED_PACKAGE_ROLES
@@ -1986,7 +2006,7 @@ fn validate_source_bundle_publication_binding(
         || manifest.files.len() != REQUIRED_PACKAGE_ROLES.len()
     {
         return Err(InstallationError::IncompleteObservation(
-            "source publication binding must contain the complete twelve-role inventory".to_owned(),
+            "source publication binding must contain the complete thirteen-role inventory".to_owned(),
         ));
     }
     for (index, (role, executable)) in REQUIRED_PACKAGE_ROLES.iter().enumerate() {
@@ -2514,12 +2534,14 @@ mod tests {
             doctor_artifact_digest: h("b".repeat(64)),
             testd_artifact_digest: h("c".repeat(64)),
             native_worker_artifact_digest: h("d".repeat(64)),
+            wasm_host_artifact_digest: h("f".repeat(64)),
             doctor_executable_path: test_path(portable_root.as_str(), "eliot-doctor.exe"),
             testd_executable_path: test_path(portable_root.as_str(), "eliot-testd.exe"),
             native_worker_executable_path: test_path(
                 portable_root.as_str(),
                 "eliot-native-worker.exe",
             ),
+            wasm_host_executable_path: test_path(portable_root.as_str(), "eliot-wasm-host.exe"),
             descriptor_digest: h("0".repeat(64)),
         };
         desc.store_bridge_arguments = desc
@@ -2543,6 +2565,7 @@ mod tests {
             doctor_artifact_digest: h("b".repeat(64)),
             testd_artifact_digest: h("c".repeat(64)),
             native_worker_artifact_digest: h("d".repeat(64)),
+            wasm_host_artifact_digest: h("f".repeat(64)),
             kernel_executable_path: test_path(portable_root.as_str(), "eliot-kernel.exe"),
             store_bridge_executable_path: desc.store_bridge_executable_path.clone(),
             canonical_store_executable_path: desc.canonical_store_executable_path.clone(),
@@ -2553,6 +2576,7 @@ mod tests {
                 portable_root.as_str(),
                 "eliot-native-worker.exe",
             ),
+            wasm_host_executable_path: test_path(portable_root.as_str(), "eliot-wasm-host.exe"),
             config_path: desc.store_config_path.clone(),
             dependency_closure_refs: vec![h("evidence:dep")],
             license_refs: vec![h("evidence:license")],
@@ -2967,6 +2991,7 @@ mod tests {
         base.doctor_artifact_digest = h(get("eliot-doctor.exe"));
         base.testd_artifact_digest = h(get("eliot-testd.exe"));
         base.native_worker_artifact_digest = h(get("eliot-native-worker.exe"));
+        base.wasm_host_artifact_digest = h(get("eliot-wasm-host.exe"));
         base.config_digest = h(get("generation.json"));
         base.supervision_key_slot = h("c".repeat(64));
         base.runtime_launch.kernel_artifact_digest = h(get("eliot-kernel.exe"));
@@ -2980,6 +3005,7 @@ mod tests {
         base.runtime_launch.doctor_artifact_digest = h(get("eliot-doctor.exe"));
         base.runtime_launch.testd_artifact_digest = h(get("eliot-testd.exe"));
         base.runtime_launch.native_worker_artifact_digest = h(get("eliot-native-worker.exe"));
+        base.runtime_launch.wasm_host_artifact_digest = h(get("eliot-wasm-host.exe"));
         base.runtime_launch.kernel_arguments = base
             .runtime_launch
             .expected_kernel_arguments(&base.runtime_launch.store_config_path.clone())
@@ -3010,6 +3036,7 @@ mod tests {
             ("eliot-doctor.exe", true),
             ("eliot-testd.exe", true),
             ("eliot-native-worker.exe", true),
+            ("eliot-wasm-host.exe", true),
             ("generation.json", false),
             ("eliotd-governor.json", false),
             ("eliotd.json", false),
@@ -3068,6 +3095,7 @@ mod tests {
             "eliot-doctor.exe",
             "eliot-testd.exe",
             "eliot-native-worker.exe",
+            "eliot-wasm-host.exe",
             "eliotd-governor.json",
         ];
         let facts = roles
@@ -3080,7 +3108,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let digest = GenerationPackagePlanner::phase_a_template_content_digest(&facts)
-            .expect("exact ten typed template facts must be accepted");
+            .expect("exact eleven typed template facts must be accepted");
         let mut reordered = facts.clone();
         reordered.swap(0, 6);
         assert_eq!(
@@ -3126,6 +3154,7 @@ mod tests {
             "eliot-doctor.exe",
             "eliot-testd.exe",
             "eliot-native-worker.exe",
+            "eliot-wasm-host.exe",
             "eliotd-governor.json",
         ];
         let facts = roles
@@ -3172,6 +3201,12 @@ mod tests {
                 .as_str()
                 .ends_with("eliot-native-worker.exe")
         );
+        let (wasm_host_path, wasm_host_digest) = candidate
+            .runtime_launch
+            .wasm_host_artifact_binding()
+            .expect("wasm-host binding is bound");
+        assert!(wasm_host_path.as_str().ends_with("eliot-wasm-host.exe"));
+        assert_eq!(wasm_host_digest.as_str(), &"f".repeat(64));
         let kernel_args = candidate
             .runtime_launch
             .expected_kernel_arguments(&candidate.runtime_launch.store_config_path.clone());
@@ -3182,7 +3217,7 @@ mod tests {
         assert!(kernel_args.contains(&"--testd-artifact-sha256".to_owned()));
         assert!(kernel_args.contains(&"--native-worker-artifact-sha256".to_owned()));
         let bindings = strict_role_bindings(&candidate);
-        assert_eq!(bindings.len(), 12);
+        assert_eq!(bindings.len(), 13);
         assert!(
             bindings
                 .iter()
@@ -3197,6 +3232,11 @@ mod tests {
             bindings
                 .iter()
                 .any(|(name, _, _, _)| *name == "eliot-native-worker.exe")
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|(name, _, _, _)| *name == "eliot-wasm-host.exe")
         );
     }
 
@@ -3448,7 +3488,7 @@ mod tests {
         )
         .unwrap();
 
-        // Recompute the exact twelve-role SHA/size vector and publication
+        // Recompute the exact thirteen-role SHA/size vector and publication
         // evidence after writing the valid generation document.
         let binding = test_source_publication_binding(&input).unwrap();
         GenerationPackagePlanner::plan_with_source_publication_binding(
@@ -3984,7 +4024,7 @@ mod tests {
         );
         assert_ne!(
             first.candidate_manifest.signature_ref, second.candidate_manifest.signature_ref,
-            "full twelve-role artifact evidence must still include both nonce-bearing JSON roles"
+            "full thirteen-role artifact evidence must still include both nonce-bearing JSON roles"
         );
     }
 

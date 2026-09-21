@@ -793,9 +793,11 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         doctor_artifact_digest: fixture_handle("6".repeat(64)),
         testd_artifact_digest: fixture_handle("7".repeat(64)),
         native_worker_artifact_digest: fixture_handle("b".repeat(64)),
+        wasm_host_artifact_digest: fixture_handle("f".repeat(64)),
         doctor_executable_path: fixture_path(root, "eliot-doctor.exe"),
         testd_executable_path: fixture_path(root, "eliot-testd.exe"),
         native_worker_executable_path: fixture_path(root, "eliot-native-worker.exe"),
+        wasm_host_executable_path: fixture_path(root, "eliot-wasm-host.exe"),
         descriptor_digest: fixture_handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch
@@ -814,6 +816,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         doctor_artifact_digest: fixture_handle("6".repeat(64)),
         testd_artifact_digest: fixture_handle("7".repeat(64)),
         native_worker_artifact_digest: fixture_handle("b".repeat(64)),
+        wasm_host_artifact_digest: fixture_handle("f".repeat(64)),
         kernel_executable_path: fixture_path(root, "eliot-kernel.exe"),
         store_bridge_executable_path: fixture_path(root, "eliot-store-surreal.exe"),
         canonical_store_executable_path: fixture_path(root, "surreal.exe"),
@@ -821,6 +824,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         doctor_executable_path: fixture_path(root, "eliot-doctor.exe"),
         testd_executable_path: fixture_path(root, "eliot-testd.exe"),
         native_worker_executable_path: fixture_path(root, "eliot-native-worker.exe"),
+        wasm_host_executable_path: fixture_path(root, "eliot-wasm-host.exe"),
         config_path: fixture_path(root, "generation.json"),
         dependency_closure_refs: vec![fixture_handle("evidence:dependency-closure")],
         license_refs: vec![fixture_handle("evidence:licenses")],
