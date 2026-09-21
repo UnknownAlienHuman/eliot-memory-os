@@ -215,11 +215,11 @@ pub use eliot_kernel_service::KernelStoreGateway;
 use eliot_kernel_service::StoreRebindQuery;
 use eliot_kernel_service::{
     AgentBridgeAdmissionDescriptor, EliotdLaunchDescriptor, HostKernelCandidateBinding,
-    HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationPermit,
-    KernelActivationReceipt, KernelControlCommand, KernelControlRequest, KernelControlResponse,
-    KernelReadyReceipt, KernelService, KernelServiceError, KernelServiceState,
-    ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest, ProcessExecutionResponse,
-    ProcessObservation, StoreBootstrapHandoff,
+    HostStartupEvidence, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE,
+    KernelActivationPermit, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
+    KernelControlResponse, KernelReadyReceipt, KernelService, KernelServiceError,
+    KernelServiceState, ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest,
+    ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
 };
 /// P-07 Doctor wire seam for the front-door dispatch/driver arms (T6-D2 Slice B).
 ///
