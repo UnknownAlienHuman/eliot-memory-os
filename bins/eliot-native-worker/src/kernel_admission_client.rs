@@ -25,8 +25,8 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use eliot_contracts::{EpochId, ResourceGeneration};
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
+use eliot_contracts::{EpochId, ResourceGeneration};
 use eliot_kernel_core::{
     AcceptedCompatibilityEvidence, CapabilityReadiness, HANDSHAKE_ENVELOPE_VERSION,
     ProcessHealthStatus, expected_seal_tag,
@@ -91,6 +91,10 @@ pub const NATIVE_WORKER_REPLAY_OPERATION: &str = "native_worker.replay";
 /// Paired with `NATIVE_WORKER_REPLAY_ACKNOWLEDGE_OPERATION` in
 /// `bins/eliot-kernel/src/native_worker_replay_route.rs:97`.
 pub const NATIVE_WORKER_REPLAY_ACKNOWLEDGE_OPERATION: &str = "native_worker.replay_acknowledge";
+
+/// Capability whose owner-produced health projection must be current before
+/// this worker can create its first lifecycle registration.
+const NATIVE_WORKER_EXECUTION_CAPABILITY: &str = "worker.execute";
 
 /// Authenticated Kernel front-door adapter for the worker lifecycle.
 ///
@@ -163,6 +167,28 @@ impl KernelRuntimeHealthEvidence {
     pub(crate) fn capability_readiness(&self) -> &[CapabilityReadiness] {
         &self.capability_readiness
     }
+
+    /// Requires one owner-declared capability to be current for the exact
+    /// seven-dimensional health snapshot carried by this authenticated
+    /// session.  The worker never substitutes process `READY`, active-looking
+    /// generation text, or a transport `OPEN` for the capability decision.
+    fn require_current_capability(&self, capability: &str) -> Result<(), NativeWorkerError> {
+        let readiness = self
+            .capability_readiness()
+            .iter()
+            .find(|readiness| readiness.capability() == capability)
+            .ok_or_else(|| {
+                NativeWorkerError::KernelAdmissionRequired(format!(
+                    "Kernel health evidence omits required capability {capability}"
+                ))
+            })?;
+        if !self.process_health().capability_is_current(readiness) {
+            return Err(NativeWorkerError::KernelAdmissionRequired(format!(
+                "Kernel capability {capability} is not current for the authenticated health snapshot"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Parses and validates the owner-produced runtime health reply.
@@ -177,11 +203,12 @@ impl KernelRuntimeHealthEvidence {
 fn validate_kernel_runtime_health(
     value: &serde_json::Value,
 ) -> Result<KernelRuntimeHealthEvidence, NativeWorkerError> {
-    let evidence: KernelRuntimeHealthEvidence = serde_json::from_value(value.clone()).map_err(|error| {
-        NativeWorkerError::KernelAdmissionRequired(format!(
-            "Kernel health response lacks the canonical runtime evidence: {error}"
-        ))
-    })?;
+    let evidence: KernelRuntimeHealthEvidence =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!(
+                "Kernel health response lacks the canonical runtime evidence: {error}"
+            ))
+        })?;
     if evidence.status != "OPEN" {
         return Err(NativeWorkerError::KernelAdmissionRequired(
             "Kernel health handshake was not OPEN".to_owned(),
@@ -395,11 +422,12 @@ impl KernelNativeWorkerClient {
         registration: &NativeWorkerRegistration,
     ) -> Result<serde_json::Value, NativeWorkerError> {
         registration.validate()?;
+        self.runtime_health
+            .require_current_capability(NATIVE_WORKER_EXECUTION_CAPABILITY)?;
         if registration.authority_epoch != self.runtime_health.authority_epoch
             || registration.worker_generation != self.runtime_health.module_generation.value()
             || registration.state_fence.authority_epoch != self.runtime_health.authority_epoch
-            || registration.state_fence.resource_generation
-                != self.runtime_health.module_generation
+            || registration.state_fence.resource_generation != self.runtime_health.module_generation
         {
             return Err(NativeWorkerError::KernelAdmissionRequired(
                 "worker registration is not bound to the authenticated Kernel runtime evidence"
@@ -1571,7 +1599,175 @@ mod tests {
     //! exact identity JSON from a real admitted fence and proves it carries
     //! the submitted operation, the admitted fence, and a live deadline.
 
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::EpochLineageId;
+    use eliot_kernel_core::{
+        CapabilityReadiness, DurableCompatibilityState, NormativePairReceipt, ProcessHealthVector,
+        StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
+    };
+    use eliot_runtime_contracts::{
+        GenerationCutoverState, HealthDimension, HealthVector, ModuleGenerationState,
+        ServiceProcessState,
+    };
+
     use super::*;
+
+    fn runtime_health_json() -> serde_json::Value {
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("test lineage"),
+            NonZeroU64::new(3).expect("test sequence"),
+        )
+        .expect("test epoch");
+        let architecture_digest = "b".repeat(64);
+        let contract_digest = "a".repeat(64);
+        let receipt = NormativePairReceipt::new(
+            architecture_digest.clone(),
+            expected_seal_tag(&architecture_digest),
+        )
+        .expect("test normative receipt");
+        let candidate = eliot_kernel_core::CompatibilityEnvelope::new(
+            VersionRange::new(1, 2).expect("protocol range"),
+            contract_digest.clone(),
+            VersionRange::new(1, 2).expect("format range"),
+            architecture_digest.clone(),
+            receipt,
+            ResourceGeneration::genesis(),
+            epoch.clone(),
+            vec!["worker.execute".to_owned()],
+            Vec::new(),
+            StateMigrationClass::NoMigration,
+        )
+        .expect("test compatibility envelope");
+        let durable = DurableCompatibilityState::new(
+            VersionRange::new(1, 2).expect("durable protocol range"),
+            contract_digest,
+            VersionRange::new(1, 2).expect("durable format range"),
+            architecture_digest,
+            epoch.clone(),
+            vec!["worker.execute".to_owned()],
+            StateMigrationClass::NoMigration,
+        )
+        .expect("test durable state");
+        let compatibility_evidence =
+            admit_handshake(&candidate, &durable).expect("test candidate must be accepted");
+        let mut canonical_health = HealthVector::healthy();
+        canonical_health.freshness = HealthDimension::Failed;
+        let process_health = ProcessHealthStatus::new(
+            "eliot-native-worker",
+            ServiceProcessState::Ready,
+            ProcessHealthVector::new(canonical_health, HealthDimension::Healthy),
+            ModuleGenerationState::Staged,
+            GenerationCutoverState::Preparing,
+        )
+        .expect("test process-health projection");
+        let fresh_capability = CapabilityReadiness::new(
+            "current-impact-analysis",
+            vec![
+                eliot_kernel_core::HealthDimensionKind::Liveness,
+                eliot_kernel_core::HealthDimensionKind::Compatibility,
+                eliot_kernel_core::HealthDimensionKind::Freshness,
+            ],
+        )
+        .expect("fresh capability");
+        let protocol_capability = CapabilityReadiness::new(
+            "protocol-ping",
+            vec![
+                eliot_kernel_core::HealthDimensionKind::Liveness,
+                eliot_kernel_core::HealthDimensionKind::Compatibility,
+            ],
+        )
+        .expect("protocol capability");
+        let worker_execution_capability = CapabilityReadiness::new(
+            NATIVE_WORKER_EXECUTION_CAPABILITY,
+            vec![
+                eliot_kernel_core::HealthDimensionKind::Liveness,
+                eliot_kernel_core::HealthDimensionKind::Readiness,
+                eliot_kernel_core::HealthDimensionKind::Compatibility,
+                eliot_kernel_core::HealthDimensionKind::Integrity,
+                eliot_kernel_core::HealthDimensionKind::Capacity,
+                eliot_kernel_core::HealthDimensionKind::SupervisionCoverage,
+            ],
+        )
+        .expect("worker execution capability");
+        serde_json::to_value(KernelRuntimeHealthEvidence {
+            status: "OPEN".to_owned(),
+            authority_epoch: epoch,
+            module_generation: ResourceGeneration::genesis(),
+            compatibility_evidence,
+            process_health,
+            capability_readiness: vec![
+                fresh_capability,
+                protocol_capability,
+                worker_execution_capability,
+            ],
+            doctor_repair_advertised: true,
+        })
+        .expect("runtime health JSON")
+    }
+
+    #[test]
+    fn runtime_health_caller_keeps_canonical_health_spaces_separate() {
+        let value = runtime_health_json();
+        let evidence = validate_kernel_runtime_health(&value).expect("owner evidence admits");
+        assert_eq!(
+            evidence.process_health().process_state(),
+            ServiceProcessState::Ready
+        );
+        assert_eq!(
+            evidence.process_health().generation_state(),
+            ModuleGenerationState::Staged
+        );
+        assert!(!evidence.process_health().generation_is_active());
+        assert!(!evidence.process_health().cutover_is_complete());
+        let fresh = evidence
+            .capability_readiness()
+            .iter()
+            .find(|capability| capability.capability() == "current-impact-analysis")
+            .expect("fresh capability retained");
+        let protocol = evidence
+            .capability_readiness()
+            .iter()
+            .find(|capability| capability.capability() == "protocol-ping")
+            .expect("protocol capability retained");
+        assert!(!evidence.process_health().capability_is_current(fresh));
+        assert!(evidence.process_health().capability_is_current(protocol));
+        evidence
+            .require_current_capability(NATIVE_WORKER_EXECUTION_CAPABILITY)
+            .expect("worker execution remains current when freshness alone fails");
+        assert!(matches!(
+            evidence.require_current_capability("current-impact-analysis"),
+            Err(NativeWorkerError::KernelAdmissionRequired(reason))
+                if reason.contains("not current")
+        ));
+        assert!(matches!(
+            evidence.require_current_capability("missing-capability"),
+            Err(NativeWorkerError::KernelAdmissionRequired(reason))
+                if reason.contains("omits required capability")
+        ));
+
+        let mut foreign = value;
+        foreign["compatibility_evidence"]["seal_tag"] = serde_json::Value::String("c".repeat(64));
+        assert!(matches!(
+            validate_kernel_runtime_health(&foreign),
+            Err(NativeWorkerError::KernelAdmissionRequired(reason))
+                if reason.contains("normative seal")
+        ));
+    }
+
+    #[test]
+    fn runtime_health_caller_rejects_missing_owner_evidence() {
+        let mut value = runtime_health_json();
+        value
+            .as_object_mut()
+            .expect("runtime health object")
+            .remove("process_health");
+        assert!(matches!(
+            validate_kernel_runtime_health(&value),
+            Err(NativeWorkerError::KernelAdmissionRequired(reason))
+                if reason.contains("canonical runtime evidence")
+        ));
+    }
 
     fn test_fence_json() -> serde_json::Value {
         serde_json::json!({
