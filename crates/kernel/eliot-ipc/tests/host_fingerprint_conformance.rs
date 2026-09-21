@@ -127,7 +127,7 @@ fn route_mismatch_marks_candidate_only_invalidates_and_quarantines() {
     assert!(outcome.candidate_only);
     assert_eq!(outcome.invalidated_count, 2);
     assert!(outcome.quarantined);
-    assert!(evidence.iter().all(|item| item.is_invalidated()));
+    assert!(evidence.iter().all(CapabilityEvidence::is_invalidated));
     // Subsequent use of that fingerprint is rejected until reconciliation.
     assert_eq!(
         admit_coverage(&evidence, &active, SCOPE, NOW, &quarantine),
@@ -153,4 +153,68 @@ fn route_mismatch_marks_candidate_only_invalidates_and_quarantines() {
         ok(admit_coverage(&fresh, &active, SCOPE, NOW, &quarantine)),
         AdmissionCoverage::Verified
     );
+}
+
+// HARDENING/1: `/` is the canonical join separator, so it is rejected inside
+// fingerprint fields — two distinct tuples must never share one canonical
+// string and each other's evidence.
+#[test]
+fn fingerprint_fields_reject_canonical_separator() {
+    for field in ["in/stal", "1.2/3", "0.9/0", "route/ma"] {
+        let (installation, host, adapter, route) = match field {
+            "in/stal" => (field, "1.2.3", "0.9.0", "route-main"),
+            "1.2/3" => ("install-1", field, "0.9.0", "route-main"),
+            "0.9/0" => ("install-1", "1.2.3", field, "route-main"),
+            _ => ("install-1", "1.2.3", "0.9.0", field),
+        };
+        assert_eq!(
+            HostFingerprint::new(
+                installation,
+                EXE_SHA,
+                Some(PKG_SHA.to_owned()),
+                host,
+                adapter,
+                route
+            ),
+            Err(ConformanceError::InvalidInput)
+        );
+    }
+}
+
+// HARDENING/2: route-mismatch reconciliation invalidates only evidence bound
+// to the mismatched fingerprint; unrelated fingerprints stay live.
+#[test]
+fn route_mismatch_invalidates_only_dependent_fingerprint() {
+    let active = fingerprint();
+    let other = ok(HostFingerprint::new(
+        "install-2",
+        EXE_SHA,
+        Some(PKG_SHA.to_owned()),
+        "1.2.3",
+        "0.9.0",
+        "route-main",
+    ));
+    let mut evidence = full_evidence();
+    evidence.push(ok(CapabilityEvidence::new(
+        &other,
+        EvidenceTier::ProductionObservation,
+        SCOPE,
+        "observed",
+        LIVE,
+        vec!["prod-span-other".to_owned()],
+    )));
+    let mut quarantine = FingerprintQuarantine::new();
+    let outcome = ok(reconcile_attempt_route(
+        "route-main",
+        Some("route-shadow"),
+        &mut evidence,
+        &mut quarantine,
+        &active,
+        RouteMismatchDisposition::Quarantine,
+    ));
+    assert!(!outcome.matches);
+    assert_eq!(outcome.invalidated_count, 2);
+    assert!(evidence[..2].iter().all(CapabilityEvidence::is_invalidated));
+    assert!(!evidence[2].is_invalidated());
+    assert!(evidence[2].is_live(NOW));
 }

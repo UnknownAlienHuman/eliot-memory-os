@@ -88,11 +88,14 @@ impl HostFingerprint {
     }
 
     fn validate(&self) -> Result<(), ConformanceError> {
-        if !is_token(&self.installation_id)
+        // Fingerprint fields are joined with `/` by `canonical`, so a `/`
+        // inside a field would let two distinct field tuples project to one
+        // canonical string and share each other's evidence. Reject it.
+        if !is_canonical_field(&self.installation_id)
             || !is_sha256(&self.executable_sha256)
-            || !is_token(&self.host_version)
-            || !is_token(&self.adapter_version)
-            || !is_token(&self.route_id)
+            || !is_canonical_field(&self.host_version)
+            || !is_canonical_field(&self.adapter_version)
+            || !is_canonical_field(&self.route_id)
         {
             return Err(ConformanceError::InvalidInput);
         }
@@ -379,10 +382,11 @@ pub struct AttemptRouteOutcome {
 /// route.
 ///
 /// A mismatch marks the result candidate-only, invalidates every dependent
-/// capability evidence entry, and quarantines the mismatched fingerprint
-/// pending reconciliation (unless `disposition` specifies `RejectUse`). An
-/// unknown observed route (`None`) fails closed as a mismatch. A match
-/// changes nothing.
+/// capability evidence entry bound to the mismatched fingerprint (evidence
+/// for unrelated fingerprints is left live), and quarantines the mismatched
+/// fingerprint pending reconciliation (unless `disposition` specifies
+/// `RejectUse`). An unknown observed route (`None`) fails closed as a
+/// mismatch. A match changes nothing.
 pub fn reconcile_attempt_route(
     requested_route: &str,
     observed_route: Option<&str>,
@@ -404,9 +408,12 @@ pub fn reconcile_attempt_route(
             quarantined: false,
         });
     }
+    // Only evidence bound to the mismatched fingerprint is dependent on it.
+    // Evidence for unrelated fingerprints must survive this reconciliation.
+    let mismatched_canonical = mismatched_fingerprint.canonical();
     let mut invalidated_count = 0;
     for item in dependent_evidence.iter_mut() {
-        if !item.is_invalidated() {
+        if item.fingerprint() == mismatched_canonical && !item.is_invalidated() {
             item.invalidate();
             invalidated_count += 1;
         }
@@ -589,7 +596,14 @@ impl AttemptGate {
 }
 
 fn is_token(value: &str) -> bool {
-    !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(|c| c.is_control())
+    !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+}
+
+/// Validates one `HostFingerprint` field: a token that additionally carries
+/// no `/`, keeping [`HostFingerprint::canonical`] an unambiguous projection
+/// of the exact field tuple.
+fn is_canonical_field(value: &str) -> bool {
+    is_token(value) && !value.contains('/')
 }
 
 fn is_sha256(value: &str) -> bool {
