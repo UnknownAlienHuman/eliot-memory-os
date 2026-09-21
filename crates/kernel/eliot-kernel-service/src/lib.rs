@@ -80,7 +80,7 @@ pub use protocol::{
     AGENT_BRIDGE_MODULE_ID, AgentBridgeAdmissionDescriptor, AgentBridgeCallerSessionPolicy,
     AgentBridgeProcessPolicy, ContainmentAction, EliotdLaunchDescriptor, HostFileIdentity,
     HostJobBinding, HostJobIdentity, HostJobRoot, HostKernelCandidateBinding, HostProcessBinding,
-    HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KERNEL_CONTROL_WIRE_ID,
+    HostStartupEvidence, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KERNEL_CONTROL_WIRE_ID,
     KERNEL_CONTROL_WIRE_VERSION, KernelActivationPermit, KernelActivationQuery,
     KernelActivationReceipt, KernelControlCommand, KernelControlRequest, KernelControlResponse,
     KernelReadyReceipt, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
