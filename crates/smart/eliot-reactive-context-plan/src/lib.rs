@@ -8,9 +8,16 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::result_large_err, clippy::large_enum_variant)]
 
+mod bridge_admission;
 mod input;
 mod plan;
 mod result;
+
+pub use bridge_admission::{
+    BridgeAdmissionBatch, BridgeAdmissionDelivery, BridgeAdmissionError,
+    BridgeAdmissionInstruction, BridgeAdmissionSeverity, MAX_BRIDGE_RELATIONS,
+    plan_bridge_admissions,
+};
 
 pub use input::{
     AttentionDisclosureRule, ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTargetBinding,
