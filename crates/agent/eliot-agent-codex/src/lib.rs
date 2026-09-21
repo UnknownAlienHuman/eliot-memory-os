@@ -927,11 +927,17 @@ fn classify_codex_payload(
                 execution_unit: bound_unit.clone(),
                 start_ref: bound_turn.to_owned(),
             }),
-            omitted_fields: omitted_top_level_keys(params, &["threadId", "thread_id", "turn"]),
+            omitted_fields: omitted_top_level_keys(
+                params,
+                &["threadId", "thread_id", "turn", "turnId"],
+            ),
             warnings: Vec::new(),
             privacy_class: HostEventPrivacyClass::RedactedSummary,
-            coverage: if omitted_top_level_keys(params, &["threadId", "thread_id", "turn"])
-                .is_empty()
+            coverage: if omitted_top_level_keys(
+                params,
+                &["threadId", "thread_id", "turn", "turnId"],
+            )
+            .is_empty()
             {
                 NormalizationCoverage::Complete
             } else {
@@ -1013,7 +1019,8 @@ fn classify_codex_payload(
         }
         "turn/completed" => {
             if let Some(status) = terminal_status_from(params) {
-                let omitted = omitted_top_level_keys(params, &["threadId", "thread_id", "turn"]);
+                let omitted =
+                    omitted_top_level_keys(params, &["threadId", "thread_id", "turn", "turnId"]);
                 let coverage = if omitted.is_empty() {
                     NormalizationCoverage::Complete
                 } else {
@@ -1036,7 +1043,7 @@ fn classify_codex_payload(
                     method,
                     UnsupportedEventReason::UnknownMethod,
                     vec!["non-terminal-turn-status".to_owned()],
-                    omitted_top_level_keys(params, &["threadId", "thread_id"]),
+                    omitted_top_level_keys(params, &["threadId", "thread_id", "turnId"]),
                 ))
             }
         }
@@ -1100,15 +1107,34 @@ fn validate_binding_for_codex(binding: &ProviderExecutionBinding) -> Result<(), 
     Ok(())
 }
 
-/// Extract the exact opaque turn ID with the real JSON parser: only
-/// `params.turn.id` as a string counts as turn evidence. Absent, null, or
-/// non-string turn identity is missing evidence, never a guessed turn.
+/// Extract the exact opaque turn ID with the real JSON parser, from both
+/// upstream turn-identity positions: `params.turn.id` (turn-scoped
+/// notifications: `turn/started` and `turn/completed` carry
+/// `{ threadId, turn: Turn }` with `Turn.id`) and top-level `params.turnId`
+/// (item delta notifications: `item/agentMessage/delta` carries
+/// `{ threadId, turnId, itemId, delta }`).
+///
+/// Only exact nonblank strings count as turn evidence. Absent, null,
+/// non-string, or blank turn identity is missing evidence, never a guessed
+/// turn. Two present string identities that disagree are conflicting evidence
+/// and yield no turn: the caller fails closed instead of choosing one.
 fn wire_turn_id(params: &Value) -> Option<&str> {
-    params
+    let nested = params
         .get("turn")
         .and_then(Value::as_object)
         .and_then(|turn| turn.get("id"))
         .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty());
+    let top_level = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty());
+    match (nested, top_level) {
+        (Some(nested), Some(top_level)) if nested == top_level => Some(nested),
+        (Some(nested), None) => Some(nested),
+        (None, Some(top_level)) => Some(top_level),
+        _ => None,
+    }
 }
 
 fn validate_wire_session_against_binding(
@@ -2829,6 +2855,116 @@ mod tests {
             started.payload,
             NormalizedHostEventPayload::ExecutionStarted(_)
         ));
+        Ok(())
+    }
+
+    /// Upstream turn identity arrives in two exact positions: `params.turn.id`
+    /// for turn-scoped notifications (`turn/started`, `turn/completed`) and
+    /// top-level `params.turnId` for item deltas
+    /// (`item/agentMessage/delta` carries `{ threadId, turnId, itemId, delta }`).
+    /// Both are exact bound-turn evidence; anything else quarantines.
+    #[test]
+    fn top_level_turn_id_is_exact_turn_evidence() -> TestResult {
+        let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
+        // Positive: upstream delta shape with the exact bound top-level turn.
+        let (delta, _) = normalize_bound(
+            "item/agentMessage/delta",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "delta": "hello",
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )?;
+        assert!(matches!(
+            delta.payload,
+            NormalizedHostEventPayload::AssistantDelta(ref observation)
+                if observation.delta_chars == 5
+        ));
+        assert_eq!(delta.lineage.attributable_binding()?, &binding);
+        // Negative (cross-turn): same thread, foreign top-level turn.
+        assert!(is_binding_mismatch(&normalize_bound(
+            "item/agentMessage/delta",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-2",
+                "itemId": "item-1",
+                "delta": "hello",
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )));
+        // Negative (loss): delta with no turn identity anywhere is missing
+        // evidence, never convenient attribution.
+        assert!(is_binding_mismatch(&normalize_bound(
+            "item/agentMessage/delta",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "itemId": "item-1",
+                "delta": "hello",
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )));
+        // Negative (conflict): `turn.id` and top-level `turnId` disagree, so
+        // neither is chosen.
+        assert!(is_binding_mismatch(&normalize_bound(
+            "turn/completed",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-2",
+                "turn": {"id": "turn-1", "status": "completed"},
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )));
+        // Agreement: both positions present and equal still attributes.
+        let (agreed, _) = normalize_bound(
+            "turn/started",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "turn": {"id": "turn-1", "status": "inProgress"},
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )?;
+        assert!(matches!(
+            agreed.payload,
+            NormalizedHostEventPayload::ExecutionStarted(_)
+        ));
+        // Robustness: a non-string top-level turn is not evidence; the exact
+        // `turn.id` still attributes.
+        let (numeric, _) = normalize_bound(
+            "turn/started",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": 42,
+                "turn": {"id": "turn-1", "status": "inProgress"},
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )?;
+        assert!(matches!(
+            numeric.payload,
+            NormalizedHostEventPayload::ExecutionStarted(_)
+        ));
+        assert_eq!(numeric.lineage.attributable_binding()?, &binding);
         Ok(())
     }
 
