@@ -30,6 +30,7 @@ use eliot_platform_windows::{
 };
 use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
+mod backup_entry;
 #[cfg(windows)]
 mod legacy_governor_config;
 use serde_json::json;
@@ -115,6 +116,11 @@ enum Command {
     ControlBoard {
         #[command(subcommand)]
         command: ControlBoardCommand,
+    },
+    /// Preview backup creation/restore plans and key coverage (#1873; preview-only, no execution).
+    Backup {
+        #[command(subcommand)]
+        command: backup_entry::BackupCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -527,6 +533,7 @@ fn run() -> Result<i32> {
         Command::Plugin { command } => run_plugin(command),
         Command::Doctor { command } => run_doctor(command),
         Command::ControlBoard { command } => run_controlboard(command),
+        Command::Backup { command } => backup_entry::run_backup(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
