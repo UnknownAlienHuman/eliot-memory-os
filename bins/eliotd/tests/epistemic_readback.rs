@@ -24,9 +24,9 @@
 use std::collections::BTreeMap;
 
 use eliot_store_api::{
-    NamedMutationOperation, NamedReadOperation, StoreError, StoreFailure,
-    StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
-    generated_operation_manifests, operation_manifest_set_digest,
+    NamedMutationOperation, NamedReadOperation, StoreError, StoreFailure, StoreFailureDisposition,
+    StoreFailureIdentityContext, StoreMutationDisposition, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 use serde_json::{Value, json};
 
@@ -58,8 +58,7 @@ fn test_fence() -> TestResult<eliot_store_api::StateFence> {
     let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
         .map_err(|error| format!("test lineage: {error}"))?;
     let sequence = NonZeroU64::new(1).ok_or("nonzero test sequence")?;
-    let epoch =
-        EpochId::new(lineage, sequence).map_err(|error| format!("test epoch: {error}"))?;
+    let epoch = EpochId::new(lineage, sequence).map_err(|error| format!("test epoch: {error}"))?;
     Ok(eliot_store_api::StateFence::new(
         epoch,
         ResourceGeneration::genesis(),
@@ -81,7 +80,10 @@ fn catalogue_activates_position_read_and_revision_write() -> TestResult {
         generated_operation_manifests().map_err(|error| format!("regenerate: {error}"))?;
     let again =
         operation_manifest_set_digest(&regenerated).map_err(|error| format!("digest: {error}"))?;
-    assert_eq!(set_digest, again, "identical catalogue binds the same digest");
+    assert_eq!(
+        set_digest, again,
+        "identical catalogue binds the same digest"
+    );
     Ok(())
 }
 
@@ -130,7 +132,10 @@ fn position_read_requires_its_closed_selector() -> TestResult {
     )?;
     assert!(matches!(
         unscoped.validate_against_catalogue(&entries),
-        Err(StoreError::InvalidField { field: "scope_id", .. })
+        Err(StoreError::InvalidField {
+            field: "scope_id",
+            ..
+        })
     ));
     Ok(())
 }
