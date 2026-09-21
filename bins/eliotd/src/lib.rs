@@ -781,6 +781,53 @@ impl DaemonComposition {
             .acknowledge_and_display(skill_id, receipt, ack, tools)
     }
 
+    /// Installs one canonical package source under the versioned canonical
+    /// tool view (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`], plus the
+    /// admitted-definition-version gate: the source reports the version it
+    /// binds (MCP canonical registry via its `CanonicalToolSource` impl),
+    /// the driver states the Governor-admitted version, and drift fails
+    /// closed before the shared handle is touched. The Skill never hardcodes
+    /// the version; the composition never invents a registry. Drivers call
+    /// post-admission with the injector's real inputs.
+    pub fn skill_install_package_versioned(
+        &self,
+        package: &eliot_skill::SkillPackage,
+        inputs: &eliot_skill::MaterializationInputs,
+        context: &eliot_skill::CatalogueInstallContext,
+        source: &dyn eliot_skill::CanonicalToolSource,
+        aliases: &eliot_skill::ToolAliasTable,
+        admitted_definition_version: &str,
+    ) -> Result<String, eliot_skill::SkillError> {
+        self.shared_skill_adapter().install_package_versioned(
+            package,
+            inputs,
+            context,
+            source,
+            aliases,
+            admitted_definition_version,
+        )
+    }
+
+    /// Runs versioned install, availability and sealed gates, and Hotset
+    /// receipt issuance as one runtime delivery act (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`]: the driver
+    /// supplies the real package, inputs, context, provider readiness and
+    /// materialization scope, versioned tool source plus alias table and
+    /// admitted version, Hotset identity, and injector approval in one
+    /// [`VersionedDeliveryAct`](skill_lifecycle_adapters::VersionedDeliveryAct);
+    /// the shared handle records the act. The receipt carries the provisional
+    /// ceiling until evidence promotion; the receiver ack re-enters through
+    /// [`Self::skill_acknowledge_and_display`].
+    pub fn skill_run_install_to_receipt(
+        &self,
+        act: skill_lifecycle_adapters::VersionedDeliveryAct<'_>,
+    ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
+        self.shared_skill_adapter().run_install_to_receipt(act)
+    }
+
     /// Borrows the single Governor task lifecycle owner as a forwarding
     /// adapter over the closed [`TaskCommand`](eliot_governor::TaskCommand) path.
     ///

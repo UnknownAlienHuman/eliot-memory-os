@@ -889,6 +889,7 @@ mod tests {
             delivered_skill_ids: vec!["skill-demo".to_owned()],
             body_digests: BTreeMap::new(),
             approval_ref: "approval-1".to_owned(),
+            provisional: true,
             receipt_digest: "d".repeat(64),
         };
         let ack = HotsetDeliveryAck {

@@ -652,6 +652,7 @@ impl SkillCatalogue {
             trigger: entry.index.trigger.clone(),
             body_version: entry.body.body_version.clone(),
             body_digest: entry.body.body_digest.clone(),
+            status: entry.status,
             index_tokens: entry.runtime.index_tokens,
             body_tokens: entry.runtime.body_tokens,
             runtime_tokens: entry.runtime.runtime_tokens,
@@ -732,6 +733,14 @@ impl HotsetDeliveryAck {
 /// a different order yields the same receipt. Delivery never implies
 /// usefulness or causal credit; it proves only that the Hotset carried
 /// the Skill.
+///
+/// The receipt carries its delivery ceiling explicitly: `provisional` is
+/// `false` only when every delivered Skill was `Current` at issuance, and
+/// `true` whenever any delivered Skill is `Provisional`, so bounded
+/// provisional use (`I7.13`: scoped/provisional without independent transfer
+/// evidence) is never representable as current-grade delivery. The flag is
+/// bound into the receipt digest; the per-Skill truth stays with the
+/// catalogue entry status and is shown on the activation display.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HotsetDeliveryReceipt {
@@ -743,6 +752,8 @@ pub struct HotsetDeliveryReceipt {
     /// approval or canonical commit receipt, bound by the injector). A
     /// non-blank Hotset identity alone never authorizes issuance.
     pub approval_ref: String,
+    /// Delivery ceiling: `true` when any delivered Skill is `Provisional`.
+    pub provisional: bool,
     pub receipt_digest: String,
 }
 
@@ -755,6 +766,7 @@ impl HotsetDeliveryReceipt {
                 &self.delivered_skill_ids,
                 &self.body_digests,
                 &self.approval_ref,
+                &self.provisional,
             ),
             "delivery.receipt",
         )
@@ -784,6 +796,7 @@ impl HotsetDeliveryReceipt {
         check_unique(&delivered_skill_ids, "delivery.delivered_skill_ids")?;
         let catalogue_digest = catalogue.catalogue_digest()?;
         let mut body_digests = BTreeMap::new();
+        let mut provisional = false;
         let mut ordered_ids = delivered_skill_ids;
         ordered_ids.sort();
         for skill_id in &ordered_ids {
@@ -796,6 +809,9 @@ impl HotsetDeliveryReceipt {
                     reason: "stale or retired Skills cannot be delivered",
                 });
             }
+            if entry.status != SkillStatus::Current {
+                provisional = true;
+            }
             body_digests.insert(skill_id.clone(), entry.body.body_digest.clone());
         }
         let mut receipt = Self {
@@ -804,6 +820,7 @@ impl HotsetDeliveryReceipt {
             delivered_skill_ids: ordered_ids,
             body_digests,
             approval_ref,
+            provisional,
             receipt_digest: String::new(),
         };
         receipt.receipt_digest = receipt.identity_digest()?;
@@ -859,6 +876,10 @@ pub struct ActivatedSkillDisplay {
     pub trigger: String,
     pub body_version: String,
     pub body_digest: String,
+    /// Entry status at display time: only `Current` or `Provisional` can
+    /// display (usability gate above). The status is the visible delivery
+    /// ceiling — a provisional activation never renders as current-grade.
+    pub status: SkillStatus,
     pub index_tokens: u32,
     pub body_tokens: u32,
     pub runtime_tokens: u32,
@@ -879,6 +900,12 @@ impl ActivatedSkillDisplay {
         check_single_line(&self.trigger, "activation.trigger", MAX_TRIGGER_CHARS)?;
         check_text(&self.body_version, "activation.body_version")?;
         check_digest(&self.body_digest, "activation.body_digest")?;
+        if !matches!(self.status, SkillStatus::Current | SkillStatus::Provisional) {
+            return Err(SkillError::InvalidField {
+                field: "activation.status",
+                reason: "only current or provisional Skills display",
+            });
+        }
         check_digest(
             &self.delivery_receipt_digest,
             "activation.delivery_receipt_digest",
@@ -903,6 +930,14 @@ impl ActivatedSkillDisplay {
     pub fn render(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!("skill {} | {}", self.skill_id, self.trigger));
+        lines.push(format!(
+            "status {}",
+            match self.status {
+                SkillStatus::Current => "current",
+                SkillStatus::Provisional => "provisional",
+                _ => "blocked",
+            }
+        ));
         lines.push(format!(
             "body {} digest {}",
             self.body_version, self.body_digest
@@ -1100,6 +1135,56 @@ mod tests {
         assert!(rendered.contains("route-1"));
         assert!(rendered.contains("profile-1"));
         assert!(rendered.contains(&receipt.receipt_digest));
+    }
+
+    #[test]
+    fn delivery_ceiling_is_provisional_until_evidence_promotion() {
+        // Provisional entry: the receipt and the display both carry the
+        // provisional ceiling — absence of verification never mints
+        // current-grade artifacts.
+        let mut catalogue = catalogue_two();
+        let provisional_receipt = HotsetDeliveryReceipt::issue(
+            "hotset-1".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+            &tools(),
+            "approval-commit-1".to_owned(),
+        )
+        .expect("delivery receipt");
+        assert!(provisional_receipt.provisional);
+        let provisional_display = catalogue
+            .activation_display(
+                "skill-alpha",
+                &provisional_receipt,
+                &applied_ack(&provisional_receipt),
+                &tools(),
+            )
+            .expect("activation display");
+        assert_eq!(provisional_display.status, SkillStatus::Provisional);
+        assert!(provisional_display.render().contains("status provisional"));
+
+        // Evidence promotion to Current (I7.13 depth rule) lifts the ceiling
+        // on later receipts and displays — the only path past provisional.
+        promote_current(&mut catalogue, "skill-alpha");
+        let current_receipt = HotsetDeliveryReceipt::issue(
+            "hotset-2".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+            &tools(),
+            "approval-commit-2".to_owned(),
+        )
+        .expect("delivery receipt");
+        assert!(!current_receipt.provisional);
+        let current_display = catalogue
+            .activation_display(
+                "skill-alpha",
+                &current_receipt,
+                &applied_ack(&current_receipt),
+                &tools(),
+            )
+            .expect("activation display");
+        assert_eq!(current_display.status, SkillStatus::Current);
+        assert!(current_display.render().contains("status current"));
     }
 
     #[test]

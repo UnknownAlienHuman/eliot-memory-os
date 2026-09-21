@@ -173,10 +173,11 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// alias table resolves provider renames to canonical names first.
     /// Synchronous: the guard is taken and dropped in a closed scope.
     ///
-    /// No in-tree production flow drives the versioned population path yet
-    /// (the versioned composition seam is carried in the delivery report for
-    /// Governor serialization). The allowance covers exactly that pending
-    /// adoption; it expires when the seam lands.
+    /// No in-tree Governor driver calls the versioned population path yet;
+    /// the composition seam
+    /// ([`DaemonComposition::skill_install_package_versioned`](super::DaemonComposition::skill_install_package_versioned))
+    /// has landed for that driver. The allowance covers exactly that pending
+    /// adoption; it expires when the driver lands.
     #[allow(dead_code)]
     pub(crate) fn install_package_versioned(
         &self,
@@ -217,10 +218,11 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// [`acknowledge_and_display`](Self::acknowledge_and_display).
     /// Synchronous: each step takes and drops the guard in a closed scope.
     ///
-    /// No in-tree production flow drives the composed delivery act yet
-    /// (the versioned composition seam is carried in the delivery report for
-    /// Governor serialization). The allowance covers exactly that pending
-    /// adoption; it expires when the seam lands.
+    /// No in-tree Governor driver calls the composed delivery act yet; the
+    /// composition seam
+    /// ([`DaemonComposition::skill_run_install_to_receipt`](super::DaemonComposition::skill_run_install_to_receipt))
+    /// has landed for that driver. The allowance covers exactly that pending
+    /// adoption; it expires when the driver lands.
     #[allow(dead_code)]
     pub(crate) fn run_install_to_receipt(
         &self,
@@ -306,7 +308,7 @@ impl<T> ForwardingSkillLifecycle<T> {
 /// (provider readiness claims, materialization scope, Hotset identity,
 /// injector approval handle) so the composition drives the whole act in one
 /// call.
-pub(crate) struct VersionedDeliveryAct<'a> {
+pub struct VersionedDeliveryAct<'a> {
     pub package: &'a eliot_skill::SkillPackage,
     pub inputs: &'a eliot_skill::MaterializationInputs,
     pub context: &'a eliot_skill::CatalogueInstallContext,
@@ -1038,6 +1040,10 @@ mod tests {
             .expect("versioned delivery act");
         assert_eq!(skill_id, "skill-demo");
         assert!(receipt.confirms_delivery("skill-demo"));
+        // No sealed verifier exists in-tree: the PlanGap path proceeds
+        // provisional, and the artifacts say so — absence of verification
+        // never mints current-grade delivery.
+        assert!(receipt.provisional);
         {
             let catalogue = forwarding.catalogue.lock().expect("catalogue lock");
             assert!(catalogue.is_usable("skill-demo"));
@@ -1058,6 +1064,7 @@ mod tests {
             .expect("acked display");
         assert_eq!(display.skill_id, "skill-demo");
         assert_eq!(display.delivery_receipt_digest, receipt.receipt_digest);
+        assert_eq!(display.status, eliot_skill::SkillStatus::Provisional);
         assert_eq!(*calls.lock().expect("calls"), 0);
     }
 
