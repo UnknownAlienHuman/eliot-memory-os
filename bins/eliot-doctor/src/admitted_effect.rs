@@ -248,7 +248,7 @@ pub fn decode_bootstrap_args(argv: &[String]) -> Result<BootstrapAction, Bootstr
 pub fn help_text() -> String {
     format!(
         "eliot-doctor ({CONTRACT_NAME} {CONTRACT_VERSION}): governed one-shot doctor.\n\
-         usage: eliot-doctor [--help] [--version]\n\
+         usage: eliot-doctor [--help] [--version] | integration <profile> --expectation <abs> --observation <abs>\n\
          Runs at most one Kernel-admitted attempt or one reconciliation request through\n\
          a single registered automatic-safe named effect adapter on the shared governed\n\
          process contour, emits one typed JSON report on stdout, flushes evidence, exits.\n\
@@ -256,6 +256,10 @@ pub fn help_text() -> String {
          argv, stdin, or environment; admission arrives only via the authenticated Kernel\n\
          channel. Diagnose-only admissions never execute. Crash after intent but before\n\
          receipt stays UNKNOWN_EFFECT_OUTCOME; blind retry is forbidden.\n\
+         integration <profile> is a read-only coverage check (expected file hashes,\n\
+         active registrations, observed hook events, handshake); verification\n\
+         mismatches report inside the JSON document with exit 0, installed and live\n\
+         kept separate, while malformed input exits 2.\n\
          exit 0: diagnosed/cancelled/escalated without effect (never a repair claim)\n\
          exit 10: effect completed, pending independent verification\n\
          exit 11: effect failed; 12: partial; 13: unknown effect outcome; 14: reconciling\n\

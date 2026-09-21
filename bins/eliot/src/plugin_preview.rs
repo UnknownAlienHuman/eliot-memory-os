@@ -162,6 +162,17 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginPreviewError
             "expected_coverage.profile must be non-empty".to_owned(),
         ));
     }
+    // I3.7 binds one installation to one expected IntegrationCoverageProfile,
+    // and `integration <profile>` rejects an expectation naming another
+    // profile. A manifest whose expected coverage names a different profile
+    // than the install would record an incoherent chain: the install receipt
+    // could later underpin a live claim for a profile it was never bound to.
+    // Reject it here, before any preview or rollback artifact exists.
+    if manifest.expected_coverage.profile.trim() != manifest.profile.trim() {
+        return Err(PluginPreviewError::ManifestInvalid(
+            "expected_coverage.profile must equal profile".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -448,6 +459,15 @@ mod tests {
             b"{\"side\":\"b\"}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mismatched_expected_coverage_profile_is_rejected() {
+        let mut manifest = fixture_manifest();
+        manifest.expected_coverage.profile = "other".to_owned();
+        let error =
+            validate_manifest(&manifest).expect_err("cross-profile coverage must not validate");
+        assert!(error.to_string().contains("expected_coverage.profile"));
     }
 
     #[test]

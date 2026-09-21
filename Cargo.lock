@@ -578,6 +578,7 @@ dependencies = [
  "eliot-bootstrap",
  "eliot-cli",
  "eliot-contracts",
+ "eliot-doctor",
  "eliot-governor",
  "eliot-host-state",
  "eliot-installation",

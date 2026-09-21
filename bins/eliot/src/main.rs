@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
+use eliot_doctor::integration;
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
@@ -94,6 +95,11 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+    /// Verify plugin/bridge integration coverage for one profile (I3.7).
+    Doctor {
+        #[command(subcommand)]
+        command: DoctorCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -344,6 +350,24 @@ enum PluginCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum DoctorCommand {
+    /// Inspect expected file hashes, active registrations, observed hook
+    /// events, and the handshake result for one profile, reporting
+    /// installation separately from runtime liveness. Read-only: executes
+    /// no repair, mints no authority, mutates nothing.
+    Integration {
+        /// Integration profile name; must equal the expectation record profile.
+        profile: String,
+        /// Absolute path to the expected integration state JSON.
+        #[arg(long, value_parser = absolute_path)]
+        expectation: PathBuf,
+        /// Absolute path to the observed integration state JSON.
+        #[arg(long, value_parser = absolute_path)]
+        observation: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SystemCommand {
     /// Capture source/build/runtime/store/integration evidence.
     Snapshot {
@@ -397,6 +421,7 @@ fn run() -> Result<i32> {
         Command::Installation { command } => run_installation(command),
         Command::Runtime { command } => run_runtime(command),
         Command::Plugin { command } => run_plugin(command),
+        Command::Doctor { command } => run_doctor(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
@@ -455,6 +480,32 @@ fn run_plugin(command: PluginCommand) -> Result<i32> {
                 }
                 Err(error) => {
                     write_installation_error("PLUGIN_INSTALL_FAILED", &error.to_string());
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+            }
+        }
+    }
+}
+
+fn run_doctor(command: DoctorCommand) -> Result<i32> {
+    match command {
+        DoctorCommand::Integration {
+            profile,
+            expectation,
+            observation,
+        } => {
+            // Same shared gate as `eliot-doctor integration`: the evaluator
+            // and output contract live in `eliot_doctor::integration`; this
+            // front door only decodes arguments and projects the result.
+            // Verification mismatches are data inside the JSON report
+            // (exit 0); only input errors exit nonzero.
+            match integration::verify_profile(&profile, &expectation, &observation) {
+                Ok(report) => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(0)
+                }
+                Err(error) => {
+                    write_installation_error("DOCTOR_INTEGRATION_INVALID", &error.to_string());
                     Ok(INVALID_REQUEST_EXIT)
                 }
             }
@@ -3254,6 +3305,27 @@ mod tests {
             parsed.command,
             Command::Plugin {
                 command: PluginCommand::Install { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn doctor_integration_parses() {
+        let parsed = Cli::try_parse_from([
+            "eliot",
+            "doctor",
+            "integration",
+            "demo",
+            "--expectation",
+            "C:\\eliot\\expectation.json",
+            "--observation",
+            "C:\\eliot\\observation.json",
+        ])
+        .expect("doctor integration parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Doctor {
+                command: DoctorCommand::Integration { .. }
             }
         ));
     }

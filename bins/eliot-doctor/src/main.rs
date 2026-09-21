@@ -71,6 +71,10 @@ const INTEGRATION_INPUT_EXIT: i32 = 2;
 /// Read-only integration coverage check (I3.7):
 /// `eliot-doctor integration <profile> --expectation <abs> --observation <abs>`.
 ///
+/// Front-door argument decoding only; the profile gate, evaluation, and
+/// contract JSON live in the shared [`integration::verify_profile`]
+/// entrypoint, also driven by `eliot doctor integration`.
+///
 /// Inspects expected file hashes, active registrations, observed hook
 /// events, and the handshake result, then reports installed separately from
 /// live. Executes no repair, mints no authority, and mutates nothing.
@@ -126,30 +130,18 @@ fn run_integration(argv: &[String]) -> i32 {
         );
         return INTEGRATION_INPUT_EXIT;
     };
-    let expected = match integration::load_expectation(std::path::Path::new(&expectation_path)) {
-        Ok(expected) => expected,
+    let report = match integration::verify_profile(
+        &profile,
+        std::path::Path::new(&expectation_path),
+        std::path::Path::new(&observation_path),
+    ) {
+        Ok(report) => report,
         Err(error) => {
             let _ = writeln!(std::io::stderr(), "integration input invalid: {error}");
             return INTEGRATION_INPUT_EXIT;
         }
     };
-    if expected.profile != profile {
-        let _ = writeln!(
-            std::io::stderr(),
-            "integration profile mismatch: requested {profile} but expectation carries {}",
-            expected.profile
-        );
-        return INTEGRATION_INPUT_EXIT;
-    }
-    let observed = match integration::load_observation(std::path::Path::new(&observation_path)) {
-        Ok(observed) => observed,
-        Err(error) => {
-            let _ = writeln!(std::io::stderr(), "integration input invalid: {error}");
-            return INTEGRATION_INPUT_EXIT;
-        }
-    };
-    let report = integration::evaluate(&profile, &expected, &observed);
-    let text = integration::report_json(&report).to_string();
+    let text = report.to_string();
     let mut stdout = std::io::stdout().lock();
     match writeln!(stdout, "{text}") {
         Ok(()) => match stdout.flush() {

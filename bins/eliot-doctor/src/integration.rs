@@ -98,6 +98,18 @@ pub enum IntegrationError {
     /// The profile argument is missing or empty.
     #[error("integration profile must be non-empty")]
     EmptyProfile,
+    /// The expectation record names a different profile than the one
+    /// requested. A cross-profile record is a typed input error, never a
+    /// live claim for the other profile.
+    #[error(
+        "integration profile mismatch: requested {requested} but expectation carries {carried}"
+    )]
+    ProfileMismatch {
+        /// Profile requested on the command line.
+        requested: String,
+        /// Profile carried by the expectation record.
+        carried: String,
+    },
 }
 
 /// Hashes one file with the canonical SHA-256 projection.
@@ -203,6 +215,32 @@ pub fn evaluate(
     }
 }
 
+/// Verifies one profile end to end through the single gate shared by every
+/// `integration` front door (`eliot-doctor integration` and
+/// `eliot doctor integration`): loads the expectation, binds it to the
+/// requested profile, loads the observation, and projects the
+/// machine-readable contract JSON. Verification mismatches are data inside
+/// the returned JSON; only input errors (including a cross-profile
+/// expectation record) are `Err`.
+pub fn verify_profile(
+    profile: &str,
+    expectation_path: &Path,
+    observation_path: &Path,
+) -> Result<serde_json::Value, IntegrationError> {
+    if profile.trim().is_empty() {
+        return Err(IntegrationError::EmptyProfile);
+    }
+    let expected = load_expectation(expectation_path)?;
+    if expected.profile != profile {
+        return Err(IntegrationError::ProfileMismatch {
+            requested: profile.to_owned(),
+            carried: expected.profile,
+        });
+    }
+    let observed = load_observation(observation_path)?;
+    Ok(report_json(&evaluate(profile, &expected, &observed)))
+}
+
 /// Projects the report to the machine-readable contract JSON, keeping
 /// installed and live as separate fields.
 #[must_use]
@@ -292,6 +330,31 @@ mod tests {
         assert!(!report.installed);
         assert!(!report.live);
         assert_eq!(report.disposition, "NOT_INSTALLED");
+    }
+
+    #[test]
+    fn cross_profile_expectation_is_rejected_not_live() {
+        let dir = std::env::temp_dir().join("eliot-go19-1964-cross-profile");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let expectation_path = dir.join("expectation.json");
+        let observation_path = dir.join("observation.json");
+        std::fs::write(
+            &expectation_path,
+            serde_json::to_vec(&expectation()).expect("write expectation"),
+        )
+        .expect("write expectation file");
+        std::fs::write(
+            &observation_path,
+            serde_json::to_vec(&observation(true)).expect("write observation"),
+        )
+        .expect("write observation file");
+        let error = verify_profile("other", &expectation_path, &observation_path)
+            .expect_err("cross-profile expectation must not verify");
+        assert!(matches!(error, IntegrationError::ProfileMismatch { .. }));
+        let value = verify_profile("demo", &expectation_path, &observation_path)
+            .expect("same-profile expectation verifies");
+        assert_eq!(value["live"], true);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
