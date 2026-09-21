@@ -12,8 +12,8 @@
 //! `crates/storage/eliot-store-surreal-adapter/tests/epistemic_revision.rs::real_position_cas_exact_replay_and_receipt_readback`
 //! (re-run on this base as the real-Surreal proof) and against the reference
 //! handler by `crates/storage/eliot-store-memory/src/epistemic_tests.rs`.
-//! This file proves the daemon half with the same closed types: the 17-entry
-//! catalogue (10 reads + 6 mutations + genesis), the CEP `position` selector,
+//! This file proves the daemon half with the same closed types: the 18-entry
+//! catalogue (10 reads + 7 mutations + genesis), the CEP `position` selector,
 //! the `ApplyEpistemicRevision` closed payload requirement (admitted) versus
 //! `RecordAuthorityRevocation` (still unactivated), the `IdentityConflict`
 //! without-second-revision disposition, and the exact daemon wiring types
@@ -68,7 +68,15 @@ fn test_fence() -> TestResult<eliot_store_api::StateFence> {
 #[test]
 fn catalogue_activates_position_read_and_revision_write() -> TestResult {
     let entries = generated_operation_manifests().map_err(|error| format!("catalogue: {error}"))?;
-    assert_eq!(entries.len(), 17, "10 reads + 6 mutations + genesis");
+    // Denominator bound to the producer declaration tables in
+    // `crates/storage/eliot-store-api/src/operation_catalogue.rs`: 10
+    // activated reads + 7 activated mutations (the seventh is `ApplyErasure`,
+    // admitted by #1712/PR #1987 with handler, schema, and consumer triple;
+    // the store owner's own count tests in
+    // `crates/storage/eliot-store-api/tests/operation_manifest_catalogue.rs`
+    // already assert 18) + the genesis bootstrap entry. Exact equality: a
+    // silent add or drop must fail here, never pass on a bound.
+    assert_eq!(entries.len(), 18, "10 reads + 7 mutations + genesis");
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
     assert!(names.contains(&"GetCurrentEpistemicPosition"));
     assert!(names.contains(&"ApplyEpistemicRevision"));
