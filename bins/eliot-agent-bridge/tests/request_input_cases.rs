@@ -33,6 +33,7 @@ fn corpus() -> Value {
         .expect("decoder corpus must parse")
 }
 
+// WORK_UNIT_CASE: 977/1
 #[test]
 fn corpus_profile_identity_is_versioned() {
     let fixture = corpus();
@@ -40,6 +41,8 @@ fn corpus_profile_identity_is_versioned() {
     assert_eq!(fixture["profile_revision"], Value::String("v1".to_owned()));
 }
 
+// WORK_UNIT_CASE: 977/1
+// WORK_UNIT_CASE: 977/20
 #[test]
 fn corpus_limit_table_is_finite_with_exact_bounds() {
     let fixture = corpus();
@@ -65,6 +68,8 @@ fn corpus_limit_table_is_finite_with_exact_bounds() {
     );
 }
 
+// WORK_UNIT_CASE: 977/19
+// WORK_UNIT_CASE: 977/20
 #[test]
 fn corpus_holds_at_least_twenty_unique_well_formed_cases() {
     let fixture = corpus();
@@ -108,4 +113,61 @@ fn corpus_holds_at_least_twenty_unique_well_formed_cases() {
     assert!(accepts >= 1, "corpus must prove at least one accept");
     assert!(skips >= 1, "corpus must prove blank-line skipping");
     assert!(rejects >= 10, "corpus must prove the rejection family");
+}
+
+// WORK_UNIT_CASE: 977/20
+#[test]
+fn production_call_chain_has_no_unbounded_bypass_or_cloned_decoder() {
+    let main = include_str!("../src/main.rs");
+    let decoder = include_str!("../src/request_input.rs");
+    // Dispatch decodes only through the bounded profile-bound entry point,
+    // and stdin is acquired only through the bounded record reader: the
+    // transport is unchanged and no second path exists.
+    assert!(
+        main.contains("fn decode_bounded_request(text: &str)"),
+        "dispatch must keep its single bounded decode entry point"
+    );
+    assert!(
+        main.contains("decode_bounded_request(text)"),
+        "the dispatch loop must call the bounded entry point"
+    );
+    assert!(
+        main.contains("read_bounded_record(&mut stdin_lock"),
+        "stdin acquisition must stay on the bounded record reader"
+    );
+    // No unbounded acquisition API survives in the binary.
+    for forbidden in [".lines()", "read_line", "read_to_end", "set_read_timeout"] {
+        assert!(
+            !main.contains(forbidden),
+            "binary must not contain unbounded/blocking-deadline API {forbidden}"
+        );
+        assert!(
+            !decoder.contains(forbidden),
+            "decoder must not contain unbounded/blocking-deadline API {forbidden}"
+        );
+    }
+    // No cloned or test-only decoder: typed `Request` construction happens
+    // exactly once, inside the bounded entry point, and the pre-scan never
+    // converts raw input into an untrusted `Value` tree before the
+    // duplicate-sensitive checks run.
+    assert!(
+        !decoder.contains("serde_json::from_str"),
+        "decoder must not host a second typed construction path"
+    );
+    assert!(
+        !decoder.contains("serde_json::Value"),
+        "decoder must not parse raw input into Value before checking it"
+    );
+    // The profile binding is present and honestly scoped: the binary
+    // validates the accepted profile before acquisition, and the decoder
+    // states that wall-clock rows are declared but not enforced on
+    // blocking stdin, so no slow-reader interruption can be claimed.
+    assert!(
+        main.contains("REQUEST_INPUT_PROFILE"),
+        "binary must stay bound to the accepted input profile"
+    );
+    assert!(
+        decoder.contains("NOT enforced"),
+        "decoder must keep its declared-not-enforced disclosure"
+    );
 }

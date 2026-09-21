@@ -961,6 +961,7 @@ mod tests {
         }
     }"#;
 
+    // WORK_UNIT_CASE: 977/11
     #[test]
     fn raw_forward_frame_is_not_a_public_operation() {
         let error = serde_json::from_str::<Request>(r#"{"op":"forward_frame","frame":{}}"#)
@@ -968,6 +969,7 @@ mod tests {
         assert!(error.to_string().contains("unknown variant"));
     }
 
+    // WORK_UNIT_CASE: 977/2
     #[test]
     fn typed_invoke_and_cancel_deserialize() {
         assert!(matches!(
@@ -980,6 +982,8 @@ mod tests {
         ));
     }
 
+    // WORK_UNIT_CASE: 977/9
+    // WORK_UNIT_CASE: 977/13
     #[test]
     fn forged_kernel_identity_field_is_rejected() {
         let forged = INVOKE.replace(
@@ -991,6 +995,7 @@ mod tests {
         assert!(error.to_string().contains("unknown field"));
     }
 
+    // WORK_UNIT_CASE: 977/17
     #[test]
     fn unavailable_kernel_binding_returns_correlated_typed_rejection() {
         let Request::Invoke { request } =
@@ -1016,6 +1021,8 @@ mod tests {
         );
     }
 
+    // WORK_UNIT_CASE: 977/2
+    // WORK_UNIT_CASE: 977/15
     #[test]
     fn cancellation_needs_no_prose_and_preserves_exact_target() {
         let Request::Cancel { request } =
@@ -1042,6 +1049,7 @@ mod tests {
         );
     }
 
+    // WORK_UNIT_CASE: 977/18
     #[test]
     fn output_bound_refuses_oversize_and_timeout_is_explicit() {
         let small = Response::Error {
@@ -1086,6 +1094,7 @@ mod tests {
         assert_eq!(fast, 7_u8);
     }
 
+    // WORK_UNIT_CASE: 977/16
     #[test]
     fn stop_reports_bounded_drain_with_original_identity() {
         let clean = build_stop_response(Vec::new());
@@ -1135,6 +1144,23 @@ mod tests {
     /// rejections assert the profile citation, the bound-specific reason,
     /// and — for the secret canary — that the sensitive body never crosses
     /// into the diagnostic.
+    ///
+    /// Case 977/14 holds by construction here: every rejection below is
+    /// produced by the pure `decode_bounded_request` stage (`&str` in,
+    /// `Result` out), which takes no handler, gateway, port, or runner
+    /// handle, so a rejected record cannot have dispatched before the
+    /// `Err` is observed. Startup failures stay on the separate
+    /// `emit_error` + process-exit path and never enter this pipeline.
+    // WORK_UNIT_CASE: 977/2
+    // WORK_UNIT_CASE: 977/4
+    // WORK_UNIT_CASE: 977/5
+    // WORK_UNIT_CASE: 977/9
+    // WORK_UNIT_CASE: 977/12
+    // WORK_UNIT_CASE: 977/13
+    // WORK_UNIT_CASE: 977/14
+    // WORK_UNIT_CASE: 977/15
+    // WORK_UNIT_CASE: 977/18
+    // WORK_UNIT_CASE: 977/19
     #[test]
     fn bounded_decoder_fixture_covers_accept_skip_and_reject() {
         let fixture: Value =

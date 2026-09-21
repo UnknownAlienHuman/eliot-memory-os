@@ -630,7 +630,7 @@ pub(crate) fn check_request_envelope(
                 reason: "object keys must be strings",
             });
         }
-        let (key, _, after_key) = parse_key(bytes, key_pos)?;
+        let (key, _, after_key) = parse_key(bytes, key_pos, profile.max_json_string_bytes)?;
         if keys.contains(&key) {
             return Err(DecodeReject::DuplicateKey {
                 key: bound_control_name(&key),
@@ -650,11 +650,17 @@ pub(crate) fn check_request_envelope(
                     reason: "request operation must be a string",
                 });
             }
-            let (name, after) = decode_string(bytes, string_pos)?;
+            let (name, after) = decode_string(bytes, string_pos, profile.max_json_string_bytes)?;
             operation = Some(name);
             after
         } else {
-            skip_json_value(bytes, value_pos, 1, profile.max_nesting_depth)?
+            skip_json_value(
+                bytes,
+                value_pos,
+                1,
+                profile.max_nesting_depth,
+                profile.max_json_string_bytes,
+            )?
         };
         keys.push(key);
         next = skip_whitespace(bytes, next);
@@ -738,6 +744,7 @@ fn skip_json_value(
     pos: usize,
     depth: usize,
     max_depth: usize,
+    max_string_bytes: usize,
 ) -> Result<usize, DecodeReject> {
     if depth > max_depth {
         return Err(DecodeReject::DepthExceeded);
@@ -747,10 +754,10 @@ fn skip_json_value(
         reason: "record ends inside a value",
     })?;
     match byte {
-        b'{' => skip_object(input, pos, depth, max_depth),
-        b'[' => skip_array(input, pos, depth, max_depth),
+        b'{' => skip_object(input, pos, depth, max_depth, max_string_bytes),
+        b'[' => skip_array(input, pos, depth, max_depth, max_string_bytes),
         b'"' => {
-            let (_, next) = decode_string(input, pos)?;
+            let (_, next) = decode_string(input, pos, max_string_bytes)?;
             Ok(next)
         }
         b't' => parse_literal(input, pos, "true"),
@@ -768,6 +775,7 @@ fn skip_object(
     pos: usize,
     depth: usize,
     max_depth: usize,
+    max_string_bytes: usize,
 ) -> Result<usize, DecodeReject> {
     let mut pos = skip_whitespace(input, pos + 1);
     if input.get(pos) == Some(&b'}') {
@@ -780,14 +788,14 @@ fn skip_object(
                 reason: "object keys must be strings",
             });
         }
-        let (_, after_key) = decode_string(input, key_pos)?;
+        let (_, after_key) = decode_string(input, key_pos, max_string_bytes)?;
         let separator = skip_whitespace(input, after_key);
         if input.get(separator) != Some(&b':') {
             return Err(DecodeReject::Malformed {
                 reason: "object key is missing its separator",
             });
         }
-        pos = skip_json_value(input, separator + 1, depth + 1, max_depth)?;
+        pos = skip_json_value(input, separator + 1, depth + 1, max_depth, max_string_bytes)?;
         pos = skip_whitespace(input, pos);
         match input.get(pos) {
             Some(b',') => {
@@ -808,13 +816,14 @@ fn skip_array(
     pos: usize,
     depth: usize,
     max_depth: usize,
+    max_string_bytes: usize,
 ) -> Result<usize, DecodeReject> {
     let mut pos = skip_whitespace(input, pos + 1);
     if input.get(pos) == Some(&b']') {
         return Ok(pos + 1);
     }
     loop {
-        pos = skip_json_value(input, pos, depth + 1, max_depth)?;
+        pos = skip_json_value(input, pos, depth + 1, max_depth, max_string_bytes)?;
         pos = skip_whitespace(input, pos);
         match input.get(pos) {
             Some(b',') => {
@@ -880,7 +889,8 @@ impl BoundsScanner {
             b'{' => self.parse_object(input, pos),
             b'[' => self.parse_array(input, pos),
             b'"' => {
-                let (decoded_len, next) = parse_string_decoded_len(input, pos)?;
+                let (decoded_len, next) =
+                    parse_string_decoded_len(input, pos, self.profile.max_json_string_bytes)?;
                 self.check_string(decoded_len)?;
                 self.count_scalar()?;
                 Ok(next)
@@ -928,7 +938,8 @@ impl BoundsScanner {
                     reason: "object keys must be strings",
                 });
             }
-            let (key, decoded_len, next) = parse_key(input, key_pos)?;
+            let (key, decoded_len, next) =
+                parse_key(input, key_pos, self.profile.max_json_string_bytes)?;
             self.check_string(decoded_len)?;
             if !seen.insert(key.clone()) {
                 self.leave_container();
@@ -1046,21 +1057,39 @@ fn skip_whitespace(input: &[u8], mut pos: usize) -> usize {
 /// length, and the offset past its closing quote.
 ///
 /// Decoding compares fully decoded key strings, so escape-equivalent spellings
-/// such as `"op"` and `"\u006f\u0070"` conflict as duplicates.
-fn parse_key(input: &[u8], pos: usize) -> Result<(String, usize, usize), DecodeReject> {
-    let (decoded, next) = decode_string(input, pos)?;
+/// such as `"op"` and `"\u006f\u0070"` conflict as duplicates. The decoded
+/// bound is enforced incrementally inside [`decode_string`], so an overlong
+/// key fails before its full text is retained.
+fn parse_key(
+    input: &[u8],
+    pos: usize,
+    max_string_bytes: usize,
+) -> Result<(String, usize, usize), DecodeReject> {
+    let (decoded, next) = decode_string(input, pos, max_string_bytes)?;
     let len = decoded.len();
     Ok((decoded, len, next))
 }
 
 /// Parses one JSON string value, returning its decoded UTF-8 byte length and
 /// the offset past its closing quote.
-fn parse_string_decoded_len(input: &[u8], pos: usize) -> Result<(usize, usize), DecodeReject> {
-    let (decoded, next) = decode_string(input, pos)?;
+///
+/// The decoded bound is enforced incrementally inside [`decode_string`], so
+/// an overlong value fails before its full text is retained; the caller
+/// re-checks the returned length against its stage bound as defense in depth.
+fn parse_string_decoded_len(
+    input: &[u8],
+    pos: usize,
+    max_string_bytes: usize,
+) -> Result<(usize, usize), DecodeReject> {
+    let (decoded, next) = decode_string(input, pos, max_string_bytes)?;
     Ok((decoded.len(), next))
 }
 
-fn decode_string(input: &[u8], pos: usize) -> Result<(String, usize), DecodeReject> {
+fn decode_string(
+    input: &[u8],
+    pos: usize,
+    max_string_bytes: usize,
+) -> Result<(String, usize), DecodeReject> {
     if input.get(pos) != Some(&b'"') {
         return Err(DecodeReject::Malformed {
             reason: "string is not opened",
@@ -1074,6 +1103,9 @@ fn decode_string(input: &[u8], pos: usize) -> Result<(String, usize), DecodeReje
             b'\\' => {
                 let (ch, next) = decode_escape(input, pos)?;
                 out.push(ch);
+                if out.len() > max_string_bytes {
+                    return Err(DecodeReject::StringTooLong);
+                }
                 pos = next;
             }
             0x00..=0x1F => {
@@ -1096,6 +1128,9 @@ fn decode_string(input: &[u8], pos: usize) -> Result<(String, usize), DecodeReje
                     }
                 })?;
                 out.push_str(chunk);
+                if out.len() > max_string_bytes {
+                    return Err(DecodeReject::StringTooLong);
+                }
             }
         }
     }
@@ -1260,6 +1295,7 @@ mod tests {
         oversize_disposition: OversizeDisposition::DiscardThroughTerminator,
     };
 
+    // WORK_UNIT_CASE: 977/1
     #[test]
     fn profile_table_identity_is_stable() {
         assert_eq!(
@@ -1271,6 +1307,7 @@ mod tests {
         assert!(REQUEST_INPUT_LIMIT_TABLE.contains("request-input"));
     }
 
+    // WORK_UNIT_CASE: 977/10
     #[test]
     fn duplicate_and_escape_equivalent_keys_rejected() {
         assert!(matches!(
@@ -1284,6 +1321,8 @@ mod tests {
         assert!(prevalidate_record(r#"{"a":1,"b":2}"#, SMALL).is_ok());
     }
 
+    // WORK_UNIT_CASE: 977/11
+    // WORK_UNIT_CASE: 977/19
     #[test]
     fn independent_bounds_reject_without_large_allocation() {
         assert!(matches!(
@@ -1300,5 +1339,183 @@ mod tests {
         ));
         assert!(check_profile_id("stale-profile").is_err());
         assert!(check_profile_id(REQUEST_INPUT_PROFILE_ID).is_ok());
+    }
+
+    /// Returns a `BufRead` yielding at most `chunk` bytes per fill over `data`.
+    struct ChunkReader<'data> {
+        rest: &'data [u8],
+        chunk: usize,
+        scratch: Vec<u8>,
+    }
+
+    impl<'data> ChunkReader<'data> {
+        fn new(data: &'data [u8], chunk: usize) -> Self {
+            Self {
+                rest: data,
+                chunk: chunk.max(1),
+                scratch: Vec::new(),
+            }
+        }
+    }
+
+    impl std::io::Read for ChunkReader<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let take = out.len().min(self.chunk).min(self.rest.len());
+            out[..take].copy_from_slice(&self.rest[..take]);
+            self.rest = &self.rest[take..];
+            Ok(take)
+        }
+    }
+
+    impl std::io::BufRead for ChunkReader<'_> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.scratch.clear();
+            let take = self.rest.len().min(self.chunk);
+            self.scratch.extend_from_slice(&self.rest[..take]);
+            Ok(&self.scratch)
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.rest = &self.rest[amount.min(self.rest.len())..];
+            self.scratch.drain(..amount.min(self.scratch.len()));
+        }
+    }
+
+    // WORK_UNIT_CASE: 977/3
+    // WORK_UNIT_CASE: 977/7
+    #[test]
+    fn chunked_crlf_blank_and_eof_final_records_frame_exactly() {
+        // CRLF split across 5-byte fills must frame identically to an
+        // unsplit terminator: the carriage return is transport framing, not
+        // record content.
+        let mut split = ChunkReader::new(b"{\"a\":1}\r\n{\"b\":2}", 5);
+        assert!(matches!(
+            read_bounded_record(&mut split, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"a\":1}"
+        ));
+        // The final record at EOF without a newline is returned when in
+        // bound; no byte is lost and none is invented.
+        assert!(matches!(
+            read_bounded_record(&mut split, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"b\":2}"
+        ));
+        assert!(matches!(
+            read_bounded_record(&mut split, SMALL),
+            Ok(ReadOutcome::Eof)
+        ));
+
+        // A bare blank line yields an empty record the dispatch loop skips;
+        // it consumes no request budget and resets nothing.
+        let mut blank = ChunkReader::new(b"\n", 5);
+        assert!(matches!(
+            read_bounded_record(&mut blank, SMALL),
+            Ok(ReadOutcome::Record(record)) if record.is_empty()
+        ));
+
+        // A CRLF-only line likewise yields an empty record: both terminator
+        // bytes stay excluded from the ceiling.
+        let mut crlf_blank = ChunkReader::new(b"\r\n", 1);
+        assert!(matches!(
+            read_bounded_record(&mut crlf_blank, SMALL),
+            Ok(ReadOutcome::Record(record)) if record.is_empty()
+        ));
+    }
+
+    // WORK_UNIT_CASE: 977/5
+    #[test]
+    fn exact_record_limit_accepts_and_one_over_rejects_at_acquisition() {
+        // A schema-shaped record of exactly `max_record_bytes` (padded with
+        // JSON whitespace, which the pre-scan skips) is accepted at both the
+        // acquisition and the decode-pre-scan stages without allocating a
+        // huge input: the SMALL profile keeps the proof small.
+        let body = "{\"a\":1,\"b\":2}";
+        let padding = SMALL.max_record_bytes - body.len();
+        let exact = format!("{body}{}", " ".repeat(padding));
+        assert_eq!(exact.len(), SMALL.max_record_bytes);
+        let exact_framed = format!("{exact}\n");
+        let mut reader = std::io::BufReader::new(exact_framed.as_bytes());
+        assert!(matches!(
+            read_bounded_record(&mut reader, SMALL),
+            Ok(ReadOutcome::Record(record)) if record.len() == SMALL.max_record_bytes
+        ));
+        assert!(prevalidate_record(&exact, SMALL).is_ok());
+
+        // One byte over the ceiling is rejected during acquisition, before
+        // any String/Value/tree exists, and the pre-scan reports the encoded
+        // bound for direct callers.
+        let over = format!("{exact} ");
+        assert_eq!(over.len(), SMALL.max_record_bytes + 1);
+        let over_framed = format!("{over}\n");
+        let mut reader = std::io::BufReader::new(over_framed.as_bytes());
+        assert!(matches!(
+            read_bounded_record(&mut reader, SMALL),
+            Ok(ReadOutcome::Oversize { .. })
+        ));
+        assert!(matches!(
+            prevalidate_record(&over, SMALL),
+            Err(DecodeReject::OversizeRecord)
+        ));
+    }
+
+    // WORK_UNIT_CASE: 977/6
+    // WORK_UNIT_CASE: 977/16
+    #[test]
+    fn unterminated_stream_is_bounded_and_unrecoverable() {
+        // An endless newline-free stream cannot make acquisition allocate or
+        // drain indefinitely: discard stops at the resynchronization bound
+        // and reports the missing terminator so the caller breaks
+        // fail-closed instead of reading a salvaged suffix.
+        let endless = std::io::repeat(b'a');
+        let mut reader = std::io::BufReader::with_capacity(64, endless);
+        assert!(matches!(
+            read_bounded_record(&mut reader, SMALL),
+            Ok(ReadOutcome::Oversize {
+                discarded_bytes,
+                found_terminator: false,
+            }) if discarded_bytes == SMALL.max_oversize_discard_bytes
+        ));
+    }
+
+    // WORK_UNIT_CASE: 977/8
+    #[test]
+    fn oversize_suffix_never_becomes_the_next_request() {
+        // An overlong record resynchronizes through its terminator within
+        // the discard bound; the following valid record still frames
+        // exactly, proving the overlong bytes were neither truncated into a
+        // request nor parsed by suffix.
+        let mut input = vec![b'a'; SMALL.max_record_bytes + 44];
+        input.push(b'\n');
+        input.extend_from_slice(b"{\"ok\":true}\n");
+        let mut reader = ChunkReader::new(&input, 64);
+        assert!(matches!(
+            read_bounded_record(&mut reader, SMALL),
+            Ok(ReadOutcome::Oversize {
+                found_terminator: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            read_bounded_record(&mut reader, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"ok\":true}"
+        ));
+    }
+
+    // WORK_UNIT_CASE: 977/19
+    #[test]
+    fn escape_expanded_strings_hit_the_decoded_bound_before_retention() {
+        // Forty `\u0041` escapes decode to 40 bytes but encode 240: the
+        // decoded bound (32 under SMALL) must fire during the scan, not
+        // after the full text is retained, and the outcome is identical to
+        // the plain-spelling rejection.
+        let escaped = format!("\"{}\"", "\\u0041".repeat(40));
+        assert!(matches!(
+            prevalidate_record(&escaped, SMALL),
+            Err(DecodeReject::StringTooLong)
+        ));
+        let plain = format!("\"{}\"", "A".repeat(40));
+        assert!(matches!(
+            prevalidate_record(&plain, SMALL),
+            Err(DecodeReject::StringTooLong)
+        ));
     }
 }
