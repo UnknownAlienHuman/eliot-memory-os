@@ -2680,6 +2680,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-sim-core"
+version = "0.1.0"
+
+[[package]]
 name = "eliot-skill"
 version = "0.1.0"
 dependencies = [

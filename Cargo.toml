@@ -4,6 +4,7 @@ members = [
   "bins/eliot-wasm-host",
   "crates/eliot-app",
   "crates/eliot-engine",
+  "crates/eliot-sim-core",
   "crates/eliot-store",
   "crates/eliot-types",
   "crates/eliot-windows-ipc",

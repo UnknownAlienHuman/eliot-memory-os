@@ -64,10 +64,11 @@ responsibility = "Instrument execution, Code Cortex/Code Graph, build-test graph
 route_topic = "instrument verifier code graph code intelligence impact test selection diagnostics"
 path_globs = [
   "crates/instrument/**",
+  "crates/eliot-sim-core/**",
   "crates/bridges/**",
   "bins/eliot-testd/**",
 ]
-documentation_handles = ["I10.8.17", "I18.18"]
+documentation_handles = ["I10.8.17", "I18.18", "I18.41"]
 
 [[block]]
 id = "smart-memory-context"
