@@ -775,11 +775,16 @@ pub struct McpCore;
 
 impl McpCore {
     /// Returns a non-binding initialize projection.
+    ///
+    /// The advertised tool count is derived from the single versioned semantic
+    /// owner (one registered profile per method identity and version), never
+    /// from a name list: a method without a profile is absent from the
+    /// advertised surface, so the count follows the owner.
     #[must_use]
-    pub const fn initialize(request: InitializeRequest) -> InitializeResponse {
+    pub fn initialize(request: InitializeRequest) -> InitializeResponse {
         InitializeResponse {
             protocol_version: request.protocol_version,
-            canonical_tool_count: crate::CANONICAL_TOOL_NAMES.len(),
+            canonical_tool_count: canonical_tool_count(),
             structured_response_limit_bytes: HARD_STRUCTURED_RESPONSE_BYTES,
             application_binding_created: false,
         }
@@ -1101,6 +1106,7 @@ fn validate_application_request(request: &ApplicationRequest) -> Result<(), Brid
         ));
     }
     request.tool.validate().map_err(contract_violation)?;
+    validate_tool_semantic_owner(&request.tool)?;
     if let ToolRequest::Finish(draft) = &request.tool {
         let metadata_task = request.identity.request.metadata.task_id.as_ref();
         if !matches!(metadata_task, Some(value) if value.as_str() == draft.task_id.as_str()) {
@@ -1126,6 +1132,32 @@ fn contract_violation(value: ContractViolation) -> BridgeError {
     match value {
         ContractViolation::InvalidField { field, reason } => BridgeError::invalid(field, reason),
     }
+}
+
+/// Number of methods owned by the single versioned semantic registry.
+///
+/// Fails closed to zero when the canonical owner cannot be built (unreachable
+/// for the literal canonical data; any build failure is a code defect, and a
+/// defect must never advertise tools).
+fn canonical_tool_count() -> usize {
+    crate::canonical_known_tools().map_or(0, |tools| tools.len())
+}
+
+/// Resolves the single versioned semantic owner for the requested tool on the
+/// normal admission path (I7.24).
+///
+/// Every admitted request joins its method identity and version to exactly one
+/// registered [`crate::ToolSemanticProfile`] before any port call; a method
+/// with no owner fails closed here. Routing behavior is read from the profile
+/// by downstream consumers, never inferred from the tool name.
+fn validate_tool_semantic_owner(tool: &ToolRequest) -> Result<(), BridgeError> {
+    crate::validate_tool_request_owner(tool).map_err(|error| {
+        BridgeError::invalid(
+            "tool.name",
+            format!("no registered semantic owner: {error}"),
+        )
+    })?;
+    Ok(())
 }
 
 fn validate_active_session_binding(
