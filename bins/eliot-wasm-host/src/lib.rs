@@ -37,8 +37,8 @@ pub use contour::{
     AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, Contour, ContourGateError,
     FS_CAPABILITY, GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY,
     PINNED_WASMTIME_VERSION, PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET,
-    STANDARD_GUEST_TARGET, admit_generation, admit_prototype, authorize_host_call,
-    check_activation_imports,
+    STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
+    authorize_host_call, check_activation_imports, check_admitted_request,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
@@ -132,23 +132,22 @@ impl WasmHostRunner {
 
     /// Executes one request under a bound contour admission.
     ///
-    /// This host serves only the WASM component contour: an admission for
-    /// any other contour is refused with
-    /// [`ContourGateError::ContourNotServedHere`] before touching A-12, so
-    /// native-process work can never execute on the WASM host by mistake.
-    /// An admitted WASM generation delegates to the injected A-12 surface
-    /// verbatim and returns exactly its verdict — this method adds routing,
-    /// never semantics.
+    /// The host gate matches the caller request against the bound admission
+    /// — contour, component identity, and input envelope — before touching
+    /// A-12, so work admitted for another component, another contour, or a
+    /// larger input envelope can never reach Wasmtime here. Artifact and
+    /// interface digests were byte-verified at admission and are enforced
+    /// again at invoke by the engine and Governor coherence; fence/epoch
+    /// freshness stays with Governor/Kernel authority inside the execution
+    /// path. An admitted WASM generation delegates to the injected A-12
+    /// surface verbatim and returns exactly its verdict — this method adds
+    /// routing, never semantics.
     pub fn execute_admitted(
         &mut self,
         admitted: &AdmittedGeneration,
         request: InvocationRequest,
     ) -> Result<InvocationResult, ContourGateError> {
-        if *admitted.contour() != Contour::WasmComponent {
-            return Err(ContourGateError::ContourNotServedHere(
-                admitted.contour().to_string(),
-            ));
-        }
+        check_admitted_request(admitted, &request)?;
         Ok(self.wasm_runtime.execute(request))
     }
 
@@ -367,6 +366,7 @@ mod tests {
         use std::collections::BTreeSet;
 
         GenerationManifest {
+            component_id: "fixture-component".to_owned(),
             target: STANDARD_GUEST_TARGET.to_owned(),
             artifact_digest: eliot_wasm_runtime::Sha256Digest::of_bytes(b"caller-fixture"),
             wit_digest: eliot_wasm_runtime::Sha256Digest::of_bytes(b"caller-wit"),
@@ -457,6 +457,53 @@ mod tests {
             ContourGateError::ContourNotServedHere("ISOLATED_NATIVE_PROCESS".to_owned())
                 .to_string(),
             "CONTOUR_NOT_SERVED_HERE:ISOLATED_NATIVE_PROCESS"
+        );
+    }
+
+    #[test]
+    fn foreign_component_is_denied_without_touching_a12() {
+        // No ports are bound (`WasmRuntime::new(None)`): denial must come
+        // from the host gate alone, before any A-12 contact is possible.
+        let decision = PrototypeContourDecision::default();
+        let mut foreign_manifest = admitted_manifest();
+        foreign_manifest.component_id = "other-component".to_owned();
+        let admitted =
+            admit_generation(Some(&decision), &foreign_manifest, &[]).expect("foreign admission");
+        let mut runner = test_runner();
+        assert_eq!(
+            runner.execute_admitted(&admitted, request(false)),
+            Err(ContourGateError::ComponentNotAdmitted(
+                "fixture-component".to_owned()
+            ))
+        );
+        assert_eq!(
+            ContourGateError::ComponentNotAdmitted("fixture-component".to_owned()).to_string(),
+            "COMPONENT_NOT_ADMITTED:fixture-component"
+        );
+    }
+
+    #[test]
+    fn oversized_input_is_denied_without_touching_a12() {
+        let decision = PrototypeContourDecision::default();
+        let admitted =
+            admit_generation(Some(&decision), &admitted_manifest(), &[]).expect("admission");
+        let mut runner = test_runner();
+        let oversized = InvocationRequest::new(
+            InvocationId::new("fixture-oversized").expect("invocation"),
+            eliot_wasm_runtime::CapabilityId::new("fixture-component").expect("component"),
+            WorkUnitId::new("fixture-work-unit").expect("work unit"),
+            WorkScopeRef::new("fixture-scope").expect("scope"),
+            ExecutionContour::Shadow,
+            vec![0u8; 65],
+            7,
+            false,
+        )
+        .expect("request");
+        assert_eq!(
+            runner.execute_admitted(&admitted, oversized),
+            Err(ContourGateError::InputLimitExceeded(
+                "input-bytes".to_owned()
+            ))
         );
     }
 }

@@ -92,7 +92,7 @@ use eliot_security_contracts::{
     InstructionTaint, IntegrityStatus, PrivacyClass, QuarantineState, SourceAssurance,
 };
 use eliot_wasm_host::{
-    AdmittedGeneration, GenerationManifest, Profile, PrototypeContourDecision,
+    AdmittedGeneration, ContourGateError, GenerationManifest, Profile, PrototypeContourDecision,
     STANDARD_GUEST_TARGET, WasmHostRunner, WasmtimeComponentEngine, admit_generation,
     provider_configuration_digest,
 };
@@ -401,14 +401,16 @@ fn assurance_fixture(fence: &eliot_contracts::StateFence) -> SourceAssurance {
 }
 
 /// Host contour admission over the real fixture: default WASM decision,
-/// closed manifest, no actual imports.
+/// closed manifest, no actual imports. Digests are recomputed from the
+/// supplied bytes — the admission never trusts a pasted claim.
 fn host_admission(
-    component_digest: &Sha256Digest,
+    component: &[u8],
     limits: &InvocationLimits,
 ) -> eliot_wasm_host::AdmittedGeneration {
     let manifest = GenerationManifest {
+        component_id: COMPONENT.to_owned(),
         target: STANDARD_GUEST_TARGET.to_owned(),
-        artifact_digest: component_digest.clone(),
+        artifact_digest: Sha256Digest::of_bytes(component),
         wit_digest: Sha256Digest::of_bytes(GUEST_WIT),
         world: "eliot:wasm/guest".to_owned(),
         allowed_imports: Vec::new(),
@@ -422,7 +424,16 @@ fn host_admission(
         rollback_generation: None,
     };
     let decision = PrototypeContourDecision::default();
-    must(admit_generation(Some(&decision), &manifest, &[]))
+    must(
+        eliot_wasm_host::admit_generation_with_bytes(
+            Some(&decision),
+            &manifest,
+            &[],
+            component,
+            GUEST_WIT,
+        )
+        .map_err(|error| format!("byte-verified admission failed: {error}")),
+    )
 }
 
 /// Kernel-admitted P03 request mirroring the runtime-derived envelope field
@@ -516,7 +527,7 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
 
     let snapshot = snapshot_fixture();
     let fence = snapshot.state_fence();
-    let admitted_gen = host_admission(&component_digest, &limits);
+    let admitted_gen = host_admission(&component, &limits);
     let contour = ContourAdmission {
         artifact_bytes: component.clone(),
         wit_bytes: GUEST_WIT.to_vec(),
@@ -799,11 +810,10 @@ fn compose_negative(
     (runner, admitted)
 }
 
-/// Host admission binding exactly the given artifact digest (no hashing
-/// here — the Governor factory re-hashes the bytes itself).
+/// Host admission binding exactly the given artifact bytes (re-hashed at
+/// admission — the Governor factory re-hashes the bytes itself too).
 fn host_admission_for(artifact: &[u8], limits: &InvocationLimits) -> AdmittedGeneration {
-    let digest = Sha256Digest::of_bytes(artifact);
-    host_admission(&digest, limits)
+    host_admission(artifact, limits)
 }
 
 /// Standard joined admission parts: snapshot fence shared by generation,
@@ -994,6 +1004,7 @@ fn non_wasm_admission_is_refused_before_a12() {
         "needs raw USB scan",
     ));
     let manifest = GenerationManifest {
+        component_id: COMPONENT.to_owned(),
         target: STANDARD_GUEST_TARGET.to_owned(),
         artifact_digest: Sha256Digest::of_bytes(&component_bytes()),
         wit_digest: Sha256Digest::of_bytes(GUEST_WIT),
@@ -1205,5 +1216,101 @@ fn bare_corpus_against_framed_execution_is_rejected() {
     assert_eq!(
         result.receipt.error,
         Some(RuntimeError::DifferentialMismatch)
+    );
+}
+
+#[test]
+fn foreign_component_admission_denies_before_a12() {
+    // Host admission bound to another component, ports resolving the
+    // genuine one: the host gate must deny before A-12 is contacted. The
+    // positive proof (same ports/request shape, matched component)
+    // establishes A-12 would otherwise proceed — so this denial is the
+    // host boundary's own work. No P03 staging: reaching `prepare` would
+    // surface `Unavailable`, not the component denial.
+    let component = component_bytes();
+    let parts = negative_parts(&component);
+    let admission = admit_negative(&parts);
+    let foreign_manifest = GenerationManifest {
+        component_id: "other-component".to_owned(),
+        target: STANDARD_GUEST_TARGET.to_owned(),
+        artifact_digest: Sha256Digest::of_bytes(&component),
+        wit_digest: Sha256Digest::of_bytes(GUEST_WIT),
+        world: "eliot:wasm/guest".to_owned(),
+        allowed_imports: Vec::new(),
+        allowed_exports: vec!["run".to_owned()],
+        capability_grants: Vec::new(),
+        limits: parts.limits.clone(),
+        state_class: "stateless".to_owned(),
+        migration_contract: "none".to_owned(),
+        privacy_policy: "project_code".to_owned(),
+        comparator: "shadow-exact".to_owned(),
+        rollback_generation: None,
+    };
+    let decision = PrototypeContourDecision::default();
+    let foreign_admitted = must(
+        eliot_wasm_host::admit_generation_with_bytes(
+            Some(&decision),
+            &foreign_manifest,
+            &[],
+            &component,
+            GUEST_WIT,
+        )
+        .map_err(|error| format!("foreign admission failed: {error}")),
+    );
+    let (mut runner, _) = compose_negative(
+        admission,
+        None,
+        None,
+        component.as_slice(),
+        component.as_slice(),
+        &parts.limits,
+        &parts.engine_binding,
+    );
+    let request = attempt_request(
+        "join-1956-foreign-component",
+        ExecutionContour::Conformance,
+        framed_input(),
+    );
+    let Err(error) = runner.execute_admitted(&foreign_admitted, request) else {
+        panic!("foreign-component admission executed")
+    };
+    assert_eq!(
+        error,
+        ContourGateError::ComponentNotAdmitted(COMPONENT.to_owned())
+    );
+    assert_eq!(error.to_string(), "COMPONENT_NOT_ADMITTED:component-1956");
+}
+
+#[test]
+fn oversized_input_denies_before_a12() {
+    // Admitted input envelope (8 bytes) below the request input (20
+    // framed bytes): the host gate denies before A-12 contact. Empty P03
+    // slot again proves `prepare` is never reached.
+    let component = component_bytes();
+    let parts = negative_parts(&component);
+    let admission = admit_negative(&parts);
+    let mut tight_limits = parts.limits.clone();
+    tight_limits.max_input_bytes = 8;
+    let tight_admitted = host_admission(&component, &tight_limits);
+    let (mut runner, _) = compose_negative(
+        admission,
+        None,
+        None,
+        component.as_slice(),
+        component.as_slice(),
+        &parts.limits,
+        &parts.engine_binding,
+    );
+    let request = attempt_request(
+        "join-1956-oversized-input",
+        ExecutionContour::Conformance,
+        framed_input(),
+    );
+    let Err(error) = runner.execute_admitted(&tight_admitted, request) else {
+        panic!("oversized input executed")
+    };
+    assert_eq!(
+        error,
+        ContourGateError::InputLimitExceeded("input-bytes".to_owned())
     );
 }

@@ -35,7 +35,7 @@
 
 use std::fmt;
 
-use eliot_wasm_runtime::{InvocationLimits, Sha256Digest};
+use eliot_wasm_runtime::{InvocationLimits, InvocationRequest, Sha256Digest};
 
 /// Pinned Wasmtime generation behind `eliot-wasm-host` (I14.19 baseline).
 /// Must match the exact workspace pin; the linked engine identity is asserted
@@ -133,11 +133,16 @@ impl Default for PrototypeContourDecision {
 /// Immutable generation record for one component generation (I14.19 manifest).
 ///
 /// A component is immutable after publication; the manifest binds the exact
-/// target, digests, declared imports/exports, capability grants, limits
-/// (including fuel policy and cancellation), and the rollback generation used
-/// for forward route-switch rollback.
+/// component identity, target, digests, declared imports/exports, capability
+/// grants, limits (including fuel policy and cancellation), and the rollback
+/// generation used for forward route-switch rollback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationManifest {
+    /// Admitted component identity, bound into [`AdmittedGeneration`] and
+    /// matched against the caller request at dispatch: a request naming any
+    /// other component is a confused-deputy attempt and fails closed before
+    /// any Wasmtime invoke.
+    pub component_id: String,
     /// Guest compile target, e.g. `wasm32-wasip2`.
     pub target: String,
     /// Digest of the exact immutable component artifact bytes.
@@ -177,6 +182,11 @@ impl GenerationManifest {
     /// target or an incomplete manifest; limit-envelope semantics remain owned
     /// by the Governor-resolved [`InvocationLimits`] contract.
     pub fn validate(&self) -> Result<(), ContourGateError> {
+        if self.component_id.trim().is_empty() {
+            return Err(ContourGateError::IncompleteManifest(
+                "component-id".to_owned(),
+            ));
+        }
         if self.target != STANDARD_GUEST_TARGET && self.target != SELF_CONTAINED_GUEST_TARGET {
             return Err(ContourGateError::UnsupportedTarget(bounded(&self.target)));
         }
@@ -304,6 +314,16 @@ pub enum ContourGateError {
     /// serves only the WASM component contour; any other admitted contour
     /// must be refused at dispatch, never executed here.
     ContourNotServedHere(String),
+    /// Admitted digest does not match the recomputed digest of the supplied
+    /// bytes (names `artifact` or `interface`). Manifest digest claims are
+    /// never trusted without the bytes.
+    AdmittedDigestMismatch(String),
+    /// Caller request names a component the admission was not bound to.
+    /// Confused-deputy attempts fail closed before any Wasmtime invoke.
+    ComponentNotAdmitted(String),
+    /// Caller input exceeds the admitted per-invocation input envelope.
+    /// Denied before any Wasmtime invoke.
+    InputLimitExceeded(String),
 }
 
 impl fmt::Display for ContourGateError {
@@ -330,6 +350,15 @@ impl fmt::Display for ContourGateError {
             }
             Self::ContourNotServedHere(contour) => {
                 write!(formatter, "CONTOUR_NOT_SERVED_HERE:{contour}")
+            }
+            Self::AdmittedDigestMismatch(which) => {
+                write!(formatter, "ADMITTED_DIGEST_MISMATCH:{which}")
+            }
+            Self::ComponentNotAdmitted(component) => {
+                write!(formatter, "COMPONENT_NOT_ADMITTED:{component}")
+            }
+            Self::InputLimitExceeded(detail) => {
+                write!(formatter, "INPUT_LIMIT_EXCEEDED:{detail}")
             }
         }
     }
@@ -426,12 +455,16 @@ pub fn check_activation_imports(
 
 /// Bound admission evidence for one prototype generation.
 ///
-/// Constructible only through [`admit_generation`], which runs the full
-/// pre-activation sequence (decision presence, contour rationale and
-/// first-contour rule, manifest baseline validation, actual-import
-/// declaration and grant checks) before binding. Field privacy means a
-/// value of this type proves the sequence ran; callers read the bound
-/// identities through the accessors below.
+/// Constructible only through [`admit_generation`] (or
+/// [`admit_generation_with_bytes`]), which runs the full pre-activation
+/// sequence (decision presence, contour rationale and first-contour rule,
+/// manifest baseline validation, actual-import declaration and grant checks,
+/// and — in the bytes entry — digest recomputation from real bytes) before
+/// binding. Field privacy means a value of this type proves the sequence
+/// ran; callers read the bound identities through the accessors below.
+/// Dispatch sites additionally match the caller request against the bound
+/// component and input envelope via [`check_admitted_request`] before any
+/// Wasmtime invoke.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmittedGeneration {
     contour: Contour,
@@ -439,6 +472,8 @@ pub struct AdmittedGeneration {
     target: String,
     artifact_digest: Sha256Digest,
     wit_digest: Sha256Digest,
+    component_id: String,
+    limits: InvocationLimits,
 }
 
 impl AdmittedGeneration {
@@ -472,6 +507,21 @@ impl AdmittedGeneration {
     pub const fn wit_digest(&self) -> &Sha256Digest {
         &self.wit_digest
     }
+
+    /// Admitted component identity bound from the validated manifest.
+    /// Dispatch matches the caller request component against exactly this.
+    #[must_use]
+    pub fn component_id(&self) -> &str {
+        &self.component_id
+    }
+
+    /// Admitted per-invocation limit envelope bound from the validated
+    /// manifest. Dispatch matches the caller input envelope against exactly
+    /// this before any Wasmtime invoke.
+    #[must_use]
+    pub const fn limits(&self) -> &InvocationLimits {
+        &self.limits
+    }
 }
 
 /// Actual contour admission: the full pre-activation sequence in one entry
@@ -494,7 +544,69 @@ pub fn admit_generation(
         target: admitted.target,
         artifact_digest: manifest.artifact_digest.clone(),
         wit_digest: manifest.wit_digest.clone(),
+        component_id: manifest.component_id.clone(),
+        limits: manifest.limits.clone(),
     })
+}
+
+/// Byte-verified contour admission: `admit_generation` plus recomputation
+/// of the manifest's artifact/interface digests from the supplied real
+/// bytes. A manifest claim that does not match its bytes fails closed
+/// here — digest claims are never trusted without the bytes they name.
+/// Fence/epoch freshness is NOT minted here: it stays with Governor/Kernel
+/// authority and is enforced pre-invoke inside the A-12 execution path
+/// (`StaleFence` and coherence gates), which this host never duplicates.
+pub fn admit_generation_with_bytes(
+    decision: Option<&PrototypeContourDecision>,
+    manifest: &GenerationManifest,
+    actual_imports: &[String],
+    artifact_bytes: &[u8],
+    wit_bytes: &[u8],
+) -> Result<AdmittedGeneration, ContourGateError> {
+    if artifact_bytes.is_empty() || wit_bytes.is_empty() {
+        return Err(ContourGateError::AdmittedDigestMismatch(
+            "empty-bytes".to_owned(),
+        ));
+    }
+    if Sha256Digest::of_bytes(artifact_bytes) != manifest.artifact_digest {
+        return Err(ContourGateError::AdmittedDigestMismatch(
+            "artifact".to_owned(),
+        ));
+    }
+    if Sha256Digest::of_bytes(wit_bytes) != manifest.wit_digest {
+        return Err(ContourGateError::AdmittedDigestMismatch(
+            "interface".to_owned(),
+        ));
+    }
+    admit_generation(decision, manifest, actual_imports)
+}
+
+/// Dispatch gate: matches one caller request against the bound admission
+/// before any Wasmtime invoke. Contour, component, and input envelope are
+/// all caller-observable here; artifact/interface/world/target digests were
+/// byte-verified at admission and are enforced at invoke by the engine and
+/// Governor coherence inside the execution path. Any mismatch fails closed
+/// with a host-taxonomy error — no A-12 port is contacted on denial.
+pub fn check_admitted_request(
+    admitted: &AdmittedGeneration,
+    request: &InvocationRequest,
+) -> Result<(), ContourGateError> {
+    if *admitted.contour() != Contour::WasmComponent {
+        return Err(ContourGateError::ContourNotServedHere(
+            admitted.contour().to_string(),
+        ));
+    }
+    if request.component_id.as_str() != admitted.component_id() {
+        return Err(ContourGateError::ComponentNotAdmitted(bounded(
+            request.component_id.as_str(),
+        )));
+    }
+    if request.input.len() as u64 > admitted.limits().max_input_bytes {
+        return Err(ContourGateError::InputLimitExceeded(
+            "input-bytes".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Authorizes one host-call proposal under the manifest grant and Governor
@@ -561,6 +673,7 @@ mod tests {
 
     fn closed_manifest() -> GenerationManifest {
         GenerationManifest {
+            component_id: "context-admission-component".to_owned(),
             target: STANDARD_GUEST_TARGET.to_owned(),
             artifact_digest: Sha256Digest::of_bytes(b"fixture-component"),
             wit_digest: typed_wit_digest(),
@@ -866,5 +979,64 @@ mod tests {
         };
         assert_eq!(admitted.contour(), &Contour::IsolatedNativeProcess);
         assert_eq!(admitted.world(), "context-admission");
+    }
+
+    fn bytes_manifest() -> (GenerationManifest, Vec<u8>, Vec<u8>) {
+        let artifact = b"unit-artifact-bytes".to_vec();
+        let wit = b"unit-wit-bytes".to_vec();
+        let mut manifest = closed_manifest();
+        manifest.artifact_digest = Sha256Digest::of_bytes(&artifact);
+        manifest.wit_digest = Sha256Digest::of_bytes(&wit);
+        (manifest, artifact, wit)
+    }
+
+    #[test]
+    fn admission_verifies_digests_from_real_bytes() {
+        let (manifest, artifact, wit) = bytes_manifest();
+        let decision = PrototypeContourDecision::default();
+        let admitted =
+            match admit_generation_with_bytes(Some(&decision), &manifest, &[], &artifact, &wit) {
+                Ok(admitted) => admitted,
+                Err(error) => panic!("byte-verified admission failed: {error:?}"),
+            };
+        assert_eq!(admitted.artifact_digest(), &manifest.artifact_digest);
+        assert_eq!(admitted.wit_digest(), &manifest.wit_digest);
+        assert_eq!(admitted.component_id(), manifest.component_id.as_str());
+        assert_eq!(
+            admitted.limits().max_input_bytes,
+            manifest.limits.max_input_bytes
+        );
+    }
+
+    #[test]
+    fn admission_rejects_digest_mismatch_and_empty_bytes() {
+        let (manifest, artifact, wit) = bytes_manifest();
+        let decision = PrototypeContourDecision::default();
+        let mut tampered = artifact.clone();
+        tampered[0] ^= 0xFF;
+        assert_eq!(
+            admit_generation_with_bytes(Some(&decision), &manifest, &[], &tampered, &wit),
+            Err(ContourGateError::AdmittedDigestMismatch(
+                "artifact".to_owned()
+            ))
+        );
+        let mut tampered_wit = wit.clone();
+        tampered_wit[0] ^= 0xFF;
+        assert_eq!(
+            admit_generation_with_bytes(Some(&decision), &manifest, &[], &artifact, &tampered_wit),
+            Err(ContourGateError::AdmittedDigestMismatch(
+                "interface".to_owned()
+            ))
+        );
+        assert_eq!(
+            admit_generation_with_bytes(Some(&decision), &manifest, &[], &[], &wit),
+            Err(ContourGateError::AdmittedDigestMismatch(
+                "empty-bytes".to_owned()
+            ))
+        );
+        assert_eq!(
+            ContourGateError::AdmittedDigestMismatch("artifact".to_owned()).to_string(),
+            "ADMITTED_DIGEST_MISMATCH:artifact"
+        );
     }
 }
