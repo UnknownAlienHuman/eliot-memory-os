@@ -43,6 +43,12 @@ pub use eliot_blob_api::{
     BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage, BlobError,
     PublishState,
 };
+pub mod demand;
+pub use demand::{
+    ApprovedBlobView, BlobGenerationProbe, BlobProbeError, StoreBlobDemand,
+    classify_capture_payload, garbage_collection_demand, probe_blob_generation,
+    staged_recovery_demand,
+};
 use eliot_blob_api::{
     BlobCasCapability, BlobCasDurability, BlobCasFailure, BlobCasOutcome, BlobCasReceipt,
     BlobCasRequest, BlobCasState, BlobCasSuccessKind, BlobFuture, BlobGcReceipt, BlobGcRequest,
