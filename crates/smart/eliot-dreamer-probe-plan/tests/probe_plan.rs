@@ -284,6 +284,12 @@ fn rival_target(left: &str, right: &str) -> AffordanceTarget {
 }
 
 fn gap_target(id: &str) -> AffordanceTarget {
+    AffordanceTarget::Objective {
+        objective: objective(id),
+    }
+}
+
+fn evidence_gap_target(id: &str) -> AffordanceTarget {
     AffordanceTarget::EvidenceGap { claim: claim(id) }
 }
 
@@ -412,14 +418,14 @@ fn probe_names_its_discriminator_or_unknown_target() {
     let plan = plan_for(
         vec![
             descriptor("aff-rival", rival_target("pred-left", "pred-right")),
-            descriptor("aff-gap", gap_target("claim-7")),
+            descriptor("aff-gap", evidence_gap_target("claim-7")),
             descriptor("aff-assumption", assumption_target("assume-3")),
         ],
         Some(16),
     );
     must(plan.validate());
-    assert_eq!(plan.probes.len(), 3);
-    assert!(plan.omissions.is_empty());
+    assert_eq!(plan.probes.len(), 1);
+    assert_eq!(plan.omissions.len(), 2);
 
     let rival = plan
         .probes
@@ -437,30 +443,36 @@ fn probe_names_its_discriminator_or_unknown_target() {
     assert!(rival.expected_discrimination.contains("pred-right"));
 
     let gap = plan
-        .probes
+        .omissions
         .iter()
-        .find(|probe| probe.probe_id.as_str() == "aff-gap")
-        .unwrap_or_else(|| panic!("gap probe must be planned"));
+        .find(|omission| omission.affordance.affordance_id.as_str() == "aff-gap")
+        .unwrap_or_else(|| panic!("evidence gap must be retained as an omission"));
+    assert_eq!(gap.kind, OmissionKind::Unprobeable);
     match &gap.target {
         ProbeTarget::EvidenceUnknown { claim } => {
             assert_eq!(claim.claim_id.as_str(), "claim-7");
         }
-        other => panic!("gap probe must name an unknown, got {other:?}"),
+        other => panic!("gap omission must name an unknown, got {other:?}"),
     }
-    assert!(gap.expected_discrimination.contains("claim-7"));
+    assert!(gap.reason.contains("exact canonical objective linkage"));
 
     let assumption = plan
-        .probes
+        .omissions
         .iter()
-        .find(|probe| probe.probe_id.as_str() == "aff-assumption")
-        .unwrap_or_else(|| panic!("assumption probe must be planned"));
+        .find(|omission| omission.affordance.affordance_id.as_str() == "aff-assumption")
+        .unwrap_or_else(|| panic!("assumption must be retained as an omission"));
+    assert_eq!(assumption.kind, OmissionKind::Unprobeable);
     match &assumption.target {
         ProbeTarget::AssumptionUnknown { assumption, .. } => {
             assert_eq!(assumption.assumption_id.as_str(), "assume-3");
         }
-        other => panic!("assumption probe must name an unknown, got {other:?}"),
+        other => panic!("assumption omission must name an unknown, got {other:?}"),
     }
-    assert!(assumption.expected_discrimination.contains("assume-3"));
+    assert!(
+        assumption
+            .reason
+            .contains("exact canonical objective linkage")
+    );
 }
 
 // (b) Deterministic ordering with set-permutation stability.
@@ -539,7 +551,7 @@ fn distinct_semantic_variants_stay_separate() {
     assert!(
         plan.probes
             .iter()
-            .all(|probe| matches!(probe.target, ProbeTarget::EvidenceUnknown { .. }))
+            .all(|probe| matches!(probe.target, ProbeTarget::ObjectiveUnknown { .. }))
     );
 
     let same_id_a = descriptor("aff-same-id", gap_target("claim-a"));

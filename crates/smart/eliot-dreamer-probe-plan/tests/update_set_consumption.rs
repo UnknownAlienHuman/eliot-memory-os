@@ -23,14 +23,14 @@ use eliot_dreamer_contracts::{
     ConsentDimension, ContextDimension, CostDimension, DreamInputBundle, EffectDimension,
     FeasibilityDimension, GapUpdateMeaning, HumanAttentionDimension, InformationDimension,
     InquiryAffordanceDescriptor, InquiryAffordanceDescriptorParams, InquiryAffordanceSet,
-    InquiryAffordanceSetParams, LatencyDimension, MaterialClaimRef, PossibleResultSchema,
-    PossibleResultValue, PrivacyDimension, ProbeObjectiveRef, ProbeOwnerRef, ResourceDimension,
-    ResultBranch, ResultTarget, ResultUpdate, ResultUpdateDiscriminability, ReversibilityDimension,
+    InquiryAffordanceSetParams, LatencyDimension, PossibleResultSchema, PossibleResultValue,
+    PrivacyDimension, ProbeObjectiveRef, ProbeOwnerRef, ResourceDimension, ResultBranch,
+    ResultTarget, ResultUpdate, ResultUpdateDiscriminability, ReversibilityDimension,
     RivalCoverageStatus, RivalCoverageSummary, RivalDeclarationSetRef, RivalModelSet,
     RivalModelSetParams, ValidatedDreamDraft, ValidationReceipt,
     grounding::canonical::{
-        ArtifactId, EpochId, EpochLineageId, Precision, PropositionId, ResourceGeneration,
-        StateFence, TaskId, ValidityBounds, sha256_hex,
+        ArtifactId, EpochId, EpochLineageId, Precision, ResourceGeneration, StateFence, TaskId,
+        ValidityBounds, sha256_hex,
     },
 };
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams};
@@ -152,16 +152,10 @@ fn objective(id: &str) -> ProbeObjectiveRef {
     }
 }
 
-fn claim(id: &str) -> MaterialClaimRef {
-    MaterialClaimRef {
-        claim_id: id.to_owned(),
-        proposition: must(PropositionId::new("prop-1")),
-        claim_preimage_digest: digest(id),
-    }
-}
-
 fn gap_target(id: &str) -> AffordanceTarget {
-    AffordanceTarget::EvidenceGap { claim: claim(id) }
+    AffordanceTarget::Objective {
+        objective: objective(id),
+    }
 }
 
 /// A single-target Gap schema whose branches carry exactly `meanings` in
@@ -302,7 +296,7 @@ fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u6
 // SUPPORTING_CASE: 610/11 (identical-consumes-predeclared)
 #[test]
 fn identical_update_sets_consume_predeclared_equivalence() {
-    let target = gap_target("claim-equiv");
+    let target = gap_target("equiv-objective");
     // Exact semantic equivalents may carry different affordance identities and
     // still collapse while retaining both identities as lineage.
     let schema_a = gap_schema(
@@ -343,7 +337,7 @@ fn identical_update_sets_consume_predeclared_equivalence() {
 // SUPPORTING_CASE: 610/11 (split-stays-split)
 #[test]
 fn distinct_predeclared_classifications_stay_split() {
-    let target = gap_target("claim-split");
+    let target = gap_target("split-objective");
     let plain = gap_schema(
         "split-schema-plain",
         "split-objective",

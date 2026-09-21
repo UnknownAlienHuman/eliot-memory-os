@@ -532,6 +532,14 @@ fn result_matrix_block_reason(
     if schema.update_discriminability() != ResultUpdateDiscriminability::Discriminating {
         return Some("result matrix updates are identical for every outcome".to_owned());
     }
+    if matches!(
+        target,
+        ProbeTarget::EvidenceUnknown { .. } | ProbeTarget::AssumptionUnknown { .. }
+    ) {
+        return Some(
+            "evidence or assumption target has no exact canonical objective linkage".to_owned(),
+        );
+    }
 
     let relevant_targets = schema
         .targets
@@ -640,10 +648,6 @@ fn result_target_is_relevant(target: &ProbeTarget, result_target: &ResultTarget)
         ) => prediction
             .as_ref()
             .is_none_or(|prediction| prediction == left || prediction == right),
-        (
-            ProbeTarget::EvidenceUnknown { .. } | ProbeTarget::AssumptionUnknown { .. },
-            ResultTarget::Gap { .. },
-        ) => true,
         (ProbeTarget::ObjectiveUnknown { objective }, ResultTarget::Gap { objective: result }) => {
             objective == result
         }

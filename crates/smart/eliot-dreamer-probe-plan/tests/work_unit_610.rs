@@ -369,6 +369,12 @@ fn rival_target(left: &str, right: &str) -> AffordanceTarget {
 }
 
 fn gap_target(id: &str) -> AffordanceTarget {
+    AffordanceTarget::Objective {
+        objective: objective(id),
+    }
+}
+
+fn evidence_gap_target(id: &str) -> AffordanceTarget {
     AffordanceTarget::EvidenceGap { claim: claim(id) }
 }
 
@@ -543,7 +549,7 @@ fn objective_result_affordance_disposition_vocabulary() {
     for (index, kind) in kinds.into_iter().enumerate() {
         let target = match index {
             0 => rival_target("pred-v-left", "pred-v-right"),
-            1 => gap_target("claim-v"),
+            1 => evidence_gap_target("claim-v"),
             2 => assumption_target("assume-v"),
             _ => objective_target(&format!("objective-v-{index}")),
         };
@@ -553,18 +559,16 @@ fn objective_result_affordance_disposition_vocabulary() {
     }
     let plan = plan_for(descriptors, Some(16));
     must(plan.validate());
-    assert_eq!(plan.probes.len(), 5);
+    assert_eq!(plan.probes.len(), 3);
+    assert_eq!(plan.omissions.len(), 2);
 
     let mut seen_rival = false;
-    let mut seen_gap = false;
-    let mut seen_assumption = false;
     let mut seen_objective = false;
     for probe in &plan.probes {
         match &probe.target {
             ProbeTarget::RivalDisagreement { .. } => seen_rival = true,
-            ProbeTarget::EvidenceUnknown { .. } => seen_gap = true,
-            ProbeTarget::AssumptionUnknown { .. } => seen_assumption = true,
             ProbeTarget::ObjectiveUnknown { .. } => seen_objective = true,
+            other => panic!("only canonically linked targets may be ready, got {other:?}"),
         }
         must(probe.target.validate());
         must(probe.result_schema.validate());
@@ -572,7 +576,17 @@ fn objective_result_affordance_disposition_vocabulary() {
         assert_eq!(probe.probe_id, probe.affordance.affordance_id);
         assert!(!probe.expected_discrimination.trim().is_empty());
     }
-    assert!(seen_rival && seen_gap && seen_assumption && seen_objective);
+    assert!(seen_rival && seen_objective);
+    assert!(
+        plan.omissions
+            .iter()
+            .any(|omission| matches!(omission.target, ProbeTarget::EvidenceUnknown { .. }))
+    );
+    assert!(
+        plan.omissions
+            .iter()
+            .any(|omission| matches!(omission.target, ProbeTarget::AssumptionUnknown { .. }))
+    );
 
     let omission_kinds = [
         OmissionKind::Unprobeable,
@@ -618,34 +632,43 @@ fn vague_no_gain_objective_is_unprobeable() {
 
 // WORK_UNIT_CASE: 610/7
 #[test]
-fn exact_evidence_verifier_gap_objective_is_plannable() {
-    let gap = descriptor("aff-exact-gap", gap_target("claim-exact"));
+fn evidence_gap_without_exact_objective_linkage_is_unprobeable() {
+    let gap = descriptor("aff-exact-gap", evidence_gap_target("claim-exact"));
     let objective_descriptor =
         descriptor("aff-exact-objective", objective_target("objective-exact"));
     let plan = plan_for(vec![gap, objective_descriptor], Some(16));
     must(plan.validate());
-    assert_eq!(plan.probes.len(), 2);
-    assert!(plan.omissions.is_empty());
+    assert_eq!(plan.probes.len(), 1);
+    assert_eq!(plan.omissions.len(), 1);
 
-    let mut seen_gap = false;
-    let mut seen_objective = false;
-    for probe in &plan.probes {
-        match &probe.target {
-            ProbeTarget::EvidenceUnknown { claim } => {
-                assert_eq!(claim.claim_id.as_str(), "claim-exact");
-                seen_gap = true;
-            }
-            ProbeTarget::ObjectiveUnknown { objective } => {
-                assert_eq!(objective.objective_id.as_str(), "objective-exact");
-                seen_objective = true;
-            }
-            other => panic!("exact gap probe must name a gap or objective, got {other:?}"),
+    let objective_probe = &plan.probes[0];
+    match &objective_probe.target {
+        ProbeTarget::ObjectiveUnknown { objective } => {
+            assert_eq!(objective.objective_id.as_str(), "objective-exact");
         }
-        must(probe.result_schema.validate());
-        assert_eq!(probe.probe_id, probe.affordance.affordance_id);
-        assert!(!probe.expected_discrimination.trim().is_empty());
+        other => panic!("canonically linked objective must remain plannable, got {other:?}"),
     }
-    assert!(seen_gap && seen_objective);
+    must(objective_probe.result_schema.validate());
+    assert_eq!(
+        objective_probe.probe_id,
+        objective_probe.affordance.affordance_id
+    );
+    assert!(!objective_probe.expected_discrimination.trim().is_empty());
+
+    let omission = &plan.omissions[0];
+    assert_eq!(omission.affordance.affordance_id.as_str(), "aff-exact-gap");
+    assert_eq!(omission.kind, OmissionKind::Unprobeable);
+    assert!(
+        omission
+            .reason
+            .contains("exact canonical objective linkage")
+    );
+    match &omission.target {
+        ProbeTarget::EvidenceUnknown { claim } => {
+            assert_eq!(claim.claim_id.as_str(), "claim-exact");
+        }
+        other => panic!("unlinked evidence gap must remain typed, got {other:?}"),
+    }
 }
 
 // WORK_UNIT_CASE: 610/8
@@ -705,7 +728,7 @@ fn bounded_closed_result_schema_is_plannable() {
     assert_eq!(schema.branches.len(), 2);
     assert!(!schema.digest.trim().is_empty());
 
-    let mut params = descriptor_params("aff-closed", gap_target("claim-closed"));
+    let mut params = descriptor_params("aff-closed", objective_target("objective-closed"));
     params.result_schema = schema.clone();
     let closed = must(InquiryAffordanceDescriptor::new(params));
     let plan = plan_for(vec![closed], Some(16));
@@ -2310,7 +2333,7 @@ fn identical_result_updates_are_unprobeable() {
 // WORK_UNIT_CASE: 610/12
 #[test]
 fn confirmation_only_result_matrix_is_unprobeable() {
-    let target = gap_target("claim-confirmation-only");
+    let target = objective_target("objective-confirmation-only");
     let schema = gap_matrix(
         "schema-confirmation-only",
         objective("objective-confirmation-only"),
