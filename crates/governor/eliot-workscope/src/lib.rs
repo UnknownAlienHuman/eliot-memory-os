@@ -21,8 +21,8 @@ mod issuance;
 mod resolver;
 
 pub use caller::{
-    DescriptorPolicy, ObservedScopeResources, ReceiptAdmission, WithholdReason,
-    describe_observed_scope, propose_scope, verify_receipt_for_admission,
+    DescriptorPolicy, ObservedScopeResources, ReceiptAdmission, TriggerAdmission, WithholdReason,
+    admit_at_trigger, describe_observed_scope, propose_scope, verify_receipt_for_admission,
 };
 pub use guard::{
     GuardTrigger, GuardVerdict, IdentityLegOutcome, TriggerReport, check_at_trigger, identity_legs,
@@ -423,6 +423,30 @@ where
         .all(|value| seen.insert(value))
         .then_some(())
         .ok_or(WorkScopeError::DuplicateReference { field })
+}
+
+/// Checks a retained binding against a descriptor on every identity field.
+///
+/// The binding's scope, kind, lineage, and generation must equal the
+/// descriptor, and its exact instance (reference and root) must be a member
+/// of the descriptor's instance set. Used by issuance and trigger admission
+/// so neither trusts self-asserted receipt fields alone.
+pub(crate) fn binding_matches_descriptor(
+    binding: &ScopeBinding,
+    descriptor: &identity::WorkScopeDescriptor,
+) -> bool {
+    binding.scope.scope_ref == descriptor.scope_ref
+        && binding.scope.kind == descriptor.kind
+        && binding.scope.lineage_ref
+            == descriptor
+                .lineage
+                .as_ref()
+                .map(|lineage| lineage.lineage_ref.clone())
+        && binding.scope.generation == descriptor.generation.resource_generation.value()
+        && descriptor.instances.iter().any(|instance| {
+            instance.instance_ref == binding.scope.instance_ref
+                && instance.root_identity == binding.scope.root_identity
+        })
 }
 
 impl ScopeIdentity {
