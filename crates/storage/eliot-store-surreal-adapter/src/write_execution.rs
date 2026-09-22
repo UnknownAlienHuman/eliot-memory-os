@@ -69,7 +69,7 @@ use crate::config::{ClientSetLimits, SchemaGeneration, validate_execution_profil
 use crate::error::AdapterError;
 use crate::write_scheduler::{
     CompletionOutcome, ReservationProjection, ReservedScopeProjection, ScheduleReject,
-    WriteScheduler,
+    SchedulerAdmission, SchedulerOccupancy, WriteScheduler,
 };
 
 /// Execution profile owned by one generation.
@@ -879,6 +879,37 @@ impl WriteExecution {
             draining: drain != DrainState::Open,
             fenced: drain == DrainState::Fenced,
         }
+    }
+
+    /// Point scheduler occupancy snapshot of this generation (issue #2030,
+    /// 994/14 follow-up binding).
+    ///
+    /// Observation for bounded-queue evidence: pending, in-flight, and
+    /// uncertain counts plus drain state and fixed bounds. Read-only and
+    /// non-blocking; a poisoned lock reports the fully-gated snapshot
+    /// (saturated, draining) instead of blocking.
+    #[must_use]
+    pub fn scheduler_occupancy(&self) -> SchedulerOccupancy {
+        self.with_inner(|inner| inner.scheduler.occupancy())
+            .unwrap_or(SchedulerOccupancy {
+                pending: usize::MAX,
+                in_flight: usize::MAX,
+                uncertain: usize::MAX,
+                draining: true,
+                lanes: 0,
+                max_pending: 0,
+            })
+    }
+
+    /// Non-blocking scheduler admission verdict for this generation (issue
+    /// #2030, 994/14 follow-up binding).
+    ///
+    /// Read-only mirror of the submit gate without mutating; a poisoned lock
+    /// refuses (`RefusedDraining`) instead of blocking.
+    #[must_use]
+    pub fn scheduler_admission(&self) -> SchedulerAdmission {
+        self.with_inner(|inner| inner.scheduler.admission())
+            .unwrap_or(SchedulerAdmission::RefusedDraining)
     }
 
     /// Acquires one protected permit without touching normal-write
