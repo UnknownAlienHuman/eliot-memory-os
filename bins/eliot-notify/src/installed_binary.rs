@@ -33,6 +33,11 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+/// Canonical installed image filename pinned by the installer-owned binding
+/// chain (I11.6). Launch, grant, and setup checks in every lane compare
+/// against this exact name; no lane substitutes another executable.
+pub const NOTIFY_IMAGE_FILE_NAME: &str = "eliot-notify.exe";
+
 /// Lowercase SHA-256 identity bound to one installed Notify image.
 ///
 /// Shape discipline matches the installer declaration (`valid_sha256`):

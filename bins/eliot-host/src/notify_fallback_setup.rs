@@ -30,19 +30,91 @@ use sha2::{Digest, Sha256};
 
 use crate::HostError;
 
-/// Explicit per-user setup inputs. Every value is caller-supplied; nothing
-/// is probed from the loader path, environment, current directory, or build
-/// output. Key material arrives as the public half from the installer key
-/// ceremony — the private signing key never enters this module.
+/// Explicit per-user setup inputs. Every value is caller-supplied except
+/// the image digest and the interactive identity, which are always
+/// observed, never configured: the digest is hashed from the installed
+/// image bytes named below, and the SID/session come from the live process
+/// token. Key material arrives as the public half from the installer key
+/// ceremony — the private signing key never enters this module. Nothing is
+/// probed from the loader path, environment, current directory, or build
+/// output.
 pub struct NotifyFallbackSetupInputs {
-    /// Installer-owned declaration fields (identity, audience, epoch, key
-    /// reference, notify path/digest, interactive SID/session).
-    pub declaration: NotifyDeclarationInputs,
+    /// Stable installation identity.
+    pub installation_identity: PlatformHandle,
+    /// Declared fallback audience.
+    pub audience: PlatformHandle,
+    /// Non-zero authority epoch.
+    pub authority_epoch: u64,
+    /// Watchdog signing key identifier.
+    pub key_id: PlatformHandle,
+    /// Lowercase hex Watchdog verifying key (public half only).
+    pub public_key: String,
+    /// Absolute installed `eliot-notify.exe` path. The image digest is
+    /// hashed from these exact bytes; no caller-supplied digest is
+    /// accepted.
+    pub notify_executable: PathBuf,
     /// Explicit installation supervision/path profile.
     pub profile: InstallationProfile,
     /// Retained portable-dev root lease. Required for `PortableDev`;
     /// `None` for service/user profiles.
     pub portable_root: Option<UserOwnedRootLease>,
+}
+
+/// Observed installed image: verified path plus the digest hashed from its
+/// exact bytes at setup time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedNotifySource {
+    /// Verified absolute installed path.
+    pub executable_path: PathBuf,
+    /// SHA-256 of the exact bytes read (lowercase hex).
+    pub artifact_digest: String,
+}
+
+/// Bound for one installed image read during setup (mirrors the pinned
+/// artifact check; launch-time re-verification stays with the launcher).
+const NOTIFY_SOURCE_BYTES_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// Verifies the installer-named image and hashes its exact bytes.
+///
+/// Fails closed on relative paths, wrong filenames, non-files, empty or
+/// oversized images, and unreadable bytes. The returned digest always
+/// describes the bytes read here — a caller cannot substitute a digest for
+/// different bytes.
+///
+/// # Errors
+///
+/// Returns [`HostError::Platform`] when the path or bytes are invalid.
+pub fn observe_installed_notify_source(
+    executable: &Path,
+) -> Result<ObservedNotifySource, HostError> {
+    if !executable.is_absolute() {
+        return Err(HostError::Platform(
+            "notify executable path must be absolute".to_owned(),
+        ));
+    }
+    if executable.file_name().and_then(|name| name.to_str())
+        != Some(eliot_notify::NOTIFY_IMAGE_FILE_NAME)
+    {
+        return Err(HostError::Platform(
+            "notify executable must name the canonical installed notify image".to_owned(),
+        ));
+    }
+    let metadata = std::fs::metadata(executable)
+        .map_err(|error| HostError::Platform(format!("open notify executable: {error}")))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > NOTIFY_SOURCE_BYTES_LIMIT {
+        return Err(HostError::Platform(
+            "notify executable is not a bounded regular file".to_owned(),
+        ));
+    }
+    let bytes = std::fs::read(executable)
+        .map_err(|error| HostError::Platform(format!("read notify executable: {error}")))?;
+    if bytes.is_empty() {
+        return Err(HostError::Platform("notify executable is empty".to_owned()));
+    }
+    Ok(ObservedNotifySource {
+        executable_path: executable.to_path_buf(),
+        artifact_digest: format!("{:x}", Sha256::digest(&bytes)),
+    })
 }
 
 /// Published declaration binding: destination plus pinned digest.
@@ -82,25 +154,39 @@ pub struct NotifyFallbackSetup {
 
 /// Publishes one canonical fallback declaration to protected storage.
 ///
-/// Renders first (pure — malformed inputs fail before any filesystem
-/// effect), then publishes through the existing Phase-B file publisher
-/// (create-new/atomic, idempotent replay on exact bytes, fail-closed on
-/// unexpected existing bytes), then verifies readback under lease with
-/// digest equality.
+/// Observes the installed image (path verified, digest hashed from the
+/// exact bytes — never caller-supplied), binds the live interactive
+/// identity from the current process token, renders, then publishes
+/// through the existing Phase-B file publisher (create-new/atomic,
+/// idempotent replay on exact bytes, fail-closed on unexpected existing
+/// bytes) and verifies readback under lease with digest equality.
 ///
 /// # Errors
 ///
-/// Returns [`HostError`] when inputs are invalid, the protected path cannot
-/// be resolved, publication or readback fails, or the platform is not
-/// Windows.
+/// Returns [`HostError`] when inputs are invalid, the image cannot be
+/// observed, the protected path cannot be resolved, publication or
+/// readback fails, or the platform is not Windows.
 pub fn publish_notify_fallback_declaration(
-    declaration: &NotifyDeclarationInputs,
-    profile: InstallationProfile,
+    inputs: &NotifyFallbackSetupInputs,
     portable_root: Option<&UserOwnedRootLease>,
 ) -> Result<PublishedNotifyDeclaration, HostError> {
-    let rendered = render_notify_fallback_declaration(declaration)
+    let source = observe_installed_notify_source(&inputs.notify_executable)?;
+    let identity = eliot_platform_windows::current_process_named_pipe_expectation()
         .map_err(|error| HostError::Platform(error.to_string()))?;
-    publish_rendered_declaration(&rendered, profile, portable_root)
+    let declaration = NotifyDeclarationInputs {
+        installation_identity: inputs.installation_identity.clone(),
+        audience: inputs.audience.clone(),
+        authority_epoch: inputs.authority_epoch,
+        key_id: inputs.key_id.clone(),
+        public_key: inputs.public_key.clone(),
+        notify_executable: source.executable_path.to_string_lossy().into_owned(),
+        notify_artifact_sha256: source.artifact_digest,
+        interactive_user_sid: identity.expected_sid().to_owned(),
+        interactive_session_id: identity.expected_session_id(),
+    };
+    let rendered = render_notify_fallback_declaration(&declaration)
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    publish_rendered_declaration(&rendered, inputs.profile, portable_root)
 }
 
 /// Registers the signed Task Scheduler fallback against the published
@@ -135,11 +221,7 @@ pub fn register_notify_fallback() -> Result<NotifyFallbackRegistration, HostErro
 pub fn setup_notify_fallback_per_user(
     inputs: &NotifyFallbackSetupInputs,
 ) -> Result<NotifyFallbackSetup, HostError> {
-    let declaration = publish_notify_fallback_declaration(
-        &inputs.declaration,
-        inputs.profile,
-        inputs.portable_root.as_ref(),
-    )?;
+    let declaration = publish_notify_fallback_declaration(inputs, inputs.portable_root.as_ref())?;
     let registration = register_notify_fallback()?;
     Ok(NotifyFallbackSetup {
         declaration,
@@ -209,41 +291,68 @@ fn verify_declaration_readback(path: &Path, expected_digest: &str) -> Result<(),
 mod tests {
     use super::*;
 
-    fn valid_declaration() -> NotifyDeclarationInputs {
-        NotifyDeclarationInputs {
+    fn valid_setup_inputs(notify_executable: PathBuf) -> NotifyFallbackSetupInputs {
+        NotifyFallbackSetupInputs {
             installation_identity: PlatformHandle::new("installation:test").expect("identity"),
             audience: PlatformHandle::new("audience:test").expect("audience"),
             authority_epoch: 7,
             key_id: PlatformHandle::new("key:test").expect("key id"),
-            public_key: valid_test_public_key(),
-            notify_executable: "C:\\Eliot\\eliot-notify.exe".to_owned(),
-            notify_artifact_sha256: "cd".repeat(32),
-            interactive_user_sid: "S-1-5-21-1-2-3-1001".to_owned(),
-            interactive_session_id: 1,
+            public_key: "ab".repeat(32),
+            notify_executable,
+            profile: InstallationProfile::PortableDev,
+            portable_root: None,
         }
     }
 
-    fn valid_test_public_key() -> String {
-        // Lowercase hex that passes the shape gate; the negative tests below
-        // fail on earlier fields, so curve validity is never reached here.
-        // Valid-key rendering is proven in eliot-notify's own suite.
-        "ab".repeat(32)
+    fn write_temp_image(name: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, bytes).expect("fixture writable");
+        path
     }
 
     #[test]
-    fn invalid_declaration_inputs_fail_before_filesystem_effect() {
-        let mut inputs = valid_declaration();
-        inputs.notify_artifact_sha256 = "NOT-HEX".to_owned();
-        let setup = NotifyFallbackSetupInputs {
-            declaration: inputs,
-            profile: InstallationProfile::PortableDev,
-            portable_root: None,
-        };
-        let error = setup_notify_fallback_per_user(&setup).expect_err("bad digest fails");
+    fn observed_source_binds_path_to_hashed_bytes() {
+        let bytes = b"installed-notify-setup-image-bytes".to_vec();
+        let path = write_temp_image("eliot-1780-notify-setup-ok.bin", &bytes);
+        // The fixture filename is not the canonical image name: observation
+        // must reject it before hashing.
+        assert!(observe_installed_notify_source(&path).is_err());
+        let canonical_dir = std::env::temp_dir().join("eliot-1780-setup-canonical");
+        let _ = std::fs::create_dir_all(&canonical_dir);
+        let canonical = canonical_dir.join(eliot_notify::NOTIFY_IMAGE_FILE_NAME);
+        std::fs::write(&canonical, &bytes).expect("fixture writable");
+        let observed =
+            observe_installed_notify_source(&canonical).expect("canonical image observes");
+        assert_eq!(observed.executable_path, canonical);
+        assert_eq!(
+            observed.artifact_digest,
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&canonical);
+    }
+
+    #[test]
+    fn invalid_setup_inputs_fail_before_publication() {
+        let bytes = b"installed-notify-setup-image-bytes".to_vec();
+        let dir = std::env::temp_dir().join("eliot-1780-setup-invalid");
+        let _ = std::fs::create_dir_all(&dir);
+        let exe = dir.join(eliot_notify::NOTIFY_IMAGE_FILE_NAME);
+        std::fs::write(&exe, &bytes).expect("fixture writable");
+        // Bad authority epoch fails at render, after source observation but
+        // before any protected publication.
+        let mut setup = valid_setup_inputs(exe.clone());
+        setup.authority_epoch = 0;
+        let error = setup_notify_fallback_per_user(&setup).expect_err("bad epoch fails");
         assert!(
             matches!(error, HostError::Platform(_)),
-            "render rejection surfaces without filesystem effect"
+            "render rejection surfaces without publication"
         );
+        // Missing image fails at observation, before render.
+        let mut missing = valid_setup_inputs(dir.join("eliot-notify.exe"));
+        missing.authority_epoch = 7;
+        assert!(setup_notify_fallback_per_user(&missing).is_err());
+        let _ = std::fs::remove_file(&exe);
     }
 
     #[test]

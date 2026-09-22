@@ -23,7 +23,6 @@ use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
     ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
 };
-use eliot_notify::NotifyDeclarationInputs;
 use eliot_host::{NotifyFallbackSetupInputs, setup_notify_fallback_per_user};
 use eliot_platform_windows::{
     FileIdentity, InstallerRootError, InstallerRootObjectSnapshot,
@@ -342,18 +341,11 @@ enum InstallationCommand {
         /// Lowercase hex Watchdog verifying key (public half only).
         #[arg(long)]
         public_key: String,
-        /// Absolute installed `eliot-notify.exe` path.
+        /// Absolute installed `eliot-notify.exe` path. The image digest is
+        /// always hashed from these exact bytes at setup time; no
+        /// caller-supplied digest is accepted.
         #[arg(long, value_parser = absolute_path)]
         notify_exe: PathBuf,
-        /// Lowercase SHA-256 of the installed image bytes.
-        #[arg(long)]
-        notify_digest: String,
-        /// Interactive user SID the fallback is bound to.
-        #[arg(long)]
-        sid: String,
-        /// Interactive session id the fallback is bound to.
-        #[arg(long)]
-        session_id: u32,
         /// Explicit installation profile (`system_service`, `user_mode`, or `portable_dev`).
         #[arg(long, value_parser = parse_installation_profile)]
         profile: InstallationProfile,
@@ -1659,9 +1651,6 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             key_id,
             public_key,
             notify_exe,
-            notify_digest,
-            sid,
-            session_id,
             profile,
             profile_anchor_root,
             output,
@@ -1672,9 +1661,6 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             key_id,
             public_key,
             notify_exe,
-            notify_digest,
-            sid,
-            session_id,
             profile,
             profile_anchor_root,
             output,
@@ -2037,9 +2023,6 @@ fn run_installation_setup_notify_fallback(
     key_id: String,
     public_key: String,
     notify_exe: PathBuf,
-    notify_digest: String,
-    sid: String,
-    session_id: u32,
     profile: InstallationProfile,
     profile_anchor_root: PathBuf,
     output: PathBuf,
@@ -2053,17 +2036,12 @@ fn run_installation_setup_notify_fallback(
         InstallationProfile::SystemService | InstallationProfile::UserMode => None,
     };
     let inputs = NotifyFallbackSetupInputs {
-        declaration: NotifyDeclarationInputs {
-            installation_identity: cli_handle(installation.clone(), "installation")?,
-            audience: cli_handle(audience.clone(), "audience")?,
-            authority_epoch,
-            key_id: cli_handle(key_id.clone(), "key_id")?,
-            public_key,
-            notify_executable: notify_exe.to_string_lossy().into_owned(),
-            notify_artifact_sha256: notify_digest,
-            interactive_user_sid: sid,
-            interactive_session_id: session_id,
-        },
+        installation_identity: cli_handle(installation.clone(), "installation")?,
+        audience: cli_handle(audience.clone(), "audience")?,
+        authority_epoch,
+        key_id: cli_handle(key_id.clone(), "key_id")?,
+        public_key,
+        notify_executable: notify_exe,
         profile,
         portable_root,
     };
@@ -4654,12 +4632,6 @@ mod tests {
             &"ab".repeat(32),
             "--notify-exe",
             r"C:\Eliot\eliot-notify.exe",
-            "--notify-digest",
-            &"cd".repeat(32),
-            "--sid",
-            "S-1-5-21-1-2-3-1001",
-            "--session-id",
-            "1",
             "--profile",
             "portable_dev",
             "--profile-anchor-root",
@@ -4675,7 +4647,6 @@ mod tests {
                     audience,
                     authority_epoch,
                     key_id,
-                    session_id,
                     profile,
                     ..
                 } => {
@@ -4683,7 +4654,6 @@ mod tests {
                     assert_eq!(audience, "audience:test");
                     assert_eq!(authority_epoch, 7);
                     assert_eq!(key_id, "key:test");
-                    assert_eq!(session_id, 1);
                     assert_eq!(profile, InstallationProfile::PortableDev);
                 }
                 _ => panic!("expected setup-notify-fallback command"),
