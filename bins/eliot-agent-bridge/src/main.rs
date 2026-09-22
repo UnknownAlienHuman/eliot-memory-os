@@ -569,7 +569,7 @@ fn main() {
             Ok(Request::Invoke { request }) => {
                 let mut response =
                     handle_invocation(&host_gateway, &mut *host_request_port, &request);
-                record_invocation_delivery(&mut runner, &request.tool, &mut response);
+                record_invocation_delivery(&mut runner, &mut response);
                 response
             }
             Ok(Request::Cancel { request }) => {
@@ -769,23 +769,18 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
 /// Runs on the normal Invoke path with the exact authenticated outcome the gateway
 /// produced. The gateway-shaped result and completion are never touched: only the
 /// additive `evidence` slot is filled, and only when recording yields a snapshot
-/// (supported kind with content beyond the hot preview bound, or an exact-URI
-/// query whose served bytes publish canonically at the requested URI).
-/// Auxiliary only: a `None` (admission, rejection, gap, unsupported kind, small inline content,
+/// (supported kind with content beyond the hot preview bound). Auxiliary only: a
+/// `None` (admission, rejection, gap, unsupported kind, small inline content,
 /// detached runner, or full registry) leaves the response exactly as the gateway
 /// shaped it, with the key absent on the wire.
 /// See [`BridgeRunner::record_tool_result_delivery`].
-fn record_invocation_delivery(
-    runner: &mut BridgeRunner,
-    tool: &ToolRequest,
-    response: &mut Response,
-) {
+fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response) {
     if let Response::Invocation {
         result, evidence, ..
     } = response
     {
         if evidence.is_none()
-            && let Some(view) = runner.record_tool_result_delivery(tool, result.outcome())
+            && let Some(view) = runner.record_tool_result_delivery(result.outcome())
         {
             *evidence = Some(view);
         }
@@ -2613,21 +2608,6 @@ mod tests {
             request
         }
 
-        fn query_projection_response(content: serde_json::Value) -> McpResponse {
-            McpResponse {
-                request_id: "req-query-1".to_owned(),
-                idempotency_key: "idem-query-1".to_owned(),
-                canonical_request_sha256: DIGEST_A.to_owned(),
-                kind: ResponseKind::Projection,
-                canonical_tool_name: "eliot.query".to_owned(),
-                content,
-                artifacts: Vec::new(),
-                proof_ceiling: ProofCeiling::Observation,
-                resource: None,
-                job: None,
-            }
-        }
-
         #[test]
         fn large_supported_tool_result_populates_registry_and_expands() {
             use eliot_agent_bridge::MAX_PREVIEW_BYTES;
@@ -2640,7 +2620,7 @@ mod tests {
             };
             // Exact production order: gateway dispatch, then delivery recording.
             let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
-            record_invocation_delivery(&mut runner, &request.tool, &mut response);
+            record_invocation_delivery(&mut runner, &mut response);
             let super::Response::Invocation {
                 result, evidence, ..
             } = &response
@@ -2687,7 +2667,7 @@ mod tests {
             // Recording the same delivered bytes again rebinds the same handle:
             // content-addressing is idempotent, never a second entry.
             let again = runner
-                .record_tool_result_delivery(&request.tool, result.outcome())
+                .record_tool_result_delivery(result.outcome())
                 .expect("re-record rebinds");
             assert_eq!(runner.resource_registry_len(), 1);
             // Expansion retrieves the exact delivered bytes behind a bounded preview.
@@ -2707,112 +2687,48 @@ mod tests {
         }
 
         #[test]
-        fn exact_uri_query_result_publishes_canonically_at_requested_uri() {
-            use eliot_agent_bridge::MAX_PREVIEW_BYTES;
-
+        fn refused_exact_uri_query_records_nothing() {
+            // Production refuses exact-resource-uri queries on the read leg
+            // (exact expansion uses the resource path, not eliot.query), so
+            // the refused outcome must record nothing: no canonical publish
+            // under a caller-asserted URI, no evidence, registry untouched.
+            // The refusing port mirrors production (invoke leg refused);
+            // nothing here bypasses that refusal with a scripted success.
             let mut runner = attached_runner();
             let request = query_request();
-            let served = serde_json::to_vec(&large_content()).expect("content serializes");
-            assert!(served.len() > MAX_PREVIEW_BYTES);
-            let mut port = RespondedPort {
-                response: query_projection_response(large_content()),
-            };
-            // Exact production order: gateway dispatch, then delivery recording.
-            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
-            record_invocation_delivery(&mut runner, &request.tool, &mut response);
-            let super::Response::Invocation { evidence, .. } = &response else {
-                panic!("invoke must answer an invocation envelope");
-            };
-            let view = evidence
-                .as_ref()
-                .expect("exact-URI delivery must carry its view");
-            assert_eq!(
-                view.handle().uri().as_str(),
-                "eliot://evidence/source-9",
-                "canonical publish names the requested URI, not a content address"
-            );
-            assert_eq!(runner.resource_registry_len(), 1);
-            let expanded = runner
-                .expand_resource(view.handle())
-                .expect("expand resolves the exact URI");
-            assert_eq!(expanded, served);
-        }
-
-        #[test]
-        fn exact_uri_query_negative_shapes_stay_auxiliary_only() {
-            let mut runner = attached_runner();
-            // Non-canonical URI text falls back to the content-addressed
-            // evidence path for large served bytes.
-            let garbage = query_request_with_exact_uri("not-a-canonical-uri");
-            let mut port = RespondedPort {
-                response: query_projection_response(large_content()),
-            };
+            let mut port = super::UnavailableKernelHostRequestPort;
             let mut response =
-                handle_invocation(&super::HostRequestGateway, &mut port, &garbage);
-            record_invocation_delivery(&mut runner, &garbage.tool, &mut response);
-            assert_eq!(runner.resource_registry_len(), 1);
-            let super::Response::Invocation { evidence, .. } = &response else {
-                panic!("invoke must answer an invocation envelope");
-            };
-            let uri = evidence
-                .as_ref()
-                .expect("large served bytes still record evidence")
-                .handle()
-                .uri()
-                .as_str()
-                .to_owned();
-            assert!(
-                uri.starts_with("eliot://evidence/") && uri != "not-a-canonical-uri",
-                "fallback stays content-addressed, got {uri}"
-            );
-            // Small served bytes publish canonically too: addressability
-            // does not depend on preview size.
-            let mut runner = attached_runner();
-            let small_uri = query_request_with_exact_uri("eliot://evidence/source-9");
-            let mut port = RespondedPort {
-                response: query_projection_response(serde_json::json!({"ok": true})),
-            };
-            let mut response =
-                handle_invocation(&super::HostRequestGateway, &mut port, &small_uri);
-            record_invocation_delivery(&mut runner, &small_uri.tool, &mut response);
-            assert_eq!(runner.resource_registry_len(), 1);
-            // An immutable conflict refuses without masking: bytes already
-            // published at the URI stand, and the response stays untouched.
-            let mut runner = attached_runner();
-            runner
-                .publish_canonical_resource(
-                    &eliot_agent_bridge_core::ResourceUri::parse("eliot://evidence/source-9")
-                        .expect("fixture URI parses"),
-                    b"first bytes".to_vec(),
-                )
-                .expect("first publish lands");
-            let conflict = query_request();
-            let mut port = RespondedPort {
-                response: query_projection_response(large_content()),
-            };
-            let mut response =
-                handle_invocation(&super::HostRequestGateway, &mut port, &conflict);
-            record_invocation_delivery(&mut runner, &conflict.tool, &mut response);
-            let super::Response::Invocation { evidence, .. } = &response else {
-                panic!("invoke must answer an invocation envelope");
+                handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            // The refused leg surfaces a Rejected outcome inside the normal
+            // invocation envelope (not an error envelope); recording must
+            // withhold everything on it.
+            let super::Response::Invocation {
+                result, ..
+            } = &response else {
+                panic!("gateway must answer an invocation envelope even on refusal");
             };
             assert!(
-                evidence.is_none(),
-                "conflicting republish must not project a masking view"
+                matches!(
+                    result.outcome(),
+                    eliot_mcp::HostInvocationOutcome::Rejected { .. }
+                ),
+                "refused leg must surface rejection"
             );
-            assert_eq!(runner.resource_registry_len(), 1);
-            // Unsupported kinds record nothing even with an exact URI.
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "rejection projects no handle"
+            );
+            // A refused leg withholds even for a canonical URI: the bridge
+            // never relabels opaque bytes it was never served.
             let mut runner = attached_runner();
-            let mut port = RespondedPort {
-                response: {
-                    let mut refused = query_projection_response(large_content());
-                    refused.kind = ResponseKind::Unsupported;
-                    refused
-                },
-            };
+            let canonical = query_request_with_exact_uri("eliot://evidence/source-9");
+            let mut port = super::UnavailableKernelHostRequestPort;
             let mut response =
-                handle_invocation(&super::HostRequestGateway, &mut port, &query_request());
-            record_invocation_delivery(&mut runner, &query_request().tool, &mut response);
+                handle_invocation(&super::HostRequestGateway, &mut port, &canonical);
+            record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
         }
 
@@ -2826,7 +2742,7 @@ mod tests {
             };
             let mut response =
                 handle_invocation(&super::HostRequestGateway, &mut unsupported, &request);
-            record_invocation_delivery(&mut runner, &request.tool, &mut response);
+            record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
             let value = serde_json::to_value(&response).expect("response must serialize");
             assert!(
@@ -2841,7 +2757,7 @@ mod tests {
                 ),
             };
             let mut response = handle_invocation(&super::HostRequestGateway, &mut small, &request);
-            record_invocation_delivery(&mut runner, &request.tool, &mut response);
+            record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
             let value = serde_json::to_value(&response).expect("response must serialize");
             assert!(
@@ -2852,7 +2768,7 @@ mod tests {
             let mut unavailable = super::UnavailableKernelHostRequestPort;
             let mut response =
                 handle_invocation(&super::HostRequestGateway, &mut unavailable, &request);
-            record_invocation_delivery(&mut runner, &request.tool, &mut response);
+            record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
         }
 
@@ -2864,7 +2780,7 @@ mod tests {
                 response: projection_response(ResponseKind::Projection, large_content()),
             };
             let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
-            record_invocation_delivery(&mut runner, &request.tool, &mut response);
+            record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
             let value = serde_json::to_value(&response).expect("response must serialize");
             assert!(
