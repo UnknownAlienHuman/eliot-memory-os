@@ -243,13 +243,14 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
         envelope
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         let now = unix_ms();
         let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
 
-        let (descriptor, receipt) = self.host_request_connection_gate(envelope)?;
+        let (descriptor, receipt) = self.host_request_connection_gate_under_transition(envelope)?;
         self.host_request_service_gate(&descriptor, envelope)?;
         let binding = bridge_process_binding(&descriptor, &receipt, &envelope.connection_id)?;
 
@@ -259,7 +260,7 @@ impl KernelComposition {
         // non-resolved disposition fails closed without a Session.
         let resolution: Option<AgentActivationResolutionResult> =
             if envelope.kind == HostRequestKind::Activation {
-                Some(self.host_request_activation_resolution(envelope)?)
+                Some(self.host_request_activation_resolution_under_transition(envelope)?)
             } else {
                 None
             };
@@ -303,7 +304,7 @@ impl KernelComposition {
                     Err(_) => return Err(TransportError::SessionFenced),
                 }
             }
-            self.note_host_request_operation(envelope)?;
+            self.note_host_request_operation_under_transition(envelope)?;
             return Err(TransportError::Timeout);
         }
 
@@ -337,7 +338,7 @@ impl KernelComposition {
             HostRequestKind::Activation | HostRequestKind::Invocation => {}
         }
 
-        self.note_host_request_operation(envelope)?;
+        self.note_host_request_operation_under_transition(envelope)?;
         Ok((admission_receipt, admitted))
     }
 
@@ -448,6 +449,7 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         receipt: &HostRequestAdmissionReceipt,
     ) -> Result<HostRequestRecord, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
         envelope
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -503,17 +505,21 @@ impl KernelComposition {
     /// presenting connection survives: every still-uncertain indexed operation
     /// is fenced to `Unknown` under the same owner-continuation rules as the
     /// per-connection fence. Like revocation, this never fails.
-    pub(super) fn fence_all_host_requests(&self) {
-        let outstanding = match self.host_request_connection_index.lock() {
-            Ok(mut index) => std::mem::take(&mut *index)
-                .into_values()
-                .flatten()
-                .collect::<Vec<_>>(),
-            Err(_) => return,
-        };
+    pub(super) fn fence_all_host_requests(&self) -> Result<(), TransportError> {
+        let outstanding = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)
+            .map(|mut index| {
+                std::mem::take(&mut *index)
+                    .into_values()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })?;
         for operation_ref in &outstanding {
             fence_one_host_request(self, operation_ref);
         }
+        Ok(())
     }
 
     /// Fences the presenting connection's still-uncertain host requests.
@@ -543,7 +549,7 @@ impl KernelComposition {
     /// with a live transport Session. Unknown connections fail closed, which
     /// is also the reconnect fence: a new connection identity never inherits
     /// the previous connection's admission.
-    fn host_request_connection_gate(
+    fn host_request_connection_gate_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
     ) -> Result<
@@ -703,6 +709,14 @@ impl KernelComposition {
     /// or fence mismatch is an identity conflict; a non-resolved disposition
     /// fails closed without yielding any binding.
     pub(super) fn host_request_activation_resolution(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<AgentActivationResolutionResult, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        self.host_request_activation_resolution_under_transition(envelope)
+    }
+
+    fn host_request_activation_resolution_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
     ) -> Result<AgentActivationResolutionResult, TransportError> {
@@ -867,10 +881,19 @@ impl KernelComposition {
 
     /// Indexes one staged operation under its presenting connection so
     /// disconnect revocation can fence it without enumerating the store.
-    fn note_host_request_operation(
+    fn note_host_request_operation_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
     ) -> Result<(), TransportError> {
+        // The transition read guard is held by the enclosing host-request
+        // ingress. Reacquire only the pending owner at the publication point:
+        // the durable stage above may have crossed no profile promotion while
+        // this guard is live, and this index entry is inserted before release.
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.host_request_connection_gate_under_transition(envelope)?;
         let mut index = self
             .host_request_connection_index
             .lock()
@@ -907,6 +930,15 @@ impl KernelComposition {
     /// bounded queue is full the oldest queued pair is evicted (daemon-leg
     /// memory only — the durable ORS record is untouched).
     pub(crate) fn enqueue_local_read_pair(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<(), TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        self.enqueue_local_read_pair_under_transition(envelope, tool)
+    }
+
+    fn enqueue_local_read_pair_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
@@ -988,6 +1020,7 @@ impl KernelComposition {
         )>,
         TransportError,
     > {
+        let _transition = self.agent_bridge_transition_read()?;
         let mut index = self
             .host_request_connection_index
             .lock()
@@ -1129,6 +1162,15 @@ impl KernelComposition {
         operation_id: &str,
         request_digest: &str,
     ) -> Result<Option<LocalReadAttemptState>, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        self.live_local_read_attempt_under_transition(operation_id, request_digest)
+    }
+
+    fn live_local_read_attempt_under_transition(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<Option<LocalReadAttemptState>, TransportError> {
         let index = self
             .host_request_connection_index
             .lock()
@@ -1152,6 +1194,13 @@ impl KernelComposition {
     /// lock/store error is contained because retirement must hold even when
     /// the store is unavailable.
     pub(crate) fn retire_local_read_pair(&self, operation_id: &str, request_digest: &str) {
+        let Ok(_transition) = self.agent_bridge_transition_read() else {
+            return;
+        };
+        self.retire_local_read_pair_under_transition(operation_id, request_digest);
+    }
+
+    fn retire_local_read_pair_under_transition(&self, operation_id: &str, request_digest: &str) {
         let Ok(mut index) = self.host_request_connection_index.lock() else {
             return;
         };
@@ -1195,6 +1244,7 @@ impl KernelComposition {
         body: &HostRequestResultBody,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
+        let _transition = self.agent_bridge_transition_read()?;
         let operation_id = OperationIdentity::new(body.operation_id.clone())
             .map_err(|_| TransportError::SessionFenced)?;
         let stored = self
@@ -1222,7 +1272,8 @@ impl KernelComposition {
         }
         // Governed attempt currency: only the live (attempt_id, generation,
         // owner) triple completes.
-        let live = self.live_local_read_attempt(&body.operation_id, &body.request_sha256)?;
+        let live = self
+            .live_local_read_attempt_under_transition(&body.operation_id, &body.request_sha256)?;
         match (&body.attempt, live) {
             (Some(attempt), Some(state))
                 if attempt.attempt_id == state.attempt_id
@@ -1339,7 +1390,7 @@ impl KernelComposition {
             .ok_or(TransportError::UnknownRequest)?;
         // The single completion consumes the attempt use budget: retire the
         // pair so no later claim or submit can reuse this generation.
-        self.retire_local_read_pair(&body.operation_id, &body.request_sha256);
+        self.retire_local_read_pair_under_transition(&body.operation_id, &body.request_sha256);
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
     }
 }
@@ -1625,6 +1676,7 @@ impl KernelComposition {
         &self,
         connection_id: &str,
     ) -> Result<Session, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
         let connections = self
             .agent_bridge_connections
             .lock()

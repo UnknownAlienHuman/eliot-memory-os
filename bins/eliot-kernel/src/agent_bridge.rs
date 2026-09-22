@@ -74,6 +74,14 @@ impl KernelComposition {
         peer: &PeerIdentity,
     ) -> bool {
         observe_bridge("kernel.bridge_peer_observed", "attempt");
+        let Ok(_transition) = self.agent_bridge_transition_read() else {
+            observe_bridge("kernel.bridge_peer_observed", "not_admitted");
+            return false;
+        };
+        let Ok(_admission_owner) = self.agent_activation_pending.lock() else {
+            observe_bridge("kernel.bridge_peer_observed", "not_admitted");
+            return false;
+        };
         let admitted = self
             .agent_bridge_profile
             .lock()
@@ -171,26 +179,48 @@ impl KernelComposition {
         &self,
         next: Option<AgentBridgeProfile>,
     ) -> Result<(), TransportError> {
-        self.revoke_all_agent_bridges()?;
+        let _transition = self.agent_bridge_transition_write()?;
+        // `agent_activation_pending` is the single Kernel admission owner for
+        // the bridge generation.  Keep it held across the no-profile fence,
+        // ownership drain, and replacement publication so no old snapshot can
+        // become reachable between revocation and the profile swap.
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        {
+            let mut profile = match self.agent_bridge_profile.lock() {
+                Ok(profile) => profile,
+                Err(poisoned) => {
+                    let mut profile = poisoned.into_inner();
+                    *profile = None;
+                    return Err(TransportError::SessionFenced);
+                }
+            };
+            // Publish the outgoing generation's fence before detaching any
+            // owned state.  A poisoned profile lock stays fail-closed.
+            *profile = None;
+        }
+        self.revoke_all_agent_bridges(&mut pending)?;
         *self
             .agent_bridge_profile
             .lock()
             .map_err(|_| TransportError::SessionFenced)? = next;
         self.note_agent_bridge_peer_set_change();
+        drop(pending);
         Ok(())
     }
 
     #[cfg(windows)]
-    fn revoke_all_agent_bridges(&self) -> Result<(), TransportError> {
+    fn revoke_all_agent_bridges(
+        &self,
+        pending: &mut AgentActivationPendingState,
+    ) -> Result<(), TransportError> {
         // Keep the Kernel owner lock order identical to activation result
         // admission: pending state is the cross-representation CAS owner and
         // the connection map is acquired only after it. This prevents profile
         // promotion from waiting on connections while a submitter waits on
         // pending state.
-        let mut pending = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
         let mut connections = self
             .agent_bridge_connections
             .lock()
@@ -199,7 +229,6 @@ impl KernelComposition {
         pending.fifo.clear();
         pending.entries.clear();
         drop(connections);
-        drop(pending);
         for (_, mut state) in revoked {
             state.exchange.abort();
             if let Some(mut session) = state.session {
@@ -207,7 +236,10 @@ impl KernelComposition {
             }
             state.accepted_transport = None;
         }
-        self.fence_all_host_requests();
+        // The index is drained while the same admission owner is held.  Its
+        // detached store fencing may continue after the map ownership is gone,
+        // but a poisoned index must prevent replacement publication.
+        self.fence_all_host_requests()?;
         self.agent_activation_changed.notify_waiters();
         Ok(())
     }
@@ -257,6 +289,7 @@ impl KernelComposition {
         peer: PeerIdentity,
     ) -> Result<AgentBridgeHandshake, TransportError> {
         observe_bridge("kernel.bridge_connect", "attempt");
+        let _transition = self.agent_bridge_transition_read()?;
         let result = self.begin_agent_bridge_inner(selection, peer);
         match &result {
             Ok(_) => {
@@ -278,6 +311,11 @@ impl KernelComposition {
         selection: &NamedPipePeerSelection,
         peer: PeerIdentity,
     ) -> Result<AgentBridgeHandshake, TransportError> {
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let observed_peer_set_revision = self.agent_bridge_peer_set_revision();
         let profile = self
             .agent_bridge_profile
             .lock()
@@ -347,6 +385,17 @@ impl KernelComposition {
         .map_err(|_| TransportError::SessionFenced)?;
         let exchange = ServerFirstConnection::new(&connection_id, challenge.clone(), &declaration)?;
         let challenge_frame = exchange.challenge_frame()?;
+        let current_profile = self
+            .agent_bridge_profile
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        if current_profile.admission != profile.admission
+            || self.agent_bridge_peer_set_revision() != observed_peer_set_revision
+        {
+            return Err(TransportError::SessionFenced);
+        }
         let mut connections = self
             .agent_bridge_connections
             .lock()
@@ -381,6 +430,7 @@ impl KernelComposition {
         frame: &Frame,
     ) -> Result<eliot_protocol::AgentBridgePeerAdmissionReceipt, TransportError> {
         observe_bridge("kernel.bridge_hello_accept", "attempt");
+        let _transition = self.agent_bridge_transition_read()?;
         let result = self.accept_agent_bridge_hello_inner(connection_id, frame);
         match &result {
             Ok(_) => observe_bridge("kernel.bridge_hello_accept", "success"),
@@ -398,6 +448,10 @@ impl KernelComposition {
         connection_id: &str,
         frame: &Frame,
     ) -> Result<eliot_protocol::AgentBridgePeerAdmissionReceipt, TransportError> {
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         let mut connections = self
             .agent_bridge_connections
             .lock()
@@ -439,6 +493,7 @@ impl KernelComposition {
         connection_id: &str,
     ) -> Result<Frame, TransportError> {
         observe_bridge("kernel.bridge_receipt_prepared", "attempt");
+        let _transition = self.agent_bridge_transition_read()?;
         let result = self.agent_bridge_admission_receipt_frame_inner(connection_id);
         match &result {
             Ok(_) => observe_bridge("kernel.bridge_receipt_prepared", "success"),
@@ -455,6 +510,10 @@ impl KernelComposition {
         &self,
         connection_id: &str,
     ) -> Result<Frame, TransportError> {
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         let connections = self
             .agent_bridge_connections
             .lock()
@@ -481,6 +540,11 @@ impl KernelComposition {
         frame: &Frame,
     ) -> Result<AgentActivationResolutionTicket, TransportError> {
         observe_bridge("kernel.bridge_activation_enqueue", "attempt");
+        let _transition = self.agent_bridge_transition_read()?;
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         let (request, receipt) = {
             let connections = self
                 .agent_bridge_connections
@@ -541,10 +605,6 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?;
             (request, receipt.clone())
         };
-        let mut pending = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
         let request_id = request
             .request_identity
             .request
@@ -610,6 +670,7 @@ impl KernelComposition {
         &self,
     ) -> Result<Option<AgentActivationResolutionTicket>, TransportError> {
         observe_bridge("kernel.bridge_activation_claim", "attempt");
+        let _transition = self.agent_bridge_transition_read()?;
         let mut pending = self
             .agent_activation_pending
             .lock()
@@ -626,6 +687,7 @@ impl KernelComposition {
         decision
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
+        let _transition = self.agent_bridge_transition_read()?;
         let mut pending = self
             .agent_activation_pending
             .lock()
@@ -1034,6 +1096,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         let incoming = submit.result;
         let ticket_id = incoming.ticket_id.clone();
+        let _transition = self.agent_bridge_transition_read()?;
         // This is the one cross-representation admission guard. Keep the
         // existing Kernel owner locked through the identity check, durable
         // retention, and canonical-v2 ledger update so the raw P-04 path
@@ -1109,6 +1172,7 @@ impl KernelComposition {
         query
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
+        let _transition = self.agent_bridge_transition_read()?;
         let results = self
             .agent_activation_results
             .lock()
@@ -1164,6 +1228,7 @@ impl KernelComposition {
         result
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
+        let _transition = self.agent_bridge_transition_read()?;
         // Hold the same Kernel owner guard used by the canonical-v2 submit
         // path. The raw P-04 compatibility result must win or fail against
         // both representations before ORS or either in-memory ledger writes.
@@ -1423,17 +1488,27 @@ impl KernelComposition {
         ticket_id: &str,
         result: &AgentActivationResolutionResult,
     ) -> Result<Frame, TransportError> {
-        let pending = {
-            let pending = self
-                .agent_activation_pending
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            pending
-                .entries
-                .get(ticket_id)
-                .ok_or(TransportError::SessionFenced)?
-                .clone()
-        };
+        let _transition = self.agent_bridge_transition_read()?;
+        self.activation_result_response_under_transition(connection_id, frame, ticket_id, result)
+    }
+
+    #[cfg(windows)]
+    fn activation_result_response_under_transition(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+        ticket_id: &str,
+        result: &AgentActivationResolutionResult,
+    ) -> Result<Frame, TransportError> {
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let pending_entry = pending
+            .entries
+            .get(ticket_id)
+            .ok_or(TransportError::SessionFenced)?
+            .clone();
         // #203: reject a tampered, wrong-ticket, or wrong-fence retained
         // result before mutating any ledger. The submit path validates before
         // retaining, so this is defense-in-depth; a failure here preserves
@@ -1441,8 +1516,9 @@ impl KernelComposition {
         // closes the negative-disposition arm, which otherwise projects
         // without any ticket binding check.
         result
-            .validate_against(&pending.ticket)
+            .validate_against(&pending_entry.ticket)
             .map_err(|_| TransportError::SessionFenced)?;
+        self.validate_result_bridge_leg(&pending_entry.ticket)?;
         // Exhaustive per-disposition projection with no wildcard arm: a
         // future disposition breaks compilation here instead of silently
         // reusing another denial code. Only `Resolved` reaches the binding
@@ -1453,15 +1529,11 @@ impl KernelComposition {
                 let reply = self.activation_response_frame_for_resolution(
                     connection_id,
                     frame,
-                    &pending,
+                    &pending_entry,
                     result,
                     binding,
                 )?;
-                self.agent_activation_pending
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .entries
-                    .remove(ticket_id);
+                pending.entries.remove(ticket_id);
                 Ok(reply)
             }
             AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
@@ -1470,18 +1542,15 @@ impl KernelComposition {
             | AgentActivationResolutionDisposition::NotReady { .. }
             | AgentActivationResolutionDisposition::StaleFence { .. }
             | AgentActivationResolutionDisposition::FailedInternal { .. } => {
-                self.agent_activation_pending
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .entries
-                    .remove(ticket_id);
-                self.revoke_agent_bridge(connection_id);
+                pending.entries.remove(ticket_id);
+                self.revoke_agent_bridge_under_transition(connection_id, &mut pending)?;
                 let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
                     .ok_or(TransportError::SessionFenced)?;
-                let response = AgentBridgeActivationResponse::denied(&pending.request, reason_code)
-                    .map_err(|_| TransportError::SessionFenced)?;
+                let response =
+                    AgentBridgeActivationResponse::denied(&pending_entry.request, reason_code)
+                        .map_err(|_| TransportError::SessionFenced)?;
                 response
-                    .validate_request(&pending.request)
+                    .validate_request(&pending_entry.request)
                     .map_err(|_| TransportError::SessionFenced)?;
                 let reply = Frame {
                     protocol_version: frame.protocol_version,
@@ -1724,6 +1793,7 @@ impl KernelComposition {
                 Gone,
             }
             let outcome = {
+                let _transition = self.agent_bridge_transition_read()?;
                 let pending = self
                     .agent_activation_pending
                     .lock()
@@ -1819,31 +1889,35 @@ impl KernelComposition {
         frame: &Frame,
         ticket_id: &str,
     ) -> Result<Frame, TransportError> {
-        let (pending_entry, result) = {
-            let pending = self
-                .agent_activation_pending
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let entry = pending
-                .entries
-                .get(ticket_id)
-                .ok_or(TransportError::SessionFenced)?
-                .clone();
-            let result = pending
-                .results
-                .get(ticket_id)
-                .ok_or(TransportError::SessionFenced)?
-                .result
-                .clone();
-            (entry, result)
-        };
+        let _transition = self.agent_bridge_transition_read()?;
+        self.project_retained_activation_result_under_transition(connection_id, frame, ticket_id)
+    }
+
+    #[cfg(windows)]
+    fn project_retained_activation_result_under_transition(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+        ticket_id: &str,
+    ) -> Result<Frame, TransportError> {
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let pending_entry = pending
+            .entries
+            .get(ticket_id)
+            .ok_or(TransportError::SessionFenced)?
+            .clone();
+        let result = pending
+            .results
+            .get(ticket_id)
+            .ok_or(TransportError::SessionFenced)?
+            .result
+            .clone();
         let reply =
             self.activation_result_response_frame(connection_id, frame, &pending_entry, &result)?;
-        self.agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .entries
-            .remove(ticket_id);
+        pending.entries.remove(ticket_id);
         Ok(reply)
     }
 
@@ -1857,28 +1931,33 @@ impl KernelComposition {
         frame: &Frame,
         ticket_id: &str,
     ) -> Result<Frame, TransportError> {
-        let pending_entry = {
-            let pending = self
-                .agent_activation_pending
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            pending
-                .entries
-                .get(ticket_id)
-                .ok_or(TransportError::SessionFenced)?
-                .clone()
-        };
+        let _transition = self.agent_bridge_transition_read()?;
+        self.project_legacy_activation_decision_under_transition(connection_id, frame, ticket_id)
+    }
+
+    #[cfg(windows)]
+    fn project_legacy_activation_decision_under_transition(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+        ticket_id: &str,
+    ) -> Result<Frame, TransportError> {
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let pending_entry = pending
+            .entries
+            .get(ticket_id)
+            .ok_or(TransportError::SessionFenced)?
+            .clone();
         let decision = pending_entry
             .decision
             .clone()
             .ok_or(TransportError::SessionFenced)?;
         let reply =
             self.activation_response_frame(connection_id, frame, &pending_entry, &decision)?;
-        self.agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .entries
-            .remove(ticket_id);
+        pending.entries.remove(ticket_id);
         Ok(reply)
     }
 
@@ -1894,24 +1973,29 @@ impl KernelComposition {
         frame: &Frame,
         ticket: &AgentActivationResolutionTicket,
     ) -> Result<Frame, TransportError> {
-        let request = {
-            let pending = self
-                .agent_activation_pending
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            pending
-                .entries
-                .get(&ticket.ticket_id)
-                .ok_or(TransportError::SessionFenced)?
-                .request
-                .clone()
-        };
-        self.agent_activation_pending
+        let _transition = self.agent_bridge_transition_read()?;
+        self.expire_agent_bridge_activation_under_transition(connection_id, frame, ticket)
+    }
+
+    #[cfg(windows)]
+    fn expire_agent_bridge_activation_under_transition(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+        ticket: &AgentActivationResolutionTicket,
+    ) -> Result<Frame, TransportError> {
+        let mut pending = self
+            .agent_activation_pending
             .lock()
-            .map_err(|_| TransportError::SessionFenced)?
+            .map_err(|_| TransportError::SessionFenced)?;
+        let request = pending
             .entries
-            .remove(&ticket.ticket_id);
-        self.revoke_agent_bridge(connection_id);
+            .get(&ticket.ticket_id)
+            .ok_or(TransportError::SessionFenced)?
+            .request
+            .clone();
+        pending.entries.remove(&ticket.ticket_id);
+        self.revoke_agent_bridge_under_transition(connection_id, &mut pending)?;
         // Result-less expiry has no daemon disposition to project, so it keeps
         // the Kernel-owned no-result denial code. Mapping it to any of the six
         // disposition codes would fabricate a daemon semantic result after the
@@ -1951,6 +2035,7 @@ impl KernelComposition {
         frame: &Frame,
     ) -> Result<Frame, TransportError> {
         observe_bridge("kernel.bridge_activation_request", "attempt");
+        let _transition = self.agent_bridge_transition_read()?;
         let Ok(mut connections) = self.agent_bridge_connections.lock() else {
             let err = TransportError::SessionFenced;
             observe_bridge("kernel.bridge_activation_request", "fenced");
@@ -2065,33 +2150,54 @@ impl KernelComposition {
     #[cfg(windows)]
     pub fn revoke_agent_bridge(&self, connection_id: &str) {
         observe_bridge("kernel.bridge_cleanup", "attempt");
+        let Ok(_transition) = self.agent_bridge_transition_read() else {
+            observe_bridge("kernel.bridge_cleanup", "fenced");
+            return;
+        };
+        let Ok(mut pending) = self.agent_activation_pending.lock() else {
+            self.fence_host_requests_for_connection(connection_id);
+            self.agent_activation_changed.notify_waiters();
+            observe_bridge("kernel.bridge_cleanup", "fenced");
+            return;
+        };
+        if self
+            .revoke_agent_bridge_under_transition(connection_id, &mut pending)
+            .is_err()
+        {
+            self.fence_host_requests_for_connection(connection_id);
+            observe_bridge("kernel.bridge_cleanup", "fenced");
+        }
+        observe_bridge("kernel.bridge_cleanup", "complete");
+    }
+
+    #[cfg(windows)]
+    fn revoke_agent_bridge_under_transition(
+        &self,
+        connection_id: &str,
+        pending: &mut AgentActivationPendingState,
+    ) -> Result<(), TransportError> {
         // This is the same pending-then-connections order used by result
         // admission. Removing both records while both guards are held keeps a
         // submitter from validating a live connection and then committing
         // against a ticket that profile/disconnect revocation has removed.
-        let revoked = if let Ok(mut pending) = self.agent_activation_pending.lock() {
-            let revoked = self
-                .agent_bridge_connections
-                .lock()
-                .ok()
-                .and_then(|mut connections| connections.remove(connection_id));
-            let removed = pending
-                .entries
-                .iter()
-                .filter(|(_, entry)| entry.ticket.connection_id == connection_id)
-                .map(|(ticket_id, _)| ticket_id.clone())
-                .collect::<Vec<_>>();
-            for ticket_id in &removed {
-                pending.entries.remove(ticket_id);
-            }
-            let live_ticket_ids = pending.entries.keys().cloned().collect::<BTreeSet<_>>();
-            pending
-                .fifo
-                .retain(|ticket_id| live_ticket_ids.contains(ticket_id));
-            revoked
-        } else {
-            None
-        };
+        let revoked = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .remove(connection_id);
+        let removed = pending
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.ticket.connection_id == connection_id)
+            .map(|(ticket_id, _)| ticket_id.clone())
+            .collect::<Vec<_>>();
+        for ticket_id in &removed {
+            pending.entries.remove(ticket_id);
+        }
+        let live_ticket_ids = pending.entries.keys().cloned().collect::<BTreeSet<_>>();
+        pending
+            .fifo
+            .retain(|ticket_id| live_ticket_ids.contains(ticket_id));
         if let Some(mut state) = revoked {
             state.exchange.abort();
             if let Some(mut session) = state.session.take() {
@@ -2101,6 +2207,6 @@ impl KernelComposition {
         }
         self.fence_host_requests_for_connection(connection_id);
         self.agent_activation_changed.notify_waiters();
-        observe_bridge("kernel.bridge_cleanup", "complete");
+        Ok(())
     }
 }
