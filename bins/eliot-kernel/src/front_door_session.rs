@@ -286,6 +286,13 @@ impl KernelComposition {
         &self,
         host_expectation: &NamedPipePeerExpectation,
     ) -> Result<NamedPipePeerSet, KernelBuildError> {
+        let Ok(_transition) = self.agent_bridge_transition_read() else {
+            let error =
+                KernelBuildError::Principal("bridge profile transition lock poisoned".to_owned());
+            observe_front_door_session("kernel.front_door_peer_set_build", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(&error));
+            return Err(error);
+        };
         observe_front_door_session("kernel.front_door_peer_set_build", "attempt");
         let result = self.front_door_peer_set_inner(host_expectation);
         match &result {
@@ -311,7 +318,12 @@ impl KernelComposition {
     ) -> Result<(u64, NamedPipePeerSet), KernelBuildError> {
         for _ in 0..8 {
             let before = self.agent_bridge_peer_set_revision();
-            let peers = self.front_door_peer_set(host_expectation)?;
+            // The public snapshot boundary already owns the transition read
+            // guard. Re-entering `front_door_peer_set` here could block on a
+            // queued writer because `std::sync::RwLock` does not guarantee
+            // recursive reader acquisition. Keep the whole retry loop under
+            // that one guard and call the uninstrumented builder directly.
+            let peers = self.front_door_peer_set_inner(host_expectation)?;
             let after = self.agent_bridge_peer_set_revision();
             if before == after {
                 return Ok((after, peers));
@@ -327,14 +339,21 @@ impl KernelComposition {
     ///
     /// Diagnostic wrapper: preserves the exact revision pair, emits the
     /// snapshot observation with the retained revision, and keeps one
-    /// designated terminal per underlying failure. A peer-set propagation
-    /// failure already emitted its terminal inside `front_door_peer_set`,
-    /// so only the continuous-churn failure emits here.
+    /// designated terminal per underlying failure. The snapshot path calls
+    /// the uninstrumented builder while it owns the transition read guard, so
+    /// this wrapper emits the terminal for both builder failures and churn.
     #[cfg(windows)]
     pub fn front_door_peer_set_snapshot(
         &self,
         host_expectation: &NamedPipePeerExpectation,
     ) -> Result<(u64, NamedPipePeerSet), KernelBuildError> {
+        let Ok(_transition) = self.agent_bridge_transition_read() else {
+            let error =
+                KernelBuildError::Principal("bridge profile transition lock poisoned".to_owned());
+            observe_front_door_session("kernel.front_door_peer_set_snapshot", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(&error));
+            return Err(error);
+        };
         observe_front_door_session("kernel.front_door_peer_set_snapshot", "attempt");
         let result = self.front_door_peer_set_snapshot_inner(host_expectation);
         match &result {
@@ -345,12 +364,10 @@ impl KernelComposition {
                 let is_churn = matches!(error, KernelBuildError::Principal(reason) if reason.contains("changed continuously"));
                 if is_churn {
                     observe_peer_snapshot(self.agent_bridge_peer_set_revision(), "fenced");
-                    super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(
-                        error,
-                    ));
                 } else {
                     observe_front_door_session("kernel.front_door_peer_set_snapshot", "fenced");
                 }
+                super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(error));
             }
         }
         result
