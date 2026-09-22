@@ -634,6 +634,228 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// Mechanical workspace-instance facts for `WorkScope` identity (issue #1787).
+///
+/// Source data only, never policy: the exact canonical root, VCS common-dir
+/// and worktree identities, head branch/commit evidence, a dirty-file count,
+/// root-level manifest names, and `.eliot` marker presence. Consumers derive
+/// identity from these facts; display names, manifest names, copied markers,
+/// and remote URLs stay supporting evidence there and never identity here.
+/// Unobservable values stay `None`/empty rather than defaulted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceInstanceFacts {
+    /// Canonicalized requested root; equals the worktree toplevel when Git is present.
+    pub canonical_root: String,
+    /// Whether a `.git` marker (dir or worktree file) was observed.
+    pub has_git: bool,
+    /// Canonical worktree git dir; distinct per worktree.
+    pub git_dir: Option<String>,
+    /// Canonical VCS common dir (shared object store); equal across worktrees of one lineage.
+    pub common_dir: Option<String>,
+    /// Head branch short name; `None` when detached or unobserved.
+    pub head_branch: Option<String>,
+    /// Head commit object id; present whenever Git evidence was read.
+    pub head_commit: Option<String>,
+    /// First root commit object id; present whenever Git evidence was read.
+    pub root_commit: Option<String>,
+    /// `origin` remote URL; `None` when no remote is configured.
+    pub remote_url: Option<String>,
+    /// Non-empty `git status --porcelain` line count; zero when clean.
+    pub dirty_files: u64,
+    /// Manifest file names present at the root only; no traversal.
+    pub manifest_names: Vec<String>,
+    /// Whether a `.eliot` marker entry exists at the root.
+    pub eliot_marker_present: bool,
+}
+
+/// Root-level manifest names admitted as supporting evidence only.
+const WORKSPACE_MANIFEST_NAMES: [&str; 8] = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "package.json",
+    "package-lock.json",
+    "go.mod",
+    "pyproject.toml",
+    "pom.xml",
+    "CMakeLists.txt",
+];
+
+impl WorkspaceInstanceFacts {
+    /// Validates observed facts without interpreting them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError::Git`] when the canonical root is blank or Git
+    /// presence disagrees with the observed VCS evidence.
+    pub fn validate(&self) -> Result<(), CaptureError> {
+        if self.canonical_root.trim().is_empty() {
+            return Err(CaptureError::Git {
+                command: "observe_workspace_instance".to_owned(),
+                detail: "canonical root is blank".to_owned(),
+            });
+        }
+        let vcs_complete = self.git_dir.is_some()
+            && self.common_dir.is_some()
+            && self.head_commit.is_some()
+            && self.root_commit.is_some();
+        if self.has_git != vcs_complete {
+            return Err(CaptureError::Git {
+                command: "observe_workspace_instance".to_owned(),
+                detail: "git marker presence disagrees with observed VCS evidence".to_owned(),
+            });
+        }
+        for manifest in &self.manifest_names {
+            if manifest.trim().is_empty() {
+                return Err(CaptureError::Git {
+                    command: "observe_workspace_instance".to_owned(),
+                    detail: "manifest name is blank".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Observes one workspace root mechanically from an explicit absolute path.
+///
+/// Mirrors the snapshot capture discipline: the requested root must exist,
+/// canonicalize, and — when Git is present — equal the discovered worktree
+/// toplevel. A missing remote stays `None`; a detached head stays `None` for
+/// the branch; a non-Git directory yields directory facts with no VCS
+/// evidence. Nothing is inferred, defaulted, or scanned beyond the root.
+///
+/// # Errors
+///
+/// Returns [`CaptureError`] when the root is not absolute, missing, or not
+/// the worktree toplevel, or when a required Git read fails.
+pub fn observe_workspace_instance(root: &Path) -> Result<WorkspaceInstanceFacts, CaptureError> {
+    if !root.is_absolute() {
+        return Err(CaptureError::RepositoryRootNotAbsolute(root.to_owned()));
+    }
+    if !root.is_dir() {
+        return Err(CaptureError::RepositoryRootMissing(root.to_owned()));
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    let has_git = fs::symlink_metadata(canonical_root.join(".git")).is_ok();
+    let mut manifest_names = Vec::new();
+    for manifest in WORKSPACE_MANIFEST_NAMES {
+        if canonical_root.join(manifest).is_file() {
+            manifest_names.push(manifest.to_owned());
+        }
+    }
+    let eliot_marker_present = canonical_root.join(".eliot").exists();
+    if !has_git {
+        let facts = WorkspaceInstanceFacts {
+            canonical_root: canonical_root.display().to_string(),
+            has_git: false,
+            git_dir: None,
+            common_dir: None,
+            head_branch: None,
+            head_commit: None,
+            root_commit: None,
+            remote_url: None,
+            dirty_files: 0,
+            manifest_names,
+            eliot_marker_present,
+        };
+        facts.validate()?;
+        return Ok(facts);
+    }
+    let discovered = git_output(&canonical_root, ["rev-parse", "--show-toplevel"])?;
+    let discovered = fs::canonicalize(PathBuf::from(discovered.trim()))?;
+    if !same_path(&canonical_root, &discovered) {
+        return Err(CaptureError::RepositoryRootMismatch {
+            requested: canonical_root,
+            discovered,
+        });
+    }
+    let git_dir = canonicalize_git_path(&canonical_root, ["rev-parse", "--git-dir"])?;
+    let common_dir = canonicalize_git_path(&canonical_root, ["rev-parse", "--git-common-dir"])?;
+    let head_commit = nonempty_git_output(&canonical_root, ["rev-parse", "HEAD"])?;
+    let root_commit = git_output(&canonical_root, ["rev-list", "--max-parents=0", "HEAD"])?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .next()
+        .filter(|line| !line.is_empty());
+    let root_commit = root_commit.ok_or_else(|| CaptureError::Git {
+        command: "git rev-list --max-parents=0 HEAD".to_owned(),
+        detail: "no root commit observed".to_owned(),
+    })?;
+    let head_branch = fs::read_to_string(PathBuf::from(&git_dir).join("HEAD"))
+        .ok()
+        .and_then(|head| head.strip_prefix("ref: refs/heads/").map(str::trim).map(str::to_owned))
+        .filter(|branch| !branch.is_empty() && !branch.contains(char::is_control));
+    let remote_url = git_output(&canonical_root, ["remote", "get-url", "origin"])
+        .map(|url| url.trim().to_owned())
+        .ok()
+        .filter(|url| !url.is_empty());
+    let dirty_files = git_output(
+        &canonical_root,
+        [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    )?
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .count() as u64;
+    let facts = WorkspaceInstanceFacts {
+        canonical_root: canonical_root.display().to_string(),
+        has_git: true,
+        git_dir: Some(git_dir),
+        common_dir: Some(common_dir),
+        head_branch,
+        head_commit: Some(head_commit),
+        root_commit: Some(root_commit),
+        remote_url,
+        dirty_files,
+        manifest_names,
+        eliot_marker_present,
+    };
+    facts.validate()?;
+    Ok(facts)
+}
+
+fn canonicalize_git_path<const N: usize>(
+    repository_root: &Path,
+    args: [&str; N],
+) -> Result<String, CaptureError> {
+    let raw = git_output(repository_root, args)?.trim().to_owned();
+    if raw.is_empty() {
+        return Err(CaptureError::Git {
+            command: format!("git -C {} <identity>", repository_root.display()),
+            detail: "git identity output is empty".to_owned(),
+        });
+    }
+    let path = PathBuf::from(&raw);
+    let joined = if path.is_absolute() {
+        path
+    } else {
+        repository_root.join(path)
+    };
+    Ok(fs::canonicalize(joined)?.display().to_string())
+}
+
+fn nonempty_git_output<const N: usize>(
+    repository_root: &Path,
+    args: [&str; N],
+) -> Result<String, CaptureError> {
+    let value = git_output(repository_root, args)?.trim().to_owned();
+    if value.is_empty() {
+        return Err(CaptureError::Git {
+            command: format!("git -C {} <identity>", repository_root.display()),
+            detail: "git identity output is empty".to_owned(),
+        });
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

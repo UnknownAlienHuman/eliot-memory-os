@@ -25,10 +25,13 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::Path;
+
+use eliot_bootstrap::capture::observe_workspace_instance;
 use eliot_contracts::StateFence;
 use eliot_governor::{
     GenerationEvidence, ScopeBinding, TaskScopeOutcome, WorkspaceInstanceIdentity,
-    check_task_observation,
+    check_task_observation, derive_observed_resources,
 };
 use eliot_observation::TaskSelectionEvidence;
 
@@ -302,6 +305,59 @@ pub fn admit_task_bound_with_observed_scope(
         selection,
         expected_task_ref,
         &expected.scope.scope_ref,
+        expected_fence,
+        compatibility,
+    )
+}
+
+/// Observes one explicit workspace root and admits one task-relative
+/// transition against the live observation.
+///
+/// This is the daemon trigger ingress for scope identity: absent selection
+/// stays on the cold path with no observation performed, while a present
+/// selection observes the explicit root mechanically (filesystem/VCS/project
+/// facts, never invented), derives the observed instance and generation, and
+/// admits only through [`admit_task_bound_with_observed_scope`]. A root that
+/// cannot be observed, or an observation that disagrees with the retained
+/// binding, fails closed with `TASK_SCOPE_INCOMPATIBLE`; the retained
+/// binding, task state, and project memory are untouched. The root is always
+/// explicit — the daemon never infers a workspace from cwd, proximity, or
+/// recency.
+pub fn observe_and_admit_task(
+    workspace_root: &Path,
+    selection: Option<&TaskSelectionEvidence>,
+    expected_task_ref: &str,
+    expected: &ScopeBinding,
+    expected_fence: &StateFence,
+    compatibility: CompatibilityDisposition,
+) -> Result<(), TaskBindingError> {
+    if selection.is_none() {
+        return admit_task_bound(
+            None,
+            expected_task_ref,
+            &expected.scope.scope_ref,
+            expected_fence,
+            compatibility,
+        );
+    }
+    let facts = observe_workspace_instance(workspace_root).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!("workspace observation failed: {error}"))
+    })?;
+    let observed = derive_observed_resources(&facts, expected_fence.resource_generation, None)
+        .map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "observed workspace resources invalid: {error}"
+            ))
+        })?;
+    let instance = observed.instances.first().ok_or_else(|| {
+        TaskBindingError::scope_incompatible("observed workspace has no instance".to_owned())
+    })?;
+    admit_task_bound_with_observed_scope(
+        selection,
+        expected_task_ref,
+        expected,
+        instance,
+        &observed.generation,
         expected_fence,
         compatibility,
     )

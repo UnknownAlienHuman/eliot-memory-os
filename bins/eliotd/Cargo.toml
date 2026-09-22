@@ -20,6 +20,7 @@ eliot-agent-codex = { path = "../../crates/agent/eliot-agent-codex", version = "
 eliot-agent-contracts.workspace = true
 eliot-agent-coordinator.workspace = true
 eliot-authority.workspace = true
+eliot-bootstrap.workspace = true
 eliot-contracts.workspace = true
 eliot-config.workspace = true
 eliot-controlboard.workspace = true

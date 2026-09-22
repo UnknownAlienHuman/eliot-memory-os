@@ -3187,6 +3187,7 @@ dependencies = [
 name = "eliot-workscope"
 version = "0.1.0"
 dependencies = [
+ "eliot-bootstrap",
  "eliot-contracts",
  "eliot-security-contracts",
  "schemars",
@@ -3205,6 +3206,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",
+ "eliot-bootstrap",
  "eliot-config",
  "eliot-contracts",
  "eliot-controlboard",
