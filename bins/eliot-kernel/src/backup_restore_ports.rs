@@ -60,10 +60,12 @@ use eliot_backup::{
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ors::{
-    JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES, MAX_JOURNAL_PAYLOAD_BYTES,
+    JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES, MAX_JOURNAL_PAYLOAD_BYTES, MAX_RECOVERY_PAGE,
+    OperationalControlProjection, OperationalRecoveryStore, RecoveryCursor,
     RESTORE_JOURNAL_RECORD_SCHEMA, OperationIdentity, OrsError, RedbRecoveryStore,
     RestoreJournalArchiveClass, RestoreJournalOperation, RestoreJournalResult,
-    RestoreJournalStreamBinding, SupervisionLeaseSnapshot,
+    RestoreJournalStreamBinding, SessionBindingReceipt, SessionDetach, SupervisionLeaseSnapshot,
+    UserBrokerFence, UserBrokerRegistrationReceipt,
 };
 
 /// Stable identity of the restore-journal stream namespace for admission
@@ -744,6 +746,93 @@ impl KernelRestoreJournal {
     ) -> Result<Option<SupervisionLeaseSnapshot>, BackupError> {
         self.store
             .load_current_supervision_lease(lease_id)
+            .map_err(map_ors_to_backup)
+    }
+
+    /// Reads the bounded live control projection (active sessions, brokers,
+    /// authority lineage) from the ORS owner, paging to exhaustion.
+    ///
+    /// All pages must agree on the authority lineage; disagreement means
+    /// concurrent authority movement mid-scan and fails closed for retry.
+    /// Callers enumerate-then-act on live state per attempt, so already
+    /// invalidated subjects vanish from later attempts instead of erroring.
+    pub(crate) fn read_control_projection(
+        &self,
+    ) -> Result<OperationalControlProjection, BackupError> {
+        let mut merged: Option<OperationalControlProjection> = None;
+        let mut after_order: u64 = 0;
+        loop {
+            let cursor = RecoveryCursor::new(after_order, MAX_RECOVERY_PAGE)
+                .map_err(map_ors_to_backup)?;
+            let (page, next) = self
+                .store
+                .control_projection_page(cursor)
+                .map_err(map_ors_to_backup)?;
+            match merged.as_mut() {
+                None => merged = Some(page),
+                Some(current) => {
+                    if current.authority_lineage != page.authority_lineage {
+                        return Err(BackupError::RestoreJournalCasConflict);
+                    }
+                    current.pending_operation_refs.extend(page.pending_operation_refs);
+                    current.active_generation_refs.extend(page.active_generation_refs);
+                    current.active_session_refs.extend(page.active_session_refs);
+                    current
+                        .active_user_broker_refs
+                        .extend(page.active_user_broker_refs);
+                    current.active_capability_refs.extend(page.active_capability_refs);
+                    current.job_checkpoint_refs.extend(page.job_checkpoint_refs);
+                    current.delivery_cursor_refs.extend(page.delivery_cursor_refs);
+                    current.recovery_inbox_refs.extend(page.recovery_inbox_refs);
+                }
+            }
+            match next {
+                None => break,
+                Some(order) => after_order = order,
+            }
+        }
+        let mut projection = merged.ok_or(BackupError::RestoreJournalCorrupt)?;
+        projection.pending_operation_refs.sort();
+        projection.pending_operation_refs.dedup();
+        projection.active_generation_refs.sort();
+        projection.active_generation_refs.dedup();
+        projection.active_session_refs.sort();
+        projection.active_session_refs.dedup();
+        projection.active_user_broker_refs.sort();
+        projection.active_user_broker_refs.dedup();
+        projection.active_capability_refs.sort();
+        projection.active_capability_refs.dedup();
+        projection.job_checkpoint_refs.sort();
+        projection.job_checkpoint_refs.dedup();
+        projection.delivery_cursor_refs.sort();
+        projection.delivery_cursor_refs.dedup();
+        projection.recovery_inbox_refs.sort();
+        projection.recovery_inbox_refs.dedup();
+        Ok(projection)
+    }
+
+    /// Detaches one active session through the session owner: Active →
+    /// Suspended with an owner-issued receipt. Detaching a non-active
+    /// subject fails closed in the owner; callers enumerate live Active
+    /// subjects first so retries skip already-detached ones.
+    pub(crate) fn detach_restore_session(
+        &self,
+        detach: SessionDetach,
+    ) -> Result<SessionBindingReceipt, BackupError> {
+        self.store
+            .detach_session(detach)
+            .map_err(map_ors_to_backup)
+    }
+
+    /// Fences one active user-broker registration through the broker
+    /// owner: Active → Fenced with an owner-issued receipt. Same
+    /// enumerate-then-act retry discipline as sessions.
+    pub(crate) fn fence_restore_broker(
+        &self,
+        fence: UserBrokerFence,
+    ) -> Result<UserBrokerRegistrationReceipt, BackupError> {
+        self.store
+            .fence_user_broker(fence)
             .map_err(map_ors_to_backup)
     }
 

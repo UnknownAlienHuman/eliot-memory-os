@@ -79,6 +79,7 @@ use eliot_backup::{
     verify_key_coverage,
 };
 use eliot_contracts::{OperationId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_ors::{SessionBindingReceipt, SessionDetach, UserBrokerFence, UserBrokerRegistrationReceipt};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{
     OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, WriteReceipt,
@@ -88,6 +89,7 @@ use super::{
     KernelComposition, KernelStoreGateway, KernelSupervisionLeaseAuthority,
     SupervisionLeaseAuthorityError,
 };
+use super::backup_restore_ports::KernelRestoreJournal;
 use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseSnapshot};
 
 /// Wire identity of the Host-issued restore destination authorization.
@@ -845,5 +847,94 @@ impl KernelComposition {
         Ok(BackupOwnerChannels {
             store_gateway: gateway,
         })
+    }
+}
+
+/// Session owner client: detaches live sessions through the session
+/// owner (Active → Suspended) under the verified destination.
+///
+/// Each detach executes against the owner's accepted mutation with the
+/// exact bindings the coordinator supplies and returns the owner-issued
+/// receipt. The client performs no enumeration itself: callers
+/// enumerate-then-act on live Active subjects per attempt, so retries skip
+/// already-detached sessions instead of erroring.
+pub struct SessionOwnerClient {
+    destination_binding_digest: String,
+}
+
+impl SessionOwnerClient {
+    /// Binds the client under the verified destination. No verification,
+    /// no client, no effect.
+    pub fn bind(verified: &VerifiedDestinationBinding) -> Self {
+        Self {
+            destination_binding_digest: verified.binding_digest(),
+        }
+    }
+
+    /// Destination binding digest this client was constructed under.
+    pub fn destination_binding_digest(&self) -> &str {
+        &self.destination_binding_digest
+    }
+
+    /// Detaches one session: binding check, then the genuine owner
+    /// operation. Any refusal fails the invalidation closed — never
+    /// write-through, never a fabricated receipt.
+    pub fn detach(
+        &self,
+        verified: &VerifiedDestinationBinding,
+        journal: &KernelRestoreJournal,
+        detach: SessionDetach,
+    ) -> Result<SessionBindingReceipt, OwnerChannelError> {
+        if verified.binding_digest() != self.destination_binding_digest {
+            return Err(OwnerChannelError::Backup(BackupError::FenceMismatch {
+                subject: "destination authorization".to_owned(),
+            }));
+        }
+        journal
+            .detach_restore_session(detach)
+            .map_err(OwnerChannelError::Backup)
+    }
+}
+
+/// User-broker owner client: fences live broker registrations through the
+/// broker owner (Active → Fenced) under the verified destination.
+///
+/// Same enumerate-then-act retry discipline as sessions: each fence
+/// executes against the owner's accepted mutation with the exact bindings
+/// the coordinator supplies and returns the owner-issued receipt.
+pub struct BrokerOwnerClient {
+    destination_binding_digest: String,
+}
+
+impl BrokerOwnerClient {
+    /// Binds the client under the verified destination. No verification,
+    /// no client, no effect.
+    pub fn bind(verified: &VerifiedDestinationBinding) -> Self {
+        Self {
+            destination_binding_digest: verified.binding_digest(),
+        }
+    }
+
+    /// Destination binding digest this client was constructed under.
+    pub fn destination_binding_digest(&self) -> &str {
+        &self.destination_binding_digest
+    }
+
+    /// Fences one broker registration: binding check, then the genuine
+    /// owner operation. Any refusal fails the invalidation closed.
+    pub fn fence(
+        &self,
+        verified: &VerifiedDestinationBinding,
+        journal: &KernelRestoreJournal,
+        fence: UserBrokerFence,
+    ) -> Result<UserBrokerRegistrationReceipt, OwnerChannelError> {
+        if verified.binding_digest() != self.destination_binding_digest {
+            return Err(OwnerChannelError::Backup(BackupError::FenceMismatch {
+                subject: "destination authorization".to_owned(),
+            }));
+        }
+        journal
+            .fence_restore_broker(fence)
+            .map_err(OwnerChannelError::Backup)
     }
 }

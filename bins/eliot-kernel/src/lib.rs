@@ -59,10 +59,10 @@ mod process_execution_client;
 mod supervision_lease_authority;
 
 pub use backup_owner_clients::{
-    AuthorizationExpectation, BackupOwnerChannels, BlobOwnerClient, CanonicalOwnerClient,
-    CanonicalStoreImportClient, ImportReconciliation, InvalidationKind, InvalidationOwnerClient,
-    OrsOwnerClient, OwnerChannelError, PurgeOwnerClient, VerifiedDestinationBinding,
-    DESTINATION_AUTHORIZATION_ISSUER,
+    AuthorizationExpectation, BackupOwnerChannels, BlobOwnerClient, BrokerOwnerClient,
+    CanonicalOwnerClient, CanonicalStoreImportClient, ImportReconciliation, InvalidationKind,
+    InvalidationOwnerClient, OrsOwnerClient, OwnerChannelError, PurgeOwnerClient,
+    SessionOwnerClient, VerifiedDestinationBinding, DESTINATION_AUTHORIZATION_ISSUER,
     DESTINATION_AUTHORIZATION_WIRE, PURGE_MEMBER_SUPPRESSION, STORE_IMPORT_CHANNEL,
     verify_destination_authorization,
 };

@@ -51,6 +51,18 @@
 //!                              (`InvalidationOwnerClient::revoke_lease`,
 //!                              cutover-gated, invoked by the #961 cutover
 //!                              executor with a terminal ticket).
+//! session invalidation ...... session owner (`SessionOwnerClient::detach`
+//!                              through `detach_session`, Active →
+//!                              Suspended, enumerate-then-act per attempt).
+//! broker invalidation ....... broker owner (`BrokerOwnerClient::fence`
+//!                              through `fence_user_broker`, Active →
+//!                              Fenced, same retry discipline).
+//! route/runtime ............ no in-tree executors: sessions bind only
+//!                              (no terminate API), routes have no retire
+//!                              mutator (advancement belongs to the I14.14
+//!                              generation machine), generations retire via
+//!                              activation. These legs refuse with their
+//!                              exact owners until their #961 owners land.
 //! ```
 //!
 //! The Host-issued destination authorization gates every effect: `restore`
@@ -94,6 +106,9 @@ use eliot_backup::{
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreObligations, RestoreProvenance};
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseOperation, SupervisionLeasePrepareRequest};
+use eliot_ors::{EpochLineage, OpaqueLabel, OperationalRecordContext, OperationalRecordInput};
+use eliot_ors::{SessionDetach, StateFenceSnapshot, UserBrokerFence};
+use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::{LeaseState, SupervisionLeaseTerminalDisposition};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
@@ -157,8 +172,9 @@ mod owners {
 /// obligation vocabulary above is retained for phase attribution and
 /// evidence; every effect call site below binds the live clients.
 use super::backup_owner_clients::{
-    AuthorizationExpectation, BlobOwnerClient, CanonicalOwnerClient, OrsOwnerClient,
-    PurgeOwnerClient, VerifiedDestinationBinding, verify_destination_authorization,
+    AuthorizationExpectation, BlobOwnerClient, BrokerOwnerClient, CanonicalOwnerClient,
+    OrsOwnerClient, PurgeOwnerClient, SessionOwnerClient, VerifiedDestinationBinding,
+    verify_destination_authorization,
 };
 
 /// Outcome of one Kernel-executed isolated restore: the journaled receipt,
@@ -215,6 +231,37 @@ struct LeaseTerminalProof {
     lease_id: String,
     lease_revision: u64,
     lease_receipt_sha256: String,
+}
+
+/// Session-invalidation proof recorded in the cutover decision: every
+/// session Active at execution was detached through the session owner.
+/// Count plus digest keeps the journaled decision bounded; the exact
+/// owner receipts live in the ORS mutation rows.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SessionInvalidationProof {
+    detached_count: u64,
+    receipts_digest: String,
+}
+
+/// Broker-invalidation proof recorded in the cutover decision: every
+/// broker registration Active at execution was fenced through the broker
+/// owner. Same bounded count-plus-digest shape as sessions.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BrokerInvalidationProof {
+    fenced_count: u64,
+    receipts_digest: String,
+}
+
+/// Executed invalidation proofs gating cutover. Each leg passes either by
+/// its exact owner in evidence or by the proof recorded here. Route and
+/// runtime have no in-tree executors, so they pass by evidence only —
+/// which finalize never marks satisfied, keeping cutover correctly gated
+/// until their #961 owners land.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutedInvalidations {
+    lease: Option<LeaseTerminalProof>,
+    session: Option<SessionInvalidationProof>,
+    broker: Option<BrokerInvalidationProof>,
 }
 
 /// Caller-supplied cutover authority bundle: the separate Human/System
@@ -696,7 +743,7 @@ impl KernelBackupRestore {
         plan: &RestorePlan,
         bundle: &BackupBundle,
         live_fence: &StateFence,
-    ) -> Result<PinnedDestinationAdmission, KernelRestoreError> {
+    ) -> Result<(PinnedDestinationAdmission, VerifiedDestinationBinding), KernelRestoreError> {
         let admission_bytes = std::fs::read(destination.root().join(DESTINATION_ADMISSION_FILE))
             .map_err(|_| {
                 KernelRestoreError::DestinationInvalid(
@@ -712,7 +759,7 @@ impl KernelBackupRestore {
         let delivered =
             Self::fetch_delivered_authorization(plan, pinned.source_installation_id.as_str())
                 .await?;
-        self.verify_destination_binding(
+        let (verified, _) = self.verify_destination_binding(
             destination,
             plan,
             bundle,
@@ -720,7 +767,7 @@ impl KernelBackupRestore {
             &delivered,
             live_fence,
         )?;
-        Ok(pinned)
+        Ok((pinned, verified))
     }
 
     /// Proposes one terminal ticket from live ORS state through the lease
@@ -802,6 +849,87 @@ impl KernelBackupRestore {
         Ok(stage.ticket().clone())
     }
 
+    /// Journals one executed-invalidation proof row with exact predecessor,
+    /// binding the effect to the restore transaction before the cutover
+    /// decision. The ORS mutation rows hold every receipt; this row pins
+    /// the proof digest so the decision references journaled evidence.
+    fn journal_invalidation_row(
+        journal: &mut KernelRestoreJournal,
+        transaction_id: &str,
+        target_id: &str,
+        kind: &str,
+        proof_bytes: &[u8],
+    ) -> Result<(), KernelRestoreError> {
+        let digest = sha256_hex(proof_bytes);
+        let request_bytes = canonical_json_bytes(&(
+            transaction_id,
+            target_id,
+            kind,
+            digest.as_str(),
+        ))
+        .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let payload = String::from_utf8(proof_bytes.to_vec()).map_err(|_| {
+            KernelRestoreError::ArchiveInvalid("invalidation proof is not UTF-8".to_owned())
+        })?;
+        journal
+            .append_decision_row(
+                format!("{kind}-invalidation-{digest}"),
+                sha256_hex(&request_bytes),
+                payload,
+            )
+            .map_err(KernelRestoreError::TargetFailed)?;
+        Ok(())
+    }
+
+    /// Executes session and broker invalidation through their owners with
+    /// journaled proofs: enumerate-then-act per live state, one restore
+    /// journal row per proof, fail closed on any refusal.
+    fn execute_authority_invalidations(
+        &mut self,
+        transaction: &RestoreTransaction,
+        target_id: &str,
+        live_fence: &StateFence,
+        verified: &VerifiedDestinationBinding,
+    ) -> Result<(SessionInvalidationProof, BrokerInvalidationProof), KernelRestoreError> {
+        let session_proof =
+            Self::invalidate_sessions(&self.journal, live_fence, verified)?;
+        let session_bytes = canonical_json_bytes(&session_proof)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        Self::journal_invalidation_row(
+            &mut self.journal,
+            transaction.transaction_id.as_str(),
+            target_id,
+            "session",
+            &session_bytes,
+        )?;
+        let broker_proof = Self::invalidate_brokers(&self.journal, live_fence, verified)?;
+        let broker_bytes = canonical_json_bytes(&broker_proof)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        Self::journal_invalidation_row(
+            &mut self.journal,
+            transaction.transaction_id.as_str(),
+            target_id,
+            "broker",
+            &broker_bytes,
+        )?;
+        Ok((session_proof, broker_proof))
+    }
+
+    /// Proposes and commits one lease terminal ticket through the lease
+    /// owner with readback proof: the first cutover prerequisite effect.
+    /// Any refusal fails closed before sessions, brokers, or the decision.
+    fn commit_lease_prerequisite(
+        lease_invalidation: &CutoverLeaseInvalidation<'_>,
+        journal: &KernelRestoreJournal,
+    ) -> Result<LeaseTerminalProof, KernelRestoreError> {
+        let ticket = Self::propose_lease_terminal_ticket(
+            lease_invalidation.authority,
+            lease_invalidation.lease_id,
+            lease_invalidation.operation,
+        )?;
+        Self::commit_lease_terminal(lease_invalidation.authority, &ticket, journal)
+    }
+
     /// Commits one terminal ticket through the lease owner and verifies the
     /// commit by owner validation plus live ORS readback.
     ///
@@ -865,6 +993,182 @@ impl KernelBackupRestore {
             lease_receipt_sha256: snapshot.receipt.receipt_sha256.clone(),
         })
     }
+
+    /// Requires the live control projection to agree with the live fence
+    /// before building invalidation inputs: same lineage text and same
+    /// epoch sequence. A lagging projection means authority moved under
+    /// the read and fails closed for retry — never caller arithmetic, only
+    /// exact owner-typed comparison.
+    fn require_current_lineage(
+        lineage: &EpochLineage,
+        live_fence: &StateFence,
+    ) -> Result<(), KernelRestoreError> {
+        if lineage.current.epoch != live_fence.authority_epoch.sequence.get()
+            || lineage.current.lineage_id.as_str()
+                != live_fence.authority_epoch.lineage_id.as_str()
+        {
+            return Err(KernelRestoreError::FenceMismatch(
+                "control projection is not current".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Builds one genuine detach/fence input for an owner-observed subject:
+    /// deterministic record identity, live lineage, live fence snapshot,
+    /// and an integrity-bound immutable locator. Every identity comes from
+    /// live owner state; failures fail closed before any effect.
+    fn invalidation_input(
+        subject: &str,
+        kind: &str,
+        lineage: &EpochLineage,
+        live_fence: &StateFence,
+    ) -> Result<OperationalRecordInput, KernelRestoreError> {
+        let target_failed =
+            |detail: String| KernelRestoreError::TargetFailed(BackupError::Target(detail));
+        let locator = PlatformHandle::new(format!("cutover-{kind}:{subject}"))
+            .map_err(|error| target_failed(error.to_string()))?;
+        let digest = sha256_hex(locator.as_str().as_bytes());
+        let context = OperationalRecordContext {
+            record_id: OpaqueLabel::new(format!("{subject}::cutover-{kind}"))
+                .map_err(|error| target_failed(error.to_string()))?,
+            subject_id: OpaqueLabel::new(subject.to_owned())
+                .map_err(|error| target_failed(error.to_string()))?,
+            authority_epoch: lineage.clone(),
+            state_fence: StateFenceSnapshot::capture(
+                live_fence,
+                live_fence.authority_epoch.sequence.get(),
+            )
+            .map_err(|error| target_failed(error.to_string()))?,
+            created_at_ms: i64::try_from(super::unix_ms()).unwrap_or(i64::MAX),
+            cleanup_after_ms: None,
+        };
+        OperationalRecordInput::immutable_locator(
+            context,
+            locator,
+            digest.clone(),
+            u64::try_from(digest.len()).unwrap_or(0),
+        )
+        .map_err(|error| target_failed(error.to_string()))
+    }
+
+    /// Bounds one proof payload: count plus digest of the exact receipt
+    /// identities, keeping the journaled decision small while the ORS
+    /// mutation rows hold every receipt.
+    fn invalidation_proof(receipt_ids: &[String]) -> Result<(u64, String), KernelRestoreError> {
+        let bytes = canonical_json_bytes(&receipt_ids)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let count = u64::try_from(receipt_ids.len()).map_err(|_| {
+            KernelRestoreError::ArchiveInvalid("invalidation receipt count overflow".to_owned())
+        })?;
+        Ok((count, sha256_hex(&bytes)))
+    }
+
+    /// Invalidates every live session through the session owner (Active →
+    /// Suspended): enumerate-then-act on live state per attempt, so
+    /// retries skip already-detached sessions. A post-loop re-read
+    /// requires the active set empty — concurrent activation during
+    /// invalidation refuses instead of cutting over with survivors.
+    fn invalidate_sessions(
+        journal: &KernelRestoreJournal,
+        live_fence: &StateFence,
+        verified: &VerifiedDestinationBinding,
+    ) -> Result<SessionInvalidationProof, KernelRestoreError> {
+        let target_failed =
+            |detail: String| KernelRestoreError::TargetFailed(BackupError::Target(detail));
+        let client = SessionOwnerClient::bind(verified);
+        let projection = journal
+            .read_control_projection()
+            .map_err(KernelRestoreError::TargetFailed)?;
+        Self::require_current_lineage(&projection.authority_lineage, live_fence)?;
+        let mut receipt_ids = Vec::with_capacity(projection.active_session_refs.len());
+        for subject in &projection.active_session_refs {
+            let input = Self::invalidation_input(
+                subject,
+                "detach",
+                &projection.authority_lineage,
+                live_fence,
+            )?;
+            let detach =
+                SessionDetach::new(input).map_err(|error| target_failed(error.to_string()))?;
+            let receipt = client
+                .detach(verified, journal, detach)
+                .map_err(|error| match error {
+                    super::backup_owner_clients::OwnerChannelError::Backup(inner) => {
+                        KernelRestoreError::TargetFailed(inner)
+                    }
+                    super::backup_owner_clients::OwnerChannelError::Lease(inner) => {
+                        KernelRestoreError::LeaseTerminal(inner.to_string())
+                    }
+                })?;
+            receipt_ids.push(receipt.receipt().record_id().as_str().to_owned());
+        }
+        let after = journal
+            .read_control_projection()
+            .map_err(KernelRestoreError::TargetFailed)?;
+        if !after.active_session_refs.is_empty() {
+            return Err(KernelRestoreError::FenceMismatch(
+                "sessions activated during invalidation".to_owned(),
+            ));
+        }
+        let (detached_count, receipts_digest) = Self::invalidation_proof(&receipt_ids)?;
+        Ok(SessionInvalidationProof {
+            detached_count,
+            receipts_digest,
+        })
+    }
+
+    /// Invalidates every live broker registration through the broker owner
+    /// (Active → Fenced) with the same enumerate-then-act and post-loop
+    /// empty-set discipline as sessions.
+    fn invalidate_brokers(
+        journal: &KernelRestoreJournal,
+        live_fence: &StateFence,
+        verified: &VerifiedDestinationBinding,
+    ) -> Result<BrokerInvalidationProof, KernelRestoreError> {
+        let target_failed =
+            |detail: String| KernelRestoreError::TargetFailed(BackupError::Target(detail));
+        let client = BrokerOwnerClient::bind(verified);
+        let projection = journal
+            .read_control_projection()
+            .map_err(KernelRestoreError::TargetFailed)?;
+        Self::require_current_lineage(&projection.authority_lineage, live_fence)?;
+        let mut receipt_ids = Vec::with_capacity(projection.active_user_broker_refs.len());
+        for subject in &projection.active_user_broker_refs {
+            let input = Self::invalidation_input(
+                subject,
+                "fence",
+                &projection.authority_lineage,
+                live_fence,
+            )?;
+            let fence =
+                UserBrokerFence::new(input).map_err(|error| target_failed(error.to_string()))?;
+            let receipt = client
+                .fence(verified, journal, fence)
+                .map_err(|error| match error {
+                    super::backup_owner_clients::OwnerChannelError::Backup(inner) => {
+                        KernelRestoreError::TargetFailed(inner)
+                    }
+                    super::backup_owner_clients::OwnerChannelError::Lease(inner) => {
+                        KernelRestoreError::LeaseTerminal(inner.to_string())
+                    }
+                })?;
+            receipt_ids.push(receipt.receipt().record_id().as_str().to_owned());
+        }
+        let after = journal
+            .read_control_projection()
+            .map_err(KernelRestoreError::TargetFailed)?;
+        if !after.active_user_broker_refs.is_empty() {
+            return Err(KernelRestoreError::FenceMismatch(
+                "brokers activated during invalidation".to_owned(),
+            ));
+        }
+        let (fenced_count, receipts_digest) = Self::invalidation_proof(&receipt_ids)?;
+        Ok(BrokerInvalidationProof {
+            fenced_count,
+            receipts_digest,
+        })
+    }
 /// Validates the #961 cutover path for one completed isolated restore:
     /// owner-approved isolated destination, separate cutover authority,
     /// epoch lineage strictly newer than every observed value, and a
@@ -890,16 +1194,17 @@ impl KernelBackupRestore {
     /// intent-before-effect ordering for cutover too.
     ///
     /// This path performs NO activation, retirement, route/process mutation,
-    /// or non-lease live-authority invalidation: runtime/session/route/
-    /// user-broker invalidation and cutover execution belong to the
+    /// or runtime live-authority invalidation: route/session binding
+    /// mechanics owned elsewhere (front-door sessions, generation routes,
+    /// module generations) plus cutover execution belong to the
     /// installer/Hume owner (#961), whose files are untouched here. The
-    /// lease leg alone executes here: the path proposes a terminal ticket
-    /// from live ORS state and commits it through the supervision-lease
-    /// owner (F2 repair). Without a bound lease there is no cutover; a
-    /// committed ticket without a journaled decision still leaves cutover
-    /// unperformed, and retry proposes fresh from current lease state
-    /// rather than replaying a consumed ticket. Rehearsal covers
-    /// validation, the ticket proposal and commit, and journaling the
+    /// lease, session, and broker legs execute here through their owners
+    /// (terminal ticket propose/commit with readback proof; session detach
+    /// and broker fence with journaled proofs). Without bound prerequisites
+    /// there is no cutover; effects without a journaled decision still
+    /// leave cutover unperformed, and retry re-runs enumerate-then-act
+    /// from live state rather than replaying consumed effects. Rehearsal
+    /// covers validation, prerequisite execution, and journaling the
     /// decision only.
     pub async fn request_cutover(
         &mut self,
@@ -932,7 +1237,7 @@ impl KernelBackupRestore {
                 "cutover destination is not the plan-admitted isolated root".to_owned(),
             ));
         }
-        let pinned = self
+        let (pinned, verified) = self
             .load_verified_destination_admission(destination, plan, bundle, live_fence)
             .await?;
         let transaction = self.check_cutover_stream_binding(plan, bundle, &pinned)?;
@@ -954,17 +1259,27 @@ impl KernelBackupRestore {
         // proof; verify by owner validation plus live ORS readback. Only a
         // committed ticket satisfies the lease leg of the denominator
         // below — the shape-only receipt never does.
-        let ticket = Self::propose_lease_terminal_ticket(
-            lease_invalidation.authority,
-            lease_invalidation.lease_id,
-            lease_invalidation.operation,
+        let lease_proof = Self::commit_lease_prerequisite(&lease_invalidation, &self.journal)?;
+        // Session and broker invalidation execute through their owners
+        // with journaled proofs; any refusal fails the cutover closed.
+        // Order is ticket, sessions, brokers: each prerequisite is
+        // retry-safe (enumerate-then-act on live state), and the decision
+        // below records every proof.
+        let (session_proof, broker_proof) = self.execute_authority_invalidations(
+            &transaction,
+            &plan.target.target_id,
+            live_fence,
+            &verified,
         )?;
-        let lease_proof =
-            Self::commit_lease_terminal(lease_invalidation.authority, &ticket, &self.journal)?;
         let evidence = evidence.ok_or(KernelRestoreError::OwnerEvidenceInvalid(
             "no observed restore evidence".to_owned(),
         ))?;
-        require_cutover_obligations(&evidence.obligations, bundle, Some(&lease_proof))
+        let invalidations = ExecutedInvalidations {
+            lease: Some(lease_proof.clone()),
+            session: Some(session_proof.clone()),
+            broker: Some(broker_proof.clone()),
+        };
+        require_cutover_obligations(&evidence.obligations, bundle, &invalidations)
             .map_err(KernelRestoreError::TargetFailed)?;
         let decision = ObservedCutoverDecision {
             plan_id: plan.plan_id.clone(),
@@ -979,6 +1294,10 @@ impl KernelBackupRestore {
             lease_id: lease_proof.lease_id.clone(),
             lease_revision: lease_proof.lease_revision,
             lease_receipt_sha256: lease_proof.lease_receipt_sha256.clone(),
+            session_detached_count: session_proof.detached_count,
+            session_receipts_digest: session_proof.receipts_digest.clone(),
+            broker_fenced_count: broker_proof.fenced_count,
+            broker_receipts_digest: broker_proof.receipts_digest.clone(),
             authorization_digest: pinned.authorization_digest.clone(),
             new_authority_epoch: cutover.new_authority_epoch.clone(),
             new_resource_generation: cutover.new_resource_generation,
@@ -1036,15 +1355,17 @@ fn suspended_entries(
 /// exact reconciliation owner can issue.
 ///
 /// The lease leg is additionally satisfied by a lease-owner-committed
-/// terminal ticket (F2 repair): the finalize-built evidence cannot know the
-/// ticket the cutover path commits, so a verified commit recorded in the
-/// decision satisfies the leg. Without one, the evidence leg applies
-/// unchanged — and since finalize never marks it satisfied, cutover
-/// refuses with the exact lease owner.
+/// terminal ticket (F2 repair), and the session/broker legs by executed
+/// owner invalidations recorded in the decision: the finalize-built
+/// evidence cannot know cutover-time effects, so verified executions
+/// recorded here satisfy their legs. Without one, the evidence leg
+/// applies unchanged — and since finalize never marks them satisfied,
+/// cutover refuses with the exact owner. Route and runtime have no
+/// in-tree executors, so they pass by evidence only.
 fn require_cutover_obligations(
     obligations: &RestoreObligations,
     bundle: &BackupBundle,
-    lease_terminal: Option<&LeaseTerminalProof>,
+    invalidations: &ExecutedInvalidations,
 ) -> Result<(), BackupError> {
     fn require(
         capability: &'static str,
@@ -1103,10 +1424,16 @@ fn require_cutover_obligations(
     for (obligation, capability, applicable) in list {
         require(capability, obligation, applicable)?;
     }
-    // Lease leg: a lease-owner-committed terminal ticket recorded in this
-    // decision satisfies it; otherwise the evidence leg applies unchanged.
-    if lease_terminal.is_none() {
+    // Executed-invalidation legs: a recorded owner execution satisfies
+    // the leg; otherwise the evidence leg applies unchanged.
+    if invalidations.lease.is_none() {
         require(owners::LEASE, &obligations.lease_invalidation, true)?;
+    }
+    if invalidations.session.is_none() {
+        require(owners::SESSION, &obligations.session_invalidation, true)?;
+    }
+    if invalidations.broker.is_none() {
+        require(owners::USER_BROKER, &obligations.user_broker_invalidation, true)?;
     }
     Ok(())
 }
@@ -1143,6 +1470,10 @@ struct ObservedCutoverDecision {
     lease_id: String,
     lease_revision: u64,
     lease_receipt_sha256: String,
+    session_detached_count: u64,
+    session_receipts_digest: String,
+    broker_fenced_count: u64,
+    broker_receipts_digest: String,
     authorization_digest: String,
     new_authority_epoch: EpochId,
     new_resource_generation: ResourceGeneration,
