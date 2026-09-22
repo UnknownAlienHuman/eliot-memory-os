@@ -168,12 +168,22 @@ pub fn pose_self_query(
 /// Pose a self-query with source citation.
 ///
 /// Every source triple the input cites must resolve to a current projected
-/// ref first; only then does the owner pose run. Stale or uncited sources
-/// fail closed before any digest freezes.
+/// ref first, and the projection fence must be compatible with the input's
+/// governing job fence; only then does the owner pose run. Stale or uncited
+/// sources, or a drifted projection fence, fail closed before any digest
+/// freezes.
 pub fn pose_with_sources(
     input: &SelfQueryInput,
     sources: &AcceptedSourceProjection,
 ) -> Result<SelfQueryPoseReceipt, SelfQueryContractError> {
     check_citations(&cited_sources(input), sources)?;
+    if !sources
+        .fence
+        .is_compatible_with(&input.validated_candidate.job.state_fence)
+    {
+        return Err(SelfQueryContractError::BindingMismatch {
+            field: "cited.projection_fence",
+        });
+    }
     pose_self_query(input)
 }

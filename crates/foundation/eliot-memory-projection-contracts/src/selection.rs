@@ -251,6 +251,9 @@ pub struct MemorySelectionTrace {
     pub allowlist: Vec<MemoryKind>,
     /// Canonical digest of the intent that produced this trace.
     pub intent_digest: String,
+    /// Policy ceiling echoed from the policy that bounded this trace.
+    /// Auditors recheck `selected <= policy_ceiling` without the policy.
+    pub policy_ceiling: usize,
     /// One entry per batch record, in deterministic provider order.
     pub entries: Vec<SelectionEntry>,
     /// Selection denominator over exactly the presented records.
@@ -282,6 +285,12 @@ impl MemorySelectionTrace {
                     reason: "must be 64 lowercase hex characters",
                 },
             ));
+        }
+        if self.policy_ceiling == 0 || self.policy_ceiling > crate::MEMORY_PROJECTION_MAX_RECORDS {
+            return Err(SelectionError::BoundViolated {
+                value: self.policy_ceiling,
+                bound: crate::MEMORY_PROJECTION_MAX_RECORDS,
+            });
         }
         let mut selected = 0usize;
         let mut not_selected = 0usize;
@@ -321,6 +330,13 @@ impl MemorySelectionTrace {
                 },
             ));
         }
+        if self.coverage.selected > self.policy_ceiling {
+            return Err(SelectionError::Upstream(
+                MemoryProjectionError::CoverageMismatch {
+                    reason: "selected exceeds the echoed policy ceiling",
+                },
+            ));
+        }
         // The batch denominator is never echoed here by construction: this
         // type has no field for it.
         Ok(())
@@ -334,6 +350,12 @@ impl MemorySelectionTrace {
 /// limit; records outside it are recorded as not selected. More passing
 /// records than the limit admits fails closed with [`SelectionError::LimitExceeded`];
 /// selection never cuts silently and never reorders provider order.
+///
+/// The trace binds all three governors: the intent through `intent_digest`,
+/// the policy through the echoed `policy_ceiling` (recheckable as
+/// `selected <= policy_ceiling` without the policy), and the batch
+/// structurally (one entry per batch record in provider order under the
+/// checked binding equality; batches carry no digest field to echo).
 ///
 /// The returned trace is fully validated. It is a static selection record,
 /// not an applicability verdict and not edge, product, or W9-consumer
@@ -394,6 +416,7 @@ pub fn select(
         binding: intent.binding.clone(),
         allowlist: intent.kinds.clone(),
         intent_digest: intent_digest(intent)?,
+        policy_ceiling: policy.max_selected,
         entries,
         coverage: SelectionCoverage {
             considered: batch.records.len(),
