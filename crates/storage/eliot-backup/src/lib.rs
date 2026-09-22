@@ -27,6 +27,7 @@ use thiserror::Error;
 mod isolated_restore;
 mod portable_recovery;
 mod product_command;
+mod product_run;
 mod restore_runner;
 
 pub use isolated_restore::{
@@ -40,6 +41,9 @@ pub use portable_recovery::{
 pub use product_command::{
     BackupCreateArgs, BackupCreatePreview, RestorePreview, parse_backup_class,
     preview_backup_create, preview_restore,
+};
+pub use product_run::{
+    IssueReport, RestoreEpochSpec, RestoreRunReport, issue_backup, run_restore,
 };
 pub use restore_runner::{
     FileRestoreJournal, FileRestoreTarget, RunnerOutcome, execute_isolated_restore,

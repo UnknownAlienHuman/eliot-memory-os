@@ -51,4 +51,6 @@ workspace = true
 
 [dev-dependencies]
 eliot-installation = { workspace = true, features = ["test-support"] }
+eliot-security-contracts.workspace = true
+eliot-store-api.workspace = true
 tempfile = "3.23"
