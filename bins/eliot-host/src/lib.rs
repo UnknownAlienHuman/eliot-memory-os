@@ -1826,21 +1826,13 @@ impl HostJobBranches {
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let response = decode_control_response_frame(&response)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            if response.message_id != probe_request.message_id
-                || response.request_digest != probe_request.payload_digest
-                || response.error.is_some()
-                || response.state != KernelServiceState::Ready
-            {
-                return Err(HostError::ProcessContour(
-                    "Kernel ProbeReady response binding failed".to_owned(),
-                ));
-            }
-            let ready = response.receipt.ok_or_else(|| {
-                HostError::ProcessContour("Kernel did not return a ready receipt".to_owned())
-            })?;
-            ready
-                .validate_for_probe(&probe_request, &activation_receipt)
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            // Startup uses the same canonical carrier gate as every later
+            // readiness probe. A ready receipt alone cannot authorize the
+            // activation: the owner-produced health/compatibility evidence
+            // must bind to this exact request, generation, epoch, process,
+            // and health vector before Host commits Active.
+            let (ready, _runtime_health) =
+                validate_probe_response(&probe_request, &activation_receipt, &response)?;
             Ok((activation_receipt, ready))
         });
         let (activation_receipt, ready) = match ready {
