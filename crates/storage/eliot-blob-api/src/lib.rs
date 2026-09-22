@@ -44,7 +44,10 @@ pub const CONTRACT_NAME: &str = "eliot.storage.blob";
 pub const CONTRACT_VERSION: &str = "s-04-v2";
 
 pub mod backup_io;
-pub use backup_io::{BlobBackupScope, SealedBlobCaptureRecord};
+pub use backup_io::{
+    BlobBackupCompletionReceipt, BlobBackupFence, BlobBackupPage, BlobBackupPartial,
+    BlobBackupScope, PageCompletion, SealedBlobCaptureRecord, BLOB_BACKUP_GENESIS,
+};
 
 fn valid_text(value: &str, field: &'static str) -> Result<(), BlobError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
