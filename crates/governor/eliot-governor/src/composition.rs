@@ -23,7 +23,8 @@ use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::reactive_owner_projection::ReactiveOwnerSource;
 use crate::reactive_owner_suppliers::GovernorReactiveOwnerSuppliers;
 use crate::reactive_projections::{
-    ReactiveProjectionError, accepted_evidence_for, validate_owner_sources,
+    GovernorReactiveProjectionSet, ReactiveProjectionError, accepted_evidence_for,
+    validate_owner_sources,
 };
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
@@ -1850,6 +1851,45 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         self.reactive_suppliers
             .install_delivery_policy(activation, evidence, policy)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Publishes one complete owner-produced reactive projection set.
+    ///
+    /// The owner lanes use this boundary once they have retained all six
+    /// semantic values.  Governor supplies the activation and accepted
+    /// evidence binding itself, validates the cue/index rows against its one
+    /// admitted journal, and atomically installs the complete set for the
+    /// existing daemon cadence.  A partial or caller-shaped set is rejected
+    /// before any supplier slot changes.
+    pub fn publish_reactive_owner_projections(
+        &self,
+        now: u64,
+        projections: GovernorReactiveProjectionSet,
+    ) -> Result<(), CompositionError> {
+        let (activation, evidence) = self.reactive_publication_binding(now)?;
+        let policy_owner = self.owners.policy.as_ref().ok_or_else(|| {
+            CompositionError::Owner(
+                "reactive delivery policy owner is unavailable; projection withheld".to_owned(),
+            )
+        })?;
+        if policy_owner.state_fence() != &activation.state_fence
+            || policy_owner.snapshot().state_fence != activation.state_fence
+            || policy_owner.snapshot().scope_id != activation.work_scope_id
+            || projections.delivery_policy.policy_id.as_str() != policy_owner.snapshot().snapshot_id
+        {
+            return Err(CompositionError::Owner(
+                "reactive delivery policy is not bound to the admitted Policy owner".to_owned(),
+            ));
+        }
+        validate_owner_sources(
+            &self.owners.observation,
+            &activation,
+            &projections.owner_sources,
+        )
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reactive_suppliers
+            .install_projection_set(activation, evidence, projections)
             .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 

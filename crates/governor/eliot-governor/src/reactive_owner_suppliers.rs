@@ -262,6 +262,68 @@ impl GovernorReactiveOwnerSuppliers {
         Ok(self.read(activation)?.owner_sources)
     }
 
+    /// Retains one complete set emitted by the semantic owners.
+    ///
+    /// This is the production owner handoff: all six typed values and the
+    /// admitted cue/index rows are validated against one activation before
+    /// any slot is replaced.  Keeping the write atomic prevents a cadence
+    /// tick from observing a mixture of revisions from separate owner calls.
+    /// The values remain owner outputs; this method does not derive a missing
+    /// projection or manufacture an empty/default value.
+    pub(crate) fn install_projection_set(
+        &self,
+        activation: GovernorActivationSnapshot,
+        evidence: ReactiveAcceptedEvidence,
+        projections: GovernorReactiveProjectionSet,
+    ) -> Result<(), ReactiveProjectionError> {
+        evidence.validate_against(&activation)?;
+        projections.validate_against(&activation)?;
+        let binding = OwnerBinding {
+            activation,
+            evidence,
+        };
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| ReactiveProjectionError::Poisoned)?;
+        if state.state_fence != binding.activation.state_fence {
+            return Err(ReactiveProjectionError::StaleProjection {
+                projection: "owner_suppliers",
+                field: "state_fence",
+            });
+        }
+        state.ensure_binding(&binding);
+        state.context_view = Some(BoundOwnerValue {
+            binding: binding.clone(),
+            value: projections.context_view,
+        });
+        state.cue_activation = Some(BoundOwnerValue {
+            binding: binding.clone(),
+            value: projections.cue_activation,
+        });
+        state.session_delivery = Some(BoundOwnerValue {
+            binding: binding.clone(),
+            value: projections.session_delivery,
+        });
+        state.critical_attention = Some(BoundOwnerValue {
+            binding: binding.clone(),
+            value: projections.critical_attention,
+        });
+        state.integration_coverage = Some(BoundOwnerValue {
+            binding: binding.clone(),
+            value: projections.integration_coverage,
+        });
+        state.delivery_policy = Some(BoundOwnerValue {
+            binding: binding.clone(),
+            value: projections.delivery_policy,
+        });
+        state.owner_sources = Some(BoundOwnerValue {
+            binding,
+            value: projections.owner_sources,
+        });
+        Ok(())
+    }
+
     pub(crate) fn install_context_view(
         &self,
         activation: GovernorActivationSnapshot,
