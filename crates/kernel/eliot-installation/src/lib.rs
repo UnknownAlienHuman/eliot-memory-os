@@ -150,8 +150,10 @@ pub use approved_generation_registry::{
     phase_b_digest_state, phase_b_scm_selector,
 };
 use approved_generation_registry::{
-    ActiveVerifiedReceiptBinding, PendingActivationTerminal, PendingActivationTerminalDisposition,
+    ActiveVerifiedReceiptBinding, PendingActivationAbortReceipt, PendingActivationTerminal,
+    PendingActivationTerminalDisposition, activation_abort_receipt_digest,
     activation_terminal_digest, candidate_manifest_digest, phase_b_scm_digest,
+    activation_projection_intent_digest,
     registry_projection_identity, validate_phase_b_scm_digest,
 };
 #[cfg(test)]
@@ -9264,6 +9266,96 @@ where
 }
 
 impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
+    /// Rolls back a first-install activation intent only after the Host-owned
+    /// registry has durably acknowledged the exact `ABORTED` terminal.
+    ///
+    /// The ordinary `rollback` seam deliberately continues to reject a
+    /// transaction carrying an activation intent.  Production recovery callers
+    /// must supply the already-open Host owner capability and registry through
+    /// this explicit owner-aware seam; no caller-supplied approval fields are
+    /// accepted.
+    pub fn rollback_with_activation_owner(
+        &mut self,
+        registry: &RedbInstallationRegistry,
+        host: &HostOwnerEpochCapability,
+        transaction_id: &PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let transaction = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let Some(intent) = transaction.activation_projection_intent().cloned() else {
+            return self.inner.rollback(transaction_id);
+        };
+        if transaction.stage() != InstallationStage::Activating {
+            return Err(InstallationError::IllegalTransition {
+                from: transaction.stage(),
+                to: InstallationStage::RolledBack,
+            });
+        }
+        if transaction.no_return_boundary.is_some() || transaction.active_verified_receipt.is_some()
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "activation rollback is refused after the no-return or committed-activation boundary"
+                    .to_owned(),
+            ));
+        }
+        if transaction.current_active_manifest.is_some() || transaction.last_known_good.is_some() {
+            return Err(InstallationError::IncompleteObservation(
+                "activation-intent rollback is restricted to a first installation".to_owned(),
+            ));
+        }
+        // This is the pre-no-return contour: service starts, credential, and
+        // Phase-B effects are still pending and carry no runtime receipt.
+        transaction.require_signed_pending_activation_effects()?;
+        let approval = intent.derive_verified_approval(&transaction)?;
+        let activation_intent_digest = activation_projection_intent_digest(&intent)?;
+        let expected_transaction = TransactionVersion::of(&transaction)?;
+        let abort_evidence = match registry.read_exact_aborted_activation_ack(
+            host,
+            transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest.generation,
+            &approval,
+            &activation_intent_digest,
+        )? {
+            Some(evidence) => evidence,
+            None => {
+                let pending_revision = registry.read_exact_pending_activation_revision(
+                    host,
+                    transaction_id,
+                    &transaction.installer_plan_digest,
+                    &approval,
+                )?;
+                registry.abort_pending_activation(host, pending_revision, &approval)?;
+                registry
+                    .read_exact_aborted_activation_ack(
+                        host,
+                        transaction_id,
+                        &transaction.installer_plan_digest,
+                        &transaction.candidate_manifest.generation,
+                        &approval,
+                        &activation_intent_digest,
+                    )?
+                    .ok_or_else(|| {
+                        InstallationError::IncompleteObservation(
+                            "Host abort returned without the exact durable ABORTED terminal"
+                                .to_owned(),
+                        )
+                    })?
+            }
+        };
+        let mut cleared = transaction;
+        cleared.prepare_pre_no_return_rollback(abort_evidence)?;
+        <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+            self.inner.store_mut(),
+            expected_transaction,
+            &cleared,
+        )?;
+        self.inner.rollback(transaction_id)
+    }
     /// Projects bootstrap only after the transaction CAS has retained the
     /// activation projection intent.  The registry remains a projection and
     /// cannot become the first durable owner of this handoff.
