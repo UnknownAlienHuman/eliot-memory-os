@@ -17,7 +17,9 @@
 //!
 //! ```text
 //! operation_id  = the admitted claim operation identity
-//! process_tree  = the admitted claim identity (distinct type, one value)
+//! process_tree  = the admitted work-scope identity (distinct type, one
+//!                 admitted string: the runtime envelope binds the tree to
+//!                 the work scope, and the owner join closes over it)
 //! job_id        = the admitted operation identity (distinct type, one value)
 //! image_id      = "wasm-host-image-" + short(owner-measured host digest)
 //! session_id    = the admitted claim identity (distinct type, one value)
@@ -69,11 +71,10 @@ use eliot_security_contracts::{
     InstructionTaint, IntegrityStatus, PrivacyClass, QuarantineState, SourceAssurance,
 };
 use eliot_wasm_runtime::{
-    ArtifactAccessLimits, AuthorityResolutionPort, CancellationPolicy, CapabilityId,
-    ComponentEnginePort, ComponentManifest, EngineBinding, EngineInvocation, EngineTermination,
-    EpochPolicy, ExecutionContour, GovernorResolutionPort, InvocationId, InvocationLimits,
-    InvocationRequest, OwnerId, P03ProcessPort, ProcessBinding, Revision, Sha256Digest,
-    SourceVerificationPort, WorkScopeRef, WorkUnitId,
+    ArtifactAccessLimits, CancellationPolicy, CapabilityId, ComponentManifest, EngineBinding,
+    EpochPolicy, ExecutionContour, InvocationId, InvocationLimits, InvocationRequest, OwnerId,
+    P03ReceiptVerifierPort, ProcessBinding, Revision, RuntimePorts, Sha256Digest, WasmRuntime,
+    WorkScopeRef, WorkUnitId,
 };
 
 use crate::child_engine::IsolatedChildEngine;
@@ -294,7 +295,7 @@ fn derive_drive_intent(
     let argv = guest_exec_argv(material, directory)?;
     ProcessIntent::new(
         OperationId::new(material.operation_id.clone()).map_err(|_| intent_field("operation"))?,
-        ProcessTreeId::new(material.claim_id.clone()).map_err(|_| intent_field("tree"))?,
+        ProcessTreeId::new(material.work.work_scope.clone()).map_err(|_| intent_field("tree"))?,
         JobId::new(material.operation_id.clone()).map_err(|_| intent_field("job"))?,
         ImageId::new(format!("wasm-host-image-{short}")).map_err(|_| intent_field("image"))?,
         SessionId::new(material.claim_id.clone()).map_err(|_| intent_field("session"))?,
@@ -744,209 +745,6 @@ fn acquire_admission(
 fn engine_binding_for(installed: &crate::installed_binary::InstalledBinary) -> EngineBinding {
     crate::grant_launch::grant_engine_binding(installed)
 }
-
-/// Runs the promotion port check: the query binds the request digest,
-/// component, generation, contour, and digests; the oracle expectations
-/// come from the owner record. Verdicts stay unevaluated until lifecycle
-/// evidence is threaded, so only Conformance admits downstream.
-fn promotion_verification(
-    admission: &mut GovernorWasmAdmission,
-    request: &InvocationRequest,
-    governor: &eliot_wasm_runtime::GovernorResolution,
-) -> Result<eliot_wasm_runtime::PromotionVerification, DriveError> {
-    use eliot_wasm_runtime::PromotionVerificationPort;
-    let query = eliot_wasm_runtime::PromotionQuery {
-        request_digest: request.request_digest().clone(),
-        component_id: request.component_id.clone(),
-        generation: governor.generation.clone(),
-        contour: request.requested_contour,
-        artifact_digest: governor.manifest.artifact_digest.clone(),
-        interface_digest: governor.manifest.interface_digest.clone(),
-        state_contract_digest: governor.manifest.state_contract_digest.clone(),
-    };
-    PromotionVerificationPort::verify(admission, &query).map_err(|_| DriveError::Admission {
-        field: "promotion-verify",
-    })
-}
-
-/// Derives the snapshot fence the accepted grant carries: the snapshot
-/// epoch plus the snapshot generation, both enforced equal to the grant
-/// fence at material validation.
-fn snapshot_fence(material: &ValidatedDispatchMaterial) -> Result<StateFence, DriveError> {
-    let generation = ResourceGeneration::new(material.snapshot.generation).map_err(|_| {
-        DriveError::Admission {
-            field: "snapshot-generation",
-        }
-    })?;
-    Ok(StateFence::new(
-        material.snapshot.authority_epoch.clone(),
-        generation,
-    ))
-}
-
-/// Assembles the engine invocation mirroring the runtime mapping field
-/// for field: identities from the request, manifest/limits/generation/
-/// lease/revisions from the Governor resolution, owner/scope from the
-/// authority resolution, assurance revisions from source, corpus and
-/// receipt digests from promotion, and the real process binding plus
-/// start receipt from the issued request.
-fn assemble_invocation(
-    request: &InvocationRequest,
-    governor: &eliot_wasm_runtime::GovernorResolution,
-    authority: &eliot_wasm_runtime::AuthorityResolution,
-    source: &eliot_wasm_runtime::SourceVerification,
-    promotion: &eliot_wasm_runtime::PromotionVerification,
-    process_binding: ProcessBinding,
-    process_start_receipt: eliot_process::ProcessStartReceipt,
-) -> Result<EngineInvocation, DriveError> {
-    // Mirrors the runtime mapping field for field; every value threads a
-    // live resolution or the request, and every digest recomputed upstream.
-    Ok(EngineInvocation {
-        invocation_id: request.invocation_id.clone(),
-        request_digest: request.request_digest().clone(),
-        component_id: request.component_id.clone(),
-        contour: request.requested_contour,
-        manifest: governor.manifest.clone(),
-        imports: governor.manifest.imports.clone(),
-        exports: governor.manifest.exports.clone(),
-        allowed_host_calls: authority.allowed_host_calls.clone(),
-        allowed_effect_proposals: authority.allowed_effect_proposals.clone(),
-        generation: governor.generation.clone(),
-        lease: governor.lease.clone(),
-        owner: authority.owner.clone(),
-        work_unit: authority.work_unit.clone(),
-        work_scope: authority.work_scope.clone(),
-        authority_revision: governor.authority_revision,
-        lifecycle_revision: governor.lifecycle_revision,
-        source_assurance: source.assurance.clone(),
-        source_verification_revision: source.verification_revision,
-        promotion_verification_revision: promotion.verification_revision,
-        conformance_corpus_digest: promotion.corpus_digest.clone(),
-        governor_resolution_receipt_digest: governor.resolution_receipt_digest.clone(),
-        authority_resolution_receipt_digest: authority.resolution_receipt_digest.clone(),
-        source_verification_receipt_digest: source.verification_receipt_digest.clone(),
-        promotion_verification_receipt_digest: promotion.verification_receipt_digest.clone(),
-        state_contract_digest: governor.manifest.state_contract_digest.clone(),
-        limits: governor.limits.clone(),
-        input: request.input.clone(),
-        deterministic_seed: request.deterministic_seed,
-        process_binding,
-        process_start_receipt,
-    })
-}
-
-/// Conformance-only direct invocation gate: Shadow without lifecycle
-/// verdicts would bypass the runtime promotion gate, so it stays denied
-/// here until verdict evidence is threaded (A13.3 residual).
-fn ensure_conformance_direct(contour: &ExecutionContour) -> Result<(), DriveError> {
-    if !matches!(contour, ExecutionContour::Conformance) {
-        return Err(DriveError::Admission {
-            field: "contour-direct",
-        });
-    }
-    Ok(())
-}
-
-/// Seated engine invocation over the reaped child: authorizes the grant,
-/// seats the engine on the shared binding, assembles the invocation, and
-/// invokes. Returns the canonical engine report with real guest output.
-fn invoke_admitted(
-    material: &ValidatedDispatchMaterial,
-    executable: &Path,
-    host_digest: &Sha256Digest,
-    engine_binding: &EngineBinding,
-    executor: &Arc<WindowsProcessExecutor>,
-    sink: &Arc<dyn ProcessEvidenceSink>,
-    governor: &eliot_wasm_runtime::GovernorResolution,
-    authority: &eliot_wasm_runtime::AuthorityResolution,
-    source: &eliot_wasm_runtime::SourceVerification,
-    promotion: &eliot_wasm_runtime::PromotionVerification,
-    request: &InvocationRequest,
-    binding: ProcessBinding,
-    start_receipt: eliot_process::ProcessStartReceipt,
-    now_ms: u64,
-) -> Result<DispatchDriveResponse, DriveError> {
-    let invoked = |field: &'static str| DriveError::Invocation { field };
-    if material.grant.expires_at() <= now_ms {
-        return Err(DriveError::Authority(DispatchAuthorityError::Unavailable {
-            field: "grant-window",
-        }));
-    }
-    if governor.manifest.engine != *engine_binding {
-        return Err(invoked("engine-binding"));
-    }
-    let executable_text = executable.to_str().ok_or(DriveError::Invocation {
-        field: "executable",
-    })?;
-    let accepted = crate::grant_client::AcceptedGrant {
-        component_id: material.ceilings.component_id.clone(),
-        artifact_digest: Sha256Digest::of_bytes(&material.artifact_bytes),
-        interface_digest: Sha256Digest::of_bytes(crate::wasmtime_provider::guest_wit_bytes()),
-        fence: snapshot_fence(material)?,
-        epoch: material.authority_epoch.clone(),
-        nonce: material.launch_nonce.clone(),
-        deadline_unix_ms: material.grant.expires_at(),
-        host_executable_path: executable_text.to_owned(),
-        host_artifact_digest: host_digest.clone(),
-    };
-    let authorized = crate::grant_authorization::authorize_grant(
-        &accepted,
-        executable_text,
-        host_digest,
-        &material.artifact_bytes,
-        &crate::wasmtime_provider::guest_wit_bytes(),
-    )
-    .map_err(|_| invoked("authorize"))?;
-    let mut engine = IsolatedChildEngine::for_authorized_grant(
-        Arc::clone(executor),
-        Arc::clone(sink),
-        engine_binding.clone(),
-        &authorized,
-        crate::wasmtime_provider::provider_configuration_digest(),
-    );
-    ensure_conformance_direct(&request.requested_contour)?;
-    let invocation = assemble_invocation(
-        request,
-        governor,
-        authority,
-        source,
-        promotion,
-        binding,
-        start_receipt,
-    )?;
-    let report = engine.invoke(&invocation).map_err(|_| invoked("invoke"))?;
-    if !matches!(report.termination, EngineTermination::Completed) {
-        return Err(DriveError::Execution {
-            stage: "termination",
-        });
-    }
-    let peak = report
-        .usage
-        .peak_memory_bytes
-        .ok_or(DriveError::Execution { stage: "metering" })?;
-    let tables = report
-        .usage
-        .table_elements
-        .ok_or(DriveError::Execution { stage: "metering" })?;
-    let ticks = report
-        .usage
-        .epoch_ticks
-        .ok_or(DriveError::Execution { stage: "metering" })?;
-    Ok(DispatchDriveResponse {
-        operation_id: material.operation_id.clone(),
-        component_id: material.ceilings.component_id.clone(),
-        artifact_digest: material.ceilings.artifact_digest.as_str().to_owned(),
-        input_digest: material.ceilings.input_digest.as_str().to_owned(),
-        host_artifact_digest: host_digest.as_str().to_owned(),
-        output_digest: Sha256Digest::of_bytes(&report.output).as_str().to_owned(),
-        output: report.output,
-        fuel_consumed: report.usage.fuel_consumed,
-        peak_memory_bytes: peak,
-        table_elements: u64::from(tables),
-        epoch_ticks: ticks,
-    })
-}
-
 /// Drives one admitted dispatch to the canonical response through the
 /// documented admission path and the existing isolated child engine:
 /// contour admission over real bytes, owner-record assembly, Governor
@@ -987,28 +785,11 @@ fn drive_material(
     // owner, scope, assurance, limits, revisions, caps, promotion. The
     // factory re-proves coherence and re-hashes digests; its receipts are
     // recomputed from retained content, never minted.
-    let mut admission = acquire_admission(material, &engine_binding, &admitted)?;
-    // Live resolutions from the retained admission: each port re-checks
-    // the request binding and returns receipt-bound records.
-    let governor = GovernorResolutionPort::resolve(&mut admission, &request).map_err(|_| {
-        DriveError::Admission {
-            field: "governor-resolve",
-        }
-    })?;
-    let authority_res =
-        AuthorityResolutionPort::resolve(&mut admission, &request).map_err(|_| {
-            DriveError::Admission {
-                field: "authority-resolve",
-            }
-        })?;
-    let source = SourceVerificationPort::verify(&mut admission, &request).map_err(|_| {
-        DriveError::Admission {
-            field: "source-verify",
-        }
-    })?;
-    let promotion = promotion_verification(&mut admission, &request, &governor)?;
-    // One-shot issue over the derived authority, then the real start. The
-    // issued request binds the runtime envelope the owner join closes.
+    let admission = acquire_admission(material, &engine_binding, &admitted)?;
+    // Live resolutions from the retained admission happen inside the
+    // runtime execute below; the drive does not resolve twice.
+    // One-shot issue over the derived authority. The issued request binds
+    // the runtime envelope the owner join closes.
     let working_directory = executable
         .parent()
         .ok_or(DriveError::Intent {
@@ -1031,36 +812,168 @@ fn drive_material(
     let intent = derive_drive_intent(material, &executable, &host_digest, &working_directory)?;
     let now_ms = now_unix_ms()?;
     let issued = issue_drive_permit(material, &dispatch_authority, &intent, now_ms)?;
-    let binding = ProcessBinding::from_request(&issued);
     let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(
         DriveAuthorityPort::new(dispatch_authority),
     )));
     let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(BoundedDriveSink::new());
-    let mut process = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink));
-    // Single ownership of the request value: the adapter's staged slot
-    // serves the runtime `prepare` path (which needs P-02 launch
-    // evidence); the parent drive moves the issued request straight into
-    // `start`, then the engine reaps the same operation. No second
-    // invocation, no retry of the effect.
-    let start_receipt = process
-        .start(issued)
-        .map_err(|_| DriveError::Execution { stage: "start" })?;
-    invoke_admitted(
-        material,
-        &executable,
+    // Engine seating from the authorized grant (deadline enforced; the
+    // wire accept path is absent on this channel). The binding is the
+    // shared grant-derived object, so the engine gate binds the exact
+    // authorized digests.
+    if material.grant.expires_at() <= now_ms {
+        return Err(DriveError::Authority(DispatchAuthorityError::Unavailable {
+            field: "grant-window",
+        }));
+    }
+    let accepted = accepted_from_material(material, &executable, &host_digest)?;
+    let executable_text = executable.to_str().ok_or(DriveError::Invocation {
+        field: "executable",
+    })?;
+    let authorized = crate::grant_authorization::authorize_grant(
+        &accepted,
+        executable_text,
         &host_digest,
-        &engine_binding,
-        &executor,
-        &sink,
-        &governor,
-        &authority_res,
-        &source,
-        &promotion,
-        &request,
-        binding,
-        start_receipt,
-        now_ms,
+        &material.artifact_bytes,
+        &crate::wasmtime_provider::guest_wit_bytes(),
     )
+    .map_err(|_| DriveError::Invocation { field: "authorize" })?;
+    let engine = IsolatedChildEngine::for_authorized_grant(
+        Arc::clone(&executor),
+        Arc::clone(&sink),
+        engine_binding,
+        &authorized,
+        crate::wasmtime_provider::provider_configuration_digest(),
+    );
+    // Retain the full port set: the SAME admission object backs all four
+    // resolution ports, the process adapter fronts the derived authority,
+    // the receipt verifier re-proves binding/receipt/envelope agreement,
+    // and the engine is seated above. Then stage the issued request for
+    // the runtime prepare path and execute through the retained ports:
+    // resolve, prepare, start, invoke, and classify (including the
+    // differential and lifecycle gates) all run inside.
+    let process = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink));
+    process
+        .stage_admitted_request(issued)
+        .map_err(|_| DriveError::Execution { stage: "stage" })?;
+    let ports = RuntimePorts::new(
+        Box::new(admission.clone()),
+        Box::new(admission.clone()),
+        Box::new(admission.clone()),
+        Box::new(admission),
+        Box::new(process),
+        Box::new(DriveReceiptVerifier),
+        Box::new(engine),
+    );
+    let mut runtime = WasmRuntime::new(Some(ports));
+    let result = runtime.execute(request);
+    map_invocation_result(&result, material, &host_digest)
+}
+
+/// Derives the snapshot fence the accepted grant carries: the snapshot
+/// epoch plus the snapshot generation, both enforced equal to the grant
+/// fence at material validation.
+fn snapshot_fence(material: &ValidatedDispatchMaterial) -> Result<StateFence, DriveError> {
+    let generation = ResourceGeneration::new(material.snapshot.generation).map_err(|_| {
+        DriveError::Admission {
+            field: "snapshot-generation",
+        }
+    })?;
+    Ok(StateFence::new(
+        material.snapshot.authority_epoch.clone(),
+        generation,
+    ))
+}
+
+/// Builds the wire-accepted grant observations from owner-channel records:
+/// digests recompute from real bytes, fence and epoch thread the snapshot
+/// and grant, nonce and deadline thread the material, and the host binding
+/// names the resolved image. The authorize call re-proves bytes and
+/// binding; this constructor shapes, never proves.
+fn accepted_from_material(
+    material: &ValidatedDispatchMaterial,
+    executable: &Path,
+    host_digest: &Sha256Digest,
+) -> Result<crate::grant_client::AcceptedGrant, DriveError> {
+    let executable_text = executable.to_str().ok_or(DriveError::Invocation {
+        field: "executable",
+    })?;
+    Ok(crate::grant_client::AcceptedGrant {
+        component_id: material.ceilings.component_id.clone(),
+        artifact_digest: Sha256Digest::of_bytes(&material.artifact_bytes),
+        interface_digest: Sha256Digest::of_bytes(crate::wasmtime_provider::guest_wit_bytes()),
+        fence: snapshot_fence(material)?,
+        epoch: material.authority_epoch.clone(),
+        nonce: material.launch_nonce.clone(),
+        deadline_unix_ms: material.grant.expires_at(),
+        host_executable_path: executable_text.to_owned(),
+        host_artifact_digest: host_digest.clone(),
+    })
+}
+
+/// Maps a classified invocation result to the canonical drive response:
+/// success carries the real guest output with recomputed digests and
+/// measured metering; differential and promotion denials surface as
+/// admission taxonomy (owner-data mismatch, never fabricated output);
+/// every other verdict fails closed with unknown outcome preserved.
+fn map_invocation_result(
+    result: &eliot_wasm_runtime::InvocationResult,
+    material: &ValidatedDispatchMaterial,
+    host_digest: &Sha256Digest,
+) -> Result<DispatchDriveResponse, DriveError> {
+    use eliot_wasm_runtime::{InvocationDisposition, RuntimeError};
+    match (&result.receipt.disposition, &result.receipt.error) {
+        (InvocationDisposition::Succeeded, _) => {}
+        (InvocationDisposition::Rejected, Some(RuntimeError::DifferentialMismatch)) => {
+            return Err(DriveError::Admission {
+                field: "differential",
+            });
+        }
+        (InvocationDisposition::Rejected, Some(RuntimeError::PromotionDenied)) => {
+            return Err(DriveError::Admission { field: "promotion" });
+        }
+        (InvocationDisposition::Rejected, _) => {
+            return Err(DriveError::Execution { stage: "rejected" });
+        }
+        (InvocationDisposition::Unavailable, _) => {
+            return Err(DriveError::Execution {
+                stage: "unavailable",
+            });
+        }
+        (InvocationDisposition::Unknown, _) => {
+            return Err(DriveError::Execution { stage: "unknown" });
+        }
+    }
+    let output = result
+        .output
+        .clone()
+        .ok_or(DriveError::Execution { stage: "response" })?;
+    let usage = result
+        .receipt
+        .usage
+        .clone()
+        .ok_or(DriveError::Execution { stage: "response" })?;
+    let peak = usage
+        .peak_memory_bytes
+        .ok_or(DriveError::Execution { stage: "metering" })?;
+    let tables = usage
+        .table_elements
+        .ok_or(DriveError::Execution { stage: "metering" })?;
+    let ticks = usage
+        .epoch_ticks
+        .ok_or(DriveError::Execution { stage: "metering" })?;
+    Ok(DispatchDriveResponse {
+        operation_id: material.operation_id.clone(),
+        component_id: material.ceilings.component_id.clone(),
+        artifact_digest: material.ceilings.artifact_digest.as_str().to_owned(),
+        input_digest: material.ceilings.input_digest.as_str().to_owned(),
+        host_artifact_digest: host_digest.as_str().to_owned(),
+        output_digest: Sha256Digest::of_bytes(&output).as_str().to_owned(),
+        output,
+        fuel_consumed: usage.fuel_consumed,
+        peak_memory_bytes: peak,
+        table_elements: u64::from(tables),
+        epoch_ticks: ticks,
+    })
 }
 
 /// `Arc`-shared dispatch authority fronting the executor. The authority is
@@ -1083,6 +996,60 @@ impl eliot_process_executor::DispatchValidationPort for DriveAuthorityPort {
         observed: eliot_process::SuspendedProcessIdentity,
     ) -> Result<eliot_process::ValidatedDispatch, ProcessExecutionError> {
         self.authority.validate_and_consume(request, observed)
+    }
+}
+
+/// Narrow P-03 receipt verifier: re-proves binding/receipt/envelope
+/// agreement on real records without minting proof. Start requires the
+/// receipt to name the bound operation and digest plus the envelope
+/// invocation; cancellation (never driven here) checks the same binding;
+/// reconciliation requires a terminal lifecycle on the bound operation.
+struct DriveReceiptVerifier;
+
+impl P03ReceiptVerifierPort for DriveReceiptVerifier {
+    fn verify_start(
+        &mut self,
+        binding: &ProcessBinding,
+        receipt: &eliot_process::ProcessStartReceipt,
+        envelope: &eliot_wasm_runtime::ProcessLaunchEnvelope,
+    ) -> Result<(), eliot_wasm_runtime::PortError> {
+        use eliot_wasm_runtime::PortError;
+        if receipt.operation_id() != binding.operation_id()
+            || receipt.request_digest() != binding.request_digest()
+            || envelope.invocation_id.as_str() != binding.operation_id().as_str()
+        {
+            return Err(PortError::Denied);
+        }
+        Ok(())
+    }
+
+    fn verify_cancellation(
+        &mut self,
+        binding: &ProcessBinding,
+        _receipt: &eliot_process::CancellationReceipt,
+        envelope: &eliot_wasm_runtime::ProcessLaunchEnvelope,
+    ) -> Result<(), eliot_wasm_runtime::PortError> {
+        use eliot_wasm_runtime::PortError;
+        if envelope.invocation_id.as_str() != binding.operation_id().as_str() {
+            return Err(PortError::Denied);
+        }
+        Ok(())
+    }
+
+    fn verify_reconciliation(
+        &mut self,
+        binding: &ProcessBinding,
+        evidence: &eliot_process::ProcessEvidence,
+        envelope: &eliot_wasm_runtime::ProcessLaunchEnvelope,
+    ) -> Result<(), eliot_wasm_runtime::PortError> {
+        use eliot_wasm_runtime::PortError;
+        if envelope.invocation_id.as_str() != binding.operation_id().as_str() {
+            return Err(PortError::Denied);
+        }
+        if !evidence.view().lifecycle().is_terminal() {
+            return Err(PortError::UnknownOutcome);
+        }
+        Ok(())
     }
 }
 
@@ -1434,8 +1401,18 @@ mod tests {
         let source = eliot_wasm_runtime::SourceVerificationPort::verify(&mut admission, &request)
             .expect("source verifies");
         let _ = source;
-        let promotion = promotion_verification(&mut admission, &request, &governor)
-            .expect("promotion verifies");
+        let query = eliot_wasm_runtime::PromotionQuery {
+            request_digest: request.request_digest().clone(),
+            component_id: request.component_id.clone(),
+            generation: governor.generation.clone(),
+            contour: request.requested_contour,
+            artifact_digest: governor.manifest.artifact_digest.clone(),
+            interface_digest: governor.manifest.interface_digest.clone(),
+            state_contract_digest: governor.manifest.state_contract_digest.clone(),
+        };
+        let promotion =
+            eliot_wasm_runtime::PromotionVerificationPort::verify(&mut admission, &query)
+                .expect("promotion verifies");
         assert_eq!(
             promotion.corpus_digest.as_str(),
             Sha256Digest::of_bytes(b"admit-corpus").as_str()
@@ -1463,18 +1440,67 @@ mod tests {
         ));
     }
 
-    /// Conformance-only direct invocation: Shadow stays denied until
-    /// lifecycle verdicts are threaded.
+    /// Result mapping denies without fabricating output: differential and
+    /// promotion mismatches surface as admission taxonomy, every other
+    /// non-success verdict fails closed with unknown outcome preserved.
     #[test]
-    fn shadow_direct_invocation_denied() {
+    fn result_mapping_denies_without_output() {
+        use eliot_wasm_runtime::{InvocationDisposition, InvocationId, RuntimeError};
+        let material = admission_material(b"intent-artifact", b"intent-input");
+        let host_digest = Sha256Digest::of_bytes(b"intent-host-image");
+        let receipt = |disposition: InvocationDisposition, error: Option<RuntimeError>| {
+            eliot_wasm_runtime::InvocationReceipt {
+                invocation_id: InvocationId::new("operation-map-001").expect("invocation"),
+                request_digest: Sha256Digest::of_bytes(b"map-request"),
+                disposition,
+                error,
+                output_digest: None,
+                effect_digest: None,
+                state_delta_digest: None,
+                engine_binding: None,
+                usage: None,
+                reconciliation_required: false,
+            }
+        };
+        let result = |disposition: InvocationDisposition, error: Option<RuntimeError>| {
+            eliot_wasm_runtime::InvocationResult {
+                receipt: receipt(disposition, error),
+                output: None,
+                proposed_effects: Vec::new(),
+                observed_state_delta: None,
+            }
+        };
         assert_eq!(
-            ensure_conformance_direct(&eliot_wasm_runtime::ExecutionContour::Shadow),
+            map_invocation_result(
+                &result(
+                    InvocationDisposition::Rejected,
+                    Some(RuntimeError::DifferentialMismatch)
+                ),
+                &material,
+                &host_digest
+            ),
             Err(DriveError::Admission {
-                field: "contour-direct"
+                field: "differential"
             })
         );
-        assert!(
-            ensure_conformance_direct(&eliot_wasm_runtime::ExecutionContour::Conformance).is_ok()
+        assert_eq!(
+            map_invocation_result(
+                &result(
+                    InvocationDisposition::Rejected,
+                    Some(RuntimeError::PromotionDenied)
+                ),
+                &material,
+                &host_digest
+            ),
+            Err(DriveError::Admission { field: "promotion" })
+        );
+        assert_eq!(
+            map_invocation_result(
+                &result(InvocationDisposition::Unknown, None),
+                &material,
+                &host_digest
+            ),
+            Err(DriveError::Execution { stage: "unknown" })
         );
     }
 

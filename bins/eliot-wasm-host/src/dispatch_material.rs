@@ -738,10 +738,7 @@ fn check_manifest_record(
         world: record.world.clone(),
         target: record.target.clone(),
         source_digest: hex_digest(&record.source_digest, "manifest-source-digest")?,
-        state_contract_digest: hex_digest(
-            &record.state_contract_digest,
-            "manifest-state-digest",
-        )?,
+        state_contract_digest: hex_digest(&record.state_contract_digest, "manifest-state-digest")?,
         required_verifier: record.required_verifier.clone(),
         privacy_classes: record.privacy_classes.clone(),
         state_class: record.state_class.clone(),
@@ -865,14 +862,8 @@ fn check_promotion_record(
 ) -> Result<ValidatedPromotionRecord, MaterialError> {
     Ok(ValidatedPromotionRecord {
         corpus_digest: hex_digest(&record.corpus_digest, "promotion-corpus")?,
-        expected_result_digest: hex_digest(
-            &record.expected_result_digest,
-            "promotion-result",
-        )?,
-        expected_effect_digest: hex_digest(
-            &record.expected_effect_digest,
-            "promotion-effects",
-        )?,
+        expected_result_digest: hex_digest(&record.expected_result_digest, "promotion-result")?,
+        expected_effect_digest: hex_digest(&record.expected_effect_digest, "promotion-effects")?,
         expected_state_delta_digest: hex_digest(
             &record.expected_state_delta_digest,
             "promotion-state-delta",
