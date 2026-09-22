@@ -46,7 +46,7 @@ Set-StrictMode -Version Latest
 $script:AuthenticodeCodeSigningEku = '1.3.6.1.5.5.7.3.3'
 $script:X509EnhancedKeyUsageExtensionOid = '2.5.29.37'
 $script:AuthenticodeSigningPolicy = 'authenticode-rfc3161'
-$script:AuthenticodeSigningScope = 'runtime-materializer-nine-plus-cli-pe-roles'
+$script:AuthenticodeSigningScope = 'runtime-materializer-ten-plus-cli-pe-roles'
 $script:StagingOwnerMarker = '.eliot-release-staging-owner'
 $script:Rfc3161TimestampAttributeOid = '1.3.6.1.4.1.311.3.3.1'
 $script:Rfc3161TstInfoContentTypeOid = '1.2.840.113549.1.9.16.1.4'
@@ -601,7 +601,7 @@ function Close-NativeDirectoryPin([object]$Pin) {
 }
 
 function Get-AuthenticodeRoleDefinitions {
-    # The nine non-CLI executable roles are admitted by
+    # The ten non-CLI executable roles are admitted by
     # bins/eliot/src/source_bundle_materializer.rs::REQUIRED_ROLES.  The Rust
     # CLI is an additional trust role: it is the install-authoritative front
     # door named by the production handoff, but it is not a Phase-A payload
@@ -622,6 +622,7 @@ function Get-AuthenticodeRoleDefinitions {
         [ordered]@{ role = 'doctor'; path = 'runtime/eliot-doctor.exe' }
         [ordered]@{ role = 'testd'; path = 'runtime/eliot-testd.exe' }
         [ordered]@{ role = 'native_worker'; path = 'runtime/eliot-native-worker.exe' }
+        [ordered]@{ role = 'wasm_host'; path = 'runtime/eliot-wasm-host.exe' }
     )
 }
 

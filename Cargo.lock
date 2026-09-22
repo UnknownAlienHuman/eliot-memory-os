@@ -981,6 +981,7 @@ name = "eliot-context"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-cue-contracts",
  "eliot-evidence",
  "schemars",
  "serde",
@@ -1171,11 +1172,20 @@ name = "eliot-cues"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-change-monitor",
  "eliot-contracts",
+ "eliot-cue-activation",
+ "eliot-cue-binding",
  "eliot-cue-contracts",
+ "eliot-cue-index",
+ "eliot-cue-normalizer",
  "eliot-evidence",
+ "eliot-observation",
+ "eliot-observation-contracts",
+ "eliot-receipts",
  "schemars",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
