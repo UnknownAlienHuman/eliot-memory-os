@@ -25,6 +25,8 @@ mod artifact_preflight;
 mod child_engine;
 mod cli_contract;
 mod contour;
+mod dispatch_drive;
+mod dispatch_material;
 mod guest_exec;
 mod installed_binary;
 mod shadow;
@@ -44,6 +46,21 @@ pub use contour::{
     PINNED_WASMTIME_VERSION, PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET,
     STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
     authorize_host_call, check_activation_imports, check_admitted_request,
+};
+pub use dispatch_drive::{
+    DispatchDriveResponse, DriveError, GUEST_EXEC_ARGV0_HINT, LifecycleVerdicts, SeatedVerdicts,
+    drive_admission, evaluate_lifecycle_verdicts, evaluate_seated_verdicts, guest_exec_argv,
+};
+pub use dispatch_material::{
+    DISPATCH_MATERIAL_MAX_BYTES, WASM_DISPATCH_MATERIAL_WIRE_ID,
+    WASM_DISPATCH_MATERIAL_WIRE_VERSION, WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+    WASM_HOST_GUEST_INPUT_FILE_NAME, WASM_HOST_MATERIAL_FILE_NAME, DispatchMaterialInput,
+    MaterialError, ValidatedAssuranceInput, ValidatedDispatchGrant, ValidatedDispatchMaterial,
+    ValidatedGuestCeilings, ValidatedGuestCeilingsInput, ValidatedManifestInput,
+    ValidatedManifestRecord, ValidatedPromotionInput, ValidatedPromotionRecord,
+    ValidatedSnapshotInput, ValidatedSnapshotRecord, ValidatedWorkInput, ValidatedWorkRecord,
+    ValidatedAssuranceRecord, admitted_material_path, bind_dispatch_material, consume_staged,
+    read_staged_bytes,
 };
 pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
