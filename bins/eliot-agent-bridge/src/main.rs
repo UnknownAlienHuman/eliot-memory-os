@@ -4,8 +4,9 @@ mod request_input;
 
 use eliot_agent_bridge::{
     BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError, CurrentAssessment,
-    HotResourceView, InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap,
-    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
+    HotResourceView, InjectionReceipt, Profile, ScopeLevel, ToolResultReceipt,
+    UnderstandingBootstrap, kernel_ports_with_declaration, parse_args,
+    reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
@@ -199,6 +200,19 @@ enum Response {
         /// reader. Absent otherwise — never estimated, never invented.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<HotResourceView>,
+        /// Byte-bound delivery receipt projected for this delivery.
+        ///
+        /// Present only when the route owner's measured attestation for the
+        /// exact delivered bytes was projected through digest-bound intake:
+        /// result digest, admissible source handle, tokens rendered under
+        /// the actual route tokenizer, and owner-observed delivery
+        /// completeness. This is the delivery receipt, distinct from the
+        /// evidence slot above (which names WHERE the bytes live, not what
+        /// they cost or how completely they delivered). Absent otherwise,
+        /// with the key absent on the wire — never estimated, never
+        /// invented.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<ToolResultReceipt>,
     },
     Cancellation {
         result: HostCancellationResult,
@@ -569,6 +583,7 @@ fn main() {
             Ok(Request::Invoke { request }) => {
                 let mut response =
                     handle_invocation(&host_gateway, &mut *host_request_port, &request);
+                record_exact_resource_delivery(&mut runner, &request.tool, &mut response);
                 record_invocation_delivery(&mut runner, &mut response);
                 response
             }
@@ -758,11 +773,69 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
             completion,
             bootstrap: None,
             evidence: None,
+            receipt: None,
         },
         Err(error) => host_gateway_error(&error),
     }
 }
 
+/// Records one owner-attested exact-resource delivery after gateway
+/// return and projects its canonical handle onto the outgoing Invocation
+/// response.
+///
+/// Runs first on the normal Invoke path with the admitted tool and the
+/// exact authenticated outcome the gateway produced: only an `eliot.query`
+/// naming an `exact_resource_uri` whose outcome carries the serving
+/// owner's resource attestation (handle URI, artifact digest, exact size,
+/// live session/fence scope all bound) publishes canonically at the
+/// queried URI via [`BridgeRunner::record_exact_resource_delivery`]. The
+/// gateway-shaped result and completion are never touched: only the
+/// additive `evidence` slot is filled. A `None` (any unattested shape)
+/// leaves the response for the existing overflow-evidence path below,
+/// which still fills the slot only when IT yields a snapshot.
+fn record_exact_resource_delivery(
+    runner: &mut BridgeRunner,
+    tool: &ToolRequest,
+    response: &mut Response,
+) {
+    if let Response::Invocation {
+        result, evidence, ..
+    } = response
+    {
+        if evidence.is_none()
+            && let Some(view) = runner.record_exact_resource_delivery(tool, result.outcome())
+        {
+            *evidence = Some(view);
+        }
+    }
+}
+
+/// Attaches one projected delivery receipt onto the outgoing Invocation
+/// response.
+///
+/// The receipt arrives already projected through digest-bound intake (see
+/// [`BridgeRunner::project_carrier_delivery`]): this callsite mints,
+/// verifies, and estimates nothing — it only files the receipt into the
+/// `receipt` slot when the response is an invocation envelope whose slot
+/// is still empty. A filled slot is never overwritten (first attestation
+/// wins); any other response shape is untouched, with the key absent on
+/// the wire. This is the delivery receipt slot, distinct from the
+/// `evidence` slot (addressable-bytes view) filled above.
+///
+/// Staged: the only receipt producer its caller needs
+/// ([`BridgeRunner::project_carrier_delivery`]) takes owner-held
+/// measurement inputs that no live path supplies yet — A5's turn-driver
+/// pump owns the material caller (anchor in CONTROL). Until that caller
+/// lands, this entry is exercised by proof only, exactly like the staged
+/// result-flow hook was before its join.
+#[allow(dead_code)]
+fn attach_delivery_receipt(response: &mut Response, receipt: ToolResultReceipt) {
+    if let Response::Invocation { receipt: slot, .. } = response
+        && slot.is_none()
+    {
+        *slot = Some(receipt);
+    }
+}
 /// Records one supported tool-result delivery after gateway return and
 /// projects its handle onto the outgoing Invocation response.
 ///
@@ -2457,23 +2530,28 @@ mod tests {
     /// `UnavailableKernelHostRequestPort` placeholder does for rejections.
     mod tool_result_delivery_tests {
         use super::super::{
-            BridgeRunner, Profile, record_invocation_delivery, status_response,
+            BridgeRunner, Profile, attach_delivery_receipt, record_exact_resource_delivery,
+            record_invocation_delivery, status_response,
         };
         use super::{
             HostInvocationRequest, PortFailure, decode_bounded_request,
             handle_invocation,
         };
         use eliot_agent_bridge_core::{
-            ActivationPortOutcome, ActivationPortResult, AttachRequest, DemandId, FencingToken,
-            Generation, HostActivationPort, PrincipalId, ProviderFailure, ProviderReadiness,
-            SessionId, TaskId, WorkUnitId,
+            ActivationPortOutcome, ActivationPortResult, AttachRequest, DemandId, DeliveryStatus,
+            FencingToken, Generation, HostActivationPort, PrincipalId, ProviderFailure,
+            ProviderReadiness, SessionId, TaskId, WorkUnitId,
         };
-        use eliot_contracts::{EpochId, EpochLineageId};
+        use eliot_contracts::{
+            ArtifactId, EpochId, EpochLineageId, ResourceGeneration, SessionId as OwnerSessionId,
+            StateFence,
+        };
         use eliot_mcp::{
-            HostInvocationPortOutcome, HostOperationHandle, KernelHostRequestPort, McpResponse,
+            HostInvocationPortOutcome, HostOperationHandle,
+            KernelHostRequestPort, McpResponse, ResourceHandle as McpResourceHandle,
             ResponseKind,
         };
-        use eliot_receipts::ProofCeiling;
+        use eliot_receipts::{ArtifactBinding, ProofCeiling, ReceiptKind, SessionBinding};
         use std::num::NonZeroU64;
 
         const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -2786,6 +2864,180 @@ mod tests {
             assert!(
                 value.get("evidence").is_none(),
                 "detached recording must not project a handle"
+            );
+        }
+
+        const EXACT_URI: &str = "eliot://evidence/source-9";
+
+        fn live_fence() -> StateFence {
+            StateFence::new(
+                EpochId::new(
+                    EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                    std::num::NonZeroU64::new(2).expect("nonzero test sequence"),
+                )
+                .expect("valid test epoch"),
+                ResourceGeneration::new(5).expect("non-zero test generation"),
+            )
+        }
+
+        fn owner_resource_handle(uri: &str, bytes: &[u8]) -> McpResourceHandle {
+            let fence = live_fence();
+            McpResourceHandle {
+                uri: uri.to_owned(),
+                artifact: ArtifactBinding {
+                    artifact_id: ArtifactId::new("artifact-delivery-9").expect("artifact id"),
+                    sha256: eliot_contracts::sha256_hex(bytes),
+                    role: ReceiptKind::Artifact,
+                    source_revision: None,
+                },
+                media_type: "application/json".to_owned(),
+                size_bytes: bytes.len() as u64,
+                session: SessionBinding {
+                    session_id: OwnerSessionId::new("session-delivery-1").expect("session"),
+                    authority_epoch: fence.authority_epoch.clone(),
+                    state_fence: fence,
+                },
+            }
+        }
+
+        fn responded_with(
+            content: serde_json::Value,
+            resource: Option<McpResourceHandle>,
+        ) -> McpResponse {
+            let mut response = projection_response(ResponseKind::Projection, content);
+            response.canonical_tool_name = "eliot.query".to_owned();
+            response.resource = resource;
+            response
+        }
+
+        #[test]
+        fn exact_resource_canonical_publish_wins_evidence_slot() {
+            // Exact production order: gateway dispatch, exact-owner
+            // recording, then the overflow-evidence path. An owner-attested
+            // exact-URI delivery publishes canonically at the queried URI —
+            // the evidence slot names the requested resource, not a
+            // content-addressed fallback — and the second path leaves it.
+            let mut runner = attached_runner();
+            let request = query_request();
+            let bytes = serde_json::to_vec(&large_content()).expect("content serializes");
+            let mut port = RespondedPort {
+                response: responded_with(
+                    large_content(),
+                    Some(owner_resource_handle(EXACT_URI, &bytes)),
+                ),
+            };
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_exact_resource_delivery(&mut runner, &request.tool, &mut response);
+            record_invocation_delivery(&mut runner, &mut response);
+            let super::Response::Invocation { evidence, .. } = &response else {
+                panic!("invoke must answer an invocation envelope");
+            };
+            let view = evidence
+                .as_ref()
+                .expect("exact-URI delivery must carry its view");
+            assert_eq!(
+                view.handle().uri().as_str(),
+                EXACT_URI,
+                "canonical publish names the requested URI, not a content address"
+            );
+            assert_eq!(runner.resource_registry_len(), 1);
+            let expanded = runner
+                .expand_resource(view.handle())
+                .expect("expand resolves the exact URI");
+            assert_eq!(expanded, bytes);
+        }
+
+        #[test]
+        fn exact_resource_fallthrough_keeps_evidence_path() {
+            // Without an owner attestation the exact wrapper yields nothing
+            // and the existing overflow-evidence path behaves byte-identically
+            // to before: large served bytes stay content-addressed.
+            let mut runner = attached_runner();
+            let request = query_request();
+            let mut port = RespondedPort {
+                response: responded_with(large_content(), None),
+            };
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_exact_resource_delivery(&mut runner, &request.tool, &mut response);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 1);
+            let super::Response::Invocation { evidence, .. } = &response else {
+                panic!("invoke must answer an invocation envelope");
+            };
+            let uri = evidence
+                .as_ref()
+                .expect("large served bytes still record evidence")
+                .handle()
+                .uri()
+                .as_str()
+                .to_owned();
+            assert!(
+                uri.starts_with("eliot://evidence/") && uri != EXACT_URI,
+                "fallback stays content-addressed, got {uri}"
+            );
+            // A refused exact-URI leg withholds on both paths: no canonical
+            // publish under a caller-asserted URI, no evidence, no receipt.
+            let mut runner = attached_runner();
+            let mut port = super::UnavailableKernelHostRequestPort;
+            let mut response =
+                handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_exact_resource_delivery(&mut runner, &request.tool, &mut response);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(value.get("evidence").is_none(), "rejection projects no handle");
+            assert!(value.get("receipt").is_none(), "rejection projects no receipt");
+        }
+
+        #[test]
+        fn delivery_receipt_slot_fills_once_and_stays_absent_otherwise() {
+            // The delivery receipt slot is distinct from the evidence slot:
+            // first projected attestation wins, later ones never overwrite,
+            // and the key stays absent on the wire until one lands.
+            let runner = attached_runner();
+            let request = invoke_request();
+            let mut port = RespondedPort {
+                response: projection_response(ResponseKind::Projection, large_content()),
+            };
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(value.get("receipt").is_none(), "no receipt before projection");
+            let bytes = serde_json::to_vec(&large_content()).expect("content serializes");
+            let uri = eliot_agent_bridge_core::ResourceUri::parse("eliot://evidence/source-9")
+                .expect("fixture URI parses");
+            let first = runner
+                .project_tool_result_receipt(&bytes, uri.clone(), 7, DeliveryStatus::Full)
+                .expect("route-owner projection lands");
+            attach_delivery_receipt(&mut response, first);
+            let second = runner
+                .project_tool_result_receipt(&bytes, uri, 9, DeliveryStatus::Full)
+                .expect("second projection lands");
+            attach_delivery_receipt(&mut response, second);
+            let super::Response::Invocation { receipt, .. } = &response else {
+                panic!("invoke must answer an invocation envelope");
+            };
+            let kept = receipt.as_ref().expect("receipt slot must hold");
+            assert_eq!(
+                kept.tokens_rendered(),
+                7,
+                "first attestation wins; later ones never overwrite"
+            );
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert_eq!(
+                value["receipt"]["tokens_rendered"],
+                serde_json::Value::Number(7.into()),
+                "projected receipt rides its own wire key"
+            );
+            // Non-invocation shapes are untouched by the slot.
+            let mut forwarded = super::Response::Forwarded {
+                bootstrap: None,
+                reactive_receipts: Vec::new(),
+            };
+            attach_delivery_receipt(&mut forwarded, kept.clone());
+            let value = serde_json::to_value(&forwarded).expect("response must serialize");
+            assert!(
+                value.get("receipt").is_none(),
+                "forwarded shapes carry no delivery receipt"
             );
         }
     }
