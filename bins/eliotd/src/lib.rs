@@ -162,8 +162,9 @@ pub use process_origin::{
     request_origin_control,
 };
 pub use reactive_feed::{
+    BorrowedReactiveFeedOwner, ReactiveFeedOwnerSnapshot, ReactiveFeedOwnerSource,
     ReactiveFeedSupplyError, drive_daemon_feed, drive_daemon_feed_from_owners,
-    project_live_bindings,
+    drive_daemon_feed_from_source, project_live_bindings,
 };
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
@@ -327,6 +328,10 @@ pub struct DaemonComposition {
     /// execute. Semantics stay in the Governor registry; this is the
     /// composition root's handle on that view.
     capability_admission: GovernorCapabilityAdmission,
+    /// Optional live A4 owner source. The source is a read-only composition
+    /// hook; it retains no queue or delivery authority and is invoked afresh
+    /// under the Governor activation fence on each scheduling tick.
+    reactive_feed_source: Option<Arc<dyn reactive_feed::ReactiveFeedOwnerSource>>,
 }
 
 impl DaemonComposition {
@@ -387,6 +392,7 @@ impl DaemonComposition {
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
+            reactive_feed_source: None,
         })
     }
 
@@ -460,6 +466,52 @@ impl DaemonComposition {
     #[must_use]
     pub fn policy_owner(&self) -> Option<&eliot_governor::PolicyOwner> {
         self.governor.owners().policy.as_ref()
+    }
+
+    /// Registers the one live A4 owner source used by the daemon scheduler.
+    ///
+    /// Registration only installs a read-only adapter. The adapter must read
+    /// the six typed projections from their real owners for each tick; this
+    /// composition does not retain a projection snapshot, queue, receipt, or
+    /// alternate authority. Duplicate registration is rejected so two
+    /// reactive schedulers cannot race the same activation.
+    pub fn register_reactive_feed_source(
+        &mut self,
+        source: Arc<dyn reactive_feed::ReactiveFeedOwnerSource>,
+    ) -> Result<(), DaemonError> {
+        if self.reactive_feed_source.is_some() {
+            return Err(DaemonError::Lifecycle(
+                "reactive feed owner source is already registered".to_owned(),
+            ));
+        }
+        self.reactive_feed_source = Some(source);
+        Ok(())
+    }
+
+    /// Drives the registered owner source from the existing activation-poll
+    /// cadence. `None` means no A4 source has been registered yet; it is an
+    /// explicit unconfigured state and never a fabricated empty feed.
+    pub fn drive_registered_reactive_feed(
+        &self,
+        now: u64,
+    ) -> Result<Option<eliot_reactive_context_plan::SettledPlanFeedOutcome>, DaemonError> {
+        let Some(source) = self.reactive_feed_source.as_ref() else {
+            return Ok(None);
+        };
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let snapshot = self
+            .governor
+            .read_unique_agent_activation(now)
+            .map_err(DaemonError::Composition)?;
+        reactive_feed::drive_daemon_feed_from_source(
+            &snapshot,
+            &self.governor.owners().observation,
+            source.as_ref(),
+        )
+        .map(Some)
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Drives one reactive Context feed from the live daemon composition.

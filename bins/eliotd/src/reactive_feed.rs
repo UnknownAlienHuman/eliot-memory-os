@@ -24,44 +24,29 @@
 //!                 identities, no planning semantics.
 //! ```
 //!
-//! Absent runtime suppliers (named exactly, never built here):
-//!
-//! ```text
-//! - Admitted records: no live readable admitted set exists; the view
-//!   arrives from its owner. Needed: a Governor context/evidence admission
-//!   implementation of `read_current_admitted_set(&StateFence)`.
-//! - Observed cues: no live minter of `ObservedCue`/`ActivationRequest`
-//!   exists. Needed: a cue-lane mapping from authenticated tool/host
-//!   observations (bridge tool-result records via A1's
-//!   `record_tool_result_delivery`) into `ActivationRequest` seeds.
-//! - Attention members: the Governor owns the semantics but retains no live
-//!   member projection. Needed: a Governor coordination implementation of
-//!   `read_open_attention(&StateFence)`.
-//! - Coverage evidence: no live verified-coverage, watchdog, or trace
-//!   suppliers exist. Needed: integration/supervision implementations
-//!   feeding `IntegrationCoverageProfile::candidate`/`verify` and
-//!   `GovernorCoverageDerivation::derive`.
-//! - Delivery policy issuance: no live policy owner exists. Needed: a policy
-//!   implementation issuing `ReactiveDeliveryPolicy` over the delivery
-//!   profile, contract, and bounds.
-//! - Live snapshot accessor: the daemon runtime holds the composition, not
-//!   this module. Requested (A3-serialized tiny export, never taken here):
-//!   a `DaemonComposition` accessor returning the live
-//!   `GovernorActivationSnapshot`, plus this module's `mod`/`pub use`
-//!   wiring in `bins/eliotd/src/lib.rs`.
-//! ```
+//! The runtime source is deliberately owner-shaped: each six-input method is
+//! called for the fresh authenticated activation, and the returned values are
+//! validated before the planner runs. Current main has no registered source
+//! for those typed projections yet; the scheduler therefore reports an
+//! explicit unconfigured state and never fills the gap with an empty view,
+//! policy, receipt, or queue. A3's Kernel/resource expansion and the A4
+//! owning lanes can register their concrete source through the public seam.
 
 #![allow(clippy::result_large_err)]
 
+use eliot_context_contracts::{
+    ContextPlanningView, CriticalAttentionProjection, IntegrationCoverageProfile,
+    SessionDeliverySnapshot,
+};
 use eliot_contracts::{ArtifactId, SessionId};
 use eliot_governor::{
-    project_reactive_owner_from_sources, GovernorActivationSnapshot, ReactiveOwnerProjection,
-    ReactiveOwnerProjectionError, ReactiveOwnerSource,
+    GovernorActivationSnapshot, ReactiveObservationCueProjection, ReactiveOwnerProjection,
+    ReactiveOwnerProjectionError, ReactiveOwnerSource, project_reactive_owner_from_sources,
 };
 use eliot_observation::ObservationJournal;
 use eliot_reactive_context_plan::{
-    drive_live_feed, LiveActivationBindings, SettledPlanFeedError, SettledPlanFeedInputs,
-    SettledPlanFeedOutcome,
+    LiveActivationBindings, SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
+    drive_live_feed,
 };
 use eliot_receipts::WorkScopeId;
 
@@ -80,6 +65,22 @@ pub enum ReactiveFeedSupplyError {
     /// The A4 feed contained a cue or atom binding that was not present in the
     /// same current owner projection.
     OwnerFeedBindingMismatch { field: &'static str },
+    /// A named owner could not supply one of the six typed feed projections.
+    OwnerRead {
+        projection: &'static str,
+        reason: String,
+    },
+    /// A supplied owner projection failed its own contract validation.
+    OwnerInputInvalid {
+        projection: &'static str,
+        reason: String,
+    },
+    /// A supplied owner projection is valid in isolation but belongs to a
+    /// different authenticated activation.
+    OwnerInputStale {
+        projection: &'static str,
+        field: &'static str,
+    },
     /// The liveness gate, planner, or producer reported; carried verbatim.
     Feed(SettledPlanFeedError),
 }
@@ -95,12 +96,319 @@ impl std::fmt::Display for ReactiveFeedSupplyError {
             Self::OwnerFeedBindingMismatch { field } => {
                 write!(formatter, "reactive feed owner binding mismatch: {field}")
             }
+            Self::OwnerRead { projection, reason } => {
+                write!(
+                    formatter,
+                    "reactive feed owner read {projection} failed: {reason}"
+                )
+            }
+            Self::OwnerInputInvalid { projection, reason } => write!(
+                formatter,
+                "reactive feed owner projection {projection} is invalid: {reason}"
+            ),
+            Self::OwnerInputStale { projection, field } => write!(
+                formatter,
+                "reactive feed owner projection {projection} is stale at {field}"
+            ),
             Self::Feed(error) => write!(formatter, "reactive feed: {error}"),
         }
     }
 }
 
 impl std::error::Error for ReactiveFeedSupplyError {}
+
+/// Read-only owner source for the six typed inputs required by the A4
+/// planner. Each method must read the retained projection from its owning
+/// lane; this boundary does not construct a projection, seal a digest, or
+/// substitute an empty value.
+pub trait ReactiveFeedOwnerSource: Send + Sync {
+    /// Read the assembled A15 context view for the exact activation.
+    fn read_context_view(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<ContextPlanningView, String>;
+    /// Read the retained A10 request/result pair for the exact activation.
+    fn read_cue_activation(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<eliot_reactive_context_plan::ReactiveCueActivation, String>;
+    /// Read the immutable A1/session delivery history for the exact activation.
+    fn read_session_snapshot(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<SessionDeliverySnapshot, String>;
+    /// Read the current Critical Attention projection for the exact activation.
+    fn read_critical_attention(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<CriticalAttentionProjection, String>;
+    /// Read the current verified coverage/watchdog/trace profile for the exact activation.
+    fn read_integration_coverage(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<IntegrationCoverageProfile, String>;
+    /// Read the owner-issued delivery policy for the exact activation.
+    fn read_policy(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<eliot_reactive_context_plan::ReactiveDeliveryPolicy, String>;
+    /// Read the admitted observation/cue/index rows used by the Governor
+    /// journal projection. Rows remain owner output; this method does not
+    /// turn cue targets into atom identities.
+    fn read_owner_sources(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<Vec<ReactiveOwnerSource>, String>;
+}
+
+/// One immutable set of owner outputs captured for one authenticated tick.
+///
+/// The snapshot is a transport-free composition value. It is not retained by
+/// the daemon and it owns no queue or receipt. `validate` binds every typed
+/// projection to the Governor activation before `drive_live_feed` is called.
+#[derive(Clone, Debug)]
+pub struct ReactiveFeedOwnerSnapshot {
+    /// Owner-issued admitted observation/cue/index rows.
+    pub owner_sources: Vec<ReactiveOwnerSource>,
+    /// Owner-issued A15 context view.
+    pub view: ContextPlanningView,
+    /// Owner-issued A10 cue activation.
+    pub cue_activation: eliot_reactive_context_plan::ReactiveCueActivation,
+    /// Owner-issued session delivery history.
+    pub session_snapshot: SessionDeliverySnapshot,
+    /// Owner-issued Critical Attention projection.
+    pub critical_attention: CriticalAttentionProjection,
+    /// Owner-issued integration coverage profile.
+    pub integration_coverage: IntegrationCoverageProfile,
+    /// Owner-issued delivery policy.
+    pub policy: eliot_reactive_context_plan::ReactiveDeliveryPolicy,
+}
+
+impl ReactiveFeedOwnerSnapshot {
+    /// Read all six projections and the admitted owner rows from one source,
+    /// then validate their exact joins against the authenticated activation.
+    pub fn read_from(
+        activation: &GovernorActivationSnapshot,
+        source: &dyn ReactiveFeedOwnerSource,
+    ) -> Result<Self, ReactiveFeedSupplyError> {
+        let snapshot = Self {
+            owner_sources: source.read_owner_sources(activation).map_err(|reason| {
+                ReactiveFeedSupplyError::OwnerRead {
+                    projection: "admitted_owner_sources",
+                    reason,
+                }
+            })?,
+            view: source.read_context_view(activation).map_err(|reason| {
+                ReactiveFeedSupplyError::OwnerRead {
+                    projection: "context_view",
+                    reason,
+                }
+            })?,
+            cue_activation: source.read_cue_activation(activation).map_err(|reason| {
+                ReactiveFeedSupplyError::OwnerRead {
+                    projection: "cue_activation",
+                    reason,
+                }
+            })?,
+            session_snapshot: source.read_session_snapshot(activation).map_err(|reason| {
+                ReactiveFeedSupplyError::OwnerRead {
+                    projection: "session_snapshot",
+                    reason,
+                }
+            })?,
+            critical_attention: source
+                .read_critical_attention(activation)
+                .map_err(|reason| ReactiveFeedSupplyError::OwnerRead {
+                    projection: "critical_attention",
+                    reason,
+                })?,
+            integration_coverage: source.read_integration_coverage(activation).map_err(
+                |reason| ReactiveFeedSupplyError::OwnerRead {
+                    projection: "integration_coverage",
+                    reason,
+                },
+            )?,
+            policy: source.read_policy(activation).map_err(|reason| {
+                ReactiveFeedSupplyError::OwnerRead {
+                    projection: "policy",
+                    reason,
+                }
+            })?,
+        };
+        snapshot.validate(activation)?;
+        Ok(snapshot)
+    }
+
+    /// Validate every owner contract and its activation binding.
+    pub fn validate(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<(), ReactiveFeedSupplyError> {
+        self.view
+            .validate()
+            .map_err(|error| owner_input_invalid("context_view", error))?;
+        self.cue_activation
+            .validate_against(&self.view)
+            .map_err(|error| owner_input_invalid("cue_activation", error))?;
+        self.session_snapshot
+            .validate()
+            .map_err(|error| owner_input_invalid("session_snapshot", error))?;
+        self.critical_attention
+            .validate()
+            .map_err(|error| owner_input_invalid("critical_attention", error))?;
+        self.integration_coverage
+            .validate()
+            .map_err(|error| owner_input_invalid("integration_coverage", error))?;
+        self.policy
+            .validate()
+            .map_err(|error| owner_input_invalid("policy", error))?;
+
+        let binding = &self.view.view.binding;
+        if binding.task_id != activation.task_id {
+            return Err(owner_input_stale("context_view", "view.binding.task_id"));
+        }
+        if binding.scope_id.as_str() != activation.work_scope_id {
+            return Err(owner_input_stale("context_view", "view.binding.scope_id"));
+        }
+        if binding.state_fence != activation.state_fence {
+            return Err(owner_input_stale(
+                "context_view",
+                "view.binding.state_fence",
+            ));
+        }
+        if self.cue_activation.request.state_fence != activation.state_fence {
+            return Err(owner_input_stale("cue_activation", "request.state_fence"));
+        }
+        if self.session_snapshot.session_id.as_str() != activation.session_id {
+            return Err(owner_input_stale("session_snapshot", "session_id"));
+        }
+        if self.session_snapshot.task_id != activation.task_id {
+            return Err(owner_input_stale("session_snapshot", "task_id"));
+        }
+        if self.session_snapshot.scope_id.as_str() != activation.work_scope_id {
+            return Err(owner_input_stale("session_snapshot", "scope_id"));
+        }
+        if self.session_snapshot.state_fence != activation.state_fence {
+            return Err(owner_input_stale("session_snapshot", "state_fence"));
+        }
+        if self.critical_attention.task_id != activation.task_id {
+            return Err(owner_input_stale("critical_attention", "task_id"));
+        }
+        if self.critical_attention.scope_id.as_str() != activation.work_scope_id {
+            return Err(owner_input_stale("critical_attention", "scope_id"));
+        }
+        if self.critical_attention.state_fence != activation.state_fence {
+            return Err(owner_input_stale("critical_attention", "state_fence"));
+        }
+        if self.integration_coverage.state_fence != activation.state_fence {
+            return Err(owner_input_stale("integration_coverage", "state_fence"));
+        }
+        if self.policy.plan_id.as_str() != activation.plan_id {
+            return Err(owner_input_stale("policy", "plan_id"));
+        }
+        Ok(())
+    }
+
+    /// Borrow the six projections in the exact input shape consumed by A4.
+    #[must_use]
+    pub fn inputs(&self) -> SettledPlanFeedInputs<'_> {
+        SettledPlanFeedInputs {
+            view: &self.view,
+            cue_activation: &self.cue_activation,
+            session_snapshot: &self.session_snapshot,
+            critical_attention: &self.critical_attention,
+            integration_coverage: &self.integration_coverage,
+            policy: &self.policy,
+        }
+    }
+}
+
+/// Concrete adapter over already-retained owner projections.
+///
+/// This is useful at a composition seam where the owning lanes already hold
+/// the six values. It only clones those exact values for one tick; it never
+/// constructs a default, recomputes a digest, or records a receipt.
+pub struct BorrowedReactiveFeedOwner<'a> {
+    /// Retained A15 view owner output.
+    pub view: &'a ContextPlanningView,
+    /// Retained A10 cue owner output.
+    pub cue_activation: &'a eliot_reactive_context_plan::ReactiveCueActivation,
+    /// Retained session owner output.
+    pub session_snapshot: &'a SessionDeliverySnapshot,
+    /// Retained Attention owner output.
+    pub critical_attention: &'a CriticalAttentionProjection,
+    /// Retained coverage owner output.
+    pub integration_coverage: &'a IntegrationCoverageProfile,
+    /// Retained policy owner output.
+    pub policy: &'a eliot_reactive_context_plan::ReactiveDeliveryPolicy,
+    /// Retained admitted observation/cue/index rows.
+    pub owner_sources: &'a [ReactiveOwnerSource],
+}
+
+impl ReactiveFeedOwnerSource for BorrowedReactiveFeedOwner<'_> {
+    fn read_context_view(
+        &self,
+        _activation: &GovernorActivationSnapshot,
+    ) -> Result<ContextPlanningView, String> {
+        Ok(self.view.clone())
+    }
+
+    fn read_cue_activation(
+        &self,
+        _activation: &GovernorActivationSnapshot,
+    ) -> Result<eliot_reactive_context_plan::ReactiveCueActivation, String> {
+        Ok(self.cue_activation.clone())
+    }
+
+    fn read_session_snapshot(
+        &self,
+        _activation: &GovernorActivationSnapshot,
+    ) -> Result<SessionDeliverySnapshot, String> {
+        Ok(self.session_snapshot.clone())
+    }
+
+    fn read_critical_attention(
+        &self,
+        _activation: &GovernorActivationSnapshot,
+    ) -> Result<CriticalAttentionProjection, String> {
+        Ok(self.critical_attention.clone())
+    }
+
+    fn read_integration_coverage(
+        &self,
+        _activation: &GovernorActivationSnapshot,
+    ) -> Result<IntegrationCoverageProfile, String> {
+        Ok(self.integration_coverage.clone())
+    }
+
+    fn read_policy(
+        &self,
+        _activation: &GovernorActivationSnapshot,
+    ) -> Result<eliot_reactive_context_plan::ReactiveDeliveryPolicy, String> {
+        Ok(self.policy.clone())
+    }
+
+    fn read_owner_sources(
+        &self,
+        _activation: &GovernorActivationSnapshot,
+    ) -> Result<Vec<ReactiveOwnerSource>, String> {
+        Ok(self.owner_sources.to_vec())
+    }
+}
+
+fn owner_input_invalid(
+    projection: &'static str,
+    error: impl std::fmt::Display,
+) -> ReactiveFeedSupplyError {
+    ReactiveFeedSupplyError::OwnerInputInvalid {
+        projection,
+        reason: error.to_string(),
+    }
+}
+
+fn owner_input_stale(projection: &'static str, field: &'static str) -> ReactiveFeedSupplyError {
+    ReactiveFeedSupplyError::OwnerInputStale { projection, field }
+}
 
 fn invalid_binding(field: &'static str, error: impl std::fmt::Display) -> ReactiveFeedSupplyError {
     ReactiveFeedSupplyError::InvalidSnapshotBinding {
@@ -147,6 +455,27 @@ pub fn drive_daemon_feed(
     drive_live_feed(&bindings, inputs).map_err(ReactiveFeedSupplyError::Feed)
 }
 
+/// Read the six owner projections from the named owners and drive one
+/// authenticated feed evaluation.
+///
+/// The activation snapshot is the only authority supplied by the daemon
+/// composition. The source must return the exact current owner values for
+/// that snapshot; a missing source, stale projection, malformed digest, or
+/// journal/cue mismatch fails before the planner runs.
+pub fn drive_daemon_feed_from_source(
+    snapshot: &GovernorActivationSnapshot,
+    journal: &ObservationJournal,
+    source: &dyn ReactiveFeedOwnerSource,
+) -> Result<SettledPlanFeedOutcome, ReactiveFeedSupplyError> {
+    let owner_snapshot = ReactiveFeedOwnerSnapshot::read_from(snapshot, source)?;
+    drive_daemon_feed_from_owners(
+        snapshot,
+        journal,
+        &owner_snapshot.owner_sources,
+        owner_snapshot.inputs(),
+    )
+}
+
 fn owner_projection_matches_feed(
     projection: &ReactiveOwnerProjection,
     inputs: &SettledPlanFeedInputs<'_>,
@@ -155,7 +484,7 @@ fn owner_projection_matches_feed(
         let mut matches = projection
             .observations
             .iter()
-            .flat_map(|observation| observation.observed_cues())
+            .flat_map(ReactiveObservationCueProjection::observed_cues)
             .filter(|observed| *observed == seed);
         if matches.next().is_none() || matches.next().is_some() {
             return Err(ReactiveFeedSupplyError::OwnerFeedBindingMismatch {
@@ -222,6 +551,59 @@ mod tests {
     use super::*;
     use eliot_contracts::TaskId;
 
+    struct UnavailableOwnerSource;
+
+    impl ReactiveFeedOwnerSource for UnavailableOwnerSource {
+        fn read_context_view(
+            &self,
+            _activation: &GovernorActivationSnapshot,
+        ) -> Result<ContextPlanningView, String> {
+            Err("A15 owner is not registered".to_owned())
+        }
+
+        fn read_cue_activation(
+            &self,
+            _activation: &GovernorActivationSnapshot,
+        ) -> Result<eliot_reactive_context_plan::ReactiveCueActivation, String> {
+            Err("A10 owner is not registered".to_owned())
+        }
+
+        fn read_session_snapshot(
+            &self,
+            _activation: &GovernorActivationSnapshot,
+        ) -> Result<SessionDeliverySnapshot, String> {
+            Err("session owner is not registered".to_owned())
+        }
+
+        fn read_critical_attention(
+            &self,
+            _activation: &GovernorActivationSnapshot,
+        ) -> Result<CriticalAttentionProjection, String> {
+            Err("Attention owner is not registered".to_owned())
+        }
+
+        fn read_integration_coverage(
+            &self,
+            _activation: &GovernorActivationSnapshot,
+        ) -> Result<IntegrationCoverageProfile, String> {
+            Err("coverage owner is not registered".to_owned())
+        }
+
+        fn read_policy(
+            &self,
+            _activation: &GovernorActivationSnapshot,
+        ) -> Result<eliot_reactive_context_plan::ReactiveDeliveryPolicy, String> {
+            Err("policy owner is not registered".to_owned())
+        }
+
+        fn read_owner_sources(
+            &self,
+            _activation: &GovernorActivationSnapshot,
+        ) -> Result<Vec<ReactiveOwnerSource>, String> {
+            Err("admitted owner is not registered".to_owned())
+        }
+    }
+
     fn snapshot() -> GovernorActivationSnapshot {
         GovernorActivationSnapshot {
             state_fence: eliot_contracts::StateFence::new(
@@ -275,6 +657,17 @@ mod tests {
                 assert_eq!(field, "snapshot.work_scope_id");
             }
             other => panic!("blank scope must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_owner_source_fails_closed_without_empty_projection() {
+        match ReactiveFeedOwnerSnapshot::read_from(&snapshot(), &UnavailableOwnerSource) {
+            Err(ReactiveFeedSupplyError::OwnerRead { projection, reason }) => {
+                assert_eq!(projection, "admitted_owner_sources");
+                assert_eq!(reason, "admitted owner is not registered");
+            }
+            other => panic!("missing owner state must not become an empty feed: {other:?}"),
         }
     }
 }
