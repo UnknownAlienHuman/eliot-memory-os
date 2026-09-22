@@ -31,7 +31,7 @@ use crate::validate_approval_against_manifest;
 use crate::{
     ActivationCommitFence, ActivationCommitReceipt, ActivePhaseBRebind, ActivePhaseBRebindIntent,
     ActivePhaseBRebindReceipt, ActivePhaseBRebindRecovery, AgentBridgeStagePrepared,
-    HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
+    ApprovedGenerationRegistry, HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
     InstallationError, PendingActivation, PendingActivationAbortReceipt, WindowsPathIdentity,
     activation_terminal_digest,
@@ -72,6 +72,77 @@ enum RegistryPathLease {
     },
     #[cfg(any(test, feature = "test-support"))]
     Test,
+}
+
+impl ApprovedGenerationRegistry {
+    /// Derives one exact committed activation receipt from an already
+    /// validated registry projection.
+    ///
+    /// This is deliberately a pure read over the projection. Callers that
+    /// need the durable bytes should obtain the projection through
+    /// [`RedbInstallationRegistry::inspect_existing_at`], which keeps the
+    /// redb handle read-only and short-lived. The returned receipt remains
+    /// bound to the transaction, plan, generation, manifest, commit fence,
+    /// registry revision, and terminal digest; it never grants mutation
+    /// authority or freshness beyond that snapshot.
+    pub fn read_committed_activation_receipt(
+        &self,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        generation: &PlatformHandle,
+    ) -> Result<ActivationCommitReceipt, InstallationError> {
+        let terminal = self.last_terminal_activation.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "no committed terminal activation exists".to_owned(),
+            )
+        })?;
+        if terminal.disposition != PendingActivationTerminalDisposition::Committed {
+            return Err(InstallationError::IncompleteObservation(
+                "last terminal activation is not committed".to_owned(),
+            ));
+        }
+        if terminal.transaction_id != *transaction_id
+            || terminal.plan_digest != *plan_digest
+            || terminal.generation != *generation
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.active_generation.as_ref() != Some(generation) {
+            return Err(InstallationError::IncompleteObservation(
+                "committed terminal is not the active registry generation".to_owned(),
+            ));
+        }
+        let manifest = self
+            .generations
+            .iter()
+            .find(|item| item.manifest.generation == *generation)
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "committed terminal generation is not approved".to_owned(),
+                )
+            })?;
+        let commit_fence = terminal.commit_fence.clone().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "committed terminal is missing its activation fence".to_owned(),
+            )
+        })?;
+        commit_fence.validate_against_manifest(&manifest.manifest)?;
+        let receipt = ActivationCommitReceipt {
+            transaction_id: terminal.transaction_id.clone(),
+            plan_digest: terminal.plan_digest.clone(),
+            generation: terminal.generation.clone(),
+            candidate_manifest_digest: candidate_manifest_digest(&manifest.manifest)?,
+            commit_fence,
+            registry_revision: self.revision,
+            terminal_digest: activation_terminal_digest(terminal)?,
+        };
+        receipt.commit_fence.validate()?;
+        crate::sha256_handle(
+            &receipt.terminal_digest,
+            "activation_commit_receipt.terminal_digest",
+        )?;
+        Ok(receipt)
+    }
 }
 
 impl RedbInstallationRegistry {
@@ -370,58 +441,11 @@ impl RedbInstallationRegistry {
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
     ) -> Result<ActivationCommitReceipt, InstallationError> {
-        let registry = self.load()?;
-        let terminal = registry.last_terminal_activation.as_ref().ok_or_else(|| {
-            InstallationError::IncompleteObservation(
-                "no committed terminal activation exists".to_owned(),
-            )
-        })?;
-        if terminal.disposition != PendingActivationTerminalDisposition::Committed {
-            return Err(InstallationError::IncompleteObservation(
-                "last terminal activation is not committed".to_owned(),
-            ));
-        }
-        if terminal.transaction_id != *transaction_id
-            || terminal.plan_digest != *plan_digest
-            || terminal.generation != *generation
-        {
-            return Err(InstallationError::IdentityConflict);
-        }
-        if registry.active_generation.as_ref() != Some(generation) {
-            return Err(InstallationError::IncompleteObservation(
-                "committed terminal is not the active registry generation".to_owned(),
-            ));
-        }
-        let manifest = registry
-            .generations
-            .iter()
-            .find(|item| item.manifest.generation == *generation)
-            .ok_or_else(|| {
-                InstallationError::IncompleteObservation(
-                    "committed terminal generation is not approved".to_owned(),
-                )
-            })?;
-        let commit_fence = terminal.commit_fence.clone().ok_or_else(|| {
-            InstallationError::IncompleteObservation(
-                "committed terminal is missing its activation fence".to_owned(),
-            )
-        })?;
-        commit_fence.validate_against_manifest(&manifest.manifest)?;
-        let receipt = ActivationCommitReceipt {
-            transaction_id: terminal.transaction_id.clone(),
-            plan_digest: terminal.plan_digest.clone(),
-            generation: terminal.generation.clone(),
-            candidate_manifest_digest: candidate_manifest_digest(&manifest.manifest)?,
-            commit_fence,
-            registry_revision: registry.revision,
-            terminal_digest: activation_terminal_digest(terminal)?,
-        };
-        receipt.commit_fence.validate()?;
-        crate::sha256_handle(
-            &receipt.terminal_digest,
-            "activation_commit_receipt.terminal_digest",
-        )?;
-        Ok(receipt)
+        self.load()?.read_committed_activation_receipt(
+            transaction_id,
+            plan_digest,
+            generation,
+        )
     }
 
     /// Loads the sealed transaction and atomically stages its exact pending
