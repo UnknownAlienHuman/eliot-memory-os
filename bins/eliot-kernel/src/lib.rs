@@ -41,6 +41,7 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+mod backup_owner_clients;
 mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
@@ -55,6 +56,14 @@ mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
 
+pub use backup_owner_clients::{
+    AuthorizationExpectation, BackupOwnerChannels, BlobOwnerClient, CanonicalOwnerClient,
+    CanonicalStoreImportClient, InvalidationKind, InvalidationOwnerClient, OrsOwnerClient,
+    OwnerChannelError, PurgeOwnerClient, VerifiedDestinationBinding,
+    DESTINATION_AUTHORIZATION_FILE, DESTINATION_AUTHORIZATION_ISSUER,
+    DESTINATION_AUTHORIZATION_WIRE, PURGE_MEMBER_SUPPRESSION, STORE_IMPORT_CHANNEL,
+    verify_destination_authorization,
+};
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
     BLOB_MANIFEST_FORMAT_VERSION, BlobCaptureOutcome, BlobDemand, BlobProbeStatus,

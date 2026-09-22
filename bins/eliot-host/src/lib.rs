@@ -31,6 +31,8 @@ mod launch_descriptor_validation;
 mod launch_options;
 #[cfg(windows)]
 mod reactive_context_delivery;
+#[cfg(windows)]
+mod restore_destination_auth;
 mod scm_launch;
 mod store_kernel_launch_sequence;
 /// Host Windows Event Log sink seam (F-LOG-HOST-0, #889): thin bounded
@@ -142,6 +144,12 @@ pub use launch_options::HostLaunchOptions;
 use launch_options::valid_sha256_text;
 #[cfg(windows)]
 pub use reactive_context_delivery::{HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError};
+#[cfg(windows)]
+pub use restore_destination_auth::{
+    DESTINATION_AUTHORIZATION_FILE, DESTINATION_AUTHORIZATION_ISSUER,
+    DESTINATION_AUTHORIZATION_WIRE, DestinationAuthError, DestinationAuthRequest,
+    DestinationAuthorization, HostRestoreDestinationAuth, MAX_AUTHORIZATION_BYTES,
+};
 pub use scm_launch::{
     HOST_SCM_CAUSE_MAX_CHARS, HostScmRegistrationCause, ValidatedHostScmLaunch,
     classify_host_scm_inspection, validate_host_scm_bootstrap,
