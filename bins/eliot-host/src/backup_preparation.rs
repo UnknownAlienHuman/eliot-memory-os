@@ -18,14 +18,15 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::HostComposition;
 use crate::backup_config_projection::{
     ApprovedBuildBinding, ProjectionError, bind_approved_build,
 };
 use eliot_installation::{
     ApprovedGeneration, ApprovedGenerationRegistry, InstallationProfile, InstallationRoots,
-    RedbInstallationRegistry,
+    RedbInstallationRegistry, RuntimeStateRoots,
 };
-use eliot_platform_windows::ProtectedRootLease;
+use eliot_platform_windows::{ProtectedRootLease, windows_paths_equal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -807,34 +808,7 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
         let binding: ApprovedBuildBinding =
             bind_approved_build(approved).map_err(projection_to_preparation)?;
         let source_root = resolve_source_root(roots, profile)?;
-        for digest in &request.build_digests {
-            check_digest(digest, "build_digests")?;
-            if !binding
-                .artifact_digests
-                .iter()
-                .any(|artifact| artifact == digest)
-            {
-                return Err(PreparationError::InvalidRequest {
-                    field: "build_digests",
-                    reason: "build digest is not an owner-approved artifact".to_owned(),
-                });
-            }
-        }
-        let admission = DestinationAdmission {
-            operation_id: request.operation_id.clone(),
-            class: request.class,
-            source_installation_id: request.source_installation_id.clone(),
-            source_root,
-            staging_parent: request.staging_parent.clone(),
-            target_build: request.target_build.clone(),
-            target_profile: request.target_profile.clone(),
-            approved_generation: request.approved_generation,
-            authority_generation: request.authority_generation,
-            manifest_digest: binding.config_digest.clone(),
-            authority_nonce: request.authority_nonce.clone(),
-            state_fence_digest: request.state_fence_digest.clone(),
-        };
-        prepare_isolated_destination(&mut self.journal, &admission)
+        prepare_admitted(&mut self.journal, &binding, source_root, request)
     }
 
     /// Reconciles one operation without duplicating effects.
@@ -986,4 +960,458 @@ pub fn verify_staging_parent_lease(parent: &Path) -> Result<PathBuf, Preparation
             reason: format!("staging parent identity changed during admission: {error}"),
         }
     })
+}
+
+/// Owner-bound manifest roots for one inspected registry (issue #958).
+///
+/// Unlike [`InstallationRoots`] (the root-composition contract with no live
+/// readers), these roots come from the registry-committed active candidate
+/// manifest: `ApprovedGeneration.manifest.runtime_launch.runtime_state_roots`.
+/// The manifest digest is the owner `config_digest`; the registry revision
+/// binds "current" for movement detection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestRootsBinding {
+    /// Manifest-bound runtime roots of the active generation.
+    pub roots: RuntimeStateRoots,
+    /// Owner configuration digest of the active manifest.
+    pub manifest_digest: String,
+    /// Registry CAS revision observed at inspection time.
+    pub registry_revision: u64,
+}
+
+/// Resolves the source installation root from manifest-bound owner roots.
+///
+/// This is the live preparation path: it validates the owner
+/// [`RuntimeStateRoots`] (profile binding, topology, roots digest) and
+/// returns the canonical durable installation root as the read-only source.
+/// The legacy [`resolve_source_root`] ([`InstallationRoots`]) seam stays for
+/// the existing fixture-driven proof; production delegation uses this
+/// function exclusively.
+pub fn resolve_manifest_source_root(
+    roots: &RuntimeStateRoots,
+) -> Result<PathBuf, PreparationError> {
+    roots
+        .validate()
+        .map_err(|_| PreparationError::InvalidRequest {
+            field: "manifest_roots",
+            reason: "owner runtime roots violate the installation profile".to_owned(),
+        })?;
+    let canonical =
+        std::fs::canonicalize(roots.installation_root.as_str()).map_err(|error| {
+            PreparationError::FilesystemEffect {
+                path: roots.installation_root.as_str().to_owned(),
+                reason: format!("cannot canonicalize owner installation root: {error}"),
+            }
+        })?;
+    if !canonical.is_dir() {
+        return Err(PreparationError::ArbitraryPath {
+            reason: "owner installation root is not a directory".to_owned(),
+        });
+    }
+    Ok(canonical)
+}
+
+impl OwnerRegistryEvidence {
+    /// Binds the active manifest roots against the retained caller root.
+    ///
+    /// Mirrors the `load_manifest_bound_canary_binding` owner pattern
+    /// (`bins/eliot/src/main.rs`): the active manifest is owner-validated,
+    /// its roots are owner-validated, and the manifest's
+    /// `runtime_state_roots.host_state_root` must equal the retained caller
+    /// root (OS-identity comparison, never bare path text). A foreign,
+    /// stale, or missing manifest withholds preparation; it never falls
+    /// back to caller-supplied roots.
+    pub fn manifest_roots_against(
+        &self,
+        host_state_root: &Path,
+    ) -> Result<ManifestRootsBinding, PreparationError> {
+        let Some(active) = self.active_generation() else {
+            return Err(PreparationError::InvalidRequest {
+                field: "approved_generation",
+                reason: "no active approved generation committed".to_owned(),
+            });
+        };
+        let manifest = active.manifest.clone();
+        manifest
+            .validate()
+            .map_err(|_| PreparationError::InvalidRequest {
+                field: "manifest",
+                reason: "active candidate manifest is not owner-valid".to_owned(),
+            })?;
+        let roots = manifest.runtime_launch.runtime_state_roots.clone();
+        roots
+            .validate()
+            .map_err(|_| PreparationError::InvalidRequest {
+                field: "manifest_roots",
+                reason: "active manifest roots are not owner-valid".to_owned(),
+            })?;
+        let retained = ProtectedRootLease::open_existing(host_state_root).map_err(|error| {
+            PreparationError::FilesystemEffect {
+                path: host_state_root.to_string_lossy().into_owned(),
+                reason: format!("protected source root unavailable: {error}"),
+            }
+        })?;
+        let canonical = retained.canonical_path().map_err(|error| {
+            PreparationError::FilesystemEffect {
+                path: host_state_root.to_string_lossy().into_owned(),
+                reason: format!("source root identity changed during binding: {error}"),
+            }
+        })?;
+        if !windows_paths_equal(Path::new(roots.host_state_root.as_str()), &canonical) {
+            return Err(PreparationError::InvalidRequest {
+                field: "manifest_roots",
+                reason: "active manifest Host state root does not equal the retained caller root"
+                    .to_owned(),
+            });
+        }
+        Ok(ManifestRootsBinding {
+            roots,
+            manifest_digest: manifest.config_digest.as_str().to_owned(),
+            registry_revision: self.revision(),
+        })
+    }
+}
+
+/// Authenticated caller control for one delegated preparation (issue #958).
+///
+/// Shape carries the owner-issued caller lease digest and the caller fence
+/// digest so refusals and (later) admissions bind them into the audit trail.
+/// Caller authentication itself is pending #954 role-bound control: until
+/// the #954 owner port lands, [`BackupCallerAuth::authenticate`] fails
+/// closed and no destination effect is reachable through delegation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BackupCallerAuth {
+    /// Owner-issued caller lease digest (hex64; shape-checked only).
+    pub lease_digest: String,
+    /// Caller-observed fence digest bound into the receipt (hex64).
+    pub fence_digest: String,
+}
+
+impl BackupCallerAuth {
+    /// Shape-checks the presented caller digests without granting authority.
+    pub fn check_shapes(&self) -> Result<(), PreparationError> {
+        check_digest(&self.lease_digest, "caller_lease_digest")?;
+        check_digest(&self.fence_digest, "caller_fence_digest")?;
+        Ok(())
+    }
+
+    /// Authenticates the caller against owner-issued control evidence.
+    ///
+    /// Fail-closed pending the #954 caller-control port: there is currently
+    /// no owner-issued caller token to verify against, so every caller is
+    /// refused here before any destination effect. The #954 implementation
+    /// fills this method without changing its signature or callers.
+    pub fn authenticate(&self) -> Result<(), PreparationError> {
+        Err(PreparationError::InvalidRequest {
+            field: "caller_auth",
+            reason: "authenticated caller control pending #954; unauthenticated preparation refused"
+                .to_owned(),
+        })
+    }
+}
+
+/// Durable preparation journal directory name under the Host state root.
+pub const PREPARATION_JOURNAL_SUBDIR: &str = "backup-preparation-journal";
+/// Maximum bytes of one journal record (intent or result).
+pub const MAX_JOURNAL_RECORD_BYTES: u64 = 1 << 20;
+/// Maximum journal files swept by one listing.
+pub const MAX_JOURNAL_SWEEP_ENTRIES: usize = 4096;
+
+/// Durable file-backed [`PreparationJournal`] sink owned by HostComposition.
+///
+/// Lives under the identity-pinned Host state root
+/// (`PREPARATION_JOURNAL_SUBDIR`): one `<sha(operation)>.intent.json` and one
+/// `<sha(operation)>.result.json` per operation, written atomically through a
+/// temp file plus rename. Intent is recorded before effects, result after;
+/// load-before-act gives the same idempotency as the tested in-memory sink.
+/// Filenames are operation-digest derived so no caller text becomes a path.
+/// This sink survives restarts; the semantic `HostStateJournal` is untouched
+/// (backup intents are not canonical transitions).
+#[derive(Clone, Debug)]
+pub struct DirPreparationJournal {
+    dir: PathBuf,
+    identity: String,
+}
+
+fn journal_record_path(dir: &Path, operation_id: &str, kind: &str) -> PathBuf {
+    dir.join(format!(
+        "{}-{}.json",
+        kind,
+        sha_hex(&[operation_id.as_bytes()])
+    ))
+}
+
+fn read_bounded(path: &Path) -> Result<Vec<u8>, PreparationError> {
+    let metadata =
+        std::fs::metadata(path).map_err(|error| PreparationError::JournalFault(format!(
+            "journal record unreadable {}: {error}",
+            path.to_string_lossy()
+        )))?;
+    if metadata.len() > MAX_JOURNAL_RECORD_BYTES {
+        return Err(PreparationError::JournalFault(format!(
+            "journal record oversize {}",
+            path.to_string_lossy()
+        )));
+    }
+    std::fs::read(path).map_err(|error| PreparationError::JournalFault(format!(
+        "journal record unreadable {}: {error}",
+        path.to_string_lossy()
+    )))
+}
+
+impl DirPreparationJournal {
+    /// Opens (creating) the durable journal below one protected Host root.
+    ///
+    /// Pins the root OS identity first, then the journal directory identity;
+    /// both are re-verifiable by the caller through [`Self::identity`].
+    /// Fail-closed with static reasons; no registry or journal writes occur
+    /// here beyond creating the owned directory.
+    pub fn open_at(host_state_root: &Path) -> Result<Self, PreparationError> {
+        let lease = ProtectedRootLease::open_existing(host_state_root).map_err(|error| {
+            PreparationError::FilesystemEffect {
+                path: host_state_root.to_string_lossy().into_owned(),
+                reason: format!("protected Host root unavailable: {error}"),
+            }
+        })?;
+        let canonical = lease.canonical_path().map_err(|error| {
+            PreparationError::FilesystemEffect {
+                path: host_state_root.to_string_lossy().into_owned(),
+                reason: format!("Host root identity changed during journal open: {error}"),
+            }
+        })?;
+        let dir = canonical.join(PREPARATION_JOURNAL_SUBDIR);
+        std::fs::create_dir_all(&dir).map_err(|error| PreparationError::FilesystemEffect {
+            path: dir.to_string_lossy().into_owned(),
+            reason: format!("preparation journal directory unavailable: {error}"),
+        })?;
+        let identity = capture_identity(&dir).map_err(|error| PreparationError::JournalFault(
+            format!("journal identity unobservable: {error:?}"),
+        ))?;
+        Ok(Self {
+            dir,
+            identity: identity.identity,
+        })
+    }
+
+    /// Pinned OS identity of the journal directory, captured at open.
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    fn store_record(
+        &self,
+        operation_id: &str,
+        kind: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), PreparationError> {
+        check_identity(operation_id, "operation_id")?;
+        let bytes = serde_json::to_vec(value).map_err(|error| {
+            PreparationError::JournalFault(format!("journal record unserializable: {error}"))
+        })?;
+        if bytes.len() as u64 > MAX_JOURNAL_RECORD_BYTES {
+            return Err(PreparationError::JournalFault(
+                "journal record oversize".to_owned(),
+            ));
+        }
+        let target = journal_record_path(&self.dir, operation_id, kind);
+        let temp = target.with_extension(format!(
+            "tmp-{}",
+            std::process::id()
+        ));
+        std::fs::write(&temp, &bytes).map_err(|error| PreparationError::JournalFault(format!(
+            "journal staging write failed {}: {error}",
+            temp.to_string_lossy()
+        )))?;
+        std::fs::rename(&temp, &target).map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            PreparationError::JournalFault(format!(
+                "journal commit failed {}: {error}",
+                target.to_string_lossy()
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+impl PreparationJournal for DirPreparationJournal {
+    fn record_intent(
+        &mut self,
+        operation_id: &str,
+        intent: &serde_json::Value,
+    ) -> Result<(), PreparationError> {
+        self.store_record(operation_id, "intent", intent)
+    }
+
+    fn record_result(
+        &mut self,
+        operation_id: &str,
+        result: &serde_json::Value,
+    ) -> Result<(), PreparationError> {
+        self.store_record(operation_id, "result", result)
+    }
+
+    fn load(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<(serde_json::Value, Option<serde_json::Value>)>, PreparationError> {
+        check_identity(operation_id, "operation_id")?;
+        let intent_path = journal_record_path(&self.dir, operation_id, "intent");
+        if !intent_path.exists() {
+            return Ok(None);
+        }
+        let intent: serde_json::Value =
+            serde_json::from_slice(&read_bounded(&intent_path)?).map_err(|error| {
+                PreparationError::JournalFault(format!(
+                    "journal intent malformed {}: {error}",
+                    intent_path.to_string_lossy()
+                ))
+            })?;
+        let result_path = journal_record_path(&self.dir, operation_id, "result");
+        let result = if result_path.exists() {
+            Some(
+                serde_json::from_slice(&read_bounded(&result_path)?).map_err(|error| {
+                    PreparationError::JournalFault(format!(
+                        "journal result malformed {}: {error}",
+                        result_path.to_string_lossy()
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+        Ok(Some((intent, result)))
+    }
+
+    fn list_operations(&self) -> Result<Vec<String>, PreparationError> {
+        let mut operations = Vec::new();
+        let entries =
+            std::fs::read_dir(&self.dir).map_err(|error| PreparationError::JournalFault(format!(
+                "journal sweep failed {}: {error}",
+                self.dir.to_string_lossy()
+            )))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                PreparationError::JournalFault(format!("journal sweep failed: {error}"))
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("intent-") || !name.ends_with(".json") {
+                continue;
+            }
+            let intent: serde_json::Value =
+                serde_json::from_slice(&read_bounded(&entry.path())?).map_err(|error| {
+                    PreparationError::JournalFault(format!(
+                        "journal intent malformed {}: {error}",
+                        entry.path().to_string_lossy()
+                    ))
+                })?;
+            if let Some(operation) = intent.get("operation_id").and_then(|v| v.as_str()) {
+                operations.push(operation.to_owned());
+            }
+            if operations.len() >= MAX_JOURNAL_SWEEP_ENTRIES {
+                break;
+            }
+        }
+        Ok(operations)
+    }
+}
+
+impl<J: PreparationJournal> DelegatedPreparation<J> {
+    /// Prepares one isolated destination from registry-committed manifest
+    /// roots plus one presented request (production path).
+    ///
+    /// The manifest digest is always the owner `config_digest` from
+    /// [`ManifestRootsBinding`]; it is cross-checked against the active
+    /// generation binding so two owner derivations cannot disagree silently.
+    /// The source root comes from [`resolve_manifest_source_root`], never
+    /// from caller text. Generation/lease/purge/target evidence stays
+    /// presented pending #954, exactly as in [`DelegatedPreparation::prepare`].
+    pub fn prepare_from_evidence(
+        &mut self,
+        evidence: &OwnerRegistryEvidence,
+        manifest: &ManifestRootsBinding,
+        request: &PresentedPreparationRequest,
+    ) -> Result<PreparedDestination, PreparationError> {
+        let binding = evidence.approved_binding()?;
+        if binding.config_digest != manifest.manifest_digest {
+            return Err(PreparationError::InvalidRequest {
+                field: "manifest",
+                reason: "active generation binding disagrees with manifest roots binding"
+                    .to_owned(),
+            });
+        }
+        let source_root = resolve_manifest_source_root(&manifest.roots)?;
+        prepare_admitted(&mut self.journal, &binding, source_root, request)
+    }
+}
+
+/// Shared admission tail: subset-check presented builds against owner
+/// artifacts, bind the owner manifest digest into the admission, and prepare
+/// idempotently through the journal.
+fn prepare_admitted<J: PreparationJournal>(
+    journal: &mut J,
+    binding: &ApprovedBuildBinding,
+    source_root: PathBuf,
+    request: &PresentedPreparationRequest,
+) -> Result<PreparedDestination, PreparationError> {
+    for digest in &request.build_digests {
+        check_digest(digest, "build_digests")?;
+        if !binding
+            .artifact_digests
+            .iter()
+            .any(|artifact| artifact == digest)
+        {
+            return Err(PreparationError::InvalidRequest {
+                field: "build_digests",
+                reason: "build digest is not an owner-approved artifact".to_owned(),
+            });
+        }
+    }
+    let admission = DestinationAdmission {
+        operation_id: request.operation_id.clone(),
+        class: request.class,
+        source_installation_id: request.source_installation_id.clone(),
+        source_root,
+        staging_parent: request.staging_parent.clone(),
+        target_build: request.target_build.clone(),
+        target_profile: request.target_profile.clone(),
+        approved_generation: request.approved_generation,
+        authority_generation: request.authority_generation,
+        manifest_digest: binding.config_digest.clone(),
+        authority_nonce: request.authority_nonce.clone(),
+        state_fence_digest: request.state_fence_digest.clone(),
+    };
+    prepare_isolated_destination(journal, &admission)
+}
+
+/// HostComposition live call path for isolated backup preparation.
+///
+/// Binds, in order: caller shapes → durable journal below the retained Host
+/// root → read-only registry evidence → manifest roots bound against the
+/// retained root → cached-registry movement check → caller authentication
+/// (fail-closed pending #954) → owner-bound preparation. Every failure is a
+/// static [`PreparationError`]; owner internals are never echoed and no
+/// destination effect precedes authentication.
+impl HostComposition {
+    /// Prepares one isolated backup destination through real owner authority.
+    pub fn prepare_isolated_backup_destination(
+        &mut self,
+        caller: &BackupCallerAuth,
+        request: &PresentedPreparationRequest,
+    ) -> Result<PreparedDestination, PreparationError> {
+        caller.check_shapes()?;
+        let journal = DirPreparationJournal::open_at(&self.registry_host_root)?;
+        let evidence = OwnerRegistryEvidence::inspect(&self.registry_host_root)?;
+        if self.registry.revision() != evidence.revision() {
+            return Err(PreparationError::InvalidRequest {
+                field: "source_registry",
+                reason: "installation registry moved during delegation; retry from a fresh read"
+                    .to_owned(),
+            });
+        }
+        let manifest = evidence.manifest_roots_against(&self.registry_host_root)?;
+        caller.authenticate()?;
+        let mut delegation = DelegatedPreparation::new(journal);
+        delegation.prepare_from_evidence(&evidence, &manifest, request)
+    }
 }
