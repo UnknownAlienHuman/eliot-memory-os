@@ -5182,24 +5182,18 @@ impl HostComposition {
             state_fence: demand.state_fence.clone(),
             state: WakeIntentState::Pending,
         };
-        if let Some(existing) = snapshot
-            .wakes
-            .iter()
-            .find(|existing| existing.wake_id == wake.wake_id)
-        {
-            if existing.intent == intent {
-                return Ok(());
-            }
-            return Err(HostError::RecoveryRequired(
-                "demand-start WakeIntent identity conflicts with the Host journal".to_owned(),
-            ));
-        }
         let safety_class = match wake.safety_class {
             HostDemandStartSafetyClass::ServiceSafe => ServiceSafetyClass::ServiceSafe,
-            HostDemandStartSafetyClass::UserSessionRequired => ServiceSafetyClass::UserSessionRequired,
+            HostDemandStartSafetyClass::UserSessionRequired => {
+                ServiceSafetyClass::UserSessionRequired
+            }
         };
-        self.append_record(HostStateRecord::Wake(WakeRecord {
-            fence: record_fence(&self.host, &activation.activation_id, &activation.fence.activation_generation),
+        let expected = WakeRecord {
+            fence: record_fence(
+                &self.host,
+                &activation.activation_id,
+                &activation.fence.activation_generation,
+            ),
             operation: demand_operation(request, "queue-wake")?,
             wake_id: wake.wake_id.clone(),
             intent,
@@ -5212,7 +5206,42 @@ impl HostComposition {
             safety_class,
             state_fence_revalidation_ref: wake.state_fence_revalidation_ref.clone(),
             budget_ref: wake.budget_ref.clone(),
-        }))?;
+        };
+        if let Some(existing) = snapshot
+            .wakes
+            .iter()
+            .find(|existing| existing.wake_id == wake.wake_id)
+        {
+            // Wake lifecycle state is mutable after the first durable append;
+            // every other field is the immutable identity of this wake.  A
+            // replay may therefore observe CLAIMED/STARTED/etc., but a
+            // changed deadline, expiry, capability, safety, budget, trigger
+            // evidence, operation, or record fence is a conflicting reuse of
+            // the same wake_id and must fail closed.
+            let same_immutable_material = existing.fence == expected.fence
+                && existing.operation == expected.operation
+                && existing.wake_id == expected.wake_id
+                && existing.intent.wake_id == expected.intent.wake_id
+                && existing.intent.reason == expected.intent.reason
+                && existing.intent.state_fence == expected.intent.state_fence
+                && existing.reason_evidence_refs == expected.reason_evidence_refs
+                && existing.earliest_start == expected.earliest_start
+                && existing.deadline == expected.deadline
+                && existing.expiry == expected.expiry
+                && existing.required_capabilities == expected.required_capabilities
+                && existing.maintenance_family == expected.maintenance_family
+                && existing.safety_class == expected.safety_class
+                && existing.state_fence_revalidation_ref == expected.state_fence_revalidation_ref
+                && existing.budget_ref == expected.budget_ref;
+            if same_immutable_material {
+                return Ok(());
+            }
+            return Err(HostError::RecoveryRequired(
+                "demand-start WakeRecord immutable material conflicts with the Host journal"
+                    .to_owned(),
+            ));
+        }
+        self.append_record(HostStateRecord::Wake(expected))?;
         Ok(())
     }
 
