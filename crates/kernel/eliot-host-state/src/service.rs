@@ -56,6 +56,31 @@ impl<B: JournalBackend> HostStateJournalService<B> {
         self.journal.reconcile(transaction_id)
     }
 
+    /// Loads one durable backup-preparation row by preparation operation id.
+    ///
+    /// Read-only projection over the journal snapshot for load-before-act
+    /// idempotency (issue #958). Returns `None` when no intent was recorded.
+    pub fn load_backup_preparation(
+        &self,
+        preparation_operation_id: &str,
+    ) -> Result<Option<crate::BackupPreparationRecord>, JournalError> {
+        Ok(self
+            .journal
+            .snapshot()?
+            .backup_preparations
+            .into_iter()
+            .find(|record| {
+                record.preparation_operation_id.as_str() == preparation_operation_id
+            }))
+    }
+
+    /// Lists all durable backup-preparation rows (bounded sweep for cleanup).
+    pub fn list_backup_preparations(
+        &self,
+    ) -> Result<Vec<crate::BackupPreparationRecord>, JournalError> {
+        Ok(self.journal.snapshot()?.backup_preparations)
+    }
+
     pub fn prepare_reactive_context(
         &self,
         request: ReactiveContextPrepareRequest,

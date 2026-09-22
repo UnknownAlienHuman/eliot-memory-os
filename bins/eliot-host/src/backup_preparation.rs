@@ -18,8 +18,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::HostComposition;
 use crate::backup_config_projection::{
     ApprovedBuildBinding, ProjectionError, bind_approved_build,
+};
+use eliot_host_state::{
+    BackupPreparationRecord, BackupPreparationStage, HostStateRecord, IdempotencyIdentity,
+    JournalError, ProductionHostStateJournal, RecordFence,
 };
 use eliot_installation::{
     ActivationCommitFence, ApprovedGeneration, ApprovedGenerationRegistry, RedbInstallationRegistry,
@@ -1164,5 +1169,213 @@ impl BackupCallerAuth {
             });
         }
         Ok(())
+    }
+}
+
+/// Durable canonical [`PreparationJournal`] sink over the Host operational
+/// journal (issue #958).
+///
+/// This is the production sink HostComposition binds: intents/results become
+/// `BackupPreparationRecord` rows in the `ProductionHostStateJournal`
+/// (single governed write path, A12.3), instead of a separate file journal.
+/// The journal reducer enforces intent-before-result per operation; unknown
+/// append outcomes reconcile by transaction identity before any retry, so no
+/// effect is recorded twice and no result precedes its intent.
+pub struct ProductionJournalSink<'a> {
+    journal: &'a ProductionHostStateJournal,
+    fence: RecordFence,
+}
+
+fn journal_fault(error: impl std::fmt::Display) -> PreparationError {
+    PreparationError::JournalFault(error.to_string())
+}
+
+impl<'a> ProductionJournalSink<'a> {
+    /// Binds the canonical journal with the live composition fence.
+    ///
+    /// The fence comes from live `HostComposition` fields (host epoch,
+    /// activation id/generation); the sink never mints fence identity.
+    pub fn new(journal: &'a ProductionHostStateJournal, fence: RecordFence) -> Self {
+        Self { journal, fence }
+    }
+
+    fn identity_for(
+        &self,
+        admission_digest: &str,
+    ) -> Result<IdempotencyIdentity, PreparationError> {
+        // Uniqueness rides the admission digest, which binds the operation
+        // identity: same inputs journal the same identity (idempotent replay),
+        // changed inputs journal a new one (conflict, never overwrite).
+        Ok(IdempotencyIdentity {
+            operation_id: PlatformHandle::new(format!(
+                "backup-preparation-{admission_digest}"
+            ))
+            .map_err(journal_fault)?,
+            idempotency_key: PlatformHandle::new(admission_digest).map_err(journal_fault)?,
+        })
+    }
+
+    fn append_record(
+        &self,
+        operation_id: &str,
+        record: BackupPreparationRecord,
+    ) -> Result<(), PreparationError> {
+        let record = HostStateRecord::BackupPreparation(record);
+        match self.journal.append(record.clone()) {
+            Ok(_) => Ok(()),
+            Err(JournalError::OutcomeUnknown { transaction_id }) => {
+                match self.journal.reconcile(&transaction_id) {
+                    Ok(eliot_host_state::ReconcileOutcome::Committed) => self
+                        .journal
+                        .append(record)
+                        .map(|_| ())
+                        .map_err(journal_fault),
+                    Ok(_) => Err(PreparationError::UnknownState {
+                        operation: operation_id.to_owned(),
+                        reason: "journal outcome unknown after reconcile; retry the exact operation"
+                            .to_owned(),
+                    }),
+                    Err(error) => Err(journal_fault(error)),
+                }
+            }
+            Err(error) => Err(journal_fault(error)),
+        }
+    }
+
+    fn digests_of(
+        intent: &serde_json::Value,
+    ) -> Result<(String, String), PreparationError> {
+        let admission_digest = intent
+            .get("admission_digest")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let manifest_digest = intent
+            .get("admission")
+            .and_then(|admission| admission.get("manifest_digest"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        check_digest(admission_digest, "admission_digest")?;
+        check_digest(manifest_digest, "manifest_digest")?;
+        Ok((admission_digest.to_owned(), manifest_digest.to_owned()))
+    }
+}
+
+impl PreparationJournal for ProductionJournalSink<'_> {
+    fn record_intent(
+        &mut self,
+        operation_id: &str,
+        intent: &serde_json::Value,
+    ) -> Result<(), PreparationError> {
+        check_identity(operation_id, "operation_id")?;
+        let intent_json = serde_json::to_string(intent).map_err(journal_fault)?;
+        let (admission_digest, manifest_digest) = Self::digests_of(intent)?;
+        let record = BackupPreparationRecord {
+            fence: self.fence.clone(),
+            operation: self.identity_for(&admission_digest)?,
+            preparation_operation_id: PlatformHandle::new(operation_id).map_err(journal_fault)?,
+            admission_digest: PlatformHandle::new(&admission_digest).map_err(journal_fault)?,
+            manifest_digest: PlatformHandle::new(&manifest_digest).map_err(journal_fault)?,
+            stage: BackupPreparationStage::Intent,
+            intent_json,
+            result_json: None,
+        };
+        self.append_record(operation_id, record)
+    }
+
+    fn record_result(
+        &mut self,
+        operation_id: &str,
+        result: &serde_json::Value,
+    ) -> Result<(), PreparationError> {
+        check_identity(operation_id, "operation_id")?;
+        // Intent-before-result is enforced at the sink: a result with no
+        // recorded intent is refused, never backfilled.
+        let Some(current) = self
+            .journal
+            .load_backup_preparation(operation_id)
+            .map_err(journal_fault)?
+        else {
+            return Err(PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: "no recorded intent for result; prepare first".to_owned(),
+            });
+        };
+        let result_json = serde_json::to_string(result).map_err(journal_fault)?;
+        let record = BackupPreparationRecord {
+            fence: self.fence.clone(),
+            operation: self.identity_for(current.admission_digest.as_str())?,
+            preparation_operation_id: PlatformHandle::new(operation_id).map_err(journal_fault)?,
+            admission_digest: current.admission_digest.clone(),
+            manifest_digest: current.manifest_digest.clone(),
+            stage: BackupPreparationStage::Result,
+            intent_json: current.intent_json.clone(),
+            result_json: Some(result_json),
+        };
+        self.append_record(operation_id, record)
+    }
+
+    fn load(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<(serde_json::Value, Option<serde_json::Value>)>, PreparationError> {
+        check_identity(operation_id, "operation_id")?;
+        let Some(record) = self
+            .journal
+            .load_backup_preparation(operation_id)
+            .map_err(journal_fault)?
+        else {
+            return Ok(None);
+        };
+        let intent: serde_json::Value =
+            serde_json::from_str(&record.intent_json).map_err(journal_fault)?;
+        let result = record
+            .result_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(journal_fault)?;
+        Ok(Some((intent, result)))
+    }
+
+    fn list_operations(&self) -> Result<Vec<String>, PreparationError> {
+        Ok(self
+            .journal
+            .list_backup_preparations()
+            .map_err(journal_fault)?
+            .into_iter()
+            .map(|record| record.preparation_operation_id.as_str().to_owned())
+            .collect())
+    }
+}
+
+/// HostComposition durable call path for isolated backup preparation.
+///
+/// Same owner chain as [`HostComposition::prepare_backup_destination`], but
+/// bound to the canonical [`ProductionJournalSink`] over the composition's
+/// live journal and fence instead of a caller-supplied sink. No destination
+/// effect precedes caller authentication.
+impl HostComposition {
+    /// Prepares one isolated backup destination with durable canonical
+    /// journaling.
+    pub fn prepare_backup_destination_durable(
+        &self,
+        caller: &BackupCallerAuth,
+        request: &PresentedPreparationRequest,
+    ) -> Result<
+        (
+            DelegatedPreparation<ProductionJournalSink<'_>>,
+            PreparedDestination,
+        ),
+        PreparationError,
+    > {
+        let sink = ProductionJournalSink::new(
+            &self.journal,
+            RecordFence {
+                host: self.host.clone(),
+                activation_id: self.activation_id.clone(),
+                activation_generation: self.activation_generation.clone(),
+            },
+        );
+        self.prepare_backup_destination(sink, caller, request)
     }
 }

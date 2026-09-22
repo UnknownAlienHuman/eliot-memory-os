@@ -539,6 +539,21 @@ fn apply(
             crate::reactive_context::apply_record(&mut state.reactive_context, next, sequence)?;
             state.clean_marker = None;
         }
+        HostStateRecord::BackupPreparation(next) => {
+            let index = state.backup_preparations.iter().position(|item| {
+                item.preparation_operation_id == next.preparation_operation_id
+            });
+            crate::model::backup_preparation_transition(
+                index.map(|index| &state.backup_preparations[index]),
+                next,
+            )?;
+            if let Some(index) = index {
+                state.backup_preparations[index] = next.clone();
+            } else {
+                state.backup_preparations.push(next.clone());
+            }
+            state.clean_marker = None;
+        }
         HostStateRecord::CleanMarker(next) => {
             let genesis_without_runtime_contour = state
                 .activation
@@ -554,7 +569,8 @@ fn apply(
                 && state.wakes.is_empty()
                 && state.observations.is_empty()
                 && state.readiness_observations.is_empty()
-                && state.store_rebinds.is_empty();
+                && state.store_rebinds.is_empty()
+                && state.backup_preparations.is_empty();
             let reactive_context_clean = state
                 .reactive_context
                 .as_ref()

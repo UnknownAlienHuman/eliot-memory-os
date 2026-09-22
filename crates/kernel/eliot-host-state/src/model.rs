@@ -1661,6 +1661,96 @@ pub(crate) fn store_rebind_transition(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BackupPreparationStage {
+    Intent,
+    Result,
+}
+
+/// Durable isolated-backup-preparation intent/result row (issue #958).
+///
+/// One row per preparation operation: the intent is recorded before any
+/// destination effect, the result after; load-before-act consumers recover
+/// idempotency from these rows. `intent_json`/`result_json` are canonical
+/// JSON texts of the lane-owned intent/result envelopes (bounded); the
+/// journal validates shape and size, never backup semantics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupPreparationRecord {
+    pub fence: RecordFence,
+    pub operation: IdempotencyIdentity,
+    pub preparation_operation_id: PlatformHandle,
+    pub admission_digest: PlatformHandle,
+    pub manifest_digest: PlatformHandle,
+    pub stage: BackupPreparationStage,
+    pub intent_json: String,
+    pub result_json: Option<String>,
+}
+
+const MAX_BACKUP_PREPARATION_JSON_BYTES: usize = 1 << 20;
+
+impl BackupPreparationRecord {
+    fn validate_json(text: &str, field: &'static str) -> Result<(), JournalError> {
+        if text.is_empty() || text.len() > MAX_BACKUP_PREPARATION_JSON_BYTES {
+            return Err(JournalError::Invalid(format!(
+                "{field} must be non-empty bounded JSON"
+            )));
+        }
+        serde_json::from_str::<serde_json::Value>(text)
+            .map(|_| ())
+            .map_err(|_| JournalError::Invalid(format!("{field} must be valid JSON")))?;
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), JournalError> {
+        self.fence.validate()?;
+        self.operation.validate()?;
+        handle(
+            &self.preparation_operation_id,
+            "backup_preparation.preparation_operation_id",
+        )?;
+        digest(&self.admission_digest, "backup_preparation.admission_digest")?;
+        digest(&self.manifest_digest, "backup_preparation.manifest_digest")?;
+        Self::validate_json(&self.intent_json, "backup_preparation.intent_json")?;
+        if let Some(result_json) = &self.result_json {
+            Self::validate_json(result_json, "backup_preparation.result_json")?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn backup_preparation_transition(
+    current: Option<&BackupPreparationRecord>,
+    next: &BackupPreparationRecord,
+) -> Result<(), JournalError> {
+    if let Some(current) = current {
+        if current.preparation_operation_id != next.preparation_operation_id
+            || current.admission_digest != next.admission_digest
+            || current.manifest_digest != next.manifest_digest
+        {
+            return Err(JournalError::StaleFence);
+        }
+        let legal = matches!(
+            (current.stage, next.stage),
+            (BackupPreparationStage::Intent, BackupPreparationStage::Intent)
+                | (BackupPreparationStage::Intent, BackupPreparationStage::Result)
+                | (BackupPreparationStage::Result, BackupPreparationStage::Result)
+        );
+        if !legal {
+            return Err(illegal("backup_preparation", current.stage, next.stage));
+        }
+        Ok(())
+    } else {
+        match next.stage {
+            // Intent-before-effect is enforced at the journal layer: a result
+            // with no recorded intent is refused, never backfilled.
+            BackupPreparationStage::Intent => Ok(()),
+            BackupPreparationStage::Result => Err(illegal("backup_preparation", "NONE", next.stage)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
@@ -1677,6 +1767,7 @@ pub enum HostStateRecord {
     EpochRetirement(EpochRetirementRecord),
     StoreRebind(StoreRebindRecord),
     ReactiveContext(ReactiveContextRecord),
+    BackupPreparation(BackupPreparationRecord),
 }
 
 impl HostStateRecord {
@@ -1694,6 +1785,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => value.validate(),
             Self::StoreRebind(value) => value.validate(),
             Self::ReactiveContext(value) => validate_record_for_journal(value),
+            Self::BackupPreparation(value) => value.validate(),
         }
     }
 
@@ -1719,6 +1811,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => &value.fence,
             Self::StoreRebind(value) => &value.fence,
             Self::ReactiveContext(value) => &value.fence,
+            Self::BackupPreparation(value) => &value.fence,
         }
     }
 
@@ -1736,6 +1829,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => &value.operation,
             Self::StoreRebind(value) => &value.operation,
             Self::ReactiveContext(value) => &value.operation,
+            Self::BackupPreparation(value) => &value.operation,
         }
     }
 }
@@ -1782,6 +1876,11 @@ pub struct HostState {
     pub readiness_observations: Vec<KernelReadinessObservationRecord>,
     #[serde(default)]
     pub store_rebinds: Vec<StoreRebindRecord>,
+    /// Durable isolated-backup-preparation intent/result rows (issue #958).
+    /// Keyed by preparation operation id at the reducer; rebuildable from
+    /// replay and never authority or freshness.
+    #[serde(default)]
+    pub backup_preparations: Vec<BackupPreparationRecord>,
     /// Durable reactive-Context queue projection owned by this journal.
     #[serde(default)]
     pub reactive_context: Option<ReactiveContextQueueState>,
@@ -1809,6 +1908,7 @@ impl HostState {
             observations: Vec::new(),
             readiness_observations: Vec::new(),
             store_rebinds: Vec::new(),
+            backup_preparations: Vec::new(),
             reactive_context: Some(ReactiveContextQueueState::default()),
             clean_marker: None,
             retained_epochs,
