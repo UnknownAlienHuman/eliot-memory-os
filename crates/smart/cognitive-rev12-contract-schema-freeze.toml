@@ -1,7 +1,7 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r4"
-revision = 4
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r3"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r5"
+revision = 5
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r4"
 supersedes_freeze_digest = "sha256:bfc30f19cde26efc13de7e3dfc3c326377aaa6746dc4769345bf03014c257dd5"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
@@ -277,9 +277,9 @@ fields = ["AdmittedKind{CURRENT_EPISTEMIC_POSITION}", "Currentness{Current, Supe
 [[frozen_type]]
 crate = "eliot-epistemic-contracts"
 rust_path = "eliot_epistemic_contracts::ProviderContribution"
-fields = ["contract_version", "view_kind", "position_digest", "claim", "currentness", "scope", "fence", "source_revision", "coverage_digest", "receipt_digest"]
+fields = ["contract_version", "view_kind", "position_digest", "claim", "owner", "currentness", "position", "position_revision", "scope", "fence", "source_revision", "coverage_digest", "receipt_digest"]
 scope_fence_fields = ["scope", "fence"]
-denominator_note = "Whole envelope or error: construction runs closed position validation, so completeness is derived from the governing records. Currentness is the owner verdict at contribution time; no partial contributions and no omission entries exist. Provider-neutral: no per-provider identity or request state."
+denominator_note = "Whole envelope or error: construction runs closed position validation, so completeness is derived from the governing records. Currentness is the owner verdict at contribution time; owner/position/revision echoes give readback per-field attribution; no partial contributions and no omission entries exist. Provider-neutral: no per-provider identity or request state."
 
 [[upstream_crate]]
 crate = "eliot-dreamer-contracts"
@@ -655,7 +655,7 @@ note = "Thin adapter over the owner envelope above. Builds independently; not a 
 crate = "eliot-dreamer-self-query"
 paths = ["crates/smart/eliot-dreamer-self-query/**"]
 status = "PROTOTYPE_PENDING_REGISTRATION"
-contract = "SelfQueryPoseReceipt{input_digest, schema_version} with pose_self_query/pose_with_sources; CitedSource{handle, revision, digest} with cited_sources/check_citations"
+contract = "SelfQueryPoseReceipt{input_digest, schema_version, cited} with pose_self_query/pose_with_sources/revalidate; CitedSource{handle, revision, digest} with cited_sources/check_citations"
 note = "Thin adapter over SelfQueryInput plus AcceptedSourceProjection citation. Builds independently; not a W9 unblock."
 
 [[lane_prototype]]
