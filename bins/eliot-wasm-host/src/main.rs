@@ -3,7 +3,7 @@
 use std::io::{self, Write};
 
 use eliot_wasm_host::{
-    CliError, GrantLaunchArgs, TypedWorld, default_experimental_limits,
+    CliError, GrantLaunchArgs, TypedWorld, default_experimental_limits, drive_dispatch,
     execute_describe_experimental, parse_args, read_bounded_artifact, resolve_kernel_port_grant,
     run_grant_launch, run_guest_exec,
 };
@@ -29,6 +29,60 @@ fn emit_receipt(fields: &[(&str, &str)]) {
     }
     let _ = writeln!(stdout);
     let _ = writeln!(stdout, "}}");
+}
+
+fn emit_stderr_receipt(fields: &[(&str, &str)]) {
+    let mut stderr = io::stderr().lock();
+    let mut first = true;
+    let _ = write!(stderr, "{{");
+    for (key, value) in fields {
+        if !first {
+            let _ = write!(stderr, ",");
+        }
+        first = false;
+        let _ = write!(stderr, "\"{key}\":\"{value}\"");
+    }
+    let _ = writeln!(stderr);
+    let _ = writeln!(stderr, "}}");
+}
+
+/// Runs the owner-dispatched parent drive branch: exactly one admitted
+/// operation to the canonical response. Returns true when a dispatch file
+/// was staged (success emitted, raw guest bytes on stdout, receipt on
+/// stderr); false on absence so the caller falls through to CLI modes.
+/// Any other denial exits the process fail-closed.
+fn run_dispatch_drive_branch() -> bool {
+    use eliot_wasm_host::DriveError;
+    match drive_dispatch() {
+        Ok(response) => {
+            let _ = io::stdout().lock().write_all(&response.output);
+            let output_bytes = response.output.len().to_string();
+            let fuel = response.fuel_consumed.to_string();
+            let peak = response.peak_memory_bytes.to_string();
+            let tables = response.table_elements.to_string();
+            let ticks = response.epoch_ticks.to_string();
+            emit_stderr_receipt(&[
+                ("status", "dispatch-drive-complete"),
+                ("operation", &response.operation_id),
+                ("component", &response.component_id),
+                ("artifact_digest", &response.artifact_digest),
+                ("input_digest", &response.input_digest),
+                ("host_artifact_digest", &response.host_artifact_digest),
+                ("output_digest", &response.output_digest),
+                ("output_bytes", &output_bytes),
+                ("fuel_consumed", &fuel),
+                ("peak_memory_bytes", &peak),
+                ("table_elements", &tables),
+                ("epoch_ticks", &ticks),
+            ]);
+            true
+        }
+        Err(DriveError::NoMaterial) => false,
+        Err(error) => {
+            emit_error("DISPATCH_DRIVE_DENIED", &error.to_string());
+            std::process::exit(ADMISSION_REQUIRED_EXIT);
+        }
+    }
 }
 
 /// Runs the governed grant-launch branch: full pipeline, staged receipt on
@@ -90,6 +144,16 @@ fn main() {
     // contaminate stdout.
     if let Some(guest) = &config.guest_exec {
         std::process::exit(run_guest_exec(guest));
+    }
+
+    // Owner-dispatched parent drive: a staged dispatch file beside this
+    // image means the Kernel admitted exactly one operation. The reaped
+    // child runs the guest; this branch reaps it and emits the canonical
+    // response (raw guest bytes on stdout, receipt on stderr). Absence
+    // falls through to the CLI modes below. Guest-exec stays first so a
+    // reaped child never drives as a parent.
+    if run_dispatch_drive_branch() {
+        return;
     }
 
     // Governed grant launch: the dedicated executable consumer path. Runs

@@ -25,6 +25,9 @@ mod artifact_preflight;
 mod child_engine;
 mod cli_contract;
 mod contour;
+mod dispatch_authority;
+mod dispatch_drive;
+mod dispatch_material;
 mod grant_authorization;
 mod grant_client;
 mod grant_launch;
@@ -49,6 +52,19 @@ pub use contour::{
     PINNED_WASMTIME_VERSION, PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET,
     STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
     authorize_host_call, check_activation_imports, check_admitted_request,
+};
+pub use dispatch_authority::{
+    DispatchAuthorityError, ValidatedDispatchGrant, WASM_DISPATCH_AUTHORITY_PREFIX,
+    WASM_DISPATCH_DERIVATION_DOMAIN, WASM_LAUNCH_GRANT_HEAD, WASM_VALIDATION_REVISION,
+    WasmDispatchAuthority,
+};
+pub use dispatch_drive::{DispatchDriveResponse, DriveError, drive_dispatch};
+pub use dispatch_material::{
+    DISPATCH_MATERIAL_MAX_BYTES, MaterialError, ValidatedDispatchMaterial, ValidatedGuestCeilings,
+    WASM_DISPATCH_MATERIAL_WIRE_ID, WASM_DISPATCH_MATERIAL_WIRE_VERSION,
+    WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
+    WASM_HOST_MATERIAL_FILE_NAME, admitted_material_path, read_dispatch_material,
+    read_dispatch_material_from,
 };
 pub use grant_authorization::{
     AuthorizedGrant, authorize_grant, authorize_grant_against_descriptor,
