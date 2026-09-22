@@ -83,7 +83,7 @@ pub(crate) fn check_schema(value: u32, field: &'static str) -> Result<(), SelfQu
     Ok(())
 }
 
-fn canonical_digest<T: Serialize>(
+pub(crate) fn canonical_digest<T: Serialize>(
     value: &T,
     field: &'static str,
 ) -> Result<String, SelfQueryContractError> {

@@ -851,8 +851,19 @@ impl KernelComposition {
         let records = ors.load_all_activation_results().map_err(|_| {
             KernelBuildError::Ors("activation result retention load failed".to_owned())
         })?;
+        if records.len() > eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS {
+            return Err(KernelBuildError::Ors(
+                "activation result retention bound exceeded".to_owned(),
+            ));
+        }
         let mut results = BTreeMap::new();
+        let mut retention_orders = BTreeSet::new();
         for retained in records {
+            if !retention_orders.insert(retained.retention_order) {
+                return Err(KernelBuildError::Ors(
+                    "activation result retention order is not unique".to_owned(),
+                ));
+            }
             retained.validate().map_err(|_| {
                 KernelBuildError::Ors("activation result retention record is invalid".to_owned())
             })?;
@@ -902,33 +913,114 @@ impl KernelComposition {
                     "activation result retention identity validation failed".to_owned(),
                 ));
             }
-            results.insert(
-                ticket.ticket_id.clone(),
-                AgentActivationResultRecord {
-                    result,
-                    phase: match retained.phase {
-                        eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal => {
-                            AgentActivationResultPhase::AcceptedTerminal
-                        }
-                        eliot_ors::ActivationResultRetentionPhase::DeferredNotReady => {
-                            AgentActivationResultPhase::DeferredNotReady
-                        }
+            if results
+                .insert(
+                    ticket.ticket_id.clone(),
+                    AgentActivationResultRecord {
+                        result,
+                        phase: match retained.phase {
+                            eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal => {
+                                AgentActivationResultPhase::AcceptedTerminal
+                            }
+                            eliot_ors::ActivationResultRetentionPhase::DeferredNotReady => {
+                                AgentActivationResultPhase::DeferredNotReady
+                            }
+                        },
+                        ticket_connection: ticket.connection_id,
+                        retention_order: retained.retention_order,
                     },
-                    ticket_connection: ticket.connection_id,
-                    retention_order: retained.retention_order,
-                },
-            );
+                )
+                .is_some()
+            {
+                return Err(KernelBuildError::Ors(
+                    "activation result retention ticket identity is duplicated".to_owned(),
+                ));
+            }
         }
         Ok(results)
     }
 
     #[cfg(windows)]
+    fn validate_activation_result_ledgers(
+        pending: &AgentActivationPendingState,
+        raw: &BTreeMap<String, AgentActivationResultRecord>,
+    ) -> Result<(), TransportError> {
+        if !pending.result_ledger_is_consistent()
+            || raw.len() > eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut retention_orders = BTreeSet::new();
+        for (ticket_id, record) in raw {
+            if ticket_id != &record.result.ticket_id
+                || !retention_orders.insert(record.retention_order)
+                || Self::result_phase_for_disposition(&record.result.disposition) != record.phase
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        let mut canonical_orders = BTreeSet::new();
+        for (ticket_id, canonical) in &pending.results {
+            if !canonical_orders.insert(canonical.retention_order)
+                || Self::result_phase_for_disposition(&canonical.result.disposition)
+                    != canonical.phase
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let Some(raw_record) = raw.get(ticket_id) else {
+                continue;
+            };
+            if canonical.result != raw_record.result
+                || canonical.phase != raw_record.phase
+                || canonical.ticket_connection != raw_record.ticket_connection
+                || canonical.retention_order != raw_record.retention_order
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn stage_raw_activation_results(
+        raw: &BTreeMap<String, AgentActivationResultRecord>,
+        pending: &AgentActivationPendingState,
+        record: AgentActivationResultRecord,
+    ) -> Option<BTreeMap<String, AgentActivationResultRecord>> {
+        let ticket_id = record.result.ticket_id.clone();
+        let required = if raw.contains_key(&ticket_id) {
+            0
+        } else {
+            raw.len()
+                .saturating_add(1)
+                .saturating_sub(eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS)
+        };
+        let mut candidates = raw
+            .iter()
+            .filter(|(candidate, _)| !pending.entries.contains_key(*candidate))
+            .map(|(candidate, existing)| (candidate.clone(), existing.retention_order))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(_, retention_order)| *retention_order);
+        if candidates.len() < required {
+            return None;
+        }
+        let mut staged = raw.clone();
+        for (victim, _) in candidates.into_iter().take(required) {
+            staged.remove(&victim)?;
+        }
+        staged.insert(ticket_id, record);
+        (staged.len() <= eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS).then_some(staged)
+    }
+
+    #[cfg(windows)]
     fn retain_activation_result_durably(
         &self,
+        pending: &mut AgentActivationPendingState,
         ticket: &AgentActivationResolutionTicket,
         result: &AgentActivationResolutionResult,
         phase: AgentActivationResultPhase,
-    ) -> Result<eliot_ors::ActivationResultRetentionRecord, TransportError> {
+        retain_canonical: bool,
+    ) -> Result<(), TransportError> {
         let retention_phase = match phase {
             AgentActivationResultPhase::AcceptedTerminal => {
                 eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal
@@ -951,33 +1043,63 @@ impl KernelComposition {
             phase: retention_phase,
             retention_order: 0,
         };
+        let canonical_stage = if retain_canonical {
+            Some(
+                pending
+                    .stage_result_retention(AgentActivationResultRecord {
+                        result: result.clone(),
+                        phase,
+                        ticket_connection: ticket.connection_id.clone(),
+                        retention_order: 0,
+                    })
+                    .ok_or(TransportError::SessionFenced)?,
+            )
+        } else {
+            if !pending.result_ledger_is_consistent() {
+                return Err(TransportError::SessionFenced);
+            }
+            None
+        };
+        // Keep the pending -> raw owner order through the durable write and
+        // both in-memory swaps. The staged map is prepared before ORS, so a
+        // capacity or identity fence cannot publish a raw/canonical fragment.
+        let mut results = self
+            .agent_activation_results
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_activation_result_ledgers(pending, &results)?;
+        let staged_raw = Self::stage_raw_activation_results(
+            &results,
+            pending,
+            AgentActivationResultRecord {
+                result: result.clone(),
+                phase,
+                ticket_connection: ticket.connection_id.clone(),
+                retention_order: results
+                    .get(&ticket.ticket_id)
+                    .map_or(0, |existing| existing.retention_order),
+            },
+        )
+        .ok_or(TransportError::SessionFenced)?;
         let retained = self
             .generation_gateway
             .ors
             .retain_activation_result(&record)
             .map_err(|_| TransportError::SessionFenced)?;
-        let mut results = self
-            .agent_activation_results
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        results.insert(
-            retained.ticket_id.clone(),
-            AgentActivationResultRecord {
-                result: result.clone(),
-                phase,
-                ticket_connection: ticket.connection_id.clone(),
-                retention_order: retained.retention_order,
-            },
-        );
-        while results.len() > eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS {
-            let oldest = results
-                .iter()
-                .min_by_key(|(_, record)| record.retention_order)
-                .map(|(ticket_id, _)| ticket_id.clone())
-                .ok_or(TransportError::SessionFenced)?;
-            results.remove(&oldest);
+        let mut staged_raw = staged_raw;
+        debug_assert!(staged_raw.contains_key(&retained.ticket_id));
+        if let Some(raw_record) = staged_raw.get_mut(&retained.ticket_id) {
+            raw_record.retention_order = retained.retention_order;
         }
-        Ok(retained)
+        *results = staged_raw;
+        if let Some(staged) = canonical_stage {
+            pending.publish_staged_result_retention(
+                staged,
+                &retained.ticket_id,
+                retained.retention_order,
+            );
+        }
+        Ok(())
     }
 
     /// Submits against an already-retained per-ticket record: exact digest
@@ -1033,16 +1155,9 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         let phase = Self::result_phase_for_disposition(&incoming.disposition);
-        let retained_durably =
-            self.retain_activation_result_durably(&entry_ticket, &incoming, phase)?;
         let ack = AgentActivationResultAck::accepted(&incoming)
             .map_err(|_| TransportError::SessionFenced)?;
-        pending.retain_activation_result(AgentActivationResultRecord {
-            result: incoming,
-            phase,
-            ticket_connection: entry_ticket.connection_id.clone(),
-            retention_order: retained_durably.retention_order,
-        });
+        self.retain_activation_result_durably(pending, &entry_ticket, &incoming, phase, true)?;
         self.agent_activation_changed.notify_waiters();
         Ok(ack)
     }
@@ -1062,15 +1177,20 @@ impl KernelComposition {
         pending: &AgentActivationPendingState,
         ticket_id: &str,
     ) -> Result<Option<AgentActivationResultRecord>, TransportError> {
-        let canonical = pending.results.get(ticket_id).cloned();
         let raw = self
             .agent_activation_results
             .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .get(ticket_id)
-            .cloned();
+            .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_activation_result_ledgers(pending, &raw)?;
+        let canonical = pending.results.get(ticket_id).cloned();
+        let raw = raw.get(ticket_id).cloned();
         match (canonical, raw) {
-            (Some(canonical), Some(raw)) if canonical.result != raw.result => {
+            (Some(canonical), Some(raw))
+                if canonical.result != raw.result
+                    || canonical.phase != raw.phase
+                    || canonical.ticket_connection != raw.ticket_connection
+                    || canonical.retention_order != raw.retention_order =>
+            {
                 Err(TransportError::IdentityConflict)
             }
             (Some(canonical), _) => Ok(Some(canonical)),
@@ -1147,17 +1267,10 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         let phase = Self::result_phase_for_disposition(&incoming.disposition);
-        let retained_durably =
-            self.retain_activation_result_durably(&entry_ticket, &incoming, phase)?;
         let ack = AgentActivationResultAck::accepted(&incoming)
             .map_err(|_| TransportError::SessionFenced)?;
+        self.retain_activation_result_durably(&mut pending, &entry_ticket, &incoming, phase, true)?;
         pending.fifo.retain(|queued_id| queued_id != &ticket_id);
-        pending.retain_activation_result(AgentActivationResultRecord {
-            result: incoming,
-            phase,
-            ticket_connection: entry_ticket.connection_id.clone(),
-            retention_order: retained_durably.retention_order,
-        });
         drop(pending);
         self.agent_activation_changed.notify_waiters();
         Ok(ack)
@@ -1180,10 +1293,15 @@ impl KernelComposition {
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         let results = self
             .agent_activation_results
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_activation_result_ledgers(&pending, &results)?;
         match results.get(&query.ticket_id) {
             None => {
                 AgentActivationResultAck::unknown(query).map_err(|_| TransportError::SessionFenced)
@@ -1283,7 +1401,7 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         let phase = Self::result_phase_for_disposition(&result.disposition);
-        self.retain_activation_result_durably(&entry_ticket, &result, phase)?;
+        self.retain_activation_result_durably(&mut pending, &entry_ticket, &result, phase, false)?;
         pending.fifo.retain(|queued_id| queued_id != &ticket_id);
         drop(pending);
         drop(result);

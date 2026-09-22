@@ -8,10 +8,12 @@
 
 #![forbid(unsafe_code)]
 
+mod accepted;
 mod input;
 mod result;
 mod source;
 
+pub use accepted::{AcceptedSourceProjection, AcceptedSourceRef};
 pub use input::{
     AttemptBinding, SelfQueryInput, SelfQueryOutputProfile, SelfQueryPolicy, SelfQueryProfile,
 };

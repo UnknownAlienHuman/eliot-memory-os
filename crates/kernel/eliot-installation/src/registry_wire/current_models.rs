@@ -22,7 +22,7 @@ use super::super::{
     HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
     InstallerServiceRegistrationApproval, PendingActivation, PendingActivationState,
-    PlatformHandle, ResourceGeneration, StateFence,
+    PendingActivationAbortReceipt, PlatformHandle, ResourceGeneration, StateFence,
 };
 
 use super::{PendingActivationTerminal, PendingActivationTerminalDisposition};
@@ -100,6 +100,7 @@ struct PendingActivationWire {
     host_artifact_digest: PlatformHandle,
     runtime_state_roots_digest: PlatformHandle,
     manifest_digest: PlatformHandle,
+    activation_intent_digest: Option<PlatformHandle>,
     prior_active_generation: Option<PlatformHandle>,
     approval: InstallationActivationApprovalWire,
     phase_b_intent: RequiredOption<HostPhaseBMaterializationIntent>,
@@ -125,6 +126,7 @@ impl PendingActivationWire {
             host_artifact_digest: self.host_artifact_digest,
             runtime_state_roots_digest: self.runtime_state_roots_digest,
             manifest_digest: self.manifest_digest,
+            activation_intent_digest: self.activation_intent_digest,
             prior_active_generation: self.prior_active_generation,
             approval: self.approval.into_approval(),
             phase_b_intent: self.phase_b_intent.0,
@@ -147,6 +149,8 @@ struct PendingActivationTerminalWire {
     /// The member is mandatory on the current wire, while explicit `null`
     /// remains the only valid value for an aborted terminal.
     commit_fence: RequiredOption<ActivationCommitFence>,
+    #[serde(default)]
+    abort_receipt: Option<PendingActivationAbortReceipt>,
 }
 
 impl PendingActivationTerminalWire {
@@ -157,6 +161,7 @@ impl PendingActivationTerminalWire {
             generation: self.generation,
             disposition: self.disposition,
             commit_fence: self.commit_fence.0,
+            abort_receipt: self.abort_receipt,
         }
     }
 }
@@ -192,6 +197,8 @@ pub(super) struct RegistryWireV11 {
     last_known_good_generation: RequiredOption<PlatformHandle>,
     pending_activation: RequiredOption<PendingActivationWire>,
     last_terminal_activation: RequiredOption<PendingActivationTerminalWire>,
+    #[serde(default)]
+    aborted_activation_receipts: Vec<PendingActivationAbortReceipt>,
     active_phase_b_rebind: RequiredOption<ActivePhaseBRebindWireV11>,
 }
 
@@ -233,6 +240,7 @@ impl RegistryWireV11 {
                 .last_terminal_activation
                 .0
                 .map(PendingActivationTerminalWire::into_terminal),
+            aborted_activation_receipts: self.aborted_activation_receipts,
             active_phase_b_rebind: self
                 .active_phase_b_rebind
                 .0
