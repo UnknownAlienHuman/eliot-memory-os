@@ -39,6 +39,7 @@ use thiserror::Error;
 pub mod catalogue;
 pub mod preflight;
 pub mod route_tokenizer;
+pub mod turn_driver;
 
 pub const CODEX_ADAPTER_ID: &str = "eliot-agent-codex";
 pub const CODEX_HOST_FAMILY: &str = "codex";
@@ -521,7 +522,7 @@ where
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WireMessageKind {
+pub(crate) enum WireMessageKind {
     Request,
     Notification,
     Response,
@@ -554,7 +555,9 @@ fn valid_method(method: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.'))
 }
 
-fn validate_wire_message(message: &CodexWireMessage) -> Result<WireMessageKind, CodexAdapterError> {
+pub(crate) fn validate_wire_message(
+    message: &CodexWireMessage,
+) -> Result<WireMessageKind, CodexAdapterError> {
     if let Some(id) = &message.id
         && !valid_wire_id(id)
     {
@@ -796,16 +799,21 @@ struct ClassifiedCodexPayload {
 /// Count characters of the first present string field, in Unicode scalar
 /// values. Absent fields yield `0` (absent evidence, never a guessed length).
 fn delta_chars_from(params: &Value, keys: &[&str]) -> u64 {
-    params
-        .as_object()
-        .and_then(|object| {
-            keys.iter()
-                .filter_map(|key| object.get(*key))
-                .filter_map(Value::as_str)
-                .next()
-        })
+    delta_text_from(params, keys)
         .map(|text| text.chars().count() as u64)
         .unwrap_or(0)
+}
+
+/// Borrow the first present string field for turn-text assembly. Same key
+/// order and first-present rule as [`delta_chars_from`]: a single owner of
+/// the wire delta key set. Absent fields yield `None`, never guessed text.
+pub(crate) fn delta_text_from<'a>(params: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    params.as_object().and_then(|object| {
+        keys.iter()
+            .filter_map(|key| object.get(*key))
+            .filter_map(Value::as_str)
+            .next()
+    })
 }
 
 /// Extract an opaque tool name from the wire without publishing arguments.
@@ -841,7 +849,7 @@ fn digest_value(value: &Value) -> Result<LowercaseSha256, CodexAdapterError> {
 /// Only exact `"completed"`/`"failed"` become observed terminal success/failure;
 /// every other status (interrupted, unknown, in-progress, numeric, missing)
 /// stays quarantine and never upgrades to success.
-fn terminal_status_from(params: &Value) -> Option<ProviderTerminalStatus> {
+pub(crate) fn terminal_status_from(params: &Value) -> Option<ProviderTerminalStatus> {
     match params
         .get("turn")
         .and_then(Value::as_object)
@@ -1127,7 +1135,7 @@ pub(crate) fn validate_binding_for_codex(
 /// non-string, or blank turn identity is missing evidence, never a guessed
 /// turn. Two present string identities that disagree are conflicting evidence
 /// and yield no turn: the caller fails closed instead of choosing one.
-fn wire_turn_id(params: &Value) -> Option<&str> {
+pub(crate) fn wire_turn_id(params: &Value) -> Option<&str> {
     let nested = params
         .get("turn")
         .and_then(Value::as_object)
@@ -1146,7 +1154,7 @@ fn wire_turn_id(params: &Value) -> Option<&str> {
     }
 }
 
-fn validate_wire_session_against_binding(
+pub(crate) fn validate_wire_session_against_binding(
     params: &Value,
     binding: &ProviderExecutionBinding,
 ) -> Result<(), CodexAdapterError> {
@@ -3225,6 +3233,68 @@ mod tests {
         Ok(binding)
     }
 
+    fn attached_with_model(model: &str) -> TestResult<CodexAttachReceipt> {
+        let mut attached = attached()?;
+        // Session validation is model-independent (thread/workdir/hashes
+        // only), so narrowing the model post-attach keeps every agreement.
+        attached.route.model = model.to_owned();
+        Ok(attached)
+    }
+
+    fn turn_wire_window() -> Vec<u8> {
+        [
+            r#"{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}}"#,
+            r#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"hello world"}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}"#,
+        ]
+        .join("\n")
+        .into_bytes()
+    }
+
+    fn turn_owner_event() -> super::turn_driver::TurnOwnerEvent {
+        use super::turn_driver::TurnOwnerEvent;
+        TurnOwnerEvent {
+            event_id: EventId::new("turn-1:1").expect("fixture event"),
+            cursor: EventCursor::new("turn-1:1").expect("fixture cursor"),
+            sequence: 1,
+            previous_sequence: None,
+            observed_at: clock_at(Some(1_786_000_000_100)),
+            predecessors: Vec::new(),
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:turn-1:1")
+                .expect("fixture handle"),
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+        }
+    }
+
+    fn drive_inputs<'a>(
+        executor: Arc<FakeExecutor>,
+        attached: &'a mut CodexAttachReceipt,
+        binding: &'a ProviderExecutionBinding,
+        admission: &'a AdmittedRouteReceipt,
+        sink: Arc<Sink>,
+        wire_bytes: &'a [u8],
+    ) -> super::turn_driver::CodexTurnDriverInputs<'a, FakeExecutor> {
+        use super::turn_driver::CodexTurnDriverInputs;
+        CodexTurnDriverInputs {
+            executor,
+            attached,
+            binding,
+            admission,
+            evidence_sink: Some(sink),
+            wire_bytes,
+            owner_event: turn_owner_event(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            continuation: None,
+            proposed_effects: Vec::new(),
+            cancelled: false,
+        }
+    }
+
     fn terminal_for(
         binding: &ProviderExecutionBinding,
         observed_at: ClockReading,
@@ -3373,6 +3443,261 @@ mod tests {
             &binding,
             &other_admission,
         )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_launches_pumps_measures_and_emits() -> TestResult {
+        use super::turn_driver::{CODEX_TURN_WIRE_MAX_BYTES, drive_codex_turn};
+        assert!(CODEX_TURN_WIRE_MAX_BYTES >= 4 * 1024 * 1024);
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let window = turn_wire_window();
+        let drive = drive_codex_turn(drive_inputs(
+            Arc::clone(&executor),
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            &window,
+        ))
+        .await?;
+        // Real P-03 launch through the injected executor, once.
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        assert!(drive.launch.is_some());
+        // Canonical turn receipt over the pumped text and derived terminal.
+        assert_eq!(drive.result.disposition, ResultDisposition::Partial);
+        assert_eq!(drive.result.attempt_id, binding.attempt_id);
+        // Measured carrier bound to the exact pumped bytes.
+        let carrier = drive.measured.expect("completed turn measures");
+        assert_eq!(carrier.tokens, 2);
+        assert_eq!(
+            carrier.result_digest,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_eq!(carrier.result_bytes, b"hello world");
+        assert_eq!(
+            carrier.observation.route_state,
+            RouteObservationState::Matched
+        );
+        assert_eq!(
+            carrier.observation.observed_route,
+            Some(binding.route.clone())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_reuses_running_server_without_relaunch() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let window = turn_wire_window();
+        let first = drive_codex_turn(drive_inputs(
+            Arc::clone(&executor),
+            &mut attached,
+            &binding,
+            &admission,
+            Arc::clone(&sink),
+            &window,
+        ))
+        .await?;
+        assert!(first.launch.is_some());
+        let second = drive_codex_turn(drive_inputs(
+            Arc::clone(&executor),
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            &window,
+        ))
+        .await?;
+        // Single-take process request: the second drive reuses the running
+        // server instead of relaunching, and still assembles + measures.
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        assert!(second.launch.is_none());
+        assert!(second.measured.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_without_terminal_yields_unknown_without_carrier() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let window = br#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"partial"}}"#;
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            window,
+        ))
+        .await?;
+        // No terminal fact exists: unknown outcome preserved, no carrier
+        // estimated — never a zero-count receipt.
+        assert_eq!(drive.result.disposition, ResultDisposition::UnknownOutcome);
+        assert!(drive.result.unknown_reason.is_some());
+        assert!(drive.measured.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_quarantines_foreign_frames() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let mut window = br#"{"method":"item/agentMessage/delta","params":{"threadId":"other-thread","turnId":"turn-9","itemId":"x-1","delta":"FOREIGN"}}"#.to_vec();
+        window.extend_from_slice(b"\n");
+        window.extend_from_slice(&turn_wire_window());
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            &window,
+        ))
+        .await?;
+        // Foreign text never enters our turn: exact own bytes measured.
+        let carrier = drive.measured.expect("own turn still measures");
+        assert_eq!(carrier.result_bytes, b"hello world");
+        assert_eq!(carrier.tokens, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_rejects_malformed_window() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let window = b"not jsonl at all {{{";
+        assert!(matches!(
+            drive_codex_turn(drive_inputs(
+                executor,
+                &mut attached,
+                &binding,
+                &admission,
+                sink,
+                window,
+            ))
+            .await,
+            Err(CodexAdapterError::MalformedWire(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_rejects_overbound_window() -> TestResult {
+        use super::turn_driver::{CODEX_TURN_WIRE_MAX_BYTES, drive_codex_turn};
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let window = vec![b'x'; CODEX_TURN_WIRE_MAX_BYTES + 1];
+        assert!(matches!(
+            drive_codex_turn(drive_inputs(
+                executor,
+                &mut attached,
+                &binding,
+                &admission,
+                sink,
+                &window,
+            ))
+            .await,
+            Err(CodexAdapterError::WireTooLarge)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_requires_sink_for_launch() -> TestResult {
+        use super::turn_driver::{CodexTurnDriverInputs, drive_codex_turn};
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let window = turn_wire_window();
+        assert!(matches!(
+            drive_codex_turn(CodexTurnDriverInputs {
+                executor,
+                attached: &mut attached,
+                binding: &binding,
+                admission: &admission,
+                evidence_sink: None,
+                wire_bytes: &window,
+                owner_event: turn_owner_event(),
+                usage: UsageReceipt {
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_microunits: None,
+                    quota: QuotaKnowledge::Unknown,
+                },
+                continuation: None,
+                proposed_effects: Vec::new(),
+                cancelled: false,
+            })
+            .await,
+            Err(CodexAdapterError::InvalidInput(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_withholds_measurement_for_community_model() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("codex-mini-latest")?;
+        let binding = bound_binding_with_model("codex-mini-latest")?;
+        let admission = admission_for(&binding)?;
+        let window = turn_wire_window();
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            &window,
+        ))
+        .await?;
+        // The turn receipt stands (translate does not measure); only the
+        // carrier withholds for the community-only mapping.
+        assert_eq!(drive.result.disposition, ResultDisposition::Partial);
+        assert!(drive.measured.is_none());
         Ok(())
     }
 
