@@ -27,6 +27,8 @@
 //! Governor admission is referenced, never minted.
 
 use blake3::Hasher;
+use eliot_contracts::{StateFence, fences_match_exact};
+use eliot_governor::VerifiedLearningAdmission;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -71,12 +73,15 @@ impl CandidateBoundPolicy {
         Ok(())
     }
 
-    /// Governor-bound validation: the shape check plus confirmation of the
-    /// owning authority against live Governor-minted evidence. A well-formed
-    /// but unminted authority string is refused.
-    pub fn validate_governed(&self, governor: &GovernorOwnerEvidence) -> Result<(), BoundsError> {
+    /// Governor-bound validation: the shape check plus confirmation that the
+    /// owning authority equals the authority bound in an owner-verified
+    /// permit. A well-formed but unissued authority string is refused.
+    pub fn validate_governed(
+        &self,
+        verified: &VerifiedLearningAdmission<'_>,
+    ) -> Result<(), BoundsError> {
         self.validate()?;
-        if !governor.confirms_authority(&self.governor_authority_ref) {
+        if self.governor_authority_ref.trim() != verified.permit().authority_ref() {
             return Err(BoundsError::GovernorAuthorityUnconfirmed);
         }
         Ok(())
@@ -218,17 +223,17 @@ impl BoundedBacklog {
     }
 
     /// Governor-bound admission: as [`BoundedBacklog::admit`], but the
-    /// surface policy's owning authority must be confirmed against live
-    /// Governor-minted evidence. Forged authority strings are refused.
+    /// surface policy's owning authority must equal the authority bound in
+    /// an owner-verified permit. Forged authority strings are refused.
     pub fn admit_governed(
         &mut self,
         candidate: ImprovementCandidate,
         value: f64,
         owner: Option<String>,
-        governor: &GovernorOwnerEvidence,
+        verified: &VerifiedLearningAdmission<'_>,
     ) -> Result<AdmitOutcome, BoundsError> {
         let policy = self.policy_for(candidate.target_surface)?.clone();
-        policy.validate_governed(governor)?;
+        policy.validate_governed(verified)?;
         self.admit_inner(&policy, candidate, value, owner)
     }
 
@@ -431,12 +436,16 @@ pub enum OverlayState {
 }
 
 /// Task-local behavioral overlay presented for retrieval.
+///
+/// The bound [`StateFence`] is canonical owner vocabulary (no string
+/// facade): retrieval requires it to exactly match the fence in the
+/// owner-verified permit, so fence drift refuses before values surface.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernedOverlay {
     pub overlay_id: String,
     pub campaign_id: String,
     pub task_id: String,
-    pub fence_ref: String,
+    pub fence: StateFence,
     pub compatible_recipe_ref: String,
     pub state: OverlayState,
     /// Governor admission receipt for the local effect (required).
@@ -451,13 +460,15 @@ impl GovernedOverlay {
             ("overlay_id", &self.overlay_id),
             ("campaign_id", &self.campaign_id),
             ("task_id", &self.task_id),
-            ("fence_ref", &self.fence_ref),
             ("compatible_recipe_ref", &self.compatible_recipe_ref),
         ] {
             if value.trim().is_empty() {
                 return Err(BoundsError::MissingField(field));
             }
         }
+        self.fence
+            .validate()
+            .map_err(|_| BoundsError::InvalidFence)?;
         Ok(())
     }
 
@@ -506,7 +517,9 @@ impl ReusableCandidateRef {
 /// Distinct, newly governed admission permitting cross-task carryover.
 ///
 /// Revalidates scope, authority, retention, evaluator, and rollback for the
-/// target task. References (never mints) Governor admission.
+/// target task. Authentication comes from the owner-verified permit: every
+/// ref below must equal the corresponding permit-bound value, so the
+/// revalidation record cannot be assembled from bare strings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossTaskAdmission {
     pub admission_id: String,
@@ -517,7 +530,6 @@ pub struct CrossTaskAdmission {
     pub retention_ref: String,
     pub evaluator_ref: String,
     pub rollback_ref: String,
-    pub governor_admission_ref: String,
 }
 
 impl CrossTaskAdmission {
@@ -531,13 +543,25 @@ impl CrossTaskAdmission {
             ("retention_ref", &self.retention_ref),
             ("evaluator_ref", &self.evaluator_ref),
             ("rollback_ref", &self.rollback_ref),
-            ("governor_admission_ref", &self.governor_admission_ref),
         ] {
             if value.trim().is_empty() {
                 return Err(BoundsError::MissingField(field));
             }
         }
         Ok(())
+    }
+
+    /// Owner-bound check: the revalidation record must match the verified
+    /// permit field-for-field. Bare-string records never pass on their own.
+    pub fn matches_permit(&self, verified: &VerifiedLearningAdmission<'_>) -> bool {
+        let permit = verified.permit();
+        self.source_campaign_id == permit.source_campaign_id()
+            && self.target_task_id == permit.target_task_id()
+            && self.scope_ref == permit.scope_ref()
+            && self.authority_ref == permit.authority_ref()
+            && self.retention_ref == permit.retention_ref()
+            && self.evaluator_ref == permit.evaluator_ref()
+            && self.rollback_ref == permit.rollback_ref()
     }
 }
 
@@ -594,10 +618,12 @@ pub enum BoundsError {
     CrossTaskAdmissionMismatch,
     #[error("campaign identity mismatch without cross-task admission")]
     CrossCampaignLeakage,
-    #[error("Governor authority is not confirmed by live owner evidence")]
+    #[error("overlay fence is invalid")]
+    InvalidFence,
+    #[error("overlay fence does not exactly match the admitted fence")]
+    StaleStateFence,
+    #[error("Governor authority does not match the owner-verified permit")]
     GovernorAuthorityUnconfirmed,
-    #[error("Governor admission is not confirmed by live owner evidence")]
-    GovernorAdmissionUnconfirmed,
     #[error("reusable candidate is not an active backlog entry")]
     NotBacklogAdmitted,
     #[error("presented admitted overlay has no live backing overlay")]
@@ -704,52 +730,22 @@ pub fn retrieve_for_attempt(
 }
 
 // ---------------------------------------------------------------------------
-// Governor-bound owner evidence and the governed consumer path.
+// Owner-verified governed consumer path (round 3).
+//
+// The round-2 caller-owned evidence sets are removed: every authority and
+// admission relied upon below arrives as an owner-verified permit
+// (`VerifiedLearningAdmission`, constructible only by the Governor owner).
+// Bare strings never authenticate here.
 // ---------------------------------------------------------------------------
-
-/// Live Governor-minted authority evidence, threaded from the Governor owner.
-///
-/// Construction rule (fail-closed here, enforced at the call site): build
-/// ONLY from live Governor projections — `Governor::snapshot()` service
-/// records, `GovernanceProfile { revision, fingerprint }` via
-/// `GovernorCoverageDerivation::current`, and the evaluation `StateFence`.
-/// Never from requester strings. A ref absent from the minted sets is
-/// refused no matter how well-formed it looks.
-///
-/// `authority_binding` renders the live authority epoch and resource
-/// generation (`EpochId` + `ResourceGeneration`); `minted_authorities` and
-/// `minted_admissions` carry the exact refs the Governor minted under it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GovernorOwnerEvidence {
-    pub authority_binding: String,
-    pub minted_authorities: BTreeSet<String>,
-    pub minted_admissions: BTreeSet<String>,
-}
-
-impl GovernorOwnerEvidence {
-    /// True only when the ref is the live binding or a minted authority.
-    pub fn confirms_authority(&self, authority_ref: &str) -> bool {
-        let candidate = authority_ref.trim();
-        if candidate.is_empty() || self.authority_binding.trim().is_empty() {
-            return false;
-        }
-        candidate == self.authority_binding.trim() || self.minted_authorities.contains(candidate)
-    }
-
-    /// True only when the Governor actually minted this admission ref.
-    pub fn confirms_admission(&self, admission_ref: &str) -> bool {
-        let candidate = admission_ref.trim();
-        !candidate.is_empty() && self.minted_admissions.contains(candidate)
-    }
-}
 
 /// Governed retrieval request: the consumer-facing gate input.
 ///
-/// Unlike bare string refs, every authority/admission relied upon here must
-/// be confirmed by `governor` (live owner evidence). When `backlog` is
-/// present, a reusable candidate must additionally resolve to an active
-/// backlog entry — `admit`/`admit_governed` grants retrieval eligibility and
-/// `archive` revokes it.
+/// `verified` carries the owner-issued permit the retrieval is bound to:
+/// overlay identity + fence and reusable identity must match it exactly,
+/// and cross-task revalidation records must equal its bound refs. When
+/// `backlog` is present, a reusable candidate must additionally resolve to
+/// an active backlog entry — `admit`/`admit_governed` grants retrieval
+/// eligibility and `archive` revokes it.
 pub struct GovernedRetrieval<'a> {
     pub requesting_campaign_id: &'a str,
     pub requesting_task_id: &'a str,
@@ -758,16 +754,18 @@ pub struct GovernedRetrieval<'a> {
     pub draft_delta_present: bool,
     pub cross_task_admission: Option<&'a CrossTaskAdmission>,
     pub backlog: Option<&'a BoundedBacklog>,
-    pub governor: &'a GovernorOwnerEvidence,
+    pub verified: &'a VerifiedLearningAdmission<'a>,
     pub now: OffsetDateTime,
 }
 
-/// Governor-bound retrieval gate: as [`retrieve_for_attempt`], but overlay
-/// and cross-task admission refs must be confirmed against live Governor
-/// owner evidence, and (when a backlog is presented) reusable candidates
-/// must be active backlog entries.
+/// Owner-verified retrieval gate: as [`retrieve_for_attempt`], but every
+/// authority/admission relied upon must arrive inside `verified` (an
+/// owner-verified permit), the overlay fence must exactly match the admitted
+/// fence, and (when a backlog is presented) reusable candidates must be
+/// active backlog entries.
 pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDecision, BoundsError> {
     let now = request.now;
+    let permit = request.verified.permit();
     if request.requesting_campaign_id.trim().is_empty() {
         return Err(BoundsError::MissingField("requesting_campaign_id"));
     }
@@ -786,9 +784,15 @@ pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDeci
     if !request.overlay.is_live_local_admitted(now) {
         return Err(BoundsError::OverlayNotAdmitted);
     }
-    match &request.overlay.admission_ref {
-        Some(admission) if request.governor.confirms_admission(admission) => {}
-        _ => return Err(BoundsError::GovernorAdmissionUnconfirmed),
+    // Owner-bound overlay identity + fence: the presented overlay must be
+    // the exact overlay the permit was issued for, under the exact fence.
+    if Some(request.overlay.overlay_id.as_str()) != permit.overlay_id()
+        || !fences_match_exact(&request.overlay.fence, permit.fence())
+    {
+        if Some(request.overlay.overlay_id.as_str()) != permit.overlay_id() {
+            return Err(BoundsError::OverlayBackingMismatch);
+        }
+        return Err(BoundsError::StaleStateFence);
     }
 
     let mut reusable_candidate_id: Option<String> = None;
@@ -805,6 +809,9 @@ pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDeci
         if candidate.owner.as_ref().is_none_or(|o| o.trim().is_empty()) {
             return Err(BoundsError::OwnerlessRecord);
         }
+        if Some(candidate.candidate_id.as_str()) != permit.candidate_id() {
+            return Err(BoundsError::CrossTaskAdmissionMismatch);
+        }
         if let Some(backlog) = request.backlog
             && backlog.entry_for(&candidate.candidate_id).is_none()
         {
@@ -812,37 +819,34 @@ pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDeci
         }
         reusable_candidate_id = Some(candidate.candidate_id.clone());
         reusable_origin = Some(candidate.origin_campaign_id.as_str());
+    } else if permit.candidate_id().is_some() {
+        // A permit binding a reusable candidate requires that candidate to
+        // be presented: influence without the bound subject is refused.
+        return Err(BoundsError::CrossTaskAdmissionMismatch);
     }
 
-    let overlay_foreign = request.overlay.campaign_id != request.requesting_campaign_id;
-    let reusable_foreign = reusable_origin
-        .map(|origin| origin != request.requesting_campaign_id)
-        .unwrap_or(false);
-    if overlay_foreign || reusable_foreign {
+    // Campaign/task binding comes from the verified permit, never from
+    // requester strings alone.
+    let source = permit.source_campaign_id();
+    let target = permit.target_task_id();
+    if request.overlay.campaign_id != source {
+        return Err(BoundsError::CrossCampaignLeakage);
+    }
+    if let Some(origin) = reusable_origin
+        && origin != source
+    {
+        return Err(BoundsError::CrossCampaignLeakage);
+    }
+    let local = request.requesting_campaign_id == source && request.requesting_task_id == target;
+    if !local {
         let admission = request
             .cross_task_admission
             .ok_or(BoundsError::CrossTaskAdmissionMissing)?;
         admission.validate()?;
-        if !request
-            .governor
-            .confirms_admission(&admission.governor_admission_ref)
-        {
-            return Err(BoundsError::GovernorAdmissionUnconfirmed);
-        }
-        let expected_source = if overlay_foreign {
-            request.overlay.campaign_id.as_str()
-        } else {
-            reusable_origin.unwrap_or("")
-        };
-        if admission.source_campaign_id != expected_source
-            || admission.target_task_id != request.requesting_task_id
-        {
+        if !admission.matches_permit(request.verified) {
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }
-        if reusable_foreign && reusable_origin.is_some_and(|o| o != admission.source_campaign_id) {
-            return Err(BoundsError::CrossTaskAdmissionMismatch);
-        }
-        if overlay_foreign && request.overlay.campaign_id != admission.source_campaign_id {
+        if request.requesting_task_id != target {
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }
         return Ok(RetrievalDecision {
@@ -877,13 +881,14 @@ pub enum GovernedClosureError {
 /// ([`assemble_campaign_learning_closure`]).
 ///
 /// Runs the #1869 retrieval gate BEFORE assembly: the closure campaign must
-/// match the requesting campaign, the closure policy's owner ids must be
-/// Governor-confirmed, and every presented `Admitted` overlay record must be
-/// backed by the exact live `LOCAL_ADMITTED` overlay in the gate. Expired
-/// overlays, unclosed/ownerless/unadmitted reusables, draft deltas, and
-/// ungoverned cross-task use return [`GovernedClosureError::Bounds`] — they
-/// never reach assembly, so they can never surface as a candidate or a
-/// silent disposition fill.
+/// match the requesting campaign, the closure policy's owner ids must equal
+/// the owner-verified permit's bound authority/rollback refs, and every
+/// presented `Admitted` overlay record must be backed by the exact live
+/// `LOCAL_ADMITTED` overlay in the gate. Expired overlays, fence drift,
+/// unclosed/ownerless/unadmitted reusables, draft deltas, and ungoverned
+/// cross-task use return [`GovernedClosureError::Bounds`] — they never reach
+/// assembly, so they can never surface as a candidate or a silent
+/// disposition fill.
 #[allow(clippy::too_many_arguments)]
 pub fn governed_assemble_campaign_learning_closure(
     exact_campaign_and_target: CampaignAndTarget,
@@ -899,12 +904,9 @@ pub fn governed_assemble_campaign_learning_closure(
             BoundsError::ClosureCampaignMismatch,
         ));
     }
-    if !gate
-        .governor
-        .confirms_authority(&closure_policy.external_owner_id)
-        || !gate
-            .governor
-            .confirms_authority(&closure_policy.rollback_owner_id)
+    let permit = gate.verified.permit();
+    if closure_policy.external_owner_id != permit.authority_ref()
+        || closure_policy.rollback_owner_id != permit.rollback_ref()
     {
         return Err(GovernedClosureError::Bounds(
             BoundsError::GovernorAuthorityUnconfirmed,

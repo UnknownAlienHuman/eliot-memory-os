@@ -1719,6 +1719,7 @@ dependencies = [
 name = "eliot-governor"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "eliot-authority",
  "eliot-budget",
  "eliot-canonical",
@@ -1859,6 +1860,8 @@ name = "eliot-improvement"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
+ "eliot-governor",
  "serde",
  "thiserror",
  "time",
