@@ -3,8 +3,9 @@
 use std::io::{self, Write};
 
 use eliot_wasm_host::{
-    CliError, TypedWorld, default_experimental_limits, execute_describe_experimental, parse_args,
-    read_bounded_artifact, resolve_kernel_port_grant, run_guest_exec,
+    CliError, GrantLaunchArgs, TypedWorld, default_experimental_limits,
+    execute_describe_experimental, parse_args, read_bounded_artifact, resolve_kernel_port_grant,
+    run_grant_launch, run_guest_exec,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -28,6 +29,32 @@ fn emit_receipt(fields: &[(&str, &str)]) {
     }
     let _ = writeln!(stdout);
     let _ = writeln!(stdout, "}}");
+}
+
+/// Runs the governed grant-launch branch: full pipeline, staged receipt on
+/// stdout on success, stage-taxonomy denial on stderr otherwise. Returns on
+/// success; exits the process on denial or argument failure upstream.
+fn run_grant_launch_branch(grant: &GrantLaunchArgs) {
+    match run_grant_launch(grant) {
+        Ok(receipt) => {
+            let deadline = receipt.deadline_unix_ms.to_string();
+            emit_receipt(&[
+                ("status", "grant-launch-staged"),
+                ("component", &receipt.component_id),
+                ("artifact_digest", &receipt.artifact_digest),
+                ("interface_digest", &receipt.interface_digest),
+                ("host_artifact_digest", &receipt.host_artifact_digest),
+                ("engine", &receipt.engine_implementation_id),
+                ("engine_artifact_digest", &receipt.engine_artifact_digest),
+                ("nonce", &receipt.nonce),
+                ("deadline_unix_ms", &deadline),
+            ]);
+        }
+        Err(error) => {
+            emit_error("GRANT_LAUNCH_DENIED", &error.to_string());
+            std::process::exit(ADMISSION_REQUIRED_EXIT);
+        }
+    }
 }
 
 fn main() {
@@ -63,6 +90,15 @@ fn main() {
     // contaminate stdout.
     if let Some(guest) = &config.guest_exec {
         std::process::exit(run_guest_exec(guest));
+    }
+
+    // Governed grant launch: the dedicated executable consumer path. Runs
+    // the full pipeline — channel binding, bundle from real bytes,
+    // authenticated transport request, descriptor authorization, installed
+    // binary resolution, engine staging — and emits the staged receipt on
+    // success. Every denial stays fail-closed with a stage-taxonomy code.
+    if let Some(grant) = &config.grant_launch {
+        run_grant_launch_branch(grant);
     }
 
     if let (Some(component_path), Some(world_name)) = (
@@ -113,11 +149,10 @@ fn main() {
         return;
     }
 
-    // The live governed path requires a Kernel-admitted RuntimePorts grant.
-    // No admission channel is bound yet, so resolution fails closed before
-    // any engine, runner, or invocation is constructed. A grant that ever
-    // resolves here still has no authenticated request loop to serve it, so
-    // holding it would invent authority: stay denied in that case too.
+    // No mode selected: the live governed path requires a Kernel-admitted
+    // RuntimePorts grant, and no admission channel is bound here, so
+    // resolution fails closed before any engine, runner, or invocation is
+    // constructed. Governed work enters through `--grant-launch` above.
     match resolve_kernel_port_grant() {
         Ok(_grant) => {
             emit_error(

@@ -177,11 +177,12 @@ pub fn export_matches_interface(export_name: &str, interface: &str) -> bool {
     false
 }
 
-/// Stable digest of the exact frozen WIT bytes (all seven files, sorted
-/// concatenation). Used as the ABI identity in receipts; the digest value
-/// itself is excluded from the hashed payload by construction.
+/// Stable bytes of the exact frozen WIT bundle (all seven files, sorted
+/// concatenation, newline-terminated each). The grant-request path hashes
+/// these real bytes for its interface digest; [`typed_wit_digest`] is that
+/// hash. Byte identity is single-sourced here, never reassembled elsewhere.
 #[must_use]
-pub fn typed_wit_digest() -> Sha256Digest {
+pub fn typed_wit_bytes() -> Vec<u8> {
     // Sorted file order for a deterministic identity.
     let parts: [&[u8]; 7] = [
         include_bytes!("../wit/typed/context-admission.wit"),
@@ -197,5 +198,13 @@ pub fn typed_wit_digest() -> Sha256Digest {
         combined.extend_from_slice(part);
         combined.push(b'\n');
     }
-    Sha256Digest::of_bytes(&combined)
+    combined
+}
+
+/// Stable digest of the exact frozen WIT bytes (all seven files, sorted
+/// concatenation). Used as the ABI identity in receipts; the digest value
+/// itself is excluded from the hashed payload by construction.
+#[must_use]
+pub fn typed_wit_digest() -> Sha256Digest {
+    Sha256Digest::of_bytes(&typed_wit_bytes())
 }

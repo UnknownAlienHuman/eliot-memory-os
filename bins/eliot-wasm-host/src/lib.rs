@@ -27,6 +27,7 @@ mod cli_contract;
 mod contour;
 mod grant_authorization;
 mod grant_client;
+mod grant_launch;
 mod guest_exec;
 mod installed_binary;
 mod shadow;
@@ -39,7 +40,9 @@ pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
 pub use child_engine::{ISOLATED_CHILD_IMPLEMENTATION_ID, IsolatedChildEngine};
-pub use cli_contract::{CliConfig, CliError, GuestExecArgs, Profile, Transport, parse_args};
+pub use cli_contract::{
+    CliConfig, CliError, GrantLaunchArgs, GuestExecArgs, Profile, Transport, parse_args,
+};
 pub use contour::{
     AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, Contour, ContourGateError,
     FS_CAPABILITY, GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY,
@@ -56,6 +59,10 @@ pub use grant_client::{
 };
 #[cfg(windows)]
 pub use grant_client::{GRANT_ISSUE_OPERATION, request_grant_via_transport};
+pub use grant_launch::{
+    GRANT_CONNECT_TIMEOUT_MAX_MS, GRANT_DESCRIPTOR_MAX_BYTES, GrantLaunchError, GrantLaunchReceipt,
+    grant_engine_binding, run_grant_launch,
+};
 pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
     GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,
@@ -68,7 +75,7 @@ pub use installed_binary::{
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
     LEGACY_EXPORT, LEGACY_WORLD, TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld,
-    export_matches_interface, typed_wit_digest,
+    export_matches_interface, typed_wit_bytes, typed_wit_digest,
 };
 pub use typed_execution::{
     ExecutionMode, TypedDescriptor, TypedExecutionError, TypedReceipt, default_experimental_limits,

@@ -109,6 +109,42 @@ impl std::str::FromStr for Profile {
     }
 }
 
+/// Bounded argument set for one governed grant launch: the dedicated
+/// executable consumer path (issue #1955, I14.19).
+///
+/// Every value is an explicit staged input, validated fail-closed before
+/// any transport or filesystem use: front-door channel facts (pipe, Kernel
+/// SID/session/artifact, connect timeout), the requested component identity
+/// plus its artifact file, the frozen WIT world selection, the live
+/// installation descriptor file, and caller freshness (nonce, deadline).
+/// Nothing is defaulted, probed, or read from ambient process state: the
+/// staging parent supplies each value exactly, like `--guest-exec`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantLaunchArgs {
+    /// Local front-door pipe name of the Kernel server.
+    pub pipe_name: String,
+    /// Expected Kernel server SID.
+    pub kernel_sid: String,
+    /// Expected Kernel server session id.
+    pub kernel_session_id: u32,
+    /// Expected Kernel artifact SHA-256 (lowercase hex).
+    pub kernel_artifact_sha256: String,
+    /// Connect timeout in milliseconds (local policy ceiling applies).
+    pub connect_timeout_ms: u64,
+    /// Requested component identity (pinned end-to-end to the grant).
+    pub component_id: String,
+    /// Component artifact file (bounded, preflighted, digest-checked).
+    pub artifact_path: std::path::PathBuf,
+    /// Frozen WIT world selection (interface digest from real WIT bytes).
+    pub world: crate::typed_bindings::TypedWorld,
+    /// Live installation descriptor file (JSON, validated on read).
+    pub descriptor_path: std::path::PathBuf,
+    /// Caller nonce for exactly-once issuance.
+    pub nonce: String,
+    /// Absolute deadline (unix ms) the grant must not outlive.
+    pub deadline_unix_ms: u64,
+}
+
 /// Parsed profile, local transport, and optional explicit experimental selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliConfig {
@@ -128,6 +164,13 @@ pub struct CliConfig {
     /// P03 staged intent, so every value here is admission-bound, never
     /// ambient.
     pub guest_exec: Option<GuestExecArgs>,
+    /// Governed grant launch: authenticated grant request over the Kernel
+    /// front-door channel, authorized against the live installation
+    /// descriptor, resolved to the installed binary, and staged for the
+    /// isolated-child engine. `None` unless at least one `--grant-*` flag
+    /// is passed; any partial set fails closed. Mutually exclusive with
+    /// `--guest-exec` and the experimental path.
+    pub grant_launch: Option<GrantLaunchArgs>,
 }
 
 /// Bounded argument set for one-shot admitted guest execution.
@@ -151,6 +194,66 @@ pub struct GuestExecArgs {
     pub epoch_deadline_ticks: u64,
 }
 
+/// Claims the spaced value for one `--flag value` pair: present and
+/// non-empty, else malformed. The `--flag=value` form is handled per flag
+/// at the call site.
+fn take_flag_value(
+    flag: &'static str,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<String, CliError> {
+    let value = arguments
+        .get(*index + 1)
+        .ok_or_else(|| CliError::MalformedArgument(format!("{flag} requires a value")))?;
+    if value.is_empty() {
+        return Err(CliError::MalformedArgument(format!(
+            "{flag} requires a value"
+        )));
+    }
+    *index += 2;
+    Ok(value.clone())
+}
+
+/// Text conversion for the grant parser: any non-empty value is accepted;
+/// shape checks belong to the launch path, not the parser.
+fn grant_text_value(text: &str) -> String {
+    text.to_owned()
+}
+
+/// `u64` conversion for [`grant_flag!`]: malformed numerals fail closed here,
+/// range checks belong to the launch path.
+fn grant_u64_value(flag: &'static str, text: &str) -> Result<u64, CliError> {
+    text.parse()
+        .map_err(|_| CliError::MalformedArgument(format!("{flag} requires a u64 value")))
+}
+
+/// Path conversion for the grant parser: records the staged path verbatim;
+/// existence and bounds are proven by the launch path on read.
+fn grant_path_value(text: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(text)
+}
+
+/// Claims one `--grant-*` value from either spelling (`--flag value`,
+/// `--flag=value`): the inline tail wins when present, else the next
+/// argument. Empty and absent values fail closed.
+fn claim_grant_value(
+    flag: &'static str,
+    inline: Option<&str>,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<String, CliError> {
+    if let Some(text) = inline {
+        if text.is_empty() {
+            return Err(CliError::MalformedArgument(format!(
+                "{flag} requires a value"
+            )));
+        }
+        *index += 1;
+        return Ok(text.to_owned());
+    }
+    take_flag_value(flag, arguments, index)
+}
+
 /// Parses B-12's profile and transport arguments without adding a CLI crate.
 #[allow(clippy::too_many_lines)]
 pub fn parse_args<I, S>(arguments: I) -> Result<CliConfig, CliError>
@@ -172,9 +275,28 @@ where
     let mut guest_max_memory: Option<u64> = None;
     let mut guest_wall_ms: Option<u64> = None;
     let mut guest_epoch_ticks: Option<u64> = None;
+    let mut grant_seen = false;
+    let mut grant_pipe: Option<String> = None;
+    let mut grant_kernel_sid: Option<String> = None;
+    let mut grant_kernel_session: Option<u64> = None;
+    let mut grant_kernel_artifact_sha256: Option<String> = None;
+    let mut grant_connect_timeout_ms: Option<u64> = None;
+    let mut grant_component: Option<String> = None;
+    let mut grant_artifact: Option<std::path::PathBuf> = None;
+    let mut grant_world: Option<String> = None;
+    let mut grant_descriptor: Option<std::path::PathBuf> = None;
+    let mut grant_nonce: Option<String> = None;
+    let mut grant_deadline_ms: Option<u64> = None;
     let mut index = 0;
     while index < arguments.len() {
-        match arguments[index].as_str() {
+        // Grant flags accept both spellings: split `--grant-flag=value`
+        // once up front (grant namespace only — every other token keeps its
+        // existing arm verbatim).
+        let (flag, inline_value): (&str, Option<&str>) = match arguments[index].split_once('=') {
+            Some((head, tail)) if head.starts_with("--grant-") => (head, Some(tail)),
+            _ => (arguments[index].as_str(), None),
+        };
+        match flag {
             "--profile" => {
                 let value = arguments.get(index + 1).ok_or_else(|| {
                     CliError::MalformedArgument("--profile requires a value".to_owned())
@@ -332,6 +454,84 @@ where
                     &mut index,
                 )?);
             }
+            "--grant-pipe" => {
+                grant_seen = true;
+                let text = claim_grant_value("--grant-pipe", inline_value, &arguments, &mut index)?;
+                grant_pipe = Some(grant_text_value(&text));
+            }
+            "--grant-kernel-sid" => {
+                grant_seen = true;
+                let text =
+                    claim_grant_value("--grant-kernel-sid", inline_value, &arguments, &mut index)?;
+                grant_kernel_sid = Some(grant_text_value(&text));
+            }
+            "--grant-kernel-session" => {
+                grant_seen = true;
+                let text = claim_grant_value(
+                    "--grant-kernel-session",
+                    inline_value,
+                    &arguments,
+                    &mut index,
+                )?;
+                grant_kernel_session = Some(grant_u64_value("--grant-kernel-session", &text)?);
+            }
+            "--grant-kernel-artifact-sha256" => {
+                grant_seen = true;
+                let text = claim_grant_value(
+                    "--grant-kernel-artifact-sha256",
+                    inline_value,
+                    &arguments,
+                    &mut index,
+                )?;
+                grant_kernel_artifact_sha256 = Some(grant_text_value(&text));
+            }
+            "--grant-connect-timeout-ms" => {
+                grant_seen = true;
+                let text = claim_grant_value(
+                    "--grant-connect-timeout-ms",
+                    inline_value,
+                    &arguments,
+                    &mut index,
+                )?;
+                grant_connect_timeout_ms =
+                    Some(grant_u64_value("--grant-connect-timeout-ms", &text)?);
+            }
+            "--grant-component" => {
+                grant_seen = true;
+                let text =
+                    claim_grant_value("--grant-component", inline_value, &arguments, &mut index)?;
+                grant_component = Some(grant_text_value(&text));
+            }
+            "--grant-artifact" => {
+                grant_seen = true;
+                let text =
+                    claim_grant_value("--grant-artifact", inline_value, &arguments, &mut index)?;
+                grant_artifact = Some(grant_path_value(&text));
+            }
+            "--grant-world" => {
+                grant_seen = true;
+                let text =
+                    claim_grant_value("--grant-world", inline_value, &arguments, &mut index)?;
+                grant_world = Some(grant_text_value(&text));
+            }
+            "--grant-descriptor" => {
+                grant_seen = true;
+                let text =
+                    claim_grant_value("--grant-descriptor", inline_value, &arguments, &mut index)?;
+                grant_descriptor = Some(grant_path_value(&text));
+            }
+            "--grant-nonce" => {
+                grant_seen = true;
+                let text =
+                    claim_grant_value("--grant-nonce", inline_value, &arguments, &mut index)?;
+                grant_nonce = Some(grant_text_value(&text));
+            }
+            "--grant-deadline-ms" => {
+                grant_seen = true;
+                let text =
+                    claim_grant_value("--grant-deadline-ms", inline_value, &arguments, &mut index)?;
+                grant_deadline_ms = Some(grant_u64_value("--grant-deadline-ms", &text)?);
+            }
             value => return Err(CliError::MalformedArgument(value.to_owned())),
         }
     }
@@ -399,13 +599,91 @@ where
     } else {
         None
     };
+    let has_guest_exec = guest_exec.is_some();
+    let has_experimental = experimental_typed_component.is_some() || experimental_world.is_some();
     Ok(CliConfig {
         profile: profile.ok_or(CliError::MissingProfile)?,
         transport,
         experimental_typed_component,
         experimental_world,
         guest_exec,
+        grant_launch: assemble_grant_launch(
+            grant_seen,
+            has_guest_exec,
+            has_experimental,
+            grant_pipe,
+            grant_kernel_sid,
+            grant_kernel_session,
+            grant_kernel_artifact_sha256,
+            grant_connect_timeout_ms,
+            grant_component,
+            grant_artifact,
+            grant_world,
+            grant_descriptor,
+            grant_nonce,
+            grant_deadline_ms,
+        )?,
     })
+}
+
+/// Assembles the governed grant-launch argument set: all-or-nothing and
+/// exclusive with guest execution and the experimental path. Any partial
+/// set, mode overlap, unknown world, or out-of-range session fails closed
+/// with the offending flag named.
+#[allow(clippy::too_many_arguments)]
+fn assemble_grant_launch(
+    grant_seen: bool,
+    has_guest_exec: bool,
+    has_experimental: bool,
+    grant_pipe: Option<String>,
+    grant_kernel_sid: Option<String>,
+    grant_kernel_session: Option<u64>,
+    grant_kernel_artifact_sha256: Option<String>,
+    grant_connect_timeout_ms: Option<u64>,
+    grant_component: Option<String>,
+    grant_artifact: Option<std::path::PathBuf>,
+    grant_world: Option<String>,
+    grant_descriptor: Option<std::path::PathBuf>,
+    grant_nonce: Option<String>,
+    grant_deadline_ms: Option<u64>,
+) -> Result<Option<GrantLaunchArgs>, CliError> {
+    if !grant_seen {
+        return Ok(None);
+    }
+    if has_guest_exec {
+        return Err(CliError::MalformedArgument(
+            "grant launch is exclusive with --guest-exec".to_owned(),
+        ));
+    }
+    if has_experimental {
+        return Err(CliError::MalformedArgument(
+            "grant launch is exclusive with the experimental path".to_owned(),
+        ));
+    }
+    let missing =
+        |flag: &'static str| CliError::MalformedArgument(format!("grant launch requires {flag}"));
+    let session = grant_kernel_session.ok_or_else(|| missing("--grant-kernel-session"))?;
+    let kernel_session_id = u32::try_from(session).map_err(|_| {
+        CliError::MalformedArgument("--grant-kernel-session requires a u32 value".to_owned())
+    })?;
+    let world_name = grant_world.ok_or_else(|| missing("--grant-world"))?;
+    let world = crate::typed_bindings::TypedWorld::parse(&world_name)
+        .ok_or(CliError::UnknownWorld(world_name))?;
+    Ok(Some(GrantLaunchArgs {
+        pipe_name: grant_pipe.ok_or_else(|| missing("--grant-pipe"))?,
+        kernel_sid: grant_kernel_sid.ok_or_else(|| missing("--grant-kernel-sid"))?,
+        kernel_session_id,
+        kernel_artifact_sha256: grant_kernel_artifact_sha256
+            .ok_or_else(|| missing("--grant-kernel-artifact-sha256"))?,
+        connect_timeout_ms: grant_connect_timeout_ms
+            .ok_or_else(|| missing("--grant-connect-timeout-ms"))?,
+        component_id: grant_component.ok_or_else(|| missing("--grant-component"))?,
+        artifact_path: grant_artifact.ok_or_else(|| missing("--grant-artifact"))?,
+        world,
+        descriptor_path: grant_descriptor.ok_or_else(|| missing("--grant-descriptor"))?,
+        nonce: grant_nonce.ok_or_else(|| missing("--grant-nonce"))?,
+        deadline_unix_ms: grant_deadline_ms.ok_or_else(|| missing("--grant-deadline-ms"))?,
+    }))
 }
 
 /// Parses one guest-execution numeric ceiling: present, non-empty, and a
@@ -471,6 +749,110 @@ mod tests {
         assert_eq!(guest.wall_deadline_ms, 10000);
         assert_eq!(guest.epoch_deadline_ticks, 100);
         assert_eq!(guest.artifact_digest, "ab");
+    }
+
+    fn grant_argv() -> Vec<String> {
+        [
+            "--profile",
+            "D2_OPERATIONAL",
+            "--grant-pipe",
+            "eliot-kernel-front-door",
+            "--grant-kernel-sid",
+            "S-1-5-18",
+            "--grant-kernel-session",
+            "1",
+            "--grant-kernel-artifact-sha256",
+            &"a".repeat(64),
+            "--grant-connect-timeout-ms",
+            "250",
+            "--grant-component",
+            "component-1955",
+            "--grant-artifact",
+            "component.bin",
+            "--grant-world",
+            "context-admission",
+            "--grant-descriptor",
+            "launch.json",
+            "--grant-nonce",
+            "nonce-1955",
+            "--grant-deadline-ms",
+            "9999999999999",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn grant_launch_args_parse_complete() {
+        let config = parse_args(grant_argv()).expect("grant argv parses");
+        let grant = config.grant_launch.expect("grant mode selected");
+        assert_eq!(grant.pipe_name, "eliot-kernel-front-door");
+        assert_eq!(grant.kernel_sid, "S-1-5-18");
+        assert_eq!(grant.kernel_session_id, 1);
+        assert_eq!(grant.kernel_artifact_sha256, "a".repeat(64));
+        assert_eq!(grant.connect_timeout_ms, 250);
+        assert_eq!(grant.component_id, "component-1955");
+        assert_eq!(
+            grant.artifact_path,
+            std::path::PathBuf::from("component.bin")
+        );
+        assert_eq!(
+            grant.world,
+            crate::typed_bindings::TypedWorld::ContextAdmission
+        );
+        assert_eq!(
+            grant.descriptor_path,
+            std::path::PathBuf::from("launch.json")
+        );
+        assert_eq!(grant.nonce, "nonce-1955");
+        assert_eq!(grant.deadline_unix_ms, 9_999_999_999_999);
+    }
+
+    #[test]
+    fn grant_launch_args_fail_closed() {
+        // Partial set names the missing flag.
+        let mut argv = grant_argv();
+        argv.drain(20..22);
+        assert_eq!(
+            parse_args(argv),
+            Err(CliError::MalformedArgument(
+                "grant launch requires --grant-nonce".to_owned()
+            ))
+        );
+        // Non-numeric session.
+        let mut argv = grant_argv();
+        argv[7] = "lots".to_owned();
+        assert!(matches!(
+            parse_args(argv),
+            Err(CliError::MalformedArgument(_))
+        ));
+        // Out-of-range session.
+        let mut argv = grant_argv();
+        argv[7] = "4294967296".to_owned();
+        assert_eq!(
+            parse_args(argv),
+            Err(CliError::MalformedArgument(
+                "--grant-kernel-session requires a u32 value".to_owned()
+            ))
+        );
+        // Unknown world.
+        let mut argv = grant_argv();
+        argv[17] = "fancy-world".to_owned();
+        assert_eq!(
+            parse_args(argv),
+            Err(CliError::UnknownWorld("fancy-world".to_owned()))
+        );
+        // Guest mode overlap.
+        let mut argv = grant_argv();
+        argv.extend(guest_argv().into_iter().skip(2));
+        assert!(matches!(
+            parse_args(argv),
+            Err(CliError::MalformedArgument(_))
+        ));
+        // No grant flags means no grant mode.
+        let config = parse_args(["--profile", "D2_OPERATIONAL"]).expect("plain argv parses");
+        assert!(config.grant_launch.is_none());
     }
 
     #[test]
