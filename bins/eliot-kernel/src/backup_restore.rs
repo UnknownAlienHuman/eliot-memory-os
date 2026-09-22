@@ -19,11 +19,49 @@
 //!
 //! What this file owns: the thin [`KernelBackupRestore`] execution body plus
 //! the [`RestoreTarget`](eliot_backup::RestoreTarget) adapter
-//! (`apply_restore_effect` / `reconcile_restore_effect`) over the historical
-//! per-phase owner methods the accepted contract retains for owner adapters.
-//! Every phase maps to its responsible owner through [`phase_owner`], and the
-//! apply path executes the genuine owner operation with the exact bindings
+//! (`apply_restore_effect` / `reconcile_restore_effect`) over the accepted
+//! per-phase owner methods. Every phase maps to its responsible owner
+//! through [`phase_owner`], and the apply path executes the genuine owner
+//! operation through the live #962 owner channels with the exact bindings
 //! the coordinator supplies:
+//!
+//! ```text
+//! prepare/finalize ......... kernel-restore-owner (destination staging,
+//!                              fence gate, observed evidence, verified
+//!                              Host-issued destination authorization);
+//! purge .................... purge owner (`PurgeOwnerClient::validate_entries`,
+//!                              staged purge-first before any import);
+//! canonical/receipt/
+//! projection/rebuild/verify . canonical owner (`CanonicalOwnerClient`
+//!                              validation plus chain coverage over observed
+//!                              destination state);
+//! sealed blobs ............. blob owner (`BlobOwnerClient::restore_blob`
+//!                              with backup-bound restoration receipts, the
+//!                              admitted key manifest, and the destination
+//!                              scope; re-sealed bytes staged, never
+//!                              plaintext);
+//! ORS suspension ........... ORS owner (`OrsOwnerClient::suspend`,
+//!                              persisted as suspended evidence, never
+//!                              runnable);
+//! live store import ........ canonical-store owner
+//!                              (`CanonicalStoreImportClient` through the
+//!                              retained `KernelStoreGateway`; the
+//!                              backup-specific Store wire stays #975-owned);
+//! lease invalidation ........ supervision-lease owner
+//!                              (`InvalidationOwnerClient::revoke_lease`,
+//!                              cutover-gated, invoked by the #961 cutover
+//!                              executor with a terminal ticket).
+//! ```
+//!
+//! The Host-issued destination authorization gates every effect: `restore`
+//! reads the pinned `destination-authorization.json` the Host-authorized
+//! preparation flow wrote, verifies it through
+//! [`verify_destination_authorization`](super::backup_owner_clients::verify_destination_authorization)
+//! (wire/issuer identity, exact target/transaction binding, digest shapes,
+//! work-root containment, manifest agreement), and every effect client
+//! binds the resulting verification. An absent or invalid authorization
+//! refuses with the exact missing owner before any effect — rehearsal
+//! without Host admission is refused, not staged.
 //!
 //! ```text
 //! prepare/finalize ......... kernel-restore-owner (destination staging,
@@ -46,12 +84,11 @@
 //! Effects whose bindings are absent refuse fail-closed with the exact
 //! responsible capability; reconciliation answers from persisted identity
 //! receipts (`Applied` on exact transaction/phase/input match, `NotApplied`
-//! otherwise). All effects here are synchronous and local with a persisted
-//! identity receipt per phase, so no ambiguous external commit exists in this
-//! target and no `Unknown` outcome is manufactured: async owner-channel
-//! unknowns belong to the #962 wire layer, which owns
-//! `backup_owner_clients.rs` and must upgrade reconciliation there, never
-//! downgrade readback to a blind re-apply here.
+//! otherwise). All effects in this target are synchronous and local with a
+//! persisted identity receipt per phase, so no ambiguous external commit
+//! exists here and no `Unknown` outcome is manufactured: live store imports
+//! reconcile through `CanonicalStoreImportClient` by exact operation
+//! identity, never by downgrading readback to a blind re-apply here.
 //!
 //! Capability cell: Kernel restore ownership (isolated import execution).
 //! Forbidden authority: no ORS row reinterpretation, no epoch minting, no
@@ -69,7 +106,7 @@ use eliot_backup::{
     RestoreHistoricalAuthority, RestoreIntent, RestoreObligationState, RestoreOwnerObligation,
     RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation, RestoreStep, RestoreTarget,
     RestoredFence, RestoredSealedBlob, WrappedKeyManifest, authorize_cutover,
-    issue_restoration_receipts, suspended_recovery_entries, verify_key_coverage,
+    suspended_recovery_entries,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreObligations, RestoreProvenance};
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
@@ -122,241 +159,21 @@ mod owners {
     /// Missing destination blob-scope admission (#956/#958) for sealed-blob
     /// restoration under destination ownership.
     pub const BLOB_SCOPE_BINDING: &str = "blob-destination-scope";
-    /// Missing live canonical-store import channel (#952/#962): writing the
-    /// live store is never staged from here.
-    pub const STORE_IMPORT: &str = "canonical-store-import";
-    /// Missing accepted purge member-matching API: no in-tree contract maps
-    /// a ledger `subject_ref` to archive member identities, so per-member
-    /// suppression cannot be computed here. Backlog to M2.
-    pub const PURGE_MEMBER_SUPPRESSION: &str = "purge-member-suppression";
 }
 
-/// Purge owner client (#962): validates the purge ledger through the
-/// owner's accepted validation before any import.
+/// Live #962 owner channels this adapter executes through.
 ///
-/// Per-entry `validate` is the owner check the archive already passed at
-/// bundle validation and each purge phase re-proves; the staged ledger is
-/// the tombstone preservation itself. `validate_restore` (refusing
-/// `Purged`-state resurrection) is deliberately NOT called here: ledger
-/// entries legitimately sit at `Purged`, and it guards resurrection into
-/// live authority — isolated import preserves tombstones instead, while the
-/// coordinator's erasure-refusal gate covers receipt rehydration.
-/// Per-member suppression against `subject_ref` has no accepted matching
-/// API in-tree and refuses as backlog rather than guessing.
-pub struct PurgeOwnerClient<'a> {
-    entries: &'a [PurgeLedgerEntry],
-}
-
-impl<'a> PurgeOwnerClient<'a> {
-    /// Binds the client's view to the archive's validated purge ledger.
-    pub fn bind(entries: &'a [PurgeLedgerEntry]) -> Self {
-        Self { entries }
-    }
-
-    /// Runs the owner's accepted per-entry validation.
-    pub fn validate_entries(&self) -> Result<(), BackupError> {
-        for entry in self.entries {
-            entry
-                .validate()
-                .map_err(|error| BackupError::Security(error.to_string()))?;
-        }
-        Ok(())
-    }
-
-    /// Suppression of one purged member. Unavailable: no accepted contract
-    /// maps a ledger `subject_ref` to archive member identities. Fails
-    /// closed as backlog instead of matching by spelling.
-    pub fn suppress_purged_member(&self, _subject_ref: &str) -> Result<(), BackupError> {
-        Err(BackupError::RestoreCapabilityUnsupported {
-            capability: owners::PURGE_MEMBER_SUPPRESSION,
-        })
-    }
-}
-
-/// Canonical owner client (#962): runs the owner's accepted validation and
-/// verification over staged members.
-///
-/// Record/receipt validation and receipt/event-chain verification are the
-/// owner's checks, invoked here with the exact members the phase touches.
-/// Writing the live canonical store is a separate channel owned by the #962
-/// wire (`backup_owner_clients.rs`): this client stages validated bytes into
-/// the isolated destination substrate and refuses live import here, so a
-/// staged byte is never presented as an executed owner transition.
-pub struct CanonicalOwnerClient;
-
-impl CanonicalOwnerClient {
-    /// Runs the owner's accepted canonical-record validation.
-    pub fn validate_event(record: &CanonicalRecord) -> Result<(), BackupError> {
-        record.validate()
-    }
-
-    /// Runs the owner's accepted write-receipt validation.
-    pub fn validate_receipt(receipt: &WriteReceipt) -> Result<(), BackupError> {
-        receipt.validate().map_err(BackupError::Store)
-    }
-
-    /// Runs the owner's accepted receipt/event-chain verification over the
-    /// exact members staged.
-    pub fn verify_chain(
-        receipts: &[WriteReceipt],
-        events: &[CanonicalRecord],
-    ) -> Result<(), BackupError> {
-        let event_ids: std::collections::BTreeSet<&str> = events
-            .iter()
-            .map(|event| event.record_id.as_str())
-            .collect();
-        for receipt in receipts {
-            Self::validate_receipt(receipt)?;
-            for event_id in &receipt.emitted_event_ids {
-                if !event_ids.contains(event_id.as_str()) {
-                    return Err(BackupError::ReceiptChainGap {
-                        event_id: event_id.to_string(),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Live canonical-store import. Unavailable in this lane: the channel
-    /// belongs to the #962 wire. Fails closed before any effect.
-    pub fn import_to_store(&self) -> Result<(), BackupError> {
-        Err(BackupError::RestoreCapabilityUnsupported {
-            capability: owners::STORE_IMPORT,
-        })
-    }
-}
-
-/// Blob owner client (#962): restores one sealed blob under destination
-/// ownership through the accepted destination adapter.
-///
-/// Binds the backup-bound restoration receipts (deterministically derived
-/// from the validated bundle and admitted key manifest), the admitted key
-/// manifest, and the destination scope. Invocation opens the sealed
-/// envelope through the installation secret owner, digest-verifies the
-/// plaintext, and re-seals under the destination lineage: key material and
-/// plaintext stay memory-only inside the adapter and never cross back.
-pub struct BlobOwnerClient<'a> {
-    receipts: Vec<BlobRestorationReceipt>,
-    manifest: &'a WrappedKeyManifest,
-    scope: &'a DestinationScope,
-}
-
-impl<'a> BlobOwnerClient<'a> {
-    /// Binds restoration receipts, key manifest, and destination scope.
-    /// All three must be present: a blob without any binding refuses.
-    pub fn bind(
-        receipts: Vec<BlobRestorationReceipt>,
-        manifest: Option<&'a WrappedKeyManifest>,
-        scope: Option<&'a DestinationScope>,
-    ) -> Result<Self, BackupError> {
-        let manifest = manifest.ok_or(BackupError::MissingRecoveryComponent(
-            "blob_key_material",
-        ))?;
-        let scope = scope.ok_or(BackupError::RestoreCapabilityUnsupported {
-            capability: owners::BLOB_SCOPE_BINDING,
-        })?;
-        Ok(Self {
-            receipts,
-            manifest,
-            scope,
-        })
-    }
-
-    /// Restores one sealed blob: receipt binding, envelope open, plaintext
-    /// digest verification, destination re-seal. Any refusal fails the phase
-    /// closed — never write-through.
-    pub fn restore_blob(
-        &self,
-        adapter: &DestinationRestoreAdapter,
-        blob: &BackupBlob,
-    ) -> Result<RestoredSealedBlob, BackupError> {
-        let receipt = self
-            .receipts
-            .iter()
-            .find(|receipt| receipt.blob_hash == blob.locator.hash.as_str())
-            .ok_or(BackupError::PlanMismatch)?;
-        adapter.restore_blob_sealed(blob, receipt, self.manifest, self.scope)
-    }
-}
-
-/// ORS owner client (#962): derives suspended-recovery evidence through the
-/// accepted pure function and reads owner-held stream bindings.
-///
-/// Suspended entries are evidence only: restored ORS operations return as
-/// `suspended_recovery`, never runnable, and this client performs no live
-/// ORS mutation. The durable stream binding read below is the owner's
-/// current authenticated evidence used by the cutover path.
-pub struct OrsOwnerClient;
-
-impl OrsOwnerClient {
-    /// Derives suspended-recovery entries from a validated ORS snapshot.
-    pub fn suspend(
-        snapshot: &OrsSnapshotFence,
-    ) -> Result<Vec<RestoreHistoricalAuthority>, BackupError> {
-        suspended_recovery_entries(snapshot)
-    }
-}
-
-/// Live-authority invalidation kinds. Each names the exact owner that must
-/// execute it; none executes inside isolated restore.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InvalidationKind {
-    Runtime,
-    Session,
-    Lease,
-    Route,
-    UserBroker,
-}
-
-impl InvalidationKind {
-    /// Obligation owner id for this invalidation.
-    #[must_use]
-    pub const fn owner_id(self) -> &'static str {
-        match self {
-            Self::Runtime => owners::RUNTIME,
-            Self::Session => owners::SESSION,
-            Self::Lease => owners::LEASE,
-            Self::Route => owners::ROUTE,
-            Self::UserBroker => owners::USER_BROKER,
-        }
-    }
-}
-
-/// Live-authority invalidation owner client (#962, cutover-gated).
-///
-/// Old sessions, leases, routes, broker registrations, and epochs must not
-/// survive alongside a cutover, but invalidating live authority during
-/// isolated rehearsal would be destructive: without a validated cutover
-/// receipt this client refuses with `CutoverNotAuthorized`. With one, the
-/// effect still requires the #962 wire channel and refuses with the exact
-/// missing capability. Either way no live state is touched here.
-pub struct InvalidationOwnerClient {
-    kind: InvalidationKind,
-}
-
-impl InvalidationOwnerClient {
-    /// Binds the client to one invalidation kind.
-    pub fn bind(kind: InvalidationKind) -> Self {
-        Self { kind }
-    }
-
-    /// Requests the invalidation. Cutover-gated, channel-absent: always
-    /// refuses here, naming either the missing cutover authority or the
-    /// missing wire channel. Lease revocation belongs to the
-    /// supervision-lease authority (`commit_terminal` in
-    /// `supervision_lease_authority.rs`, which needs a live commit ticket,
-    /// predecessor proof, trust anchor, and signer) under #961 sequencing;
-    /// the other kinds have no execution API in-tree at all.
-    pub fn request(&self, cutover: Option<&CutoverReceipt>) -> Result<(), BackupError> {
-        match cutover {
-            None => Err(BackupError::CutoverNotAuthorized),
-            Some(_) => Err(BackupError::RestoreCapabilityUnsupported {
-                capability: self.kind.owner_id(),
-            }),
-        }
-    }
-}
+/// Replacement (a replacement replaces): the staging-only owner clients
+/// previously defined in this file are superseded by the live
+/// [`backup_owner_clients`](super::backup_owner_clients) wire, which
+/// executes every effect through its responsible owner's accepted API under
+/// a verified Host-issued destination authorization. The `owners`
+/// obligation vocabulary above is retained for phase attribution and
+/// evidence; every effect call site below binds the live clients.
+use super::backup_owner_clients::{
+    AuthorizationExpectation, BlobOwnerClient, CanonicalOwnerClient, OrsOwnerClient,
+    PurgeOwnerClient, VerifiedDestinationBinding, verify_destination_authorization,
+};
 
 /// Outcome of one Kernel-executed isolated restore: the journaled receipt,
 /// target-observed evidence when this process executed finalize (or the
@@ -460,7 +277,7 @@ impl KernelBackupRestore {
             ));
         }
         if let Some(manifest) = keys {
-            verify_key_coverage(&bundle.blobs, manifest)
+            BlobOwnerClient::ensure_key_coverage(&bundle.blobs, manifest)
                 .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         } else if !bundle.blobs.is_empty() {
             return Err(KernelRestoreError::CapabilityMissing {
@@ -473,37 +290,20 @@ impl KernelBackupRestore {
             });
         }
         if let Some(evidence) = manifest_evidence.as_ref() {
-            evidence.validate()?;
-            let own_root = std::fs::canonicalize(&self.work_root).map_err(|error| {
-                KernelRestoreError::DestinationInvalid(error.to_string())
-            })?;
-            let admitted_root = std::fs::canonicalize(&evidence.kernel_work_root).map_err(
-                |error| KernelRestoreError::DestinationInvalid(error.to_string()),
-            )?;
-            if own_root != admitted_root {
-                return Err(KernelRestoreError::DestinationInvalid(
-                    "admitted work root does not match the Kernel work root".to_owned(),
-                ));
-            }
-            if let Some(config) = bundle
-                .artifacts
-                .iter()
-                .find(|artifact| artifact.kind == "config")
-            {
-                if config.sha256 != evidence.manifest_digest {
-                    return Err(KernelRestoreError::FenceMismatch(
-                        "destination manifest".to_owned(),
-                    ));
-                }
-            }
+            self.check_manifest_evidence(bundle, evidence)?;
         }
         let plan = RestorePlan::compile(bundle, target.clone())
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         self.journal
             .bind_plan_stream(&plan, bundle, kernel_fence)?;
         let destination = KernelIsolatedDestination::open(&self.work_root, &target.target_id)?;
+        // #962 issuer gate: the Host-authorized preparation flow pinned the
+        // destination authorization before restore; every effect below binds
+        // its verification. Absence refuses with the exact missing owner.
+        let verified =
+            self.verify_destination_binding(&destination, &plan, bundle, manifest_evidence.as_ref())?;
         let receipts = match keys {
-            Some(manifest) => issue_restoration_receipts(
+            Some(manifest) => BlobOwnerClient::issue_receipts(
                 bundle.manifest.backup_id.as_str(),
                 manifest,
                 &bundle.blobs,
@@ -518,6 +318,7 @@ impl KernelBackupRestore {
             blob_scope,
             receipts,
             manifest_evidence,
+            verified,
         );
         let receipt = plan
             .execute_with_journal(bundle, &mut target_impl, &mut self.journal)
@@ -539,6 +340,153 @@ impl KernelBackupRestore {
             destination_root: target_impl.root,
             journal_owner,
         })
+    }
+
+    /// Checks owner-approved manifest evidence against this Kernel's work
+    /// root and the archive's `config` artifact before effects: shapes
+    /// validate, the admitted work root must canonicalize-equal this
+    /// Kernel's own work root, and the admitted manifest digest must equal
+    /// the archive's `config` artifact when the archive carries one. The
+    /// values pin at prepare and any drift refuses later effects and
+    /// cutover.
+    fn check_manifest_evidence(
+        &self,
+        bundle: &BackupBundle,
+        evidence: &DestinationManifestEvidence,
+    ) -> Result<(), KernelRestoreError> {
+        evidence.validate()?;
+        let own_root = std::fs::canonicalize(&self.work_root)
+            .map_err(|error| KernelRestoreError::DestinationInvalid(error.to_string()))?;
+        let admitted_root = std::fs::canonicalize(&evidence.kernel_work_root).map_err(
+            |error| KernelRestoreError::DestinationInvalid(error.to_string()),
+        )?;
+        if own_root != admitted_root {
+            return Err(KernelRestoreError::DestinationInvalid(
+                "admitted work root does not match the Kernel work root".to_owned(),
+            ));
+        }
+        if let Some(config) = bundle
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "config")
+            && config.sha256 != evidence.manifest_digest
+        {
+            return Err(KernelRestoreError::FenceMismatch(
+                "destination manifest".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads the Host-issued destination authorization pinned by the
+    /// Host-authorized preparation flow and verifies it for this exact
+    /// plan, bundle, and work root.
+    ///
+    /// Wire/issuer identity, exact target/transaction binding, digest
+    /// shapes, work-root containment, and manifest agreement are all
+    /// re-proven through the #962 verifier. When owner-approved manifest
+    /// evidence is supplied, its projection must agree with the issuer
+    /// bytes. Any refusal fails closed with the exact missing owner before
+    /// any effect; cutover re-verifies freshness through this same gate.
+    fn verify_destination_binding(
+        &self,
+        destination: &KernelIsolatedDestination,
+        plan: &RestorePlan,
+        bundle: &BackupBundle,
+        manifest_evidence: Option<&DestinationManifestEvidence>,
+    ) -> Result<VerifiedDestinationBinding, KernelRestoreError> {
+        let transaction = plan
+            .transaction()
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let expected_manifest_digest = bundle
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "config")
+            .map(|artifact| artifact.sha256.as_str());
+        let auth_bytes = destination.read_destination_authorization()?;
+        let verified = verify_destination_authorization(
+            &auth_bytes,
+            &AuthorizationExpectation {
+                target_id: plan.target.target_id.as_str(),
+                transaction_id: transaction.transaction_id.as_str(),
+                expected_manifest_digest,
+                kernel_work_root: &self.work_root,
+            },
+        )
+        .map_err(KernelRestoreError::TargetFailed)?;
+        if let Some(evidence) = manifest_evidence {
+            evidence.validate()?;
+            if evidence.manifest_digest != verified.manifest_digest()
+                || evidence.roots_digest != verified.roots_digest()
+                || evidence.registry_revision != verified.registry_revision()
+            {
+                return Err(KernelRestoreError::DestinationInvalid(
+                    "destination admission drifted from the Host-issued authorization".to_owned(),
+                ));
+            }
+        }
+        Ok(verified)
+    }
+
+    /// Validates cutover inputs without effects: separate cutover
+    /// authorization, receipt/plan/target binding, observed evidence with
+    /// its complete validation denominator (any applicable unresolved
+    /// effect, missing receipt, or unknown reconciliation without its
+    /// complete current denominator refuses qualification).
+    fn check_cutover_inputs(
+        plan: &RestorePlan,
+        bundle: &BackupBundle,
+        receipt: &RestoreReceipt,
+        evidence: Option<&RestoreEvidence>,
+        auth: Option<&CutoverAuthorization>,
+    ) -> Result<(), KernelRestoreError> {
+        let auth = auth.ok_or(KernelRestoreError::CutoverNotAuthorized)?;
+        auth.validate()
+            .map_err(|error| KernelRestoreError::OwnerEvidenceInvalid(error.to_string()))?;
+        if receipt.plan_id != plan.plan_id
+            || receipt.bundle_sha256 != plan.bundle_sha256
+            || receipt.target_id != plan.target.target_id
+        {
+            return Err(KernelRestoreError::ArchiveInvalid(
+                "restore receipt does not bind this plan and target".to_owned(),
+            ));
+        }
+        let evidence = evidence.ok_or(KernelRestoreError::OwnerEvidenceInvalid(
+            "no observed restore evidence".to_owned(),
+        ))?;
+        evidence.validate().map_err(KernelRestoreError::TargetFailed)?;
+        evidence
+            .validate_against_plan(plan, bundle)
+            .map_err(KernelRestoreError::TargetFailed)?;
+        require_cutover_obligations(&evidence.obligations, bundle)
+            .map_err(KernelRestoreError::TargetFailed)?;
+        Ok(())
+    }
+
+    /// Loads the pinned destination admission and re-proves the Host-issued
+    /// authorization for cutover: readback reconciliation with owner
+    /// evidence gates the decision; any drift refuses instead of cutting
+    /// over.
+    fn load_verified_destination_admission(
+        &self,
+        destination: &KernelIsolatedDestination,
+        plan: &RestorePlan,
+        bundle: &BackupBundle,
+    ) -> Result<PinnedDestinationAdmission, KernelRestoreError> {
+        let admission_bytes = std::fs::read(destination.root().join(DESTINATION_ADMISSION_FILE))
+            .map_err(|_| {
+                KernelRestoreError::DestinationInvalid(
+                    "no owner-approved destination admission pinned".to_owned(),
+                )
+            })?;
+        let pinned: PinnedDestinationAdmission =
+            serde_json::from_slice(&admission_bytes).map_err(|_| {
+                KernelRestoreError::DestinationInvalid(
+                    "pinned destination admission is corrupt".to_owned(),
+                )
+            })?;
+        self.verify_destination_binding(destination, plan, bundle, Some(&pinned.evidence))?;
+        Ok(pinned)
     }
 
     /// Validates the #961 cutover path for one completed isolated restore:
@@ -579,26 +527,8 @@ impl KernelBackupRestore {
         destination: &KernelIsolatedDestination,
         auth: Option<&CutoverAuthorization>,
     ) -> Result<CutoverReceipt, KernelRestoreError> {
+        Self::check_cutover_inputs(plan, bundle, receipt, evidence, auth)?;
         let auth = auth.ok_or(KernelRestoreError::CutoverNotAuthorized)?;
-        auth.validate()
-            .map_err(|error| KernelRestoreError::OwnerEvidenceInvalid(error.to_string()))?;
-        if receipt.plan_id != plan.plan_id
-            || receipt.bundle_sha256 != plan.bundle_sha256
-            || receipt.target_id != plan.target.target_id
-        {
-            return Err(KernelRestoreError::ArchiveInvalid(
-                "restore receipt does not bind this plan and target".to_owned(),
-            ));
-        }
-        let evidence = evidence.ok_or(KernelRestoreError::OwnerEvidenceInvalid(
-            "no observed restore evidence".to_owned(),
-        ))?;
-        evidence.validate().map_err(KernelRestoreError::TargetFailed)?;
-        evidence
-            .validate_against_plan(plan, bundle)
-            .map_err(KernelRestoreError::TargetFailed)?;
-        require_cutover_obligations(&evidence.obligations, bundle)
-            .map_err(KernelRestoreError::TargetFailed)?;
         if destination.label() != plan.target.target_id
             || !destination.root().starts_with(&self.work_root)
         {
@@ -606,18 +536,8 @@ impl KernelBackupRestore {
                 "cutover destination is not the plan-admitted isolated root".to_owned(),
             ));
         }
-        let admission_bytes = std::fs::read(destination.root().join(DESTINATION_ADMISSION_FILE))
-            .map_err(|_| {
-                KernelRestoreError::DestinationInvalid(
-                    "no owner-approved destination admission pinned".to_owned(),
-                )
-            })?;
-        let pinned: PinnedDestinationAdmission =
-            serde_json::from_slice(&admission_bytes).map_err(|_| {
-                KernelRestoreError::DestinationInvalid(
-                    "pinned destination admission is corrupt".to_owned(),
-                )
-            })?;
+        let pinned =
+            self.load_verified_destination_admission(destination, plan, bundle)?;
         let transaction = plan
             .transaction()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
@@ -872,6 +792,7 @@ struct KernelRestoreTarget<'a> {
     blob_scope: Option<&'a DestinationScope>,
     receipts: Vec<BlobRestorationReceipt>,
     manifest_evidence: Option<DestinationManifestEvidence>,
+    verified: VerifiedDestinationBinding,
     calls: Vec<String>,
     final_evidence: Option<RestoreEvidence>,
 }
@@ -884,6 +805,7 @@ impl<'a> KernelRestoreTarget<'a> {
         blob_scope: Option<&'a DestinationScope>,
         receipts: Vec<BlobRestorationReceipt>,
         manifest_evidence: Option<DestinationManifestEvidence>,
+        verified: VerifiedDestinationBinding,
     ) -> Self {
         Self {
             root: destination.root().to_path_buf(),
@@ -892,6 +814,7 @@ impl<'a> KernelRestoreTarget<'a> {
             blob_scope,
             receipts,
             manifest_evidence,
+            verified,
             calls: Vec::new(),
             final_evidence: None,
         }
@@ -1099,9 +1022,15 @@ impl<'a> KernelRestoreTarget<'a> {
     ) -> Result<RestoreAppliedEffect, BackupError> {
         self.gate(bundle)?;
         let blob = Self::find_blob(bundle, hash)?;
-        let client = BlobOwnerClient::bind(self.receipts.clone(), self.keys, self.blob_scope)?;
+        let client = BlobOwnerClient::bind(
+            self.receipts.clone(),
+            self.keys,
+            self.blob_scope,
+            &self.verified,
+        )?;
         let adapter = DestinationRestoreAdapter::bind(self.root.as_path())?;
-        let restored: RestoredSealedBlob = client.restore_blob(&adapter, blob)?;
+        let restored: RestoredSealedBlob =
+            client.restore_blob(&self.verified, &adapter, blob)?;
         self.write_file(&format!("blobs/{hash}"), &restored.resealed_bytes)?;
         let observed = ObservedBlobRestore {
             resealed_sha256: restored.resealed_sha256.clone(),
@@ -1526,7 +1455,7 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     }
 
     fn apply_purge_ledger(&mut self, entries: &[PurgeLedgerEntry]) -> Result<(), BackupError> {
-        PurgeOwnerClient::bind(entries).validate_entries()?;
+        PurgeOwnerClient::bind(entries, &self.verified).validate_entries()?;
         let bytes = canonical_json_bytes(&entries)
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         self.write_file("purge_ledger.json", &bytes)?;

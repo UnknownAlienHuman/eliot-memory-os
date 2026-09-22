@@ -59,15 +59,14 @@ mod process_execution_client;
 mod supervision_lease_authority;
 
 pub use backup_owner_clients::{
-    AuthorizationExpectation, BackupOwnerChannels, CanonicalStoreImportClient, ImportReconciliation,
-    OwnerChannelError, VerifiedDestinationBinding, DESTINATION_AUTHORIZATION_FILE,
-    DESTINATION_AUTHORIZATION_ISSUER, DESTINATION_AUTHORIZATION_WIRE, PURGE_MEMBER_SUPPRESSION,
-    STORE_IMPORT_CHANNEL, verify_destination_authorization,
+    AuthorizationExpectation, BackupOwnerChannels, BlobOwnerClient, CanonicalOwnerClient,
+    CanonicalStoreImportClient, ImportReconciliation, InvalidationKind, InvalidationOwnerClient,
+    OrsOwnerClient, OwnerChannelError, PurgeOwnerClient, VerifiedDestinationBinding,
+    DESTINATION_AUTHORIZATION_FILE, DESTINATION_AUTHORIZATION_ISSUER,
+    DESTINATION_AUTHORIZATION_WIRE, PURGE_MEMBER_SUPPRESSION, STORE_IMPORT_CHANNEL,
+    verify_destination_authorization,
 };
-pub use backup_restore::{
-    BlobOwnerClient, CanonicalOwnerClient, InvalidationKind, InvalidationOwnerClient,
-    KernelBackupRestore, KernelRestoreOutcome, OrsOwnerClient, PurgeOwnerClient, phase_owner,
-};
+pub use backup_restore::{KernelBackupRestore, KernelRestoreOutcome, phase_owner};
 pub use backup_restore_ports::{
     DestinationManifestEvidence, KernelIsolatedDestination, KernelRestoreError, KernelRestoreJournal,
     RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_KEEP_RESOLVED,
