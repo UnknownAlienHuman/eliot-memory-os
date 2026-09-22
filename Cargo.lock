@@ -840,6 +840,7 @@ dependencies = [
  "blake3",
  "eliot-blob-api",
  "eliot-contracts",
+ "eliot-platform-windows",
  "eliot-security-contracts",
  "eliot-store-api",
  "eliot-store-memory",
