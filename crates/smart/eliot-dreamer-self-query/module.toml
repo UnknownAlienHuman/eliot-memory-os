@@ -1,0 +1,67 @@
+schema_version = 4
+module_id = "smart.dreamer.self_query"
+crate = "eliot-dreamer-self-query"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 49
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.self_query"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "A Dreamer self-query binds one question to one fence with evidence refs by handle, so brief handlers consume exact inputs instead of prose."
+causal_property = "bounded Dreamer self-query over refs by handle"
+old_failure_or_missing_capability = "Self-queries recompile context, rerun admission, or read arbitrary prose instead of binding one question to one fence with handle refs (CC-006)."
+discriminator = "posing validates the subject, scope, fence, and ref bounds and freezes a canonical request digest; the package never compiles, admits, or briefs"
+primary_responsibility = "Pose one validated SelfQueryRequest and freeze its canonical digest for downstream brief handlers."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["question and task family", "scope and StateFence", "ActiveUnderstandingView handle", "accepted-source and evidence handles"]
+outputs = ["SelfQueryCandidate"]
+depends_on = ["eliot-contracts", "eliot-receipts"]
+providers = ["eliot-context-assembly (view handle supply only)", "accepted-source projection owner (handle supply only)"]
+consumers = ["eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief"]
+non_goals = ["second ContextCompiler invocation", "second admission pass", "mutable UnderstandingState", "ArchitectureBrief/ImplementationBrief authorship", "model route calls", "support/truth promotion"]
+invariants = ["one question, one task family, one fence per request", "refs by handle only; no prose bodies", "canonical request digest frozen at pose time", "no compilation, admission, briefing, or model work"]
+failure_behavior = "Reject blank or oversized subjects, invalid scope/fence, and over-bound ref lists explicitly."
+proof_surface = ["digest determinism", "subject bounds", "ref bounds", "fence/scope shape", "wire roundtrip"]
+proof_ceiling = "PACKAGE_PROOF_ONLY"
+product_pulse = "D3A_SELF_QUERY_EDGE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+disposition = "frozen upstream surface: StateFence scope/fence bindings, ActiveUnderstandingView by handle; accepted-source projection recorded NOT_FROZEN (CC-006)"
+
+[agent_task]
+objective = "Pose a validated fence-bound self-query and freeze its canonical digest."
+write_scope = ["crates/smart/eliot-dreamer-self-query/**"]
+deliverables = ["self-query request and candidate contracts", "digest pose", "consumer compile fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification", "second compilation or admission pass"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, model work, compilation/admission ownership, or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main rebase and integration-owner review"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
