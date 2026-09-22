@@ -5155,12 +5155,19 @@ mod tests {
     }
 
     fn context_json(effect: &str, operation: &str, request: &str) -> String {
-        let fence = r#"{"authority_epoch":4,"resource_generation":7,"task_revision":null,"policy_revision":null,"integration_revision":null}"#;
+        // Epoch wire shape follows the current contract: EpochId is the exact
+        // (lineage_id, sequence) tuple, never a scalar. Fence and authority
+        // epochs match (AuthorityBinding::validate enforces sameness).
+        let epoch =
+            r#"{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":4}"#;
+        let fence = format!(
+            "{{\"authority_epoch\":{epoch},\"resource_generation\":7,\"task_revision\":null,\"policy_revision\":null,\"integration_revision\":null}}"
+        );
         let metadata = format!(
             r#"{{"request_id":"{request}","session_id":null,"task_id":null,"product_id":"product-1","source_id":"source-1","state_fence":{fence},"clock":{{"valid_time_ms":1,"known_time_ms":1,"transaction_sequence":null,"monotonic_ns":1}}}}"#
         );
         format!(
-            r#"{{"work_scope":{{"scope_id":"scope-1","product_id":"product-1","resource_generation":7,"state_fence":{fence}}},"task":null,"session":null,"causal":{{"state_fence":{fence},"transaction_sequence":1,"parent_receipt_id":null,"predecessor_receipt_ids":[]}},"request":{{"metadata":{metadata},"state_fence":{fence}}},"operation":{{"operation_id":"{operation}","request_id":"{request}","idempotency_key":"idem-1","operation_kind":"blob-test","effect":"{effect}","state_fence":{fence}}},"authority":{{"authority_id":"authority-1","authority_owner":"test-owner","authority_epoch":4,"state_fence":{fence},"allowed_effect":"{effect}","proof_ceiling":"OBSERVED_EXTERNAL_EFFECT"}}}}"#
+            r#"{{"work_scope":{{"scope_id":"scope-1","product_id":"product-1","resource_generation":7,"state_fence":{fence}}},"task":null,"session":null,"causal":{{"state_fence":{fence},"transaction_sequence":1,"parent_receipt_id":null,"predecessor_receipt_ids":[]}},"request":{{"metadata":{metadata},"state_fence":{fence}}},"operation":{{"operation_id":"{operation}","request_id":"{request}","idempotency_key":"idem-1","operation_kind":"blob-test","effect":"{effect}","state_fence":{fence}}},"authority":{{"authority_id":"authority-1","authority_owner":"test-owner","authority_epoch":{epoch},"state_fence":{fence},"allowed_effect":"{effect}","proof_ceiling":"OBSERVED_EXTERNAL_EFFECT"}}}}"#
         )
     }
 
@@ -5380,6 +5387,41 @@ mod tests {
         assert_eq!(chunk.anchor_fingerprint(), expected_anchor.fingerprint());
         assert!(chunk.is_complete());
         assert!(block_on(client.health()).expect("health").ready);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_user_ports_drive_stage_read_roundtrip() {
+        use crate::key_ports::{DpapiUserAeadPort, DpapiUserKeyPort};
+
+        let root = unique_test_root();
+        let platform_root = std::env::temp_dir().join(format!("eliot-1873k-svc-{root}"));
+        std::fs::create_dir_all(&platform_root).expect("isolated platform root");
+        let platform = eliot_platform_windows::WindowsPlatform::new(platform_root.clone())
+            .expect("platform");
+        let lineage = BlobId::new("dpapi-user-1873k-svc").expect("lineage");
+        let bootstrap = stage_request("bootstrap", b"", &root);
+        let store = BlobStoreService::new(
+            bootstrap.root_lease,
+            MemoryPlatform::default(),
+            TestCompression,
+            DpapiUserKeyPort::new(lineage, 5).expect("key port"),
+            DpapiUserAeadPort::new(platform),
+            TestLiveSets::default(),
+            test_anchor(),
+        )
+        .expect("store");
+        let client: &dyn BlobStoreClient = &store;
+        let mut request = stage_request("dpapi-roundtrip", b"payload-1873k", &root);
+        request.residency.encryption_key_domain_id =
+            BlobId::new("dpapi-user-1873k-svc").expect("key domain");
+        let ready = block_on(client.stage(request)).expect("stage");
+        assert_eq!(ready.plaintext_length(), 13);
+        let chunk =
+            block_on(client.read(read_request(&ready, "dpapi-read", &root))).expect("read");
+        assert_eq!(chunk.bytes(), b"payload-1873k");
+        assert!(chunk.is_complete());
+        std::fs::remove_dir_all(&platform_root).ok();
     }
 
     #[test]
