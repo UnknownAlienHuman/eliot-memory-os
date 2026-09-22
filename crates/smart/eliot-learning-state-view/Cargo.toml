@@ -20,9 +20,9 @@ runtime_bundle = "eliotd"
 agent_order = 33
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
-eliot-learning-contracts = { path = "../eliot-learning-contracts" }
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-learning-contracts = { path = "../eliot-learning-contracts", version = "0.1.0" }
 
 [lints]
 workspace = true
