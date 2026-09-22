@@ -61,6 +61,7 @@ use eliot_agent_coordinator::{
 use eliot_contracts::{SessionId, StateFence, TaskId, WorkLeaseId, fences_match_exact};
 use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_process::ProcessRequest;
+use eliot_protocol::{AgentActivationResolutionDisposition, AgentActivationResolutionResult};
 use eliot_source_assurance::{AdmissionExpectation, SourceAssurance};
 use thiserror::Error;
 
@@ -784,7 +785,9 @@ pub enum GovernedDispatchOutcome {
 /// Evaluated in the daemon binary flow (see the run-loop dispatch arm):
 /// reads the live Kernel fence, owner session, and Governor fence; requires
 /// Kernel/Governor fence agreement under the normative
-/// [`fences_match_exact`]; and either dispatches through
+/// [`fences_match_exact`]; validates a retained Governor resolution's
+/// admitted session/task triple against the live Kernel session when one
+/// was consumed for this dispatch; and either dispatches through
 /// [`launch_closed_execution`] with a presented bundle or declines with the
 /// exact live missing-owner inventory. Absence of dispatchable work is a
 /// normal idle outcome, never an error, and execution-plane failures must
@@ -798,6 +801,7 @@ pub enum GovernedDispatchOutcome {
 pub fn poll_governed_dispatch(
     kernel: &DaemonKernelClient,
     composition: &DaemonComposition,
+    activation: Option<&AgentActivationResolutionResult>,
     bundle: Option<PresentedExecutionBundle>,
 ) -> GovernedDispatchOutcome {
     let _span = tracing::info_span!("eliotd.governed_dispatch_poll").entered();
@@ -811,6 +815,45 @@ pub fn poll_governed_dispatch(
     let governor_fence = supply_governor_fence(composition);
     if !fences_match_exact(&live_fence, &governor_fence) {
         return GovernedDispatchOutcome::Failed(ExecutionChainError::StaleAdmissionFence);
+    }
+    // Activation-resolved triple: when the loop retained a Governor
+    // resolution for this dispatch, validate its admitted session/task text
+    // into canonical types and require the session to equal the live Kernel
+    // session (the daemon serves a single live owner session). Task,
+    // principal, scope, and plan are observed and traced — no independent
+    // live task/principal read exists in daemon scope, so they are never
+    // asserted, only recorded. Disagreement fails closed with the exact
+    // field; non-Resolved dispositions carry no admission signal.
+    if let Some(result) = activation
+        && let AgentActivationResolutionDisposition::Resolved { binding } = &result.disposition
+    {
+        let admitted_session = match SessionId::new(binding.session_id.clone()) {
+            Ok(session) => session,
+            Err(error) => {
+                return GovernedDispatchOutcome::Failed(ExecutionChainError::OwnerIdentity(error));
+            }
+        };
+        let admitted_task = match TaskId::new(binding.task_id.clone()) {
+            Ok(task) => task,
+            Err(error) => {
+                return GovernedDispatchOutcome::Failed(ExecutionChainError::OwnerIdentity(error));
+            }
+        };
+        match &live_session {
+            Some(live) if *live == admitted_session => {
+                tracing::debug!(
+                    session = %crate::diagnostics::sanitize_identity(admitted_session.as_str()),
+                    task = %crate::diagnostics::sanitize_identity(admitted_task.as_str()),
+                    principal = %crate::diagnostics::sanitize_identity(&binding.principal_id),
+                    "activation-resolved triple agrees with the live owner session",
+                );
+            }
+            _ => {
+                return GovernedDispatchOutcome::Failed(ExecutionChainError::Match(
+                    SessionMatchError::SessionMismatch,
+                ));
+            }
+        }
     }
     let Some(bundle) = bundle else {
         // No presented bundle: report the live missing-owner inventory. A

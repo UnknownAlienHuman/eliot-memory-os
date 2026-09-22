@@ -90,6 +90,11 @@ enum ActivationCompletion {
 struct ActivationFlightState {
     future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>>,
     retained: Option<RetainedActivationIdentity>,
+    /// Governor resolution retained for post-dispatch consumption (O1
+    /// governed execution trigger): the resolved session/task binding lets
+    /// the dispatch arm validate the admitted triple against live Kernel
+    /// reads. Cleared with the flight; never replayed across flights.
+    resolved: Option<AgentActivationResolutionResult>,
 }
 
 /// Sole owner of activation state in `run_loop`. `Idle` means no activation
@@ -660,6 +665,7 @@ async fn run_loop(
                     flight = ActivationFlight::InFlight(ActivationFlightState {
                         future: start_activation_claim(&kernel),
                         retained: None,
+                        resolved: None,
                     });
                 }
             }
@@ -713,14 +719,21 @@ async fn run_loop(
                             // O1 governed execution trigger (issue #1942): an
                             // activation resolved, so re-evaluate governed
                             // dispatchability now — new sessions may be
-                            // admitted. The poll reads live owners and
-                            // declines without dispatchable work; execution
-                            // outcomes never fail this activation loop (the
-                            // poll reports Dispatched/Declined/Failed
-                            // internally with diagnostics).
+                            // admitted. Consumes the retained Governor
+                            // resolution once (take = single delivery, no
+                            // replay, no stale reuse); the poll validates
+                            // its admitted triple against live Kernel reads.
+                            // Execution outcomes never fail this activation
+                            // loop (the poll reports Dispatched/Declined/
+                            // Failed internally with diagnostics).
+                            let resolved = match &mut flight {
+                                ActivationFlight::InFlight(state) => state.resolved.take(),
+                                ActivationFlight::Idle => None,
+                            };
                             eliotd::attempt_execution_chain::poll_governed_dispatch(
                                 kernel.as_ref(),
                                 composition.as_ref(),
+                                resolved.as_ref(),
                                 None,
                             );
                             flight = ActivationFlight::Idle;
@@ -779,6 +792,11 @@ fn start_valid_claim_step(
         ticket_id: ticket.ticket_id.clone(),
         result_sha256: result.result_sha256.clone(),
     };
+    // O1 governed execution trigger: retain the Governor resolution itself
+    // (not just its identity) so the dispatch arm can validate the admitted
+    // session/task binding against live Kernel reads. The retained record is
+    // consumed once below and drops with the flight; it is never replayed.
+    let resolved = Some(result.clone());
     let kernel_clone = Arc::clone(kernel);
     let future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> =
         Box::pin(async move {
@@ -788,6 +806,7 @@ fn start_valid_claim_step(
     Ok(Some(ActivationFlightState {
         future,
         retained: Some(retained),
+        resolved,
     }))
 }
 
@@ -2001,6 +2020,7 @@ mod tests {
         let mut flight = ActivationFlight::InFlight(ActivationFlightState {
             future: Box::pin(std::future::pending::<ActivationCompletion>()),
             retained: None,
+            resolved: None,
         });
         assert_eq!(
             decide_activation_tick(&flight),
