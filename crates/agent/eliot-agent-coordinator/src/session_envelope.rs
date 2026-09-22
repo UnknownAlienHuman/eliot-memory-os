@@ -39,6 +39,7 @@
 //! producer resolves once the coordinator holds a session-bound attempt.
 
 use eliot_agent_api::{AttemptId, SessionId, StateFence, TaskId};
+use eliot_contracts::fences_match_exact;
 use thiserror::Error;
 
 use crate::core::AgentCoordinator;
@@ -145,13 +146,15 @@ pub enum SessionMatchError {
 ///
 /// Takes the coordinator-owned record plus the bridge-owned live reads
 /// (session, fence, task from the same attach binding) and requires exact
-/// typed equality on all three. Generation agreement rides along: the S1
-/// validator already enforced `binding.runtime_generation ==
-/// fence.resource_generation` at bind, and the snapshot's authoritative
-/// runtime generation comes from the Kernel activation receipt (see the
-/// `eliot-kernel-service` producer), so fence equality transitively pins the
-/// S1-checked generation. Any disagreement fails closed with the exact
-/// field; nothing is hashed, parsed, or minted.
+/// agreement: typed equality for session and task, and the normative
+/// [`fences_match_exact`] for the fence (bidirectional; revision wildcards
+/// rejected — never `is_compatible_with` one-way matching, never digests).
+/// Generation agreement rides along: the S1 validator already enforced
+/// `binding.runtime_generation == fence.resource_generation` at bind, and the
+/// snapshot's authoritative runtime generation comes from the Kernel
+/// activation receipt (see the `eliot-kernel-service` producer), so fence
+/// equality transitively pins the S1-checked generation. Any disagreement
+/// fails closed with the exact field; nothing is hashed, parsed, or minted.
 pub fn verify_session_binding(
     record: &SessionBoundAttemptFacts,
     live_session: &SessionId,
@@ -161,7 +164,7 @@ pub fn verify_session_binding(
     if record.session != *live_session {
         return Err(SessionMatchError::SessionMismatch);
     }
-    if record.state_fence != *live_fence {
+    if !fences_match_exact(&record.state_fence, live_fence) {
         return Err(SessionMatchError::FenceMismatch);
     }
     if record.task_id != *live_task {

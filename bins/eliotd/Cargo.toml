@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 eliot-agent-api.workspace = true
 eliot-agent-bridge-core.workspace = true
+eliot-agent-codex = { path = "../../crates/agent/eliot-agent-codex", version = "0.1.0" }
 eliot-agent-contracts.workspace = true
 eliot-agent-coordinator.workspace = true
 eliot-authority.workspace = true
@@ -36,6 +37,7 @@ eliot-evaluation-contracts.workspace = true
 eliot-governor.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
+eliot-kernel-service.workspace = true
 eliot-maintenance.workspace = true
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
 eliot-observation.workspace = true
@@ -49,6 +51,7 @@ eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-security-contracts.workspace = true
 eliot-skill.workspace = true
+eliot-source-assurance.workspace = true
 eliot-store-api.workspace = true
 eliot-watchdog-core.workspace = true
 serde.workspace = true

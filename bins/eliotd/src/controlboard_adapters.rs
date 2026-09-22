@@ -330,8 +330,10 @@ impl AdmittedSessionAccess {
 /// Parses the validated Kernel-issued `sid=..;session=..` binding string into
 /// `(principal_sid, session_id)` (AUD-C02-B). Exact shape only: anything else
 /// fails closed as `Invalid`, never a default. Text/character rules are
-/// re-checked by [`AdmittedSessionAccess::new`].
-fn parse_kernel_session_binding(binding: &str) -> Result<(String, String), PortError> {
+/// re-checked by [`AdmittedSessionAccess::new`]. Shared crate-wide so the
+/// execution chain derives the live Kernel session from the same strict
+/// shape instead of a second parser.
+pub(crate) fn parse_kernel_session_binding(binding: &str) -> Result<(String, String), PortError> {
     let invalid = || PortError::Invalid("kernel owner session binding is malformed".to_owned());
     let rest = binding.strip_prefix("sid=").ok_or_else(invalid)?;
     let (sid, rest) = rest.split_once(';').ok_or_else(invalid)?;
