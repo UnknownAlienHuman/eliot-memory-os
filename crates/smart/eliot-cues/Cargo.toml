@@ -9,21 +9,21 @@ description = "ELIOT bounded, revision-fenced cue projection and activation cont
 [dependencies]
 blake3.workspace = true
 eliot-contracts.workspace = true
-eliot-cue-activation = { path = "../eliot-cue-activation" }
-eliot-cue-binding = { path = "../eliot-cue-binding" }
-eliot-cue-contracts = { path = "../eliot-cue-contracts" }
-eliot-cue-index = { path = "../eliot-cue-index" }
-eliot-cue-normalizer = { path = "../eliot-cue-normalizer" }
+eliot-cue-activation = { path = "../eliot-cue-activation", version = "0.1.0" }
+eliot-cue-binding = { path = "../eliot-cue-binding", version = "0.1.0" }
+eliot-cue-contracts = { path = "../eliot-cue-contracts", version = "0.1.0" }
+eliot-cue-index = { path = "../eliot-cue-index", version = "0.1.0" }
+eliot-cue-normalizer = { path = "../eliot-cue-normalizer", version = "0.1.0" }
 eliot-evidence.workspace = true
-eliot-observation = { path = "../../governor/eliot-observation" }
+eliot-observation = { path = "../../governor/eliot-observation", version = "0.1.0" }
 schemars.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-eliot-change-monitor = { path = "../../governor/eliot-change-monitor" }
-eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts" }
-eliot-receipts = { path = "../../foundation/eliot-receipts" }
+eliot-change-monitor = { path = "../../governor/eliot-change-monitor", version = "0.1.0" }
+eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts", version = "0.1.0" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
 serde_json.workspace = true
 
 [lints]
