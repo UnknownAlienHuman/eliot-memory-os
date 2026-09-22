@@ -16,9 +16,10 @@
 //! decode error; decode/binding failures stay non-success and never become a
 //! board.
 
+use eliot_kernel_service::NotificationStateReadResponse;
 use eliot_runtime_status::{
-    ControlBoardTransportMessage, RenderedControlBoard, CONTROLBOARD_CONSUMER_CONTRACT,
-    CONTROLBOARD_TRANSPORT_CONTRACT,
+    CONTROLBOARD_CONSUMER_CONTRACT, CONTROLBOARD_TRANSPORT_CONTRACT, ControlBoardTransportMessage,
+    RenderedControlBoard,
 };
 
 /// Re-exported operation selector so the composition root names the exact
@@ -112,6 +113,91 @@ pub fn render_status_json(
 #[must_use]
 pub fn status_request_payload() -> serde_json::Value {
     serde_json::json!({})
+}
+
+/// Decodes one served notify inbox response into the canonical read it carries.
+///
+/// The value is the `Response::Inbox` JSON document the notify `ReadInbox`
+/// server arm emits (`bins/eliot-notify/src/main.rs`): `status == "inbox"`
+/// with the canonical `read` page (records, owner metrics, fence,
+/// revision). Deserialization uses the owning kernel-service read type;
+/// anything else is refused with a typed decode error. Like
+/// [`decode_status_response`], this checks shape only: fence admission
+/// stays with the producing read path and the serving transport, never
+/// with this consumer.
+pub fn decode_inbox_response(
+    value: &serde_json::Value,
+) -> Result<NotificationStateReadResponse, ControlBoardStatusError> {
+    let status = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ControlBoardStatusError::Decode("inbox response has no status".to_owned())
+        })?;
+    if status != "inbox" {
+        return Err(ControlBoardStatusError::Decode(format!(
+            "inbox response status is not inbox: {status}"
+        )));
+    }
+    let read = value.get("read").cloned().ok_or_else(|| {
+        ControlBoardStatusError::Decode("inbox response carries no read page".to_owned())
+    })?;
+    serde_json::from_value(read).map_err(|error| ControlBoardStatusError::Decode(error.to_string()))
+}
+
+/// Projects one canonical inbox read to terminal JSON.
+///
+/// Every owner record is reproduced 1:1 (dedup key, severity, subject,
+/// summary, evidence, scope, owner, action, deadline, channels,
+/// occurrences, delivery failure + reason, acknowledgement, resolution,
+/// revision) with owner metrics, fence, and revision preserved verbatim.
+/// No health, readiness, support, or product scalar is synthesized, and no
+/// record is filtered by role, privacy, or quiet hours at this layer —
+/// projection semantics stay with the canonical owner. Presentation-only:
+/// the `contract` label names this terminal projection, nothing parses it.
+pub fn render_inbox_json(
+    read: &NotificationStateReadResponse,
+) -> Result<serde_json::Value, ControlBoardStatusError> {
+    let rows: Result<Vec<serde_json::Value>, ControlBoardStatusError> = read
+        .records
+        .iter()
+        .map(|record| {
+            let delivery = serde_json::to_value(&record.delivery)
+                .map_err(|error| ControlBoardStatusError::Decode(error.to_string()))?;
+            Ok(serde_json::json!({
+                "notification_id": record.notification_id.as_str(),
+                "dedup_key": record.dedup_key,
+                "severity": serde_json::to_value(record.severity)
+                    .map_err(|error| ControlBoardStatusError::Decode(error.to_string()))?,
+                "subject": record.subject,
+                "summary": record.summary,
+                "evidence_handles": record.evidence_handles,
+                "affected_scope": record.affected_scope,
+                "owner": record.owner,
+                "required_action": record.required_action,
+                "deadline_or_review": record.deadline_or_review,
+                "delivery_channels": record.delivery_channels,
+                "occurrences": record.occurrences,
+                "delivery_failed": record.is_failed_delivery(),
+                "failure_reason": delivery.get("reason").cloned().unwrap_or(serde_json::Value::Null),
+                "acknowledged": record.acknowledgement.is_some(),
+                "resolved": !record.is_unresolved(),
+                "revision": record.revision,
+            }))
+        })
+        .collect();
+    let state_fence = serde_json::to_value(&read.state_fence)
+        .map_err(|error| ControlBoardStatusError::Decode(error.to_string()))?;
+    let metrics = serde_json::to_value(&read.metrics)
+        .map_err(|error| ControlBoardStatusError::Decode(error.to_string()))?;
+    Ok(serde_json::json!({
+        "contract": "eliot.controlboard.inbox",
+        "contract_version": "1.0.0",
+        "revision": read.revision,
+        "state_fence": state_fence,
+        "metrics": metrics,
+        "rows": rows?,
+    }))
 }
 
 #[cfg(test)]
@@ -269,5 +355,141 @@ mod tests {
             .as_object()
             .expect("object")
             .is_empty());
+    }
+
+    /// Real notify-produced inbox bytes: verbatim wire shape from the
+    /// `ReadInbox` server arm (`bins/eliot-notify/src/main.rs`), one
+    /// acknowledged critical failed-delivery record plus owner metrics.
+    fn inbox_document() -> serde_json::Value {
+        serde_json::json!({
+            "status": "inbox",
+            "service": "eliot-notify",
+            "protocol": "eliot.notify.v1",
+            "read": {
+                "records": [{
+                    "notification_id": "notification-1",
+                    "severity": "CRITICAL",
+                    "subject": "subject",
+                    "summary": "summary",
+                    "evidence_handles": ["evidence-1"],
+                    "affected_scope": "scope-1",
+                    "owner": "owner-1",
+                    "required_action": "review",
+                    "deadline_or_review": null,
+                    "dedup_key": "backup-failed",
+                    "delivery_channels": ["CONTROL_BOARD"],
+                    "occurrences": 2,
+                    "delivery": {"kind": "FAILED", "reason": "toast provider failed"},
+                    "acknowledgement": {"principal": "operator-1", "sequence": 1},
+                    "resolution_ref": null,
+                    "state_fence": {
+                        "authority_epoch": {
+                            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                            "sequence": 1
+                        },
+                        "resource_generation": 1,
+                        "task_revision": 1,
+                        "policy_revision": 1,
+                        "integration_revision": 1
+                    },
+                    "revision": 2
+                }],
+                "metrics": {
+                    "unresolved_total": 1,
+                    "critical_unresolved": 1,
+                    "action_required_unresolved": 0,
+                    "failed_delivery_unresolved": 1,
+                    "acknowledged_unresolved": 1,
+                    "resolved_total": 0
+                },
+                "state_fence": {
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
+                    "resource_generation": 1,
+                    "task_revision": 1,
+                    "policy_revision": 1,
+                    "integration_revision": 1
+                },
+                "revision": 2
+            }
+        })
+    }
+
+    #[test]
+    fn decode_inbox_accepts_owner_shapes() {
+        let read = decode_inbox_response(&inbox_document()).expect("owner inbox decodes");
+        assert_eq!(read.revision, 2);
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.records[0].dedup_key, "backup-failed");
+        assert_eq!(
+            serde_json::to_value(&read.records[0].severity).expect("severity encodes"),
+            "CRITICAL"
+        );
+        assert!(read.records[0].acknowledgement.is_some());
+        assert!(read.records[0].is_failed_delivery());
+        assert!(read.records[0].is_unresolved());
+        assert_eq!(read.metrics.critical_unresolved, 1);
+        assert_eq!(read.metrics.failed_delivery_unresolved, 1);
+        assert_eq!(read.metrics.acknowledged_unresolved, 1);
+    }
+
+    #[test]
+    fn decode_inbox_refuses_foreign_shapes() {
+        let mut forged_status = inbox_document();
+        forged_status["status"] = serde_json::json!("delivered");
+        assert!(decode_inbox_response(&forged_status).is_err());
+
+        let mut missing_read = inbox_document();
+        missing_read.as_object_mut().expect("object").remove("read");
+        assert!(decode_inbox_response(&missing_read).is_err());
+
+        let mut undecodable = inbox_document();
+        undecodable["read"]["records"][0]["dedup_key"] = serde_json::json!(7);
+        assert!(decode_inbox_response(&undecodable).is_err());
+
+        assert!(decode_inbox_response(&serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn render_inbox_projects_rows_metrics_and_no_health() {
+        let read = decode_inbox_response(&inbox_document()).expect("owner inbox decodes");
+        let rendered = render_inbox_json(&read).expect("inbox renders");
+        assert_eq!(rendered["contract"], "eliot.controlboard.inbox");
+        assert_eq!(rendered["contract_version"], "1.0.0");
+        assert_eq!(rendered["revision"], 2);
+        assert_eq!(rendered["metrics"]["critical_unresolved"], 1);
+        assert_eq!(rendered["metrics"]["failed_delivery_unresolved"], 1);
+        assert_eq!(rendered["metrics"]["acknowledged_unresolved"], 1);
+        let rows = rendered["rows"].as_array().expect("rows array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["dedup_key"], "backup-failed");
+        assert_eq!(rows[0]["severity"], "CRITICAL");
+        assert_eq!(rows[0]["subject"], "subject");
+        assert_eq!(rows[0]["acknowledged"], true);
+        assert_eq!(rows[0]["delivery_failed"], true);
+        assert_eq!(rows[0]["failure_reason"], "toast provider failed");
+        assert_eq!(rows[0]["resolved"], false);
+        assert_eq!(rows[0]["occurrences"], 2);
+        for key in ["healthy", "health", "readiness", "support", "product"] {
+            assert!(
+                rendered.get(key).is_none(),
+                "rendered inbox must not synthesize {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn inbox_decode_render_round_trip_byte_stable() {
+        // Returned rows re-encode byte-equal to the wire records: decode
+        // drops, reorders, or alters nothing on the way to the consumer.
+        let read = decode_inbox_response(&inbox_document()).expect("owner inbox decodes");
+        let returned =
+            eliot_contracts::canonical_json_bytes(&read.records).expect("returned encodes");
+        let wire = inbox_document()["read"]["records"].clone();
+        let expected = eliot_contracts::canonical_json_bytes(&wire).expect("wire encodes");
+        assert_eq!(returned, expected);
+        assert!(!returned.is_empty());
     }
 }
