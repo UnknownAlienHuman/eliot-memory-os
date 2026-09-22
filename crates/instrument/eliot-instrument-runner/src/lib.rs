@@ -18,9 +18,11 @@ use eliot_process::{
 };
 use thiserror::Error;
 
+pub mod cache_lane;
 pub mod registry;
 pub mod testd_port;
 
+pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
 pub use registry::{
     ExecutableIdentityCause, ProviderRegistry, RegistryEntry, RegistryError,
     ResolvedExecutableIdentity,
