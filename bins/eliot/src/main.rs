@@ -485,6 +485,14 @@ enum ControlBoardCommand {
     /// Read-only: owns no board handle, cache, or canonical state, and
     /// synthesizes no health from the dispositions.
     Status,
+    /// Render one canonical notification inbox response document read
+    /// from stdin (notify `ReadInbox` server output) and project its
+    /// typed rows. Read-only plumbing for the operator: owns no board
+    /// handle, cache, canonical state, or notify launch, admits no
+    /// session, and synthesizes no health. The producing side (notify
+    /// binary under its admitted fence) is separate; this arm only
+    /// decodes and renders exactly the bytes it was given.
+    Inbox,
 }
 
 #[derive(Debug, Subcommand)]
@@ -809,7 +817,55 @@ fn run_controlboard(command: ControlBoardCommand) -> Result<i32> {
                 Ok(FRONT_DOOR_CLOSED_EXIT)
             }
         }
+        ControlBoardCommand::Inbox => run_controlboard_inbox(),
     }
+}
+
+/// Renders one operator-supplied inbox response document from stdin.
+///
+/// Minimal dispatch plumbing for the notification inbox consumer
+/// (`controlboard_status::decode_inbox_response` /
+/// `render_inbox_json`): reads the exact notify `ReadInbox` server bytes,
+/// decodes and renders them, and prints the terminal projection. Stdin is
+/// the only input — no transact, no spawn, no fence or session is minted
+/// here, and no board state is retained. Malformed bytes fail closed with
+/// the existing request-error conventions; a well-formed document of the
+/// wrong shape is refused, never rendered.
+fn run_controlboard_inbox() -> Result<i32> {
+    let mut input = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut input)
+        .context("read one inbox response document from stdin")?;
+    if input.iter().all(u8::is_ascii_whitespace) {
+        write_json_error(
+            "REQUEST_REQUIRED",
+            "controlboard inbox requires one JSON inbox response document",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    let document = match serde_json::from_slice::<serde_json::Value>(&input) {
+        Ok(document) => document,
+        Err(error) => {
+            write_json_error("REQUEST_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let read = match controlboard_status::decode_inbox_response(&document) {
+        Ok(read) => read,
+        Err(error) => {
+            write_json_error("CONTROLBOARD_INBOX_REFUSED", &error.to_string());
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+    };
+    let rendered = match controlboard_status::render_inbox_json(&read) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            write_json_error("CONTROLBOARD_INBOX_REFUSED", &error.to_string());
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&rendered)?);
+    Ok(0)
 }
 
 #[cfg(windows)]
@@ -4145,6 +4201,18 @@ mod tests {
             parsed.command,
             Command::ControlBoard {
                 command: ControlBoardCommand::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn controlboard_inbox_parses() {
+        let parsed = Cli::try_parse_from(["eliot", "controlboard", "inbox"])
+            .expect("controlboard inbox parses");
+        assert!(matches!(
+            parsed.command,
+            Command::ControlBoard {
+                command: ControlBoardCommand::Inbox
             }
         ));
     }
