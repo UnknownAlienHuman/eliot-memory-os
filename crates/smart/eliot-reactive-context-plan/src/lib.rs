@@ -28,8 +28,9 @@ pub use input::{
     produce_reactive_cue_activation, produce_reactive_delivery_policy,
 };
 pub use owner_retention::{
-    MAX_RETAINED_PROJECTION_SETS, ReactiveOwnerRetention, RestoredOwnerSnapshots,
-    ingest_restored_projection_set,
+    MAX_RETAINED_PROJECTION_SETS, MAX_SNAPSHOT_IDENTITY_BYTES, ProjectionSnapshotSlot,
+    ReactiveOwnerRetention, ServedSnapshotDelivery, ServedSnapshotLeg,
+    ingest_served_snapshot_delivery,
 };
 pub use owner_supply::{
     MAX_OWNER_SNAPSHOT_BYTES, OwnerProjectionBytes, OwnerProjectionSet, OwnerSupplyError,

@@ -9,11 +9,34 @@
 //! reactive projections: validated [`OwnerProjectionSet`] values keyed by
 //! the exact (session, fence) they were served under.
 //!
+//! Canonical slot contract (published here for the serving side):
+//!
+//! ```text
+//! slot view            context-assembly owner snapshot;
+//! slot cue_activation  cue-activation owner snapshot (A10 pair + bindings);
+//! slot session         session/delivery owner snapshot;
+//! slot attention       attention owner snapshot;
+//! slot coverage        host/coverage owner snapshot;
+//! slot policy          policy owner record.
+//! ```
+//!
+//! The serving side (Store/Kernel restore + central export) fills one
+//! [`ServedSnapshotDelivery`] per (session, fence) binding: the reply
+//! session echo, the observed owner revision, and exactly one
+//! [`ServedSnapshotLeg`] per [`ProjectionSnapshotSlot`] — matched by slot,
+//! never by position. Each leg carries its claimed content digest and owner
+//! revision; retention re-hashes content (presented digests are never
+//! trusted), enforces the byte ceiling and identity shape, binds
+//! session/attention/coverage revisions to the decoded projections, and only
+//! then runs the validated supply read. No snapshot URIs are invented here:
+//! the I07-18 identities under which legs are served are the serving side's
+//! mapping; retention checks slot completeness, never URI text.
+//!
 //! Ingestion discipline (type-enforced):
 //!
 //! ```text
-//! owner-served snapshot bytes (restore shaped: reply session echo +
-//!   six projection slots)
+//! ServedSnapshotDelivery (slot-complete, reply echo)
+//! → per-leg identity/digest/ceiling checks + revision binds
 //! → read_owner_projection_set (decode + intrinsic validation + fence
 //!   and cross-projection joins; the ONLY constructor —
 //!   OwnerProjectionSet fields are private)
@@ -23,36 +46,126 @@
 //!   (session, fence); stale or foreign reads fail closed.
 //! ```
 //!
-//! The retention holds no bytes and runs no decoders: decoders live only in
-//! the ingestion edge (`owner_supply`), and the read path serves retained
-//! validated sets. Durable source of truth remains the Store/Kernel restore
-//! path (unchanged, unowned here); this retention is process-scoped and
-//! bounded. Session end or fence rotation invalidates explicitly via
-//! [`ReactiveOwnerRetention::invalidate_session`]; a rotated fence is never
-//! served from a stale entry.
+//! The retention holds no undecodable bytes and runs no planners: decoders
+//! live only in the ingestion edge (`owner_supply`), and the read path
+//! serves retained validated sets. Durable source of truth remains the
+//! Store/Kernel restore path (unchanged, unowned here); this retention is
+//! process-scoped and bounded. Session end or fence rotation invalidates
+//! explicitly via [`ReactiveOwnerRetention::invalidate_session`]; a rotated
+//! fence is never served from a stale entry.
 //!
 //! Authority boundaries (no new authority, no second ledger):
 //!
 //! ```text
 //! retention owns: exact-key storage and fail-closed reads of validated
 //!                 sets; it validates nothing itself beyond key equality.
-//! supply owns:    decode + intrinsic validation + coherence joins.
+//! supply owns:    leg checks, decode, intrinsic validation, coherence.
 //! bridge owns:    live session/fence binding, ledger mutation, receipts.
 //! store/kernel:   durable snapshots and their serving reads (unchanged).
 //! ```
 
-use eliot_contracts::{SessionId, StateFence};
+use eliot_contracts::{SessionId, StateFence, sha256_hex};
 
 use crate::owner_supply::{
-    OwnerProjectionBytes, OwnerProjectionSet, OwnerSupplyError, read_owner_projection_set,
+    MAX_OWNER_SNAPSHOT_BYTES, OwnerProjectionBytes, OwnerProjectionSet, OwnerSupplyError,
+    read_owner_projection_set,
 };
 
 /// Maximum validated projection sets retained in one process.
 ///
 /// One entry per live session; same-session ingest replaces (fence
-/// rotation), so the bound only ever binds pathological session fan-out, at
-/// which point ingest fails closed instead of growing without bound.
+/// rotation supersedes), so the bound only ever binds pathological session
+/// fan-out, at which point ingest fails closed instead of growing without
+/// bound.
 pub const MAX_RETAINED_PROJECTION_SETS: usize = 8;
+
+/// Maximum bytes for one snapshot-leg identity field (owner, revision).
+pub const MAX_SNAPSHOT_IDENTITY_BYTES: usize = 256;
+
+/// Canonical snapshot slot for one of the six projections.
+///
+/// Fixed slot vocabulary for the serving contract: legs are matched by slot,
+/// never by position, so serving order is irrelevant and a missing or
+/// duplicated slot fails closed by name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectionSnapshotSlot {
+    /// Context-assembly owner snapshot.
+    View,
+    /// Cue-activation owner snapshot (A10 pair + target-to-atom bindings).
+    CueActivation,
+    /// Session/delivery owner snapshot.
+    Session,
+    /// Attention owner snapshot.
+    Attention,
+    /// Host/coverage owner snapshot.
+    Coverage,
+    /// Policy owner record.
+    Policy,
+}
+
+impl ProjectionSnapshotSlot {
+    /// Stable slot name used in diagnostics and revision binds.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::CueActivation => "cue_activation",
+            Self::Session => "session",
+            Self::Attention => "attention",
+            Self::Coverage => "coverage",
+            Self::Policy => "policy",
+        }
+    }
+
+    /// All six slots in supply (dependency) order.
+    #[must_use]
+    pub const fn all() -> [Self; 6] {
+        [
+            Self::View,
+            Self::CueActivation,
+            Self::Session,
+            Self::Attention,
+            Self::Coverage,
+            Self::Policy,
+        ]
+    }
+}
+
+/// One served snapshot leg: content plus its claimed identity.
+///
+/// Filled by the serving side per slot. `content_digest` is the claimed
+/// lowercase SHA-256 hex of `content`; retention re-hashes and enforces
+/// equality (never trusted as presented). `owner_id` and `source_revision`
+/// are bounded provenance text; session/attention/coverage revisions are
+/// additionally bound to the decoded projections at ingest.
+#[derive(Clone, Copy, Debug)]
+pub struct ServedSnapshotLeg<'a> {
+    /// Slot this leg serves.
+    pub slot: ProjectionSnapshotSlot,
+    /// Served canonical snapshot bytes.
+    pub content: &'a [u8],
+    /// Claimed lowercase SHA-256 hex of `content`.
+    pub content_digest: &'a str,
+    /// Owner revision of the served snapshot.
+    pub source_revision: &'a str,
+    /// Owner identity that issued the snapshot.
+    pub owner_id: &'a str,
+}
+
+/// The exact fillable delivery the serving side must produce per binding.
+///
+/// One delivery per live (session, fence) binding: the serving reply's
+/// session echo, the observed owner revision, and exactly one leg per slot.
+/// Slot completeness (exactly one leg per slot) is enforced at ingest.
+#[derive(Clone, Copy, Debug)]
+pub struct ServedSnapshotDelivery<'a> {
+    /// Session identity echoed by the serving restore reply.
+    pub reply_session: &'a str,
+    /// Owner revision observed on the serving restore leg, when known.
+    pub reply_revision: Option<u64>,
+    /// Six served legs, matched by slot (any order, no duplicates).
+    pub legs: [ServedSnapshotLeg<'a>; 6],
+}
 
 /// One retained entry: the validated set plus the exact key it was served under.
 #[derive(Clone, Debug)]
@@ -69,29 +182,75 @@ struct RetainedEntry {
 
 /// Process-scoped retention of validated owner projection sets.
 ///
-/// Holds no bytes and runs no decoders; populated only through
-/// [`ingest_restored_projection_set`] (restore-shaped ingestion) and read
-/// only through [`ReactiveOwnerRetention::read`] under an exact
-/// (session, fence) key.
+/// Holds no undecodable bytes and runs no decoders beyond the ingestion
+/// edge; populated only through [`ingest_served_snapshot_delivery`]
+/// (slot-complete served deliveries) and read only through
+/// [`ReactiveOwnerRetention::read`] under an exact (session, fence) key.
 #[derive(Clone, Debug, Default)]
 pub struct ReactiveOwnerRetention {
     entries: Vec<RetainedEntry>,
 }
 
-/// Owner-served snapshot legs for one restore-shaped ingestion.
-///
-/// The bytes are the six projection slots served for the restore reply's
-/// session; slot order is fixed by [`OwnerProjectionBytes`]. Which snapshot
-/// URI each slot was served under is the serving path's mapping (the
-/// reported publication-contract blocker); retention never invents URIs.
-#[derive(Clone, Copy, Debug)]
-pub struct RestoredOwnerSnapshots<'a> {
-    /// Session identity echoed by the serving restore reply.
-    pub reply_session: &'a str,
-    /// Owner revision observed on the serving restore leg, when known.
-    pub reply_revision: Option<u64>,
-    /// Six served projection slots, in [`OwnerProjectionBytes`] order.
-    pub projections: OwnerProjectionBytes<'a>,
+fn valid_identity(value: &str) -> bool {
+    !value.trim().is_empty()
+        && !value.chars().any(char::is_control)
+        && value.len() <= MAX_SNAPSHOT_IDENTITY_BYTES
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn leg_for<'a>(
+    legs: &'a [ServedSnapshotLeg<'a>],
+    slot: ProjectionSnapshotSlot,
+) -> Result<&'a ServedSnapshotLeg<'a>, OwnerSupplyError> {
+    let mut found = None;
+    for leg in legs {
+        if leg.slot == slot {
+            if found.is_some() {
+                return Err(OwnerSupplyError::Invalid {
+                    projection: slot.name(),
+                    detail: "duplicate snapshot leg",
+                });
+            }
+            found = Some(leg);
+        }
+    }
+    found.ok_or(OwnerSupplyError::Empty {
+        projection: slot.name(),
+    })
+}
+
+fn verified_leg_content<'a>(
+    leg: &'a ServedSnapshotLeg<'a>,
+) -> Result<&'a [u8], OwnerSupplyError> {
+    let slot = leg.slot.name();
+    if leg.content.is_empty() {
+        return Err(OwnerSupplyError::Empty { projection: slot });
+    }
+    if leg.content.len() > MAX_OWNER_SNAPSHOT_BYTES {
+        return Err(OwnerSupplyError::Oversize { projection: slot });
+    }
+    if !valid_identity(leg.owner_id) || !valid_identity(leg.source_revision) {
+        return Err(OwnerSupplyError::Invalid {
+            projection: slot,
+            detail: "snapshot leg identity is invalid",
+        });
+    }
+    if !valid_digest(leg.content_digest) {
+        return Err(OwnerSupplyError::Invalid {
+            projection: slot,
+            detail: "snapshot leg digest is invalid",
+        });
+    }
+    if sha256_hex(leg.content) != leg.content_digest {
+        return Err(OwnerSupplyError::DigestMismatch { projection: slot });
+    }
+    Ok(leg.content)
 }
 
 impl ReactiveOwnerRetention {
@@ -119,10 +278,14 @@ impl ReactiveOwnerRetention {
     ///
     /// Same-session ingest replaces (fence rotation supersedes); an
     /// unknown session pushes while bounded, else [`OwnerSupplyError::RetentionFull`].
-    /// Only [`ingest_restored_projection_set`] calls this with
-    /// restore-shaped inputs — the set type itself is constructible only
-    /// via the validated supply read.
-    fn ingest(&mut self, set: OwnerProjectionSet, revision: Option<u64>) -> Result<(), OwnerSupplyError> {
+    /// Only [`ingest_served_snapshot_delivery`] calls this with
+    /// slot-complete served inputs — the set type itself is constructible
+    /// only via the validated supply read.
+    fn ingest(
+        &mut self,
+        set: OwnerProjectionSet,
+        revision: Option<u64>,
+    ) -> Result<(), OwnerSupplyError> {
         let session_id = set.session().session_id.clone();
         let fence = set.view().view.binding.state_fence.clone();
         if let Some(entry) = self
@@ -188,31 +351,71 @@ impl ReactiveOwnerRetention {
     }
 }
 
-/// Ingest one restore-shaped owner snapshot delivery into retention.
+/// Ingest one slot-complete served delivery into retention.
 ///
-/// Requires the serving reply's session echo to equal the live session and
-/// the set's own session identity to agree with it; the supply read binds
-/// every projection fence to the live fence. Any absent, oversize,
-/// undecodable, invalid, foreign-session, or fence-mismatched leg withholds
-/// the whole ingestion: partial sets never land in retention.
-pub fn ingest_restored_projection_set(
+/// Requires the serving reply's session echo to equal the live session;
+/// requires exactly one leg per slot; re-hashes every leg against its
+/// claimed digest; binds session/attention/coverage leg revisions to the
+/// decoded projections; then runs the validated supply read binding every
+/// projection fence to the live fence, and requires the set's own session
+/// identity to agree with the live session. Any absent, duplicated,
+/// oversize, undecodable, digest-mismatched, revision-diverged, invalid,
+/// foreign-session, or fence-mismatched leg withholds the whole ingestion:
+/// partial sets never land in retention.
+pub fn ingest_served_snapshot_delivery(
     retention: &mut ReactiveOwnerRetention,
     live_session: &str,
     live_fence: &StateFence,
-    restored: &RestoredOwnerSnapshots<'_>,
+    served: &ServedSnapshotDelivery<'_>,
 ) -> Result<(), OwnerSupplyError> {
-    if restored.reply_session != live_session {
+    if served.reply_session != live_session {
         return Err(OwnerSupplyError::BindingMismatch {
             projection: "retention",
             field: "restore.reply_session",
         });
     }
-    let set = read_owner_projection_set(live_fence, &restored.projections)?;
+    let mut legs = [None; 6];
+    for (index, slot) in ProjectionSnapshotSlot::all().into_iter().enumerate() {
+        let leg = leg_for(&served.legs, slot)?;
+        legs[index] = Some(verified_leg_content(leg)?);
+    }
+    let [view, cue_activation, session, attention, coverage, policy] =
+        legs.map(|leg| leg.expect("slot-complete legs"));
+    let session_leg = leg_for(&served.legs, ProjectionSnapshotSlot::Session)?;
+    let attention_leg = leg_for(&served.legs, ProjectionSnapshotSlot::Attention)?;
+    let coverage_leg = leg_for(&served.legs, ProjectionSnapshotSlot::Coverage)?;
+    let bytes = OwnerProjectionBytes {
+        view,
+        cue_activation,
+        session,
+        attention,
+        coverage,
+        policy,
+    };
+    let set = read_owner_projection_set(live_fence, &bytes)?;
+    if set.session().source_revision != session_leg.source_revision {
+        return Err(OwnerSupplyError::BindingMismatch {
+            projection: "session",
+            field: "session.source_revision",
+        });
+    }
+    if set.attention().source_revision != attention_leg.source_revision {
+        return Err(OwnerSupplyError::BindingMismatch {
+            projection: "attention",
+            field: "attention.source_revision",
+        });
+    }
+    if set.coverage().profile_revision != coverage_leg.source_revision {
+        return Err(OwnerSupplyError::BindingMismatch {
+            projection: "coverage",
+            field: "coverage.profile_revision",
+        });
+    }
     if set.session().session_id.as_str() != live_session {
         return Err(OwnerSupplyError::BindingMismatch {
             projection: "session",
             field: "session.session_id",
         });
     }
-    retention.ingest(set, restored.reply_revision)
+    retention.ingest(set, served.reply_revision)
 }

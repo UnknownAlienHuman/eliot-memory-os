@@ -1,9 +1,9 @@
 //! Daemon-owned reactive projection feed (I7.19 plan step, #1942 lane D).
 //!
-//! After the six owner-issued projections are produced by the lane-D
-//! producers (`eliot-context-contracts` + `eliot-reactive-context-plan`
-//! `produce_*`), this module drives one daemon-side feed evaluation over
-//! them through the existing settled-plan feed
+//! The serving side fills one slot-complete [`ServedSnapshotDelivery`](eliot_reactive_context_plan::ServedSnapshotDelivery)
+//! per live (session, fence) binding; this module ingests it into
+//! process-scoped retention and drives one daemon-side feed evaluation over
+//! the retained set through the existing settled-plan feed
 //! ([`drive_live_feed`](eliot_reactive_context_plan::drive_live_feed)).
 //! The resulting settled plan + batch crosses to the agent bridge, where the
 //! A1 transport admits it (`admit_producer_feed`); delivery, receipts,
@@ -36,23 +36,25 @@
 use eliot_contracts::{SessionId, StateFence};
 use eliot_governor::CompositionReadiness;
 use eliot_reactive_context_plan::{
-    BridgeAdmissionError, LiveActivationBindings, NoInjectionDisposition, OwnerProjectionBytes,
-    OwnerSupplyError, ReactiveContextPlanningError, ReactiveOwnerRetention, RestoredOwnerSnapshots,
-    SettledPlanFeed, SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
-    drive_live_feed, ingest_restored_projection_set,
+    BridgeAdmissionError, LiveActivationBindings, NoInjectionDisposition, OwnerSupplyError,
+    ReactiveContextPlanningError, ReactiveOwnerRetention, ServedSnapshotDelivery, SettledPlanFeed,
+    SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome, drive_live_feed,
+    ingest_served_snapshot_delivery,
 };
 use thiserror::Error;
 
 /// Borrowed owner projections plus the live activation they must be current for.
 ///
-/// The daemon central export threads the owners' canonical snapshots (served
-/// through the durable restore path) into one read-set evaluation; this feed
-/// performs exactly one evaluation over them. `Copy` because the struct is
-/// only borrowed owner references.
+/// The daemon central export threads one slot-complete served delivery
+/// (slot contract on [`ServedSnapshotDelivery`](eliot_reactive_context_plan::ServedSnapshotDelivery))
+/// into retention and evaluates from the retained set; this feed performs
+/// exactly one evaluation over it. `Copy` because the struct is only
+/// borrowed owner references.
 ///
-/// Live snapshot publication (typed snapshot reads per projection keyed by
-/// session/fence) is the reported ownership blocker: until it exists, bytes
-/// arrive via the restore path and any absent owner withholds the feed.
+/// Remaining serving-side implementation (Store/Kernel snapshot reads
+/// filling each slot's URI-addressed legs) is outside lane-D scope; until
+/// it exists, legs arrive via the restore path and any absent owner
+/// withholds the feed.
 #[derive(Clone, Copy, Debug)]
 pub struct DaemonReactiveFeedInputs<'a> {
     /// Live activation the projections must be planned under, projected by
@@ -137,40 +139,30 @@ pub fn drive_daemon_reactive_feed(
     }
 }
 
-/// Drive one daemon-side feed evaluation from a restore-shaped snapshot delivery.
+/// Drive one daemon-side feed evaluation from a slot-complete served delivery.
 ///
 /// Ingestion edge: the set is validated, retained under the live
 /// (session, fence) key, and re-read from retention before the
 /// readiness-gated daemon feed runs — the drive below consumes retained
-/// state, never fresh caller bytes. Bytes are the owners' canonical
-/// snapshots served through the durable restore path; the live session and
-/// fence are observed by the daemon central export, which threads the
-/// owners' snapshots. Any absent, foreign-session, oversize, undecodable,
-/// invalid, or mismatched leg withholds the whole evaluation.
+/// state, never fresh caller bytes. The served delivery (reply echo plus
+/// exactly one leg per slot) comes from the serving restore leg; the live
+/// session and fence are observed by the daemon central export, which
+/// threads the owners' snapshots. Any incomplete, foreign-session,
+/// oversize, undecodable, digest-mismatched, revision-diverged, invalid, or
+/// mismatched leg withholds the whole evaluation.
 pub fn drive_daemon_supplied_feed(
     readiness: CompositionReadiness,
     bindings: &LiveActivationBindings,
     retention: &mut ReactiveOwnerRetention,
     live_session: &str,
     fence: &StateFence,
-    reply_session: &str,
-    reply_revision: Option<u64>,
-    snapshots: &OwnerProjectionBytes<'_>,
+    served: &ServedSnapshotDelivery<'_>,
 ) -> Result<DaemonReactiveFeedOutcome, DaemonReactiveFeedError> {
     if readiness != CompositionReadiness::Ready {
         return Err(DaemonReactiveFeedError::NotReady);
     }
-    ingest_restored_projection_set(
-        retention,
-        live_session,
-        fence,
-        &RestoredOwnerSnapshots {
-            reply_session,
-            reply_revision,
-            projections: *snapshots,
-        },
-    )
-    .map_err(DaemonReactiveFeedError::Supply)?;
+    ingest_served_snapshot_delivery(retention, live_session, fence, served)
+        .map_err(DaemonReactiveFeedError::Supply)?;
     let session_id = SessionId::new(live_session).map_err(|_| {
         DaemonReactiveFeedError::Supply(OwnerSupplyError::Invalid {
             projection: "retention",

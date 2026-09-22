@@ -40,14 +40,13 @@
 //! owner-issued stored values re-validated here, never recomputed guesses:
 //! a digest mismatch fails the read.
 //!
-//! Residual ownership note: no live in-tree handle for the six owner stores
-//! exists yet (no typed snapshot reads keyed by session/fence serving these
-//! canonical JSON snapshots). Reads therefore operate on owner-issued
-//! snapshot bytes threaded through the restore/central-export path. The
-//! missing piece is the owner-snapshot publication contract (canonical
-//! snapshot identities per I07-18 plus serving reads), owned by the
-//! Store/Kernel restore path and the daemon central export — reported to the
-//! manager as the exact blocker, not rerouted silently.
+//! Residual serving note: the slot contract the serving side must fill is
+//! published in [`crate::owner_retention`] ([`ServedSnapshotDelivery`](crate::owner_retention::ServedSnapshotDelivery),
+//! one digest-bound leg per slot per (session, fence) binding). Serving-side
+//! snapshot-read implementation (Store/Kernel reads filling each slot's
+//! legs) remains outside lane-D scope; until it exists, legs arrive via the
+//! restore path and any absent owner withholds ingestion — reported to the
+//! manager as the remaining implementation gap, not rerouted silently.
 //!
 //! Read-path discipline: the decoders below are the ingestion edge ONLY.
 //! Validated sets are retained by
@@ -285,6 +284,11 @@ pub enum OwnerSupplyError {
         /// Bounded validation diagnostic.
         detail: String,
     },
+    /// Served content does not hash to its claimed digest.
+    DigestMismatch {
+        /// Projection whose content digest mismatched.
+        projection: &'static str,
+    },
     /// The projection's fence disagrees with the explicit read fence.
     FenceMismatch {
         /// Projection evaluated under a foreign fence.
@@ -317,6 +321,10 @@ impl std::fmt::Display for OwnerSupplyError {
             Self::Invalid { projection, detail } => {
                 write!(formatter, "owner supply rejected: {projection} invalid: {detail}")
             }
+            Self::DigestMismatch { projection } => write!(
+                formatter,
+                "owner supply rejected: {projection} content digest mismatch"
+            ),
             Self::FenceMismatch { projection } => write!(
                 formatter,
                 "owner supply stale: {projection} disagrees with the read fence"
