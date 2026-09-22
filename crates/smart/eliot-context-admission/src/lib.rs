@@ -7,6 +7,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod learning_gate;
+
+pub use learning_gate::{
+    LearningAtomClaim, LearningSubject, admit_context_with_learning, screen_learning_subjects,
+};
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use eliot_context_contracts::{
