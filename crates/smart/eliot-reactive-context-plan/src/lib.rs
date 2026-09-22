@@ -37,5 +37,5 @@ pub use settled_plan_feed::{
 };
 pub use view_cue_owner_serve::{
     MappedCueTarget, ServedViewCues, ServedViewFeed, ServedViewFeedError, UnmappedCueTarget,
-    drive_served_view_feed, serve_view_cues_under_fence,
+    assemble_cue_activation_for_view, drive_served_view_feed, serve_view_cues_under_fence,
 };

@@ -71,11 +71,11 @@
 
 use eliot_contracts::{ArtifactId, StateFence};
 use eliot_context_contracts::{ContextPlanningView, ReactiveInputError};
-use eliot_cue_contracts::{ActivationStrength, TargetHandle};
+use eliot_cue_contracts::{ActivationRequest, ActivationResult, ActivationStrength, TargetHandle};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::input::ReactiveCueActivation;
+use crate::input::{ReactiveCueActivation, ReactiveTargetBinding};
 use crate::settled_plan_feed::{
     LiveActivationBindings, SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
     drive_live_feed,
@@ -192,6 +192,33 @@ pub fn serve_view_cues_under_fence(
         mapped,
         frontier,
     })
+}
+
+/// Assemble the cue activation join the six-slot path consumes.
+///
+/// Binds a proven cue pair (`request`/`result` as admitted by the cue
+/// owner — e.g. from the Governor `LiveCuePair`) to one assembled owner
+/// view with the caller target bindings, then proves the whole join
+/// against that view. This is the view/cue slot filler for the six-slot
+/// assembly (`SettledPlanFeedInputs.cue_activation`): downstream slots
+/// fill from this live serving, never from caller-asserted bindings —
+/// every binding must name a rendered owner atom with matching source
+/// coordinates or the join fails closed here.
+pub fn assemble_cue_activation_for_view(
+    request: ActivationRequest,
+    result: ActivationResult,
+    view: &ContextPlanningView,
+    target_bindings: Vec<ReactiveTargetBinding>,
+) -> Result<ReactiveCueActivation, ReactiveInputError> {
+    let activation = ReactiveCueActivation {
+        request,
+        result,
+        expected_view_id: Some(view.view_id.clone()),
+        expected_admitted_set_digest: Some(view.admitted_canonical_sha256.clone()),
+        target_bindings,
+    };
+    activation.validate_against(view)?;
+    Ok(activation)
 }
 
 /// Project one admitted hit through the explicit target binding.

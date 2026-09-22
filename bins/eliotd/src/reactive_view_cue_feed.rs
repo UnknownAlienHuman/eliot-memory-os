@@ -75,7 +75,7 @@ use std::sync::Arc;
 use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_context_contracts::{
     ContextPlanningView, CriticalAttentionProjection, IntegrationCoverageProfile,
-    SessionDeliverySnapshot,
+    ReactiveInputError, SessionDeliverySnapshot,
 };
 use eliot_cue_activation::ActivationProfile;
 use eliot_cue_contracts::{NormalizationProfile, ObservedCue, SnapshotId};
@@ -86,8 +86,9 @@ use eliot_governor::{
 };
 use eliot_read::{QueryResult, ReadError, ReadService};
 use eliot_reactive_context_plan::{
-    LiveActivationBindings, ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTargetBinding,
-    ServedViewFeed, ServedViewFeedError, SettledPlanFeedInputs, drive_served_view_feed,
+    LiveActivationBindings, ReactiveDeliveryPolicy, ReactiveTargetBinding, ServedViewFeed,
+    ServedViewFeedError, SettledPlanFeedInputs, assemble_cue_activation_for_view,
+    drive_served_view_feed,
 };
 use eliot_store_api::{RevisionKey, ScopeId};
 use thiserror::Error;
@@ -150,8 +151,9 @@ pub struct ReactiveViewCueOutcome {
 }
 
 /// Fail-closed caller errors. Each stage surfaces distinctly: a fence or
-/// composition failure, a reconstruction failure, a live-pair failure, a
-/// resolver failure, or a serving/planning failure. Nothing downgrades.
+/// composition failure, a reconstruction failure, a live-pair failure, an
+/// assembly failure, a resolver failure, or a serving/planning failure.
+/// Nothing downgrades.
 #[derive(Debug, Error)]
 pub enum ReactiveViewCueError {
     /// The caller fence does not equal the admitted fence.
@@ -176,6 +178,9 @@ pub enum ReactiveViewCueError {
         /// Resolver's typed failure message.
         detail: String,
     },
+    /// The cue activation join failed against the owner view.
+    #[error("cue activation assembly failed: {0}")]
+    Assemble(ReactiveInputError),
     /// The served-view feed rejected the assembled inputs.
     #[error("served-view feed failed: {0}")]
     Feed(ServedViewFeedError),
@@ -277,13 +282,13 @@ pub async fn drive_reactive_view_cue_feed(
         activation_profile,
     )
     .map_err(ReactiveViewCueError::Pair)?;
-    let cue_activation = ReactiveCueActivation {
-        request: pair.bound.request.clone(),
-        result: pair.bound.result.clone(),
-        expected_view_id: Some(view.view_id.clone()),
-        expected_admitted_set_digest: Some(view.admitted_canonical_sha256.clone()),
+    let cue_activation = assemble_cue_activation_for_view(
+        pair.bound.request.clone(),
+        pair.bound.result.clone(),
+        view,
         target_bindings,
-    };
+    )
+    .map_err(ReactiveViewCueError::Assemble)?;
     let feed = drive_served_view_feed(
         bindings,
         SettledPlanFeedInputs {
