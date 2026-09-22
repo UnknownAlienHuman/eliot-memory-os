@@ -30,16 +30,16 @@ use eliot_protocol::{
     ProtocolVersion, ServerHello,
 };
 use eliot_store_api::{
-    CAPABILITIES, CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
-    ExactJsonBytes, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
+    CAPABILITIES, CanonicalBackupPorts, CanonicalRequestView, CanonicalStoreClient,
+    CanonicalValidationSnapshot, EFFECTS, ExactJsonBytes, NamedReadRequest, NamedReadResponse,
+    OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
     StoreBackupBeginRequest, StoreBackupCompletionReceipt, StoreBackupConsistency,
     StoreBackupEndRequest, StoreBackupPage, StoreBackupPageRequest, StoreBackupReconcileRequest,
     StoreBackupReconciliation, StoreBackupStatusReport, StoreBackupStatusRequest,
     StoreBackupValidationReceipt, StoreBackupValidationRequest, StoreError, StoreHealth,
-    StoreIsolatedRestoreRequest, WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests, genesis_manifest,
-    verify_canonical_request_hash,
+    StoreIsolatedRestoreRequest, WriteReceipt, decode_request_frame_with_authority,
+    generated_operation_manifests, genesis_manifest, verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -269,6 +269,11 @@ pub struct StoreComposition {
     connections: StoreConnectionManager,
     health_admission: HealthAdminAdmission,
     _runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
+    /// Backup-table provisioning proved at `connect` time (issue #975).
+    /// `true` only when a live probe against the backup coordination
+    /// tables succeeded. Sessions advertise `store.backup` exactly when
+    /// this holds, so an unowned capability is never advertised.
+    backup_provisioned: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for StoreComposition {
@@ -358,6 +363,7 @@ impl StoreComposition {
             connections,
             health_admission: HealthAdminAdmission::bridge_default(),
             _runtime_root_leases: runtime_root_leases,
+            backup_provisioned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -393,11 +399,30 @@ impl StoreComposition {
 
     /// Starts the one retained canonical provider child and proves authenticated
     /// version readiness before the Store pipe accepts requests.
+    ///
+    /// Also proves backup-table provisioning once the provider is up: the
+    /// `store.backup` capability is advertised to later handshakes exactly
+    /// when this probe succeeds. Tables provisioned after startup take
+    /// effect on process restart; an unowned capability is never
+    /// advertised.
     pub async fn connect(&self) -> Result<(), String> {
         self.store
             .connect()
             .await
-            .map_err(|error| format!("canonical provider startup failed: {error}"))
+            .map_err(|error| format!("canonical provider startup failed: {error}"))?;
+        let provisioned = self.store.backup_provisioned().await;
+        self.backup_provisioned
+            .store(provisioned, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Reports whether the backup coordination tables proved provisioned at
+    /// `connect` time. Sessions advertise `store.backup` exactly when this
+    /// holds.
+    #[must_use]
+    pub fn backup_provisioned(&self) -> bool {
+        self.backup_provisioned
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Semantic schema readiness observation.  This is not a write authority
@@ -648,10 +673,10 @@ impl StoreComposition {
     ///
     /// Thin composition delegation: the closed #950 begin request is
     /// validated and the fence is pinned to this composition before the
-    /// canonical adapter port runs. Until the #951 capture backend lands,
-    /// the unimplemented port refuses with [`StoreError::UnknownOperation`]
-    /// without effects; support is advertised only from the accepted
-    /// concrete backend, never from this delegation.
+    /// canonical adapter port runs. The production arm delegates exactly
+    /// once to the accepted #951 capture backend; an unprovisioned backend
+    /// refuses with a typed failure before any provider I/O and never
+    /// falls back to another operation.
     pub async fn backup_begin(
         &self,
         request: StoreBackupBeginRequest,
@@ -660,14 +685,14 @@ impl StoreComposition {
         if request.scope.state_fence != self.state_fence {
             return Err(StoreError::FenceMismatch);
         }
-        Err(StoreError::UnknownOperation)
+        CanonicalBackupPorts::backup_begin(&self.store, request).await
     }
 
     /// Reads one page of an open capture under its consistency point
     /// (issue #975).
     ///
-    /// Same unbound-port contract as [`Self::backup_begin`]: validated
-    /// here and refused without effects until the #951 backend lands. The
+    /// Same live-backend contract as [`Self::backup_begin`]: validated
+    /// here and delegated exactly once to the #951 capture backend. The
     /// page request carries no separate fence field; the fence stays bound
     /// by the session admission and the wire envelope around it.
     pub async fn backup_page(
@@ -675,27 +700,27 @@ impl StoreComposition {
         request: StoreBackupPageRequest,
     ) -> Result<StoreBackupPage, StoreError> {
         request.validate()?;
-        Err(StoreError::UnknownOperation)
+        CanonicalBackupPorts::backup_page(&self.store, request).await
     }
 
     /// Closes one capture and issues its completion receipt (issue #975).
     ///
-    /// Same unbound-port contract as [`Self::backup_begin`]: validated
-    /// here, refused without effects until the #951 backend lands.
+    /// Same live-backend contract as [`Self::backup_begin`]: validated
+    /// here and delegated exactly once to the #951 capture backend.
     pub async fn backup_end(
         &self,
         request: StoreBackupEndRequest,
     ) -> Result<StoreBackupCompletionReceipt, StoreError> {
         request.validate()?;
-        Err(StoreError::UnknownOperation)
+        CanonicalBackupPorts::backup_end(&self.store, request).await
     }
 
     /// Restores validated canonical records into the admitted isolated
     /// destination only (issue #975).
     ///
-    /// Same unbound-port contract as [`Self::backup_begin`]: validated and
-    /// destination-pinned here, refused without effects until the #952
-    /// backend lands. This method can never activate the installation,
+    /// Same live-backend contract as [`Self::backup_begin`]: validated
+    /// and destination-pinned here, delegated exactly once to the #952
+    /// restore backend. This method can never activate the installation,
     /// unblock effects, or retire the source.
     pub async fn backup_isolated_restore(
         &self,
@@ -705,51 +730,49 @@ impl StoreComposition {
         if request.scope.state_fence != self.state_fence {
             return Err(StoreError::FenceMismatch);
         }
-        Err(StoreError::UnknownOperation)
+        CanonicalBackupPorts::backup_isolated_restore(&self.store, request).await
     }
 
     /// Validates one captured snapshot without restoring it (issue #975).
     ///
-    /// Same unbound-port contract as [`Self::backup_begin`]: validated
-    /// here and refused without effects until the #952 backend lands.
-    /// The fence stays bound by the session admission and the wire
-    /// envelope. Validation can never import.
+    /// Same live-backend contract as [`Self::backup_begin`]: validated
+    /// here and delegated exactly once to the #952 backend. The fence
+    /// stays bound by the session admission and the wire envelope.
+    /// Validation can never import.
     pub async fn backup_validate(
         &self,
         request: StoreBackupValidationRequest,
     ) -> Result<StoreBackupValidationReceipt, StoreError> {
         request.validate()?;
-        Err(StoreError::UnknownOperation)
+        CanonicalBackupPorts::backup_validate(&self.store, request).await
     }
 
     /// Observes the status of one backup operation (issue #975).
     ///
-    /// Same unbound-port contract as [`Self::backup_begin`]: validated
-    /// here and refused without effects until the #951/#952 backends land.
-    /// The fence stays bound by the session admission and the wire
-    /// envelope.
+    /// Same live-backend contract as [`Self::backup_begin`]: validated
+    /// here and delegated exactly once to the #951/#952 backends. The
+    /// fence stays bound by the session admission and the wire envelope.
     pub async fn backup_status(
         &self,
         request: StoreBackupStatusRequest,
     ) -> Result<StoreBackupStatusReport, StoreError> {
         request.validate()?;
-        Err(StoreError::UnknownOperation)
+        CanonicalBackupPorts::backup_status(&self.store, request).await
     }
 
     /// Reconciles one uncertain backup mutation by exact identity
     /// (issue #975).
     ///
-    /// Same unbound-port contract as [`Self::backup_begin`]: validated
-    /// here and refused without effects until the #951/#952 backends land.
-    /// The fence stays bound by the session admission and the wire
-    /// envelope. Unknown stays unknown; reconciliation never mints a new
-    /// operation.
+    /// Same live-backend contract as [`Self::backup_begin`]: validated
+    /// here and delegated exactly once to the #951/#952 backends. The
+    /// fence stays bound by the session admission and the wire envelope.
+    /// Unknown stays unknown; reconciliation never mints a new operation.
     pub async fn backup_reconcile(
         &self,
         request: StoreBackupReconcileRequest,
     ) -> Result<StoreBackupReconciliation, StoreError> {
         request.validate()?;
-        Err(StoreError::UnknownOperation)
+        CanonicalBackupPorts::backup_reconcile(&self.store, request).await
     }
 
     /// Reconciles a possibly ambiguous write by exact operation identity.
@@ -921,6 +944,7 @@ pub fn require_semantic_ready_for_pipe(
 pub struct StoreHandshakeIdentity {
     operation_manifest_digest: String,
     blob_root_owner: serde_json::Value,
+    backup_provisioned: bool,
 }
 
 impl StoreHandshakeIdentity {
@@ -933,7 +957,17 @@ impl StoreHandshakeIdentity {
         Self {
             operation_manifest_digest: operation_manifest_digest.into(),
             blob_root_owner,
+            backup_provisioned: false,
         }
+    }
+
+    /// Marks backup-table provisioning proved at composition `connect`
+    /// time. Sessions admit `store.backup` exactly when this holds; the
+    /// default refuses the backup edge before dispatch.
+    #[must_use]
+    pub fn with_backup_provisioned(mut self, provisioned: bool) -> Self {
+        self.backup_provisioned = provisioned;
+        self
     }
 }
 
@@ -1030,11 +1064,27 @@ pub fn admit_handshake(
     if usize::try_from(hello.max_frame).unwrap_or(usize::MAX) > limits.max_frame_bytes {
         return Err("ClientHello max_frame exceeds the bounded transport limit".to_owned());
     }
-    let capabilities: Vec<String> = CAPABILITIES
+    let mut capabilities: Vec<String> = CAPABILITIES
         .iter()
         .filter(|capability| hello.capabilities.iter().any(|value| value == **capability))
         .map(|capability| (*capability).to_owned())
         .collect();
+    // Issue #975: the backup edge is admitted exactly when the composition
+    // proved its backend provisioned at connect time. The capability stays
+    // unlisted in `CAPABILITIES` (API presence is not readiness); it joins
+    // the session set here only with live provisioning proof, so an
+    // unowned capability is never advertised.
+    if identity.backup_provisioned
+        && hello
+            .capabilities
+            .iter()
+            .any(|value| value == eliot_store_api::CAPABILITY_STORE_BACKUP)
+        && !capabilities
+            .iter()
+            .any(|value| value == eliot_store_api::CAPABILITY_STORE_BACKUP)
+    {
+        capabilities.push(eliot_store_api::CAPABILITY_STORE_BACKUP.to_owned());
+    }
     let effects: Vec<String> = EFFECTS.iter().map(|effect| (*effect).to_owned()).collect();
     let server_hello = ServerHello {
         selected_protocol: protocol_version,

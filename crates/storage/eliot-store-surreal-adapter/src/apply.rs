@@ -30,6 +30,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 mod atomic_write;
+mod backup_restore;
+mod backup_snapshot;
 mod empty_migration;
 mod genesis;
 #[path = "health_probe.rs"]
@@ -67,6 +69,10 @@ pub(crate) async fn initialize_genesis(
     Ok(receipt)
 }
 
+pub(crate) use backup_restore::{
+    backup_isolated_restore, backup_provisioned, backup_reconcile, backup_status, backup_validate,
+};
+pub(crate) use backup_snapshot::{backup_begin, backup_end, backup_page};
 #[cfg(test)]
 use genesis::{
     GenesisState, build_genesis_bindings, build_genesis_sql, genesis_receipt,
@@ -117,6 +123,17 @@ fn is_admitted_migration(migration: &CompiledMigration) -> bool {
         && migration.checksum_sha256 == v2_delta
         && migration.generation_after.as_str() == schema::GENERATION_V2
         && migration.statements.trim() == schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.trim()
+    {
+        return true;
+    }
+    // Additive backup coordination tables (issues #951/#952): creates only
+    // the three backup tables on top of a v2 baseline without changing the
+    // generation, in the v1-to-v2 delta style.
+    let backup_delta = eliot_store_api::sha256_hex(schema::BACKUP_TABLES_DDL.as_bytes());
+    if migration.migration_id == schema::MIGRATION_ID_BACKUP_TABLES
+        && migration.checksum_sha256 == backup_delta
+        && migration.generation_after.as_str() == schema::GENERATION_V2
+        && migration.statements.trim() == schema::BACKUP_TABLES_DDL.trim()
     {
         return true;
     }

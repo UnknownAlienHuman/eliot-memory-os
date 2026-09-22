@@ -202,7 +202,8 @@ async fn run() -> Result<(), String> {
             "process_id": composition.blob_owner().process_id(),
             "claim_id": composition.blob_owner().claim_id(),
         }),
-    );
+    )
+    .with_backup_provisioned(composition.backup_provisioned());
     let (mut session, server_hello) =
         admit_handshake(hello_frame, limits, &config, &handshake_identity)?;
     let mut negotiated_limits = limits;
