@@ -21,5 +21,10 @@ thiserror.workspace = true
 tiktoken-rs.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+eliot-agent-bridge-core.workspace = true
+eliot-platform.workspace = true
+eliot-process-executor.workspace = true
+
 [lints]
 workspace = true

@@ -3241,6 +3241,64 @@ mod tests {
         Ok(attached)
     }
 
+    /// Test SHA-256 hex for pinning the real child executable identity.
+    fn test_sha256_file(path: &std::path::Path) -> TestResult<String> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let count = file.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&chunk[..count]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Rebuilds the attach receipt over one explicit process request,
+    /// mirroring `attached()` field for field (launch, authority, route
+    /// with the measured model, session, Q-01 assurance) but binding the
+    /// given owner-issued request instead of the helper's own fixture.
+    /// The session working directory follows the request so attach-time
+    /// agreement holds on the real cwd.
+    fn attach_for_chain(
+        process_request: ProcessRequest,
+        working_directory: &str,
+    ) -> TestResult<CodexAttachReceipt> {
+        let (source_assurance, source_expectation) = source()?;
+        let mut route = route();
+        route.model = "gpt-5-codex".to_owned();
+        Ok(attach(CodexAttachInput {
+            launch: launch()?,
+            authority: AuthorityEnvelope {
+                epoch: test_epoch(TEST_LINEAGE_A, 1),
+                scope_ref: "scope-1".into(),
+                effect_ceiling: ceiling(),
+                lease: serde_json::from_value::<WorkLeaseId>(
+                    serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+                )?,
+                state_fence: StateFence::new(
+                    test_epoch(TEST_LINEAGE_A, 1),
+                    ResourceGeneration::new(1)?,
+                ),
+                valid_until: "never".into(),
+            },
+            route,
+            session: CodexSessionBinding {
+                session_id: SessionId::new("session-1")?,
+                thread_id: "thread-1".into(),
+                runtime_hash: fixture_digest("runtime"),
+                working_directory: working_directory.to_owned(),
+            },
+            process_request,
+            source_assurance,
+            source_expectation,
+        })?)
+    }
+
     enum FakeRead {
         Data(Vec<u8>),
         Eof,
@@ -4228,6 +4286,251 @@ mod tests {
             carrier.result_digest,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+        Ok(())
+    }
+    /// P-04 port for the chain proof: validates the launch against the
+    /// fixture authority exactly like production, over caller-supplied
+    /// records. Mirrors the executor crate's own test port; no authority
+    /// is minted here.
+    #[cfg(windows)]
+    struct ChainPort {
+        authority: std::sync::Mutex<eliot_process::DispatchPermitAuthority>,
+        context: eliot_process::DispatchValidationContext,
+    }
+
+    #[cfg(windows)]
+    impl eliot_process_executor::DispatchValidationPort for ChainPort {
+        fn validate_and_consume(
+            &self,
+            request: ProcessRequest,
+            observed: eliot_process::SuspendedProcessIdentity,
+        ) -> Result<eliot_process::ValidatedDispatch, ProcessExecutionError> {
+            let mut authority = self.authority.lock().map_err(|_| {
+                ProcessExecutionError::Unavailable("dispatch authority lock poisoned".to_owned())
+            })?;
+            authority
+                .validate_and_consume(request, observed, &self.context)
+                .map_err(Into::into)
+        }
+    }
+
+    /// Projects one driven carrier into its bridge receipt through the real
+    /// intake: attested count/digest plus the live admission/binding, with
+    /// the core attached through its real activation port. Mirrors the
+    /// bridge crate's own test core; the join logic under proof is the
+    /// production entry, not a copy.
+    #[cfg(windows)]
+    fn bridge_receipt_for(
+        carrier: &super::route_tokenizer::CodexMeasuredToolResult,
+        admission: &AdmittedRouteReceipt,
+        binding: &ProviderExecutionBinding,
+    ) -> TestResult<eliot_agent_bridge_core::ToolResultReceipt> {
+        use eliot_agent_bridge_core::{
+            AgentBridgeCore, AttachRequest, ConnectionId, DemandId, Generation, ProviderReadiness,
+        };
+        struct StaticHost {
+            result: eliot_agent_bridge_core::ActivationPortResult,
+        }
+        impl eliot_agent_bridge_core::HostActivationPort for StaticHost {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<
+                eliot_agent_bridge_core::ActivationPortOutcome,
+                eliot_agent_bridge_core::ProviderFailure,
+            > {
+                Ok(
+                    eliot_agent_bridge_core::ActivationPortOutcome::Authenticated(
+                        self.result.clone(),
+                    ),
+                )
+            }
+        }
+        let generation = Generation::new(1)?;
+        let fence = eliot_agent_bridge_core::FencingToken::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            Generation::new(1)?,
+            "fence-1".to_owned(),
+        )?;
+        let result = eliot_agent_bridge_core::ActivationPortResult::authenticated(
+            eliot_agent_bridge_core::PrincipalId::new("principal-1")?,
+            eliot_agent_bridge_core::SessionId::new("session-1")?,
+            generation,
+            fence,
+            eliot_agent_bridge_core::TaskId::new("task-1")?,
+            eliot_agent_bridge_core::WorkUnitId::new("work-unit-1")?,
+            "scope-1",
+            "task-revision-1",
+            "plan-1",
+            "plan-revision-1",
+        )?;
+        let mut core = AgentBridgeCore::new(
+            ProviderReadiness::all_admitted(),
+            Some(Box::new(StaticHost { result })),
+            None,
+            eliot_agent_bridge_core::CursorPolicy::new(
+                eliot_agent_bridge_core::AckPhase::Durable,
+                eliot_agent_bridge_core::AckPhase::Normalized,
+            )?,
+        );
+        core.attach(AttachRequest::managed(
+            DemandId::new("demand-1")?,
+            ConnectionId::new("connection-1")?,
+        ))?;
+        let payload = eliot_agent_bridge_core::TokenMeasurementPayload {
+            contract_version: eliot_agent_bridge_core::TOKEN_MEASUREMENT_VERSION,
+            observation: carrier.observation.clone(),
+            result_digest: carrier.result_digest.clone(),
+            tokens: carrier.tokens,
+        };
+        Ok(core.project_produced_tool_result(
+            &carrier.result_bytes,
+            eliot_agent_bridge_core::ResourceUri::parse("eliot://evidence/source")?,
+            Some(&payload),
+            admission,
+            binding,
+            eliot_agent_bridge_core::DeliveryStatus::Full,
+        )?)
+    }
+
+    /// End-to-end realpath proof: a REAL P-04 launch of a REAL child
+    /// speaking REAL turn frames through the REAL channel implementation,
+    /// driven by the REAL turn driver over owner-issued records, with the
+    /// carrier landing in a REAL bridge receipt. Only the owner-issued
+    /// records (attach/binding/admission/event identity — daemon-owned in
+    /// production) are fixture-constructed through their real validators;
+    /// every execution, pump, normalization, measurement, and projection
+    /// step is production code.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn measured_turn_chain_executes_end_to_end() -> TestResult {
+        use super::turn_driver::{CodexTurnDriverInputs, drive_codex_turn};
+        let executable = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let digest = test_sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = eliot_process::OperationId::new("op-t9-chain-01")?;
+        let generation = eliot_process::Generation::new(1)?;
+        let mut test_env = std::collections::BTreeMap::new();
+        test_env.insert("SystemRoot".to_owned(), std::env::var("SystemRoot")?);
+        let temp_dir = std::env::temp_dir().to_string_lossy().into_owned();
+        test_env.insert("TEMP".to_owned(), temp_dir.clone());
+        test_env.insert("TMP".to_owned(), temp_dir);
+        let intent = eliot_process::ProcessIntent::new(
+            operation_id.clone(),
+            eliot_process::ProcessTreeId::new("tree-t9-chain-01")?,
+            eliot_process::JobId::new("job-t9-chain-01")?,
+            eliot_process::ImageId::new("image-t9-chain-01")?,
+            eliot_process::SessionId::new("session-t9-chain-01")?,
+            generation,
+            executable,
+            digest,
+            vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                "Write-Output '{\"id\":\"turn-1-start\",\"result\":{\"ok\":true}}'; Write-Output '{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-1\",\"turnId\":\"turn-1\",\"itemId\":\"i-1\",\"delta\":\"hello world\"}}'; Write-Output '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-1\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}'".to_owned(),
+            ],
+            working_directory.clone(),
+            eliot_process::EnvironmentProjection::new(
+                test_env,
+                Vec::new(),
+                eliot_process::EnvironmentInheritance::None,
+            )?,
+            eliot_process::ResourceLimits::new(
+                30_000,
+                Some(10_000),
+                Some(512_000_000),
+                4_096,
+                4_096,
+                4,
+            )?,
+        )?
+        .with_interactive_stdin()?;
+        let fence = eliot_process::FencingToken::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            generation,
+            "fence-t9-chain-01",
+        )?;
+        let mut authority = eliot_process::DispatchPermitAuthority::activate(
+            eliot_process::DispatchAuthorityId::new("auth-t9-chain")?,
+            eliot_process::KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            eliot_process::PermitIssuance::new(
+                eliot_process::ActionLeaseRef::new("lease-t9-chain-01")?,
+                fence.clone(),
+                std::collections::BTreeMap::from([
+                    ("authority".to_owned(), "a".repeat(64)),
+                    ("state".to_owned(), "b".repeat(64)),
+                ]),
+                100,
+                10_000,
+                "nonce-t9-chain-01",
+            )?,
+        )?;
+        let process_request = eliot_process::ProcessRequest::new(intent, permit)?;
+        let context = eliot_process::DispatchValidationContext::new(
+            eliot_platform::ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            test_epoch(TEST_LINEAGE_A, 1),
+            std::collections::BTreeMap::from([
+                ("authority".to_owned(), "a".repeat(64)),
+                ("state".to_owned(), "b".repeat(64)),
+            ]),
+            41,
+        )?;
+        let port = ChainPort {
+            authority: std::sync::Mutex::new(authority),
+            context,
+        };
+        let executor = Arc::new(eliot_process_executor::WindowsProcessExecutor::new(
+            Arc::new(port),
+        ));
+        let channel: Arc<dyn eliot_process::InteractiveChildChannel> = executor.clone();
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attach_for_chain(process_request, &working_directory)?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let drive = drive_codex_turn(CodexTurnDriverInputs {
+            executor: Arc::clone(&executor),
+            channel,
+            attached: &mut attached,
+            binding: &binding,
+            admission: &admission,
+            evidence_sink: Some(sink),
+            turn_input: serde_json::json!({"prompt": "hello"}),
+            turn_timeout: std::time::Duration::from_secs(30),
+            owner_event: turn_owner_event(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            continuation: None,
+            proposed_effects: Vec::new(),
+            cancelled: false,
+        })
+        .await?;
+        // Real launch through P-04 exactly once.
+        assert!(drive.launch.is_some());
+        // Canonical turn receipt over really pumped bytes.
+        assert_eq!(drive.result.disposition, ResultDisposition::Partial);
+        // Carrier lands in a real bridge receipt through the real intake.
+        let carrier = drive.measured.expect("live turn measures");
+        let receipt = bridge_receipt_for(&carrier, &admission, &binding)?;
+        assert_eq!(receipt.tokens_rendered(), 2);
+        assert_eq!(
+            receipt.result_digest(),
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert!(receipt.check_complete_evidence().is_ok());
         Ok(())
     }
 

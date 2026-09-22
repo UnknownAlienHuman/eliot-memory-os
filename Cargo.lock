@@ -726,9 +726,12 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-agent-api",
+ "eliot-agent-bridge-core",
  "eliot-agent-coordinator",
  "eliot-contracts",
+ "eliot-platform",
  "eliot-process",
+ "eliot-process-executor",
  "eliot-receipts",
  "eliot-source-assurance",
  "serde",
