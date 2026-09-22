@@ -12,6 +12,13 @@
 //!   the set verdict, and every projection/receipt binding are resolved and
 //!   verified here, and bare caller handles or structural digests are never
 //!   promoted to accepted facts;
+//! - canonical identity comes from the batch record, never from the repeated
+//!   fields of the caller-supplied verdict: `kind`, `roles`, and
+//!   `projection_revision` are derived from the [`MemoryProjectionRecord`];
+//!   the set contributes only the verdict, the substantive reason, and the
+//!   advisory cue flag. `projection_revision` travels as the owner currency
+//!   assertion it is: carried and echoed, never independently established
+//!   here, so this result is not advertised as a current canonical view;
 //! - no score, rank, similarity, retrieval count, or model judgment is read
 //!   or emitted, because no frozen contract carries one; gravity and
 //!   maintenance sections are per-record advisory dispositions with exact
@@ -19,35 +26,46 @@
 //! - low use never reduces support and retrieval never reinforces it: gravity
 //!   marks narrowing or suppression *candidates* and preservation notes, never
 //!   deletion, lifecycle transition, or support promotion (A14.4);
-//! - receipt candidates are advisory only: their member/stage denominators
-//!   are retained separately and observed counts never substitute for the
-//!   batch denominator;
+//! - receipt candidates are advisory only: each contributes a bound
+//!   [`ReceiptObservation`] (identity, member denominator, stage/metric
+//!   volume, digest lineage), never a merged verdict; observed counts never
+//!   substitute for the batch denominator, and no observation proves use,
+//!   decision delta, or benefit;
+//! - coverage is explicit, never a bare count: the assessment carries a
+//!   closed [`CoverageStatus`], the exact truncation frontier, the named
+//!   batch omissions, and the admitted projection omissions. A `Complete`
+//!   result exists only for lossless, fully accounted coverage; anything
+//!   else is `Inconclusive` with the exact evidence needed for recheck;
 //! - assessment order is deterministic input order; counter-metric rule
 //!   counts are sorted by rule name.
 //!
-//! A returned assessment is `Complete` by construction: a known denominator,
-//! exact binding echoes, and a handle union identical to the batch records
-//! are all enforced before any section is derived. Failures are typed
-//! errors, never silent drops.
+//! Failures are typed errors, never silent drops. [`MemoryEcologyAssessment`]
+//! serializes self-validating evidence: version, known denominator bound to
+//! the metric total, recomputed applicability/rule counts, closed rule names,
+//! deterministic ordering, and coverage/status invariants are all rechecked
+//! by [`MemoryEcologyAssessment::validate`].
 
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_context_contracts::{CanonicalProjectionSet, ContextError};
+use eliot_context_contracts::{CanonicalProjectionSet, ContextBinding, ContextError, OmissionRecord};
 use eliot_contracts::{ArtifactId, ContractVersion, fences_match_exact};
 use eliot_evidence::LifecycleState;
+use eliot_learning_contracts::identity::validate_digest as validate_learning_digest;
 use eliot_memory_projection_contracts::{
-    ApplicableMemorySet, DenominatorState, ExclusionReason, FreshnessState, MemoryKind,
-    MemoryProjectionBatch, MemoryProjectionError, MemoryRole, MemoryScopeBinding,
+    ApplicableMemorySet, CoverageOmission, DenominatorState, ExclusionReason, FreshnessState,
+    MemoryKind, MemoryProjectionBatch, MemoryProjectionError, MemoryRole, MemoryScopeBinding,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-// Re-exported so consumers name the advisory receipt type without
-// depending on the learning owner crate directly.
-pub use eliot_learning_contracts::HarnessActivationReceiptCandidate;
+// Re-exported so consumers name the advisory receipt and denominator types
+// without depending on the learning owner crate directly.
+pub use eliot_learning_contracts::{
+    HarnessActivationReceiptCandidate, SourceDenominator,
+};
 use eliot_learning_contracts::LearningContractError;
 
 /// Stable wire name for this consumer contract family.
@@ -59,6 +77,23 @@ pub const QUALITY_CONTRACT_NAME: &str = "eliot.smart.memory-quality";
 pub const QUALITY_CONTRACT_VERSION: ContractVersion = ContractVersion::new(0, 1, 0);
 /// Hard ceiling on advisory receipt candidates carried by one request.
 pub const MAX_QUALITY_RECEIPTS: usize = 64;
+
+/// Closed coverage posture of one assessment.
+///
+/// `Complete` is bound to lossless, fully accounted evidence by
+/// [`MemoryEcologyAssessment::validate`]: no truncation, no batch or
+/// projection omissions, an empty frontier, and a denominator total exactly
+/// equal to the assessed records. Any truncation, omission, or unaccounted
+/// volume yields `Inconclusive`, which carries the exact frontier and
+/// omission identities needed for independent recheck.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CoverageStatus {
+    /// Lossless, fully accounted coverage with an exact denominator.
+    Complete,
+    /// Truncated, lossy, or partially bound evidence; recheck required.
+    Inconclusive,
+}
 
 /// Assessment failure for a memory quality request.
 ///
@@ -106,6 +141,16 @@ pub enum QualityError {
         /// Short machine-stable rule description.
         reason: &'static str,
     },
+}
+
+fn text(value: &str, field: &'static str) -> Result<(), QualityError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(QualityError::InvalidField {
+            field,
+            reason: "must be non-blank and free of control characters",
+        });
+    }
+    Ok(())
 }
 
 /// Memory quality request over one bounded projection and its owner verdict.
@@ -226,16 +271,23 @@ impl QualityRequest {
     }
 }
 
-/// One assessed record: owner verdict joined by handle, roles preserved.
+/// One assessed record: canonical identity from the batch, verdict from the set.
+///
+/// `kind`, `roles`, and `projection_revision` are derived from the
+/// [`MemoryProjectionRecord`], never from the repeated fields of the
+/// caller-supplied verdict entry. The verdict contributes only
+/// applicability, the substantive reason, and the advisory cue flag.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ItemAssessment {
     /// Exact canonical handle of the assessed record.
     pub handle: ArtifactId,
-    /// Canonical kind of the record.
+    /// Canonical kind derived from the batch record.
     pub kind: MemoryKind,
-    /// Roles preserved with the record, never stripped.
+    /// Roles preserved from the batch record, never stripped.
     pub roles: Vec<MemoryRole>,
+    /// Owner projection revision: currency assertion echoed, not established.
+    pub projection_revision: u64,
     /// Whether the owner verdict holds this record applicable.
     pub applicable: bool,
     /// Substantive owner rule for excluded records; absent when applicable.
@@ -305,10 +357,10 @@ pub struct GravityNote {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MaintenanceNoteKind {
-    /// Freshness reports a known older snapshot; revalidation names the
+    /// Freshness reports a known older snapshot; `rationale` names the
     /// boundary that passed.
     StaleMaterial,
-    /// Freshness cannot be established; the owner note names what is missing.
+    /// Freshness cannot be established; `rationale` names what is missing.
     FreshnessUnknown,
     /// The record retains a predecessor in the immutable lineage while
     /// superseded content stays addressable as history.
@@ -325,6 +377,11 @@ pub enum MaintenanceNoteKind {
 }
 
 /// One maintenance note bound to an assessed record handle.
+///
+/// `rationale` carries the exact owner freshness note for stale/unknown
+/// dispositions so the stale-hit reason survives without inventing a
+/// storage resolver; `source_revision` echoes the owner provenance
+/// revision. No resolution or canonical retention is decided here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MaintenanceNote {
@@ -334,10 +391,14 @@ pub struct MaintenanceNote {
     pub kind: MaintenanceNoteKind,
     /// Predecessor handle for supersession lineage; absent otherwise.
     pub predecessor: Option<ArtifactId>,
+    /// Owner freshness rationale; present exactly for stale/unknown kinds.
+    pub rationale: Option<String>,
+    /// Owner provenance revision echoed from the assessed record.
+    pub source_revision: Option<String>,
 }
 
 impl MaintenanceNote {
-    /// Validate the note shape: lineage presence matches the lineage kind.
+    /// Validate the note shape: lineage, rationale, and revision echoes.
     pub fn validate(&self) -> Result<(), QualityError> {
         if (self.kind == MaintenanceNoteKind::SupersededWithLineage) != self.predecessor.is_some()
         {
@@ -346,6 +407,52 @@ impl MaintenanceNote {
                 reason: "predecessor must be present exactly for supersession lineage",
             });
         }
+        let needs_rationale = matches!(
+            self.kind,
+            MaintenanceNoteKind::StaleMaterial | MaintenanceNoteKind::FreshnessUnknown
+        );
+        if needs_rationale != self.rationale.is_some() {
+            return Err(QualityError::InvalidField {
+                field: "maintenance.rationale",
+                reason: "rationale must be present exactly for stale/unknown dispositions",
+            });
+        }
+        if let Some(rationale) = &self.rationale {
+            text(rationale, "maintenance.rationale")?;
+        }
+        if let Some(revision) = &self.source_revision {
+            text(revision, "maintenance.source_revision")?;
+        }
+        Ok(())
+    }
+}
+
+/// One bound advisory receipt observation.
+///
+/// A separately bound echo of one validated receipt candidate: identity,
+/// member denominator, stage/metric volume, and digest lineage. Advisory
+/// only: it establishes no retrieval, use, decision delta, or benefit, and
+/// its counts never substitute for the batch denominator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptObservation {
+    /// Stable activation receipt identity echoed from the candidate.
+    pub activation_id: ArtifactId,
+    /// Member/stage denominator retained separately from observed counts.
+    pub member_denominator: SourceDenominator,
+    /// Stage observations carried by the candidate.
+    pub stages_observed: usize,
+    /// Metric observations carried by the candidate.
+    pub metrics_observed: usize,
+    /// Canonical receipt candidate digest echoed from the candidate.
+    pub canonical_digest: String,
+}
+
+impl ReceiptObservation {
+    /// Validate the observation: denominator bounds and digest shape.
+    pub fn validate(&self) -> Result<(), QualityError> {
+        self.member_denominator.validate()?;
+        validate_learning_digest(&self.canonical_digest, "receipt.canonical_digest")?;
         Ok(())
     }
 }
@@ -360,13 +467,32 @@ pub struct RuleCount {
     pub count: usize,
 }
 
+/// Closed owner rule names admissible in [`RuleCount`].
+///
+/// The [`rule_name`] match is exhaustive over [`ExclusionReason`]; this list
+/// mirrors it so serialized validation rejects invented rules without
+/// relying on a silent default.
+const CLOSED_RULES: [&str; 11] = [
+    "CONFLICTED",
+    "EPISTEMICALLY_UNKNOWN",
+    "FENCE_MISMATCH",
+    "LIFECYCLE_INACTIVE",
+    "NEGATIVE_MEMORY",
+    "PRECONDITION_FAILED",
+    "PRECONDITION_UNASSESSED",
+    "PROTECTED",
+    "REJECTED",
+    "SCOPE_MISMATCH",
+    "STALE",
+];
+
 /// Exact counter-metrics with the independently recheckable denominator.
 ///
-/// Every count reconciles against the echoed denominator: assessed plus
-/// omitted volume is covered by the batch total, applicable plus excluded
-/// equals assessed, and rule counts sum to excluded. No rate, ratio, or
-/// score is derived: cold-capture ratios and weak-claim rates stay proof
-/// fixtures with their own horizons, not assessment fields.
+/// Every count reconciles exactly: the denominator total equals assessed
+/// plus omitted plus unaccounted volume, applicable plus excluded equals
+/// assessed, and rule counts sum to excluded. No rate, ratio, or score is
+/// derived: cold-capture ratios and weak-claim rates stay proof fixtures
+/// with their own horizons, not assessment fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CounterMetrics {
@@ -376,6 +502,10 @@ pub struct CounterMetrics {
     pub records_assessed: usize,
     /// Named batch omissions carried alongside the records.
     pub omissions_carried: usize,
+    /// Declared volume with no carried record or omission: unaccounted.
+    pub unaccounted_volume: usize,
+    /// Admitted projection omissions carried alongside the batch.
+    pub projection_omissions: usize,
     /// Records the owner verdict holds applicable.
     pub applicable_count: usize,
     /// Records the owner verdict excludes.
@@ -389,8 +519,7 @@ pub struct CounterMetrics {
 }
 
 impl CounterMetrics {
-    /// Validate metric reconciliation (rule-count summation is checked by
-    /// the assessment, which sees the emitted notes).
+    /// Validate metric reconciliation and closed, ordered rule names.
     pub fn validate(&self) -> Result<(), QualityError> {
         if self.applicable_count + self.excluded_count != self.records_assessed {
             return Err(QualityError::InvalidField {
@@ -398,13 +527,15 @@ impl CounterMetrics {
                 reason: "applicable plus excluded must equal assessed",
             });
         }
-        if self.denominator_total < self.records_assessed + self.omissions_carried {
+        if self.denominator_total
+            != self.records_assessed + self.omissions_carried + self.unaccounted_volume
+        {
             return Err(QualityError::InvalidField {
                 field: "counter_metrics",
-                reason: "denominator must cover assessed plus omitted volume",
+                reason: "denominator must equal assessed plus omitted plus unaccounted volume",
             });
         }
-        let mut seen = BTreeSet::new();
+        let mut previous: Option<&str> = None;
         for entry in &self.excluded_by_rule {
             if entry.rule.trim().is_empty() || entry.count == 0 {
                 return Err(QualityError::InvalidField {
@@ -412,12 +543,19 @@ impl CounterMetrics {
                     reason: "rule counts must be named and nonzero",
                 });
             }
-            if !seen.insert(entry.rule.clone()) {
+            if !CLOSED_RULES.contains(&entry.rule.as_str()) {
                 return Err(QualityError::InvalidField {
                     field: "counter_metrics.excluded_by_rule",
-                    reason: "rule names must be unique",
+                    reason: "rule names must be closed owner rules",
                 });
             }
+            if previous.is_some_and(|prior| prior >= entry.rule.as_str()) {
+                return Err(QualityError::InvalidField {
+                    field: "counter_metrics.excluded_by_rule",
+                    reason: "rule counts must be sorted by rule name without duplicates",
+                });
+            }
+            previous = Some(entry.rule.as_str());
         }
         Ok(())
     }
@@ -425,22 +563,36 @@ impl CounterMetrics {
 
 /// Memory ecology assessment over one bounded scope.
 ///
-/// Complete by construction: the echoed denominator is known, bindings echo
-/// the evaluated owners, and every section derives deterministically from
-/// the validated request in input order.
+/// `status` reports the exact coverage posture: `Complete` only for
+/// lossless, fully accounted evidence, `Inconclusive` otherwise with the
+/// frontier and omission identities needed for recheck. The assessment
+/// serializes self-validating evidence: version, known denominator bound to
+/// the metric total, applicability and rule counts recomputed from `items`,
+/// closed ordered rule names, and coverage/status invariants are all
+/// rechecked by [`MemoryEcologyAssessment::validate`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryEcologyAssessment {
     /// Contract version this assessment was written against.
     pub contract_version: ContractVersion,
+    /// Exact coverage posture of this assessment.
+    pub status: CoverageStatus,
     /// Binding echoed from the evaluated batch.
     pub binding: MemoryScopeBinding,
+    /// Binding echoed from the admitted projection set.
+    pub projections_binding: ContextBinding,
     /// Denominator echoed from the evaluated batch; always known.
     pub denominator: DenominatorState,
     /// Truncation flag echoed from the evaluated batch.
     pub truncated: bool,
     /// Revalidation requirement echoed from the evaluated batch.
     pub revalidation_required: bool,
+    /// Resume handles for truncated volume; echoed from the batch.
+    pub frontier: Vec<String>,
+    /// Named batch omissions with exact reasons; echoed from the batch.
+    pub batch_omissions: Vec<CoverageOmission>,
+    /// Admitted projection omissions; echoed from the projection set.
+    pub projection_omissions: Vec<OmissionRecord>,
     /// Per-record verdicts in deterministic batch order.
     pub items: Vec<ItemAssessment>,
     /// Advisory gravity dispositions in deterministic record order.
@@ -449,23 +601,52 @@ pub struct MemoryEcologyAssessment {
     pub maintenance: Vec<MaintenanceNote>,
     /// Reconciled counter-metrics with the exact denominator.
     pub counter_metrics: CounterMetrics,
-    /// Advisory receipt candidates considered; observed, never merged.
-    pub receipts_considered: usize,
+    /// Bound advisory receipt observations; observed, never merged.
+    pub receipts: Vec<ReceiptObservation>,
 }
 
 impl MemoryEcologyAssessment {
-    /// Validate the assessment: version, echoes, handle coverage, and
-    /// metric reconciliation.
+    /// Validate the assessment: version, echoes, handle coverage, recomputed
+    /// metrics, closed rules, and coverage/status invariants.
     pub fn validate(&self) -> Result<(), QualityError> {
         if self.contract_version != QUALITY_CONTRACT_VERSION {
             return Err(QualityError::VersionMismatch);
         }
         self.binding.validate()?;
-        if !matches!(
-            self.denominator,
-            DenominatorState::Known { .. }
-        ) {
+        let DenominatorState::Known { total } = &self.denominator else {
             return Err(QualityError::MissingDenominator);
+        };
+        if self.counter_metrics.denominator_total != *total {
+            return Err(QualityError::InvalidField {
+                field: "counter_metrics.denominator_total",
+                reason: "metric total must equal the echoed known denominator",
+            });
+        }
+        if self.projections_binding.task_id != self.binding.task_id
+            || self.projections_binding.scope_id != self.binding.scope_id
+        {
+            return Err(QualityError::BindingMismatch {
+                left: "projections_binding",
+                right: "binding",
+            });
+        }
+        if !fences_match_exact(
+            &self.projections_binding.state_fence,
+            &self.binding.state_fence,
+        ) {
+            return Err(QualityError::BindingMismatch {
+                left: "projections_binding.state_fence",
+                right: "binding.state_fence",
+            });
+        }
+        for omission in &self.projection_omissions {
+            omission.validate(&self.projections_binding)?;
+        }
+        for omission in &self.batch_omissions {
+            omission.validate()?;
+        }
+        for handle in &self.frontier {
+            text(handle, "assessment.frontier")?;
         }
         let mut seen = BTreeSet::new();
         for item in &self.items {
@@ -477,6 +658,19 @@ impl MemoryEcologyAssessment {
                 });
             }
         }
+        self.validate_section_handles(&seen)?;
+        for observation in &self.receipts {
+            observation.validate()?;
+        }
+        self.counter_metrics.validate()?;
+        self.validate_section_counts()?;
+        self.validate_recomputed()?;
+        self.validate_status()?;
+        Ok(())
+    }
+
+    /// Validate gravity/maintenance note handles against assessed items.
+    fn validate_section_handles(&self, seen: &BTreeSet<String>) -> Result<(), QualityError> {
         for note in &self.gravity {
             if !seen.contains(note.handle.as_str()) {
                 return Err(QualityError::HandleMismatch {
@@ -494,8 +688,14 @@ impl MemoryEcologyAssessment {
                 });
             }
         }
-        self.counter_metrics.validate()?;
+        Ok(())
+    }
+
+    /// Validate metric section counts against the carried sections.
+    fn validate_section_counts(&self) -> Result<(), QualityError> {
         if self.counter_metrics.records_assessed != self.items.len()
+            || self.counter_metrics.omissions_carried != self.batch_omissions.len()
+            || self.counter_metrics.projection_omissions != self.projection_omissions.len()
             || self.counter_metrics.gravity_notes != self.gravity.len()
             || self.counter_metrics.maintenance_notes != self.maintenance.len()
         {
@@ -504,7 +704,26 @@ impl MemoryEcologyAssessment {
                 reason: "section counts must equal the carried sections",
             });
         }
-        let applicable = self.items.iter().filter(|item| item.applicable).count();
+        Ok(())
+    }
+
+    /// Recompute applicability and every closed rule count from items:
+    /// serialized counts are re-derived, never trusted.
+    fn validate_recomputed(&self) -> Result<(), QualityError> {
+        let mut applicable = 0_usize;
+        let mut recomputed: BTreeMap<&str, usize> = BTreeMap::new();
+        for item in &self.items {
+            if item.applicable {
+                applicable += 1;
+            } else if let Some(reason) = &item.reason {
+                *recomputed.entry(rule_name(reason)).or_insert(0) += 1;
+            } else {
+                return Err(QualityError::InvalidField {
+                    field: "assessment.items",
+                    reason: "excluded records must carry a substantive reason",
+                });
+            }
+        }
         if self.counter_metrics.applicable_count != applicable
             || self.counter_metrics.excluded_count != self.items.len() - applicable
         {
@@ -513,14 +732,37 @@ impl MemoryEcologyAssessment {
                 reason: "applicability counts must equal the carried items",
             });
         }
-        let mut ruled: usize = 0;
-        for entry in &self.counter_metrics.excluded_by_rule {
-            ruled += entry.count;
-        }
-        if ruled != self.counter_metrics.excluded_count {
+        let expected: Vec<RuleCount> = recomputed
+            .into_iter()
+            .map(|(rule, count)| RuleCount {
+                rule: rule.to_owned(),
+                count,
+            })
+            .collect();
+        if self.counter_metrics.excluded_by_rule != expected {
             return Err(QualityError::InvalidField {
                 field: "counter_metrics.excluded_by_rule",
-                reason: "rule counts must sum to excluded",
+                reason: "rule counts must be recomputed exactly from items",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate coverage/status invariants: Complete binds lossless, fully
+    /// accounted evidence; anything else is Inconclusive.
+    fn validate_status(&self) -> Result<(), QualityError> {
+        let lossy = self.truncated
+            || !self.batch_omissions.is_empty()
+            || !self.projection_omissions.is_empty()
+            || self.counter_metrics.unaccounted_volume != 0;
+        if self.status == CoverageStatus::Complete
+            && (lossy
+                || !self.frontier.is_empty()
+                || self.counter_metrics.denominator_total != self.items.len())
+        {
+            return Err(QualityError::InvalidField {
+                field: "assessment.status",
+                reason: "complete requires lossless fully-accounted coverage",
             });
         }
         Ok(())
@@ -602,6 +844,10 @@ fn gravity_for(
 }
 
 /// Derive maintenance notes for one record from owner lifecycle facts.
+///
+/// Stale/unknown dispositions retain the exact owner freshness rationale;
+/// the owner provenance revision travels as the retention reference. No
+/// storage resolver is invented: resolvability stays an owner boundary.
 fn maintenance_for(
     handle: &ArtifactId,
     record: &eliot_memory_projection_contracts::MemoryProjectionRecord,
@@ -612,11 +858,15 @@ fn maintenance_for(
             handle: handle.clone(),
             kind: MaintenanceNoteKind::StaleMaterial,
             predecessor: None,
+            rationale: Some(record.freshness.note.clone()),
+            source_revision: record.provenance.revision.clone(),
         }),
         FreshnessState::Unknown => out.push(MaintenanceNote {
             handle: handle.clone(),
             kind: MaintenanceNoteKind::FreshnessUnknown,
             predecessor: None,
+            rationale: Some(record.freshness.note.clone()),
+            source_revision: record.provenance.revision.clone(),
         }),
         FreshnessState::Current => {}
     }
@@ -625,6 +875,8 @@ fn maintenance_for(
             handle: handle.clone(),
             kind: MaintenanceNoteKind::SupersededWithLineage,
             predecessor: Some(predecessor.clone()),
+            rationale: None,
+            source_revision: record.provenance.revision.clone(),
         });
     }
     let lifecycle_note = match record.lifecycle {
@@ -639,23 +891,29 @@ fn maintenance_for(
             handle: handle.clone(),
             kind,
             predecessor: None,
+            rationale: None,
+            source_revision: record.provenance.revision.clone(),
         });
     }
 }
 
-/// Assess memory ecology over one bounded projection and its owner verdict.
+/// Derived per-record sections: items, gravity, maintenance, and rule counts.
+type DerivedSections = (
+    Vec<ItemAssessment>,
+    Vec<GravityNote>,
+    Vec<MaintenanceNote>,
+    BTreeMap<&'static str, usize>,
+);
+
+/// Derive per-record items, gravity, and maintenance sections.
 ///
-/// The request is validated, a known denominator is required, and every
-/// batch record receives its owner verdict joined by handle plus advisory
-/// gravity and maintenance notes. Receipt candidates are counted, never
-/// merged: their metrics stay observations with their own denominators.
-pub fn assess_quality(
+/// Canonical identity (`kind`, `roles`, `projection_revision`) is joined
+/// from the batch records; the verdict map contributes only applicability,
+/// the substantive reason, and the advisory cue flag.
+fn derive_sections(
     request: &QualityRequest,
-) -> Result<MemoryEcologyAssessment, QualityError> {
-    request.validate()?;
-    let DenominatorState::Known { total } = &request.batch.coverage.denominator else {
-        return Err(QualityError::MissingDenominator);
-    };
+    verdicts: &BTreeMap<&str, (Option<&ExclusionReason>, bool)>,
+) -> Result<DerivedSections, QualityError> {
     let safety_triggers: BTreeSet<&str> = request
         .projections
         .safety
@@ -663,23 +921,12 @@ pub fn assess_quality(
         .iter()
         .map(String::as_str)
         .collect();
-    let mut verdicts: BTreeMap<&str, (&MemoryKind, Option<&ExclusionReason>, bool)> =
-        BTreeMap::new();
-    for entry in &request.applicable.applicable {
-        verdicts.insert(entry.handle.as_str(), (&entry.kind, None, entry.cue_hit));
-    }
-    for entry in &request.applicable.excluded {
-        verdicts.insert(
-            entry.handle.as_str(),
-            (&entry.kind, Some(&entry.reason), entry.cue_hit),
-        );
-    }
     let mut items = Vec::with_capacity(request.batch.records.len());
     let mut gravity = Vec::new();
     let mut maintenance = Vec::new();
     let mut rules: BTreeMap<&'static str, usize> = BTreeMap::new();
     for record in &request.batch.records {
-        let Some((kind, reason, cue_hit)) = verdicts.get(record.handle.as_str()) else {
+        let Some((reason, cue_hit)) = verdicts.get(record.handle.as_str()) else {
             // Unreachable: validate() enforces the exact handle union.
             return Err(QualityError::HandleMismatch {
                 field: "applicable",
@@ -689,8 +936,9 @@ pub fn assess_quality(
         let applicable = reason.is_none();
         items.push(ItemAssessment {
             handle: record.handle.clone(),
-            kind: **kind,
+            kind: record.kind,
             roles: record.roles.clone(),
+            projection_revision: record.projection_revision,
             applicable,
             reason: reason.cloned(),
             cue_hit: *cue_hit,
@@ -708,33 +956,91 @@ pub fn assess_quality(
         );
         maintenance_for(&record.handle, record, &mut maintenance);
     }
-    let excluded_by_rule = rules
-        .into_iter()
-        .map(|(rule, count)| RuleCount {
-            rule: rule.to_owned(),
-            count,
+    Ok((items, gravity, maintenance, rules))
+}
+
+/// Assess memory ecology over one bounded projection and its owner verdict.
+///
+/// The request is validated and canonical identity is joined from the batch
+/// records while the verdict contributes only applicability, reason, and
+/// cue flag. A known denominator is required; coverage then decides the
+/// posture: lossless, fully accounted evidence yields `Complete`, anything
+/// truncated, omitted, or unaccounted yields `Inconclusive` carrying the
+/// exact frontier and omission identities. Receipt candidates become bound
+/// advisory observations, never merged verdicts.
+pub fn assess_quality(
+    request: &QualityRequest,
+) -> Result<MemoryEcologyAssessment, QualityError> {
+    request.validate()?;
+    let DenominatorState::Known { total } = &request.batch.coverage.denominator else {
+        return Err(QualityError::MissingDenominator);
+    };
+    let mut verdicts: BTreeMap<&str, (Option<&ExclusionReason>, bool)> = BTreeMap::new();
+    for entry in &request.applicable.applicable {
+        verdicts.insert(entry.handle.as_str(), (None, entry.cue_hit));
+    }
+    for entry in &request.applicable.excluded {
+        verdicts.insert(
+            entry.handle.as_str(),
+            (Some(&entry.reason), entry.cue_hit),
+        );
+    }
+    let (items, gravity, maintenance, rules) = derive_sections(request, &verdicts)?;
+    let unaccounted_volume = total.saturating_sub(
+        request.batch.records.len() + request.batch.coverage.omissions.len(),
+    );
+    let lossy = request.batch.coverage.truncated
+        || !request.batch.coverage.omissions.is_empty()
+        || !request.projections.omissions.is_empty()
+        || unaccounted_volume != 0;
+    let receipts = request
+        .receipts
+        .iter()
+        .map(|receipt| ReceiptObservation {
+            activation_id: receipt.activation_id.clone(),
+            member_denominator: receipt.member_denominator,
+            stages_observed: receipt.stages.len(),
+            metrics_observed: receipt.metrics.len(),
+            canonical_digest: receipt.canonical_digest.clone(),
         })
         .collect();
     let assessment = MemoryEcologyAssessment {
         contract_version: QUALITY_CONTRACT_VERSION,
+        status: if lossy {
+            CoverageStatus::Inconclusive
+        } else {
+            CoverageStatus::Complete
+        },
         binding: request.batch.binding.clone(),
+        projections_binding: request.projections.binding.clone(),
         denominator: request.batch.coverage.denominator.clone(),
         truncated: request.batch.coverage.truncated,
         revalidation_required: request.batch.coverage.revalidation_required,
+        frontier: request.batch.coverage.frontier.clone(),
+        batch_omissions: request.batch.coverage.omissions.clone(),
+        projection_omissions: request.projections.omissions.clone(),
         counter_metrics: CounterMetrics {
             denominator_total: *total,
             records_assessed: request.batch.records.len(),
             omissions_carried: request.batch.coverage.omissions.len(),
+            unaccounted_volume,
+            projection_omissions: request.projections.omissions.len(),
             applicable_count: items.iter().filter(|item| item.applicable).count(),
             excluded_count: items.iter().filter(|item| !item.applicable).count(),
-            excluded_by_rule,
+            excluded_by_rule: rules
+                .into_iter()
+                .map(|(rule, count)| RuleCount {
+                    rule: rule.to_owned(),
+                    count,
+                })
+                .collect(),
             gravity_notes: gravity.len(),
             maintenance_notes: maintenance.len(),
         },
         items,
         gravity,
         maintenance,
-        receipts_considered: request.receipts.len(),
+        receipts,
     };
     assessment.validate()?;
     Ok(assessment)

@@ -12,7 +12,8 @@ use std::num::NonZeroU64;
 use eliot_agent_contracts::{AgentAttemptId, TargetId};
 use eliot_context_contracts::{
     AffordanceProjection, CanonicalProjectionSet, ContextBinding, ContinuityProjection,
-    SafetyProjection, TaskProjection,
+    DecisionRevision, LossPolicy, NonRecoverableReason, OmissionReason, OmissionRecord,
+    ProviderId, ProviderRole, SafetyProjection, SemanticRole, TaskProjection,
 };
 use eliot_contracts::{
     ArtifactId, DecisionId, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId,
@@ -27,12 +28,13 @@ use eliot_learning_contracts::{
     StageDisposition, StageObservation,
 };
 use eliot_memory_projection_contracts::{
-    ApplicableMemory, ApplicableMemorySet, DenominatorState, ExcludedMemory, ExclusionReason,
-    FreshnessState, MemoryFreshness, MemoryKind, MemoryProjectionBatch, MemoryProjectionRecord,
-    MemoryRole, MemoryScopeBinding, NegativeTrigger, ProjectionCoverage,
+    ApplicableMemory, ApplicableMemorySet, CoverageOmission, DenominatorState, ExcludedMemory,
+    ExclusionReason, FreshnessState, MemoryFreshness, MemoryKind, MemoryProjectionBatch,
+    MemoryProjectionRecord, MemoryRole, MemoryScopeBinding, NegativeTrigger, ProjectionCoverage,
 };
 use eliot_memory_quality::{
-    GravityNoteKind, MaintenanceNoteKind, QualityError, QualityRequest, assess_quality,
+    CoverageStatus, GravityNoteKind, MaintenanceNoteKind, QualityError, QualityRequest,
+    assess_quality,
 };
 use eliot_receipts::WorkScopeId;
 
@@ -61,14 +63,18 @@ fn hex_byte(byte: &str) -> String {
 }
 
 fn fence() -> StateFence {
-    StateFence::new(
-        EpochId::new(
-            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("fixture lineage"),
-            NonZeroU64::new(1).expect("non-zero"),
+    StateFence {
+        task_revision: Some(TaskRevision::new(1).expect("fixture revision")),
+        ..StateFence::new(
+            EpochId::new(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("fixture lineage"),
+                NonZeroU64::new(1).expect("non-zero"),
+            )
+            .expect("fixture epoch"),
+            ResourceGeneration::genesis(),
         )
-        .expect("fixture epoch"),
-        ResourceGeneration::genesis(),
-    )
+    }
 }
 
 fn binding() -> MemoryScopeBinding {
@@ -108,7 +114,7 @@ fn record(handle: &str) -> MemoryProjectionRecord {
         kind: MemoryKind::Episode,
         binding: binding(),
         state_fence: fence(),
-        projection_revision: 1,
+        projection_revision: 7,
         epistemic: EpistemicStatus::Supported,
         assertability: Assertability::NonAssertableUnverified,
         lifecycle: LifecycleState::Active,
@@ -128,44 +134,52 @@ fn record(handle: &str) -> MemoryProjectionRecord {
     }
 }
 
+fn coverage(total: usize) -> ProjectionCoverage {
+    ProjectionCoverage {
+        denominator: DenominatorState::Known { total },
+        truncated: false,
+        frontier: vec![],
+        omissions: vec![],
+        revalidation_required: false,
+    }
+}
+
 fn batch(records: Vec<MemoryProjectionRecord>) -> MemoryProjectionBatch {
     let total = records.len();
     MemoryProjectionBatch {
         contract_version: eliot_memory_projection_contracts::CONTRACT_VERSION,
         binding: binding(),
         records,
-        coverage: ProjectionCoverage {
-            denominator: DenominatorState::Known { total },
-            truncated: false,
-            frontier: vec![],
-            omissions: vec![],
-            revalidation_required: false,
-        },
+        coverage: coverage(total),
     }
 }
 
 /// Build the owner verdict explicitly: handles listed in `excluded` carry
 /// the given rule, every other batch record is applicable with kept roles.
+/// A caller-supplied kind override proves the consumer derives identity
+/// from the batch record, never from the repeated verdict field.
 fn set_for(
     batch: &MemoryProjectionBatch,
     excluded: &[(&str, ExclusionReason)],
     cue_hits: &[&str],
+    kind_override: Option<MemoryKind>,
 ) -> ApplicableMemorySet {
     let mut applicable = Vec::new();
     let mut excluded_out = Vec::new();
     for record in &batch.records {
         let handle = record.handle.as_str();
         let cue_hit = cue_hits.contains(&handle);
+        let kind = kind_override.unwrap_or(record.kind);
         match excluded.iter().find(|(name, _)| *name == handle) {
             None => applicable.push(ApplicableMemory {
                 handle: record.handle.clone(),
-                kind: record.kind,
+                kind,
                 roles: record.roles.clone(),
                 cue_hit,
             }),
             Some((_, reason)) => excluded_out.push(ExcludedMemory {
                 handle: record.handle.clone(),
-                kind: record.kind,
+                kind,
                 reason: reason.clone(),
                 cue_hit,
             }),
@@ -194,7 +208,36 @@ fn context_binding() -> ContextBinding {
     }
 }
 
-fn projections(triggers: Vec<String>) -> CanonicalProjectionSet {
+fn omission_record() -> OmissionRecord {
+    OmissionRecord {
+        atom_id: aid("atom-memq"),
+        source_id: aid("source-atom-memq"),
+        provider_role: ProviderRole {
+            provider: ProviderId::new("provider-memq").expect("fixture provider"),
+            role: SemanticRole::Source,
+        },
+        decision: DecisionRevision {
+            decision_id: DecisionId::new("decision-memq").expect("fixture decision"),
+            recipe_revision: TaskRevision::new(1).expect("fixture revision"),
+            policy_sha256: hex_byte("ef"),
+        },
+        task_revision: TaskRevision::new(1).expect("fixture revision"),
+        reason: OmissionReason::Capacity,
+        competing_constraint: "context window".to_owned(),
+        measured_cost: None,
+        allowed_representation: LossPolicy::HandleOnly,
+        expansion: None,
+        non_recoverable_reason: Some(NonRecoverableReason::PolicyDisallows),
+        authorization_requirement: "owner release".to_owned(),
+        privacy_requirement: "none".to_owned(),
+        proof_requirement: "reprojection".to_owned(),
+        expires: None,
+        invalidation: None,
+        digest: hex_byte("01"),
+    }
+}
+
+fn projections(triggers: Vec<String>, omissions: Vec<OmissionRecord>) -> CanonicalProjectionSet {
     let binding = context_binding();
     CanonicalProjectionSet {
         binding: binding.clone(),
@@ -221,7 +264,7 @@ fn projections(triggers: Vec<String>) -> CanonicalProjectionSet {
             binding: binding.clone(),
             affordances: vec!["afford-memq".to_owned()],
         },
-        omissions: vec![],
+        omissions,
     }
 }
 
@@ -287,17 +330,17 @@ fn request(
     cue_hits: &[&str],
     triggers: Vec<String>,
 ) -> QualityRequest {
-    let applicable = set_for(&batch, excluded, cue_hits);
+    let applicable = set_for(&batch, excluded, cue_hits, None);
     QualityRequest {
         batch,
         applicable,
-        projections: projections(triggers),
+        projections: projections(triggers, vec![]),
         receipts: vec![receipt()],
     }
 }
 
 #[test]
-fn happy_path_emits_complete_sections_with_exact_denominator() {
+fn happy_path_emits_complete_assessment_with_exact_denominator() {
     let mut first = record("mem-1");
     first.negative_trigger = Some(trigger("trig-1"));
     let mut second = record("mem-2");
@@ -312,15 +355,30 @@ fn happy_path_emits_complete_sections_with_exact_denominator() {
     );
     let assessment = assess_quality(&candidate).expect("quality assessment");
     assessment.validate().expect("assessment validates");
+    assert_eq!(assessment.status, CoverageStatus::Complete);
     assert_eq!(assessment.items.len(), 2);
+    assert_eq!(assessment.items[0].kind, MemoryKind::Episode);
+    assert_eq!(assessment.items[0].projection_revision, 7);
     assert_eq!(assessment.counter_metrics.denominator_total, 2);
     assert_eq!(assessment.counter_metrics.records_assessed, 2);
+    assert_eq!(assessment.counter_metrics.unaccounted_volume, 0);
     assert_eq!(assessment.counter_metrics.applicable_count, 1);
     assert_eq!(assessment.counter_metrics.excluded_count, 1);
     assert_eq!(assessment.counter_metrics.excluded_by_rule.len(), 1);
     assert_eq!(assessment.counter_metrics.excluded_by_rule[0].rule, "STALE");
     assert_eq!(assessment.counter_metrics.excluded_by_rule[0].count, 1);
-    assert_eq!(assessment.receipts_considered, 1);
+    assert_eq!(assessment.receipts.len(), 1);
+    assert_eq!(
+        assessment.receipts[0].activation_id,
+        aid("activation-memq")
+    );
+    assert_eq!(
+        assessment.receipts[0].member_denominator,
+        SourceDenominator {
+            declared: 1,
+            observed: 0,
+        }
+    );
     let gravity: Vec<GravityNoteKind> = assessment
         .gravity
         .iter()
@@ -330,12 +388,30 @@ fn happy_path_emits_complete_sections_with_exact_denominator() {
     assert!(gravity.contains(&GravityNoteKind::MinorityPreserved));
     assert!(gravity.contains(&GravityNoteKind::CueHitButExcluded));
     assert!(gravity.contains(&GravityNoteKind::CounterexamplePreserved));
-    assert!(
-        assessment
-            .maintenance
-            .iter()
-            .any(|note| note.kind == MaintenanceNoteKind::StaleMaterial)
+    let stale_note = assessment
+        .maintenance
+        .iter()
+        .find(|note| note.kind == MaintenanceNoteKind::StaleMaterial)
+        .expect("stale note");
+    assert_eq!(
+        stale_note.rationale,
+        Some("projected at the batch fence".to_owned())
     );
+    assert_eq!(stale_note.source_revision, Some("rev-1".to_owned()));
+}
+
+#[test]
+fn canonical_identity_comes_from_the_batch_record_not_the_verdict() {
+    let batch_value = batch(vec![record("mem-1")]);
+    let applicable = set_for(&batch_value, &[], &[], Some(MemoryKind::Observation));
+    let candidate = QualityRequest {
+        batch: batch_value,
+        applicable,
+        projections: projections(vec![], vec![]),
+        receipts: vec![],
+    };
+    let assessment = assess_quality(&candidate).expect("quality assessment");
+    assert_eq!(assessment.items[0].kind, MemoryKind::Episode);
 }
 
 #[test]
@@ -344,11 +420,11 @@ fn unknown_denominator_fails_closed() {
     batch_value.coverage.denominator = DenominatorState::Unknown {
         reason: "read-side recount pending".to_owned(),
     };
-    let applicable = set_for(&batch_value, &[], &[]);
+    let applicable = set_for(&batch_value, &[], &[], None);
     let candidate = QualityRequest {
         batch: batch_value,
         applicable,
-        projections: projections(vec![]),
+        projections: projections(vec![], vec![]),
         receipts: vec![],
     };
     assert_eq!(
@@ -358,15 +434,100 @@ fn unknown_denominator_fails_closed() {
 }
 
 #[test]
+fn truncated_coverage_is_inconclusive_with_frontier() {
+    let mut batch_value = batch(vec![record("mem-1")]);
+    batch_value.coverage.truncated = true;
+    batch_value.coverage.frontier = vec!["resume-1".to_owned()];
+    batch_value.coverage.revalidation_required = true;
+    let applicable = set_for(&batch_value, &[], &[], None);
+    let candidate = QualityRequest {
+        batch: batch_value,
+        applicable,
+        projections: projections(vec![], vec![]),
+        receipts: vec![],
+    };
+    let assessment = assess_quality(&candidate).expect("quality assessment");
+    assessment.validate().expect("assessment validates");
+    assert_eq!(assessment.status, CoverageStatus::Inconclusive);
+    assert_eq!(assessment.frontier, vec!["resume-1".to_owned()]);
+    let mut complete = assessment.clone();
+    complete.status = CoverageStatus::Complete;
+    assert!(complete.validate().is_err());
+}
+
+#[test]
+fn batch_omissions_are_carried_with_identities() {
+    let mut batch_value = batch(vec![record("mem-1")]);
+    batch_value.coverage.denominator = DenominatorState::Known { total: 2 };
+    batch_value.coverage.omissions = vec![CoverageOmission {
+        handle: aid("mem-omitted"),
+        reason: "fence-mismatch".to_owned(),
+    }];
+    batch_value.coverage.revalidation_required = true;
+    let applicable = set_for(&batch_value, &[], &[], None);
+    let candidate = QualityRequest {
+        batch: batch_value,
+        applicable,
+        projections: projections(vec![], vec![]),
+        receipts: vec![],
+    };
+    let assessment = assess_quality(&candidate).expect("quality assessment");
+    assessment.validate().expect("assessment validates");
+    assert_eq!(assessment.status, CoverageStatus::Inconclusive);
+    assert_eq!(assessment.batch_omissions.len(), 1);
+    assert_eq!(assessment.batch_omissions[0].handle, aid("mem-omitted"));
+    assert_eq!(assessment.counter_metrics.omissions_carried, 1);
+    assert_eq!(assessment.counter_metrics.unaccounted_volume, 0);
+}
+
+#[test]
+fn undeclared_volume_is_inconclusive_not_silent() {
+    let batch_value = batch(vec![record("mem-1")]);
+    let mut lossy = batch_value;
+    lossy.coverage.denominator = DenominatorState::Known { total: 3 };
+    let applicable = set_for(&lossy, &[], &[], None);
+    let candidate = QualityRequest {
+        batch: lossy,
+        applicable,
+        projections: projections(vec![], vec![]),
+        receipts: vec![],
+    };
+    let assessment = assess_quality(&candidate).expect("quality assessment");
+    assessment.validate().expect("assessment validates");
+    assert_eq!(assessment.status, CoverageStatus::Inconclusive);
+    assert_eq!(assessment.counter_metrics.unaccounted_volume, 2);
+}
+
+#[test]
+fn projection_omissions_block_completeness() {
+    let batch_value = batch(vec![record("mem-1")]);
+    let applicable = set_for(&batch_value, &[], &[], None);
+    let candidate = QualityRequest {
+        batch: batch_value,
+        applicable,
+        projections: projections(vec![], vec![omission_record()]),
+        receipts: vec![],
+    };
+    let assessment = assess_quality(&candidate).expect("quality assessment");
+    assessment.validate().expect("assessment validates");
+    assert_eq!(assessment.status, CoverageStatus::Inconclusive);
+    assert_eq!(assessment.projection_omissions.len(), 1);
+    assert_eq!(
+        assessment.counter_metrics.projection_omissions,
+        1
+    );
+}
+
+#[test]
 fn verdict_missing_a_batch_record_is_rejected() {
     let batch_value = batch(vec![record("mem-1"), record("mem-2")]);
-    let applicable = set_for(&batch_value, &[], &[]);
+    let applicable = set_for(&batch_value, &[], &[], None);
     let mut partial = applicable;
     partial.applicable.pop();
     let candidate = QualityRequest {
         batch: batch_value,
         applicable: partial,
-        projections: projections(vec![]),
+        projections: projections(vec![], vec![]),
         receipts: vec![],
     };
     assert!(matches!(
@@ -378,8 +539,8 @@ fn verdict_missing_a_batch_record_is_rejected() {
 #[test]
 fn projection_binding_drift_is_rejected() {
     let batch_value = batch(vec![record("mem-1")]);
-    let applicable = set_for(&batch_value, &[], &[]);
-    let mut drifted = projections(vec![]);
+    let applicable = set_for(&batch_value, &[], &[], None);
+    let mut drifted = projections(vec![], vec![]);
     drifted.binding.task_id = TaskId::new("other-task").expect("fixture drift");
     for projection in [
         &mut drifted.task.binding,
@@ -404,13 +565,13 @@ fn projection_binding_drift_is_rejected() {
 #[test]
 fn invalid_receipt_propagates_the_owner_error() {
     let batch_value = batch(vec![record("mem-1")]);
-    let applicable = set_for(&batch_value, &[], &[]);
+    let applicable = set_for(&batch_value, &[], &[], None);
     let mut broken = receipt();
     broken.stages.clear();
     let candidate = QualityRequest {
         batch: batch_value,
         applicable,
-        projections: projections(vec![]),
+        projections: projections(vec![], vec![]),
         receipts: vec![broken],
     };
     assert!(matches!(
@@ -447,6 +608,7 @@ fn lineage_and_lifecycle_facts_become_maintenance_notes() {
         .find(|note| note.kind == MaintenanceNoteKind::SupersededWithLineage)
         .expect("lineage note");
     assert_eq!(lineage.predecessor, Some(aid("mem-8")));
+    assert_eq!(lineage.source_revision, Some("rev-1".to_owned()));
     assert!(
         assessment
             .gravity
@@ -465,4 +627,67 @@ fn tampered_assessment_version_is_rejected() {
         assessment.validate(),
         Err(QualityError::VersionMismatch)
     );
+}
+
+#[test]
+fn tampered_denominator_total_is_rejected() {
+    let batch_value = batch(vec![record("mem-1")]);
+    let candidate = request(batch_value, &[], &[], vec![]);
+    let mut assessment = assess_quality(&candidate).expect("quality assessment");
+    assessment.counter_metrics.denominator_total = 99;
+    assert!(assessment.validate().is_err());
+}
+
+#[test]
+fn invented_or_unordered_rules_are_rejected() {
+    let batch_value = batch(vec![record("mem-1"), record("mem-2")]);
+    let candidate = request(
+        batch_value,
+        &[
+            ("mem-1", ExclusionReason::Stale),
+            ("mem-2", ExclusionReason::Rejected),
+        ],
+        &[],
+        vec![],
+    );
+    let assessment = assess_quality(&candidate).expect("quality assessment");
+    // Constructor emits sorted closed rules: REJECTED then STALE.
+    assert_eq!(
+        assessment.counter_metrics.excluded_by_rule[0].rule,
+        "REJECTED"
+    );
+    let mut invented = assessment.clone();
+    invented.counter_metrics.excluded_by_rule[0].rule = "VIBES".to_owned();
+    assert!(invented.validate().is_err());
+    let mut unordered = assessment.clone();
+    unordered.counter_metrics.excluded_by_rule.reverse();
+    assert!(unordered.validate().is_err());
+    let mut dropped = assessment;
+    dropped.counter_metrics.excluded_by_rule.pop();
+    assert!(dropped.validate().is_err());
+}
+
+#[test]
+fn dropped_freshness_rationale_is_rejected() {
+    let mut stale = record("mem-1");
+    stale.freshness.state = FreshnessState::Stale;
+    let batch_value = batch(vec![stale]);
+    let candidate = request(
+        batch_value,
+        &[("mem-1", ExclusionReason::Stale)],
+        &[],
+        vec![],
+    );
+    let mut assessment = assess_quality(&candidate).expect("quality assessment");
+    assessment.maintenance[0].rationale = None;
+    assert!(assessment.validate().is_err());
+}
+
+#[test]
+fn tampered_receipt_digest_is_rejected() {
+    let batch_value = batch(vec![record("mem-1")]);
+    let candidate = request(batch_value, &[], &[], vec![]);
+    let mut assessment = assess_quality(&candidate).expect("quality assessment");
+    assessment.receipts[0].canonical_digest = "not-a-digest".to_owned();
+    assert!(assessment.validate().is_err());
 }
