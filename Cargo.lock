@@ -1060,6 +1060,8 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-governor",
+ "eliot-improvement",
  "eliot-receipts",
 ]
 
@@ -1071,6 +1073,8 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-governor",
+ "eliot-improvement",
  "eliot-observation-contracts",
  "eliot-receipts",
  "serde",
