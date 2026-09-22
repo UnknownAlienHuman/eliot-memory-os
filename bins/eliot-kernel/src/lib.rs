@@ -57,10 +57,13 @@ mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
 
-pub use backup_restore::{KernelBackupRestore, KernelRestoreOutcome, phase_owner};
+pub use backup_restore::{
+    BlobOwnerClient, CanonicalOwnerClient, InvalidationKind, InvalidationOwnerClient,
+    KernelBackupRestore, KernelRestoreOutcome, OrsOwnerClient, PurgeOwnerClient, phase_owner,
+};
 pub use backup_restore_ports::{
     KernelIsolatedDestination, KernelRestoreError, KernelRestoreJournal, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_FILE_NAME, RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_KEEP_RESOLVED,
+    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_KEEP_RESOLVED, RESTORE_JOURNAL_OWNER_LABEL,
     check_kernel_effect_fence,
 };
 pub use blob_store_controller::{
@@ -484,9 +487,9 @@ pub struct KernelComposition {
     /// manifest at startup without starting the generation.
     blob_store: Mutex<Option<BlobStoreController>>,
     /// Kernel-owned production restore adapter (issue #960). `None` while the
-    /// restore journal cannot be opened below the work root; restore effects
-    /// are refused in that state and unrelated Kernel work is unaffected.
-    /// Caller integration that drives restores arrives separately (#962).
+    /// restore owner handle cannot be bound; restore effects are refused in
+    /// that state and unrelated Kernel work is unaffected. Caller
+    /// integration that drives restores arrives separately (#962).
     #[allow(
         dead_code,
         reason = "composition-held restore owner awaiting its #962 caller integration; effects refuse while unbound"

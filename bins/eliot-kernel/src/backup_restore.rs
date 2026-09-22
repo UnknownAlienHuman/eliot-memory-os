@@ -63,15 +63,16 @@ use std::path::PathBuf;
 
 use eliot_backup::{
     BackupBlob, BackupBundle, BackupError, BlobRestorationReceipt, CanonicalRecord,
-    DestinationRestoreAdapter, DestinationScope, OrsSnapshotFence, RestoreAppliedEffect,
-    RestoreArchiveDisposition, RestoreArchiveDispositionKind, RestoreContext, RestoreEffectReceipt,
-    RestoreEvidence, RestoreHistoricalAuthority, RestoreIntent, RestoreObligationState,
-    RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation,
-    RestoreStep, RestoreTarget, RestoredFence, RestoredSealedBlob, WrappedKeyManifest,
+    CutoverAuthorization, CutoverReceipt, DestinationRestoreAdapter, DestinationScope,
+    IsolatedRestorePlan, OrsSnapshotFence, RestoreAppliedEffect, RestoreArchiveDisposition,
+    RestoreArchiveDispositionKind, RestoreContext, RestoreEffectReceipt, RestoreEvidence,
+    RestoreHistoricalAuthority, RestoreIntent, RestoreObligationState, RestoreOwnerObligation,
+    RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation, RestoreStep, RestoreTarget,
+    RestoredFence, RestoredSealedBlob, WrappedKeyManifest, authorize_cutover,
     issue_restoration_receipts, suspended_recovery_entries, verify_key_coverage,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreObligations, RestoreProvenance};
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 use serde::Serialize;
@@ -120,6 +121,236 @@ mod owners {
     /// Missing destination blob-scope admission (#956/#958) for sealed-blob
     /// restoration under destination ownership.
     pub const BLOB_SCOPE_BINDING: &str = "blob-destination-scope";
+    /// Missing live canonical-store import channel (#952/#962): writing the
+    /// live store is never staged from here.
+    pub const STORE_IMPORT: &str = "canonical-store-import";
+    /// Missing accepted purge member-matching API: no in-tree contract maps
+    /// a ledger `subject_ref` to archive member identities, so per-member
+    /// suppression cannot be computed here. Backlog to M2.
+    pub const PURGE_MEMBER_SUPPRESSION: &str = "purge-member-suppression";
+}
+
+/// Purge owner client (#962): validates the purge ledger through the
+/// owner's accepted validation before any import.
+///
+/// Per-entry `validate` is the owner check the archive already passed at
+/// bundle validation and each purge phase re-proves; the staged ledger is
+/// the tombstone preservation itself. `validate_restore` (refusing
+/// `Purged`-state resurrection) is deliberately NOT called here: ledger
+/// entries legitimately sit at `Purged`, and it guards resurrection into
+/// live authority — isolated import preserves tombstones instead, while the
+/// coordinator's erasure-refusal gate covers receipt rehydration.
+/// Per-member suppression against `subject_ref` has no accepted matching
+/// API in-tree and refuses as backlog rather than guessing.
+pub struct PurgeOwnerClient<'a> {
+    entries: &'a [PurgeLedgerEntry],
+}
+
+impl<'a> PurgeOwnerClient<'a> {
+    /// Binds the client's view to the archive's validated purge ledger.
+    pub fn bind(entries: &'a [PurgeLedgerEntry]) -> Self {
+        Self { entries }
+    }
+
+    /// Runs the owner's accepted per-entry validation.
+    pub fn validate_entries(&self) -> Result<(), BackupError> {
+        for entry in self.entries {
+            entry
+                .validate()
+                .map_err(|error| BackupError::Security(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Suppression of one purged member. Unavailable: no accepted contract
+    /// maps a ledger `subject_ref` to archive member identities. Fails
+    /// closed as backlog instead of matching by spelling.
+    pub fn suppress_purged_member(&self, _subject_ref: &str) -> Result<(), BackupError> {
+        Err(BackupError::RestoreCapabilityUnsupported {
+            capability: owners::PURGE_MEMBER_SUPPRESSION,
+        })
+    }
+}
+
+/// Canonical owner client (#962): runs the owner's accepted validation and
+/// verification over staged members.
+///
+/// Record/receipt validation and receipt/event-chain verification are the
+/// owner's checks, invoked here with the exact members the phase touches.
+/// Writing the live canonical store is a separate channel owned by the #962
+/// wire (`backup_owner_clients.rs`): this client stages validated bytes into
+/// the isolated destination substrate and refuses live import here, so a
+/// staged byte is never presented as an executed owner transition.
+pub struct CanonicalOwnerClient;
+
+impl CanonicalOwnerClient {
+    /// Runs the owner's accepted canonical-record validation.
+    pub fn validate_event(record: &CanonicalRecord) -> Result<(), BackupError> {
+        record.validate()
+    }
+
+    /// Runs the owner's accepted write-receipt validation.
+    pub fn validate_receipt(receipt: &WriteReceipt) -> Result<(), BackupError> {
+        receipt.validate().map_err(BackupError::Store)
+    }
+
+    /// Runs the owner's accepted receipt/event-chain verification over the
+    /// exact members staged.
+    pub fn verify_chain(
+        receipts: &[WriteReceipt],
+        events: &[CanonicalRecord],
+    ) -> Result<(), BackupError> {
+        let event_ids: std::collections::BTreeSet<&str> = events
+            .iter()
+            .map(|event| event.record_id.as_str())
+            .collect();
+        for receipt in receipts {
+            Self::validate_receipt(receipt)?;
+            for event_id in &receipt.emitted_event_ids {
+                if !event_ids.contains(event_id.as_str()) {
+                    return Err(BackupError::ReceiptChainGap {
+                        event_id: event_id.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Live canonical-store import. Unavailable in this lane: the channel
+    /// belongs to the #962 wire. Fails closed before any effect.
+    pub fn import_to_store(&self) -> Result<(), BackupError> {
+        Err(BackupError::RestoreCapabilityUnsupported {
+            capability: owners::STORE_IMPORT,
+        })
+    }
+}
+
+/// Blob owner client (#962): restores one sealed blob under destination
+/// ownership through the accepted destination adapter.
+///
+/// Binds the backup-bound restoration receipts (deterministically derived
+/// from the validated bundle and admitted key manifest), the admitted key
+/// manifest, and the destination scope. Invocation opens the sealed
+/// envelope through the installation secret owner, digest-verifies the
+/// plaintext, and re-seals under the destination lineage: key material and
+/// plaintext stay memory-only inside the adapter and never cross back.
+pub struct BlobOwnerClient<'a> {
+    receipts: Vec<BlobRestorationReceipt>,
+    manifest: &'a WrappedKeyManifest,
+    scope: &'a DestinationScope,
+}
+
+impl<'a> BlobOwnerClient<'a> {
+    /// Binds restoration receipts, key manifest, and destination scope.
+    /// All three must be present: a blob without any binding refuses.
+    pub fn bind(
+        receipts: Vec<BlobRestorationReceipt>,
+        manifest: Option<&'a WrappedKeyManifest>,
+        scope: Option<&'a DestinationScope>,
+    ) -> Result<Self, BackupError> {
+        let manifest = manifest.ok_or(BackupError::MissingRecoveryComponent(
+            "blob_key_material",
+        ))?;
+        let scope = scope.ok_or(BackupError::RestoreCapabilityUnsupported {
+            capability: owners::BLOB_SCOPE_BINDING,
+        })?;
+        Ok(Self {
+            receipts,
+            manifest,
+            scope,
+        })
+    }
+
+    /// Restores one sealed blob: receipt binding, envelope open, plaintext
+    /// digest verification, destination re-seal. Any refusal fails the phase
+    /// closed — never write-through.
+    pub fn restore_blob(
+        &self,
+        adapter: &DestinationRestoreAdapter,
+        blob: &BackupBlob,
+    ) -> Result<RestoredSealedBlob, BackupError> {
+        let receipt = self
+            .receipts
+            .iter()
+            .find(|receipt| receipt.blob_hash == blob.locator.hash.as_str())
+            .ok_or(BackupError::PlanMismatch)?;
+        adapter.restore_blob_sealed(blob, receipt, self.manifest, self.scope)
+    }
+}
+
+/// ORS owner client (#962): derives suspended-recovery evidence through the
+/// accepted pure function and reads owner-held stream bindings.
+///
+/// Suspended entries are evidence only: restored ORS operations return as
+/// `suspended_recovery`, never runnable, and this client performs no live
+/// ORS mutation. The durable stream binding read below is the owner's
+/// current authenticated evidence used by the cutover path.
+pub struct OrsOwnerClient;
+
+impl OrsOwnerClient {
+    /// Derives suspended-recovery entries from a validated ORS snapshot.
+    pub fn suspend(
+        snapshot: &OrsSnapshotFence,
+    ) -> Result<Vec<RestoreHistoricalAuthority>, BackupError> {
+        suspended_recovery_entries(snapshot)
+    }
+}
+
+/// Live-authority invalidation kinds. Each names the exact owner that must
+/// execute it; none executes inside isolated restore.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidationKind {
+    Runtime,
+    Session,
+    Lease,
+    Route,
+    UserBroker,
+}
+
+impl InvalidationKind {
+    /// Obligation owner id for this invalidation.
+    #[must_use]
+    pub const fn owner_id(self) -> &'static str {
+        match self {
+            Self::Runtime => owners::RUNTIME,
+            Self::Session => owners::SESSION,
+            Self::Lease => owners::LEASE,
+            Self::Route => owners::ROUTE,
+            Self::UserBroker => owners::USER_BROKER,
+        }
+    }
+}
+
+/// Live-authority invalidation owner client (#962, cutover-gated).
+///
+/// Old sessions, leases, routes, broker registrations, and epochs must not
+/// survive alongside a cutover, but invalidating live authority during
+/// isolated rehearsal would be destructive: without a validated cutover
+/// receipt this client refuses with `CutoverNotAuthorized`. With one, the
+/// effect still requires the #962 wire channel and refuses with the exact
+/// missing capability. Either way no live state is touched here.
+pub struct InvalidationOwnerClient {
+    kind: InvalidationKind,
+}
+
+impl InvalidationOwnerClient {
+    /// Binds the client to one invalidation kind.
+    pub fn bind(kind: InvalidationKind) -> Self {
+        Self { kind }
+    }
+
+    /// Requests the invalidation. Cutover-gated, channel-absent: always
+    /// refuses here, naming either the missing cutover authority or the
+    /// missing wire channel.
+    pub fn request(&self, cutover: Option<&CutoverReceipt>) -> Result<(), BackupError> {
+        match cutover {
+            None => Err(BackupError::CutoverNotAuthorized),
+            Some(_) => Err(BackupError::RestoreCapabilityUnsupported {
+                capability: self.kind.owner_id(),
+            }),
+        }
+    }
 }
 
 /// Outcome of one Kernel-executed isolated restore: the journaled receipt,
@@ -134,7 +365,7 @@ pub struct KernelRestoreOutcome {
     pub suspended_entries: Vec<RestoreHistoricalAuthority>,
     pub phase_log: Vec<String>,
     pub destination_root: PathBuf,
-    pub journal_path: PathBuf,
+    pub journal_owner: String,
 }
 
 /// Kernel-owned production restore adapter.
@@ -152,24 +383,15 @@ pub struct KernelBackupRestore {
 }
 
 impl KernelBackupRestore {
-    /// Binds the restore owner to its admitted journal and work root.
+    /// Binds the restore owner to an owner-handled journal and work root.
+    ///
+    /// The journal must already bind the actual existing ORS owner
+    /// ([`KernelRestoreJournal::bind_owner`]) because no second database may
+    /// be opened here; it starts unadmitted and unbound, and [`restore`](Self::restore)
+    /// binds admission plus the transaction stream. There is no file-backed
+    /// constructor: a second writer path must not exist even as an option.
     pub fn bind(journal: KernelRestoreJournal, work_root: PathBuf) -> Self {
         Self { journal, work_root }
-    }
-
-    /// Opens the restore owner on a fresh journal below `work_root`.
-    ///
-    /// The journal starts unadmitted and unbound: bind owner admission on
-    /// [`KernelRestoreJournal::admit`] and the transaction stream on
-    /// [`KernelRestoreJournal::bind_plan_stream`] (done by
-    /// [`restore`](Self::restore)) before executing. Production durability
-    /// claims additionally require a non-fixture admission (see
-    /// [`RestoreJournalAdmission::admits_production_durable_recovery`](eliot_backup::RestoreJournalAdmission::admits_production_durable_recovery)).
-    pub fn open(work_root: &std::path::Path) -> Result<Self, KernelRestoreError> {
-        Ok(Self {
-            journal: KernelRestoreJournal::open(work_root)?,
-            work_root: work_root.to_path_buf(),
-        })
     }
 
     /// Returns the bound journal (admission, stream binding, inspection).
@@ -268,14 +490,135 @@ impl KernelBackupRestore {
             .final_evidence
             .clone()
             .or_else(|| read_resumed_evidence(&target_impl.root));
+        let journal_owner = match self.journal.bound_stream() {
+            Some(stream) => format!("{}:{stream}", self.journal.owner_label()),
+            None => self.journal.owner_label().to_owned(),
+        };
         Ok(KernelRestoreOutcome {
             receipt,
             evidence,
             suspended_entries: suspended,
             phase_log: target_impl.calls,
             destination_root: target_impl.root,
-            journal_path: self.journal.journal_path().to_path_buf(),
+            journal_owner,
         })
+    }
+
+    /// Validates the #961 cutover path for one completed isolated restore:
+    /// owner-approved isolated destination, separate cutover authority, and
+    /// epoch lineage strictly newer than every observed value.
+    ///
+    /// Consumes only authenticated evidence: the accepted owner
+    /// authorization (bound to this exact plan and bundle), the completed
+    /// restore receipt (bound to this exact plan, bundle, and target), the
+    /// ORS owner's durably held stream binding (destination and transaction
+    /// cross-check — a rotated authority or drifted archive refuses instead
+    /// of continuing), and the freshly re-validated restored fence (lineage
+    /// advance re-proven here with no caller arithmetic on epochs). The
+    /// accepted [`authorize_cutover`](eliot_backup::authorize_cutover)
+    /// mints the receipt; a degraded archive keeps its `canonical_only`
+    /// marking and is never upgraded. The decision is journaled to the
+    /// bound ORS stream with the exact observed predecessor, preserving
+    /// intent-before-effect ordering for cutover too.
+    ///
+    /// This path performs NO activation, retirement, route/process mutation,
+    /// or live-authority invalidation: cutover execution belongs to the
+    /// installer/Hume owner (#961), whose files are untouched here.
+    /// Rehearsal is safe by construction — there is simply no effect to
+    /// rehearse beyond validation and journaling the decision.
+    pub fn request_cutover(
+        &mut self,
+        plan: &RestorePlan,
+        bundle: &BackupBundle,
+        receipt: &RestoreReceipt,
+        destination: &KernelIsolatedDestination,
+        auth: Option<&CutoverAuthorization>,
+    ) -> Result<CutoverReceipt, KernelRestoreError> {
+        let auth = auth.ok_or(KernelRestoreError::CutoverNotAuthorized)?;
+        auth.validate()
+            .map_err(|error| KernelRestoreError::OwnerEvidenceInvalid(error.to_string()))?;
+        if receipt.plan_id != plan.plan_id
+            || receipt.bundle_sha256 != plan.bundle_sha256
+            || receipt.target_id != plan.target.target_id
+        {
+            return Err(KernelRestoreError::ArchiveInvalid(
+                "restore receipt does not bind this plan and target".to_owned(),
+            ));
+        }
+        if destination.label() != plan.target.target_id
+            || !destination.root().starts_with(&self.work_root)
+        {
+            return Err(KernelRestoreError::DestinationInvalid(
+                "cutover destination is not the plan-admitted isolated root".to_owned(),
+            ));
+        }
+        plan.restored_fence
+            .validate()
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let stream = self
+            .journal
+            .bound_stream()
+            .ok_or(KernelRestoreError::JournalNotAdmitted)?;
+        let durable = self
+            .journal
+            .read_durable_binding(stream)
+            .map_err(KernelRestoreError::TargetFailed)?
+            .ok_or(KernelRestoreError::JournalNotAdmitted)?;
+        let transaction = plan
+            .transaction()
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        if durable.transaction_id != transaction.transaction_id
+            || durable.destination_ref != plan.target.target_id
+            || durable.source_archive_id != bundle.manifest.backup_id
+        {
+            return Err(KernelRestoreError::JournalBindingConflict);
+        }
+        let carrier = IsolatedRestorePlan {
+            plan: plan.clone(),
+            suspended_entries: suspended_entries(bundle)?,
+            restored_fence: plan.restored_fence.clone(),
+            root: destination.root().to_path_buf(),
+            bundle_sha256: plan.bundle_sha256.clone(),
+            canonical_only: bundle.manifest.class.is_canonical_only(),
+        };
+        let cutover = authorize_cutover(&carrier, Some(auth))
+            .map_err(KernelRestoreError::TargetFailed)?;
+        cutover
+            .validate()
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let decision = ObservedCutoverDecision {
+            plan_id: plan.plan_id.clone(),
+            bundle_sha256: plan.bundle_sha256.clone(),
+            target_id: plan.target.target_id.clone(),
+            destination: destination.root().to_string_lossy().into_owned(),
+            authorized_by: auth.authorized_by.clone(),
+            new_authority_epoch: cutover.new_authority_epoch.clone(),
+            new_resource_generation: cutover.new_resource_generation,
+            canonical_only: cutover.canonical_only,
+        };
+        let payload_bytes = canonical_json_bytes(&decision)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let payload = String::from_utf8(payload_bytes.clone()).map_err(|_| {
+            KernelRestoreError::ArchiveInvalid(
+                "cutover decision payload is not UTF-8".to_owned(),
+            )
+        })?;
+        let plan_bytes = canonical_json_bytes(&plan.plan_id)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let request_bytes = canonical_json_bytes(&(
+            transaction.transaction_id.as_str(),
+            plan.plan_id.as_str(),
+            auth.authorized_by.as_str(),
+        ))
+        .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        self.journal
+            .append_decision_row(
+                format!("cutover-decision-{}", sha256_hex(&plan_bytes)),
+                sha256_hex(&request_bytes),
+                payload,
+            )
+            .map_err(KernelRestoreError::TargetFailed)?;
+        Ok(cutover)
     }
 }
 
@@ -301,6 +644,22 @@ fn read_resumed_evidence(root: &std::path::Path) -> Option<RestoreEvidence> {
     Some(evidence)
 }
 
+/// Kernel-observed cutover decision journaled to the bound ORS stream: the
+/// exact validated authorization, bound plan/archive/destination, and the
+/// new lineage the accepted cutover function minted. Observation of a
+/// validated decision, never an activation.
+#[derive(Serialize)]
+struct ObservedCutoverDecision {
+    plan_id: String,
+    bundle_sha256: String,
+    target_id: String,
+    destination: String,
+    authorized_by: String,
+    new_authority_epoch: EpochId,
+    new_resource_generation: ResourceGeneration,
+    canonical_only: bool,
+}
+
 /// Kernel-observed prepare evidence: the exact intent executed, bound to the
 /// compiled plan and the constructed destination. Observation, not authority.
 #[derive(Serialize)]
@@ -319,6 +678,14 @@ struct ObservedBlobRestore {
     receipt_id: String,
     key_lineage: String,
     source_plaintext_sha256: String,
+}
+
+/// Reconcile observation for one intent: exact applied receipt, proven
+/// non-attempt, or undecidable bytes. Undecidable never becomes success.
+enum ObservedEffect {
+    Applied(RestoreAppliedEffect),
+    NotAttempted,
+    Undecidable,
 }
 
 /// Kernel restore target over the accepted effect seam.
@@ -363,12 +730,17 @@ impl<'a> KernelRestoreTarget<'a> {
     }
 
     fn write_file(&self, relative: &str, bytes: &[u8]) -> Result<(), BackupError> {
+        // Atomic temp-write + rename: a crash never leaves a torn receipt
+        // that later reads as success. An unparseable receipt still reports
+        // Unknown (rollback disposition), never a fabricated outcome.
         let path = self.root.join(relative);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| BackupError::Target(error.to_string()))?;
         }
-        std::fs::write(&path, bytes).map_err(|error| BackupError::Target(error.to_string()))
+        let tmp = path.with_extension("tmp-restore");
+        std::fs::write(&tmp, bytes).map_err(|error| BackupError::Target(error.to_string()))?;
+        std::fs::rename(&tmp, &path).map_err(|error| BackupError::Target(error.to_string()))
     }
 
     fn phase_receipt_path(&self, phase: &RestorePhase) -> Result<PathBuf, BackupError> {
@@ -414,21 +786,27 @@ impl<'a> KernelRestoreTarget<'a> {
     fn load_applied(
         &self,
         intent: &RestoreIntent,
-    ) -> Result<Option<RestoreAppliedEffect>, BackupError> {
+    ) -> Result<ObservedEffect, BackupError> {
         let path = self.phase_receipt_path(&intent.phase)?;
         if !path.exists() {
-            return Ok(None);
+            return Ok(ObservedEffect::NotAttempted);
         }
         let bytes = std::fs::read(&path).map_err(|error| BackupError::Target(error.to_string()))?;
-        let applied: RestoreAppliedEffect =
-            serde_json::from_slice(&bytes).map_err(|_| BackupError::RestoreJournalCorrupt)?;
+        let applied: RestoreAppliedEffect = match serde_json::from_slice(&bytes) {
+            Ok(applied) => applied,
+            // Torn or foreign bytes: the effect state cannot be established
+            // from this observation. Propagate Unknown so the coordinator
+            // takes the explicit rollback-required disposition (I14.21);
+            // never guess, never blind-retry.
+            Err(_) => return Ok(ObservedEffect::Undecidable),
+        };
         if applied.receipt.transaction_id != intent.transaction_id
             || applied.receipt.phase != intent.phase
             || applied.receipt.input_digest != intent.input_digest
         {
             return Err(BackupError::RestoreJournalCorrupt);
         }
-        Ok(Some(applied))
+        Ok(ObservedEffect::Applied(applied))
     }
 
     fn find_blob<'b>(
@@ -511,20 +889,9 @@ impl<'a> KernelRestoreTarget<'a> {
     ) -> Result<RestoreAppliedEffect, BackupError> {
         self.gate(bundle)?;
         let blob = Self::find_blob(bundle, hash)?;
-        let receipt = self
-            .receipts
-            .iter()
-            .find(|receipt| receipt.blob_hash == hash)
-            .ok_or(BackupError::PlanMismatch)?;
-        let manifest = self.keys.ok_or(BackupError::MissingRecoveryComponent(
-            "blob_key_material",
-        ))?;
-        let scope = self.blob_scope.ok_or(BackupError::RestoreCapabilityUnsupported {
-            capability: owners::BLOB_SCOPE_BINDING,
-        })?;
+        let client = BlobOwnerClient::bind(self.receipts.clone(), self.keys, self.blob_scope)?;
         let adapter = DestinationRestoreAdapter::bind(self.root.as_path())?;
-        let restored: RestoredSealedBlob =
-            adapter.restore_blob_sealed(blob, receipt, manifest, scope)?;
+        let restored: RestoredSealedBlob = client.restore_blob(&adapter, blob)?;
         self.write_file(&format!("blobs/{hash}"), &restored.resealed_bytes)?;
         let observed = ObservedBlobRestore {
             resealed_sha256: restored.resealed_sha256.clone(),
@@ -949,11 +1316,7 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     }
 
     fn apply_purge_ledger(&mut self, entries: &[PurgeLedgerEntry]) -> Result<(), BackupError> {
-        for entry in entries {
-            entry
-                .validate()
-                .map_err(|error| BackupError::Security(error.to_string()))?;
-        }
+        PurgeOwnerClient::bind(entries).validate_entries()?;
         let bytes = canonical_json_bytes(&entries)
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         self.write_file("purge_ledger.json", &bytes)?;
@@ -972,7 +1335,7 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     }
 
     fn import_canonical_event(&mut self, record: &CanonicalRecord) -> Result<(), BackupError> {
-        record.validate()?;
+        CanonicalOwnerClient::validate_event(record)?;
         let bytes = canonical_json_bytes(&record.payload)
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         self.write_file(&format!("events/{}.json", record.record_id), &bytes)?;
@@ -980,7 +1343,7 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     }
 
     fn import_receipt(&mut self, receipt: &WriteReceipt) -> Result<(), BackupError> {
-        receipt.validate().map_err(BackupError::Store)?;
+        CanonicalOwnerClient::validate_receipt(receipt)?;
         let bytes = canonical_json_bytes(receipt)
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         self.write_file(&format!("receipts/{}.json", receipt.operation_id), &bytes)?;
@@ -988,7 +1351,7 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     }
 
     fn import_projection(&mut self, record: &CanonicalRecord) -> Result<(), BackupError> {
-        record.validate()?;
+        CanonicalOwnerClient::validate_event(record)?;
         let bytes = canonical_json_bytes(&record.payload)
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         self.write_file(&format!("projections/{}.json", record.record_id), &bytes)?;
@@ -996,7 +1359,7 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     }
 
     fn suspend_ors_operations(&mut self, snapshot: &OrsSnapshotFence) -> Result<(), BackupError> {
-        let entries = suspended_recovery_entries(snapshot)?;
+        let entries = OrsOwnerClient::suspend(snapshot)?;
         let bytes = canonical_json_bytes(&entries)
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         self.write_file("suspended_ors.json", &bytes)?;
@@ -1017,21 +1380,7 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
         receipts: &[WriteReceipt],
         events: &[CanonicalRecord],
     ) -> Result<(), BackupError> {
-        let event_ids: std::collections::BTreeSet<&str> = events
-            .iter()
-            .map(|event| event.record_id.as_str())
-            .collect();
-        for receipt in receipts {
-            receipt.validate().map_err(BackupError::Store)?;
-            for event_id in &receipt.emitted_event_ids {
-                if !event_ids.contains(event_id.as_str()) {
-                    return Err(BackupError::ReceiptChainGap {
-                        event_id: event_id.to_string(),
-                    });
-                }
-            }
-        }
-        Ok(())
+        CanonicalOwnerClient::verify_chain(receipts, events)
     }
 
     fn finalize_isolated(
@@ -1067,13 +1416,18 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
         // transaction, phase, and input digest is Applied; its absence is
         // NotApplied and the coordinator re-applies idempotently (byte
         // staging overwrites, re-sealing mints fresh bytes with a fresh
-        // receipt — no prior receipt exists to contradict). No ambiguous
-        // external commit exists here, hence no manufactured Unknown.
+        // receipt — no prior receipt exists to contradict). Bytes that parse
+        // as nothing are Undecidable and propagate as Unknown: the
+        // coordinator takes the explicit rollback-required disposition
+        // (I14.21) with no new identity and no blind retry. Async
+        // owner-channel unknowns belong to the #962 wire layer, which must
+        // upgrade reconciliation there, never downgrade readback here.
         match &intent.phase {
             RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
             _ => match self.load_applied(intent)? {
-                Some(applied) => Ok(RestoreReconciliation::Applied(applied)),
-                None => Ok(RestoreReconciliation::NotApplied),
+                ObservedEffect::Applied(applied) => Ok(RestoreReconciliation::Applied(applied)),
+                ObservedEffect::NotAttempted => Ok(RestoreReconciliation::NotApplied),
+                ObservedEffect::Undecidable => Ok(RestoreReconciliation::Unknown),
             },
         }
     }

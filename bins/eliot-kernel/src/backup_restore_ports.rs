@@ -21,12 +21,12 @@
 //! compare-and-append plus idempotent replay, merged into this lane from the
 //! M2 candidate), the constructed (never accepted)
 //! [`KernelIsolatedDestination`], and the [`check_kernel_effect_fence`] gate.
-//! There is no filesystem, in-memory, or no-op journal path here: the journal
-//! substrate is a Kernel-owned separate redb file
-//! (`kernel-restore-journal.redb`, mirroring the established
-//! `doctor_recovery_ledger.rs` pattern) driven exclusively through the E
-//! owner's committed row/table logic, so restore rows keep exactly one writer
-//! and never share a handle with the operational store.
+//! There is no filesystem, in-memory, or no-op journal path here, and no
+//! second database is opened: the journal binds the actual existing ORS
+//! owner handle (the operational `RedbRecoveryStore` owned by Kernel
+//! composition), driving restore streams exclusively through the E owner's
+//! committed row/table logic, so restore rows keep exactly one writer
+//! inside the owner's file and never share a handle with any second store.
 //!
 //! Stream binding (lossless transaction/source/class/destination/fence
 //! binding): one ORS stream per restore transaction (the stream key is the
@@ -52,6 +52,7 @@
 //! of any installation, no in-memory/no-op journal substitute in any path.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eliot_backup::{
     BackupBundle, BackupClass, BackupError, RestoreJournalAdmission, RestoreJournalPort,
@@ -64,13 +65,15 @@ use eliot_ors::{
     RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding,
 };
 
-/// File name of the Kernel-owned durable restore journal below the canonical
-/// work root. A separate database file from the operational ORS store, so
-/// restore rows keep exactly one writer.
-pub const RESTORE_JOURNAL_FILE_NAME: &str = "kernel-restore-journal.redb";
-/// Stable identity of this journal for admission bindings. Composition must
-/// place this identity in the admission it issues for this journal.
+/// Stable identity of the restore-journal stream namespace for admission
+/// bindings. Composition must place this identity in the admission it issues
+/// for the restore streams owned by the operational ORS database.
 pub const RESTORE_JOURNAL_IDENTITY: &str = "kernel-restore-journal-v1";
+/// Owner label identifying the operational ORS database behind restore
+/// streams (evidence + diagnostics reference). The rows live in the
+/// Kernel-owned operational ORS file; this label names that owner, never a
+/// second database.
+pub const RESTORE_JOURNAL_OWNER_LABEL: &str = "kernel-operational-ors";
 /// Isolated-restore area below `<work_root>/.eliot`.
 pub const RESTORE_ISOLATED_AREA: &str = "restore-isolated";
 /// Resolved intent/result pairs retained per stream by pruning. The bounded
@@ -111,6 +114,9 @@ pub enum KernelRestoreError {
     CapabilityMissing { capability: &'static str },
     /// Owner-issued evidence is invalid or does not advance observed lineage.
     OwnerEvidenceInvalid(String),
+    /// Cutover requires a separate Human/System Owner authorization, which
+    /// was absent. Rehearsal never activates or retires.
+    CutoverNotAuthorized,
     /// The journaled restore engine reported a typed failure.
     TargetFailed(BackupError),
 }
@@ -148,6 +154,10 @@ impl std::fmt::Display for KernelRestoreError {
             Self::OwnerEvidenceInvalid(detail) => {
                 write!(formatter, "owner-issued restore evidence invalid: {detail}")
             }
+            Self::CutoverNotAuthorized => write!(
+                formatter,
+                "cutover requires a separate Human/System Owner authorization"
+            ),
             Self::TargetFailed(error) => write!(formatter, "restore target failed: {error}"),
         }
     }
@@ -267,6 +277,7 @@ fn kernel_to_backup(error: KernelRestoreError) -> BackupError {    match error {
             BackupError::InvalidField { field, reason }
         }
         KernelRestoreError::TargetFailed(inner) => inner,
+        KernelRestoreError::CutoverNotAuthorized => BackupError::CutoverNotAuthorized,
         KernelRestoreError::DestinationInvalid(_)
         | KernelRestoreError::FenceMismatch(_)
         | KernelRestoreError::ArchiveInvalid(_)
@@ -287,12 +298,11 @@ struct BoundStream {
 
 /// Kernel-owned durable restore journal over the committed ORS journal port.
 ///
-/// Owns the separate redb file below the canonical work root and implements
-/// the accepted [`RestoreJournalPort`] seam exclusively through the E-owned
-/// row/table logic (`bind` / exact-predecessor `append` with idempotent
+/// Binds the actual existing ORS owner handle and implements the accepted
+/// [`RestoreJournalPort`] seam exclusively through the E-owned row/table logic (`bind` / exact-predecessor `append` with idempotent
 /// replay / bounded chain-validated `load` / paired `result` / `prune`).
-/// Single writer: the Kernel restore coordinator is the only writer of this
-/// file; the in-memory head is a lossy accelerator only — every swap
+/// Single writer: the Kernel restore coordinator is the only writer of
+/// restore-journal streams in the owner's file; the in-memory head is a lossy accelerator only — every swap
 /// re-derives continuity from the durable tail when the cache is cold, and a
 /// lost predecessor race reports [`RestoreJournalCasConflict`](BackupError::RestoreJournalCasConflict)
 /// instead of retrying blindly. There is no `Default`, no in-memory
@@ -301,8 +311,7 @@ struct BoundStream {
 /// ([`JournalNotAdmitted`](KernelRestoreError::JournalNotAdmitted)) instead
 /// of standing in for durability.
 pub struct KernelRestoreJournal {
-    store: RedbRecoveryStore,
-    file: PathBuf,
+    store: Arc<RedbRecoveryStore>,
     admission: Option<RestoreJournalAdmission>,
     bound: Option<BoundStream>,
     head: Option<(u64, String)>,
@@ -313,7 +322,7 @@ impl std::fmt::Debug for KernelRestoreJournal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("KernelRestoreJournal")
-            .field("file", &self.file)
+            .field("owner", &RESTORE_JOURNAL_OWNER_LABEL)
             .field("admission", &self.admission)
             .field("bound", &self.bound)
             .field("head", &self.head)
@@ -322,42 +331,24 @@ impl std::fmt::Debug for KernelRestoreJournal {
 }
 
 impl KernelRestoreJournal {
-    /// Opens (or creates) the Kernel-owned durable restore journal below
-    /// `work_root` and ensures the versioned ORS journal schema.
+    /// Binds the actual existing ORS owner handle for restore streams.
     ///
-    /// `work_root` is the canonical absolute Kernel work root from the
-    /// authenticated Host launch contour (same pattern as the doctor recovery
-    /// ledger), never a request value. A foreign schema identity refuses
-    /// here so an old empty/incomplete journal can never read as complete.
-    /// The journal starts unadmitted and unbound: [`admit`](Self::admit) must
-    /// bind owner admission and
+    /// Takes the already-open operational ORS store owned by Kernel
+    /// composition — no second database is opened and no second writer is
+    /// created; restore streams are namespaced by transaction inside the
+    /// owner's file and driven exclusively through the E-owned row/table
+    /// logic. Ensures the versioned ORS journal schema (additive, E-owned);
+    /// a foreign schema identity refuses so an old empty/incomplete journal
+    /// can never read as complete. The journal starts unadmitted and
+    /// unbound: [`admit`](Self::admit) must bind owner admission and
     /// [`bind_plan_stream`](Self::bind_plan_stream) the transaction stream
     /// before any restore executes against it.
-    pub fn open(work_root: &Path) -> Result<Self, KernelRestoreError> {
-        if !work_root.is_absolute() {
-            return Err(KernelRestoreError::InvalidInput {
-                field: "restore.work_root",
-                reason: "the restore journal root must be absolute",
-            });
-        }
-        if !work_root.is_dir() {
-            return Err(KernelRestoreError::InvalidInput {
-                field: "restore.work_root",
-                reason: "the restore journal root must be an existing directory",
-            });
-        }
-        let file = work_root.join(RESTORE_JOURNAL_FILE_NAME);
-        let store =
-            RedbRecoveryStore::open(&file).map_err(|error| match &error {
-                OrsError::IntegrityProblem { .. } => KernelRestoreError::JournalCorrupt,
-                _ => KernelRestoreError::JournalIo(error.to_string()),
-            })?;
+    pub fn bind_owner(store: Arc<RedbRecoveryStore>) -> Result<Self, KernelRestoreError> {
         store
             .ensure_restore_journal_schema()
             .map_err(map_ors_to_kernel)?;
         Ok(Self {
             store,
-            file,
             admission: None,
             bound: None,
             head: None,
@@ -458,10 +449,11 @@ impl KernelRestoreJournal {
         Ok(stream)
     }
 
-    /// Stable journal file path (evidence + diagnostics reference).
+    /// Owner label of the operational ORS database behind restore streams
+    /// (evidence + diagnostics reference).
     #[must_use]
-    pub fn journal_path(&self) -> &Path {
-        &self.file
+    pub fn owner_label(&self) -> &'static str {
+        RESTORE_JOURNAL_OWNER_LABEL
     }
 
     /// Returns the bound stream key, if bound.
@@ -579,13 +571,6 @@ impl KernelRestoreJournal {
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         let payload = String::from_utf8(payload_bytes.clone())
             .map_err(|_| BackupError::Serialization("restore journal payload is not UTF-8".to_owned()))?;
-        if payload.len() > MAX_JOURNAL_PAYLOAD_BYTES {
-            return Err(BackupError::LimitExceeded {
-                field: "restore.journal_payload",
-                limit: MAX_JOURNAL_PAYLOAD_BYTES,
-            });
-        }
-        let payload_sha256 = sha256_hex(&payload_bytes);
         let phase_operation = Self::phase_operation(&next.state, &next.phase)?;
         let request_bytes = canonical_json_bytes(&(
             journal_key,
@@ -604,30 +589,111 @@ impl KernelRestoreJournal {
             record_schema: RESTORE_JOURNAL_RECORD_SCHEMA.to_owned(),
             phase_operation: phase_operation.clone(),
             request_digest: sha256_hex(&request_bytes),
-            body_digest: payload_sha256.clone(),
+            body_digest: String::new(),
             expected_predecessor: predecessor,
             payload_handle: format!("restore-row:{journal_key}:{expected_revision}"),
         };
+        let (sequence, digest) =
+            self.append_row(&stream, operation, &payload, &payload_bytes)?;
+        self.head = Some((sequence, digest));
+        self.head_record = Some(next.clone());
+        Ok(())
+    }
+
+    /// Reads the durable stream binding from the ORS owner (owner evidence).
+    ///
+    /// Returns the binding the owner durably holds for the bound stream, or
+    /// `None` when the stream was never bound. Callers cross-check this
+    /// owner-held value instead of trusting handle memory.
+    pub(crate) fn read_durable_binding(
+        &self,
+        stream: &str,
+    ) -> Result<Option<RestoreJournalStreamBinding>, BackupError> {
+        self.store
+            .load_restore_journal_binding(stream)
+            .map_err(map_ors_to_backup)
+    }
+
+    /// Appends one non-coordinator decision row (e.g. cutover) to the bound
+    /// stream with the exact observed predecessor, its paired result, and
+    /// pruning. The payload is the caller's canonical JSON observation;
+    /// digests bind it losslessly. An idempotent replay of the identical
+    /// row succeeds with the persisted receipt instead of duplicating.
+    pub(crate) fn append_decision_row(
+        &mut self,
+        phase_operation: String,
+        request_digest: String,
+        payload: String,
+    ) -> Result<(u64, String), BackupError> {
+        let (stream, binding) = self
+            .bound
+            .as_ref()
+            .map(|bound| (bound.stream.clone(), bound.binding.clone()))
+            .ok_or(BackupError::RestoreJournalRequired)?;
+        if self.head.is_none() && self.head_record.is_none() {
+            self.refresh_head()?;
+        }
+        let predecessor = self.head.clone().map(|(sequence, digest)| JournalPredecessor {
+            sequence,
+            digest,
+        });
+        let payload_bytes = payload.clone().into_bytes();
+        let operation = RestoreJournalOperation {
+            transaction_id: binding.transaction_id.clone(),
+            source_archive_id: binding.source_archive_id.clone(),
+            archive_class: binding.archive_class,
+            destination_ref: binding.destination_ref.clone(),
+            writer_id: binding.writer_id.clone(),
+            writer_fence_digest: binding.writer_fence_digest.clone(),
+            record_schema: RESTORE_JOURNAL_RECORD_SCHEMA.to_owned(),
+            phase_operation,
+            request_digest,
+            body_digest: String::new(),
+            expected_predecessor: predecessor,
+            payload_handle: format!("restore-decision:{stream}"),
+        };
+        let (sequence, digest) = self.append_row(&stream, operation, &payload, &payload_bytes)?;
+        self.head = Some((sequence, digest.clone()));
+        Ok((sequence, digest))
+    }
+
+    /// Core row append shared by swaps and decision rows: size-gated payload,
+    /// lossless body digest, exact-predecessor intent, paired result, prune.
+    /// Returns the appended `(sequence, record digest)` and refreshes the
+    /// head; the caller owns revision/transaction continuity for its protocol.
+    fn append_row(
+        &mut self,
+        stream: &str,
+        mut operation: RestoreJournalOperation,
+        payload: &str,
+        payload_bytes: &[u8],
+    ) -> Result<(u64, String), BackupError> {
+        if payload.len() > MAX_JOURNAL_PAYLOAD_BYTES {
+            return Err(BackupError::LimitExceeded {
+                field: "restore.journal_payload",
+                limit: MAX_JOURNAL_PAYLOAD_BYTES,
+            });
+        }
+        let payload_sha256 = sha256_hex(payload_bytes);
+        operation.body_digest = payload_sha256.clone();
         let receipt = self
             .store
-            .append_restore_journal_intent(&stream, &operation, &payload_sha256, &payload)
+            .append_restore_journal_intent(stream, &operation, &payload_sha256, payload)
             .map_err(map_ors_to_backup)?;
         let result = RestoreJournalResult {
             transaction_id: operation.transaction_id.clone(),
-            phase_operation,
+            phase_operation: operation.phase_operation.clone(),
             intent_sequence: receipt.sequence,
             receipt_sha256: payload_sha256,
-            receipt: payload,
+            receipt: payload.to_owned(),
         };
         self.store
-            .append_restore_journal_result(&stream, &result)
+            .append_restore_journal_result(stream, &result)
             .map_err(map_ors_to_backup)?;
         self.store
-            .prune_restore_journal(&stream, RESTORE_JOURNAL_KEEP_RESOLVED)
+            .prune_restore_journal(stream, RESTORE_JOURNAL_KEEP_RESOLVED)
             .map_err(map_ors_to_backup)?;
-        self.head = Some((receipt.sequence, receipt.record_digest));
-        self.head_record = Some(next.clone());
-        Ok(())
+        Ok((receipt.sequence, receipt.record_digest))
     }
 }
 
