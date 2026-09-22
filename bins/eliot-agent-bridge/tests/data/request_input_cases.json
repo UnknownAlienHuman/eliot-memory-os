@@ -4,7 +4,7 @@
   "preparation": "issue #977 portion 1: versioned private input profile and finite compatibility/limit table; portion 2 binds this accepted profile into parser dispatch",
   "source_binding": {
     "profile_source": "bins/eliot-agent-bridge/src/request_input.rs",
-    "source_sha256": "413678c592a37a085e6e1d6fdb28fa683bc93d6f0b04d34a8072a4952a8bea8b",
+    "source_sha256": "78b7533ed5648e89acc5a8aaf351736dd0f718706b19bc6a5e787e07b08ae08b",
     "preparation_base_commit": "827c836ffdd87d1800a58eaf44ee208b9a30c135",
     "accepted_baseline": {"pr": 2314, "merge": "52941612f53450da3b0cd5f06f82067b6421b02a", "source_sha256": "f294444a54be8ab037ffc291e458d1fcae63797444d0f731cd6c37dfe5bbddc2"},
     "post_acceptance_delta": "exactly two envelope arms (dry_run_invoke|dry_run_cancel via merge f44fdded; bootstrap via 4056d007); every numeric limit retained unchanged",
@@ -56,7 +56,7 @@
     {"id": "valid-reconnect", "raw": "{\"op\":\"reconnect\",\"expected_connection_id\":\"conn-1\",\"new_connection_id\":\"conn-2\",\"session_id\":\"session-1\",\"activation_generation\":1,\"authority_epoch\":{\"lineage_id\":\"12345678-1234-1234-1234-1234567890ab\",\"sequence\":1},\"fence_nonce\":\"fence-1\"}", "expect": "accept", "op": "reconnect"},
     {"id": "valid-dry-run-invoke", "raw": "{\"op\":\"dry_run_invoke\",\"request\":{\"protocol_version\":\"2026-07-28\",\"correlation_id\":\"host-request-1\",\"client_capabilities\":{\"tasks\":false},\"tool\":{\"name\":\"eliot.state\",\"arguments\":{\"include\":[\"task\"]}},\"deadline_preference_ms\":5000,\"observed_context\":{\"host_session_hint\":\"host-turn-1\",\"observed_resource_refs\":[],\"event_cursors\":[],\"trace_context\":{}}}}", "expect": "accept", "op": "dry_run_invoke", "note": "owner-added envelope shape after accepted v1; exact invoke key shape, inert preview only"},
     {"id": "valid-dry-run-cancel", "raw": "{\"op\":\"dry_run_cancel\",\"request\":{\"protocol_version\":\"2026-07-28\",\"correlation_id\":\"host-cancel-1\",\"operation_handle\":\"kernel-operation-1\",\"reason\":null,\"deadline_preference_ms\":2000,\"observed_context\":{\"host_session_hint\":null,\"observed_resource_refs\":[],\"event_cursors\":[],\"trace_context\":{}}}}", "expect": "accept", "op": "dry_run_cancel", "note": "owner-added envelope shape after accepted v1; exact cancel key shape, inert preview only"},
-    {"id": "valid-bootstrap", "raw": "{\"op\":\"bootstrap\",\"context\":null,\"tasks\":{},\"requested_assessment\":{}}", "expect": "accept", "op": "bootstrap", "note": "owner-added envelope shape after accepted v1 via 1938 lane; nested typed validity stays with the Request owner and later dispatch proof"},
+    {"id": "valid-bootstrap", "raw": "{\"op\":\"bootstrap\",\"context\":null,\"tasks\":{\"scope_level\":\"session\"},\"requested_assessment\":\"READY\"}", "expect": "accept", "op": "bootstrap", "note": "fully typed-valid minimal bootstrap mirroring in-tree BOOTSTRAP_OP; nested typed validity stays with the Request owner and later dispatch proof"},
     {"id": "crlf-tolerated", "raw": "{\"op\":\"status\"}\r\n", "expect": "accept", "op": "status", "note": "trailing CRLF after a complete record is transport framing whitespace, not a second value"},
     {"id": "blank-line", "raw": "   ", "expect": "skip", "note": "blank lines are skipped before decoding"},
     {"id": "malformed-truncated", "raw": "{\"op\":\"status\"", "expect": "reject", "reason": "malformed"},
