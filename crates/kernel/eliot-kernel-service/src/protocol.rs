@@ -2,6 +2,7 @@
 
 use eliot_contracts::{AuthorityEpoch, EpochId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_ipc::TransportError;
+use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_ors::{SupervisionLeaseProjection, SupervisionLeaseSnapshot};
 use eliot_platform::{KernelActivationNonce, PlatformHandle, PortError};
 use eliot_process::{
@@ -62,7 +63,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 4;
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 5;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
@@ -1395,6 +1396,9 @@ pub struct KernelControlResponse {
     pub state: KernelServiceState,
     /// Receipt returned only after Kernel-owned readiness observation.
     pub receipt: Option<KernelReadyReceipt>,
+    /// Owner-produced authenticated runtime-health carrier returned with a
+    /// Kernel-authored readiness receipt.
+    pub runtime_health: Option<KernelRuntimeHealthEvidence>,
     /// Exact receipt returned after one activation permit is consumed, or
     /// after a nonce-free operation-identity reconciliation finds it.
     pub activation_receipt: Option<KernelActivationReceipt>,
@@ -1423,6 +1427,7 @@ impl KernelControlResponse {
             request_digest: &'a str,
             state: KernelServiceState,
             receipt: &'a Option<KernelReadyReceipt>,
+            runtime_health: &'a Option<KernelRuntimeHealthEvidence>,
             activation_receipt: &'a Option<KernelActivationReceipt>,
             store_rebind_receipt: &'a Option<StoreRebindReceipt>,
             supervision_lease: &'a Option<SupervisionLeaseSnapshot>,
@@ -1435,6 +1440,7 @@ impl KernelControlResponse {
             request_digest: &self.request_digest,
             state: self.state,
             receipt: &self.receipt,
+            runtime_health: &self.runtime_health,
             activation_receipt: &self.activation_receipt,
             store_rebind_receipt: &self.store_rebind_receipt,
             supervision_lease: &self.supervision_lease,
@@ -1487,6 +1493,29 @@ impl KernelControlResponse {
                 field: "control.supervision_lease",
                 reason: "must accompany exactly one Kernel-authored ready receipt",
             });
+        }
+        if self.receipt.is_some() != self.runtime_health.is_some() {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.runtime_health",
+                reason: "must accompany exactly one Kernel-authored ready receipt",
+            });
+        }
+        if let (Some(receipt), Some(runtime_health)) = (&self.receipt, &self.runtime_health) {
+            runtime_health
+                .validate()
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "control.runtime_health",
+                    reason: "must be an exact validated Kernel health carrier",
+                })?;
+            let process_health = runtime_health.process_health();
+            if process_health.process_id() != receipt.process.process_id.as_str()
+                || process_health.process_state() != receipt.process.state
+                || process_health.health().canonical != receipt.health
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "control.runtime_health.ready_binding",
+                });
+            }
         }
         if let Some(snapshot) = &self.supervision_lease {
             snapshot
