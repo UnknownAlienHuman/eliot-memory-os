@@ -1067,10 +1067,13 @@ impl CommonGroundAssessment {
     /// Independently recheck the denominator against current owner objects:
     /// fences re-gated, every cite re-resolved, digest recomputed.
     ///
-    /// This is the consumer authority path: `validate()` proves shape only.
+    /// This is the consumer authority path: `validate()` first proves the
+    /// persisted candidate's version, six-leg canonical shape, and digest;
+    /// owner re-resolution then proves that its current evidence still binds.
     /// A non-complete verdict means the candidate no longer binds; the
     /// owning review path transitions it to `Stale`.
     pub fn recheck(&self, owner: &OwnerContext<'_>) -> Result<DenominatorRecheck, AssessmentError> {
+        self.validate()?;
         gate_owner(owner, &self.scope)?;
         let mut rollup = BindingRollup::default();
         rollup.classify_slots(
@@ -1393,14 +1396,17 @@ impl ScopedUnderstandingAssessment {
     /// `product_claims` must match the flag the candidate was assessed under:
     /// held-out slots join the missing set only for product claims.
     /// `*_where_applicable` slots are re-resolved for drift but never
-    /// required. This is the consumer authority path: `validate()` proves
-    /// shape only. A non-complete verdict means the candidate no longer
-    /// binds; the product acceptance path transitions it to `Stale`.
+    /// required. This is the consumer authority path: `validate()` first
+    /// proves the persisted candidate's version, slot/text shape, and digest;
+    /// owner re-resolution then proves that its current evidence still binds.
+    /// A non-complete verdict means the candidate no longer binds; the product
+    /// acceptance path transitions it to `Stale`.
     pub fn recheck(
         &self,
         owner: &OwnerContext<'_>,
         product_claims: bool,
     ) -> Result<DenominatorRecheck, AssessmentError> {
+        self.validate()?;
         gate_owner(owner, &self.scope)?;
         let mut rollup = BindingRollup::default();
         rollup.classify_slots(
