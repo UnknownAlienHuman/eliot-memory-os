@@ -11,6 +11,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod candidate_bounds;
 pub mod learning_closure;
 
 pub mod promotion_input;

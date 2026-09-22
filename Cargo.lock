@@ -1027,6 +1027,7 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-governor",
  "eliot-receipts",
 ]
 
@@ -1035,9 +1036,11 @@ name = "eliot-context-assembly"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-contracts",
+ "eliot-context-admission",
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-governor",
  "eliot-observation-contracts",
  "eliot-receipts",
  "serde",
@@ -1761,6 +1764,7 @@ dependencies = [
 name = "eliot-governor"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "eliot-authority",
  "eliot-budget",
  "eliot-canonical",
@@ -1903,6 +1907,8 @@ name = "eliot-improvement"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
+ "eliot-governor",
  "serde",
  "thiserror",
  "time",
