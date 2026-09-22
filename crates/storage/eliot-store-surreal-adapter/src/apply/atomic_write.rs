@@ -97,6 +97,8 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "revision_head_create_conflict",
     "ordering_head_cas_conflict",
     "ordering_head_create_conflict",
+    "finish_owner_cas_conflict",
+    "finish_owner_create_conflict",
 ];
 
 /// Reports whether a provider statement error proves shared-allocation
@@ -492,6 +494,8 @@ fn build_apply_statements(
 
     append_automation_statements(&mut sql, &mut bindings, automation)?;
 
+    append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
+
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
         "receipt_table".to_owned(),
@@ -529,6 +533,115 @@ fn build_apply_statements(
 
     sql.push_str(schema::TX_COMMIT);
     Ok((sql, bindings))
+}
+
+/// Appends the single Governor-owned finish persistence leg, when present.
+///
+/// The adapter does not decode or derive a finish decision.  It binds the
+/// admitted receipt bytes verbatim to the fixed `owner/finish` recovery row
+/// and lets the provider arbitrate the exact fence and outer revision inside
+/// the same canonical transaction as the receipt.  The Governor remains the
+/// owner of all finish semantics and evidence.
+fn append_finish_owner_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let Some(command) = transition
+        .named_operations
+        .iter()
+        .find(|command| command.operation == eliot_store_api::NamedMutationOperation::RecordFinishDecision)
+    else {
+        return Ok(());
+    };
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let attempt_id = text_param("attempt_id")?;
+    let expected_revision = text_param("expected_finish_revision")?
+        .parse::<u64>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "expected_finish_revision must be a decimal revision",
+            })
+        })?;
+    let receipt_json = text_param("receipt_json")?;
+    if receipt_json.is_empty() {
+        return Err(AdapterError::Store(StoreError::Empty {
+            field: "finish.receipt_json",
+        }));
+    }
+    if receipt_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+
+    let finish_key = eliot_store_api::RecoveryRecordKey::new("owner", "finish")
+        .map_err(AdapterError::Store)?;
+    let owner_id = recovery_owner_id(&finish_key)?;
+    let payload = receipt_json.as_bytes();
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(finish_key.namespace));
+    record.insert("key".to_owned(), json!(finish_key.key));
+    record.insert(
+        "state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    record.insert(
+        "revision".to_owned(),
+        json!(expected_revision.checked_add(1).ok_or_else(|| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "finish.owner_revision",
+                reason: "revision overflow",
+            })
+        })?),
+    );
+    record.insert(
+        "schema".to_owned(),
+        json!(eliot_store_api::OWNER_SNAPSHOT_SCHEMA),
+    );
+    record.insert("payload".to_owned(), json!(payload));
+    record.insert(
+        "value_digest".to_owned(),
+        json!(eliot_store_api::sha256_hex(payload)),
+    );
+
+    sql.push_str(schema::TX_FINISH_OWNER);
+    bindings.insert(
+        "finish_owner_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("finish_owner_id".to_owned(), json!(owner_id));
+    bindings.insert("finish_expected_state_fence".to_owned(), json!(&transition.state_fence));
+    bindings.insert(
+        "finish_expected_revision".to_owned(),
+        json!(expected_revision),
+    );
+    bindings.insert("finish_owner_record".to_owned(), Value::Object(record));
+    // Keep the attempt identity bound in the assembled transaction even
+    // though the storage layer treats the receipt payload as opaque.  This
+    // prevents a future caller from silently dropping the required parameter
+    // while preserving Governor ownership of its interpretation.
+    bindings.insert("finish_attempt_id".to_owned(), json!(attempt_id));
+    Ok(())
+}
+
+fn recovery_owner_id(
+    key: &eliot_store_api::RecoveryRecordKey,
+) -> Result<String, AdapterError> {
+    let bytes = eliot_store_api::canonical_json_bytes(key)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    Ok(eliot_store_api::sha256_hex(&bytes))
 }
 
 /// Appends canonical notification record writes (issue #1780).

@@ -39,6 +39,7 @@ mod composition;
 mod context_inputs;
 mod cue_composition;
 mod epistemic_composition;
+mod finish_attempt;
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
@@ -49,6 +50,7 @@ pub use cue_composition::{
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
+pub use finish_attempt::{FinishAttemptError, GovernorFinishAttempt};
 mod controlboard_projection;
 mod observation_reconciliation;
 mod operator_reconciliation;
@@ -80,7 +82,10 @@ pub use controlboard_projection::{
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
-pub use eliot_canonical::CanonicalWriteEnvelope;
+pub use eliot_canonical::{
+    CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome,
+};
+pub use eliot_finish::FinishDecisionReceipt;
 /// Task lifecycle domain types re-exported so the daemon composition root
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).

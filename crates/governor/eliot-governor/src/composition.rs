@@ -24,7 +24,7 @@ use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
     Governor, GovernorConfig, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
-    ServiceObservation,
+    ServiceObservation, FinishAttemptError, GovernorFinishAttempt,
 };
 use eliot_authority::{
     GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
@@ -32,7 +32,9 @@ use eliot_authority::{
     IntroductionStatus, P07AuthorityPort, P07PortError,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
-use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
+use eliot_canonical::{
+    CanonicalError, CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence,
+};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
@@ -40,7 +42,7 @@ use eliot_contracts::{
     sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
-use eliot_finish::{FinishDecisionReceipt, FinishService};
+use eliot_finish::{DescendantClosure, FinishDecisionReceipt, FinishService};
 use eliot_maintenance::{
     MaintenanceController, MaintenanceError, MaintenanceJob, MaintenanceStateStore,
 };
@@ -833,6 +835,74 @@ pub struct CanonicalAdmissionSnapshot {
     pub state_fence: StateFence,
     pub owner_revision: u64,
     pub current_plan: Option<CanonicalPlanBinding>,
+    /// Canonical evidence required to evaluate a finish candidate.  The
+    /// candidate draft never supplies this record; it is rehydrated with the
+    /// current canonical owner image and must carry the same fence as it.
+    #[serde(default)]
+    pub finish_evidence: Option<CanonicalFinishEvidence>,
+}
+
+/// Canonical owner evidence consumed by the Governor finish path.
+///
+/// This is deliberately a projection owned by the canonical owner, rather
+/// than a second finish machine.  `FinishService` derives the decision from
+/// this record; the Store only persists the resulting receipt projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalFinishEvidence {
+    /// Fence at which the evidence was observed.
+    pub state_fence: StateFence,
+    /// Acceptance, artifact, verifier, and effect evidence from canonical
+    /// state.  It is never accepted from the finish caller.
+    pub evidence: FinishEvidence,
+    /// Closure observation for admitted descendants and external effects.
+    pub descendant_closure: DescendantClosure,
+    /// Authority owner reference for finish evaluation.
+    pub finish_authority_ref: String,
+    /// Optional explicit authority for a closing lifecycle action.
+    pub closure_authority_ref: Option<String>,
+}
+
+impl CanonicalFinishEvidence {
+    /// Validates the evidence against one active canonical fence.
+    pub fn validate(&self, expected_fence: &StateFence) -> Result<(), CompositionError> {
+        if &self.state_fence != expected_fence {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence has a stale state fence".to_owned(),
+            ));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        self.evidence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.evidence.task_id.trim().is_empty()
+            || self.evidence.task_id.chars().any(char::is_control)
+        {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence task identity is invalid".to_owned(),
+            ));
+        }
+        if self.finish_authority_ref.trim().is_empty()
+            || self.finish_authority_ref.chars().any(char::is_control)
+        {
+            return Err(CompositionError::Recovery(
+                "canonical finish authority reference is invalid".to_owned(),
+            ));
+        }
+        if let Some(reference) = &self.closure_authority_ref
+            && (reference.trim().is_empty() || reference.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical closure authority reference is invalid".to_owned(),
+            ));
+        }
+        // Keep the descendant/effect owner validation in the finish crate;
+        // serialization here only proves the owner boundary and fence.
+        let _ = &self.descendant_closure;
+        Ok(())
+    }
 }
 
 impl CanonicalAdmissionSnapshot {
@@ -846,6 +916,7 @@ impl CanonicalAdmissionSnapshot {
             state_fence,
             owner_revision,
             current_plan,
+            finish_evidence: None,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -864,6 +935,16 @@ impl CanonicalAdmissionSnapshot {
         if let Some(current_plan) = &self.current_plan {
             current_plan.validate()?;
         }
+        if let Some(finish_evidence) = &self.finish_evidence {
+            finish_evidence.validate(&self.state_fence)?;
+            if let Some(current_plan) = &self.current_plan
+                && current_plan.task_id.as_str() != finish_evidence.evidence.task_id
+            {
+                return Err(CompositionError::Recovery(
+                    "canonical finish evidence task does not match current plan".to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -874,6 +955,8 @@ struct CanonicalAdmissionSnapshotWire {
     state_fence: StateFence,
     owner_revision: u64,
     current_plan: Option<CanonicalPlanBinding>,
+    #[serde(default)]
+    finish_evidence: Option<CanonicalFinishEvidence>,
 }
 
 impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
@@ -882,7 +965,13 @@ impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
         D: serde::Deserializer<'de>,
     {
         let wire = CanonicalAdmissionSnapshotWire::deserialize(deserializer)?;
-        Self::new(wire.state_fence, wire.owner_revision, wire.current_plan)
+        let snapshot = Self {
+            state_fence: wire.state_fence,
+            owner_revision: wire.owner_revision,
+            current_plan: wire.current_plan,
+            finish_evidence: wire.finish_evidence,
+        };
+        snapshot.validate().map(|()| snapshot)
             .map_err(serde::de::Error::custom)
     }
 }
@@ -1039,6 +1128,33 @@ impl CanonicalAdmissionOwner {
                 "canonical current plan is absent; semantic activation is unavailable".to_owned(),
             )
         })
+    }
+
+    /// Reads the canonical finish evidence at the exact active fence.
+    ///
+    /// The result is owner state recovered from the Kernel named read.  A
+    /// missing record is a plan gap, never an empty evidence default, because
+    /// the finish service must not derive proof from the caller draft.
+    pub fn read_finish_evidence(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalFinishEvidence, CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.state_fence != *state_fence || self.scope.state_fence != *state_fence {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence read used a stale state fence".to_owned(),
+            ));
+        }
+        let evidence = self.snapshot.finish_evidence.clone().ok_or_else(|| {
+            CompositionError::Recovery(
+                "canonical finish evidence owner is absent; completion proof is unavailable"
+                    .to_owned(),
+            )
+        })?;
+        evidence.validate(state_fence)?;
+        Ok(evidence)
     }
 }
 
@@ -1845,6 +1961,49 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &self.owners.canonical,
             self.kernel.as_ref(),
         )
+    }
+
+    /// Borrows the single Governor FinishAttempt adapter.
+    ///
+    /// The adapter rehydrates the current task and canonical finish-evidence
+    /// owner at the retained fence, evaluates a scratch clone of the existing
+    /// [`FinishService`], and emits one `RecordFinishDecision` transition.
+    /// It never consumes provider result state as proof and never publishes a
+    /// local owner mutation.
+    #[must_use]
+    pub fn finish_attempt_service(&self) -> GovernorFinishAttempt<'_, P> {
+        let finish_revision = self
+            .recovery
+            .owner_reads
+            .iter()
+            .find(|read| read.owner == RecoveryOwner::Finish)
+            .map_or(0, |read| read.revision);
+        GovernorFinishAttempt::new(
+            &self.owners,
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+            finish_revision,
+        )
+    }
+
+    /// Runs the production FinishAttempt path and returns only after the
+    /// canonical receipt has committed. Publication is performed by the
+    /// daemon composition through `refresh_from_kernel`, using the same
+    /// committed-receipt boundary as the other daemon callers.
+    pub async fn finish_attempt(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<FinishDecisionReceipt, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        let receipt = {
+            let service = self.finish_attempt_service();
+            service.submit(identity, operation_id, draft).await?
+        };
+        Ok(receipt)
     }
 
     /// Borrows the single observation/verified-repair reconciliation owner as
@@ -3418,6 +3577,7 @@ mod tests {
                 state_fence: state_fence.clone(),
                 owner_revision: 1,
                 current_plan: None,
+                finish_evidence: None,
             }),
             RecoveryOwner::Task => serde_json::to_value(TaskLifecycleSnapshot {
                 next_sequence: 1,
@@ -3530,6 +3690,7 @@ mod tests {
                 task_id: TaskId::new("task-1").expect("task id"),
                 work_scope_id: "scope:work".to_owned(),
             }),
+            finish_evidence: None,
         }
     }
 
