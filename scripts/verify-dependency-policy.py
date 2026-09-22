@@ -149,6 +149,17 @@ def _read_stable_file_bytes(path: Path, label: str) -> tuple[bytes, tuple[object
     return b"".join(chunks), _stable_file_identity(after)
 
 
+def _pe_machine(payload: bytes) -> int | None:
+    """Return the PE machine value only when the payload is a well-formed PE."""
+
+    if len(payload) < 0x40 or payload[:2] != b"MZ":
+        return None
+    pe_offset = int.from_bytes(payload[0x3C:0x40], "little")
+    if pe_offset < 0 or pe_offset + 6 > len(payload) or payload[pe_offset : pe_offset + 4] != b"PE\0\0":
+        return None
+    return int.from_bytes(payload[pe_offset + 4 : pe_offset + 6], "little")
+
+
 def sha256_file(path: Path) -> str:
     payload, _ = _read_stable_file_bytes(path, "file")
     h = hashlib.sha256()
@@ -1018,30 +1029,68 @@ def _verified_private_executable(payload: bytes, label: str):
 
     with tempfile.TemporaryDirectory(prefix="eliot-verified-executable-") as temporary:
         private_path = Path(temporary) / "verified.exe"
-        fd: int | None = None
+        write_fd: int | None = None
         try:
-            fd = os.open(
+            write_fd = os.open(
                 private_path,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
                 0o700,
             )
             view = memoryview(payload)
             while view:
-                written = os.write(fd, view)
+                written = os.write(write_fd, view)
                 if written <= 0:
                     raise OSError(f"{label} private copy made no progress")
                 view = view[written:]
-            os.fsync(fd)
+            os.fsync(write_fd)
         finally:
-            if fd is not None:
-                os.close(fd)
+            if write_fd is not None:
+                os.close(write_fd)
 
-        observed, _ = _read_stable_file_bytes(private_path, f"{label} private copy")
-        if observed != payload:
-            raise OSError(f"{label} private copy changed before execution")
         if os.name != "nt":
             private_path.chmod(0o700)
-        yield private_path
+
+        # Keep the same no-follow handle open for the complete child lifetime.
+        # On Windows the handle denies delete/rename; on other platforms the
+        # post-exec identity and byte checks close the remaining replacement
+        # window.  The subprocess still receives the verified private path,
+        # never the evidence path that was originally inspected.
+        verify_fd: int | None = None
+        try:
+            verify_fd = _open_nofollow_read_handle(private_path)
+            before = os.fstat(verify_fd)
+            if getattr(before, "st_file_attributes", 0) & _REPARSE_POINT:
+                raise OSError(f"{label} private copy opened as a reparse point")
+            os.lseek(verify_fd, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            while chunk := os.read(verify_fd, 1024 * 1024):
+                chunks.append(chunk)
+            after = os.fstat(verify_fd)
+            if getattr(after, "st_file_attributes", 0) & _REPARSE_POINT:
+                raise OSError(f"{label} private copy became a reparse point")
+            observed = b"".join(chunks)
+            if _stable_file_identity(before) != _stable_file_identity(after) or observed != payload:
+                raise OSError(f"{label} private copy changed before execution")
+            yield private_path
+
+            # Re-read the held handle after the child exits.  This catches a
+            # replacement or in-place mutation even where the host does not
+            # enforce delete sharing for the temporary file.
+            after_exec = os.fstat(verify_fd)
+            os.lseek(verify_fd, 0, os.SEEK_SET)
+            post_chunks: list[bytes] = []
+            while chunk := os.read(verify_fd, 1024 * 1024):
+                post_chunks.append(chunk)
+            final = os.fstat(verify_fd)
+            if (
+                _stable_file_identity(before) != _stable_file_identity(after_exec)
+                or _stable_file_identity(after_exec) != _stable_file_identity(final)
+                or b"".join(post_chunks) != payload
+            ):
+                raise OSError(f"{label} private copy changed during execution")
+        finally:
+            if verify_fd is not None:
+                os.close(verify_fd)
 
 
 def _run_verified_executable(payload: bytes, args: list[str], root: Path, label: str) -> subprocess.CompletedProcess:
@@ -1594,6 +1643,7 @@ def _validate_patched_candidate(
     if not isinstance(candidate, dict):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate must be a project-local release lock table"))
         return {}
+    candidate_config_start = len(findings)
     for field in required:
         if field not in candidate:
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb patched_candidate missing '{field}'"))
@@ -1640,30 +1690,30 @@ def _validate_patched_candidate(
     if candidate.get("build_command") != expected_command:
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate build_command does not match the official Windows action"))
 
-    candidate_start = len(findings)
+    candidate_config_valid = len(findings) == candidate_config_start
+    artifact_execution_valid = candidate_config_valid
     artifact_path, artifact_bytes = _read_external_evidence_file(
         root, candidate.get("artifact_path"), "SurrealDB patched candidate artifact", findings
     )
     artifact_sha = hashlib.sha256(artifact_bytes).hexdigest() if artifact_bytes is not None else None
     if artifact_bytes is None:
+        artifact_execution_valid = False
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate artifact has not been provisioned locally"))
     else:
         if artifact_sha != candidate_sha:
+            artifact_execution_valid = False
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate bytes do not match the pinned SHA-256"))
         if candidate.get("artifact_size") != len(artifact_bytes):
+            artifact_execution_valid = False
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate byte length does not match the release asset"))
-        if len(artifact_bytes) < 0x40 or artifact_bytes[:2] != b"MZ":
+        machine = _pe_machine(artifact_bytes)
+        if machine is None:
+            artifact_execution_valid = False
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate is not a Windows PE artifact"))
-        else:
-            pe_offset = int.from_bytes(artifact_bytes[0x3C:0x40], "little")
-            machine = (
-                int.from_bytes(artifact_bytes[pe_offset + 4 : pe_offset + 6], "little")
-                if pe_offset + 6 <= len(artifact_bytes) and artifact_bytes[pe_offset : pe_offset + 4] == b"PE\0\0"
-                else None
-            )
-            if machine != 0x8664:
-                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate PE machine is not x86_64"))
-        if artifact_path is not None and artifact_bytes is not None:
+        elif machine != 0x8664:
+            artifact_execution_valid = False
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate PE machine is not x86_64"))
+        if artifact_execution_valid and artifact_path is not None:
             try:
                 proc = _run_verified_executable(
                     artifact_bytes,
@@ -1674,8 +1724,10 @@ def _validate_patched_candidate(
                 combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
                 observed_candidate_version = _extract_external_version(combined)
                 if proc.returncode != 0 or observed_candidate_version != str(candidate.get("version")):
+                    artifact_execution_valid = False
                     findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate version probe does not match the pinned release"))
             except (OSError, subprocess.TimeoutExpired) as exc:
+                artifact_execution_valid = False
                 findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb patched candidate version probe failed: {exc}"))
 
     release_path, _, release_data = _parse_external_json(
@@ -1739,7 +1791,7 @@ def _validate_patched_candidate(
         "provisioning": candidate.get("provisioning"),
         "installation_approval": candidate.get("installation_approval"),
         "artifact": {
-            "status": "verified" if artifact_bytes is not None and len(findings) == candidate_start else "findings",
+            "status": "verified" if artifact_bytes is not None and artifact_execution_valid else "findings",
             "path": str(artifact_path.relative_to(root)).replace("\\", "/") if artifact_path else None,
             "sha256": artifact_sha,
             "bytes": len(artifact_bytes) if artifact_bytes is not None else None,
@@ -1912,32 +1964,57 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
     observed_path: Path | None = None
     observed_sha = None
     observed_version = None
+    observed_payload: bytes | None = None
     version_probe: dict = {"status": "not_executed"}
+    observed_execution_valid = _HEX64.fullmatch(configured_sha) is not None
     if not isinstance(observed_path_value, str) or not Path(observed_path_value).is_absolute():
+        observed_execution_valid = False
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb observed_path must be an absolute path"))
     else:
         observed_path = Path(observed_path_value)
         if observed_path.name.lower() != str(surreal.get("name", "")).lower():
+            observed_execution_valid = False
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb observed_path filename does not match configured executable name"))
         if not observed_path.is_file() or observed_path.is_symlink():
+            observed_execution_valid = False
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb observed executable is not a regular file: {observed_path}"))
         else:
             try:
-                observed_sha = sha256_file(observed_path).lower()
+                observed_payload, _ = _read_stable_file_bytes(observed_path, "observed surrealdb executable")
+                observed_sha = hashlib.sha256(observed_payload).hexdigest().lower()
             except OSError as exc:
+                observed_execution_valid = False
                 findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"cannot hash observed surrealdb executable: {exc}"))
             if observed_sha and _HEX64.fullmatch(configured_sha) and observed_sha != configured_sha:
+                observed_execution_valid = False
                 findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb observed SHA-256 {observed_sha} differs from pinned {configured_sha}"))
+            if observed_payload is not None and not observed_payload:
+                observed_execution_valid = False
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb observed executable is empty"))
+            if observed_payload is not None:
+                machine = _pe_machine(observed_payload)
+                if machine is None:
+                    observed_execution_valid = False
+                    findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb observed executable is not a Windows PE artifact"))
+                elif machine != 0x8664:
+                    observed_execution_valid = False
+                    findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb observed executable PE machine is not x86_64"))
 
             version_args = surreal.get("version_args")
             if not isinstance(version_args, list) or any(not isinstance(arg, str) or not arg for arg in version_args):
+                observed_execution_valid = False
                 findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb version_args must be a non-empty string list"))
                 version_args = []
-            if version_args:
+            if observed_execution_valid and observed_payload is not None and version_args:
                 command = [str(observed_path), *version_args]
-                version_probe = {"command": command}
+                version_probe = {"command": command, "execution": "verified_private_copy"}
                 try:
-                    proc = subprocess.run(command, cwd=str(root), capture_output=True, text=True, timeout=30, check=False)
+                    proc = _run_verified_executable(
+                        observed_payload,
+                        version_args,
+                        root,
+                        "observed surrealdb executable",
+                    )
                     combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
                     observed_version = _extract_external_version(combined)
                     version_probe.update(
@@ -1949,10 +2026,13 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
                         }
                     )
                     if proc.returncode != 0 or not observed_version:
+                        observed_execution_valid = False
                         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb version probe did not produce a version"))
                     elif observed_version != str(surreal.get("version", "")):
+                        observed_execution_valid = False
                         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb observed version {observed_version} differs from pinned {surreal.get('version')}"))
                 except (OSError, subprocess.TimeoutExpired) as exc:
+                    observed_execution_valid = False
                     version_probe = {"status": "unavailable", "error": str(exc), "command": command}
                     findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb version probe failed: {exc}"))
 
@@ -2319,6 +2399,7 @@ def _scanner_advisory_binding_digest(execution: dict) -> str:
             "command": execution.get("command"),
             "input_snapshot_before_digest": execution.get("input_snapshot_before_digest"),
             "input_snapshot_after_digest": execution.get("input_snapshot_after_digest"),
+            "input_snapshot_digest": execution.get("input_snapshot_digest"),
             "input_snapshot_equal": execution.get("input_snapshot_equal"),
             "advisory_content_digest": execution.get("advisory_content_digest"),
             "scanner_identity": execution.get("scanner_identity"),
@@ -2361,6 +2442,23 @@ def _scanner_advisory_binding_is_valid(cargo_summary: dict) -> bool:
     before = execution.get("input_snapshot_before")
     after = execution.get("input_snapshot_after")
     if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    expected_before_digest = _canonical_digest(before)
+    expected_after_digest = _canonical_digest(after)
+    expected_snapshot_digest = _canonical_digest(
+        {
+            "before": before,
+            "after": after,
+            "equal": before == after,
+        }
+    )
+    if execution.get("input_snapshot_before_digest") != expected_before_digest:
+        return False
+    if execution.get("input_snapshot_after_digest") != expected_after_digest:
+        return False
+    if execution.get("input_snapshot_digest") != expected_snapshot_digest:
+        return False
+    if execution.get("input_snapshot_equal") is not (before == after):
         return False
     if any(
         not isinstance(snapshot, dict) or snapshot.get("status") != "verified"
@@ -2501,21 +2599,93 @@ def run_cargo_deny(
         execution["status"] = STATUS_TOOL_UNAVAILABLE
         return findings, STATUS_TOOL_UNAVAILABLE, {"_execution": execution}
 
+    expected_version = str(scanner_info.get("version", ""))
+    expected_digest = str(scanner_info.get("sha256", "")).lower()
+    scanner_config_errors: list[str] = []
+    if scanner_info.get("tool") != "cargo-deny":
+        scanner_config_errors.append("[scanner].tool must be cargo-deny")
+    if executable_name not in {"cargo-deny", "cargo-deny.exe"}:
+        scanner_config_errors.append("[scanner].executable must identify cargo-deny")
+    if not _SEMVER.fullmatch(expected_version):
+        scanner_config_errors.append("[scanner].version must be an exact semantic version")
+    if not _HEX64.fullmatch(expected_digest):
+        scanner_config_errors.append("[scanner].sha256 must be a 64-character hexadecimal digest")
+    configured_checks = scanner_info.get("checks")
+    required_checks = {"advisories", "bans", "licenses", "sources"}
+    if (
+        not isinstance(configured_checks, list)
+        or any(not isinstance(check, str) for check in configured_checks)
+        or set(configured_checks) != required_checks
+    ):
+        scanner_config_errors.append("[scanner].checks must contain advisories, bans, licenses and sources exactly once")
+
+    option_args, option_evidence, config_errors = _rust_policy_options(root, rust_policy)
+    execution.update(option_evidence)
+    for detail in scanner_config_errors:
+        findings.append(Finding(SCANNER_IDENTITY_FINDING, "config/dependency-policy.toml", 1, detail))
+    for detail in config_errors:
+        findings.append(Finding("DEP-002", "config/dependency-policy.toml", 1, detail))
+    if findings:
+        execution["status"] = STATUS_CONFLICTED
+        return findings, STATUS_CONFLICTED, {"_execution": execution}
+
+    scanner_payload: bytes | None = None
     try:
-        observed_digest = sha256_file(Path(exec_path)).lower()
+        scanner_payload, _ = _read_stable_file_bytes(Path(exec_path), "cargo-deny scanner")
+        observed_digest = hashlib.sha256(scanner_payload).hexdigest().lower()
     except OSError as exc:
         findings.append(Finding("DEP-001", "deny.toml", 1, f"cannot read scanner executable '{exec_path}': {exc}"))
         execution["status"] = STATUS_TOOL_UNAVAILABLE
         return findings, STATUS_TOOL_UNAVAILABLE, {"_execution": execution}
 
+    scanner_identity_valid = True
+    if not scanner_payload:
+        scanner_identity_valid = False
+        findings.append(Finding(SCANNER_IDENTITY_FINDING, "config/dependency-policy.toml", 1, "cargo-deny scanner executable is empty"))
+    scanner_machine = _pe_machine(scanner_payload) if scanner_payload is not None else None
+    if scanner_machine is None:
+        scanner_identity_valid = False
+        findings.append(Finding(SCANNER_IDENTITY_FINDING, "config/dependency-policy.toml", 1, "cargo-deny scanner is not a Windows PE artifact"))
+    elif scanner_machine != 0x8664:
+        scanner_identity_valid = False
+        findings.append(Finding(SCANNER_IDENTITY_FINDING, "config/dependency-policy.toml", 1, "cargo-deny scanner PE machine is not x86_64"))
+    if observed_digest != expected_digest:
+        scanner_identity_valid = False
+        findings.append(
+            Finding(
+                SCANNER_IDENTITY_FINDING,
+                "config/dependency-policy.toml",
+                1,
+                f"scanner executable SHA-256 mismatch: configured {expected_digest}, observed {observed_digest}",
+            )
+        )
+    execution.update(
+        {
+            "executable": str(Path(exec_path).resolve()),
+            "observed_sha256": observed_digest,
+            "observed_size": len(scanner_payload) if scanner_payload is not None else None,
+            "scanner_identity": {
+                "executable": str(Path(exec_path).resolve()),
+                "version": None,
+                "sha256": observed_digest,
+                "size": len(scanner_payload) if scanner_payload is not None else None,
+                "configured_version": expected_version,
+                "configured_sha256": expected_digest,
+            },
+            "scanner_identity_stable": False,
+            "execution_transport": "verified_private_copy",
+        }
+    )
+    if not scanner_identity_valid or scanner_payload is None:
+        execution["status"] = STATUS_CONFLICTED
+        return findings, STATUS_CONFLICTED, {"_execution": execution}
+
     try:
-        version_proc = subprocess.run(
-            [exec_path, "--version"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
+        version_proc = _run_verified_executable(
+            scanner_payload,
+            ["--version"],
+            root,
+            "cargo-deny scanner",
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         findings.append(Finding("DEP-001", "deny.toml", 1, f"cannot execute scanner identity probe: {exc}"))
@@ -2527,9 +2697,7 @@ def run_cargo_deny(
     observed_version = _scanner_version(version_output)
     execution.update(
         {
-            "executable": str(Path(exec_path).resolve()),
             "observed_version": observed_version,
-            "observed_sha256": observed_digest,
             "version_probe_exit_code": version_proc.returncode,
             "scanner_identity": {
                 "executable": str(Path(exec_path).resolve()),
@@ -2542,8 +2710,6 @@ def run_cargo_deny(
         }
     )
 
-    expected_version = str(scanner_info.get("version", ""))
-    expected_digest = str(scanner_info.get("sha256", "")).lower()
     if version_proc.returncode != 0 or not observed_version:
         findings.append(
             Finding(
@@ -2563,26 +2729,20 @@ def run_cargo_deny(
             )
         )
 
-    if expected_digest and observed_digest != expected_digest:
-        findings.append(
-            Finding(
-                SCANNER_IDENTITY_FINDING,
-                "config/dependency-policy.toml",
-                1,
-                f"scanner executable SHA-256 mismatch: configured {expected_digest}, observed {observed_digest}",
-            )
-        )
-
     if findings:
         execution["status"] = STATUS_CONFLICTED
         return findings, STATUS_CONFLICTED, {"_execution": execution}
 
     execution["identity_verified"] = True
-    option_args, option_evidence, config_errors = _rust_policy_options(root, rust_policy)
-    execution.update(option_evidence)
-    if config_errors:
-        for detail in config_errors:
-            findings.append(Finding("DEP-002", "config/dependency-policy.toml", 1, detail))
+    try:
+        scanner_pre_policy_payload, _ = _read_stable_file_bytes(Path(exec_path), "cargo-deny scanner before policy execution")
+        scanner_pre_policy_sha = hashlib.sha256(scanner_pre_policy_payload).hexdigest().lower()
+    except OSError as exc:
+        findings.append(Finding(SCANNER_IDENTITY_FINDING, "deny.toml", 1, f"cannot re-read scanner identity before policy execution: {exc}"))
+        execution["status"] = STATUS_CONFLICTED
+        return findings, STATUS_CONFLICTED, {"_execution": execution}
+    if scanner_pre_policy_sha != observed_digest:
+        findings.append(Finding(SCANNER_IDENTITY_FINDING, "deny.toml", 1, "scanner executable identity changed before cargo-deny policy execution"))
         execution["status"] = STATUS_CONFLICTED
         return findings, STATUS_CONFLICTED, {"_execution": execution}
 
@@ -2592,22 +2752,27 @@ def run_cargo_deny(
     if profile == "offline-source":
         option_args.append("--offline")
 
-    cmd = [exec_path, "--format", "json", "--color", "never"] + option_args + ["check"] + checks
+    policy_args = ["--format", "json", "--color", "never"] + option_args + ["check"] + checks
     execution["checks"] = checks
     execution["offline"] = profile == "offline-source"
-    execution["command"] = [str(arg) for arg in cmd]
+    execution["command"] = [str(Path(exec_path).resolve()), *[str(arg) for arg in policy_args]]
+    snapshot_start = len(findings)
     input_snapshot_before = _scanner_input_snapshot(root, rust_policy, findings)
     execution["input_snapshot_before"] = input_snapshot_before
     execution["input_snapshot_before_digest"] = _canonical_digest(input_snapshot_before)
+    if len(findings) != snapshot_start or any(
+        not isinstance(snapshot, dict) or snapshot.get("status") != "verified"
+        for snapshot in input_snapshot_before.values()
+    ):
+        execution["status"] = STATUS_CONFLICTED
+        return findings, STATUS_CONFLICTED, {"_execution": execution}
 
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(root),
-            capture_output=True,
-            text=False,
-            timeout=180,
-            check=False,
+        proc = _run_verified_executable(
+            scanner_payload,
+            policy_args,
+            root,
+            "cargo-deny scanner",
         )
     except subprocess.TimeoutExpired:
         findings.append(Finding("DEP-001", "deny.toml", 1, "cargo-deny execution timed out after 180s"))
@@ -2638,7 +2803,8 @@ def run_cargo_deny(
         }
     )
     try:
-        scanner_after_sha = sha256_file(Path(exec_path)).lower()
+        scanner_after_payload, _ = _read_stable_file_bytes(Path(exec_path), "cargo-deny scanner after policy execution")
+        scanner_after_sha = hashlib.sha256(scanner_after_payload).hexdigest().lower()
     except OSError as exc:
         scanner_after_sha = None
         findings.append(Finding(SCANNER_IDENTITY_FINDING, "deny.toml", 1, f"cannot re-read scanner identity after execution: {exc}"))
