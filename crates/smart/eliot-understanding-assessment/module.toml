@@ -23,7 +23,7 @@ owned_mutable_state = []
 allowed_effects = []
 inputs = ["immutable ActiveUnderstandingView by handle via eliot-context-assembly (contract_only)", "immutable accepted-source projection by handle (CC-006)", "immutable outcome/verifier evidence by handle"]
 outputs = ["CommonGroundAssessment candidate", "ScopedUnderstandingAssessment"]
-depends_on = ["eliot-context-contracts", "eliot-contracts"]
+depends_on = ["eliot-context-contracts", "eliot-contracts", "eliot-dreamer-contracts", "eliot-epistemic-contracts", "eliot-observation-contracts"]
 providers = ["A-15 admitted context contract", "accepted-source projection owner"]
 consumers = ["model/harness-change review path", "product acceptance path"]
 non_goals = ["second ContextCompiler invocation", "second admission pass", "mutable UnderstandingState", "semantic Understanding ownership", "global understands flag", "single understanding score"]
@@ -47,6 +47,22 @@ disposition = "authoritative definition"
 [[donor]]
 path = "docs/architecture/A06-07-eliot-self-knowledge.md"
 disposition = "authoritative contract"
+
+[[donor]]
+path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+disposition = "wave authority: order-85 frozen ActiveUnderstandingView input, unit-#3 accepted-source closure, unit-#4 experience legs; MemoryContextProjectionRequest stays NOT_FROZEN and is not implemented by this consumer"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-contracts/src/self_query/accepted.rs"
+disposition = "owner contract reused: AcceptedSourceProjection project()/validate()/check_cited() with frozen digest and exact-triple currency; cited by handle only"
+
+[[donor]]
+path = "crates/smart/eliot-epistemic-contracts/src/contribution.rs"
+disposition = "owner contract reused: ProviderContribution contribute()/validate() with closed position validation and envelope binding; cited by digest and claim only"
+
+[[donor]]
+path = "crates/foundation/eliot-observation-contracts/src/experience_projection.rs"
+disposition = "owner contract reused: JournalProjection/BankProjection/FeedbackProjection envelopes with owner coverage binding and closed omission classes; validated as wholes, fences carried"
 
 [agent_task]
 objective = "Freeze the owner-neutral Common Ground and scoped-understanding field contract with exact denominator; no implementation in this work unit."
