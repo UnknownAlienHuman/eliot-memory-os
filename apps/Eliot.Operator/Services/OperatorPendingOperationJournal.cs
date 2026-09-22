@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Eliot.Operator.Protocol;
@@ -13,7 +15,7 @@ namespace Eliot.Operator.Services;
 /// receipt is observed. A record left in Submitted/PossiblyExecuted state at
 /// process restart is conservatively promoted to UnknownReconciling, so a
 /// restart cannot create a second logical mutation.
-public sealed class OperatorPendingOperationJournal
+public sealed class OperatorPendingOperationJournal : IDisposable
 {
     public const int MaxOperations = 32;
     public const int MaxEnvelopeChars = 64 * 1024;
@@ -38,25 +40,107 @@ public sealed class OperatorPendingOperationJournal
         "token"
     ];
 
-    private readonly string _path;
-    private readonly object _gate = new();
+    // The named mutex is the cross-process writer lease. The process gate also
+    // covers accidental second journal objects in one UI process; a per-instance
+    // lock alone would still allow two stale arrays to replace one another.
+    private static readonly ConcurrentDictionary<string, object> ProcessGates = new(
+        StringComparer.OrdinalIgnoreCase);
 
-    private OperatorPendingOperationJournal(string path) => _path = path;
+    private readonly string? _path;
+    private readonly object _gate;
+    private readonly Mutex? _writerMutex;
+    private readonly string? _writerUnavailableReason;
+    private bool _writerOwned;
+    private bool _disposed;
+
+    private OperatorPendingOperationJournal(
+        string? path,
+        Mutex? writerMutex,
+        bool writerOwned,
+        string? writerUnavailableReason)
+    {
+        _path = path;
+        _gate = ProcessGates.GetOrAdd(path ?? "<unavailable>", static _ => new object());
+        _writerMutex = writerMutex;
+        _writerOwned = writerOwned;
+        _writerUnavailableReason = writerUnavailableReason;
+    }
 
     public static OperatorPendingOperationJournal CreateDefault()
     {
         var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         if (string.IsNullOrWhiteSpace(localAppData))
         {
-            throw new OperatorPendingOperationJournalException(
-                "user-local application data is unavailable; operator recovery is disabled");
+            return new OperatorPendingOperationJournal(
+                path: null,
+                writerMutex: null,
+                writerOwned: false,
+                writerUnavailableReason:
+                    "user-local application data is unavailable; operator mutations are disabled");
         }
 
-        return new OperatorPendingOperationJournal(Path.Combine(
+        var path = Path.Combine(
             localAppData,
             "Eliot",
             "Operator",
-            "pending-operations.json"));
+            "pending-operations.json");
+
+        Mutex? mutex = null;
+        try
+        {
+            mutex = new Mutex(initiallyOwned: false, BuildWriterMutexName(path));
+            bool acquired;
+            try
+            {
+                acquired = mutex.WaitOne(millisecondsTimeout: 0);
+            }
+            catch (AbandonedMutexException)
+            {
+                // The previous owner exited without disposing the lease. The
+                // OS has transferred ownership to this caller; the journal
+                // loader below will still promote every nonterminal record.
+                acquired = true;
+            }
+
+            if (!acquired)
+            {
+                mutex.Dispose();
+                return new OperatorPendingOperationJournal(
+                    path,
+                    writerMutex: null,
+                    writerOwned: false,
+                    writerUnavailableReason:
+                        "another Eliot Operator instance owns the pending-operation journal; this instance is read-only until it exits");
+            }
+
+            return new OperatorPendingOperationJournal(
+                path,
+                mutex,
+                writerOwned: true,
+                writerUnavailableReason: null);
+        }
+        catch (Exception error) when (
+            error is UnauthorizedAccessException
+            or IOException
+            or ArgumentException
+            or NotSupportedException
+            or System.Security.SecurityException)
+        {
+            mutex?.Dispose();
+            return new OperatorPendingOperationJournal(
+                path,
+                writerMutex: null,
+                writerOwned: false,
+                writerUnavailableReason:
+                    "the user-local pending-operation writer lease could not be established; operator mutations are disabled");
+        }
+    }
+
+    private static string BuildWriterMutexName(string path)
+    {
+        var canonicalPath = Path.GetFullPath(path).ToUpperInvariant();
+        var identity = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonicalPath)));
+        return $"Global\\Eliot.Operator.PendingOperationJournal.{identity}";
     }
 
     /// Loads records that survived a process boundary. Any non-terminal
@@ -66,6 +150,7 @@ public sealed class OperatorPendingOperationJournal
     {
         lock (_gate)
         {
+            EnsureWriter();
             var loaded = ReadLocked();
             var recovered = loaded
                 .Where(operation => !IsTerminal(operation.Phase))
@@ -81,12 +166,15 @@ public sealed class OperatorPendingOperationJournal
     }
 
     /// Replaces the complete bounded journal using a durable temp-file swap.
-    /// The caller owns the in-memory list and serializes calls through this
-    /// service; a failed write leaves the prior file intact.
+    /// The lifetime writer lease prevents a second process from replacing the
+    /// file from a stale in-memory array; the process gate covers additional
+    /// journal objects created in this process. A failed write leaves the prior
+    /// file intact and is reported through the typed recovery exception.
     public void Save(IReadOnlyCollection<OperatorPendingOperation> operations)
     {
         lock (_gate)
         {
+            EnsureWriter();
             ValidateCollection(operations);
             WriteLocked(operations.ToArray());
         }
@@ -94,21 +182,22 @@ public sealed class OperatorPendingOperationJournal
 
     private OperatorPendingOperation[] ReadLocked()
     {
-        if (!File.Exists(_path))
+        EnsureWriter();
+        if (!File.Exists(_path!))
         {
             return [];
         }
 
         try
         {
-            var info = new FileInfo(_path);
+            var info = new FileInfo(_path!);
             if (info.Length > MaxJournalBytes)
             {
                 throw new OperatorPendingOperationJournalException(
                     "pending operation journal exceeds its bounded size");
             }
 
-            var bytes = File.ReadAllBytes(_path);
+            var bytes = File.ReadAllBytes(_path!);
             var operations = JsonSerializer.Deserialize<OperatorPendingOperation[]>(bytes, Json)
                 ?? throw new OperatorPendingOperationJournalException(
                     "pending operation journal is empty or unreadable");
@@ -129,24 +218,30 @@ public sealed class OperatorPendingOperationJournal
 
     private void WriteLocked(IReadOnlyCollection<OperatorPendingOperation> operations)
     {
-        var directory = Path.GetDirectoryName(_path);
-        if (string.IsNullOrWhiteSpace(directory))
-        {
-            throw new OperatorPendingOperationJournalException(
-                "pending operation journal has no user-local directory");
-        }
-
-        Directory.CreateDirectory(directory);
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(operations, Json);
-        if (bytes.Length > MaxJournalBytes)
-        {
-            throw new OperatorPendingOperationJournalException(
-                "pending operation journal exceeds its bounded size");
-        }
-
-        var temporary = $"{_path}.tmp-{Guid.NewGuid():N}";
+        EnsureWriter();
+        string? temporary = null;
         try
         {
+            // Directory creation is part of the same typed persistence path as
+            // the file swap. A denied or unavailable user profile must block
+            // the owner send through TryPersistPendingState, never escape as an
+            // unclassified startup/command exception.
+            var directory = Path.GetDirectoryName(_path!);
+            if (string.IsNullOrWhiteSpace(directory))
+            {
+                throw new OperatorPendingOperationJournalException(
+                    "pending operation journal has no user-local directory");
+            }
+
+            Directory.CreateDirectory(directory);
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(operations, Json);
+            if (bytes.Length > MaxJournalBytes)
+            {
+                throw new OperatorPendingOperationJournalException(
+                    "pending operation journal exceeds its bounded size");
+            }
+
+            temporary = $"{_path!}.tmp-{Guid.NewGuid():N}";
             using (var stream = new FileStream(
                 temporary,
                 FileMode.CreateNew,
@@ -162,9 +257,15 @@ public sealed class OperatorPendingOperationJournal
             // MoveFileEx(REPLACE_EXISTING) is used by the Windows runtime for
             // this same-volume swap. The old file remains until the complete
             // new document has been flushed.
-            File.Move(temporary, _path, overwrite: true);
+            File.Move(temporary, _path!, overwrite: true);
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        catch (Exception error) when (
+            error is IOException
+            or UnauthorizedAccessException
+            or JsonException
+            or ArgumentException
+            or NotSupportedException
+            or System.Security.SecurityException)
         {
             throw new OperatorPendingOperationJournalException(
                 "pending operation journal could not be durably updated",
@@ -174,13 +275,54 @@ public sealed class OperatorPendingOperationJournal
         {
             try
             {
-                if (File.Exists(temporary)) File.Delete(temporary);
+                if (!string.IsNullOrWhiteSpace(temporary) && File.Exists(temporary)) File.Delete(temporary);
             }
             catch
             {
                 // Preserve the existing journal and surface the original
                 // update result; orphaned temp files contain only the bounded
                 // envelope and are never treated as a recovery journal.
+            }
+        }
+    }
+
+    private void EnsureWriter()
+    {
+        if (_disposed)
+        {
+            throw new OperatorPendingOperationJournalException(
+                "pending-operation journal has been disposed; operator mutations are disabled");
+        }
+
+        if (!_writerOwned || _writerMutex is null)
+        {
+            throw new OperatorPendingOperationJournalException(
+                _writerUnavailableReason
+                ?? "the pending-operation journal writer lease is unavailable; operator mutations are disabled");
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            if (!_writerOwned || _writerMutex is null) return;
+
+            try
+            {
+                _writerMutex.ReleaseMutex();
+            }
+            catch (ApplicationException)
+            {
+                // The OS may already have released the lease during process
+                // teardown. Disposal must not mask the window close path.
+            }
+            finally
+            {
+                _writerOwned = false;
+                _writerMutex.Dispose();
             }
         }
     }

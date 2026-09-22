@@ -12,14 +12,16 @@ namespace Eliot.Operator;
 public sealed partial class MainWindow : Window
 {
     private readonly GovernorPipeClient _client;
+    private readonly OperatorPendingOperationJournal _pendingJournal;
     public MainViewModel ViewModel { get; }
 
     public MainWindow()
     {
         _client = new GovernorPipeClient(new RuntimeDiscoveryService());
+        _pendingJournal = OperatorPendingOperationJournal.CreateDefault();
         ViewModel = new MainViewModel(
             _client,
-            OperatorPendingOperationJournal.CreateDefault());
+            _pendingJournal);
         InitializeComponent();
         ViewModel.PropertyChanged += (_, args) =>
         {
@@ -263,5 +265,15 @@ public sealed partial class MainWindow : Window
         UnknownOutcomePanel.Visibility = ViewModel.HasUnknownOperations ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    private async void MainWindow_OnClosed(object sender, WindowEventArgs args) => await _client.DisposeAsync();
+    private async void MainWindow_OnClosed(object sender, WindowEventArgs args)
+    {
+        try
+        {
+            await _client.DisposeAsync();
+        }
+        finally
+        {
+            _pendingJournal.Dispose();
+        }
+    }
 }
