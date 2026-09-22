@@ -216,7 +216,7 @@ max_required_bytes = 458752
 [[route]]
 id = "workscope-identity"
 description = "WorkScope identity, evidence-first resolution order, authenticated proposals, ScopeBindingGuard revalidation, and scope transition."
-path_globs = ["crates/governor/eliot-workscope/**", "crates/governor/eliot-governor/**"]
+path_globs = ["crates/governor/eliot-workscope/**", "crates/governor/eliot-governor/**", "crates/foundation/eliot-bootstrap/**"]
 topic_keywords = ["workscope", "scope identity", "resolution order", "scope binding guard", "scope candidate", "bootstrap scanner", "scope transition", "scope resolution receipt"]
 required_handles = ["I4", "I4.1", "I4.2", "I4.2.1", "I4.3", "I4.3.1", "I4.7"]
 optional_handles = ["I4.4", "I4.4.1", "I4.5", "I4.6", "I4.8", "I4.*"]
@@ -296,4 +296,9 @@ expect_routes = ["repository-root"]
 [[coverage.example]]
 path = "crates/governor/eliot-workscope/src/lib.rs"
 topic = "WorkScope identity resolution"
+expect_routes = ["generic-source", "workscope-identity"]
+
+[[coverage.example]]
+path = "crates/foundation/eliot-bootstrap/src/capture.rs"
+topic = "workspace instance observation"
 expect_routes = ["generic-source", "workscope-identity"]
