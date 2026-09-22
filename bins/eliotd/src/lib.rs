@@ -725,21 +725,27 @@ impl DaemonComposition {
         ))
     }
 
-    /// Serves one live `ControlBoard` inbox for the single owner session (#1780).
+    /// Serves one live `ControlBoard` inbox for one observed envelope (#1780).
     ///
-    /// Dedicated daemon serve path over the current Governor projection
-    /// snapshot: admits the serve request from the held Kernel-issued owner
-    /// facts (unadmitted when absent), builds one board through
-    /// [`Self::controlboard`], and serves the exact-revision inbox section
-    /// via [`controlboard_serve`]. No owner session → typed access-resolver
-    /// gap; Governor not ready → composition error; view refusals → typed
-    /// board gaps. Pure in-memory reads: no I/O, no new thread, no stored
-    /// client, no run-loop change.
-    pub fn serve_controlboard_inbox(
+    /// Per-request serve dispatch over the current Governor projection
+    /// snapshot: verifies the envelope's session claim against the held
+    /// Kernel-issued owner facts (foreign or absent claim skips
+    /// explicitly), builds one board through [`Self::controlboard`], and
+    /// serves the fence-pinned inbox from the envelope's observed fields
+    /// via [`controlboard_serve`]. No owner session → typed
+    /// access-resolver gap; Governor not ready → composition error; view
+    /// refusals → typed board gaps. Pure in-memory reads: no I/O, no new
+    /// thread, no stored client, no new scheduler.
+    pub fn serve_board_for_envelope(
         &self,
-    ) -> Result<controlboard_serve::ServedBoardInbox, controlboard_serve::ControlboardServeError>
+        envelope: &eliot_protocol::HostRequestEnvelope,
+    ) -> Result<controlboard_serve::BoardServeDispatch, controlboard_serve::ControlboardServeError>
     {
-        controlboard_serve::serve_live_inbox(self.owner_session.as_ref(), || self.controlboard())
+        controlboard_serve::serve_board_for_envelope(
+            self.owner_session.as_ref(),
+            || self.controlboard(),
+            envelope,
+        )
     }
 
     /// Borrows the single Governor Skill lifecycle owner as a forwarding
