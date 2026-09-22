@@ -3197,6 +3197,7 @@ dependencies = [
  "eliot-agent-coordinator",
  "eliot-authority",
  "eliot-config",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-controlboard",
  "eliot-doctor-core",

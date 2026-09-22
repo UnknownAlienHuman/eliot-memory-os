@@ -661,6 +661,23 @@ async fn run_loop(
                 // gate: it must start even while an activation is in flight,
                 // so its gate is checked before the activation early-continue.
                 maybe_start_local_read_poll(&kernel, &composition, &mut local_read_flight);
+                // Reactive planning rides this existing activation cadence;
+                // it does not create a second scheduler. A registered source
+                // is read under a fresh authenticated activation and every
+                // malformed/stale owner projection fails the daemon loop
+                // closed. Until the real A4 source is registered, `None` is
+                // an explicit unconfigured state and no empty plan is made.
+                let now = unix_ms(SystemTime::now())?;
+                if let Some(outcome) = composition
+                    .drive_registered_reactive_feed(now)
+                    .map_err(|error| format!("daemon reactive feed tick: {error}"))?
+                {
+                    tracing::debug!(
+                        target: "eliotd::reactive_feed",
+                        ?outcome,
+                        event = "eliotd.reactive_feed_tick",
+                    );
+                }
                 if decide_activation_tick(&flight) == ActivationTickDecision::StartClaim {
                     flight = ActivationFlight::InFlight(ActivationFlightState {
                         future: start_activation_claim(&kernel),

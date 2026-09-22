@@ -21,6 +21,7 @@ eliot-agent-coordinator.workspace = true
 eliot-authority.workspace = true
 eliot-contracts.workspace = true
 eliot-config.workspace = true
+eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts" }
 eliot-controlboard.workspace = true
 eliot-doctor-core.workspace = true
 eliot-dreamer-bundle = { path = "../../crates/smart/eliot-dreamer-bundle" }
