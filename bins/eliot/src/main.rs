@@ -24,11 +24,13 @@ use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
     ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
 };
+use eliot_notify::NotifyDeclarationInputs;
+use eliot_host::{NotifyFallbackSetupInputs, setup_notify_fallback_per_user};
 use eliot_platform_windows::{
     FileIdentity, InstallerRootError, InstallerRootObjectSnapshot,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
     PackageStagingError, PackageStagingStage, ProtectedRootLease, ProtectedRuntimePathLease,
-    TrustedSourceBundle, TrustedSourceFileLease, WindowsInstallerRootPrimitive,
+    TrustedSourceBundle, TrustedSourceFileLease, UserOwnedRootLease, WindowsInstallerRootPrimitive,
     is_eliot_governor_running, is_process_elevated, observe_current_user_config,
     windows_path_identity_digest,
 };
@@ -320,6 +322,48 @@ enum InstallationCommand {
         profile_anchor_root: PathBuf,
         #[arg(long)]
         installation_key: Option<String>,
+    },
+    /// Publish the per-user Notify fallback declaration and register the
+    /// signed Task Scheduler fallback. Runs in the interactive session
+    /// matching `--sid`/`--session-id`; normal launch stays User-Broker
+    /// owned (I11.6). No process is spawned by this command.
+    SetupNotifyFallback {
+        /// Stable installation identity.
+        #[arg(long)]
+        installation: String,
+        /// Declared fallback audience.
+        #[arg(long)]
+        audience: String,
+        /// Non-zero authority epoch.
+        #[arg(long)]
+        authority_epoch: u64,
+        /// Watchdog signing key identifier.
+        #[arg(long)]
+        key_id: String,
+        /// Lowercase hex Watchdog verifying key (public half only).
+        #[arg(long)]
+        public_key: String,
+        /// Absolute installed `eliot-notify.exe` path.
+        #[arg(long, value_parser = absolute_path)]
+        notify_exe: PathBuf,
+        /// Lowercase SHA-256 of the installed image bytes.
+        #[arg(long)]
+        notify_digest: String,
+        /// Interactive user SID the fallback is bound to.
+        #[arg(long)]
+        sid: String,
+        /// Interactive session id the fallback is bound to.
+        #[arg(long)]
+        session_id: u32,
+        /// Explicit installation profile (`system_service`, `user_mode`, or `portable_dev`).
+        #[arg(long, value_parser = parse_installation_profile)]
+        profile: InstallationProfile,
+        /// Absolute OS-validated profile anchor root.
+        #[arg(long, value_parser = absolute_path)]
+        profile_anchor_root: PathBuf,
+        /// Absolute create-new diagnostic JSON path.
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
     },
     /// Stage one update package into a new versioned directory without
     /// overwriting the running executable. `eliot-kernel` and `eliot-host`
@@ -1609,6 +1653,33 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             agent_bridge_exe,
             agent_bridge_account,
         ),
+        InstallationCommand::SetupNotifyFallback {
+            installation,
+            audience,
+            authority_epoch,
+            key_id,
+            public_key,
+            notify_exe,
+            notify_digest,
+            sid,
+            session_id,
+            profile,
+            profile_anchor_root,
+            output,
+        } => run_installation_setup_notify_fallback(
+            installation,
+            audience,
+            authority_epoch,
+            key_id,
+            public_key,
+            notify_exe,
+            notify_digest,
+            sid,
+            session_id,
+            profile,
+            profile_anchor_root,
+            output,
+        ),
         InstallationCommand::StageUpdate {
             install_root,
             package,
@@ -1954,6 +2025,87 @@ where
         output_path: output,
         store_path,
     })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "per-user setup carries the full explicit declaration field set"
+)]
+fn run_installation_setup_notify_fallback(
+    installation: String,
+    audience: String,
+    authority_epoch: u64,
+    key_id: String,
+    public_key: String,
+    notify_exe: PathBuf,
+    notify_digest: String,
+    sid: String,
+    session_id: u32,
+    profile: InstallationProfile,
+    profile_anchor_root: PathBuf,
+    output: PathBuf,
+) -> Result<i32> {
+    use eliot_host::HostError;
+    let portable_root = match profile {
+        InstallationProfile::PortableDev => Some(
+            UserOwnedRootLease::open_existing(&profile_anchor_root)
+                .map_err(|error| anyhow::anyhow!("portable setup root is not provisioned: {error}"))?,
+        ),
+        InstallationProfile::SystemService | InstallationProfile::UserMode => None,
+    };
+    let inputs = NotifyFallbackSetupInputs {
+        declaration: NotifyDeclarationInputs {
+            installation_identity: cli_handle(installation.clone(), "installation")?,
+            audience: cli_handle(audience.clone(), "audience")?,
+            authority_epoch,
+            key_id: cli_handle(key_id.clone(), "key_id")?,
+            public_key,
+            notify_executable: notify_exe.to_string_lossy().into_owned(),
+            notify_artifact_sha256: notify_digest,
+            interactive_user_sid: sid,
+            interactive_session_id: session_id,
+        },
+        profile,
+        portable_root,
+    };
+    let setup = match eliot_host::setup_notify_fallback_per_user(&inputs) {
+        Ok(setup) => setup,
+        Err(error) => {
+            if let HostError::RecoveryRequired(_) = &error {
+                write_installation_error(
+                    "NOTIFY_FALLBACK_SETUP_RECOVERY_REQUIRED",
+                    &error.to_string(),
+                );
+                return Ok(UNKNOWN_OUTCOME_EXIT);
+            }
+            write_installation_error("NOTIFY_FALLBACK_SETUP_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let receipt = serde_json::to_string_pretty(&json!({
+        "contract": "eliot.kernel.installation",
+        "contract_version": INSTALLATION_CONTRACT_VERSION,
+        "status": "NOTIFY_FALLBACK_SETUP_PUBLISHED",
+        "output_role": "DIAGNOSTIC_NON_IMPORTABLE",
+        "declaration_path": setup.declaration.declaration_path.display().to_string(),
+        "declaration_digest": setup.declaration.declaration_digest.as_str(),
+        "task_name": setup.registration.task_name,
+        "sid": setup.registration.sid,
+        "session_id": setup.registration.session_id,
+        "notify_artifact_sha256": setup.registration.notify_artifact_sha256,
+        "verifier_sha256": setup.registration.verifier_sha256,
+        "task_xml_sha256": setup.registration.task_xml_sha256,
+    }))?;
+    let mut output_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .map_err(|error| anyhow::anyhow!("open setup output: {error}"))?;
+    output_file
+        .write_all(receipt.as_bytes())
+        .map_err(|error| anyhow::anyhow!("write setup output: {error}"))?;
+    println!("{receipt}");
+    Ok(0)
 }
 
 #[allow(
@@ -4569,6 +4721,63 @@ mod tests {
             _ => panic!("expected installation command"),
         }
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installation_setup_notify_fallback_parses_explicit_per_user_fields() {
+        let cli = Cli::try_parse_from([
+            "eliot",
+            "installation",
+            "setup-notify-fallback",
+            "--installation",
+            "installation:test",
+            "--audience",
+            "audience:test",
+            "--authority-epoch",
+            "7",
+            "--key-id",
+            "key:test",
+            "--public-key",
+            &"ab".repeat(32),
+            "--notify-exe",
+            r"C:\Eliot\eliot-notify.exe",
+            "--notify-digest",
+            &"cd".repeat(32),
+            "--sid",
+            "S-1-5-21-1-2-3-1001",
+            "--session-id",
+            "1",
+            "--profile",
+            "portable_dev",
+            "--profile-anchor-root",
+            r"C:\Eliot\anchor",
+            "--output",
+            r"C:\Eliot\setup-output.json",
+        ])
+        .expect("setup-notify-fallback must parse");
+        match cli.command {
+            Command::Installation { command } => match command {
+                InstallationCommand::SetupNotifyFallback {
+                    installation,
+                    audience,
+                    authority_epoch,
+                    key_id,
+                    session_id,
+                    profile,
+                    ..
+                } => {
+                    assert_eq!(installation, "installation:test");
+                    assert_eq!(audience, "audience:test");
+                    assert_eq!(authority_epoch, 7);
+                    assert_eq!(key_id, "key:test");
+                    assert_eq!(session_id, 1);
+                    assert_eq!(profile, InstallationProfile::PortableDev);
+                }
+                _ => panic!("expected setup-notify-fallback command"),
+            },
+            _ => panic!("expected installation command"),
+        }
     }
 
     fn honest_cli_temp_root(prefix: &str) -> PathBuf {
