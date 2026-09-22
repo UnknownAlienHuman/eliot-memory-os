@@ -589,16 +589,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
             string? receiptId;
             try
             {
-                accepted = receipt.GetProperty("accepted").GetBoolean();
-                executed = receipt.GetProperty("executed").GetBoolean();
-                outcome = receipt.GetProperty("outcome").GetString() ?? "unknown";
-                receiptId = receipt.TryGetProperty("canonical_receipt", out var canonicalReceipt)
-                    && canonicalReceipt.ValueKind == JsonValueKind.Object
-                    && canonicalReceipt.TryGetProperty("receipt_id", out var canonicalReceiptId)
-                        ? canonicalReceiptId.GetString()
-                        : null;
+                var parsed = ReadCommandReceipt(receipt, pending);
+                accepted = parsed.Accepted;
+                executed = parsed.Executed;
+                outcome = parsed.Outcome;
+                receiptId = parsed.ReceiptId;
             }
-            catch (Exception error) when (error is InvalidOperationException or KeyNotFoundException)
+            catch (Exception error) when (error is InvalidOperationException or KeyNotFoundException or JsonException)
             {
                 // The owner answered but the receipt shape proves nothing:
                 // retain the same identity for reconciliation.
@@ -721,6 +718,74 @@ public sealed class MainViewModel : INotifyPropertyChanged
             IsBusy = false;
             NotifyCounts();
         }
+    }
+
+    private static (bool Accepted, bool Executed, string Outcome, string? ReceiptId) ReadCommandReceipt(
+        JsonElement receipt,
+        OperatorPendingOperation pending)
+    {
+        if (receipt.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("operator command receipt must be one JSON object");
+        }
+
+        if (!receipt.TryGetProperty("operation_id", out var operationId)
+            || operationId.ValueKind != JsonValueKind.String
+            || !string.Equals(operationId.GetString(), pending.OperationId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("operator command receipt is bound to a different operation");
+        }
+
+        if (!receipt.TryGetProperty("expected_revision", out var expectedRevision)
+            || expectedRevision.ValueKind != JsonValueKind.Number
+            || !expectedRevision.TryGetUInt64(out var receiptExpectedRevision)
+            || receiptExpectedRevision != pending.ExpectedRevision)
+        {
+            throw new InvalidOperationException("operator command receipt is bound to a different expected revision");
+        }
+
+        if (!receipt.TryGetProperty("revision", out var revision)
+            || revision.ValueKind != JsonValueKind.Number
+            || !revision.TryGetUInt64(out var receiptRevision)
+            || receiptRevision != pending.ExpectedRevision)
+        {
+            throw new InvalidOperationException("operator command receipt has an unbound task revision");
+        }
+
+        if (!receipt.TryGetProperty("accepted", out var acceptedValue)
+            || (acceptedValue.ValueKind != JsonValueKind.True && acceptedValue.ValueKind != JsonValueKind.False)
+            || !receipt.TryGetProperty("executed", out var executedValue)
+            || (executedValue.ValueKind != JsonValueKind.True && executedValue.ValueKind != JsonValueKind.False))
+        {
+            throw new InvalidOperationException("operator command receipt has no typed terminal disposition");
+        }
+
+        if (!receipt.TryGetProperty("outcome", out var outcomeValue)
+            || outcomeValue.ValueKind != JsonValueKind.String
+            || string.IsNullOrWhiteSpace(outcomeValue.GetString())
+            || string.Equals(outcomeValue.GetString(), "unknown", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("operator command receipt has no proven outcome");
+        }
+
+        var accepted = acceptedValue.GetBoolean();
+        var executed = executedValue.GetBoolean();
+        string? receiptId = null;
+        if (receipt.TryGetProperty("canonical_receipt", out var canonicalReceipt)
+            && canonicalReceipt.ValueKind == JsonValueKind.Object
+            && canonicalReceipt.TryGetProperty("receipt_id", out var canonicalReceiptId)
+            && canonicalReceiptId.ValueKind == JsonValueKind.String)
+        {
+            receiptId = canonicalReceiptId.GetString();
+            if (string.IsNullOrWhiteSpace(receiptId)) receiptId = null;
+        }
+
+        if (executed != (receiptId is not null) || (executed && !accepted))
+        {
+            throw new InvalidOperationException("operator command receipt has an inconsistent canonical disposition");
+        }
+
+        return (accepted, executed, outcomeValue.GetString()!, receiptId);
     }
 
     private bool ReplacePending(string operationId, OperatorOperationPhase phase)

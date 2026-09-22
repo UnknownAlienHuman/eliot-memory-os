@@ -992,6 +992,10 @@ pub enum OperatorCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OperatorCommandReceipt {
+    /// The exact retained UI idempotency identity that the owner evaluated.
+    pub operation_id: String,
+    /// The task revision supplied by the caller and checked before dispatch.
+    pub expected_revision: u64,
     pub command_id: String,
     pub accepted: bool,
     pub executed: bool,

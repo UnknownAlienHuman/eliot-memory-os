@@ -432,6 +432,9 @@ pub mod kernel_client {
         ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
         ProtocolVersion, RequestIdentity, ServerHello,
     };
+    pub use eliot_user_broker_core::{
+        OperatorLaunchReceipt, OperatorLaunchRestartReceipt,
+    };
     use serde::Deserialize;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
@@ -531,11 +534,12 @@ pub mod kernel_client {
         pub capabilities: Vec<String>,
     }
 
-    /// Provider-neutral launch receipt returned by the User Broker/Kernel
-    /// boundary.  Its fields intentionally remain opaque to the CLI.
+    /// Closed outer envelope returned by the serving Kernel/User Broker owner.
+    /// The nested body is decoded into the broker-core owner projection below;
+    /// a non-empty JSON object is never sufficient.
     #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
-    pub struct OperatorLaunchReceipt {
+    struct OperatorLaunchWireEnvelope {
         pub operation_id: String,
         pub status: String,
         pub receipt: Value,
@@ -659,12 +663,14 @@ pub mod kernel_client {
                     .enable_all()
                     .build()
                     .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+                let expected_operation_id = identity.idempotency_key.clone();
                 let served = runtime.block_on(self.transact_async(
                     OPERATOR_LAUNCH_OPERATION,
                     payload,
                     identity,
                 ))?;
-                let (status, receipt) = decode_operator_launch_receipt(&served)?;
+                let (status, receipt) =
+                    decode_operator_launch_receipt(&served, &expected_operation_id)?;
                 match status {
                     OperatorLaunchStatus::Admitted => Ok(receipt),
                     OperatorLaunchStatus::RestartRequired => {
@@ -1053,47 +1059,92 @@ pub mod kernel_client {
     }
 
     /// Decodes the serving owner's launch receipt closed: the operation
-    /// identity is non-empty and control-character free, the status is one of
-    /// the two admitted dispositions, and the receipt body is a JSON object.
-    /// Anything else is an unknown outcome for same-operation reconciliation,
-    /// never a rejection and never an admission.
+    /// identity is the exact admitted request identity, the status is one of
+    /// the two admitted dispositions, and the receipt body is the closed
+    /// broker-core owner projection. Anything else is an unknown outcome for
+    /// same-operation reconciliation, never a rejection and never an
+    /// admission.
     fn decode_operator_launch_receipt(
         served: &Value,
+        expected_operation_id: &str,
     ) -> Result<(OperatorLaunchStatus, Value), KernelClientError> {
-        let operation_id = served
-            .get("operation_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                KernelClientError::UnknownOutcome(
-                    "Kernel operator launch reply has no operation identity".to_owned(),
-                )
-            })?;
-        if operation_id.trim().is_empty()
-            || operation_id.len() > 256
-            || operation_id.chars().any(char::is_control)
+        if expected_operation_id.trim().is_empty()
+            || expected_operation_id.len() > 256
+            || expected_operation_id.chars().any(char::is_control)
         {
             return Err(KernelClientError::UnknownOutcome(
-                "Kernel operator launch operation identity is invalid".to_owned(),
+                "Kernel operator launch request identity is invalid".to_owned(),
             ));
         }
-        let status = match served.get("status").and_then(Value::as_str) {
-            Some("admitted") => OperatorLaunchStatus::Admitted,
-            Some("restart_required") => OperatorLaunchStatus::RestartRequired,
+        let envelope: OperatorLaunchWireEnvelope = serde_json::from_value(served.clone())
+            .map_err(|error| {
+                KernelClientError::UnknownOutcome(format!(
+                    "Kernel operator launch reply is not a closed envelope: {error}"
+                ))
+            })?;
+        if envelope.operation_id != expected_operation_id {
+            return Err(KernelClientError::UnknownOutcome(
+                "Kernel operator launch receipt identity does not match the request"
+                    .to_owned(),
+            ));
+        }
+        match envelope.status.as_str() {
+            "admitted" => {
+                let receipt: OperatorLaunchReceipt =
+                    serde_json::from_value(envelope.receipt).map_err(|error| {
+                        KernelClientError::UnknownOutcome(format!(
+                            "Kernel operator launch admitted receipt is not typed: {error}"
+                        ))
+                    })?;
+                receipt.validate().map_err(|error| {
+                    KernelClientError::UnknownOutcome(format!(
+                        "Kernel operator launch admitted receipt failed owner validation: {error}"
+                    ))
+                })?;
+                if receipt.operation_id.as_str() != expected_operation_id {
+                    return Err(KernelClientError::UnknownOutcome(
+                        "Kernel operator launch admitted receipt identity does not match the request"
+                            .to_owned(),
+                    ));
+                }
+                let projected = serde_json::to_value(receipt).map_err(|error| {
+                    KernelClientError::UnknownOutcome(format!(
+                        "Kernel operator launch admitted receipt could not be projected: {error}"
+                    ))
+                })?;
+                Ok((OperatorLaunchStatus::Admitted, projected))
+            }
+            "restart_required" => {
+                let receipt: OperatorLaunchRestartReceipt =
+                    serde_json::from_value(envelope.receipt).map_err(|error| {
+                        KernelClientError::UnknownOutcome(format!(
+                            "Kernel operator restart receipt is not typed: {error}"
+                        ))
+                    })?;
+                receipt.validate().map_err(|error| {
+                    KernelClientError::UnknownOutcome(format!(
+                        "Kernel operator restart receipt failed owner validation: {error}"
+                    ))
+                })?;
+                if receipt.operation_id.as_str() != expected_operation_id {
+                    return Err(KernelClientError::UnknownOutcome(
+                        "Kernel operator restart receipt identity does not match the request"
+                            .to_owned(),
+                    ));
+                }
+                let projected = serde_json::to_value(receipt).map_err(|error| {
+                    KernelClientError::UnknownOutcome(format!(
+                        "Kernel operator restart receipt could not be projected: {error}"
+                    ))
+                })?;
+                Ok((OperatorLaunchStatus::RestartRequired, projected))
+            }
             _ => {
                 return Err(KernelClientError::UnknownOutcome(
                     "Kernel operator launch disposition is not a closed receipt".to_owned(),
                 ));
             }
-        };
-        if served
-            .get("receipt")
-            .is_none_or(|receipt| !receipt.is_object())
-        {
-            return Err(KernelClientError::UnknownOutcome(
-                "Kernel operator launch receipt body is not a typed object".to_owned(),
-            ));
         }
-        Ok((status, served.clone()))
     }
 
     #[cfg(test)]
@@ -1191,19 +1242,21 @@ pub mod kernel_client {
             let admitted = serde_json::json!({
                 "operation_id": "op-launch-1",
                 "status": "admitted",
-                "receipt": {"handoff": "owner-issued"},
+                "receipt": valid_operator_launch_receipt("op-launch-1"),
             });
-            let (status, receipt) =
-                decode_operator_launch_receipt(&admitted).expect("admitted receipt");
+            let (status, receipt) = decode_operator_launch_receipt(&admitted, "op-launch-1")
+                .expect("admitted receipt");
             assert_eq!(status, OperatorLaunchStatus::Admitted);
-            assert_eq!(receipt, admitted);
+            assert_eq!(receipt, admitted["receipt"]);
             let restart = serde_json::json!({
                 "operation_id": "op-launch-2",
                 "status": "restart_required",
-                "receipt": {},
+                "receipt": valid_operator_restart_receipt("op-launch-2"),
             });
-            let (status, _) = decode_operator_launch_receipt(&restart).expect("restart receipt");
+            let (status, receipt) = decode_operator_launch_receipt(&restart, "op-launch-2")
+                .expect("restart receipt");
             assert_eq!(status, OperatorLaunchStatus::RestartRequired);
+            assert_eq!(receipt, restart["receipt"]);
         }
 
         #[test]
@@ -1224,16 +1277,101 @@ pub mod kernel_client {
                     "status": "admitted",
                     "receipt": "flat-string-is-not-a-receipt",
                 }),
+                serde_json::json!({
+                    "operation_id": "op-launch-5",
+                    "status": "admitted",
+                    "receipt": {"handoff": "unbound-object"},
+                }),
                 serde_json::json!({"status": "admitted", "receipt": {}}),
             ] {
                 assert!(
                     matches!(
-                        decode_operator_launch_receipt(&served),
+                        decode_operator_launch_receipt(
+                            &served,
+                            served
+                                .get("operation_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("missing"),
+                        ),
                         Err(KernelClientError::UnknownOutcome(_))
                     ),
                     "open launch shape must stay unknown: {served}"
                 );
             }
+        }
+
+        fn valid_operator_launch_receipt(operation_id: &str) -> Value {
+            serde_json::json!({
+                "wire_id": "eliot.user-broker.operator-launch-receipt",
+                "wire_version": 1,
+                "operation_id": operation_id,
+                "request_digest": "a".repeat(64),
+                "registration_digest": "b".repeat(64),
+                "user_broker_epoch": 1,
+                "fence_id": "operator-fence",
+                "process_receipt": {
+                    "binding": {
+                        "operation_id": operation_id,
+                        "process_tree_id": "operator-tree",
+                        "job_id": "operator-job",
+                        "image_id": "operator-image",
+                        "session_id": "operator-session",
+                        "generation": 1,
+                        "action_lease_ref": "operator-lease",
+                        "authority_id": "eliot",
+                        "authority_epoch": {
+                            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                            "sequence": 1
+                        },
+                        "state_fence": {
+                            "authority_epoch": {
+                                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                                "sequence": 1
+                            },
+                            "generation": 1,
+                            "nonce": "operator-fence-nonce"
+                        },
+                        "request_digest": "a".repeat(64),
+                        "permit_digest": "b".repeat(64),
+                        "effect_digest": "c".repeat(64),
+                        "validation_revision": 1
+                    },
+                    "identity": {
+                        "suspended": {
+                            "process_id": "operator-process",
+                            "process_tree_id": "operator-tree",
+                            "job_id": "operator-job",
+                            "image_id": "operator-image",
+                            "session_id": "operator-session",
+                            "generation": 1,
+                            "physical": {
+                                "process_id": 1,
+                                "start_time_100ns": 1,
+                                "image_path": "C:\\ProgramData\\Eliot\\operator.exe",
+                                "executor_job_name": "Local\\Eliot-Operator"
+                            },
+                            "created_suspended_at_unix_ms": 1,
+                            "executable_sha256": "a".repeat(64)
+                        },
+                        "resumed_at_unix_ms": 2
+                    },
+                    "lifecycle": "running"
+                },
+                "proof_ceiling": "OBSERVATION",
+                "lineage_verified": true,
+                "disposition": "ACTIVE"
+            })
+        }
+
+        fn valid_operator_restart_receipt(operation_id: &str) -> Value {
+            serde_json::json!({
+                "wire_id": "eliot.user-broker.operator-restart-receipt",
+                "wire_version": 1,
+                "operation_id": operation_id,
+                "registration_digest": "b".repeat(64),
+                "user_broker_epoch": 1,
+                "fence_id": "operator-fence"
+            })
         }
     }
 

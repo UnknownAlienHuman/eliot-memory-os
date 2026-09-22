@@ -125,10 +125,47 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         try
         {
             // Connection establishment and handshake failures happen before
-            // this mutation/read request is written. Once RequestAsync starts,
-            // every parse, correlation, protocol, or cancellation failure is
-            // conservatively an unknown owner outcome.
-            await EnsureConnectedAsync(cancellationToken);
+            // this mutation/read request is written. They still cannot
+            // compact a retained reconciliation entry: a fresh connection
+            // refusal says nothing about the original effect. Convert every
+            // known local/pre-send failure to the same typed recovery outcome
+            // used after a possible send.
+            try
+            {
+                await EnsureConnectedAsync(cancellationToken);
+            }
+            catch (OperatorRestartRequiredException)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (RuntimeDiscoveryException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (UnauthorizedAccessException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (IOException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (OperatorProtocolException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (JsonException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (InvalidOperationException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
             var requestId = Interlocked.Increment(ref _requestId);
             try
             {
@@ -139,6 +176,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                     method = "tools/call",
                     @params = new { name = tool, arguments }
                 }, cancellationToken);
+                ValidateJsonRpcResponse(response, requestId);
                 if (response.Error is not null)
                 {
                     // A JSON-RPC error carries no owner-bound terminal receipt;
@@ -270,10 +308,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             {
                 throw new UnauthorizedAccessException("Governor rejected the operator handshake");
             }
+            var initializeId = Interlocked.Increment(ref _requestId);
             var initialize = await RequestAsync<JsonRpcResponse<JsonElement>>(new
             {
                 jsonrpc = "2.0",
-                id = Interlocked.Increment(ref _requestId),
+                id = initializeId,
                 method = "initialize",
                 @params = new
                 {
@@ -283,12 +322,18 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                     capabilities = new { }
                 }
             }, cancellationToken);
+            ValidateJsonRpcResponse(initialize, initializeId);
             if (initialize.Error is not null || initialize.Result.ValueKind == JsonValueKind.Undefined)
             {
                 throw new UnauthorizedAccessException("Governor rejected operator initialization");
             }
         }
         catch (OperatorRestartRequiredException)
+        {
+            await DisconnectAsync();
+            throw;
+        }
+        catch (OperationCanceledException)
         {
             await DisconnectAsync();
             throw;
@@ -381,6 +426,18 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             if (buffer[index] == '\n') return index;
         }
         return -1;
+    }
+
+    private static void ValidateJsonRpcResponse<T>(JsonRpcResponse<T> response, long expectedRequestId)
+    {
+        if (!string.Equals(response.JsonRpc, "2.0", StringComparison.Ordinal)
+            || response.Id is not JsonElement id
+            || id.ValueKind != JsonValueKind.Number
+            || !id.TryGetInt64(out var actualRequestId)
+            || actualRequestId != expectedRequestId)
+        {
+            throw new OperatorProtocolException("json_rpc_response", "correlation");
+        }
     }
 
     private async Task DisconnectAsync()

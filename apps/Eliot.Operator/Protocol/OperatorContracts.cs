@@ -207,4 +207,8 @@ public sealed record OperatorProjectionPage(
     [property: JsonPropertyName("generated_at")] DateTimeOffset GeneratedAt);
 
 public sealed record McpToolResult([property: JsonPropertyName("structuredContent")] JsonElement StructuredContent);
-public sealed record JsonRpcResponse<T>([property: JsonPropertyName("result")] T? Result, [property: JsonPropertyName("error")] JsonElement? Error);
+public sealed record JsonRpcResponse<T>(
+    [property: JsonPropertyName("jsonrpc")] string? JsonRpc,
+    [property: JsonPropertyName("id")] JsonElement? Id,
+    [property: JsonPropertyName("result")] T? Result,
+    [property: JsonPropertyName("error")] JsonElement? Error);
