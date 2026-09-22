@@ -26,6 +26,7 @@ use thiserror::Error;
 
 mod isolated_restore;
 mod owner_adapters;
+mod portable_adapters;
 mod portable_recovery;
 mod product_command;
 mod product_run;
@@ -38,6 +39,13 @@ pub use isolated_restore::{
 pub use owner_adapters::{
     DestinationRestoreAdapter, DestinationScope, RESTORE_ENVELOPE_ALGORITHM,
     RESTORE_ENVELOPE_VERSION, RestoredSealedBlob, SealedEnvelope,
+};
+pub use portable_adapters::{
+    AdmittedKeyMap, PORTABLE_ENVELOPE_ALGORITHM, PORTABLE_ENVELOPE_VERSION, PORTABLE_KEY_BYTES,
+    PORTABLE_NONCE_BYTES, PORTABLE_TAG_BYTES, PortableKeyVault, PortableSealedEnvelope,
+    PortableSecretKey, portable_blob_ad, portable_keywrap_ad, restore_portable_blob,
+    restore_portable_blob_admitted, rewrap_portable_data_key, seal_portable_envelope,
+    verify_portable_restorable,
 };
 pub use portable_recovery::{
     BlobRestorationReceipt, FullRecoveryPackage, MAX_WRAPPED_KEY_BYTES, WrappedKeyEntry,
