@@ -133,6 +133,14 @@ pub enum GuestError {
     /// Envelope bytes exceed the guest ceiling or are undecodable.
     #[error("envelope bytes rejected: {0}")]
     RejectedBytes(String),
+    /// Learning-marked atoms or tickets in a guest input. The guest contour
+    /// cannot owner-verify issuance, liveness, or expiry (no live Governor,
+    /// no clock, no registry), so it admits only unmarked, unticketed
+    /// inputs. Marked influence requires the governed native path
+    /// (`admit_context_with_learning`); the native host must route marked
+    /// inputs there and never honor a guest result for them.
+    #[error("learning influence requires the governed native path")]
+    LearningRequiresGovernedPath,
 }
 
 impl From<&ContextError> for GuestError {
@@ -328,6 +336,20 @@ fn check_envelope(request: &GuestRequest) -> Result<(), GuestError> {
     Ok(())
 }
 
+/// True when the input carries any learning influence: learning-marked
+/// atoms or admission tickets. The guest contour admits neither: without
+/// the live Governor owner it cannot verify issuance, liveness, expiry,
+/// or backlog backing, so marked influence must travel the governed
+/// native path instead of being decided here.
+fn input_has_learning(input: &AdmissionInput) -> bool {
+    !input.learning_tickets.is_empty()
+        || input
+            .candidates
+            .candidates
+            .iter()
+            .any(|candidate| candidate.learning.is_some())
+}
+
 /// Encodes a typed request to its canonical byte envelope.
 pub fn encode_request(request: &GuestRequest) -> Result<Vec<u8>, ConversionError> {
     let bytes =
@@ -390,9 +412,17 @@ pub fn handle_with_ledger(request: &GuestRequest, ledger: &CallLedger) -> GuestR
     if let Err(error) = check_envelope(request) {
         return respond(None, Some(error), 0);
     }
-    // Learning bypass closure (I12.24, #1869): marked atoms require covering
-    // owner-minted tickets bound to this compilation. Refusal precedes the
-    // native gate, so an unverified mark can never reach admission here.
+    // Learning bypass closure (I12.24, #1869): the guest contour cannot
+    // owner-verify issuance, liveness, or expiry, so any learning-marked
+    // atom or ticket refuses the whole input BEFORE the structural screen
+    // and the native gate. Marked influence admits only through the
+    // governed native path; unmarked inputs decide exactly as before.
+    if input_has_learning(&request.input) {
+        return respond(None, Some(GuestError::LearningRequiresGovernedPath), 0);
+    }
+    // Structural screen for defense in depth (binding rules for any caller
+    // presenting marks through this crate's rlib surface); on the guest
+    // contour it observes only unmarked inputs after the refusal above.
     if let Err(error) = crate::guest_gate::check_guest_tickets(&request.input) {
         return respond(None, Some(GuestError::from(&error)), 0);
     }

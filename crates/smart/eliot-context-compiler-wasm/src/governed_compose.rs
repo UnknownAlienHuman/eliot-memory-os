@@ -43,6 +43,7 @@ use eliot_improvement::candidate_bounds::{
     BoundsError, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
 };
 use thiserror::Error;
+use time::OffsetDateTime;
 
 /// One governed learning compilation: retrieval decision, admission, and
 /// the projected view when admission completed.
@@ -60,6 +61,8 @@ pub enum ComposeError {
     PermitMismatch,
     #[error("campaign overlay record required for composed retrieval")]
     OverlayRequired,
+    #[error("owner clock unavailable")]
+    ClockUnavailable,
     #[error("governed production refused: {0}")]
     Production(BoundsError),
     #[error("governed retrieval refused: {0}")]
@@ -78,6 +81,13 @@ pub enum ComposeError {
 /// and requesting identity for the screens. Both verified handles must
 /// cite the exact same issuance digest. `input` is the caller-built
 /// ordinary admission input the produced atom joins.
+///
+/// The wall clock is sourced LIVE from the host owner clock
+/// ([`OffsetDateTime::now_utc`]) inside this function: any
+/// caller-supplied `now_unix_secs` in `presented` is ignored, so requester
+/// envelopes can never backdate mark/overlay expiry. Direct screen callers
+/// (outside this composition) MUST likewise pass owner-sourced time, never
+/// requester values.
 pub fn compose_governed_compilation<F>(
     production: LearningProduction<'_>,
     presented: PresentedLearning<'_>,
@@ -93,6 +103,12 @@ where
     if production.verified.permit().digest() != presented.verified.permit().digest() {
         return Err(ComposeError::PermitMismatch);
     }
+    let live_now_secs = u64::try_from(OffsetDateTime::now_utc().unix_timestamp().max(0))
+        .map_err(|_| ComposeError::ClockUnavailable)?;
+    let presented = PresentedLearning {
+        now_unix_secs: live_now_secs,
+        ..presented
+    };
     let overlay = presented.overlay.ok_or(ComposeError::OverlayRequired)?;
     let permit = presented.verified.permit();
     let produced = produce_learning_candidate(production).map_err(ComposeError::Production)?;

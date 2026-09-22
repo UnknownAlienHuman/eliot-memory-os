@@ -71,6 +71,10 @@ pub struct PresentedLearning<'a> {
     pub cross_task_admission: Option<&'a CrossTaskAdmission>,
     pub requesting_campaign_id: &'a str,
     pub requesting_task_id: &'a str,
+    /// Wall clock both expiries enforce against. MUST be sourced from the
+    /// owner/host clock live at the call (the composed entry re-sources it
+    /// itself); never accept this value from requester envelopes — a
+    /// backdated stamp defeats mark and overlay expiry.
     pub now_unix_secs: u64,
 }
 
