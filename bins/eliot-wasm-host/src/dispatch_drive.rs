@@ -385,6 +385,26 @@ fn now_unix_ms() -> Result<u64, DriveError> {
         .map_err(|_| DriveError::Execution { stage: "clock" })
 }
 
+/// Progression gate: a Shadow operation must prove a prior
+/// conformance-verified run for the exact current artifact (A13.3 order:
+/// contract/conformance before effect-free shadow). Conformance enters
+/// freely. Pure check over admitted values — no filesystem, no spawn.
+fn check_contour_prior(
+    contour: &ExecutionContour,
+    prior: &Option<Sha256Digest>,
+    current_artifact: &Sha256Digest,
+) -> Result<(), DriveError> {
+    if !matches!(contour, ExecutionContour::Shadow) {
+        return Ok(());
+    }
+    match prior {
+        Some(previous) if previous.as_str() == current_artifact.as_str() => Ok(()),
+        _ => Err(DriveError::Admission {
+            field: "contour-prior",
+        }),
+    }
+}
+
 /// Builds the invocation request from admitted identities: invocation and
 /// tree bind the operation and claim, work unit and scope bind the work
 /// record, the contour binds the material marker, the input is the proven
@@ -831,6 +851,16 @@ fn drive_material(
     // bind the operation and claim so the runtime coherence rules close
     // over admitted values, never minted ones.
     let request = assemble_request(material)?;
+    // Progression gate: Shadow operations must prove a prior
+    // conformance-verified run for the exact current artifact (A13.3
+    // order: contract/conformance before effect-free shadow).
+    // Conformance enters freely; canary/active never reach here (the
+    // envelope spelling check admits only Shadow/Conformance).
+    check_contour_prior(
+        &request.requested_contour,
+        &material.prior_conformance_artifact,
+        &material.ceilings.artifact_digest,
+    )?;
     // Contour admission over real bytes: manifest assembly, default WASM
     // decision, byte re-hash, request binding. A divergent fixture is
     // denied before any authority, permit, or child exists.
@@ -1151,6 +1181,35 @@ mod tests {
         );
     }
 
+    /// Progression gate cases: Conformance enters with or without prior;
+    /// Shadow requires the exact current artifact digest and denies
+    /// absence or foreign digests.
+    #[test]
+    fn contour_prior_gate_enforces_progression() {
+        use eliot_wasm_runtime::ExecutionContour;
+        let current = Sha256Digest::of_bytes(b"current-artifact");
+        let prior = Sha256Digest::of_bytes(b"current-artifact");
+        let foreign = Sha256Digest::of_bytes(b"foreign-artifact");
+        assert!(check_contour_prior(&ExecutionContour::Conformance, &None, &current).is_ok());
+        assert!(
+            check_contour_prior(&ExecutionContour::Conformance, &Some(foreign.clone()), &current)
+                .is_ok()
+        );
+        assert!(check_contour_prior(&ExecutionContour::Shadow, &Some(prior), &current).is_ok());
+        assert_eq!(
+            check_contour_prior(&ExecutionContour::Shadow, &None, &current),
+            Err(DriveError::Admission {
+                field: "contour-prior"
+            })
+        );
+        assert_eq!(
+            check_contour_prior(&ExecutionContour::Shadow, &Some(foreign), &current),
+            Err(DriveError::Admission {
+                field: "contour-prior"
+            })
+        );
+    }
+
     /// Canonical intent pin: the derived intent carries exactly the
     /// admitted identities, the resolved image, the `--guest-exec` argv
     /// spellings, and the material ceilings. The owner publisher derives
@@ -1196,6 +1255,7 @@ mod tests {
             grant,
             host_artifact_digest: Sha256Digest::of_bytes(b"intent-host-image"),
             profile: crate::cli_contract::Profile::D2Operational,
+            prior_conformance_artifact: None,
             manifest: crate::dispatch_material::ValidatedManifestRecord {
                 component_id: "component-intent".to_owned(),
                 world: "eliot:wasm/guest".to_owned(),
@@ -1337,6 +1397,7 @@ mod tests {
             grant,
             host_artifact_digest: Sha256Digest::of_bytes(b"admit-host-image"),
             profile: crate::cli_contract::Profile::D2Operational,
+            prior_conformance_artifact: None,
             manifest: crate::dispatch_material::ValidatedManifestRecord {
                 component_id: "component-admit".to_owned(),
                 world: "eliot:wasm/guest".to_owned(),

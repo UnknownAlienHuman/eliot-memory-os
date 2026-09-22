@@ -228,6 +228,7 @@ struct MaterialEnvelopeMirror {
     grant: MaterialGrantMirror,
     guest: GuestCeilingsMirror,
     profile: String,
+    prior_conformance_artifact: Option<String>,
     manifest: ManifestRecordMirror,
     work: WorkRecordMirror,
     assurance: AssuranceRecordMirror,
@@ -417,6 +418,9 @@ pub struct ValidatedDispatchMaterial {
     pub host_artifact_digest: Sha256Digest,
     /// Owner-selected composition profile, compiled into this binary.
     pub profile: crate::cli_contract::Profile,
+    /// Artifact digest of the prior conformance-verified run, when a
+    /// Shadow operation must prove progression from it.
+    pub prior_conformance_artifact: Option<Sha256Digest>,
     /// Validated manifest record.
     pub manifest: ValidatedManifestRecord,
     /// Validated work identity record.
@@ -505,6 +509,11 @@ fn validate_envelope(
     if !profile.is_compiled() {
         return Err(invalid("profile"));
     }
+    let prior_conformance_artifact = envelope
+        .prior_conformance_artifact
+        .as_deref()
+        .map(|hex| hex_digest(hex, "prior-conformance"))
+        .transpose()?;
     let grant = rebuild_grant(envelope)?;
     let ceilings = check_guest_ceilings(envelope)?;
     let manifest = check_manifest_record(&envelope.manifest)?;
@@ -538,6 +547,7 @@ fn validate_envelope(
         grant: grant.grant,
         host_artifact_digest: grant.host_digest,
         profile,
+        prior_conformance_artifact,
         manifest,
         work,
         assurance,
@@ -961,6 +971,7 @@ mod tests {
             "launch_nonce": "launch-nonce-wasm-r1-0001",
             "admitted_at_unix_ms": 4000000000000,
             "profile": "D2_OPERATIONAL",
+            "prior_conformance_artifact": null,
             "grant": {{
                 "grant_digest": "{}",
                 "authority_epoch": {{

@@ -481,6 +481,11 @@ pub struct WasmDispatchMaterial {
     /// argv (`--profile <profile>` first), so the owner join derives it
     /// identically.
     pub profile: String,
+    /// Artifact digest of the prior conformance-verified run for this
+    /// component lineage, when a Shadow operation must prove progression
+    /// from it. `None` admits Conformance entry freely; Shadow requires
+    /// `Some` exactly equal to the current artifact digest.
+    pub prior_conformance_artifact: Option<String>,
     /// Owner-authored component manifest record.
     pub manifest: WasmManifestRecord,
     /// Owner-authored work identity record.
@@ -516,6 +521,7 @@ pub fn publish_wasm_dispatch_material(
     assurance: WasmAssuranceRecord,
     promotion: WasmPromotionRecord,
     snapshot: WasmSnapshotRecord,
+    prior_conformance_artifact: Option<String>,
 ) -> Result<WasmDispatchMaterial, WasmDispatchError> {
     require_nonblank(claim_id, "claim-id")?;
     require_nonblank(operation_id, "operation-id")?;
@@ -556,6 +562,9 @@ pub fn publish_wasm_dispatch_material(
         admitted_at_unix_ms,
         host_artifact_digest,
     )?;
+    if let Some(prior) = &prior_conformance_artifact {
+        require_digest(prior, "prior-conformance")?;
+    }
     Ok(WasmDispatchMaterial {
         wire_id: WASM_DISPATCH_MATERIAL_WIRE_ID.to_owned(),
         wire_version: WASM_DISPATCH_MATERIAL_WIRE_VERSION,
@@ -568,6 +577,7 @@ pub fn publish_wasm_dispatch_material(
         grant,
         guest,
         profile: profile.to_owned(),
+        prior_conformance_artifact,
         manifest,
         work,
         assurance,
@@ -758,6 +768,8 @@ pub struct WasmJoinGate {
     pub grant_digest: String,
     /// Forward-issued invocation digest for the join table.
     pub invocation_digest: String,
+    /// Grant expiry bounding the join window (Unix milliseconds).
+    pub expires_at: u64,
 }
 
 /// Computes the owner-side join gate for one admitted claim: the identical
@@ -927,7 +939,115 @@ pub fn wasm_join_gate(
         authority_id: derived.authority_id,
         grant_digest: grant.grant_digest,
         invocation_digest: request.invocation_digest().to_owned(),
+        expires_at: grant.expires_at,
     })
+}
+
+/// Owner-side live join table: the retained registry of published joins
+/// the central dispatch consults before admitting a presented request.
+/// Lookup is by admitted (claim, operation) pair; admission consumes the
+/// entry one-shot (replay of a consumed or foreign digest fails closed),
+/// and entries carry the grant window so stale joins deny even on digest
+/// match. Bounded by [`prune`](WasmJoinTable::prune); removal is explicit,
+/// never silent eviction.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WasmJoinTable {
+    records: std::collections::HashMap<(String, String), WasmJoinRecord>,
+}
+
+/// One retained join record: the published digests plus the window and
+/// the one-shot consumption flag.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WasmJoinRecord {
+    authority_id: String,
+    grant_digest: String,
+    invocation_digest: String,
+    expires_at: u64,
+    consumed: bool,
+}
+
+/// Join admission denial: stable taxonomy, no digests echoed.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum JoinDeny {
+    /// No join was published for the presented (claim, operation) pair.
+    #[error("WASM_JOIN_DENY_MISSING")]
+    Missing,
+    /// The presented digest does not match the published join.
+    #[error("WASM_JOIN_DENY_MISMATCH")]
+    Mismatched,
+    /// The published join window has passed.
+    #[error("WASM_JOIN_DENY_STALE")]
+    Stale,
+    /// The published join was already consumed (replay refused).
+    #[error("WASM_JOIN_DENY_REPLAYED")]
+    Replayed,
+}
+
+impl WasmJoinTable {
+    /// Registers one published join, replacing any prior record for the
+    /// same pair (re-publication after a failed drive re-arms the exact
+    /// operation; the staged files were just rewritten with it).
+    pub fn register(&mut self, join: &WasmJoinGate) {
+        self.records.insert(
+            (join.claim_id.clone(), join.operation_id.clone()),
+            WasmJoinRecord {
+                authority_id: join.authority_id.clone(),
+                grant_digest: join.grant_digest.clone(),
+                invocation_digest: join.invocation_digest.clone(),
+                expires_at: join.expires_at,
+                consumed: false,
+            },
+        );
+    }
+
+    /// Admits one presented request against the retained join: the pair
+    /// must be published and fresh, the digest must match exactly, and a
+    /// consumed join never admits twice. Success consumes the entry.
+    /// Stale entries are removed on sight so the table cannot fill with
+    /// dead joins.
+    pub fn admit(
+        &mut self,
+        claim_id: &str,
+        operation_id: &str,
+        presented_digest: &str,
+        now_ms: u64,
+    ) -> Result<(), JoinDeny> {
+        let key = (claim_id.to_owned(), operation_id.to_owned());
+        let record = self.records.get(&key).ok_or(JoinDeny::Missing)?;
+        if record.expires_at <= now_ms {
+            self.records.remove(&key);
+            return Err(JoinDeny::Stale);
+        }
+        if record.consumed {
+            return Err(JoinDeny::Replayed);
+        }
+        if record.invocation_digest != presented_digest {
+            return Err(JoinDeny::Mismatched);
+        }
+        if let Some(record) = self.records.get_mut(&key) {
+            record.consumed = true;
+        }
+        Ok(())
+    }
+
+    /// Removes expired joins; returns the count removed.
+    pub fn prune(&mut self, now_ms: u64) -> usize {
+        let before = self.records.len();
+        self.records.retain(|_, record| record.expires_at > now_ms);
+        before - self.records.len()
+    }
+
+    /// Counts retained joins (published minus pruned).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Reports whether no joins are retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
 }
 
 /// Canonical material bytes for delivery: exact JSON the child parses.
@@ -969,6 +1089,9 @@ pub struct WasmOwnerClaim {
     pub promotion: WasmPromotionRecord,
     /// Owner-attested snapshot record.
     pub snapshot: WasmSnapshotRecord,
+    /// Artifact digest of the prior conformance-verified run, if the
+    /// operation must prove progression from it.
+    pub prior_conformance_artifact: Option<String>,
     /// Exact guest artifact bytes to stage.
     pub artifact_bytes: Vec<u8>,
     /// Exact guest input bytes to stage.
@@ -1008,6 +1131,7 @@ pub struct WasmPublishedBundle {
 pub fn publish_wasm_dispatch_bundle(
     descriptor: &eliot_installation::RuntimeLaunchDescriptor,
     claim: &WasmOwnerClaim,
+    joins: &mut WasmJoinTable,
 ) -> Result<WasmPublishedBundle, WasmDispatchError> {
     if claim.artifact_bytes.is_empty() || claim.input_bytes.is_empty() {
         return Err(invalid("guest-bytes"));
@@ -1040,6 +1164,7 @@ pub fn publish_wasm_dispatch_bundle(
         claim.assurance.clone(),
         claim.promotion.clone(),
         claim.snapshot.clone(),
+        claim.prior_conformance_artifact.clone(),
     )?;
     let material_path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
     let artifact_path = install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME);
@@ -1054,6 +1179,9 @@ pub fn publish_wasm_dispatch_bundle(
     std::fs::write(&material_path, material_bytes(&material)?).map_err(io_denied)?;
     std::fs::write(&artifact_path, &claim.artifact_bytes).map_err(io_denied)?;
     std::fs::write(&input_path, &claim.input_bytes).map_err(io_denied)?;
+    // Register only after every file staged: a failed delivery leaves no
+    // phantom join behind.
+    joins.register(&join);
     Ok(WasmPublishedBundle {
         material,
         join,
@@ -1373,31 +1501,108 @@ mod tests {
                 assurance: test_assurance(),
                 promotion: test_promotion(),
                 snapshot: test_snapshot(),
+                prior_conformance_artifact: None,
                 artifact_bytes: b"bundle-artifact-bytes".to_vec(),
                 input_bytes: b"bundle-input-bytes".to_vec(),
             }
         }
 
         // Byte binding fails before any registry or filesystem touch: the
-        // claim digests (fixture hex) do not match the staged bytes.
+        // claim digests (fixture hex) do not match the staged bytes. The
+        // table stays empty: nothing registers without a staged bundle.
+        let mut joins = WasmJoinTable::default();
         assert!(matches!(
-            publish_wasm_dispatch_bundle(&garbage_descriptor(), &test_claim()),
+            publish_wasm_dispatch_bundle(&garbage_descriptor(), &test_claim(), &mut joins),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));
+        assert!(joins.is_empty());
         // Empty bytes fail closed first of all.
         let mut empty = test_claim();
         empty.artifact_bytes.clear();
         assert!(matches!(
-            publish_wasm_dispatch_bundle(&garbage_descriptor(), &empty),
+            publish_wasm_dispatch_bundle(&garbage_descriptor(), &empty, &mut joins),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));
+        assert!(joins.is_empty());
+    }
+
+    /// Live join-table enforcement: hit allows once, then replay denies;
+    /// miss, mismatch, and stale deny without effect. Pure registry logic
+    /// over retained records — the central dispatch calls exactly this.
+    #[test]
+    fn join_table_admits_once_then_denies() {
+        let gate = WasmJoinGate {
+            claim_id: "claim-join-001".to_owned(),
+            operation_id: "operation-join-001".to_owned(),
+            authority_id: "wasm-host-dispatch-authority-test".to_owned(),
+            grant_digest: "e".repeat(64),
+            invocation_digest: "f".repeat(64),
+            expires_at: 4_000_000_060_000,
+        };
+        let mut table = WasmJoinTable::default();
+        assert!(table.is_empty());
+        table.register(&gate);
+        assert_eq!(table.len(), 1);
+        // Hit: exact digest inside the window allows and consumes.
+        assert_eq!(
+            table.admit(
+                "claim-join-001",
+                "operation-join-001",
+                &"f".repeat(64),
+                4_000_000_030_000
+            ),
+            Ok(())
+        );
+        // Replay: the consumed join never admits twice.
+        assert_eq!(
+            table.admit(
+                "claim-join-001",
+                "operation-join-001",
+                &"f".repeat(64),
+                4_000_000_030_000
+            ),
+            Err(JoinDeny::Replayed)
+        );
+        // Miss: unknown pair denies.
+        assert_eq!(
+            table.admit("claim-foreign", "operation-join-001", &"f".repeat(64), 4_000_000_030_000),
+            Err(JoinDeny::Missing)
+        );
+        // Mismatch: wrong digest denies; the record is retained (a
+        // corrected presentation after re-publication can still close).
+        table.register(&gate);
+        assert_eq!(
+            table.admit(
+                "claim-join-001",
+                "operation-join-001",
+                &"0".repeat(64),
+                4_000_000_030_000
+            ),
+            Err(JoinDeny::Mismatched)
+        );
+        // Stale: past the window denies and evicts.
+        assert_eq!(
+            table.admit(
+                "claim-join-001",
+                "operation-join-001",
+                &"f".repeat(64),
+                4_000_000_060_000
+            ),
+            Err(JoinDeny::Stale)
+        );
+        assert!(table.is_empty());
+        // Prune: expired records removed with an exact count.
+        table.register(&gate);
+        assert_eq!(table.prune(4_000_000_060_000), 1);
+        assert!(table.is_empty());
+        assert_eq!(table.prune(1), 0);
     }
 
     /// R1 join vector: fixed claim + registry values produce the pinned
     /// invocation digest below. The child asserts the identical literal
-    /// (`bins/eliot-wasm-host/src/dispatch_drive.rs`, join issuance pin);
-    /// agreement is the join interop proof — the owner-published join
-    /// closes if and only if the child re-derives these values.
+    /// (`bins/eliot-wasm-host/src/dispatch_authority.rs`, join issuance
+    /// pin); agreement is the join interop proof — the owner-published
+    /// join closes if and only if the child re-derives these values.
     #[test]
     fn join_gate_matches_child_vector() {
         fn join_claim() -> WasmOwnerClaim {
@@ -1433,6 +1638,7 @@ mod tests {
                 assurance: test_assurance(),
                 promotion: test_promotion(),
                 snapshot: test_snapshot(),
+                prior_conformance_artifact: None,
                 artifact_bytes: b"join-artifact-bytes".to_vec(),
                 input_bytes: b"join-input-bytes".to_vec(),
             }
@@ -1484,6 +1690,7 @@ mod tests {
             test_assurance(),
             test_promotion(),
             test_snapshot(),
+            None,
         )
         .expect("material publishes");
         assert_eq!(material.wire_id, WASM_DISPATCH_MATERIAL_WIRE_ID);
@@ -1512,6 +1719,7 @@ mod tests {
                 test_assurance(),
                 test_promotion(),
                 test_snapshot(),
+            None,
             ),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));
@@ -1533,6 +1741,7 @@ mod tests {
                 test_assurance(),
                 test_promotion(),
                 test_snapshot(),
+            None,
             ),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));
@@ -1556,6 +1765,29 @@ mod tests {
                 assurance,
                 test_promotion(),
                 test_snapshot(),
+            None,
+            ),
+            Err(WasmDispatchError::InvalidMaterial(_))
+        ));
+        // Malformed prior digest fails closed.
+        assert!(matches!(
+            publish_wasm_dispatch_material(
+                "claim-wasm-r1-001",
+                "operation-wasm-r1-001",
+                Generation::new(7).expect("generation"),
+                &test_epoch(),
+                "launch-nonce-wasm-r1-0001",
+                4_000_000_000_000,
+                &"a".repeat(64),
+                &"d".repeat(64),
+                test_guest(),
+                "D2_OPERATIONAL",
+                test_manifest(),
+                test_work(),
+                test_assurance(),
+                test_promotion(),
+                test_snapshot(),
+                Some("not-a-digest".to_owned()),
             ),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));
