@@ -37,6 +37,7 @@ pub mod candidate;
 pub mod causal;
 pub mod claim_map;
 pub mod conflict;
+pub mod contribution;
 pub mod coverage;
 pub mod error;
 pub mod grade;
@@ -72,6 +73,7 @@ pub use conflict::{
     ArgumentAcceptability, ConflictKind, ConflictLifecycle, ConflictPosition, ConflictSet,
     ConflictSetParams,
 };
+pub use contribution::ProviderContribution;
 pub use coverage::{
     CoverageDenominator, CoverageDenominatorParams, DenominatorKind, ExclusionReason,
     ExclusionRecord, FrontierRevision, FrontierSpec, PaginationBounds, QueryRevision, QuerySpec,
