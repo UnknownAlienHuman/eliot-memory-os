@@ -58,6 +58,7 @@ mod kernel_transition_client;
 pub mod notification_board_attach;
 mod observation_adapters;
 mod process_origin;
+mod reactive_projection_feed;
 mod route_receipts;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -159,6 +160,10 @@ pub use process_origin::{
     PhysicalProcessBinding, ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError,
     ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
     request_origin_control,
+};
+pub use reactive_projection_feed::{
+    DaemonReactiveFeedError, DaemonReactiveFeedInputs, DaemonReactiveFeedOutcome,
+    drive_daemon_reactive_feed, drive_daemon_retained_feed, drive_daemon_supplied_feed,
 };
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,

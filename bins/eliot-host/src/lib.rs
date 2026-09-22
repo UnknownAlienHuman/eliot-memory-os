@@ -12,6 +12,8 @@
 )]
 
 mod credential_control;
+mod backup_preparation;
+pub mod backup_config_projection;
 #[cfg(windows)]
 mod host_activation_durable;
 #[cfg(windows)]

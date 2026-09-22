@@ -214,7 +214,7 @@ fn leg_for<'a>(
             if found.is_some() {
                 return Err(OwnerSupplyError::Invalid {
                     projection: slot.name(),
-                    detail: "duplicate snapshot leg",
+                    detail: "duplicate snapshot leg".to_string(),
                 });
             }
             found = Some(leg);
@@ -238,13 +238,13 @@ fn verified_leg_content<'a>(
     if !valid_identity(leg.owner_id) || !valid_identity(leg.source_revision) {
         return Err(OwnerSupplyError::Invalid {
             projection: slot,
-            detail: "snapshot leg identity is invalid",
+            detail: "snapshot leg identity is invalid".to_string(),
         });
     }
     if !valid_digest(leg.content_digest) {
         return Err(OwnerSupplyError::Invalid {
             projection: slot,
-            detail: "snapshot leg digest is invalid",
+            detail: "snapshot leg digest is invalid".to_string(),
         });
     }
     if sha256_hex(leg.content) != leg.content_digest {
