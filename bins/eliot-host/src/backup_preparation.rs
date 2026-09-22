@@ -18,15 +18,15 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::HostComposition;
 use crate::backup_config_projection::{
     ApprovedBuildBinding, ProjectionError, bind_approved_build,
 };
 use eliot_installation::{
-    ApprovedGeneration, ApprovedGenerationRegistry, InstallationProfile, InstallationRoots,
-    RedbInstallationRegistry, RuntimeStateRoots,
+    ActivationCommitFence, ApprovedGeneration, ApprovedGenerationRegistry, RedbInstallationRegistry,
+    RuntimeStateRoots,
 };
-use eliot_platform_windows::{ProtectedRootLease, windows_paths_equal};
+use eliot_platform::PlatformHandle;
+use eliot_platform_windows::{FileIdentity, HostOwnerLease, ProtectedRootLease, windows_paths_equal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -698,38 +698,37 @@ pub fn cleanup_preparations<J: PreparationJournal>(
     Ok(report)
 }
 
-/// Resolves the source installation root from owner-issued installation
-/// roots: validates the root set for the Host profile, then returns the
-/// canonical durable-data root that preparation must treat as the active
-/// source. The source is observed read-only for comparison and never
-/// modified.
+/// Resolves the source installation root from manifest-bound owner runtime
+/// roots: validates the owner topology, then returns the canonical
+/// installation root that preparation must treat as the active source. The
+/// source is observed read-only for comparison and never modified.
 ///
-/// Fail-closed with static reasons: a root-set violation yields
+/// Fail-closed with static reasons: a topology violation yields
 /// [`PreparationError::InvalidRequest`], a non-directory yields
 /// [`PreparationError::ArbitraryPath`], and an unresolvable root yields
 /// [`PreparationError::FilesystemEffect`]. Owner error internals are never
 /// echoed. Staging admission, generation/lease authority, and journal
 /// binding stay with [`prepare_isolated_destination`] and HostComposition
 /// delegation.
-pub fn resolve_source_root(
-    roots: &InstallationRoots,
-    profile: InstallationProfile,
+pub fn resolve_owner_source_root(
+    roots: &RuntimeStateRoots,
 ) -> Result<PathBuf, PreparationError> {
     roots
-        .validate(profile)
+        .validate()
         .map_err(|_| PreparationError::InvalidRequest {
             field: "source_roots",
-            reason: "owner installation roots violate the Host profile".to_owned(),
+            reason: "owner runtime roots violate topology".to_owned(),
         })?;
-    let canonical = std::fs::canonicalize(&roots.durable_data).map_err(|error| {
-        PreparationError::FilesystemEffect {
-            path: roots.durable_data.clone(),
-            reason: format!("cannot canonicalize owner durable-data root: {error}"),
-        }
-    })?;
+    let canonical =
+        std::fs::canonicalize(roots.installation_root.as_str()).map_err(|error| {
+            PreparationError::FilesystemEffect {
+                path: roots.installation_root.as_str().to_owned(),
+                reason: format!("cannot canonicalize owner installation root: {error}"),
+            }
+        })?;
     if !canonical.is_dir() {
         return Err(PreparationError::ArbitraryPath {
-            reason: "owner durable-data root is not a directory".to_owned(),
+            reason: "owner installation root is not a directory".to_owned(),
         });
     }
     Ok(canonical)
@@ -774,12 +773,12 @@ pub struct PresentedPreparationRequest {
 /// preparation (issue #958).
 ///
 /// This is the exact sink interface the HostComposition owner binds: it owns
-/// the installation/Host journal sink (`J`), takes the owner records it
-/// holds ([`ApprovedGeneration`], [`InstallationRoots`]) plus one presented
-/// request, and runs the full owner-bound preparation lifecycle. Caller
-/// authentication stays parameterized pending #954; every owner or
-/// presented-evidence failure maps to a static fail-closed
-/// [`PreparationError`] without echoing owner internals.
+/// the installation/Host journal sink (`J`), takes inspected owner evidence
+/// ([`OwnerEvidence`]) plus one presented request, and runs the full
+/// owner-bound preparation lifecycle. Caller authentication stays
+/// parameterized pending #954; every owner or presented-evidence failure
+/// maps to a static fail-closed [`PreparationError`] without echoing owner
+/// internals.
 pub struct DelegatedPreparation<J: PreparationJournal> {
     journal: J,
 }
@@ -793,22 +792,47 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
     /// Prepares one isolated destination from owner evidence plus one
     /// presented request.
     ///
-    /// Order: bind the active approved generation, resolve the owner source
-    /// root, subset-check presented builds against owner artifacts, admit,
-    /// then prepare idempotently. The manifest digest is always the owner
-    /// configuration digest; generation/lease/purge/target evidence stays
-    /// presented as documented at [`PresentedPreparationRequest`].
+    /// Order: bind the active approved generation from the inspected
+    /// evidence, resolve the manifest-bound owner source root, subset-check
+    /// presented builds against owner artifacts, admit, then prepare
+    /// idempotently. The manifest digest is always the owner configuration
+    /// digest; generation/lease/purge/target evidence stays presented as
+    /// documented at [`PresentedPreparationRequest`].
     pub fn prepare(
         &mut self,
-        approved: &ApprovedGeneration,
-        roots: &InstallationRoots,
-        profile: InstallationProfile,
+        evidence: &OwnerEvidence,
         request: &PresentedPreparationRequest,
     ) -> Result<PreparedDestination, PreparationError> {
-        let binding: ApprovedBuildBinding =
-            bind_approved_build(approved).map_err(projection_to_preparation)?;
-        let source_root = resolve_source_root(roots, profile)?;
-        prepare_admitted(&mut self.journal, &binding, source_root, request)
+        let binding: ApprovedBuildBinding = evidence.approved_binding()?;
+        let source_root = resolve_owner_source_root(evidence.runtime_roots())?;
+        for digest in &request.build_digests {
+            check_digest(digest, "build_digests")?;
+            if !binding
+                .artifact_digests
+                .iter()
+                .any(|artifact| artifact == digest)
+            {
+                return Err(PreparationError::InvalidRequest {
+                    field: "build_digests",
+                    reason: "build digest is not an owner-approved artifact".to_owned(),
+                });
+            }
+        }
+        let admission = DestinationAdmission {
+            operation_id: request.operation_id.clone(),
+            class: request.class,
+            source_installation_id: request.source_installation_id.clone(),
+            source_root,
+            staging_parent: request.staging_parent.clone(),
+            target_build: request.target_build.clone(),
+            target_profile: request.target_profile.clone(),
+            approved_generation: request.approved_generation,
+            authority_generation: request.authority_generation,
+            manifest_digest: binding.config_digest.clone(),
+            authority_nonce: request.authority_nonce.clone(),
+            state_fence_digest: request.state_fence_digest.clone(),
+        };
+        prepare_isolated_destination(&mut self.journal, &admission)
     }
 
     /// Reconciles one operation without duplicating effects.
@@ -857,36 +881,72 @@ fn projection_to_preparation(error: ProjectionError) -> PreparationError {
     }
 }
 
-/// Read-only owner registry evidence for one protected Host root.
+/// Registry-committed owner evidence for one protected Host root.
 ///
-/// This is the delegation-time read bundle HostComposition holds while
-/// preparing: the installation registry projection is inspected through the
-/// existing read-only owner query
+/// This is the delegation-time read bundle preparation consumes: the
+/// installation registry projection is inspected through the existing
+/// read-only owner query
 /// ([`RedbInstallationRegistry::inspect_existing_at`], A13.9 short-lived
 /// poll read — no writer is acquired and no registry mutation is possible
-/// here), so the active generation served below is registry-committed owner
-/// state, never a caller assertion. The bundle owns the projection; every
-/// accessor borrows from it, so evidence cannot outlive its read.
-pub struct OwnerRegistryEvidence {
+/// here), and only the fully bound chain below is returned: lease-verified
+/// caller root equal to the manifest root, validated registry, active
+/// approved generation, validated manifest, topology-validated
+/// manifest-bound runtime roots, committed fence, and fence↔manifest
+/// agreement. The bundle owns every record it serves, so evidence cannot
+/// outlive its read and no caller input enters it.
+pub struct OwnerEvidence {
     registry: ApprovedGenerationRegistry,
+    approved: ApprovedGeneration,
+    fence: ActivationCommitFence,
+    canonical_host_root: PathBuf,
+    root_identity: FileIdentity,
 }
 
-impl OwnerRegistryEvidence {
-    /// Inspects the committed installation registry below one protected Host
-    /// root without acquiring a writer.
+impl OwnerEvidence {
+    /// Inspects and binds the committed owner evidence below one protected
+    /// Host root.
     ///
-    /// Fail-closed: an unprotectable root yields
-    /// [`PreparationError::FilesystemEffect`], a withheld inspection yields
-    /// [`PreparationError::InvalidRequest`] naming `source_registry`, and an
-    /// absent registry file yields the same with a distinct reason — absence
-    /// of proof is never treated as proof of absence.
+    /// Order, mirroring the `load_manifest_bound_canary_binding` precedent:
+    /// absolute-path gate, protected-root lease, canonical path,
+    /// stable-identity proof, caller-root equality, read-only registry
+    /// inspection, registry validation, active generation, manifest
+    /// validation, manifest/profile agreement with the bound runtime roots,
+    /// manifest-root equality, committed fence, fence validation, and
+    /// fence↔manifest agreement. Any step fails closed with a static
+    /// [`PreparationError`]; owner error internals are never echoed.
+    /// Absence of proof is never treated as proof of absence.
     pub fn inspect(host_state_root: &Path) -> Result<Self, PreparationError> {
+        if !host_state_root.is_absolute() {
+            return Err(PreparationError::InvalidRequest {
+                field: "host_state_root",
+                reason: "absolute protected root required".to_owned(),
+            });
+        }
         let lease = ProtectedRootLease::open_existing(host_state_root).map_err(|error| {
             PreparationError::FilesystemEffect {
                 path: host_state_root.to_string_lossy().into_owned(),
                 reason: format!("protected source root unavailable: {error}"),
             }
         })?;
+        let root_identity = lease.identity();
+        let canonical = lease.canonical_path().map_err(|error| {
+            PreparationError::FilesystemEffect {
+                path: host_state_root.to_string_lossy().into_owned(),
+                reason: format!("resolve source root: {error}"),
+            }
+        })?;
+        lease.verify_stable_identity().map_err(|error| {
+            PreparationError::FilesystemEffect {
+                path: host_state_root.to_string_lossy().into_owned(),
+                reason: format!("verify source root identity: {error}"),
+            }
+        })?;
+        if !windows_paths_equal(host_state_root, &canonical) {
+            return Err(PreparationError::InvalidRequest {
+                field: "host_state_root",
+                reason: "caller root differs from retained OS identity".to_owned(),
+            });
+        }
         let registry =
             RedbInstallationRegistry::inspect_existing_at(lease).map_err(|_| {
                 PreparationError::InvalidRequest {
@@ -900,31 +960,107 @@ impl OwnerRegistryEvidence {
                 reason: "no committed installation registry under the protected root".to_owned(),
             });
         };
-        Ok(Self { registry })
+        registry
+            .validate()
+            .map_err(|_| PreparationError::InvalidRequest {
+                field: "source_registry",
+                reason: "owner registry projection invalid".to_owned(),
+            })?;
+        let approved = registry.active().cloned().ok_or(PreparationError::InvalidRequest {
+            field: "approved_generation",
+            reason: "no active approved generation committed".to_owned(),
+        })?;
+        approved
+            .manifest
+            .validate()
+            .map_err(|_| PreparationError::InvalidRequest {
+                field: "approved_generation",
+                reason: "active candidate manifest invalid".to_owned(),
+            })?;
+        let roots = &approved.manifest.runtime_launch.runtime_state_roots;
+        roots
+            .validate()
+            .map_err(|_| PreparationError::InvalidRequest {
+                field: "source_roots",
+                reason: "owner runtime roots violate topology".to_owned(),
+            })?;
+        if approved.manifest.runtime_launch.profile != roots.profile {
+            return Err(PreparationError::InvalidRequest {
+                field: "source_roots",
+                reason: "manifest profile disagrees with bound runtime roots".to_owned(),
+            });
+        }
+        if !windows_paths_equal(Path::new(roots.host_state_root.as_str()), &canonical) {
+            return Err(PreparationError::InvalidRequest {
+                field: "host_state_root",
+                reason: "active manifest root differs from retained root".to_owned(),
+            });
+        }
+        let fence = registry
+            .last_committed_activation_fence()
+            .cloned()
+            .ok_or(PreparationError::InvalidRequest {
+                field: "commit_fence",
+                reason: "no committed activation fence".to_owned(),
+            })?;
+        fence
+            .validate()
+            .map_err(|_| PreparationError::InvalidRequest {
+                field: "commit_fence",
+                reason: "committed activation fence invalid".to_owned(),
+            })?;
+        if fence.generation != approved.manifest.generation
+            || fence.config_digest != approved.manifest.config_digest
+            || fence.authority_generation != approved.manifest.runtime_launch.authority_generation
+        {
+            return Err(PreparationError::InvalidRequest {
+                field: "commit_fence",
+                reason: "fence and manifest disagree".to_owned(),
+            });
+        }
+        Ok(Self {
+            registry,
+            approved,
+            fence,
+            canonical_host_root: canonical,
+            root_identity,
+        })
     }
 
-    /// Returns the currently active approved generation, if the registry
-    /// carries a committed active record.
-    ///
-    /// `None` means no active generation is committed — callers withhold
-    /// preparation rather than substituting any other record.
-    pub fn active_generation(&self) -> Option<&ApprovedGeneration> {
-        self.registry.active()
+    /// Returns the validated active approved generation.
+    pub fn approved(&self) -> &ApprovedGeneration {
+        &self.approved
+    }
+
+    /// Returns the validated committed activation fence agreed with the
+    /// manifest.
+    pub fn fence(&self) -> &ActivationCommitFence {
+        &self.fence
+    }
+
+    /// Returns the lease-verified canonical Host root, equal to the manifest
+    /// Host state root.
+    pub fn canonical_host_root(&self) -> &Path {
+        &self.canonical_host_root
+    }
+
+    /// Returns the pinned OS identity observed at inspection time.
+    pub fn root_identity(&self) -> FileIdentity {
+        self.root_identity
+    }
+
+    /// Returns the topology-validated manifest-bound runtime roots.
+    pub fn runtime_roots(&self) -> &RuntimeStateRoots {
+        &self.approved.manifest.runtime_launch.runtime_state_roots
     }
 
     /// Binds the active generation to owner-verified build facts.
     ///
-    /// Combines [`OwnerRegistryEvidence::active_generation`] with
-    /// [`bind_approved_build`]: absent, inactive, or owner-invalid records
-    /// fail closed before any destination effect.
+    /// The record is already validated by [`OwnerEvidence::inspect`];
+    /// [`bind_approved_build`] re-verifies it here so the binding never
+    /// depends on inspection-time state alone.
     pub fn approved_binding(&self) -> Result<ApprovedBuildBinding, PreparationError> {
-        let Some(approved) = self.active_generation() else {
-            return Err(PreparationError::InvalidRequest {
-                field: "approved_generation",
-                reason: "no active approved generation committed".to_owned(),
-            });
-        };
-        bind_approved_build(approved).map_err(projection_to_preparation)
+        bind_approved_build(&self.approved).map_err(projection_to_preparation)
     }
 
     /// Returns the registry CAS revision observed at inspection time.
@@ -960,116 +1096,6 @@ pub fn verify_staging_parent_lease(parent: &Path) -> Result<PathBuf, Preparation
             reason: format!("staging parent identity changed during admission: {error}"),
         }
     })
-}
-
-/// Owner-bound manifest roots for one inspected registry (issue #958).
-///
-/// Unlike [`InstallationRoots`] (the root-composition contract with no live
-/// readers), these roots come from the registry-committed active candidate
-/// manifest: `ApprovedGeneration.manifest.runtime_launch.runtime_state_roots`.
-/// The manifest digest is the owner `config_digest`; the registry revision
-/// binds "current" for movement detection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManifestRootsBinding {
-    /// Manifest-bound runtime roots of the active generation.
-    pub roots: RuntimeStateRoots,
-    /// Owner configuration digest of the active manifest.
-    pub manifest_digest: String,
-    /// Registry CAS revision observed at inspection time.
-    pub registry_revision: u64,
-}
-
-/// Resolves the source installation root from manifest-bound owner roots.
-///
-/// This is the live preparation path: it validates the owner
-/// [`RuntimeStateRoots`] (profile binding, topology, roots digest) and
-/// returns the canonical durable installation root as the read-only source.
-/// The legacy [`resolve_source_root`] ([`InstallationRoots`]) seam stays for
-/// the existing fixture-driven proof; production delegation uses this
-/// function exclusively.
-pub fn resolve_manifest_source_root(
-    roots: &RuntimeStateRoots,
-) -> Result<PathBuf, PreparationError> {
-    roots
-        .validate()
-        .map_err(|_| PreparationError::InvalidRequest {
-            field: "manifest_roots",
-            reason: "owner runtime roots violate the installation profile".to_owned(),
-        })?;
-    let canonical =
-        std::fs::canonicalize(roots.installation_root.as_str()).map_err(|error| {
-            PreparationError::FilesystemEffect {
-                path: roots.installation_root.as_str().to_owned(),
-                reason: format!("cannot canonicalize owner installation root: {error}"),
-            }
-        })?;
-    if !canonical.is_dir() {
-        return Err(PreparationError::ArbitraryPath {
-            reason: "owner installation root is not a directory".to_owned(),
-        });
-    }
-    Ok(canonical)
-}
-
-impl OwnerRegistryEvidence {
-    /// Binds the active manifest roots against the retained caller root.
-    ///
-    /// Mirrors the `load_manifest_bound_canary_binding` owner pattern
-    /// (`bins/eliot/src/main.rs`): the active manifest is owner-validated,
-    /// its roots are owner-validated, and the manifest's
-    /// `runtime_state_roots.host_state_root` must equal the retained caller
-    /// root (OS-identity comparison, never bare path text). A foreign,
-    /// stale, or missing manifest withholds preparation; it never falls
-    /// back to caller-supplied roots.
-    pub fn manifest_roots_against(
-        &self,
-        host_state_root: &Path,
-    ) -> Result<ManifestRootsBinding, PreparationError> {
-        let Some(active) = self.active_generation() else {
-            return Err(PreparationError::InvalidRequest {
-                field: "approved_generation",
-                reason: "no active approved generation committed".to_owned(),
-            });
-        };
-        let manifest = active.manifest.clone();
-        manifest
-            .validate()
-            .map_err(|_| PreparationError::InvalidRequest {
-                field: "manifest",
-                reason: "active candidate manifest is not owner-valid".to_owned(),
-            })?;
-        let roots = manifest.runtime_launch.runtime_state_roots.clone();
-        roots
-            .validate()
-            .map_err(|_| PreparationError::InvalidRequest {
-                field: "manifest_roots",
-                reason: "active manifest roots are not owner-valid".to_owned(),
-            })?;
-        let retained = ProtectedRootLease::open_existing(host_state_root).map_err(|error| {
-            PreparationError::FilesystemEffect {
-                path: host_state_root.to_string_lossy().into_owned(),
-                reason: format!("protected source root unavailable: {error}"),
-            }
-        })?;
-        let canonical = retained.canonical_path().map_err(|error| {
-            PreparationError::FilesystemEffect {
-                path: host_state_root.to_string_lossy().into_owned(),
-                reason: format!("source root identity changed during binding: {error}"),
-            }
-        })?;
-        if !windows_paths_equal(Path::new(roots.host_state_root.as_str()), &canonical) {
-            return Err(PreparationError::InvalidRequest {
-                field: "manifest_roots",
-                reason: "active manifest Host state root does not equal the retained caller root"
-                    .to_owned(),
-            });
-        }
-        Ok(ManifestRootsBinding {
-            roots,
-            manifest_digest: manifest.config_digest.as_str().to_owned(),
-            registry_revision: self.revision(),
-        })
-    }
 }
 
 /// Authenticated caller control for one delegated preparation (issue #958).
@@ -1108,310 +1134,35 @@ impl BackupCallerAuth {
                 .to_owned(),
         })
     }
-}
 
-/// Durable preparation journal directory name under the Host state root.
-pub const PREPARATION_JOURNAL_SUBDIR: &str = "backup-preparation-journal";
-/// Maximum bytes of one journal record (intent or result).
-pub const MAX_JOURNAL_RECORD_BYTES: u64 = 1 << 20;
-/// Maximum journal files swept by one listing.
-pub const MAX_JOURNAL_SWEEP_ENTRIES: usize = 4096;
-
-/// Durable file-backed [`PreparationJournal`] sink owned by HostComposition.
-///
-/// Lives under the identity-pinned Host state root
-/// (`PREPARATION_JOURNAL_SUBDIR`): one `<sha(operation)>.intent.json` and one
-/// `<sha(operation)>.result.json` per operation, written atomically through a
-/// temp file plus rename. Intent is recorded before effects, result after;
-/// load-before-act gives the same idempotency as the tested in-memory sink.
-/// Filenames are operation-digest derived so no caller text becomes a path.
-/// This sink survives restarts; the semantic `HostStateJournal` is untouched
-/// (backup intents are not canonical transitions).
-#[derive(Clone, Debug)]
-pub struct DirPreparationJournal {
-    dir: PathBuf,
-    identity: String,
-}
-
-fn journal_record_path(dir: &Path, operation_id: &str, kind: &str) -> PathBuf {
-    dir.join(format!(
-        "{}-{}.json",
-        kind,
-        sha_hex(&[operation_id.as_bytes()])
-    ))
-}
-
-fn read_bounded(path: &Path) -> Result<Vec<u8>, PreparationError> {
-    let metadata =
-        std::fs::metadata(path).map_err(|error| PreparationError::JournalFault(format!(
-            "journal record unreadable {}: {error}",
-            path.to_string_lossy()
-        )))?;
-    if metadata.len() > MAX_JOURNAL_RECORD_BYTES {
-        return Err(PreparationError::JournalFault(format!(
-            "journal record oversize {}",
-            path.to_string_lossy()
-        )));
-    }
-    std::fs::read(path).map_err(|error| PreparationError::JournalFault(format!(
-        "journal record unreadable {}: {error}",
-        path.to_string_lossy()
-    )))
-}
-
-impl DirPreparationJournal {
-    /// Opens (creating) the durable journal below one protected Host root.
+    /// Authenticates the caller against held owner facts without minting
+    /// authority.
     ///
-    /// Pins the root OS identity first, then the journal directory identity;
-    /// both are re-verifiable by the caller through [`Self::identity`].
-    /// Fail-closed with static reasons; no registry or journal writes occur
-    /// here beyond creating the owned directory.
-    pub fn open_at(host_state_root: &Path) -> Result<Self, PreparationError> {
-        let lease = ProtectedRootLease::open_existing(host_state_root).map_err(|error| {
-            PreparationError::FilesystemEffect {
-                path: host_state_root.to_string_lossy().into_owned(),
-                reason: format!("protected Host root unavailable: {error}"),
-            }
-        })?;
-        let canonical = lease.canonical_path().map_err(|error| {
-            PreparationError::FilesystemEffect {
-                path: host_state_root.to_string_lossy().into_owned(),
-                reason: format!("Host root identity changed during journal open: {error}"),
-            }
-        })?;
-        let dir = canonical.join(PREPARATION_JOURNAL_SUBDIR);
-        std::fs::create_dir_all(&dir).map_err(|error| PreparationError::FilesystemEffect {
-            path: dir.to_string_lossy().into_owned(),
-            reason: format!("preparation journal directory unavailable: {error}"),
-        })?;
-        let identity = capture_identity(&dir).map_err(|error| PreparationError::JournalFault(
-            format!("journal identity unobservable: {error:?}"),
-        ))?;
-        Ok(Self {
-            dir,
-            identity: identity.identity,
-        })
-    }
-
-    /// Pinned OS identity of the journal directory, captured at open.
-    #[must_use]
-    pub fn identity(&self) -> &str {
-        &self.identity
-    }
-
-    fn store_record(
+    /// Verifies digest shapes, then requires the held owner lease to cover
+    /// the launch installation and the presented source to equal it. The
+    /// lease/fence digests stay shape-checked audit-trail evidence: no owner
+    /// digest scheme binds them yet, so they grant nothing here.
+    /// Caller-channel (control-plane principal) authentication awaits the
+    /// #954 role-bound port and is reported as backlog, not assumed.
+    pub fn authenticate_for_owner(
         &self,
-        operation_id: &str,
-        kind: &str,
-        value: &serde_json::Value,
+        lease: &HostOwnerLease,
+        installation: &PlatformHandle,
+        source_installation_id: &str,
     ) -> Result<(), PreparationError> {
-        check_identity(operation_id, "operation_id")?;
-        let bytes = serde_json::to_vec(value).map_err(|error| {
-            PreparationError::JournalFault(format!("journal record unserializable: {error}"))
-        })?;
-        if bytes.len() as u64 > MAX_JOURNAL_RECORD_BYTES {
-            return Err(PreparationError::JournalFault(
-                "journal record oversize".to_owned(),
-            ));
+        self.check_shapes()?;
+        if !lease.is_for_installation(installation) {
+            return Err(PreparationError::InvalidRequest {
+                field: "caller_auth",
+                reason: "held owner lease does not cover the launch installation".to_owned(),
+            });
         }
-        let target = journal_record_path(&self.dir, operation_id, kind);
-        let temp = target.with_extension(format!(
-            "tmp-{}",
-            std::process::id()
-        ));
-        std::fs::write(&temp, &bytes).map_err(|error| PreparationError::JournalFault(format!(
-            "journal staging write failed {}: {error}",
-            temp.to_string_lossy()
-        )))?;
-        std::fs::rename(&temp, &target).map_err(|error| {
-            let _ = std::fs::remove_file(&temp);
-            PreparationError::JournalFault(format!(
-                "journal commit failed {}: {error}",
-                target.to_string_lossy()
-            ))
-        })?;
+        if source_installation_id != installation.as_str() {
+            return Err(PreparationError::InvalidRequest {
+                field: "caller_auth",
+                reason: "presented source differs from the lease-bound installation".to_owned(),
+            });
+        }
         Ok(())
-    }
-}
-
-impl PreparationJournal for DirPreparationJournal {
-    fn record_intent(
-        &mut self,
-        operation_id: &str,
-        intent: &serde_json::Value,
-    ) -> Result<(), PreparationError> {
-        self.store_record(operation_id, "intent", intent)
-    }
-
-    fn record_result(
-        &mut self,
-        operation_id: &str,
-        result: &serde_json::Value,
-    ) -> Result<(), PreparationError> {
-        self.store_record(operation_id, "result", result)
-    }
-
-    fn load(
-        &self,
-        operation_id: &str,
-    ) -> Result<Option<(serde_json::Value, Option<serde_json::Value>)>, PreparationError> {
-        check_identity(operation_id, "operation_id")?;
-        let intent_path = journal_record_path(&self.dir, operation_id, "intent");
-        if !intent_path.exists() {
-            return Ok(None);
-        }
-        let intent: serde_json::Value =
-            serde_json::from_slice(&read_bounded(&intent_path)?).map_err(|error| {
-                PreparationError::JournalFault(format!(
-                    "journal intent malformed {}: {error}",
-                    intent_path.to_string_lossy()
-                ))
-            })?;
-        let result_path = journal_record_path(&self.dir, operation_id, "result");
-        let result = if result_path.exists() {
-            Some(
-                serde_json::from_slice(&read_bounded(&result_path)?).map_err(|error| {
-                    PreparationError::JournalFault(format!(
-                        "journal result malformed {}: {error}",
-                        result_path.to_string_lossy()
-                    ))
-                })?,
-            )
-        } else {
-            None
-        };
-        Ok(Some((intent, result)))
-    }
-
-    fn list_operations(&self) -> Result<Vec<String>, PreparationError> {
-        let mut operations = Vec::new();
-        let entries =
-            std::fs::read_dir(&self.dir).map_err(|error| PreparationError::JournalFault(format!(
-                "journal sweep failed {}: {error}",
-                self.dir.to_string_lossy()
-            )))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                PreparationError::JournalFault(format!("journal sweep failed: {error}"))
-            })?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with("intent-") || !name.ends_with(".json") {
-                continue;
-            }
-            let intent: serde_json::Value =
-                serde_json::from_slice(&read_bounded(&entry.path())?).map_err(|error| {
-                    PreparationError::JournalFault(format!(
-                        "journal intent malformed {}: {error}",
-                        entry.path().to_string_lossy()
-                    ))
-                })?;
-            if let Some(operation) = intent.get("operation_id").and_then(|v| v.as_str()) {
-                operations.push(operation.to_owned());
-            }
-            if operations.len() >= MAX_JOURNAL_SWEEP_ENTRIES {
-                break;
-            }
-        }
-        Ok(operations)
-    }
-}
-
-impl<J: PreparationJournal> DelegatedPreparation<J> {
-    /// Prepares one isolated destination from registry-committed manifest
-    /// roots plus one presented request (production path).
-    ///
-    /// The manifest digest is always the owner `config_digest` from
-    /// [`ManifestRootsBinding`]; it is cross-checked against the active
-    /// generation binding so two owner derivations cannot disagree silently.
-    /// The source root comes from [`resolve_manifest_source_root`], never
-    /// from caller text. Generation/lease/purge/target evidence stays
-    /// presented pending #954, exactly as in [`DelegatedPreparation::prepare`].
-    pub fn prepare_from_evidence(
-        &mut self,
-        evidence: &OwnerRegistryEvidence,
-        manifest: &ManifestRootsBinding,
-        request: &PresentedPreparationRequest,
-    ) -> Result<PreparedDestination, PreparationError> {
-        let binding = evidence.approved_binding()?;
-        if binding.config_digest != manifest.manifest_digest {
-            return Err(PreparationError::InvalidRequest {
-                field: "manifest",
-                reason: "active generation binding disagrees with manifest roots binding"
-                    .to_owned(),
-            });
-        }
-        let source_root = resolve_manifest_source_root(&manifest.roots)?;
-        prepare_admitted(&mut self.journal, &binding, source_root, request)
-    }
-}
-
-/// Shared admission tail: subset-check presented builds against owner
-/// artifacts, bind the owner manifest digest into the admission, and prepare
-/// idempotently through the journal.
-fn prepare_admitted<J: PreparationJournal>(
-    journal: &mut J,
-    binding: &ApprovedBuildBinding,
-    source_root: PathBuf,
-    request: &PresentedPreparationRequest,
-) -> Result<PreparedDestination, PreparationError> {
-    for digest in &request.build_digests {
-        check_digest(digest, "build_digests")?;
-        if !binding
-            .artifact_digests
-            .iter()
-            .any(|artifact| artifact == digest)
-        {
-            return Err(PreparationError::InvalidRequest {
-                field: "build_digests",
-                reason: "build digest is not an owner-approved artifact".to_owned(),
-            });
-        }
-    }
-    let admission = DestinationAdmission {
-        operation_id: request.operation_id.clone(),
-        class: request.class,
-        source_installation_id: request.source_installation_id.clone(),
-        source_root,
-        staging_parent: request.staging_parent.clone(),
-        target_build: request.target_build.clone(),
-        target_profile: request.target_profile.clone(),
-        approved_generation: request.approved_generation,
-        authority_generation: request.authority_generation,
-        manifest_digest: binding.config_digest.clone(),
-        authority_nonce: request.authority_nonce.clone(),
-        state_fence_digest: request.state_fence_digest.clone(),
-    };
-    prepare_isolated_destination(journal, &admission)
-}
-
-/// HostComposition live call path for isolated backup preparation.
-///
-/// Binds, in order: caller shapes → durable journal below the retained Host
-/// root → read-only registry evidence → manifest roots bound against the
-/// retained root → cached-registry movement check → caller authentication
-/// (fail-closed pending #954) → owner-bound preparation. Every failure is a
-/// static [`PreparationError`]; owner internals are never echoed and no
-/// destination effect precedes authentication.
-impl HostComposition {
-    /// Prepares one isolated backup destination through real owner authority.
-    pub fn prepare_isolated_backup_destination(
-        &mut self,
-        caller: &BackupCallerAuth,
-        request: &PresentedPreparationRequest,
-    ) -> Result<PreparedDestination, PreparationError> {
-        caller.check_shapes()?;
-        let journal = DirPreparationJournal::open_at(&self.registry_host_root)?;
-        let evidence = OwnerRegistryEvidence::inspect(&self.registry_host_root)?;
-        if self.registry.revision() != evidence.revision() {
-            return Err(PreparationError::InvalidRequest {
-                field: "source_registry",
-                reason: "installation registry moved during delegation; retry from a fresh read"
-                    .to_owned(),
-            });
-        }
-        let manifest = evidence.manifest_roots_against(&self.registry_host_root)?;
-        caller.authenticate()?;
-        let mut delegation = DelegatedPreparation::new(journal);
-        delegation.prepare_from_evidence(&evidence, &manifest, request)
     }
 }
