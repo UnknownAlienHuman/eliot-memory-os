@@ -3020,6 +3020,27 @@ impl HostJobBranches {
         }
     }
 
+    /// Proves the process contour is still before any no-return/service
+    /// boundary for a first-install abort. Unknown Job observations and any
+    /// retained launch/recovery object fail closed; callers must preserve the
+    /// durable pending carrier in those cases.
+    pub(crate) fn pre_no_return_abort_liveness(&self) -> Result<(), String> {
+        let kernel = Self::branch_state(self.kernel.as_ref())?;
+        let store = Self::branch_state(self.store.as_ref())?;
+        if !matches!(kernel, BranchLiveness::Dead)
+            || !matches!(store, BranchLiveness::Dead)
+            || self.has_recorded_contour()
+            || self.launch.is_some()
+            || self.kernel_candidate.is_some()
+            || self.kernel_activation_receipt.is_some()
+        {
+            return Err(
+                "Host Job contour has live, unknown, or retained service progress".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     fn liveness_only(&self) -> HostBranchDisposition {
         let kernel_live = matches!(
             Self::branch_state(self.kernel.as_ref()),

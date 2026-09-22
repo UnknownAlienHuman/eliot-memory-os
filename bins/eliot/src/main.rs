@@ -25,7 +25,7 @@ use eliot_live_canary::{
     ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
 };
 use eliot_platform_windows::{
-    FileIdentity, InstallerRootError, InstallerRootObjectSnapshot,
+    FileIdentity, HostOwnerLease, InstallerRootError, InstallerRootObjectSnapshot,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
     PackageStagingError, PackageStagingStage, ProtectedRootLease, ProtectedRuntimePathLease,
     TrustedSourceBundle, TrustedSourceFileLease, WindowsInstallerRootPrimitive,
@@ -2699,7 +2699,15 @@ fn run_installation_effect(
     };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     let outcome = if recover {
-        coordinator.rollback(&transaction_id)
+        if preflight_transaction.has_activation_projection_intent() {
+            rollback_with_activation_owner(
+                &mut coordinator,
+                &preflight_transaction,
+                &transaction_id,
+            )
+        } else {
+            coordinator.rollback(&transaction_id)
+        }
     } else if preflight_transaction.profile == InstallationProfile::SystemService {
         match coordinator.drive_until_host_bootstrap(&transaction_id) {
             Ok(InstallationStepOutcome::Applied { .. }) => {
@@ -3038,6 +3046,36 @@ fn open_existing_registry_for_terminal_reconcile(
         panic!("lock-contention loop must retain its cause");
     };
     Err(cause)
+}
+
+/// Re-enters the installation owner's pre-no-return rollback seam for a
+/// durable activation intent.  The CLI only wires already-owned capabilities:
+/// the protected Host root bounds the one short-lived redb writer, while the
+/// installation-wide Host lease supplies the non-forgeable mutation proof.
+/// No caller-supplied approval, registry revision, or root path is accepted.
+fn rollback_with_activation_owner(
+    coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    transaction: &InstallationTransaction,
+    transaction_id: &PlatformHandle,
+) -> Result<InstallationStepOutcome, InstallationError> {
+    let host_state_root = Path::new(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    let registry =
+        open_existing_registry_for_terminal_reconcile(host_state_root)?.ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "Host activation registry is absent for owner-aware rollback".to_owned(),
+            )
+        })?;
+    let owner = HostOwnerLease::acquire(&transaction.installation_epoch.installation)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let host = owner.activation_capability();
+    coordinator.rollback_with_activation_owner(&registry, &host, transaction_id)
 }
 
 fn reconcile_host_activation_terminal(
