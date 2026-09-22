@@ -1797,6 +1797,7 @@ dependencies = [
  "eliot-change-monitor",
  "eliot-config",
  "eliot-context-candidates",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-coordination",
  "eliot-cue-contracts",
@@ -1933,6 +1934,11 @@ name = "eliot-improvement"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-governor",
+ "eliot-receipts",
  "serde",
  "thiserror",
  "time",
