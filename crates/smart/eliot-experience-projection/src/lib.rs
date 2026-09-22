@@ -1,145 +1,144 @@
-//! Immutable System Experience journal slice (#223, review repair).
+//! Immutable experience read-aid view over owner projection vocabulary
+//! (#223, review repair, unit #4).
 //!
-//! [`ExperienceJournalSlice`] is a thin validated envelope over supplied
-//! owner-typed `SystemObservationJournalRecord`s (foundation
-//! observation-contracts owner, `CONTRACT_VERSION` 1.0.0): every record is
-//! validated with the owner's `validate()`, coverage gaps travel as the
-//! owner's typed `CoverageGap` records, and coverage provenance echoes each
-//! record's owner `denominator_source_ref`.
+//! [`ExperienceView`] carries opaque record refs for Smart-side candidate
+//! handling without bodies, framed by the owner coverage binding
+//! ([`ProjectionCoverage`]) and closed-class [`ProjectionOmission`]s. The
+//! view echoes coverage posture; it never establishes it: a `Complete`
+//! disposition is structurally rejected, because a bare ref list cannot
+//! recheck the owner enumeration behind the coverage digest. Completeness
+//! lives in the owner projection envelopes
+//! (`JournalProjection`/`BankProjection`/`FeedbackProjection`) with their
+//! reconciled counts, empty omissions, and empty blind intervals.
 //!
-//! The slice denominator is exactly the supplied validated set.
-//! Completeness over the owner journal is never claimed, vector length is
-//! never an owner denominator, and revalidation against the owner stays
-//! required before any completeness use. Scope, fence, revision, and
-//! coverage semantics stay with the owner records; this crate carries no
-//! caller-supplied scope/fence, no free-form omission reasons, and no
-//! record bodies of its own. The retired `eliot-system-experience`
-//! duplicate is reused by reference only: no second self-memory owner,
-//! relation store, or lifecycle transition path. This package is not a W9
-//! unblock: the typed journal/bank/feedback completeness proofs stay with
-//! their owners.
+//! Scope and fence are bound to owner metadata: every ref echoes its
+//! owner-reported scope and fence, checked here for scope equality and
+//! fence compatibility against the envelope. Omission reasons use only the
+//! closed [`ProjectionOmissionClass`]; free-form strings cannot cross this
+//! boundary. This package performs no admission, enumeration, retrieval,
+//! ranking, or promotion, and it is not edge, product, or W9-consumer
+//! proof.
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::ContractVersion;
+use eliot_contracts::StateFence;
 use eliot_observation_contracts::{
-    CONTRACT_VERSION, CoverageGap, ObservationError, ObservationRecordKind,
-    SystemObservationJournalRecord,
+    ExperienceRecordRef, ExperienceSourceFamily, ObservationError, ObservationScope,
+    ProjectionCoverage, ProjectionOmission, MAX_PROJECTION_MEMBERS, MAX_PROJECTION_OMISSIONS,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 /// Freeze identity this package builds against.
 ///
 /// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
 pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22";
 
-/// Experience-slice failure: every case fails closed with its reason.
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum ExperienceError {
-    /// An owner record shape is invalid.
-    #[error("experience journal slice: {0}")]
-    Upstream(#[from] ObservationError),
-    /// The slice version drifted from the frozen owner contract version.
-    #[error("experience journal slice: version drift")]
-    VersionMismatch,
-    /// The supplied count does not equal the carried record count.
-    #[error("experience journal slice: supplied {supplied} contradicts carried {actual}")]
-    CountMismatch {
-        /// Declared supplied count.
-        supplied: usize,
-        /// Records actually carried.
-        actual: usize,
-    },
-}
-
-/// Immutable validated envelope over supplied owner journal records.
+/// Immutable read-aid view: opaque refs plus the owner coverage binding.
 ///
-/// `supplied` always equals `records.len()`: it accounts the supplied set,
-/// never the owner journal. A consumer that needs owner completeness must
-/// revalidate against the owner; this slice never substitutes for that
-/// enumeration.
+/// The view accounts exactly its carried refs against the echoed owner
+/// coverage and names every loss with a closed omission class. It claims
+/// no completeness: use owner projections where completeness matters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ExperienceJournalSlice {
-    /// Frozen owner contract version this slice was written against.
-    pub contract_version: ContractVersion,
-    /// Owner-validated records in deterministic supply order.
-    pub records: Vec<SystemObservationJournalRecord>,
-    /// Supplied-set count; always equals `records.len()`.
-    pub supplied: usize,
+pub struct ExperienceView {
+    /// Source family this view reads.
+    pub family: ExperienceSourceFamily,
+    /// Read scope governing this view.
+    pub scope: ObservationScope,
+    /// Fence this view was read under, carried for edge gating.
+    pub fence: StateFence,
+    /// Opaque refs in deterministic supply order; no bodies travel.
+    pub refs: Vec<ExperienceRecordRef>,
+    /// Owner coverage binding echoed for this view.
+    pub coverage: ProjectionCoverage,
+    /// Closed-class omissions for this view.
+    pub omissions: Vec<ProjectionOmission>,
 }
 
-impl ExperienceJournalSlice {
-    /// Assemble a validated slice over owner-typed records.
+impl ExperienceView {
+    /// Assemble a validated view over opaque refs with owner coverage.
     pub fn assemble(
-        records: Vec<SystemObservationJournalRecord>,
-    ) -> Result<Self, ExperienceError> {
-        let slice = Self {
-            contract_version: CONTRACT_VERSION,
-            records,
-            supplied: 0,
+        family: ExperienceSourceFamily,
+        scope: ObservationScope,
+        fence: StateFence,
+        refs: Vec<ExperienceRecordRef>,
+        coverage: ProjectionCoverage,
+        omissions: Vec<ProjectionOmission>,
+    ) -> Result<Self, ObservationError> {
+        let view = Self {
+            family,
+            scope,
+            fence,
+            refs,
+            coverage,
+            omissions,
         };
-        let supplied = slice.records.len();
-        let slice = Self { supplied, ..slice };
-        slice.validate()?;
-        Ok(slice)
+        view.validate()?;
+        Ok(view)
     }
 
-    /// Validate version, per-record owner shapes, and supplied-set
-    /// accounting.
-    pub fn validate(&self) -> Result<(), ExperienceError> {
-        if self.contract_version != CONTRACT_VERSION {
-            return Err(ExperienceError::VersionMismatch);
+    /// Validate shapes, ref echoes, omission classes, and coverage
+    /// consistency. A `Complete` coverage posture is rejected: views never
+    /// establish completeness.
+    pub fn validate(&self) -> Result<(), ObservationError> {
+        self.scope.validate()?;
+        if self.fence.validate().is_err() {
+            return Err(ObservationError::InvalidField {
+                field: "view.fence",
+                reason: "fence interval is invalid",
+            });
         }
-        for record in &self.records {
-            record.validate()?;
+        if self.refs.len() > MAX_PROJECTION_MEMBERS {
+            return Err(ObservationError::InvalidField {
+                field: "view.refs",
+                reason: "exceeds bounded length",
+            });
         }
-        if self.supplied != self.records.len() {
-            return Err(ExperienceError::CountMismatch {
-                supplied: self.supplied,
-                actual: self.records.len(),
+        for reference in &self.refs {
+            reference.validate()?;
+            if reference.scope != self.scope {
+                return Err(ObservationError::InvalidField {
+                    field: "view.refs",
+                    reason: "ref scope does not match view scope",
+                });
+            }
+            if !reference.fence.is_compatible_with(&self.fence) {
+                return Err(ObservationError::InvalidField {
+                    field: "view.refs",
+                    reason: "ref fence is not compatible with view fence",
+                });
+            }
+        }
+        if self.omissions.len() > MAX_PROJECTION_OMISSIONS {
+            return Err(ObservationError::InvalidField {
+                field: "view.omissions",
+                reason: "exceeds bounded length",
+            });
+        }
+        for omission in &self.omissions {
+            omission.validate()?;
+        }
+        self.coverage.validate()?;
+        let carried = u64::try_from(self.refs.len()).unwrap_or(u64::MAX);
+        if carried > self.coverage.evidence.observed_count {
+            return Err(ObservationError::CoverageIncomplete {
+                reason: "carried refs exceed the owner-observed volume",
+            });
+        }
+        if self.coverage.evidence.disposition
+            == eliot_observation_contracts::CoverageDisposition::Complete
+        {
+            return Err(ObservationError::CoverageIncomplete {
+                reason: "views never establish completeness",
             });
         }
         Ok(())
     }
 
-    /// Typed omission surface: the owner's gap records, in supply order.
+    /// Refs of one omission-free reading: handles in supply order.
     #[must_use]
-    pub fn gaps(&self) -> Vec<&CoverageGap> {
-        self.records
-            .iter()
-            .filter_map(|record| record.coverage_gap.as_ref())
-            .collect()
-    }
-
-    /// Records of one owner family, in supply order.
-    #[must_use]
-    pub fn records_of(
-        &self,
-        kind: ObservationRecordKind,
-    ) -> Vec<&SystemObservationJournalRecord> {
-        self.records
-            .iter()
-            .filter(|record| record.kind == kind)
-            .collect()
-    }
-
-    /// Coverage provenance refs echoed from event-carrying records, in
-    /// supply order without duplicates. These name the owner's denominator
-    /// sources; they establish no view-level completeness.
-    #[must_use]
-    pub fn denominator_source_refs(&self) -> Vec<&str> {
-        let mut refs = Vec::new();
-        for record in &self.records {
-            if let Some(event) = &record.event {
-                let candidate = event.coverage_and_blind_intervals.denominator_source_ref.as_str();
-                if !refs.contains(&candidate) {
-                    refs.push(candidate);
-                }
-            }
-        }
-        refs
+    pub fn handles(&self) -> Vec<&eliot_contracts::ArtifactId> {
+        self.refs.iter().map(|item| &item.handle).collect()
     }
 }

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Immutable System Experience projection refs over Governor-owned experience records (#223)"
+description = "Immutable experience read-aid view over owner projection vocabulary (#223)"
 
 [lib]
 path = "src/lib.rs"
@@ -24,9 +24,9 @@ eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0"
 eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts", version = "0.1.0" }
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
-thiserror = "2.0.18"
 
 [dev-dependencies]
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
 serde_json = "1.0.150"
 
 [lints]
