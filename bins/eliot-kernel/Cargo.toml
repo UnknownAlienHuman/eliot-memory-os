@@ -19,6 +19,8 @@ name = "eliot-kernel"
 path = "src/main.rs"
 
 [dependencies]
+eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
+eliot-security-contracts.workspace = true
 eliot-contracts.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
