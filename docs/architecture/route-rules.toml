@@ -214,6 +214,16 @@ optional_files = ["Justfile"]
 max_required_bytes = 458752
 
 [[route]]
+id = "workscope-identity"
+description = "WorkScope identity, evidence-first resolution order, authenticated proposals, ScopeBindingGuard revalidation, and scope transition."
+path_globs = ["crates/governor/eliot-workscope/**", "crates/governor/eliot-governor/**"]
+topic_keywords = ["workscope", "scope identity", "resolution order", "scope binding guard", "scope candidate", "bootstrap scanner", "scope transition", "scope resolution receipt"]
+required_handles = ["I4", "I4.1", "I4.2", "I4.2.1", "I4.3", "I4.3.1", "I4.7"]
+optional_handles = ["I4.4", "I4.4.1", "I4.5", "I4.6", "I4.8", "I4.*"]
+required_files = ["crates/governor/AGENTS.md"]
+optional_files = []
+
+[[route]]
 id = "repository-root"
 description = "Root-level repository identity, licensing, tool pins, and contributor entry surfaces."
 path_globs = [
@@ -282,3 +292,8 @@ expect_routes = ["documentation-authority", "doctor-operations"]
 path = "README.md"
 topic = "repository root"
 expect_routes = ["repository-root"]
+
+[[coverage.example]]
+path = "crates/governor/eliot-workscope/src/lib.rs"
+topic = "WorkScope identity resolution"
+expect_routes = ["generic-source", "workscope-identity"]
