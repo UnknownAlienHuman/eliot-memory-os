@@ -1130,6 +1130,43 @@ impl CanonicalAdmissionOwner {
         })
     }
 
+    /// Returns the durable canonical owner revision used by a finish-evidence
+    /// compare-and-set.
+    #[must_use]
+    pub const fn owner_revision(&self) -> u64 {
+        self.snapshot.owner_revision
+    }
+
+    /// Builds the next canonical admission owner image after a Governor-owned
+    /// finish-evidence derivation.  This is a pure owner transition payload;
+    /// persistence is performed only by the Kernel transition port.
+    pub fn prepare_finish_evidence(
+        &self,
+        evidence: CanonicalFinishEvidence,
+    ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
+        evidence.validate(&self.state_fence)?;
+        if let Some(plan) = &self.snapshot.current_plan
+            && plan.task_id.as_str() != evidence.evidence.task_id
+        {
+            return Err(CompositionError::Recovery(
+                "finish evidence task does not match the current canonical plan".to_owned(),
+            ));
+        }
+        let owner_revision = self
+            .snapshot
+            .owner_revision
+            .checked_add(1)
+            .ok_or_else(|| CompositionError::Recovery("canonical owner revision overflow".to_owned()))?;
+        let snapshot = CanonicalAdmissionSnapshot {
+            state_fence: self.state_fence.clone(),
+            owner_revision,
+            current_plan: self.snapshot.current_plan.clone(),
+            finish_evidence: Some(evidence),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     /// Reads the canonical finish evidence at the exact active fence.
     ///
     /// The result is owner state recovered from the Kernel named read.  A
@@ -1695,6 +1732,13 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         }
         let canonical_snapshot: CanonicalAdmissionSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Canonical)?;
+        let canonical_read_revision = recovery.owner_read(RecoveryOwner::Canonical)?.revision;
+        if canonical_snapshot.owner_revision != canonical_read_revision {
+            return Err(CompositionError::Recovery(
+                "canonical snapshot revision does not match its Kernel named-read revision"
+                    .to_owned(),
+            ));
+        }
         let canonical = CanonicalAdmissionOwner::new(
             state_fence.clone(),
             recovery.canonical_scope.clone(),
@@ -1966,10 +2010,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Borrows the single Governor FinishAttempt adapter.
     ///
     /// The adapter rehydrates the current task and canonical finish-evidence
-    /// owner at the retained fence, evaluates a scratch clone of the existing
-    /// [`FinishService`], and emits one `RecordFinishDecision` transition.
-    /// It never consumes provider result state as proof and never publishes a
-    /// local owner mutation.
+    /// sources at the retained fence. The composition's production method
+    /// publishes the Governor-derived `owner/canonical` evidence CAS and
+    /// refreshes its readback before the adapter evaluates the existing
+    /// [`FinishService`]. It never consumes provider result state as proof.
     #[must_use]
     pub fn finish_attempt_service(&self) -> GovernorFinishAttempt<'_, P> {
         let finish_revision = self
@@ -1999,6 +2043,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
+        {
+            let service = self.finish_attempt_service();
+            service
+                .publish_finish_evidence(identity, &operation_id, &draft)
+                .await?;
+        }
+        self.refresh_from_kernel()
+            .map_err(FinishAttemptError::Composition)?;
         let receipt = {
             let service = self.finish_attempt_service();
             service.submit(identity, operation_id, draft).await?

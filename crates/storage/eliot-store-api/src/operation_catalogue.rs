@@ -346,7 +346,7 @@ struct ActivatedMutationDescriptor {
 /// `CaptureObservation` and `AppendAuditEvent` persist the lowest ceiling
 /// (`Candidate`) through the `CaptureCandidate` family; `ApplyLifecyclePolicy`
 /// persists `ReversibleMutation` through the `LifecyclePolicy` family;
-/// `ReconcileRecovery` and `RecordFinishDecision` persist
+/// `ReconcileRecovery`, `RecordFinishEvidence`, and `RecordFinishDecision` persist
 /// `ReversibleMutation` through the `RecoverySchema` family;
 /// `UpdateTaskState` persists `ReversibleMutation`
 /// through the `TaskControl` family; `ApplyEpistemicRevision` persists
@@ -360,9 +360,9 @@ struct ActivatedMutationDescriptor {
 /// `ReversibleMutation` through the `ReactiveState` family (issue #1941 C4:
 /// Store-owned durable reactive delivery records and revisioned resource
 /// snapshots with the closed reactive typed contract). All
-/// ten address no scope, mirroring the scope-free read descriptors. Every
+/// twelve address no scope, mirroring the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 12] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 13] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -395,6 +395,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 12] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::RecordFinishDecision,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordFinishEvidence,
         transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: READ_MAX_INPUT_BYTES,
@@ -499,7 +505,7 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
 /// Declaration order is the canonical order: the fourteen activated reads, the
-/// eleven activated mutations, then the genesis bootstrap entry. Generation is
+/// twelve activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -732,6 +738,7 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::ApplyLifecyclePolicy
             | NamedMutationOperation::ReconcileRecovery
             | NamedMutationOperation::RecordFinishDecision
+            | NamedMutationOperation::RecordFinishEvidence
             | NamedMutationOperation::UpdateTaskState
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure => {

@@ -99,6 +99,8 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "ordering_head_create_conflict",
     "finish_owner_cas_conflict",
     "finish_owner_create_conflict",
+    "canonical_owner_cas_conflict",
+    "canonical_owner_create_conflict",
 ];
 
 /// Reports whether a provider statement error proves shared-allocation
@@ -494,6 +496,7 @@ fn build_apply_statements(
 
     append_automation_statements(&mut sql, &mut bindings, automation)?;
 
+    append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
 
     sql.push_str(schema::TX_CREATE_RECEIPT);
@@ -533,6 +536,100 @@ fn build_apply_statements(
 
     sql.push_str(schema::TX_COMMIT);
     Ok((sql, bindings))
+}
+
+/// Appends the Governor-produced canonical finish-evidence owner image.
+///
+/// The adapter keeps the snapshot opaque and only performs the fixed
+/// `owner/canonical` fenced revision CAS. Governor has already validated and
+/// derived the evidence from its task, observation, coordination, and plan
+/// owners before this statement is assembled.
+fn append_finish_evidence_owner_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let Some(command) = transition
+        .named_operations
+        .iter()
+        .find(|command| command.operation == eliot_store_api::NamedMutationOperation::RecordFinishEvidence)
+    else {
+        return Ok(());
+    };
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let expected_revision = text_param("expected_canonical_revision")?
+        .parse::<u64>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "expected_canonical_revision must be a decimal revision",
+            })
+        })?;
+    let snapshot_json = text_param("snapshot_json")?;
+    if snapshot_json.is_empty() {
+        return Err(AdapterError::Store(StoreError::Empty {
+            field: "canonical.finish_evidence_snapshot_json",
+        }));
+    }
+    if snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+
+    let canonical_key = eliot_store_api::RecoveryRecordKey::new("owner", "canonical")
+        .map_err(AdapterError::Store)?;
+    let owner_id = recovery_owner_id(&canonical_key)?;
+    let payload = snapshot_json.as_bytes();
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(canonical_key.namespace));
+    record.insert("key".to_owned(), json!(canonical_key.key));
+    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
+    record.insert(
+        "revision".to_owned(),
+        json!(expected_revision.checked_add(1).ok_or_else(|| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "canonical.owner_revision",
+                reason: "revision overflow",
+            })
+        })?),
+    );
+    record.insert(
+        "schema".to_owned(),
+        json!(eliot_store_api::OWNER_SNAPSHOT_SCHEMA),
+    );
+    record.insert("payload".to_owned(), json!(payload));
+    record.insert(
+        "value_digest".to_owned(),
+        json!(eliot_store_api::sha256_hex(payload)),
+    );
+
+    sql.push_str(schema::TX_CANONICAL_OWNER);
+    bindings.insert(
+        "canonical_owner_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("canonical_owner_id".to_owned(), json!(owner_id));
+    bindings.insert(
+        "canonical_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    bindings.insert(
+        "canonical_expected_revision".to_owned(),
+        json!(expected_revision),
+    );
+    bindings.insert("canonical_owner_record".to_owned(), Value::Object(record));
+    Ok(())
 }
 
 /// Appends the single Governor-owned finish persistence leg, when present.

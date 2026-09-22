@@ -466,6 +466,11 @@ pub(crate) const TX_CREATE_RECEIPT: &str =
 /// revision conflict by the adapter.
 pub(crate) const TX_FINISH_OWNER: &str = "LET $finish_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($finish_owner_table, $finish_owner_id)); IF type::is_object($finish_existing) { LET $finish_owner_cas = (UPDATE type::record($finish_owner_table, $finish_owner_id) CONTENT $finish_owner_record WHERE state_fence = $finish_expected_state_fence AND revision = $finish_expected_revision RETURN AFTER); IF array::len($finish_owner_cas ?? []) != 1 { THROW 'finish_owner_cas_conflict'; }; } ELSE { IF $finish_expected_revision != 0 { THROW 'finish_owner_create_conflict'; }; LET $finish_owner_create = (CREATE type::record($finish_owner_table, $finish_owner_id) CONTENT $finish_owner_record RETURN AFTER); IF array::len($finish_owner_create ?? []) != 1 { THROW 'finish_owner_create_conflict'; }; };";
 
+/// Fenced upsert of the Governor-produced canonical admission owner image.
+/// The payload remains opaque to the adapter; only the fixed owner address,
+/// fence, and outer revision are provider-arbitrated.
+pub(crate) const TX_CANONICAL_OWNER: &str = "LET $canonical_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($canonical_owner_table, $canonical_owner_id)); IF type::is_object($canonical_existing) { LET $canonical_owner_cas = (UPDATE type::record($canonical_owner_table, $canonical_owner_id) CONTENT $canonical_owner_record WHERE state_fence = $canonical_expected_state_fence AND revision = $canonical_expected_revision RETURN AFTER); IF array::len($canonical_owner_cas ?? []) != 1 { THROW 'canonical_owner_cas_conflict'; }; } ELSE { IF $canonical_expected_revision != 0 { THROW 'canonical_owner_create_conflict'; }; LET $canonical_owner_create = (CREATE type::record($canonical_owner_table, $canonical_owner_id) CONTENT $canonical_owner_record RETURN AFTER); IF array::len($canonical_owner_create ?? []) != 1 { THROW 'canonical_owner_create_conflict'; }; };";
+
 /// Renders an indexed transaction template for the given binding index.
 pub(crate) fn indexed(template: &str, index: usize) -> String {
     template.replace("{i}", &index.to_string())
