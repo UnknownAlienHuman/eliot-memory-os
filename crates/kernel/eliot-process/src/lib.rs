@@ -16,6 +16,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -2654,6 +2656,66 @@ pub trait ProcessExecutor: Send + Sync {
         &self,
         operation_id: OperationId,
     ) -> Result<ProcessEvidence, ProcessExecutionError>;
+}
+
+/// Maximum stdin bytes accepted by one interactive write (I7.2 hot-turn
+/// bound: turn protocol frames are small; larger inputs chunk across
+/// writes, never bypass the bound).
+pub const MAX_CHILD_STDIN_WRITE_BYTES: usize = 64 * 1024;
+
+/// One interactive stdout read window: the bytes observed plus whether the
+/// stream ended. An empty non-terminal window is a spurious wakeup, never
+/// EOF: the caller retries within its own deadline. Timeouts surface as
+/// empty windows, never as errors, so the caller (deadline owner) decides
+/// between retry and unknown outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildStdoutChunk {
+    /// Observed stdout bytes (at most the requested maximum).
+    pub bytes: Vec<u8>,
+    /// True only when stdout closed: no further bytes will ever arrive.
+    pub end_of_stream: bool,
+}
+
+/// One explicitly sendable future shape for every interactive child I/O call.
+pub type InteractiveChildFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ProcessExecutionError>> + Send + 'a>>;
+
+/// Bounded interactive child stdio channel for request/response turn
+/// protocols (issue #1941 result flow).
+///
+/// Provider-neutral capability boundary for JSONL-style turn sessions over
+/// an admitted child's stdio: write bounded input frames (turn requests)
+/// and read bounded stdout windows with an explicit per-call deadline.
+/// Pipe mechanics, handle retention, Job containment, and deadlines stay
+/// with the physical implementation (P-04); this contract only bounds
+/// shapes, identities, and failure dimensions. It mints nothing: the
+/// operation must already exist (launched through [`ProcessExecutor`]).
+///
+/// Failure mapping (implementors): unknown operation → [`NotFound`](ProcessExecutionError::NotFound);
+/// unavailable executor, closed/broken stdin, or short write →
+/// [`Unavailable`](ProcessExecutionError::Unavailable); over-bound write →
+/// [`Contract`](ProcessExecutionError::Contract)
+/// (`LimitExceeded` on `stdin_write_bytes`); evidence-sink interaction
+/// stays with [`ProcessExecutor`], never this channel.
+pub trait InteractiveChildChannel: Send + Sync {
+    /// Writes one bounded input frame to the admitted child's stdin.
+    /// Implementations write all bytes or fail; short writes are errors,
+    /// never silent truncation.
+    fn write_child_stdin(
+        &self,
+        operation_id: OperationId,
+        bytes: Vec<u8>,
+    ) -> InteractiveChildFuture<'_, usize>;
+
+    /// Reads up to `max_bytes` stdout bytes within `deadline`. Returns
+    /// whatever arrived (possibly empty with `end_of_stream: false` on
+    /// timeout); `end_of_stream: true` means stdout closed.
+    fn read_child_stdout(
+        &self,
+        operation_id: &OperationId,
+        max_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> InteractiveChildFuture<'_, ChildStdoutChunk>;
 }
 
 /// Kernel-owned launch proof checked after suspension and immediately before
