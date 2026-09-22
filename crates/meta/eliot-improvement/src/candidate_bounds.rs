@@ -507,6 +507,16 @@ impl GovernedOverlay {
             None => false,
         }
     }
+
+    /// Unix-seconds form of [`GovernedOverlay::is_live_local_admitted`] for
+    /// screens whose clock is a `u64`. Fail-closed: out-of-range stamps
+    /// report not-live.
+    pub fn is_live_local_admitted_at_unix(&self, now_unix_secs: u64) -> bool {
+        let stamp = i64::try_from(now_unix_secs).ok().and_then(|secs| {
+            OffsetDateTime::from_unix_timestamp(secs).ok()
+        });
+        stamp.is_some_and(|now| self.is_live_local_admitted(now))
+    }
 }
 
 /// Reference to a reusable candidate offered for retrieval.
@@ -658,6 +668,13 @@ pub enum BoundsError {
 
 /// Retrieval gate for a compatible attempt.
 ///
+/// UNGOVERNED LEGACY: this function checks caller-presented overlays,
+/// reusables, and cross-task records as bare data — nothing here is bound
+/// to a live Governor issuance. Authority decisions MUST use
+/// [`retrieve_governed`] with an owner-verified permit instead. This
+/// function remains only for registry-level pre-screening and migration;
+/// removal is out of scope for this work unit.
+///
 /// Enforces, in order: overlay liveness (exact non-expired
 /// `LOCAL_ADMITTED`), draft-delta ineligibility, reusable closure/owner
 /// eligibility, campaign identity, and cross-task admission.
@@ -764,10 +781,12 @@ pub fn retrieve_for_attempt(
 ///
 /// `verified` carries the owner-issued permit the retrieval is bound to:
 /// overlay identity + fence and reusable identity must match it exactly,
-/// and cross-task revalidation records must equal its bound refs. When
-/// `backlog` is present, a reusable candidate must additionally resolve to
-/// an active backlog entry — `admit`/`admit_governed` grants retrieval
-/// eligibility and `archive` revokes it.
+/// and cross-task revalidation records must equal its bound refs. A
+/// reusable candidate must additionally resolve to an active backlog
+/// entry — `admit`/`admit_governed` grants retrieval eligibility and
+/// `archive` revokes it. The backlog registry handle is non-optional on
+/// this governed path: pass the production [`BoundedBacklog`] even for
+/// overlay-only retrieval.
 pub struct GovernedRetrieval<'a> {
     pub requesting_campaign_id: &'a str,
     pub requesting_task_id: &'a str,
@@ -775,7 +794,7 @@ pub struct GovernedRetrieval<'a> {
     pub reusable: Option<&'a ReusableCandidateRef>,
     pub draft_delta_present: bool,
     pub cross_task_admission: Option<&'a CrossTaskAdmission>,
-    pub backlog: Option<&'a BoundedBacklog>,
+    pub backlog: &'a BoundedBacklog,
     pub verified: &'a VerifiedLearningAdmission<'a>,
     pub now: OffsetDateTime,
 }
@@ -834,8 +853,10 @@ pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDeci
         if Some(candidate.candidate_id.as_str()) != permit.candidate_id() {
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }
-        if let Some(backlog) = request.backlog
-            && backlog.entry_for(&candidate.candidate_id).is_none()
+        if request
+            .backlog
+            .entry_for(&candidate.candidate_id)
+            .is_none()
         {
             return Err(BoundsError::NotBacklogAdmitted);
         }
