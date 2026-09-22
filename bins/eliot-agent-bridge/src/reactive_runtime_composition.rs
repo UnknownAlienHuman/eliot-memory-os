@@ -28,16 +28,20 @@
 //! restore ever lands.
 
 use eliot_agent_bridge_core::{AttachBinding, BridgeError, ResourceUri};
-use eliot_contracts::{ResourceGeneration, SessionId, StateFence};
+use eliot_contracts::{ResourceGeneration, SessionId, StateFence, sha256_hex};
 use eliot_integration_coverage::GovernorCoverageDerivation;
 use eliot_mcp::{KernelHostRequestPort, PortFailure};
 use eliot_protocol::{
     MAX_RESTORE_URIS, ReactiveRestoreQuery, ReactiveRestoreReply, RestoredSnapshot,
 };
 use eliot_reactive_context_plan::{
-    LiveActivationBindings, OwnerSupplyError, ReactiveOwnerRetention,
-    ServedSnapshotDelivery, SettledPlanFeedError, SettledPlanFeedInputs, drive_live_feed,
-    ingest_served_snapshot_delivery,
+    LiveActivationBindings, MAX_OWNER_SNAPSHOT_BYTES, OwnerProjectionBytes, OwnerSupplyError,
+    ProjectionSnapshotSlot, ReactiveOwnerRetention, ServedSnapshotDelivery, SettledPlanFeedError,
+    SettledPlanFeedInputs, drive_live_feed, ingest_observed_projection_set,
+    ingest_served_snapshot_delivery, supply_context_planning_view,
+    supply_critical_attention_projection, supply_integration_coverage_profile,
+    supply_reactive_cue_activation, supply_reactive_delivery_policy,
+    supply_session_delivery_snapshot,
 };
 use std::fmt;
 
@@ -672,6 +676,236 @@ pub fn drive_retained_projection_set(
 ) -> Result<FeedAdmissionOutcome, OwnerProjectionFeedError> {
     let stored = retention
         .read(session_id, fence)
+        .map_err(OwnerProjectionFeedError::Supply)?;
+    drive_owner_projections_to_ledger(runner, derivation, admission, bindings, stored.feed_inputs())
+}
+
+/// One slot's fill outcome from observed serving state.
+///
+/// `filled` is true only when a served snapshot's content decoded,
+/// intrinsically validated, and fence-bound as this slot through the
+/// existing supply validators. `uri` names the serving snapshot the
+/// content arrived under (provenance, never identity); `digest` is the
+/// recomputed content digest. Unfilled slots carry the reason in
+/// `reason`: `"foreign serving echo"` when the reply disagrees with the
+/// live binding, otherwise `"no served snapshot validated"`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServedSlotFill {
+    /// Slot this fill reports on.
+    pub slot: ProjectionSnapshotSlot,
+    /// Whether observed serving state filled the slot.
+    pub filled: bool,
+    /// Serving URI the filling content arrived under, when filled.
+    pub uri: Option<String>,
+    /// Recomputed content digest, when filled.
+    pub digest: Option<String>,
+    /// Fill outcome reason (always bounded static text).
+    pub reason: &'static str,
+}
+
+/// Serving observation: what the owner serving path actually returned.
+///
+/// Built only from an observed [`ReactiveRestoreReply`] — the
+/// kernel-service authenticated serving answer (Store named reads behind
+/// the front-door port) — whose session/fence echo is checked against the
+/// live attach binding inside [`serve_projection_slots`]. Slot fills are
+/// attempted from the served snapshot contents in dependency order (view
+/// first: the cue join needs it). No caller bytes enter here; unmatched
+/// slots stay unfilled with exact reasons.
+#[derive(Clone, Debug)]
+pub struct ServedSlotsObservation<'a> {
+    /// Live attach session the observation was served under.
+    pub session_id: String,
+    /// Live fence the observation was served under.
+    pub fence: StateFence,
+    /// Highest owner revision observed on the serving leg.
+    pub revision: u64,
+    /// Per-slot fill outcomes, in slot order.
+    pub fills: [ServedSlotFill; 6],
+    /// Filled slot contents borrowed from the serving reply; unfilled slots
+    /// are empty. Only complete fills (all six) ever reach ingestion.
+    pub bytes: OwnerProjectionBytes<'a>,
+}
+
+fn fill_slot_from_snapshots<'a>(
+    snapshots: &'a [RestoredSnapshot],
+    slot: ProjectionSnapshotSlot,
+    fills: &mut [ServedSlotFill; 6],
+    validate: impl Fn(&[u8]) -> bool,
+) -> Option<&'a [u8]> {
+    for snapshot in snapshots {
+        if snapshot.content.is_empty()
+            || snapshot.content.len() > MAX_OWNER_SNAPSHOT_BYTES
+            || !validate(&snapshot.content)
+        {
+            continue;
+        }
+        if let Some(fill) = fills.iter_mut().find(|fill| fill.slot == slot) {
+            fill.filled = true;
+            fill.uri = Some(snapshot.uri.clone());
+            fill.digest = Some(sha256_hex(&snapshot.content));
+            fill.reason = "served";
+        }
+        return Some(snapshot.content.as_slice());
+    }
+    None
+}
+
+/// Serve the six projection slots from an observed restore reply.
+///
+/// Checks the reply's session/fence echo against the live attach binding,
+/// then attempts each slot from the served snapshot contents through the
+/// existing supply validators (view first for the cue join; session,
+/// attention, coverage, and policy independently). Served content that is
+/// empty, oversize, undecodable, invalid, or fence-foreign never fills a
+/// slot. The returned observation records exactly what owners served —
+/// including per-slot reasons where they served nothing usable.
+pub fn serve_projection_slots<'a>(
+    reply: &'a ReactiveRestoreReply,
+    live_session: &str,
+    live_fence: &StateFence,
+) -> ServedSlotsObservation<'a> {
+    let mut bytes = OwnerProjectionBytes {
+        view: &[],
+        cue_activation: &[],
+        session: &[],
+        attention: &[],
+        coverage: &[],
+        policy: &[],
+    };
+    let mut fills = ProjectionSnapshotSlot::all().map(|slot| ServedSlotFill {
+        slot,
+        filled: false,
+        uri: None,
+        digest: None,
+        reason: "no served snapshot validated",
+    });
+    if reply.session_id.as_str() == live_session && reply.state_fence == *live_fence {
+        if let Some(content) = fill_slot_from_snapshots(
+            &reply.snapshots,
+            ProjectionSnapshotSlot::View,
+            &mut fills,
+            |content| supply_context_planning_view(live_fence, content).is_ok(),
+        ) {
+            bytes.view = content;
+            if let Ok(view) = supply_context_planning_view(live_fence, bytes.view) {
+                if let Some(cue) = fill_slot_from_snapshots(
+                    &reply.snapshots,
+                    ProjectionSnapshotSlot::CueActivation,
+                    &mut fills,
+                    |content| {
+                        supply_reactive_cue_activation(live_fence, content, &view).is_ok()
+                    },
+                ) {
+                    bytes.cue_activation = cue;
+                }
+            }
+        }
+        if let Some(content) = fill_slot_from_snapshots(
+            &reply.snapshots,
+            ProjectionSnapshotSlot::Session,
+            &mut fills,
+            |content| supply_session_delivery_snapshot(live_fence, content).is_ok(),
+        ) {
+            bytes.session = content;
+        }
+        if let Some(content) = fill_slot_from_snapshots(
+            &reply.snapshots,
+            ProjectionSnapshotSlot::Attention,
+            &mut fills,
+            |content| supply_critical_attention_projection(live_fence, content).is_ok(),
+        ) {
+            bytes.attention = content;
+        }
+        if let Some(content) = fill_slot_from_snapshots(
+            &reply.snapshots,
+            ProjectionSnapshotSlot::Coverage,
+            &mut fills,
+            |content| supply_integration_coverage_profile(live_fence, content).is_ok(),
+        ) {
+            bytes.coverage = content;
+        }
+        if let Some(content) = fill_slot_from_snapshots(
+            &reply.snapshots,
+            ProjectionSnapshotSlot::Policy,
+            &mut fills,
+            |content| supply_reactive_delivery_policy(content).is_ok(),
+        ) {
+            bytes.policy = content;
+        }
+    } else {
+        for fill in &mut fills {
+            fill.reason = "foreign serving echo";
+        }
+    }
+    ServedSlotsObservation {
+        session_id: live_session.to_owned(),
+        fence: live_fence.clone(),
+        revision: reply.revision,
+        fills,
+        bytes,
+    }
+}
+
+/// Ingest one serving observation into retention.
+///
+/// Requires all six slots filled; any unfilled slot withholds the whole
+/// ingestion naming the first unfilled slot (the observation itself carries
+/// every slot's reason). Complete fills flow through the observed ingest
+/// (re-validated supply read + session echo + keyed retention).
+pub fn ingest_served_observation(
+    retention: &mut ReactiveOwnerRetention,
+    observation: &ServedSlotsObservation<'_>,
+) -> Result<(), OwnerSupplyError> {
+    if let Some(unfilled) = observation.fills.iter().find(|fill| !fill.filled) {
+        return Err(OwnerSupplyError::Empty {
+            projection: unfilled.slot.name(),
+        });
+    }
+    ingest_observed_projection_set(
+        retention,
+        observation.session_id.as_str(),
+        &observation.fence,
+        &observation.bytes,
+        Some(observation.revision),
+    )
+}
+
+/// Serve, ingest, and drive one feed evaluation from an observed restore reply.
+///
+/// Central-export feeding over real owner serving state: the reply is the
+/// kernel-service authenticated serving answer the caller observed on the
+/// restore round-trip for the live attach binding. Slots fill only from
+/// served snapshot contents that validate; the complete fill is ingested
+/// from the observation and the drive below consumes retained state. Any
+/// unfilled slot fails closed naming the slot — never a fabricated
+/// projection, never a silent drop.
+pub fn serve_and_drive_observed_slots(
+    runner: &mut BridgeRunner,
+    derivation: &GovernorCoverageDerivation,
+    admission: &mut SettledPlanAdmission,
+    bindings: &LiveActivationBindings,
+    retention: &mut ReactiveOwnerRetention,
+    reply: &ReactiveRestoreReply,
+) -> Result<FeedAdmissionOutcome, OwnerProjectionFeedError> {
+    let view = runner
+        .attach_view()
+        .ok_or(PlanAdmissionError::NotAttached)
+        .map_err(OwnerProjectionFeedError::Admission)?;
+    let live_session = view.binding().session_id().as_str().to_owned();
+    let live_fence = live_state_fence(view.binding())
+        .map_err(|_| OwnerProjectionFeedError::Supply(OwnerSupplyError::InvalidFence))?;
+    let observation = serve_projection_slots(reply, &live_session, &live_fence);
+    ingest_served_observation(retention, &observation)
+        .map_err(OwnerProjectionFeedError::Supply)?;
+    let session_id = SessionId::new(live_session.as_str()).map_err(|_| {
+        OwnerProjectionFeedError::Supply(OwnerSupplyError::Invalid {
+            projection: "retention",
+            detail: "live session identity is invalid".to_owned(),
+        })
+    })?;
+    let stored = retention
+        .read(&session_id, &live_fence)
         .map_err(OwnerProjectionFeedError::Supply)?;
     drive_owner_projections_to_ledger(runner, derivation, admission, bindings, stored.feed_inputs())
 }
