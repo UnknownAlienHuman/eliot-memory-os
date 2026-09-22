@@ -584,6 +584,7 @@ dependencies = [
  "eliot-governor",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-kernel-core",
  "eliot-kernel-service",
  "eliot-live-canary",
  "eliot-ors",

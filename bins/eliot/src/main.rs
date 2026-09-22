@@ -19,6 +19,7 @@ use eliot_installation::{
     parse_installation_transaction_id, registry_projection_pending_ref,
     require_published_source_bundle_journal, validate_installation_transaction_json,
 };
+use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
     ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
@@ -2126,7 +2127,26 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
-    match eliot_runtime_status::collect_status(host_state_root, deadline) {
+    let runtime_health = match load_authenticated_kernel_runtime_health() {
+        Ok(runtime_health) => runtime_health,
+        Err(error) => {
+            let (code, detail) = match error {
+                AuthenticatedRuntimeHealthError::Unavailable(detail) => {
+                    ("KERNEL_RUNTIME_HEALTH_UNAVAILABLE", detail)
+                }
+                AuthenticatedRuntimeHealthError::Invalid(detail) => {
+                    ("KERNEL_RUNTIME_HEALTH_INVALID", detail)
+                }
+            };
+            write_runtime_status_error(code, &detail, false);
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    match eliot_runtime_status::collect_status_with_kernel_health(
+        host_state_root,
+        deadline,
+        &runtime_health,
+    ) {
         Ok(report) => {
             let status_code = if report.status == "RUNTIME_LIVE" {
                 "RUNTIME_LIVE"
@@ -2169,6 +2189,7 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
                         "proof_status": report.readiness.proof_status,
                         "gap": report.readiness.age_gap,
                     },
+                    "runtime_health": report.runtime_health,
                     "recovery_command": report.recovery_command,
                     "gaps": report.gaps,
                     "components": report.components,
@@ -3624,6 +3645,56 @@ fn write_runtime_status_error(code: &str, detail: &str, deadline_exceeded: bool)
     );
 }
 
+#[derive(Debug)]
+enum AuthenticatedRuntimeHealthError {
+    Unavailable(String),
+    Invalid(String),
+}
+
+/// Decodes the exact owner-produced health carrier returned by the
+/// authenticated Kernel front door. Deserialization alone is insufficient:
+/// the consumer boundary must rerun the Kernel carrier invariants before the
+/// evidence reaches the operator projection.
+fn decode_authenticated_kernel_runtime_health(
+    payload: serde_json::Value,
+) -> std::result::Result<KernelRuntimeHealthEvidence, AuthenticatedRuntimeHealthError> {
+    let evidence: KernelRuntimeHealthEvidence = serde_json::from_value(payload).map_err(|error| {
+        AuthenticatedRuntimeHealthError::Invalid(format!(
+            "authenticated Kernel health payload is not the canonical runtime-health carrier: {error}"
+        ))
+    })?;
+    evidence.validate().map_err(|error| {
+        AuthenticatedRuntimeHealthError::Invalid(format!(
+            "authenticated Kernel health carrier failed canonical validation: {error}"
+        ))
+    })?;
+    Ok(evidence)
+}
+
+#[cfg(windows)]
+fn load_authenticated_kernel_runtime_health()
+-> std::result::Result<KernelRuntimeHealthEvidence, AuthenticatedRuntimeHealthError> {
+    let mut port = AuthenticatedKernelPort::load().map_err(|error| {
+        AuthenticatedRuntimeHealthError::Unavailable(format!(
+            "load authenticated Kernel health caller: {error}"
+        ))
+    })?;
+    let payload = port.probe_runtime_health().map_err(|error| {
+        AuthenticatedRuntimeHealthError::Unavailable(format!(
+            "authenticated Kernel health probe did not produce an owner response: {error}"
+        ))
+    })?;
+    decode_authenticated_kernel_runtime_health(payload)
+}
+
+#[cfg(not(windows))]
+fn load_authenticated_kernel_runtime_health()
+-> std::result::Result<KernelRuntimeHealthEvidence, AuthenticatedRuntimeHealthError> {
+    Err(AuthenticatedRuntimeHealthError::Unavailable(
+        "the authenticated Kernel health front door is Windows-only".to_owned(),
+    ))
+}
+
 fn installation_projection_completed(stage: InstallationStage) -> bool {
     stage == InstallationStage::Completed
 }
@@ -3650,6 +3721,12 @@ impl AuthenticatedKernelPort {
         &mut self,
     ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
         self.client.ensure_operator_launch()
+    }
+
+    fn probe_runtime_health(
+        &mut self,
+    ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
+        self.client.probe()
     }
 
     /// Sends the exact `controlboard.status` operation through the
@@ -3750,6 +3827,17 @@ fn init_tracing() {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_status_caller_rejects_untyped_kernel_health_payload() {
+        let error = decode_authenticated_kernel_runtime_health(json!({ "status": "OPEN" }))
+            .expect_err("an incomplete payload must not reach operator status");
+        assert!(matches!(
+            error,
+            AuthenticatedRuntimeHealthError::Invalid(detail)
+                if detail.contains("canonical runtime-health carrier")
+        ));
+    }
 
     #[test]
     fn command_tree_is_valid_and_catalogue_help_text_parses() {
