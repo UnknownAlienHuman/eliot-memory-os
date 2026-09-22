@@ -127,11 +127,12 @@ impl KernelAuthorityClient {
                     KernelPortError::NotAdmitted(_) => OwnerPublishDisposition::NotAdmitted,
                     KernelPortError::Contract(_) => OwnerPublishDisposition::RefusedBinding,
                     // Unproven delivery: the bind may have committed before
-                    // the acknowledgement was lost. The exact published
-                    // identity travels with the disposition so the caller
-                    // reconciles the Kernel owner readback before any
+                    // the acknowledgement was lost. The exact operation and
+                    // published identity travel with the disposition so the
+                    // caller reconciles the Kernel owner readback before any
                     // reattempt or claim.
                     KernelPortError::Unknown(_) => OwnerPublishDisposition::UnknownOutcome {
+                        operation: PUBLISH_OWNER_BUNDLE_OPERATION,
                         expected_revision,
                         bundle_digest: bundle_digest.to_owned(),
                     },

@@ -802,6 +802,13 @@ fn maintain_owner_feed_pass(
             );
         }
         eliotd::OwnerFeedMaintenance::Unchanged => {}
+        eliotd::OwnerFeedMaintenance::Backoff => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.owner_feed_maintenance",
+                outcome = "backoff",
+            );
+        }
         eliotd::OwnerFeedMaintenance::Published { revision } => {
             tracing::info!(
                 target: "eliotd::diagnostics",

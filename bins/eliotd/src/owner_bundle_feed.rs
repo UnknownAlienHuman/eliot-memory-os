@@ -69,6 +69,8 @@ pub enum OwnerPublishDisposition {
     /// Unproven delivery: reconcile the Kernel owner readback against the
     /// exact published identity before any reattempt or claim.
     UnknownOutcome {
+        /// Exact operation identity that was sent.
+        operation: &'static str,
         expected_revision: u64,
         bundle_digest: String,
     },
@@ -99,6 +101,20 @@ pub enum PublishReconcile {
     Unbound,
 }
 
+/// Exact identity of an unproven publish, retained until reconcile
+/// readback confirms, diverges, or empties it. Never collapsed into a
+/// plain retry flag: the operation, revision, and digest name the exact
+/// bytes whose fate is unknown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnconfirmedPublish {
+    /// Exact operation identity that was sent.
+    pub operation: &'static str,
+    /// Published revision.
+    pub revision: u64,
+    /// Canonical digest of the published bundle bytes.
+    pub digest: String,
+}
+
 /// Owner-feed maintenance outcome for one loop pass.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OwnerFeedMaintenance {
@@ -112,6 +128,9 @@ pub enum OwnerFeedMaintenance {
     /// Degraded outcome with a diagnostic reason; the daemon continues and
     /// retries on a later pass. No partial publish is claimed.
     Degraded { reason: String },
+    /// Backoff pass: a degraded streak is cooling down, so no IO was
+    /// performed. Retries resume automatically; nothing is claimed.
+    Backoff,
 }
 
 /// Daemon-side canonical owner feed behind the P-07 durable boundary.
@@ -132,6 +151,13 @@ pub struct OwnerBundleFeed {
     /// Kernel-acknowledged publish. A dirty feed is republished on the next
     /// maintenance pass instead of re-serving silently served bytes.
     dirty: bool,
+    /// Exact identity of the last unproven publish, if any. Reconcile
+    /// readback resolves it before any reattempt; it is never collapsed
+    /// into a plain retry flag.
+    unconfirmed: Option<UnconfirmedPublish>,
+    /// Consecutive degraded passes, memory-only. Maintenance cools down
+    /// after repeated degradation instead of loading a failing route.
+    degraded_streak: u32,
 }
 
 impl OwnerBundleFeed {
@@ -161,6 +187,8 @@ impl OwnerBundleFeed {
             served_revision: None,
             served_snapshot_digest: None,
             dirty: true,
+            unconfirmed: None,
+            degraded_streak: 0,
         })
     }
 
@@ -238,6 +266,7 @@ impl OwnerBundleFeed {
         self.provider.refresh(snapshot, history, expected_revision)?;
         self.served_revision = None;
         self.served_snapshot_digest = None;
+        self.unconfirmed = None;
         self.dirty = true;
         Ok(())
     }
@@ -409,18 +438,45 @@ pub fn publish_owner_bundle(
         revision,
         &digest,
     );
-    if matches!(
-        disposition,
-        OwnerPublishDisposition::Bound { .. }
-    ) {
-        feed.dirty = false;
-        persist_owner_feed(composition, feed)?;
+    match &disposition {
+        OwnerPublishDisposition::Bound { .. } => {
+            feed.dirty = false;
+            feed.unconfirmed = None;
+            persist_owner_feed(composition, feed)?;
+        }
+        OwnerPublishDisposition::UnknownOutcome {
+            operation,
+            expected_revision,
+            bundle_digest,
+        } => {
+            // The exact published identity is retained on the feed until
+            // reconcile readback resolves it. Dirty stays set, but the
+            // next pass reconciles first instead of republishing blindly.
+            feed.unconfirmed = Some(UnconfirmedPublish {
+                operation,
+                revision: *expected_revision,
+                digest: bundle_digest.clone(),
+            });
+        }
+        _ => {}
     }
     Ok(disposition)
 }
 
-/// Reconciles an unproven publish against the Kernel owner readback and
-/// the exact published identity.
+/// Confirms a reconciled publish on the feed: clears the retained
+/// unconfirmed identity and the dirty flag, then checkpoints the registry.
+/// Only exact readback confirmation reaches here — never a timeout, a
+/// refusal, or an assumption.
+fn confirm_published(
+    feed: &mut OwnerBundleFeed,
+    composition: &DaemonComposition,
+    revision: u64,
+) -> Result<u64, DaemonError> {
+    feed.unconfirmed = None;
+    feed.dirty = false;
+    persist_owner_feed(composition, feed)?;
+    Ok(revision)
+}
 ///
 /// The readback is compared field by field before any reattempt or claim:
 /// an exact match confirms the bind without republishing; a different
@@ -522,11 +578,45 @@ pub fn acquire_current_history(
 /// they still resolve, and republishes; an unproven publish reconciles
 /// the readback before any claim. Every degraded outcome names its reason
 /// and leaves the daemon running for a later pass.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the maintenance pass keeps change detection, refresh, publish, reconcile, and persist in one audited sequence"
+)]
 pub fn maintain_owner_feed(
     feed: &mut OwnerBundleFeed,
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
 ) -> OwnerFeedMaintenance {
+    // Unconfirmed-first: an unproven publish reconciles before any new
+    // work, so a reattempt never overlaps an unknown fate. A confirmed
+    // bind completes here; a diverged or failed readback degrades with
+    // the identity retained; a proven-empty readback clears the identity
+    // and falls through to the normal flow below for a fresh publish.
+    if let Some(pending) = feed.unconfirmed.clone() {
+        match reconcile_owner_publish(kernel, pending.revision, &pending.digest) {
+            Ok(PublishReconcile::Confirmed { revision }) => {
+                return match confirm_published(feed, composition, revision) {
+                    Ok(revision) => OwnerFeedMaintenance::Published { revision },
+                    Err(error) => OwnerFeedMaintenance::Degraded {
+                        reason: error.to_string(),
+                    },
+                };
+            }
+            Ok(PublishReconcile::DivergedStale) => {
+                return OwnerFeedMaintenance::Degraded {
+                    reason: "publish reconciled against foreign owner state".to_owned(),
+                };
+            }
+            Ok(PublishReconcile::Unbound) => {
+                feed.unconfirmed = None;
+            }
+            Err(error) => {
+                return OwnerFeedMaintenance::Degraded {
+                    reason: error.to_string(),
+                };
+            }
+        }
+    }
     let owner = &composition.governor.owners().authority;
     let snapshot = match owner.snapshot() {
         Ok(snapshot) => snapshot,
@@ -578,18 +668,30 @@ pub fn maintain_owner_feed(
             OwnerFeedMaintenance::Published { revision }
         }
         Ok(OwnerPublishDisposition::UnknownOutcome {
+            operation: _,
             expected_revision,
             bundle_digest,
         }) => match reconcile_owner_publish(kernel, expected_revision, &bundle_digest) {
             Ok(PublishReconcile::Confirmed { revision }) => {
-                OwnerFeedMaintenance::Published { revision }
+                match confirm_published(feed, composition, revision) {
+                    Ok(revision) => OwnerFeedMaintenance::Published { revision },
+                    Err(error) => OwnerFeedMaintenance::Degraded {
+                        reason: error.to_string(),
+                    },
+                }
             }
             Ok(PublishReconcile::DivergedStale) => OwnerFeedMaintenance::Degraded {
                 reason: "publish reconciled against foreign owner state".to_owned(),
             },
-            Ok(PublishReconcile::Unbound) => OwnerFeedMaintenance::Degraded {
-                reason: "publish unproven and Kernel holds no owner".to_owned(),
-            },
+            Ok(PublishReconcile::Unbound) => {
+                // Proven empty: the unproven publish did not commit.
+                // The unconfirmed identity clears, the dirty flag stays so
+                // a fresh publish flow proceeds on a later pass.
+                feed.unconfirmed = None;
+                OwnerFeedMaintenance::Degraded {
+                    reason: "publish unproven and Kernel holds no owner".to_owned(),
+                }
+            }
             Err(error) => OwnerFeedMaintenance::Degraded {
                 reason: error.to_string(),
             },
@@ -690,18 +792,30 @@ pub fn attach_owner_feed(
             OwnerFeedAttach::Ready { revision }
         }
         Ok(OwnerPublishDisposition::UnknownOutcome {
+            operation: _,
             expected_revision,
             bundle_digest,
         }) => match reconcile_owner_publish(kernel, expected_revision, &bundle_digest) {
             Ok(PublishReconcile::Confirmed { revision }) => {
-                OwnerFeedAttach::Ready { revision }
+                match confirm_published(&mut feed, composition, revision) {
+                    Ok(revision) => OwnerFeedAttach::Ready { revision },
+                    Err(error) => OwnerFeedAttach::Unavailable {
+                        reason: error.to_string(),
+                    },
+                }
             }
             Ok(PublishReconcile::DivergedStale) => OwnerFeedAttach::Unavailable {
                 reason: "publish reconciled against foreign owner state".to_owned(),
             },
-            Ok(PublishReconcile::Unbound) => OwnerFeedAttach::Unavailable {
-                reason: "publish unproven and Kernel holds no owner".to_owned(),
-            },
+            Ok(PublishReconcile::Unbound) => {
+                // Proven empty: the unproven publish did not commit.
+                // The unconfirmed identity clears, the dirty flag stays so
+                // a fresh publish flow proceeds on a later pass.
+                feed.unconfirmed = None;
+                OwnerFeedAttach::Unavailable {
+                    reason: "publish unproven and Kernel holds no owner".to_owned(),
+                }
+            }
             Err(error) => OwnerFeedAttach::Unavailable {
                 reason: error.to_string(),
             },
@@ -713,11 +827,13 @@ pub fn attach_owner_feed(
             reason: error.to_string(),
         },
     };
-    if let OwnerFeedAttach::Ready { .. } = outcome {
-        *slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(feed);
-    }
+    // The feed is retained for loop maintenance on every outcome reached
+    // past the build: refusals and unproven publishes retry or reconcile
+    // on later passes instead of rebuilding from scratch each time. Only
+    // build/acquire failures return above with an empty slot.
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(feed);
     (slot, outcome)
 }
 
@@ -772,5 +888,19 @@ pub fn maintain_owner_feed_slot(
             reason: "owner feed slot emptied during maintenance".to_owned(),
         };
     };
-    maintain_owner_feed(feed, composition, kernel)
+    // Degradation backoff: after repeated degraded passes the loop cools
+    // down instead of loading a failing route every pass. A healthy pass
+    // resets the streak below.
+    if feed.degraded_streak >= 7 {
+        feed.degraded_streak = 0;
+    } else if feed.degraded_streak > 0 {
+        feed.degraded_streak += 1;
+        return OwnerFeedMaintenance::Backoff;
+    }
+    let outcome = maintain_owner_feed(feed, composition, kernel);
+    match &outcome {
+        OwnerFeedMaintenance::Degraded { .. } => feed.degraded_streak += 1,
+        _ => feed.degraded_streak = 0,
+    }
+    outcome
 }

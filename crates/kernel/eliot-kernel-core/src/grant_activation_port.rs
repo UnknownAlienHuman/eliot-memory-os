@@ -81,8 +81,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_ors::{
     CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
-    GrantClosureCommit, GrantClosurePreserved, GrantClosureState, OpaqueLabel, OperationIdentity,
-    OperationalPhase, OperationalRecordInput, OperationalRecoveryStore, StateFenceSnapshot,
+    CapabilityIntroductionActivation, GrantClosureCommit, GrantClosurePreserved, GrantClosureState,
+    OpaqueLabel, OperationIdentity, OperationalPhase, OperationalRecordInput,
+    OperationalRecoveryStore, StateFenceSnapshot,
 };
 use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
 use eliot_runtime_contracts::{
@@ -232,7 +233,9 @@ impl RootGrantHydration {
                 "hydrated opaque root-grant record has a different identity".to_owned(),
             ));
         }
-        check_opaque_record_binding(self.durable_record.record(), &request.binding, active_epoch)
+        // Opaque↔intent seal: contour, shape/integrity reconstruction, and
+        // epoch/fence agreement before the record becomes the trust anchor.
+        verify_grant_seal(&self.durable_record, &self.intent, active_epoch)
     }
 
     fn validate_fields(&self, active_epoch: &EpochId) -> Result<(), KernelError> {
@@ -1248,11 +1251,7 @@ impl GrantActivationPort {
             IntentResolve::New => {}
         }
         validate_introduction_activation(request, &ledger, active_epoch, now_ms)?;
-        check_opaque_record_binding(
-            hydration.durable_record.record(),
-            &request.binding,
-            active_epoch,
-        )?;
+        verify_introduction_seal(&hydration.durable_record, request, active_epoch)?;
         // Durable row gate: only an absent row may be committed. An `Active`
         // row must carry the exact presented input (exact replay installs
         // through the idempotent ORS transition); a `Fenced` row is fence
@@ -1592,11 +1591,7 @@ impl GrantActivationPort {
             Some(_) => {}
         }
         validate_introduction_activation(request, &ledger, active_epoch, now_ms)?;
-        check_opaque_record_binding(
-            hydration.durable_record.record(),
-            &request.binding,
-            active_epoch,
-        )?;
+        verify_introduction_seal(&hydration.durable_record, request, active_epoch)?;
         check_closure_watermark(
             boundary,
             &request.authority_root_ref,
@@ -4611,6 +4606,75 @@ fn check_opaque_record_binding(
         return Err(KernelError::FenceMismatch);
     }
     Ok(())
+}
+
+/// Proves the opaque↔intent seal for one presented grant record: the exact
+/// identity contour plus full shape/integrity revalidation.
+///
+/// The contour binds the opaque bytes to the admitted intent (record and
+/// subject identities must name the intent's operation and grant).
+/// Integrity and shape re-run exactly the ORS construction validation
+/// (epoch/fence agreement, payload length/SHA-256, secret-reference shape,
+/// expiry) by reconstructing the typed record: presented bytes are proven
+/// before they become the trust anchor, and ORS revalidates again on every
+/// read. Epoch/fence agreement against the active epoch follows.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] for a contour disagreement or a
+/// malformed record, and [`KernelError::FenceMismatch`] for a stale,
+/// future, or cross-lineage epoch or fence.
+pub fn verify_grant_seal(
+    record: &CapabilityGrantActivation,
+    intent: &GrantActivationIntent,
+    active_epoch: &EpochId,
+) -> Result<(), KernelError> {
+    if record.record().record_id.as_str() != intent.operation_id
+        || record.record().subject_id.as_str() != intent.grant_id
+    {
+        return Err(KernelError::InvalidField {
+            field: "durable_record",
+            reason: "opaque record identity disagrees with the admitted grant intent",
+        });
+    }
+    CapabilityGrantActivation::new(record.record().clone()).map_err(|_| {
+        KernelError::InvalidField {
+            field: "durable_record",
+            reason: "opaque grant record failed seal validation",
+        }
+    })?;
+    check_opaque_record_binding(record.record(), &intent.binding, active_epoch)
+}
+
+/// Proves the opaque↔intent seal for one presented introduction record,
+/// mirroring [`verify_grant_seal`]: exact identity contour, full
+/// shape/integrity reconstruction, then epoch/fence agreement.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] for a contour disagreement or a
+/// malformed record, and [`KernelError::FenceMismatch`] for a stale,
+/// future, or cross-lineage epoch or fence.
+pub fn verify_introduction_seal(
+    record: &CapabilityIntroductionActivation,
+    intent: &IntroductionActivationIntent,
+    active_epoch: &EpochId,
+) -> Result<(), KernelError> {
+    if record.record().record_id.as_str() != intent.operation_id
+        || record.record().subject_id.as_str() != intent.introduction_id
+    {
+        return Err(KernelError::InvalidField {
+            field: "durable_record",
+            reason: "opaque record identity disagrees with the admitted introduction intent",
+        });
+    }
+    CapabilityIntroductionActivation::new(record.record().clone()).map_err(|_| {
+        KernelError::InvalidField {
+            field: "durable_record",
+            reason: "opaque introduction record failed seal validation",
+        }
+    })?;
+    check_opaque_record_binding(record.record(), &intent.binding, active_epoch)
 }
 
 /// Binds the persisted ORS lineage contour to both the canonical binding and

@@ -554,6 +554,7 @@ impl OwnerClosureProvider {
                 &member.intent.authority_root_ref,
                 &member.intent.binding,
             )?;
+            verify_imported_grant_seal(&member.intent.grant_id, &member.intent.operation_id, member.durable_record.record())?;
             if shadow
                 .members
                 .insert(member.intent.grant_id.clone(), member.clone())
@@ -571,6 +572,7 @@ impl OwnerClosureProvider {
                 &root.intent.authority_root_ref,
                 &root.intent.binding,
             )?;
+            verify_imported_grant_seal(&root.intent.grant_id, &root.intent.operation_id, root.durable_record.record())?;
             if root.intent.parent_grant_id.is_some() {
                 return Err(CompositionError::Recovery(
                     "hydration snapshot carries a non-root identity as a root".to_owned(),
@@ -591,6 +593,7 @@ impl OwnerClosureProvider {
                 &hydration.intent.supporting_grant_ids,
                 &hydration.intent.authority_root_ref,
             )?;
+            verify_imported_introduction_seal(&hydration.intent.introduction_id, &hydration.intent.operation_id, hydration.durable_record.record())?;
             if shadow
                 .introductions
                 .insert(
@@ -946,9 +949,43 @@ fn recovery(error: impl ToString) -> CompositionError {
     CompositionError::Recovery(error.to_string())
 }
 
+/// Proves the opaque↔intent seal for one imported grant record: exact
+/// identity contour plus shape/integrity reconstruction exactly as ORS
+/// construction enforces. Imported bytes bypass the admission compiler,
+/// so the seal is proven here before the bytes re-enter the registry.
+fn verify_imported_grant_seal(
+    grant_id: &str,
+    operation_id: &str,
+    record: &eliot_ors::OperationalRecordInput,
+) -> Result<(), CompositionError> {
+    if record.record_id.as_str() != operation_id || record.subject_id.as_str() != grant_id {
+        return Err(CompositionError::Recovery(
+            "imported opaque record identity disagrees with the imported intent".to_owned(),
+        ));
+    }
+    eliot_ors::CapabilityGrantActivation::new(record.clone()).map_err(recovery)?;
+    Ok(())
+}
+
+/// Proves the opaque↔intent seal for one imported introduction record,
+/// mirroring [`verify_imported_grant_seal`].
+fn verify_imported_introduction_seal(
+    introduction_id: &str,
+    operation_id: &str,
+    record: &eliot_ors::OperationalRecordInput,
+) -> Result<(), CompositionError> {
+    if record.record_id.as_str() != operation_id || record.subject_id.as_str() != introduction_id
+    {
+        return Err(CompositionError::Recovery(
+            "imported opaque record identity disagrees with the imported intent".to_owned(),
+        ));
+    }
+    eliot_ors::CapabilityIntroductionActivation::new(record.clone()).map_err(recovery)?;
+    Ok(())
+}
+
 /// Rejects blank or control-character identities before admission.
-fn reject_blank(value: &str, field: &'static str) -> Result<(), CompositionError> {
-    if value.trim().is_empty() || value.chars().any(char::is_control) {
+fn reject_blank(value: &str, field: &'static str) -> Result<(), CompositionError> {    if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(CompositionError::Owner(format!(
             "{field} is blank or malformed"
         )));

@@ -38,7 +38,8 @@ use eliot_authority::{
     GrantGraph, GrantGraphRecoverySnapshot, GrantId, RevocationHistoryEvidence,
 };
 
-use crate::error::{KernelError, validate_id};use crate::grant_activation_port::{
+use crate::error::{KernelError, validate_id};
+use crate::grant_activation_port::{
     GrantClosureEnumeration, GrantClosureMember, GrantClosureSurvivor, RootGrantHydration,
     RootGrantHydrationSource,
 };
@@ -191,6 +192,11 @@ impl GovernorClosureSource {
         let mut members = BTreeMap::new();
         for member in restore.members {
             validate_id(&member.intent.grant_id, "restore.member.grant_id")?;
+            // Opaque↔intent seal at the trust-anchor entry: contour plus
+            // shape/integrity reconstruction before the bytes become the
+            // enumeration authority. Epoch agreement re-runs port-side at
+            // every use.
+            verify_admitted_grant_seal(&member.intent.grant_id, &member.intent.operation_id, member.durable_record.record())?;
             if members
                 .insert(member.intent.grant_id.clone(), member)
                 .is_some()
@@ -204,6 +210,7 @@ impl GovernorClosureSource {
         let mut roots = BTreeMap::new();
         for root in restore.roots {
             validate_id(&root.intent.grant_id, "restore.root.grant_id")?;
+            verify_admitted_grant_seal(&root.intent.grant_id, &root.intent.operation_id, root.durable_record.record())?;
             if roots.insert(root.intent.grant_id.clone(), root).is_some() {
                 return Err(KernelError::InvalidField {
                     field: "restore.roots",
@@ -228,6 +235,7 @@ impl GovernorClosureSource {
                     "admitted introduction hydration failed validation".to_owned(),
                 )
             })?;
+            verify_admitted_introduction_seal(&hydration.intent.introduction_id, &hydration.intent.operation_id, hydration.durable_record.record())?;
             if introductions
                 .insert(
                     hydration.intent.introduction_id.clone(),
@@ -255,6 +263,53 @@ impl GovernorClosureSource {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Proves the opaque↔intent seal for one admitted grant record at the
+/// trust-anchor entry: exact identity contour plus shape/integrity
+/// reconstruction exactly as ORS construction enforces. Epoch agreement
+/// re-runs port-side at every use against the live epoch.
+fn verify_admitted_grant_seal(
+    grant_id: &str,
+    operation_id: &str,
+    record: &eliot_ors::OperationalRecordInput,
+) -> Result<(), KernelError> {
+    if record.record_id.as_str() != operation_id || record.subject_id.as_str() != grant_id {
+        return Err(KernelError::InvalidField {
+            field: "restore.durable_record",
+            reason: "admitted opaque record identity disagrees with the admitted intent",
+        });
+    }
+    eliot_ors::CapabilityGrantActivation::new(record.clone()).map_err(|_| {
+        KernelError::InvalidField {
+            field: "restore.durable_record",
+            reason: "admitted opaque grant record failed seal validation",
+        }
+    })?;
+    Ok(())
+}
+
+/// Proves the opaque↔intent seal for one admitted introduction record,
+/// mirroring [`verify_admitted_grant_seal`].
+fn verify_admitted_introduction_seal(
+    introduction_id: &str,
+    operation_id: &str,
+    record: &eliot_ors::OperationalRecordInput,
+) -> Result<(), KernelError> {
+    if record.record_id.as_str() != operation_id || record.subject_id.as_str() != introduction_id
+    {
+        return Err(KernelError::InvalidField {
+            field: "restore.durable_record",
+            reason: "admitted opaque record identity disagrees with the admitted intent",
+        });
+    }
+    eliot_ors::CapabilityIntroductionActivation::new(record.clone()).map_err(|_| {
+        KernelError::InvalidField {
+            field: "restore.durable_record",
+            reason: "admitted opaque introduction record failed seal validation",
+        }
+    })?;
+    Ok(())
 }
 
 /// Thin-request root hydration handle shared by the production adapter.

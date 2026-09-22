@@ -352,7 +352,9 @@ impl KernelComposition {
     /// canonical bootstrap against the retained ORS handle and retains the
     /// binding. A zero or disagreeing revision, an empty admitted root set,
     /// or a stale presentation against the durable watermark fails closed
-    /// without installing any owner. Returns the bound revision.
+    /// without installing any owner. Binding requires no retained owner:
+    /// rotation goes through refresh or recover, never a silent
+    /// replacement. Returns the bound revision.
     pub fn bind_p07_owner(
         &self,
         restore: GovernorClosureRestore,
@@ -362,6 +364,16 @@ impl KernelComposition {
             EntrypointStage::Composition,
             "kernel.composition.p07_owner_bind_started",
         );
+        if self
+            .p07_owner
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+            .is_some()
+        {
+            return Err(KernelBuildError::Service(
+                "P-07 owner bind requires no retained owner".to_owned(),
+            ));
+        }
         let digest = owner_bundle_digest(&restore)
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         let store: Arc<dyn OperationalRecoveryStore> =
@@ -397,7 +409,9 @@ impl KernelComposition {
     ///
     /// The expected revision must not move backwards; the admitted state
     /// swaps atomically and the durable per-root watermark advances with
-    /// the swap. Refuses when no owner is bound — bind first.
+    /// the swap. Refuses when no owner is bound — bind first. A
+    /// same-revision presentation carrying different bytes refuses as well:
+    /// the digest agreement below proves rotation, not silent replacement.
     pub fn refresh_p07_owner(
         &self,
         restore: GovernorClosureRestore,
@@ -416,6 +430,7 @@ impl KernelComposition {
         };
         let digest = owner_bundle_digest(&restore)
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        self.check_owner_digest_agreement(expected_revision, &digest)?;
         bound
             .refresh(restore, expected_revision, &store)
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
@@ -473,6 +488,33 @@ impl KernelComposition {
             }
             _ => (false, None, None),
         }
+    }
+
+    /// Refuses a same-revision presentation carrying different bytes.
+    ///
+    /// Rotation is proven by revision advance or exact-digest equality;
+    /// a matching revision with a disagreeing digest is a conflicting
+    /// presentation, never a silent replacement. Unbound compositions
+    /// have nothing to disagree with and pass through to bind.
+    fn check_owner_digest_agreement(
+        &self,
+        expected_revision: u64,
+        digest: &str,
+    ) -> Result<(), KernelBuildError> {
+        let (bound, revision, retained) = self.p07_owner_readback();
+        if bound
+            && revision == Some(expected_revision)
+            && retained.as_deref() != Some(digest)
+        {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.p07_owner_digest_conflict",
+            );
+            return Err(KernelBuildError::Core(
+                "same-revision owner bundle digest disagreement".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn assemble_with_process_authority(
