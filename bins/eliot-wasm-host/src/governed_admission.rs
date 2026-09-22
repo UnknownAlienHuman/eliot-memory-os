@@ -45,13 +45,13 @@ use eliot_context_contracts::{
 };
 use eliot_governor::{Governor, LearningAdmissionClaim, issue_learning_admission};
 use eliot_improvement::{
-    BoundsError, LearningProduction, PresentedLearning, datetime_from_unix, produce_learning_candidate,
+    LearningProduction, PresentedLearning, datetime_from_unix, produce_learning_candidate,
 };
 use eliot_improvement::candidate_bounds::{
-    GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
+    BoundsError, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
 };
 use eliot_improvement::{
-    CarriageMark, bounds_to_context_error, check_governed_carriage,
+    CarriageMark, bounds_to_context_error,
 };
 
 /// One host-composed governed learning compilation: retrieval decision,

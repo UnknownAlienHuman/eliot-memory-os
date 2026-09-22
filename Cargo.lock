@@ -3125,8 +3125,12 @@ dependencies = [
 name = "eliot-wasm-host"
 version = "0.1.0"
 dependencies = [
+ "eliot-context-admission",
+ "eliot-context-assembly",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-governor",
+ "eliot-improvement",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-process",
