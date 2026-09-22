@@ -47,6 +47,7 @@ mod kernel_activation_client;
 mod kernel_host_request_client;
 pub mod memory_handle_join;
 pub mod reactive_injection_receipts;
+pub mod reactive_owner_publication;
 pub mod reactive_runtime_composition;
 pub mod settled_plan_transport;
 mod understanding_bootstrap;

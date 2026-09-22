@@ -9,6 +9,7 @@
 #![allow(clippy::result_large_err, clippy::large_enum_variant)]
 
 mod bridge_admission;
+mod coverage_policy_owner_bind;
 mod input;
 mod plan;
 mod result;
@@ -18,6 +19,9 @@ pub use bridge_admission::{
     BridgeAdmissionBatch, BridgeAdmissionDelivery, BridgeAdmissionError,
     BridgeAdmissionInstruction, BridgeAdmissionSeverity, MAX_BRIDGE_RELATIONS,
     plan_bridge_admissions,
+};
+pub use coverage_policy_owner_bind::{
+    OwnerBindError, OwnerBoundPublication, OwnerBoundSixSlot, bind_owner_publication,
 };
 
 pub use input::{
