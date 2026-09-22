@@ -27,6 +27,7 @@ mod cli_contract;
 mod contour;
 mod dispatch_drive;
 mod dispatch_material;
+mod governed_admission;
 mod guest_exec;
 mod installed_binary;
 mod parent_authority;
@@ -70,6 +71,9 @@ pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
     GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,
     validate_request,
+};
+pub use governed_admission::{
+    HostAdmitError, admit_governed_host, check_governed_host_output,
 };
 pub use installed_binary::{
     InstalledBinary, InstalledBinaryError, WasmHostBinaryBinding, resolve_installed_binary,

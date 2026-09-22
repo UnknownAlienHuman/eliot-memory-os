@@ -29,6 +29,11 @@ eliot-security-contracts.workspace = true
 eliot-wasm-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+eliot-governor.workspace = true
+eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts", version = "0.1.0" }
+eliot-context-assembly = { path = "../../crates/smart/eliot-context-assembly", version = "0.1.0" }
+eliot-improvement = { path = "../../crates/meta/eliot-improvement", version = "0.1.0" }
+eliot-context-compiler-wasm = { path = "../../crates/smart/eliot-context-compiler-wasm", version = "0.1.0" }
 wasmtime.workspace = true
 thiserror.workspace = true
 
