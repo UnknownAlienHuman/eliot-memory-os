@@ -7,6 +7,10 @@ license.workspace = true
 description = "Governor-owned host integration coverage and Governance Profile derivation (I7.16)"
 
 [dependencies]
+eliot-context-contracts = { path = "../../smart/eliot-context-contracts", version = "0.1.0" }
+eliot-contracts.workspace = true
+eliot-protocol.workspace = true
+eliot-receipts.workspace = true
 schemars.workspace = true
 serde.workspace = true
 thiserror.workspace = true

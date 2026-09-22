@@ -2065,6 +2065,10 @@ dependencies = [
 name = "eliot-integration-coverage"
 version = "0.1.0"
 dependencies = [
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-protocol",
+ "eliot-receipts",
  "schemars",
  "serde",
  "thiserror",

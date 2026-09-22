@@ -10,6 +10,7 @@
 
 mod bridge_admission;
 mod coverage_policy_owner_bind;
+mod delivery_policy_owner;
 mod input;
 mod owner_retention;
 mod owner_supply;
@@ -33,6 +34,10 @@ pub use coverage_policy_owner_bind::{
     OwnerBindError, OwnerBoundPublication, OwnerBoundSixSlot, bind_owner_publication,
 };
 
+pub use delivery_policy_owner::{
+    ChoiceSnapshot, DeliveryPolicyChoices, DeliveryPolicyOwner, PolicyOwnerError,
+    assemble_delivery_policy,
+};
 pub use input::{
     AttentionDisclosureRule, ReactiveCueActivation, ReactiveCueActivationParts,
     ReactiveDeliveryPolicy, ReactiveDeliveryPolicyParts, ReactiveTargetBinding,
