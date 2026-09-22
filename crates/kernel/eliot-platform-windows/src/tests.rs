@@ -1589,13 +1589,19 @@ fn watchdog_host_control_grant_rejects_rights_escalation_and_shape_substitution(
         ),
     ] {
         assert!(
+            ServiceControlGrantReadback::new(principal, sid, mask, digest, "S-1-5-18", "S-1-5-18",)
+                .is_err()
+        );
+    }
+    for (owner, group) in [("S-1-5-19", "S-1-5-18"), ("S-1-5-18", "S-1-5-19")] {
+        assert!(
             ServiceControlGrantReadback::new(
-                principal,
-                sid,
-                mask,
-                digest,
-                "S-1-5-18",
-                "S-1-5-18",
+                ELIOT_HOST_SERVICE_NAME,
+                "S-1-5-80-1-2-3-4-5",
+                ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                descriptor_digest.clone(),
+                owner,
+                group,
             )
             .is_err()
         );

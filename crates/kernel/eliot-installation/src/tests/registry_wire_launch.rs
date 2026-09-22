@@ -245,6 +245,18 @@ fn v11_registry_wire_requires_explicit_migration_to_v16() {
 }
 
 #[test]
+fn v15_registry_wire_requires_explicit_migration_to_v16() {
+    let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+    legacy["registry_wire_version"] = must(serde_json::to_value(ContractVersion::new(15, 0, 0)));
+    let bytes = must(serde_json::to_vec(&legacy));
+    assert!(matches!(
+        decode_registry_bytes(&bytes),
+        Err(InstallationError::MigrationRequired { reason })
+            if reason.contains("registry wire 15.0.0") && reason.contains("16.0.0")
+    ));
+}
+
+#[test]
 fn v16_registry_wire_round_trips_without_synthesizing_control_grants() {
     let current = ApprovedGenerationRegistry::new();
     let bytes = must(serde_json::to_vec(&current));

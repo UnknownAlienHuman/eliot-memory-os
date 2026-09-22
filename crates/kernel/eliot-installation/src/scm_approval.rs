@@ -6,11 +6,10 @@ use eliot_contracts::sha256_hex;
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
-    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, ServiceAccount,
-    ServiceBootstrapArguments, ServiceControlGrantReadback, ServiceRegistrationRequest,
-    ServiceStartMode, SERVICE_EXPECTED_GROUP_SID, SERVICE_EXPECTED_OWNER_SID,
-    host_service_security_descriptor_digest,
-    watchdog_service_security_descriptor_digest,
+    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, SERVICE_EXPECTED_GROUP_SID,
+    SERVICE_EXPECTED_OWNER_SID, ServiceAccount, ServiceBootstrapArguments,
+    ServiceControlGrantReadback, ServiceRegistrationRequest, ServiceStartMode,
+    host_service_security_descriptor_digest, watchdog_service_security_descriptor_digest,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

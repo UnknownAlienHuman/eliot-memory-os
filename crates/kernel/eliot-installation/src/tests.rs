@@ -3704,6 +3704,35 @@ fn service_marker_requires_exact_transaction_nonce_and_configuration() {
         &"e".repeat(64),
         Some(&substituted_grant),
     ));
+
+    let mut substituted_owner = test_watchdog_control_grant();
+    substituted_owner.security_descriptor_owner = test_handle("S-1-5-19");
+    assert!(!watchdog_marker.matches(
+        &request,
+        ELIOT_WATCHDOG_SERVICE_NAME,
+        &"e".repeat(64),
+        Some(&substituted_owner),
+    ));
+
+    let mut substituted_group = test_watchdog_control_grant();
+    substituted_group.security_descriptor_group = test_handle("S-1-5-19");
+    assert!(!watchdog_marker.matches(
+        &request,
+        ELIOT_WATCHDOG_SERVICE_NAME,
+        &"e".repeat(64),
+        Some(&substituted_group),
+    ));
+}
+
+#[test]
+fn durable_service_control_grant_rejects_owner_and_group_substitution() {
+    let mut owner_substitution = test_host_service_control_grant();
+    owner_substitution.security_descriptor_owner = test_handle("S-1-5-19");
+    assert!(owner_substitution.validate().is_err());
+
+    let mut group_substitution = test_host_service_control_grant();
+    group_substitution.security_descriptor_group = test_handle("S-1-5-19");
+    assert!(group_substitution.validate().is_err());
 }
 
 // s38 (#1345): a Host service whose DACL is not the installer policy must

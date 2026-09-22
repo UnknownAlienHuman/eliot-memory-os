@@ -6627,7 +6627,7 @@ fn service_marker_read(
 /// The proof must bind this exact validated registration; a proof for any
 /// other name or configuration digest is a provider/readback substitution and
 /// fails closed. Evidence binds the effect, plan, observed service identity,
-/// and the `DOES_NOT_EXIST` outcome, mirroring the service-matching-v2
+/// and the `DOES_NOT_EXIST` outcome, mirroring the service-matching-v3
 /// binding. The precondition is cloned unchanged so an admitted snapshot is
 /// preserved verbatim.
 fn service_absent_observation(

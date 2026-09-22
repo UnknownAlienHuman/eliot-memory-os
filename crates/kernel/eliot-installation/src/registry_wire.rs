@@ -555,8 +555,8 @@ pub(super) fn decode_registry_bytes(
         .and_then(|version| version.get("major"))
         .and_then(serde_json::Value::as_u64);
     if declared_major == Some(10) {
-            return Err(InstallationError::MigrationRequired {
-                reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v16; nested authority is never synthesized or adopted"
+        return Err(InstallationError::MigrationRequired {
+            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v16; nested authority is never synthesized or adopted"
                 .to_owned(),
         });
     }

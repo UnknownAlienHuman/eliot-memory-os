@@ -267,11 +267,11 @@ pub use service_registration::{
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
     ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME,
     SERVICE_DACL_READ_SECURITY_INFORMATION, SERVICE_EXPECTED_GROUP_AUTHORITY,
-    SERVICE_EXPECTED_GROUP_SID, SERVICE_EXPECTED_OWNER_SID, SERVICE_GROUP_READ_SECURITY_INFORMATION,
-    SERVICE_OWNER_READ_SECURITY_INFORMATION, ServiceAbsentProof, ServiceAccount,
-    ServiceBootstrapArguments, ServiceControlGrantReadback, ServiceInspectionUnknownDetail,
-    ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
-    ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
+    SERVICE_EXPECTED_GROUP_SID, SERVICE_EXPECTED_OWNER_SID,
+    SERVICE_GROUP_READ_SECURITY_INFORMATION, SERVICE_OWNER_READ_SECURITY_INFORMATION,
+    ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceControlGrantReadback,
+    ServiceInspectionUnknownDetail, ServiceRegistrationCurrent, ServiceRegistrationInspection,
+    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
     ServiceRegistrationRuntimeReadback, ServiceRuntimeObservation, ServiceSidType,
     ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
 };
@@ -4198,14 +4198,15 @@ fn read_service_security_binding(
         unsafe { LocalFree(descriptor.cast()) };
         ServiceGrantReadError::from_adapter(kind, "query-group")
     })?;
-    let expected_group_sid = resolve_account_sid(SERVICE_EXPECTED_GROUP_AUTHORITY).map_err(|kind| {
-        // SAFETY: LocalFree releases the descriptor allocated above exactly once.
-        unsafe { LocalFree(descriptor.cast()) };
-        ServiceGrantReadError::from_adapter(kind, "resolve-expected-group")
-    })?;
+    let expected_group_sid =
+        resolve_account_sid(SERVICE_EXPECTED_GROUP_AUTHORITY).map_err(|kind| {
+            // SAFETY: LocalFree releases the descriptor allocated above exactly once.
+            unsafe { LocalFree(descriptor.cast()) };
+            ServiceGrantReadError::from_adapter(kind, "resolve-expected-group")
+        })?;
     let owner_matches = owner_text == SERVICE_EXPECTED_OWNER_SID;
-    let group_matches = group_text == expected_group_sid
-        && expected_group_sid == SERVICE_EXPECTED_GROUP_SID;
+    let group_matches =
+        group_text == expected_group_sid && expected_group_sid == SERVICE_EXPECTED_GROUP_SID;
 
     let mut control = 0_u16;
     let mut revision = 0_u32;
