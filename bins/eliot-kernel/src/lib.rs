@@ -161,7 +161,7 @@ use runtime_identity::{
     observed_session_principal_binding,
 };
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -705,33 +705,117 @@ impl AgentActivationPendingState {
         None
     }
 
-    /// Retains one exact result record under its ticket identity, evicting the
-    /// oldest retained ticket that no longer has a live pending bridge entry
-    /// when the bounded ledger is full. A live entry is never evicted: the
-    /// bridge waiter requires both representations until projection. Returns
-    /// `false` only when the state already violates the pending/result bound
-    /// invariant and every retained ticket is still live, so callers can
-    /// fail closed instead of dropping a waiter-visible result.
-    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) -> bool {
-        let ticket_id = record.result.ticket_id.clone();
-        if !self.results.contains_key(&ticket_id) {
-            while self.results.len() >= eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS {
-                let Some(oldest_index) = self
-                    .result_order
-                    .iter()
-                    .position(|candidate| !self.entries.contains_key(candidate))
-                else {
-                    return false;
-                };
-                let Some(oldest) = self.result_order.remove(oldest_index) else {
-                    return false;
-                };
-                self.results.remove(&oldest);
-            }
-            self.result_order.push_back(ticket_id.clone());
+    /// Checks the canonical result map and its insertion order without
+    /// changing either representation. The order is a bijection with the map:
+    /// every ticket occurs exactly once and no ticket is omitted or extraneous.
+    #[cfg(windows)]
+    fn result_ledger_is_consistent(&self) -> bool {
+        let max = eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS;
+        if self.results.len() > max || self.result_order.len() > max {
+            return false;
         }
-        self.results.insert(ticket_id, record);
-        true
+        let mut ordered = BTreeSet::new();
+        for ticket_id in &self.result_order {
+            if !self.results.contains_key(ticket_id) || !ordered.insert(ticket_id) {
+                return false;
+            }
+        }
+        ordered.len() == self.results.len()
+            && self
+                .results
+                .iter()
+                .all(|(ticket_id, record)| ticket_id == &record.result.ticket_id)
+            && self
+                .results
+                .keys()
+                .all(|ticket_id| ordered.contains(ticket_id))
+    }
+
+    /// Determines the only safe eviction plan for one incoming result. This
+    /// is deliberately pure: an impossible bound or order/map state returns
+    /// `None` before durable ORS publication can begin.
+    #[cfg(windows)]
+    fn result_retention_eviction_plan(&self, ticket_id: &str) -> Option<Vec<String>> {
+        if !self.result_ledger_is_consistent() {
+            return None;
+        }
+        if self.results.contains_key(ticket_id) {
+            return Some(Vec::new());
+        }
+        let max = eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS;
+        let required = self.results.len().saturating_add(1).saturating_sub(max);
+        let mut victims = Vec::with_capacity(required);
+        for candidate in &self.result_order {
+            if !self.entries.contains_key(candidate) {
+                victims.push(candidate.clone());
+                if victims.len() == required {
+                    break;
+                }
+            }
+        }
+        (victims.len() == required).then_some(victims)
+    }
+
+    /// Stages the canonical result map/order update before the durable write.
+    /// The returned copies are not published until ORS has committed, so an
+    /// impossible capacity or order state leaves the live ledger untouched.
+    #[cfg(windows)]
+    fn stage_result_retention(
+        &self,
+        record: AgentActivationResultRecord,
+    ) -> Option<(
+        BTreeMap<String, AgentActivationResultRecord>,
+        VecDeque<String>,
+    )> {
+        let ticket_id = record.result.ticket_id.clone();
+        let victims = self.result_retention_eviction_plan(&ticket_id)?;
+        let mut results = self.results.clone();
+        let mut result_order = self.result_order.clone();
+        for victim in victims {
+            results.remove(&victim)?;
+            let before = result_order.len();
+            result_order.retain(|candidate| candidate != &victim);
+            if result_order.len().saturating_add(1) != before {
+                return None;
+            }
+        }
+        if !results.contains_key(&ticket_id) {
+            result_order.push_back(ticket_id.clone());
+        }
+        results.insert(ticket_id, record);
+        Some((results, result_order))
+    }
+
+    /// Publishes a previously staged canonical result after durable ORS
+    /// success. `stage_result_retention` proves the ticket exists in the copy;
+    /// the debug assertion documents that internal invariant without adding a
+    /// post-commit error path for an otherwise unreachable state.
+    #[cfg(windows)]
+    fn publish_staged_result_retention(
+        &mut self,
+        mut staged: (
+            BTreeMap<String, AgentActivationResultRecord>,
+            VecDeque<String>,
+        ),
+        ticket_id: &str,
+        retention_order: u64,
+    ) {
+        debug_assert!(staged.0.contains_key(ticket_id));
+        if let Some(record) = staged.0.get_mut(ticket_id) {
+            record.retention_order = retention_order;
+        }
+        self.results = staged.0;
+        self.result_order = staged.1;
+    }
+
+    #[cfg(test)]
+    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) {
+        let ticket_id = record.result.ticket_id.clone();
+        let retention_order = record.retention_order;
+        let staged = self
+            .stage_result_retention(record)
+            .expect("test result ledger must have a safe retention state");
+        self.publish_staged_result_retention(staged, &ticket_id, retention_order);
     }
 }
 
