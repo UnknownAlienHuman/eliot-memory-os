@@ -594,7 +594,7 @@ fn field_between_backticks(message: &str) -> String {
 ///
 /// Derived read-only from `bins/eliot-agent-bridge/src/main.rs` `Request`;
 /// this table moves with that enum when its owner changes the operation set.
-const GLOBAL_ENVELOPE_KEYS: [&str; 9] = [
+const GLOBAL_ENVELOPE_KEYS: [&str; 12] = [
     "op",
     "request",
     "event",
@@ -604,6 +604,9 @@ const GLOBAL_ENVELOPE_KEYS: [&str; 9] = [
     "activation_generation",
     "authority_epoch",
     "fence_nonce",
+    "context",
+    "tasks",
+    "requested_assessment",
 ];
 
 /// Validates the top-level operation envelope before typed construction.
