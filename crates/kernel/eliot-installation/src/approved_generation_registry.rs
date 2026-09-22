@@ -2870,6 +2870,12 @@ impl ApprovedGenerationRegistry {
         approval.validate()?;
         validate_approval_against_manifest(&approval, &manifest, "pending_activation")?;
         let manifest_digest = candidate_manifest_digest(&manifest)?;
+        let activation_intent_digest = activation_intent_digest.ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "pending activation requires the transaction-owned activation intent digest"
+                    .to_owned(),
+            )
+        })?;
         let pending = PendingActivation {
             transaction_id: approval.transaction_id.clone(),
             plan_digest: approval.installer_plan_digest.clone(),
@@ -2882,7 +2888,7 @@ impl ApprovedGenerationRegistry {
             runtime_state_roots_digest: manifest.runtime_state_roots_digest.clone(),
             manifest,
             manifest_digest,
-            activation_intent_digest,
+            activation_intent_digest: Some(activation_intent_digest),
             prior_active_generation: self.active_generation.clone(),
             approval,
             phase_b_intent: None,
@@ -2949,12 +2955,13 @@ impl ApprovedGenerationRegistry {
         activation_intent: Option<&InstallationActivationProjectionIntent>,
     ) -> Result<(), InstallationError> {
         approval.validate_against(transaction)?;
-        if let Some(activation_intent) = activation_intent {
-            activation_intent.validate_against_transaction(transaction)?;
-        }
-        let activation_intent_digest = activation_intent
-            .map(activation_projection_intent_digest)
-            .transpose()?;
+        let activation_intent = activation_intent.ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "pending activation requires the transaction-owned activation intent".to_owned(),
+            )
+        })?;
+        activation_intent.validate_against_transaction(transaction)?;
+        let activation_intent_digest = activation_projection_intent_digest(activation_intent)?;
         let approvals = transaction.service_registration_approvals()?;
         if transaction.profile == InstallationProfile::SystemService && approvals.len() != 2 {
             return Err(InstallationError::IncompleteObservation(
@@ -2967,6 +2974,7 @@ impl ApprovedGenerationRegistry {
             && existing.plan_digest == transaction.installer_plan_digest
             && existing.manifest == transaction.candidate_manifest
             && existing.approval == approval
+            && existing.activation_intent_digest.as_ref() == Some(&activation_intent_digest)
         {
             for approval in &approvals {
                 if self.service_registration_approval(&approval.generation, approval.role)
@@ -2981,7 +2989,7 @@ impl ApprovedGenerationRegistry {
             transaction.candidate_manifest.clone(),
             approval,
             &approvals,
-            activation_intent_digest,
+            Some(activation_intent_digest),
         )?;
         Ok(())
     }
@@ -3789,6 +3797,27 @@ impl ApprovedGenerationRegistry {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let activation_intent_digest = self
+            .pending_activation
+            .as_ref()
+            .filter(|pending| {
+                pending.transaction_id == *transaction_id && pending.plan_digest == *plan_digest
+            })
+            .and_then(|pending| pending.activation_intent_digest.clone())
+            .or_else(|| {
+                self.aborted_activation_receipts
+                    .iter()
+                    .find(|receipt| {
+                        receipt.transaction_id == *transaction_id
+                            && receipt.plan_digest == *plan_digest
+                    })
+                    .map(|receipt| receipt.activation_intent_digest.clone())
+            })
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "exact activation intent digest is required for abort".to_owned(),
+                )
+            })?;
         let generation = self
             .pending_activation
             .as_ref()
@@ -3816,7 +3845,12 @@ impl ApprovedGenerationRegistry {
                     "no pending activation exists".to_owned(),
                 )
             })?;
-        self.abort_pending_activation_unchecked(transaction_id, plan_digest, &generation)
+        self.abort_pending_activation_unchecked(
+            transaction_id,
+            plan_digest,
+            &generation,
+            &activation_intent_digest,
+        )
     }
 
     pub(crate) fn abort_pending_activation_unchecked(
@@ -3824,20 +3858,32 @@ impl ApprovedGenerationRegistry {
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
+        activation_intent_digest: &PlatformHandle,
     ) -> Result<(), InstallationError> {
+        sha256_handle(
+            activation_intent_digest,
+            "pending_activation.activation_intent_digest",
+        )?;
         self.validate()?;
         let Some(pending) = self.pending_activation.as_ref() else {
-            if self.aborted_activation_receipts.iter().any(|receipt| {
+            let exact_receipt = self.aborted_activation_receipts.iter().find(|receipt| {
                 receipt.transaction_id == *transaction_id
                     && receipt.plan_digest == *plan_digest
                     && receipt.generation == *generation
-            }) || self.terminal_matches(
-                transaction_id,
-                plan_digest,
-                Some(generation),
-                None,
-                PendingActivationTerminalDisposition::Aborted,
-            ) {
+            });
+            if exact_receipt.is_some_and(|receipt| {
+                receipt.activation_intent_digest == *activation_intent_digest
+            }) || self.last_terminal_activation.as_ref().is_some_and(|terminal| {
+                Self::terminal_identity_matches(
+                    terminal,
+                    transaction_id,
+                    plan_digest,
+                    Some(generation),
+                    PendingActivationTerminalDisposition::Aborted,
+                ) && terminal.abort_receipt.as_ref().is_some_and(|receipt| {
+                    receipt.activation_intent_digest == *activation_intent_digest
+                })
+            }) {
                 if self.active_generation.is_some() || self.last_known_good_generation.is_some() {
                     return Err(InstallationError::IncompleteObservation(
                         "aborted first-install terminal coexists with active registry state"
@@ -3853,6 +3899,7 @@ impl ApprovedGenerationRegistry {
         if pending.transaction_id != *transaction_id
             || pending.plan_digest != *plan_digest
             || pending.manifest.generation != *generation
+            || pending.activation_intent_digest.as_ref() != Some(activation_intent_digest)
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -4354,12 +4401,12 @@ impl PendingActivation {
         if candidate_manifest_digest(&self.manifest)? != self.manifest_digest {
             return Err(InstallationError::IdentityConflict);
         }
-        if let Some(intent_digest) = &self.activation_intent_digest {
-            sha256_handle(
-                intent_digest,
-                "pending_activation.activation_intent_digest",
-            )?;
-        }
+        let intent_digest = self.activation_intent_digest.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "pending activation has no retained transaction intent digest".to_owned(),
+            )
+        })?;
+        sha256_handle(intent_digest, "pending_activation.activation_intent_digest")?;
         for (value, field, expected) in [
             (
                 &self.config_digest,

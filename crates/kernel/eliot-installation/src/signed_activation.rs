@@ -524,6 +524,11 @@ impl RedbInstallationRegistry {
         transaction: &InstallationTransaction,
         approval: &InstallationActivationApproval,
     ) -> Result<bool, InstallationError> {
+        let Some(intent) = transaction.activation_projection_intent() else {
+            return Ok(false);
+        };
+        intent.validate_against_transaction(transaction)?;
+        let expected_intent_digest = super::activation_projection_intent_digest(intent)?;
         let registry = self.load()?;
         let Some(pending) = registry.pending_activation().cloned() else {
             return Ok(false);
@@ -533,6 +538,7 @@ impl RedbInstallationRegistry {
             || pending.plan_digest != transaction.installer_plan_digest
             || pending.manifest != transaction.candidate_manifest
             || pending.approval != *approval
+            || pending.activation_intent_digest.as_ref() != Some(&expected_intent_digest)
         {
             return Ok(false);
         }

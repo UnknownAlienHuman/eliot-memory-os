@@ -804,6 +804,7 @@ impl RedbInstallationRegistry {
             let pending = registry.pending_activation.as_ref().ok_or_else(|| {
                 InstallationError::IncompleteObservation("no pending activation exists".to_owned())
             })?;
+            self.validate_host_owner_binding(host, pending)?;
             if pending.approval != approval
                 || pending.phase_b_prepared.as_ref() != Some(&prepared)
                 || pending.phase_b_receipt.is_some()
@@ -959,16 +960,22 @@ impl RedbInstallationRegistry {
     /// projection.  Staging itself advances the registry revision, so abort
     /// must use this guarded readback revision rather than replaying the
     /// pre-stage snapshot number.
-    pub(crate) fn read_exact_pending_activation_revision(
+    pub fn read_exact_pending_activation_revision(
         &self,
         host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         approval: &InstallationActivationApproval,
+        activation_intent_digest: &PlatformHandle,
     ) -> Result<u64, InstallationError> {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        approval.validate()?;
+        crate::sha256_handle(
+            activation_intent_digest,
+            "activation_projection.intent_digest",
+        )?;
         let registry = self.load()?;
         let pending = registry.pending_activation().ok_or_else(|| {
             InstallationError::IncompleteObservation(
@@ -979,6 +986,7 @@ impl RedbInstallationRegistry {
         if pending.transaction_id != *transaction_id
             || pending.plan_digest != *plan_digest
             || pending.approval != *approval
+            || pending.activation_intent_digest.as_ref() != Some(activation_intent_digest)
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -990,12 +998,13 @@ impl RedbInstallationRegistry {
     /// the transaction CAS response was observed.  This readback accepts only
     /// the durable `ABORTED` terminal for the exact transaction, plan and
     /// generation; it never treats a missing or different terminal as success.
-    pub(crate) fn read_exact_aborted_activation_ack(
+    pub fn read_exact_aborted_activation_ack(
         &self,
         host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
+        manifest_digest: &PlatformHandle,
         approval: &InstallationActivationApproval,
         activation_intent_digest: &PlatformHandle,
     ) -> Result<Option<PlatformHandle>, InstallationError> {
@@ -1007,6 +1016,7 @@ impl RedbInstallationRegistry {
             activation_intent_digest,
             "activation_projection.intent_digest",
         )?;
+        crate::sha256_handle(manifest_digest, "pending_activation.manifest_digest")?;
         let registry = self.load()?;
         let receipt = registry
             .aborted_activation_receipts
@@ -1038,6 +1048,7 @@ impl RedbInstallationRegistry {
             ));
         }
         if !receipt.approval.matches_approval(approval)
+            || candidate_manifest_digest(&receipt.manifest)? != *manifest_digest
             || receipt.activation_intent_digest != *activation_intent_digest
         {
             return Err(InstallationError::IdentityConflict);
@@ -1063,21 +1074,30 @@ impl RedbInstallationRegistry {
         Err(InstallationError::IdentityConflict)
     }
     /// Atomically aborts one exact first-install pending approval.
-    pub fn abort_pending_activation(
+    pub fn abort_pending_activation_exact(
         &self,
         host: &HostOwnerEpochCapability,
         expected_revision: u64,
         approval: &InstallationActivationApproval,
+        activation_intent_digest: &PlatformHandle,
     ) -> Result<(), InstallationError> {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         approval.validate()?;
+        crate::sha256_handle(
+            activation_intent_digest,
+            "activation_projection.intent_digest",
+        )?;
         let approval = approval.clone();
+        let activation_intent_digest = activation_intent_digest.clone();
         self.mutate_atomic(expected_revision, |registry| {
             if let Some(pending) = registry.pending_activation.as_ref() {
                 self.validate_host_owner_binding(host, pending)?;
-                if pending.approval != approval {
+                if pending.approval != approval
+                    || pending.activation_intent_digest.as_ref()
+                        != Some(&activation_intent_digest)
+                {
                     return Err(InstallationError::IdentityConflict);
                 }
             } else if let Some(receipt) = registry.aborted_activation_receipts.iter().find(|receipt| {
@@ -1087,7 +1107,9 @@ impl RedbInstallationRegistry {
             }) {
                 receipt.validate()?;
                 self.validate_host_owner_binding_for_abort_receipt(host, receipt)?;
-                if !receipt.approval.matches_approval(&approval) {
+                if !receipt.approval.matches_approval(&approval)
+                    || receipt.activation_intent_digest != activation_intent_digest
+                {
                     return Err(InstallationError::IdentityConflict);
                 }
             }
@@ -1095,8 +1117,50 @@ impl RedbInstallationRegistry {
                 &approval.transaction_id,
                 &approval.installer_plan_digest,
                 &approval.generation,
+                &activation_intent_digest,
             )
         })
+    }
+
+    /// Test-only compatibility seam for registry state-machine fixtures.
+    /// Production callers must provide the transaction-owned digest through
+    /// [`Self::abort_pending_activation_exact`]; this fixture helper derives
+    /// only the already-persisted test projection and cannot authorize a
+    /// production transaction.
+    #[cfg(test)]
+    pub fn abort_pending_activation(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        approval: &InstallationActivationApproval,
+    ) -> Result<(), InstallationError> {
+        let registry = self.load()?;
+        let activation_intent_digest = registry
+            .pending_activation()
+            .filter(|pending| pending.approval == *approval)
+            .and_then(|pending| pending.activation_intent_digest.clone())
+            .or_else(|| {
+                registry
+                    .aborted_activation_receipts
+                    .iter()
+                    .find(|receipt| {
+                        receipt.transaction_id == approval.transaction_id
+                            && receipt.plan_digest == approval.installer_plan_digest
+                            && receipt.generation == approval.generation
+                    })
+                    .map(|receipt| receipt.activation_intent_digest.clone())
+            })
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "exact activation intent digest is required for abort".to_owned(),
+                )
+            })?;
+        self.abort_pending_activation_exact(
+            host,
+            expected_revision,
+            approval,
+            &activation_intent_digest,
+        )
     }
 }
 

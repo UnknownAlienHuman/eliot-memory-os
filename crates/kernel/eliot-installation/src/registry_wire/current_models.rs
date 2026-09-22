@@ -100,7 +100,6 @@ struct PendingActivationWire {
     host_artifact_digest: PlatformHandle,
     runtime_state_roots_digest: PlatformHandle,
     manifest_digest: PlatformHandle,
-    #[serde(default)]
     activation_intent_digest: Option<PlatformHandle>,
     prior_active_generation: Option<PlatformHandle>,
     approval: InstallationActivationApprovalWire,

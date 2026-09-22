@@ -9311,6 +9311,7 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         // Phase-B effects are still pending and carry no runtime receipt.
         transaction.require_signed_pending_activation_effects()?;
         let approval = intent.derive_verified_approval(&transaction)?;
+        let manifest_digest = candidate_manifest_digest(&transaction.candidate_manifest)?;
         let activation_intent_digest = activation_projection_intent_digest(&intent)?;
         let expected_transaction = TransactionVersion::of(&transaction)?;
         let abort_evidence = match registry.read_exact_aborted_activation_ack(
@@ -9318,6 +9319,7 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
             transaction_id,
             &transaction.installer_plan_digest,
             &transaction.candidate_manifest.generation,
+            &manifest_digest,
             &approval,
             &activation_intent_digest,
         )? {
@@ -9328,14 +9330,21 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
                     transaction_id,
                     &transaction.installer_plan_digest,
                     &approval,
+                    &activation_intent_digest,
                 )?;
-                registry.abort_pending_activation(host, pending_revision, &approval)?;
+                registry.abort_pending_activation_exact(
+                    host,
+                    pending_revision,
+                    &approval,
+                    &activation_intent_digest,
+                )?;
                 registry
                     .read_exact_aborted_activation_ack(
                         host,
                         transaction_id,
                         &transaction.installer_plan_digest,
                         &transaction.candidate_manifest.generation,
+                        &manifest_digest,
                         &approval,
                         &activation_intent_digest,
                     )?
