@@ -12,7 +12,13 @@ mod bridge_admission;
 mod input;
 mod plan;
 mod result;
+mod session_envelope;
 mod settled_plan_feed;
+
+pub use session_envelope::{
+    ItemCueFacts, RecordOperationError, RecordOperationFacts, produce_item_cue_facts,
+    produce_record_operation_envelope,
+};
 
 pub use bridge_admission::{
     BridgeAdmissionBatch, BridgeAdmissionDelivery, BridgeAdmissionError,

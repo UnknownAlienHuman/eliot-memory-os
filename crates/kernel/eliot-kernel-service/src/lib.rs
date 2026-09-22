@@ -40,6 +40,7 @@ mod protocol;
 mod reactive_state;
 #[cfg(test)]
 mod reactive_state_tests;
+mod session_envelope;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
@@ -151,6 +152,9 @@ pub use reactive_state::{
     ResourceSnapshotReadRequest, ResourceSnapshotReadResponse, ResourceSnapshotRequest,
     ResourceSnapshotResponse, handle_reactive_ledger_read, handle_reactive_ledger_request,
     handle_resource_snapshot_read, handle_resource_snapshot_request, reconcile_reactive_state,
+};
+pub use session_envelope::{
+    RuntimeEnvelopeError, RuntimeEnvelopeFacts, produce_runtime_generation, produce_runtime_id,
 };
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,

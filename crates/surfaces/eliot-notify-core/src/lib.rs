@@ -8,8 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+mod session_envelope;
 mod user_automation;
 
+pub use session_envelope::{RecipientEnvelopeError, produce_recipient_id};
 pub use user_automation::{
     UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationExecutionMode,
     UserAutomationFailureNotification, UserAutomationFailureRequest, UserAutomationInvocation,

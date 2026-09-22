@@ -658,6 +658,19 @@ impl AgentCoordinator {
         self.attempts.get(attempt_id)
     }
 
+    /// Read-only projection of every attempt record held by this
+    /// coordinator, in deterministic attempt-identity order.
+    ///
+    /// Owner-read for session-envelope producers (issue #1942, lane O1):
+    /// producers filter this live registry with a deterministic rule and
+    /// never accept caller-supplied attempt identity. The registry carries
+    /// no session; the caller receives each candidate's fence so the session
+    /// assembly can verify the binding against the live attach fence that
+    /// the bridge owns.
+    pub fn attempt_records(&self) -> Vec<AttemptRecord> {
+        self.attempts.values().cloned().collect()
+    }
+
     pub fn events(&self) -> &[CoordinatorEvent] {
         &self.events
     }
