@@ -2990,11 +2990,6 @@ fn run_installation_effect(
     Ok(installation_command_exit_code(overall_status))
 }
 
-/// Reconciles only an exact Host-committed registry terminal.  A missing
-/// terminal is the expected fenced first-install state and remains pending;
-/// this query never starts services, rewrites descriptors, or retries a
-/// credential/SCM effect.
-///
 /// The terminal-reconcile writer open below is short-lived and bounded: it
 /// retries only redb exclusive-lock contention with backoff, then fails
 /// typed with the preserved cause (A13.9:14 no exclusive owner across an
@@ -3081,6 +3076,10 @@ fn rollback_with_activation_owner(
     coordinator.rollback_with_activation_owner(&registry, &host, transaction_id)
 }
 
+/// Reconciles only an exact Host-committed registry terminal.  A missing
+/// terminal is the expected fenced first-install state and remains pending;
+/// this query never starts services, rewrites descriptors, or retries a
+/// credential/SCM effect.
 fn reconcile_host_activation_terminal(
     store_path: &Path,
     transaction: &InstallationTransaction,
@@ -3093,7 +3092,9 @@ fn reconcile_host_activation_terminal(
             .host_state_root
             .as_str(),
     );
-    let Some(registry) = open_existing_registry_for_terminal_reconcile(host_state_root)? else {
+    let host_root = ProtectedRootLease::open_existing(host_state_root)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let Some(registry) = RedbInstallationRegistry::inspect_existing_at(host_root)? else {
         return Ok(None);
     };
     let receipt = match registry.read_committed_activation_receipt(
