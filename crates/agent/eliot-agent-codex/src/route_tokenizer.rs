@@ -29,11 +29,25 @@
 //! the bridge verifies admission linkage and byte binding at intake, never
 //! here. Layering is one-way by construction: provider-side measurement
 //! never depends on surface contracts.
+//!
+//! [`observe_measured_tool_result`] extends measurement with observation:
+//! given the wire terminal fact for the bound execution unit, it builds the
+//! canonical Matched physical observation the bridge payload needs — the
+//! observed route is the wire-attributed binding's route (never the
+//! requested route defaulted), evidence-bound to the exact counted bytes.
+//! Without a terminal fact, or when any linkage leg disagrees, it fails
+//! closed instead of emitting `Unobserved` guesses: absence of observation
+//! stays absence, never a zero-count receipt.
 
+use eliot_agent_api::{
+    AdmittedRouteReceipt, CONTRACT_VERSION, ClockReading, ExecutionOutcome,
+    NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    QuotaKnowledge, RouteObservationState, UsageReceipt,
+};
 use sha2::{Digest, Sha256};
 use tiktoken_rs::tokenizer::{Tokenizer, get_tokenizer};
 
-use crate::CodexAdapterError;
+use crate::{CodexAdapterError, validate_binding_for_codex, validate_terminal_observation};
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -159,6 +173,142 @@ pub fn measure_result_tokens(
         tokens,
         encoding,
         result_digest: sha256_hex(result_bytes),
+    })
+}
+
+/// Measured tool-result carrier: canonical observed evidence bound to the
+/// exact counted bytes, for the bridge-side receipt join.
+///
+/// The observation is the physical evidence the bridge payload needs; the
+/// count and digest are this route's actual-tokenizer outputs for the
+/// carried bytes; the bytes travel owned so the bridge verifies the
+/// binding against exactly what was counted. Only counts, digests, the
+/// canonical observation, and the bytes cross — no tiktoken type, no
+/// bridge type.
+#[derive(Clone, Debug)]
+pub struct CodexMeasuredToolResult {
+    /// Matched physical observation: wire-attributed route, admission
+    /// linkage enforced, sealed digest recomputed.
+    pub observation: PhysicalRouteObservationReceipt,
+    /// Token count the route's actual tokenizer reported for
+    /// [`Self::result_bytes`].
+    pub tokens: u64,
+    /// Lowercase SHA-256 hex of [`Self::result_bytes`].
+    pub result_digest: String,
+    /// Exact bytes that were counted.
+    pub result_bytes: Vec<u8>,
+}
+
+/// Observe one tool-result delivery with the route's actual tokenizer and
+/// emit the measured carrier.
+///
+/// Genuine facts in, canonical evidence out: the wire terminal envelope
+/// must attribute terminal execution to `binding`
+/// ([`validate_terminal_observation`](crate::validate_terminal_observation)),
+/// the admitted route must select the executed route, and the exact result
+/// bytes must be countable text under the wire-attributed route's
+/// owner-published tokenizer mapping. The observed route is the attributed
+/// binding's route — never the requested route defaulted, never a
+/// configured model: requested, attributed, and admitted-selected routes
+/// must agree by typed equality, and any leg that disagrees fails closed.
+/// Turn-level usage never enters: the observation carries explicit unknown
+/// usage, and the count travels only in [`CodexMeasuredToolResult::tokens`].
+/// Raw-evidence reference stays absent with its digest slot: at adapter
+/// time no evidence record exists yet (the digest binding the counted bytes
+/// travels in the carrier and the bridge wire payload).
+///
+/// # Errors
+///
+/// Returns [`CodexAdapterError::UnknownTokenizerModel`] when the attributed
+/// route's model has no owner-published mapping,
+/// [`CodexAdapterError::UncountableBytes`] when the bytes are not text,
+/// [`CodexAdapterError::TokenizerUnavailable`] when counting cannot
+/// complete, [`CodexAdapterError::InvalidInput`] when the terminal fact
+/// carries unknown observation time, or contract errors
+/// (`BindingMismatch`, digest failures) when any linkage leg disagrees.
+pub fn observe_measured_tool_result(
+    result_bytes: &[u8],
+    terminal: &NormalizedHostEventEnvelope,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+) -> Result<CodexMeasuredToolResult, CodexAdapterError> {
+    validate_binding_for_codex(binding)?;
+    validate_terminal_observation(terminal, binding, admission)?;
+    let attributed = terminal
+        .lineage
+        .attributable_binding()
+        .map_err(CodexAdapterError::Contract)?;
+    debug_assert_eq!(
+        attributed, binding,
+        "terminal attribution already enforced equal to the presented binding"
+    );
+    if terminal.observed_at.valid_time_ms.is_none() {
+        return Err(CodexAdapterError::InvalidInput(
+            "terminal observation time unknown",
+        ));
+    }
+    let measured = measure_result_tokens(&attributed.route.model, result_bytes)?;
+    let requested = admission
+        .selected_route
+        .clone()
+        .ok_or(CodexAdapterError::Contract(
+            eliot_agent_api::ContractError::BindingMismatch,
+        ))?;
+    let zero_digest: eliot_agent_api::LowercaseSha256 =
+        serde_json::from_value(serde_json::Value::String(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        ))
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    let mut observation = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: binding.attempt_id.clone(),
+        state_fence: binding.state_fence.clone(),
+        runtime_generation: binding.runtime_generation,
+        admitted_route_digest: admission.self_digest.clone(),
+        binding: binding.clone(),
+        requested_route: requested,
+        observed_route: Some(attributed.route.clone()),
+        route_state: RouteObservationState::Matched,
+        diverged_fields: Vec::new(),
+        execution_outcome: ExecutionOutcome::Observed,
+        // Unknown request commitment, honestly zero: the admitted request
+        // bytes are host-side, unseen at this layer (translate_result
+        // precedent); the counted bytes are bound by result_digest below.
+        request_digest: zero_digest,
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: UsageReceipt {
+            input_tokens: None,
+            output_tokens: None,
+            cost_microunits: None,
+            quota: QuotaKnowledge::Unknown,
+        },
+        started: ClockReading::default(),
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal: terminal.observed_at,
+        event_cursor: terminal.cursor.clone(),
+        event_sequence: terminal.sequence,
+        cancellation: None,
+        unobserved_reason: None,
+        recovery_ref: None,
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: serde_json::from_value(serde_json::Value::String(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        ))
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?,
+    };
+    observation.self_digest = observation
+        .compute_digest()
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    observation.validate_against(binding, admission)?;
+    Ok(CodexMeasuredToolResult {
+        observation,
+        tokens: measured.tokens(),
+        result_digest: measured.result_digest().to_owned(),
+        result_bytes: result_bytes.to_vec(),
     })
 }
 
