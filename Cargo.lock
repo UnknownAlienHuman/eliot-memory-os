@@ -1061,6 +1061,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-evidence",
  "eliot-receipts",
+ "serde",
 ]
 
 [[package]]

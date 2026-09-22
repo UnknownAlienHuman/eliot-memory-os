@@ -9,7 +9,10 @@
 
 pub mod decision;
 
-pub use decision::RetrievalAdmissionDecision;
+pub use decision::{
+    MaterialRankTrace, RetrievalAdmissionDecision, RetrievalStaleness, check_retrieval_freshness,
+    trace_material,
+};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -31,6 +34,19 @@ const UNKNOWN_AVAILABILITY_CONSTRAINT: &str =
 /// or non-recoverable reason. No source is fetched and no representation is
 /// generated here.
 pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
+    // I12.26 stale-projection fence arm, enforced before exact cue firing: a
+    // candidate closure compiled under another fence must refresh the packet
+    // and can never silently admit. Today's boundary refusal for exactly this
+    // case is `InvalidFence`, so the mapping is exact rather than a new
+    // meaning. Floor/optional staleness keeps flowing through the existing
+    // typed incomplete/omission paths below; erroring there would change the
+    // boundary contract those paths own.
+    if matches!(
+        check_retrieval_freshness(input),
+        Err(RetrievalStaleness::PacketRefreshRequired)
+    ) {
+        return Err(ContextError::InvalidFence);
+    }
     validate_admission_contract(input)?;
     let input_digest = input.canonical_digest()?;
     let profile_digest = input.measurement_profile.canonical_digest()?;
