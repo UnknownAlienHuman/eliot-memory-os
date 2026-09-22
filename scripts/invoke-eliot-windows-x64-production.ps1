@@ -27,7 +27,7 @@ $ErrorActionPreference = 'Stop'
 if ($MyInvocation.InvocationName -eq '.') {
     throw 'the canonical production materialize launcher cannot be dot-sourced'
 }
-$script:ProductionCliSigningScope = 'runtime-materializer-nine-plus-cli-pe-roles'
+$script:ProductionCliSigningScope = 'runtime-materializer-ten-plus-cli-pe-roles'
 $script:ProductionCliSigningPolicy = 'authenticode-rfc3161'
 $script:ProductionCliVerifier = 'SignTool(/pa,/all,/v,/tw)+Get-AuthenticodeSignature/WinTrust+RFC3161-CMS'
 $script:ProductionCliCodeSigningEku = '1.3.6.1.5.5.7.3.3'
@@ -45,6 +45,7 @@ $script:ProductionMaterializedRoles = @(
     [pscustomobject]@{ name = 'eliot-doctor.exe'; executable = $true }
     [pscustomobject]@{ name = 'eliot-testd.exe'; executable = $true }
     [pscustomobject]@{ name = 'eliot-native-worker.exe'; executable = $true }
+    [pscustomobject]@{ name = 'eliot-wasm-host.exe'; executable = $true }
     [pscustomobject]@{ name = 'generation.json'; executable = $false }
     [pscustomobject]@{ name = 'eliotd-governor.json'; executable = $false }
     [pscustomobject]@{ name = 'eliotd.json'; executable = $false }
@@ -752,7 +753,7 @@ function New-TrustedSignedRolePins([string]$SignedBundlePath) {
                 if ($handle -and -not $handle.IsClosed) { $handle.Dispose() }
             }
         }
-        # Part B (#1227): exact nine-plus-CLI PE role count (10).  Bound
+        # Part B (#1227): exact ten-plus-CLI PE role count (11).  Bound
         # dynamically to the finalizer denominator so scripts, manifests and
         # the aggregator agree; hardcoded seven/nine counts are forbidden.
         $expectedRoleCount = @(Get-AuthenticodeRoleDefinitions).Count
@@ -912,8 +913,8 @@ function Get-VerifiedSignedRoleManifestBinding(
 ) {
     $bundle = Assert-ExistingBundleDirectory $SignedBundlePath 'SignedBundle'
     $normalizedRolePath = $RolePath.Replace('\', '/')
-    # Part B (#1227): exact nine-plus-CLI verification size, bound
-    # dynamically to the finalizer denominator (10), not a stale seven.
+    # Part B (#1227): exact ten-plus-CLI verification size, bound
+    # dynamically to the finalizer denominator (11), not a stale seven.
     $expectedVerificationRoles = @(Get-AuthenticodeRoleDefinitions).Count
     if (-not $Verification -or [string]$Verification.status -cne 'VERIFIED_SIGNED' -or
         [string]$Verification.verification_kind -cne 'READ_ONLY_SNAPSHOT' -or
@@ -1179,6 +1180,10 @@ function New-ProductionMaterializeArguments([object]$Contract, [object[]]$RolePi
     $storeBridge = Get-TrustedSignedRolePin $RolePins 'store_bridge'
     $database = Get-TrustedSignedRolePin $RolePins 'database'
     $daemon = Get-TrustedSignedRolePin $RolePins 'daemon'
+    $doctor = Get-TrustedSignedRolePin $RolePins 'doctor'
+    $testd = Get-TrustedSignedRolePin $RolePins 'testd'
+    $nativeWorker = Get-TrustedSignedRolePin $RolePins 'native_worker'
+    $wasmHost = Get-TrustedSignedRolePin $RolePins 'wasm_host'
     $arguments = [System.Collections.Generic.List[string]]::new()
     foreach ($value in @(
             'installation', 'materialize-source-bundle',
@@ -1188,6 +1193,10 @@ function New-ProductionMaterializeArguments([object]$Contract, [object[]]$RolePi
             '--eliot-store-surreal', [string]$storeBridge.path,
             '--surreal', [string]$database.path,
             '--eliotd', [string]$daemon.path,
+            '--eliot-doctor', [string]$doctor.path,
+            '--eliot-testd', [string]$testd.path,
+            '--eliot-native-worker', [string]$nativeWorker.path,
+            '--eliot-wasm-host', [string]$wasmHost.path,
             '--output-bundle', [string]$Contract.output_bundle,
             '--output', [string]$Contract.output,
             '--store', [string]$Contract.store,
@@ -1331,7 +1340,7 @@ function Get-ProductionMaterializeReadback([object]$Contract, [object]$Receipt) 
             $fact = $receiptFiles[$index]
             if ([string]$fact.relative_path -cne [string]$definition.name -or
                 [bool]$fact.executable -ne [bool]$definition.executable) {
-                throw 'materialized twelve-role receipt is missing, reordered, or substituted'
+                throw 'materialized thirteen-role receipt is missing, reordered, or substituted'
             }
             $rolePath = Join-Path ([string]$Contract.output_bundle) ([string]$definition.name)
             $handle = [EliotReleaseNativeFileSystem]::OpenFileReadFence($rolePath)

@@ -981,6 +981,7 @@ name = "eliot-context"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-cue-contracts",
  "eliot-evidence",
  "schemars",
  "serde",

@@ -611,7 +611,11 @@ fn assert_classifier_units() {
     // Classifier unit coverage on literals: local definitions, eliot_types
     // import and fully-qualified paths resolve; anything else is unknown.
     for (snippet, in_types, expected) in [
-        (concat!("pub enum", " ", "CueKind { A, }"), false, KindProvenance::Local),
+        (
+            concat!("pub enum", " ", "CueKind { A, }"),
+            false,
+            KindProvenance::Local,
+        ),
         (
             "pub type CueKind = LegacyCueKindV1;",
             false,
