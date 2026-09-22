@@ -25,6 +25,9 @@
 //! ceiling and the owner-approved six-field task-control schema emitted by
 //! the Governor task lifecycle envelope
 //! (`crates/governor/eliot-governor/src/task_lifecycle.rs`, `task_envelope`)),
+//! plus the `RecordFinishDecision` mutation (issue #325: persists the
+//! Governor-owned opaque finish receipt through the existing `RecoverySchema`
+//! owner path),
 //! plus the `ApplyEpistemicRevision` mutation (T11.2: persists
 //! `TransitionClass::Epistemic` with the `EffectClass::Candidate`
 //! ceiling and the owner-approved epistemic-revision payload),
@@ -343,8 +346,9 @@ struct ActivatedMutationDescriptor {
 /// `CaptureObservation` and `AppendAuditEvent` persist the lowest ceiling
 /// (`Candidate`) through the `CaptureCandidate` family; `ApplyLifecyclePolicy`
 /// persists `ReversibleMutation` through the `LifecyclePolicy` family;
-/// `ReconcileRecovery` persists `ReversibleMutation` through the
-/// `RecoverySchema` family; `UpdateTaskState` persists `ReversibleMutation`
+/// `ReconcileRecovery` and `RecordFinishDecision` persist
+/// `ReversibleMutation` through the `RecoverySchema` family;
+/// `UpdateTaskState` persists `ReversibleMutation`
 /// through the `TaskControl` family; `ApplyEpistemicRevision` persists
 /// `ReversibleMutation` through the `Epistemic` family; `ApplyErasure`
 /// persists `ReversibleMutation` through the `Erasure` family (issue #1712:
@@ -358,7 +362,7 @@ struct ActivatedMutationDescriptor {
 /// snapshots with the closed reactive typed contract). All
 /// ten address no scope, mirroring the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 11] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 12] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -385,6 +389,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 11] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ReconcileRecovery,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordFinishDecision,
         transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: READ_MAX_INPUT_BYTES,
@@ -721,6 +731,7 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::AppendAuditEvent
             | NamedMutationOperation::ApplyLifecyclePolicy
             | NamedMutationOperation::ReconcileRecovery
+            | NamedMutationOperation::RecordFinishDecision
             | NamedMutationOperation::UpdateTaskState
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure => {

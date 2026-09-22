@@ -37,6 +37,7 @@ use eliot_store_api::{
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
     StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    MAX_RECOVERY_RECORD_BYTES, OWNER_SNAPSHOT_SCHEMA,
     canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
     decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
     decode_resource_content, generated_operation_manifests, genesis_manifest, is_genesis_fence,
@@ -336,6 +337,7 @@ impl MemoryStore {
         // outbox references include the appended automation outbox intents.
         // Rows, receipt, and outbox still commit atomically below.
         dispatch_apply_automation_state(&mut state, &transition, &mut plan)?;
+        dispatch_apply_finish_decision(&mut state, &transition)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
         if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
             commit.readback(&receipt)?;
@@ -575,6 +577,81 @@ fn dispatch_apply_erasure(
     };
     record_erasure_intent_state(state, intent)?;
     apply_erasure_state(state, operation_id)?;
+    Ok(())
+}
+
+const FINISH_OWNER_NAMESPACE: &str = "owner";
+const FINISH_OWNER_KEY: &str = "finish";
+
+/// Applies the admitted Governor finish-owner mutation under the same lock as
+/// the canonical receipt. The receipt JSON is deliberately opaque here: the
+/// Governor owns its shape and semantics, while this handler only performs
+/// the fixed `owner/finish` fenced revision CAS/upsert.
+fn dispatch_apply_finish_decision(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    let Some(command) = transition
+        .named_operations
+        .iter()
+        .find(|command| command.operation == NamedMutationOperation::RecordFinishDecision)
+    else {
+        return Ok(());
+    };
+    if transition.transition_class != TransitionClass::RecoverySchema {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let text_param = |name: &str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })
+    };
+    let _attempt_id = text_param("attempt_id")?;
+    let expected_revision = text_param("expected_finish_revision")?.parse::<u64>().map_err(|_| {
+        StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "expected_finish_revision must be a decimal revision",
+        }
+    })?;
+    let receipt_json = text_param("receipt_json")?;
+    if receipt_json.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+
+    let key = RecoveryRecordKey::new(FINISH_OWNER_NAMESPACE, FINISH_OWNER_KEY)?;
+    if let Some(existing) = state.recovery_records.get(&key) {
+        if existing.state_fence != transition.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        if existing.revision != expected_revision {
+            return Err(StoreError::RevisionConflict);
+        }
+    } else if expected_revision != 0 {
+        return Err(StoreError::RevisionConflict);
+    }
+    let revision = expected_revision
+        .checked_add(1)
+        .ok_or(StoreError::InvalidField {
+            field: "finish.owner_revision",
+            reason: "revision overflow",
+        })?;
+    let payload = receipt_json.as_bytes().to_vec();
+    let record = RecoveryRecord {
+        namespace: FINISH_OWNER_NAMESPACE.to_owned(),
+        key: FINISH_OWNER_KEY.to_owned(),
+        state_fence: transition.state_fence.clone(),
+        revision,
+        schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+        value_digest: sha256_hex(&payload),
+        payload,
+    };
+    record.validate()?;
+    state.recovery_records.insert(key, record);
     Ok(())
 }
 
@@ -1650,6 +1727,10 @@ fn validate_transaction_state(
             .named_operations
             .iter()
             .any(|command| command.operation == NamedMutationOperation::ApplyUserAutomationState)
+        || transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::RecordFinishDecision)
     {
         return transition.validate_against_catalogue(&generated_operation_manifests()?);
     }

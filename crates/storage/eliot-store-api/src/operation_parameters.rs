@@ -306,6 +306,26 @@ static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
         required: true,
     },
 ];
+/// Owner-approved Governor finish persistence fields. The receipt remains an
+/// opaque canonical JSON document at this boundary; only the fixed
+/// `owner/finish` record address and outer revision are storage semantics.
+static RECORD_FINISH_DECISION_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: "attempt_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_finish_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "receipt_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 static EPISTEMIC_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
     name: "revision",
@@ -812,6 +832,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::UpdateTaskState => "UpdateTaskState",
         NamedMutationOperation::ApplyLifecyclePolicy => "ApplyLifecyclePolicy",
         NamedMutationOperation::ReconcileRecovery => "ReconcileRecovery",
+        NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
@@ -831,6 +852,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"UpdateTaskState" => Some(NamedMutationOperation::UpdateTaskState),
         b"ApplyLifecyclePolicy" => Some(NamedMutationOperation::ApplyLifecyclePolicy),
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
+        b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
@@ -946,6 +968,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::AppendAuditEvent => &APPEND_AUDIT_EVENT_PARAMETERS,
         NamedMutationOperation::ApplyLifecyclePolicy => &APPLY_LIFECYCLE_POLICY_PARAMETERS,
         NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
+        NamedMutationOperation::RecordFinishDecision => &RECORD_FINISH_DECISION_PARAMETERS,
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
