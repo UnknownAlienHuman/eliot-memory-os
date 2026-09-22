@@ -35,7 +35,9 @@ pub use identity::{
     ScopeRelocationKind, ScopeRelocationOrAttachReceipt, SupportingEvidenceClass,
     WorkScopeDescriptor, WorkScopeProposal, WorkScopeResolutionReceipt,
 };
-pub use issuance::{IssuanceRefusal, issuance_refusal, issue_resolution_receipt};
+pub use issuance::{
+    IssuanceRefusal, admit_initial_binding, issuance_refusal, issue_resolution_receipt,
+};
 pub use resolver::{
     BindingToken, HostObservedHandles, ManifestBoundaryClaim, RegisteredInstanceEvidence,
     ResolutionOutcome, ResolutionRequest, ResolutionTier, ResumedTaskEvidence, SessionTaskClaim,

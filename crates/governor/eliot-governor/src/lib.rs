@@ -54,6 +54,7 @@ mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_projection_refresh;
 mod reactive_admission;
+mod scope_identity_admission;
 mod skill_lifecycle;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
@@ -93,6 +94,17 @@ pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_comma
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
     assess_reactive_risk, bind_atom_risk, mint_atom_warning,
+};
+pub use scope_identity_admission::{
+    BindingToken, GenerationEvidence, GoverningSourceSet, GuardTrigger, GuardVerdict,
+    HostObservedHandles, IdentityEvidence, IdentityLegOutcome, ManifestBoundaryClaim,
+    PrivacyProfile, ProposalSource, RegisteredInstanceEvidence, ResolutionAuthentication,
+    ResolutionOutcome, ResolutionRequest, ResolutionTier, ResumedTaskEvidence, ScopeBinding,
+    ScopeBindingDisposition, ScopeBindingGuard, ScopeFingerprint, ScopeRelocationOrAttachReceipt,
+    ScopeResolution, SessionTaskClaim, TaskScopeCheck, TaskScopeOutcome, TriggerReport,
+    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor, WorkScopeResolutionReceipt,
+    WorkScopeResolver, WorkspaceInstanceIdentity, check_at_trigger, check_task_observation,
+    identity_legs, issue_resolution_receipt, rebind_with_receipt, require_fresh_matched_binding,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
