@@ -351,6 +351,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "test fixtures use expect to make violated setup invariants fail immediately"
+    )]
     fn healthy_generation_probes_ready_with_bound_digest() {
         let probe = block_on(probe_blob_generation(
             &view(),
