@@ -419,6 +419,7 @@ impl KernelComposition {
                     KernelFrameAction::Doctor { .. } => "doctor_admitted",
                     KernelFrameAction::Testd { .. } => "testd_admitted",
                     KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
+                    KernelFrameAction::ReactiveRestore { .. } => "reactive_restore_admitted",
                     KernelFrameAction::Fence(_) => "fenced_reply",
                 };
                 observe_frame("kernel.frame_validated", "success");

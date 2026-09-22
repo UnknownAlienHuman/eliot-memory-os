@@ -354,6 +354,14 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::ReactiveRestore { .. } => {
+                // The reactive restore carrier is not a front-door semantic
+                // action. Exact resource reads use the admitted local-read
+                // result path; any stray carrier is fenced rather than
+                // creating a second response/persistence route.
+                session.fence();
+                return Err(TransportError::SessionFenced);
+            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 session.fence();
@@ -514,7 +522,8 @@ async fn serve_admitted_bridge_host_requests(
             | KernelFrameAction::Daemon { .. }
             | KernelFrameAction::Doctor { .. }
             | KernelFrameAction::Testd { .. }
-            | KernelFrameAction::Dreamer { .. } => {
+            | KernelFrameAction::Dreamer { .. }
+            | KernelFrameAction::ReactiveRestore { .. } => {
                 // Bridge transports never carry process, daemon, Doctor,
                 // testd, or Dreamer authority: the Doctor serves only its own
                 // admitted generation-bound session/connection (T6-D2 P-07),
