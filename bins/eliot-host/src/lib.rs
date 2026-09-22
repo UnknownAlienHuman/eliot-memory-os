@@ -148,7 +148,7 @@ use launch_options::valid_sha256_text;
 pub use reactive_context_delivery::{HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError};
 #[cfg(windows)]
 pub use restore_destination_auth::{
-    DESTINATION_AUTHORIZATION_FILE, DESTINATION_AUTHORIZATION_ISSUER,
+    DESTINATION_AUTHORIZATION_ISSUER,
     DESTINATION_AUTHORIZATION_WIRE, DestinationAuthError, DestinationAuthRequest,
     DestinationAuthorization, HostRestoreDestinationAuth, MAX_AUTHORIZATION_BYTES,
 };

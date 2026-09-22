@@ -59,6 +59,11 @@ const UNKNOWN_REF_REASONS: &[&str] = &[
     "reactive-context-queue-full",
     "reactive-context-queue-response",
     "reactive-context",
+    "restore-destination-validation",
+    "restore-destination-queue-lock",
+    "restore-destination-queue-full",
+    "restore-destination-queue-response",
+    "restore-destination-authorization",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -69,6 +74,7 @@ pub enum HostRuntimeControlOperation {
     RecoverStore,
     ReconcileStoreRecovery,
     DeliverReactiveContext,
+    DeliverRestoreDestinationAuth,
 }
 
 fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
@@ -78,6 +84,9 @@ fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static
         HostRuntimeControlOperation::RecoverStore => "RecoverStore",
         HostRuntimeControlOperation::ReconcileStoreRecovery => "ReconcileStoreRecovery",
         HostRuntimeControlOperation::DeliverReactiveContext => "DeliverReactiveContext",
+        HostRuntimeControlOperation::DeliverRestoreDestinationAuth => {
+            "DeliverRestoreDestinationAuth"
+        }
     }
 }
 
@@ -88,6 +97,9 @@ fn operation_unknown_prefix(operation: &HostRuntimeControlOperation) -> &'static
         HostRuntimeControlOperation::RecoverStore
         | HostRuntimeControlOperation::ReconcileStoreRecovery => "store-recovery",
         HostRuntimeControlOperation::DeliverReactiveContext => "reactive-context",
+        HostRuntimeControlOperation::DeliverRestoreDestinationAuth => {
+            "restore-destination-authorization"
+        }
     }
 }
 
@@ -204,6 +216,9 @@ fn parse_runtime_control_unknown_ref(
         "RecoverStore" => HostRuntimeControlOperation::RecoverStore,
         "ReconcileStoreRecovery" => HostRuntimeControlOperation::ReconcileStoreRecovery,
         "DeliverReactiveContext" => HostRuntimeControlOperation::DeliverReactiveContext,
+        "DeliverRestoreDestinationAuth" => {
+            HostRuntimeControlOperation::DeliverRestoreDestinationAuth
+        }
         _ => return None,
     };
     let request = HostRuntimeControlRequest {
@@ -213,6 +228,7 @@ fn parse_runtime_control_unknown_ref(
         mutation_digest: PlatformHandle::new(mutation_digest).ok()?,
         request_digest: PlatformHandle::new(request_digest).ok()?,
         reactive_context: None,
+        restore_destination: None,
     };
     request.validate_identity().ok().map(|_| request)
 }
@@ -249,6 +265,74 @@ impl HostReactiveContextRuntimeRequest {
     }
 }
 
+/// Wire identity carried inside restore-destination responses. This names
+/// the Host owner binding the response attests; it is a discriminator,
+/// never authority by itself — authority comes from the authenticated
+/// channel plus the digest-bound request/response correlation.
+pub const RESTORE_DESTINATION_WIRE: &str = "eliot.host.restore-destination-authorization.v1";
+/// Issuer identity carried inside restore-destination responses.
+pub const RESTORE_DESTINATION_ISSUER: &str = "host-restore-destination-owner";
+
+fn restore_destination_text(value: &PlatformHandle, field: &str) -> Result<(), String> {
+    let text = value.as_str();
+    if text.is_empty() || text.len() > 256 || text.chars().any(char::is_control) {
+        return Err(format!("restore destination {field} is invalid"));
+    }
+    Ok(())
+}
+
+fn restore_destination_label(value: &PlatformHandle, field: &str) -> Result<(), String> {
+    let text = value.as_str();
+    if text.is_empty()
+        || text.len() > 64
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!("restore destination {field} is invalid"));
+    }
+    Ok(())
+}
+
+/// Complete owner-produced restore-destination input accepted by the
+/// authenticated Host runtime-control front door: the exact descriptors one
+/// destination authorization is issued for. The mutation digest covers the
+/// complete typed handoff, so payload cannot override the digest-bound
+/// descriptors.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRestoreDestinationRuntimeRequest {
+    /// Isolated restore target the authorization is issued for.
+    pub target_id: PlatformHandle,
+    /// Restore transaction the authorization is issued for.
+    pub transaction_id: PlatformHandle,
+    /// Presented source installation identity; must equal the owner-bound
+    /// installation epoch at issuance.
+    pub source_installation_id: PlatformHandle,
+}
+
+impl HostRestoreDestinationRuntimeRequest {
+    /// Validate the descriptors before they enter the Host queue.
+    pub fn validate(&self) -> Result<(), String> {
+        restore_destination_label(&self.target_id, "target_id")?;
+        restore_destination_text(&self.transaction_id, "transaction_id")?;
+        restore_destination_text(&self.source_installation_id, "source_installation_id")?;
+        Ok(())
+    }
+}
+
+fn restore_destination_mutation_digest(
+    source: &HostRestoreDestinationRuntimeRequest,
+) -> Result<String, String> {
+    let encoded = serde_json::to_vec(source)
+        .map_err(|_| "restore destination source could not be encoded".to_owned())?;
+    let mut material = Vec::with_capacity(WIRE.len() + encoded.len() + 24);
+    material.extend_from_slice(WIRE.as_bytes());
+    material.extend_from_slice(b":restore-destination:");
+    material.extend_from_slice(&encoded);
+    Ok(sha256_hex(&material))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostRuntimeControlRequest {
@@ -260,6 +344,10 @@ pub struct HostRuntimeControlRequest {
     /// Complete typed input for the authenticated reactive Context operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reactive_context: Option<HostReactiveContextRuntimeRequest>,
+    /// Complete typed input for the authenticated restore-destination
+    /// authorization operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_destination: Option<HostRestoreDestinationRuntimeRequest>,
 }
 
 impl HostRuntimeControlRequest {
@@ -294,6 +382,38 @@ impl HostRuntimeControlRequest {
             mutation_digest,
             request_digest,
             reactive_context: None,
+            restore_destination: None,
+        };
+        value.validate().map_err(|e| e.to_string())?;
+        Ok(value)
+    }
+
+    /// Construct an authenticated restore-destination authorization request
+    /// whose mutation digest covers the complete typed descriptors.
+    pub fn new_restore_destination(
+        request_id: PlatformHandle,
+        destination: HostRestoreDestinationRuntimeRequest,
+    ) -> Result<Self, String> {
+        destination.validate()?;
+        let wire = PlatformHandle::new(WIRE.to_owned()).map_err(|e| e.to_string())?;
+        let mutation_digest =
+            PlatformHandle::new(restore_destination_mutation_digest(&destination)?)
+                .map_err(|e| e.to_string())?;
+        let request_digest = PlatformHandle::new(request_digest_for(
+            &wire,
+            &HostRuntimeControlOperation::DeliverRestoreDestinationAuth,
+            &request_id,
+            &mutation_digest,
+        ))
+        .map_err(|e| e.to_string())?;
+        let value = Self {
+            wire,
+            operation: HostRuntimeControlOperation::DeliverRestoreDestinationAuth,
+            request_id,
+            mutation_digest,
+            request_digest,
+            reactive_context: None,
+            restore_destination: Some(destination),
         };
         value.validate().map_err(|e| e.to_string())?;
         Ok(value)
@@ -329,6 +449,7 @@ impl HostRuntimeControlRequest {
             mutation_digest,
             request_digest,
             reactive_context: Some(reactive_context),
+            restore_destination: None,
         };
         value.validate()?;
         Ok(value)
@@ -369,12 +490,32 @@ impl HostRuntimeControlRequest {
             (HostRuntimeControlOperation::DeliverReactiveContext, None) => {
                 return Err("reactive Context input is required".to_owned());
             }
-            (_, Some(_)) => {
+            (_, Some(_)) if self.restore_destination.is_none() => {
                 return Err(
                     "reactive Context input is reserved for DeliverReactiveContext".to_owned(),
                 );
             }
-            (_, None) => {}
+            _ => {}
+        }
+        match (&self.operation, &self.restore_destination) {
+            (
+                HostRuntimeControlOperation::DeliverRestoreDestinationAuth,
+                Some(destination),
+            ) => {
+                destination.validate()?;
+                let expected = restore_destination_mutation_digest(destination)?;
+                if self.mutation_digest.as_str() != expected {
+                    return Err("restore destination mutation_digest mismatch".to_owned());
+                }
+            }
+            (HostRuntimeControlOperation::DeliverRestoreDestinationAuth, None) => {
+                return Err("restore destination input is required".to_owned());
+            }
+            // No reconcile variant exists by design: issuance is effect-free
+            // read-only, so a fresh admitted request for the same descriptors
+            // is the reconcile. A separate replay identity would add wire
+            // without removing an effect.
+            _ => {}
         }
         Ok(())
     }
@@ -535,6 +676,92 @@ impl HostStoreRecoveryReceipt {
     }
 }
 
+/// Host-issued restore-destination authorization receipt: the owner facts
+/// bound to one digest-bound request. The receipt echoes the exact request
+/// digests (checked by `response_matches_request`) and carries the live
+/// owner observation — manifest/roots digests, registry revision,
+/// installation, generation, and work root — attested at issuance time.
+/// Field names mirror the Host owner binding one-to-one; the Kernel
+/// rebuilds the canonical authorization bytes from exactly these fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRestoreDestinationReceipt {
+    /// The mutation identity of the restore-destination request.
+    pub mutation_digest: PlatformHandle,
+    pub request_digest: PlatformHandle,
+    /// Owner-binding wire discriminator (non-authoritative hint).
+    pub wire: PlatformHandle,
+    /// Issuing owner identity (non-authoritative hint).
+    pub issuer: PlatformHandle,
+    /// Owner-observed source installation identity.
+    pub source_installation_id: PlatformHandle,
+    /// Isolated restore target this authorization binds.
+    pub target_id: PlatformHandle,
+    /// Restore transaction this authorization binds.
+    pub transaction_id: PlatformHandle,
+    /// Owner config digest of the active manifest.
+    pub manifest_digest: PlatformHandle,
+    /// Digest of the manifest-bound runtime roots.
+    pub roots_digest: PlatformHandle,
+    /// Registry revision observed at inspection time.
+    pub registry_revision: u64,
+    /// Kernel work root text bound by the active manifest roots.
+    pub kernel_work_root: PlatformHandle,
+    /// Active approved generation identity.
+    pub approved_generation: PlatformHandle,
+    pub receipt_digest: PlatformHandle,
+}
+
+impl HostRestoreDestinationReceipt {
+    pub fn computed_digest(&self) -> Result<PlatformHandle, String> {
+        let bytes = serde_json::to_vec(&(
+            self.mutation_digest.as_str(),
+            self.request_digest.as_str(),
+            self.wire.as_str(),
+            self.issuer.as_str(),
+            self.source_installation_id.as_str(),
+            self.target_id.as_str(),
+            self.transaction_id.as_str(),
+            self.manifest_digest.as_str(),
+            self.roots_digest.as_str(),
+            self.registry_revision,
+            self.kernel_work_root.as_str(),
+            self.approved_generation.as_str(),
+        ))
+        .map_err(|e| e.to_string())?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|e| e.to_string())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (v, name) in [
+            (&self.mutation_digest, "mutation_digest"),
+            (&self.request_digest, "request_digest"),
+        ] {
+            if !is_sha256_digest(v) {
+                return Err(format!("{name} must be sha256"));
+            }
+        }
+        if self.wire.as_str() != RESTORE_DESTINATION_WIRE {
+            return Err("wire must be the restore-destination wire".to_owned());
+        }
+        if self.issuer.as_str() != RESTORE_DESTINATION_ISSUER {
+            return Err("issuer must be the host restore-destination owner".to_owned());
+        }
+        restore_destination_text(&self.source_installation_id, "source_installation_id")?;
+        restore_destination_label(&self.target_id, "target_id")?;
+        restore_destination_text(&self.transaction_id, "transaction_id")?;
+        if !is_sha256_digest(&self.manifest_digest) || !is_sha256_digest(&self.roots_digest) {
+            return Err("manifest/roots digests must be sha256".to_owned());
+        }
+        restore_destination_text(&self.kernel_work_root, "kernel_work_root")?;
+        restore_destination_text(&self.approved_generation, "approved_generation")?;
+        if self.receipt_digest != self.computed_digest()? {
+            return Err("receipt_digest mismatch".to_owned());
+        }
+        Ok(())
+    }
+}
+
 #[allow(private_interfaces)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -545,6 +772,7 @@ impl HostStoreRecoveryReceipt {
 pub enum HostRuntimeControlResponse {
     Restarted { receipt: HostKernelRestartReceipt },
     StoreRecovered { receipt: HostStoreRecoveryReceipt },
+    DestinationAuthorized { receipt: HostRestoreDestinationReceipt },
     Unknown { pending_ref: PlatformHandle },
 }
 
@@ -565,6 +793,14 @@ impl HostRuntimeControlResponse {
         Self::StoreRecovered { receipt }
     }
 
+    pub fn destination_authorized_for(
+        request: &HostRuntimeControlRequest,
+        receipt: HostRestoreDestinationReceipt,
+    ) -> Self {
+        let _ = request;
+        Self::DestinationAuthorized { receipt }
+    }
+
     pub fn unknown_for(request: &HostRuntimeControlRequest, pending_ref: PlatformHandle) -> Self {
         let _ = request;
         Self::Unknown { pending_ref }
@@ -574,6 +810,7 @@ impl HostRuntimeControlResponse {
         match self {
             Self::Restarted { receipt, .. } => receipt.validate(),
             Self::StoreRecovered { receipt, .. } => receipt.validate(),
+            Self::DestinationAuthorized { receipt, .. } => receipt.validate(),
             Self::Unknown { pending_ref, .. } => parse_runtime_control_unknown_ref(pending_ref)
                 .map(|_| ())
                 .ok_or_else(|| "pending_ref is not canonical".to_owned()),
@@ -609,6 +846,10 @@ pub fn response_matches_request(
         HostRuntimeControlResponse::StoreRecovered { receipt } => {
             receipt.request_digest == request.request_digest
                 && receipt.external_control_mutation_digest == request.mutation_digest
+        }
+        HostRuntimeControlResponse::DestinationAuthorized { receipt } => {
+            receipt.request_digest == request.request_digest
+                && receipt.mutation_digest == request.mutation_digest
         }
         HostRuntimeControlResponse::Unknown { pending_ref } => {
             pending_ref_matches_request(pending_ref, request)
@@ -733,6 +974,9 @@ pub fn runtime_control_response_frame(
         HostRuntimeControlResponse::StoreRecovered { receipt, .. } => {
             receipt.request_digest.as_str().to_owned()
         }
+        HostRuntimeControlResponse::DestinationAuthorized { receipt, .. } => {
+            receipt.request_digest.as_str().to_owned()
+        }
         HostRuntimeControlResponse::Unknown { pending_ref, .. } => {
             parse_runtime_control_unknown_ref(pending_ref)
                 .ok_or_else(|| "SessionFenced".to_owned())?
@@ -797,6 +1041,11 @@ pub fn decode_runtime_control_response_frame(
             }
         }
         HostRuntimeControlResponse::StoreRecovered { receipt, .. } => {
+            if frame_request_id.as_str() != receipt.request_digest.as_str() {
+                return Err("SessionFenced".to_owned());
+            }
+        }
+        HostRuntimeControlResponse::DestinationAuthorized { receipt, .. } => {
             if frame_request_id.as_str() != receipt.request_digest.as_str() {
                 return Err("SessionFenced".to_owned());
             }

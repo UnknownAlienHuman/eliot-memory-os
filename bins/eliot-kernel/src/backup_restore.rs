@@ -190,6 +190,21 @@ pub struct KernelBackupRestore {
     work_root: PathBuf,
 }
 
+/// Coordinator-supplied source binding for one restore: the trusted
+/// in-process manifest projection plus the source installation identity
+/// the Host must verify against its live epoch. Both travel together so
+/// no restore runs with a projection but no source (or vice versa); the
+/// delivered authorization must agree with both.
+pub struct RestoreSourceBinding<'a> {
+    /// Owner-approved destination projection from the preparation flow.
+    /// Required: without the trusted in-process projection the delivered
+    /// bytes stand alone and fail closed.
+    pub manifest_evidence: Option<DestinationManifestEvidence>,
+    /// Source installation identity the coordinator serves and the Host
+    /// verifies against its live installation epoch.
+    pub source_installation_id: &'a str,
+}
+
 /// Lease-owner-committed terminal ticket proof recorded in the cutover
 /// decision (F2 repair): the ticket the cutover path committed through the
 /// supervision-lease authority, verified by owner validation plus live ORS
@@ -258,23 +273,29 @@ impl KernelBackupRestore {
     /// the restore is refused with zero target effects. Blob-carrying
     /// archives require exact key coverage plus the destination blob scope;
     /// a fixture-flagged journal admission refuses as not admitted for
-    /// production. `manifest_evidence`, when supplied, binds the
-    /// owner-approved destination scope: its shapes validate, its work root
-    /// must canonicalize-equal this Kernel's own work root, and its manifest
-    /// digest must equal the archive's `config` artifact when the archive
-    /// carries one; the values pin at prepare and any drift refuses later
-    /// effects and cutover. Coordinator failures propagate typed in
-    /// [`KernelRestoreError::TargetFailed`]; the primary error is preserved,
-    /// never flattened into a fabricated success.
-    pub fn restore(
+    /// production. The source binding carries the trusted in-process
+    /// manifest projection (required) plus the source installation identity:
+    /// the destination authorization is fetched live from the Host owner
+    /// over the authenticated runtime-control pipe for these exact
+    /// descriptors — never from a file — then verified, ORS-journaled, and
+    /// re-verified from live readback before effects. An unreachable or
+    /// refusing Host fails closed with the exact cause. Coordinator
+    /// failures propagate typed in [`KernelRestoreError::TargetFailed`];
+    /// the primary error is preserved, never flattened into a fabricated
+    /// success.
+    pub async fn restore(
         &mut self,
         bundle: &BackupBundle,
         target: RestoreContext,
         kernel_fence: &StateFence,
         keys: Option<&WrappedKeyManifest>,
         blob_scope: Option<&DestinationScope>,
-        manifest_evidence: Option<DestinationManifestEvidence>,
+        source: RestoreSourceBinding<'_>,
     ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
+        let RestoreSourceBinding {
+            manifest_evidence,
+            source_installation_id,
+        } = source;
         bundle
             .validate()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
@@ -309,16 +330,17 @@ impl KernelBackupRestore {
         self.journal
             .bind_plan_stream(&plan, bundle, kernel_fence)?;
         let destination = KernelIsolatedDestination::open(&self.work_root, &target.target_id)?;
-        // #962 issuer gate: the Host-authorized preparation flow pinned the
-        // destination authorization before restore; it is verified,
-        // ORS-journaled, and re-verified from live readback here, and every
-        // effect below binds the readback value. Absence refuses with the
-        // exact missing owner.
+        let delivered =
+            Self::fetch_delivered_authorization(&plan, source_installation_id).await?;
+        // #962 issuer gate: the delivered bytes are verified, ORS-journaled,
+        // and re-verified from live readback here, and every effect below
+        // binds the readback value. Refusal carries the exact missing owner.
         let (verified, authorization_digest) = self.verify_destination_binding(
             &destination,
             &plan,
             bundle,
             manifest_evidence.as_ref(),
+            &delivered,
         )?;
         let receipts = match keys {
             Some(manifest) => BlobOwnerClient::issue_receipts(
@@ -399,32 +421,65 @@ impl KernelBackupRestore {
         Ok(())
     }
 
-    /// Verifies the Host-issued destination authorization for this exact
-    /// plan, bundle, and work root, then pins it into the single-writer ORS
-    /// stream with exact-predecessor journaling and live readback.
+    /// Fetches one destination authorization from the Host owner over the
+    /// authenticated runtime-control pipe for the plan's exact descriptors
+    /// and assembles the canonical verifier bytes after echo checks. An
+    /// unreachable or refusing Host fails closed with the exact cause
+    /// before any effect — no file is read.
+    async fn fetch_delivered_authorization(
+        plan: &RestorePlan,
+        source_installation_id: &str,
+    ) -> Result<Vec<u8>, KernelRestoreError> {
+        let transaction = plan
+            .transaction()
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let receipt = super::host_auth_delivery::fetch_authorization(
+            plan.target.target_id.as_str(),
+            transaction.transaction_id.as_str(),
+            source_installation_id,
+        )
+        .await
+        .map_err(|error| {
+            KernelRestoreError::TargetFailed(BackupError::Target(error.to_string()))
+        })?;
+        super::host_auth_delivery::authorization_bytes(
+            &receipt,
+            plan.target.target_id.as_str(),
+            transaction.transaction_id.as_str(),
+            source_installation_id,
+        )
+        .map_err(|error| {
+            KernelRestoreError::TargetFailed(BackupError::Target(error.to_string()))
+        })
+    }
+
+    /// Verifies delivered destination authorization bytes for this exact
+    /// plan, bundle, and work root, then pins them into the single-writer
+    /// ORS stream with exact-predecessor journaling and live readback.
     ///
-    /// Authority path (F1 repair): the pinned file is a transport hint
-    /// only. Shape/binding/containment/archive checks filter the hint;
+    /// Authority path: the bytes arrive over the authenticated Host channel
+    /// (OS peer plus digest-bound correlation), never from a file.
+    /// Shape/binding/containment/archive checks filter them;
     /// owner-approved manifest evidence is REQUIRED — absence refuses with
-    /// the exact missing owner, since a lone file is forgeable — and must
-    /// agree with the issuer bytes; the verified bytes are then journaled
-    /// through the admitted owner journal port and re-verified FROM the
-    /// live ORS readback, so effects bind the readback value, never the raw
-    /// file hint. `source_installation_id` and `approved_generation` ride
-    /// inside the verified binding, the journal payload, and the
-    /// destination pin, and continuity against the first-journaled binding
-    /// is enforced at resume and cutover. Any refusal fails closed before
-    /// any effect.
+    /// the exact missing owner — and must agree with the delivered bytes;
+    /// the verified bytes are then journaled through the admitted owner
+    /// journal port and re-verified FROM the live ORS readback, so effects
+    /// bind the readback value. `source_installation_id` and
+    /// `approved_generation` ride inside the verified binding, the journal
+    /// payload, and the destination pin, and continuity against the
+    /// first-journaled binding is enforced at resume and cutover. Any
+    /// refusal fails closed before any effect.
     fn verify_destination_binding(
         &mut self,
         destination: &KernelIsolatedDestination,
         plan: &RestorePlan,
         bundle: &BackupBundle,
         manifest_evidence: Option<&DestinationManifestEvidence>,
+        delivered: &[u8],
     ) -> Result<(VerifiedDestinationBinding, String), KernelRestoreError> {
-        // Without the trusted in-process projection the pinned file stands
-        // alone: refuse with the exact missing owner instead of authorizing
-        // from file bytes.
+        // Without the trusted in-process projection the delivered bytes
+        // stand alone: refuse with the exact missing owner instead of
+        // authorizing from channel bytes alone.
         let manifest_evidence = manifest_evidence.ok_or(KernelRestoreError::CapabilityMissing {
             capability: super::backup_owner_clients::DESTINATION_AUTHORIZATION_ISSUER,
         })?;
@@ -442,21 +497,20 @@ impl KernelBackupRestore {
             expected_manifest_digest,
             kernel_work_root: &self.work_root,
         };
-        let hint = destination.read_destination_authorization()?;
-        let filed = verify_destination_authorization(&hint, &expectation)
+        let filtered = verify_destination_authorization(delivered, &expectation)
             .map_err(KernelRestoreError::TargetFailed)?;
         self.check_manifest_evidence(bundle, manifest_evidence)?;
-        if manifest_evidence.manifest_digest != filed.manifest_digest()
-            || manifest_evidence.roots_digest != filed.roots_digest()
-            || manifest_evidence.registry_revision != filed.registry_revision()
+        if manifest_evidence.manifest_digest != filtered.manifest_digest()
+            || manifest_evidence.roots_digest != filtered.roots_digest()
+            || manifest_evidence.registry_revision != filtered.registry_revision()
         {
             return Err(KernelRestoreError::DestinationInvalid(
                 "destination admission drifted from the Host-issued authorization".to_owned(),
             ));
         }
-        // Pin the verified bytes into the single-writer stream with exact
+        // Pin the delivered bytes into the single-writer stream with exact
         // predecessor journaling, then prove them by live ORS readback.
-        let payload = String::from_utf8(hint).map_err(|_| {
+        let payload = String::from_utf8(delivered.to_owned()).map_err(|_| {
             KernelRestoreError::TargetFailed(BackupError::Serialization(
                 "destination authorization is not UTF-8".to_owned(),
             ))
@@ -481,10 +535,10 @@ impl KernelBackupRestore {
             .verify_journaled_head(sequence, &digest, &payload)
             .map_err(KernelRestoreError::TargetFailed)?;
         // Re-verify FROM the ORS-journaled bytes and require identity with
-        // the file-filtered value: the durable bytes are the verified bytes.
+        // the delivered value: the durable bytes are the verified bytes.
         let verified = verify_destination_authorization(confirmed.as_bytes(), &expectation)
             .map_err(KernelRestoreError::TargetFailed)?;
-        if verified.binding_digest() != filed.binding_digest() {
+        if verified.binding_digest() != filtered.binding_digest() {
             return Err(KernelRestoreError::JournalCorrupt);
         }
         // Continuity: a previously pinned binding (resume/cutover) must
@@ -598,10 +652,12 @@ impl KernelBackupRestore {
     }
 
     /// Loads the pinned destination admission and re-proves the Host-issued
-    /// authorization for cutover: readback reconciliation with owner
-    /// evidence gates the decision; any drift refuses instead of cutting
-    /// over.
-    fn load_verified_destination_admission(
+    /// authorization for cutover: a fresh authenticated delivery for the
+    /// pinned descriptors, verified, ORS-journaled, re-verified from live
+    /// readback, and continuity-checked against the pin. Readback
+    /// reconciliation with owner evidence gates the decision; any drift
+    /// refuses instead of cutting over.
+    async fn load_verified_destination_admission(
         &mut self,
         destination: &KernelIsolatedDestination,
         plan: &RestorePlan,
@@ -619,7 +675,16 @@ impl KernelBackupRestore {
                     "pinned destination admission is corrupt".to_owned(),
                 )
             })?;
-        self.verify_destination_binding(destination, plan, bundle, Some(&pinned.evidence))?;
+        let delivered =
+            Self::fetch_delivered_authorization(plan, pinned.source_installation_id.as_str())
+                .await?;
+        self.verify_destination_binding(
+            destination,
+            plan,
+            bundle,
+            Some(&pinned.evidence),
+            &delivered,
+        )?;
         Ok(pinned)
     }
 
@@ -721,7 +786,7 @@ impl KernelBackupRestore {
     /// current lease state, never a replay of the consumed one. Rehearsal
     /// is safe by construction — there is simply no effect to rehearse
     /// beyond validation, ticket commit, and journaling the decision.
-    pub fn request_cutover(
+    pub async fn request_cutover(
         &mut self,
         plan: &RestorePlan,
         bundle: &BackupBundle,
@@ -749,8 +814,9 @@ impl KernelBackupRestore {
                 "cutover destination is not the plan-admitted isolated root".to_owned(),
             ));
         }
-        let pinned =
-            self.load_verified_destination_admission(destination, plan, bundle)?;
+        let pinned = self
+            .load_verified_destination_admission(destination, plan, bundle)
+            .await?;
         let transaction = self.check_cutover_stream_binding(plan, bundle, &pinned)?;
         let carrier = IsolatedRestorePlan {
             plan: plan.clone(),

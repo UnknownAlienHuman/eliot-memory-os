@@ -959,30 +959,6 @@ impl KernelIsolatedDestination {
         &self.root
     }
 
-    /// Reads the Host-issued destination authorization pinned by the
-    /// Host-authorized preparation flow (`destination-authorization.json`).
-    ///
-    /// Ports-owned admission readback: an absent file names the exact
-    /// missing owner (the Host destination issuer) and refuses before any
-    /// effect; present-but-unreadable bytes are invalid owner evidence.
-    /// The caller verifies the bytes through the #962 verifier before any
-    /// effect runs.
-    pub fn read_destination_authorization(&self) -> Result<Vec<u8>, KernelRestoreError> {
-        let path = self
-            .root
-            .join(super::backup_owner_clients::DESTINATION_AUTHORIZATION_FILE);
-        match std::fs::read(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(KernelRestoreError::CapabilityMissing {
-                    capability:
-                        super::backup_owner_clients::DESTINATION_AUTHORIZATION_ISSUER,
-                })
-            }
-            Err(error) => Err(KernelRestoreError::OwnerEvidenceInvalid(error.to_string())),
-            Ok(bytes) => Ok(bytes),
-        }
-    }
-
     /// Destination label; restore binds it to the plan target id.
     #[must_use]
     pub fn label(&self) -> &str {

@@ -21,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-host-control-endpoint = { path = "../../crates/kernel/eliot-host-control-endpoint", version = "0.1.0" }
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true

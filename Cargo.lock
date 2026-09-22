@@ -1882,6 +1882,7 @@ dependencies = [
  "eliot-ipc",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-protocol",
  "serde_json",
  "tokio",
 ]
@@ -2092,6 +2093,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-backup",
  "eliot-contracts",
+ "eliot-host-control-endpoint",
  "eliot-installation",
  "eliot-ipc",
  "eliot-kernel-core",

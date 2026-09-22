@@ -94,13 +94,9 @@ use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseSnapshot};
 pub const DESTINATION_AUTHORIZATION_WIRE: &str =
     "eliot.host.restore-destination-authorization.v1";
 /// Issuer identity every accepted destination authorization must carry.
+/// Non-authoritative hint: authority comes from the authenticated delivery
+/// channel plus the ORS-journaled binding, never from this literal.
 pub const DESTINATION_AUTHORIZATION_ISSUER: &str = "host-restore-destination-owner";
-/// Pinned transport filename inside the isolated destination: the
-/// Host-authorized preparation flow writes the issued authorization here and
-/// the Kernel verifier reads it back before effects. No new pipe family or
-/// transport is introduced; the file is the cross-process handoff both owner
-/// halves document.
-pub const DESTINATION_AUTHORIZATION_FILE: &str = "destination-authorization.json";
 /// Missing live canonical-store import channel: writing the live store is
 /// never staged locally; the effect crosses the retained gateway.
 pub const STORE_IMPORT_CHANNEL: &str = "canonical-store-gateway-import";

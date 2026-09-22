@@ -8,10 +8,10 @@
 //! build registry, and the `HostStateJournal` boundary); I5.13 backup classes;
 //! I5.16 common durable fields.
 //! Implementation: I5.19 intent-before-effect ordering (the authorization is
-//! issued before any destination effect and pinned to the destination before
+//! issued before any destination effect and journaled by the Kernel before
 //! later effects run); I14.21 unknown-commit recovery (a lost authorization
-//! response reconciles by re-reading the pinned file plus current owner
-//! evidence, never by re-issuing blindly under changed authority).
+//! response retries with a fresh admitted request for the same descriptors
+//! plus current owner evidence, never by replaying possibly stale bytes).
 //!
 //! What this file owns: the issuing owner half of restore destination
 //! authorization. [`HostRestoreDestinationAuth::issue`] inspects the
@@ -26,17 +26,19 @@
 //! serves, so evidence cannot outlive its read and no caller input enters it
 //! except the target/transaction/source descriptors the request binds.
 //!
-//! The authorization travels to the Kernel verifier as the pinned file
-//! [`DESTINATION_AUTHORIZATION_FILE`] inside the isolated destination
-//! (written by the Host-authorized preparation flow, read back by the Kernel
-//! before effects — see `bins/eliot-kernel/src/backup_owner_clients.rs`).
-//! No new pipe family or transport is introduced, no Host lease is invented
-//! (the real protected-root lease and installation registry owners issue
-//! every fact), and no bare digest triple authorizes anything: digests ride
+//! The authorization travels to the Kernel over the authenticated Host
+//! runtime-control pipe as a digest-bound
+//! [`HostRestoreDestinationReceipt`](eliot_host_service::runtime_control::HostRestoreDestinationReceipt):
+//! the Kernel requests it for exact descriptors, the Host issues fresh
+//! from live inspection per request, and the OS peer plus digest-bound
+//! request/response correlation prove which service answered. No new pipe
+//! family or transport is introduced, no Host lease is invented (the real
+//! protected-root lease and installation registry owners issue every
+//! fact), and no bare digest triple authorizes anything: digests ride
 //! inside the owner-bound authorization the Kernel verifies in full.
 //!
 //! Capability cell: Host restore-destination ownership (destination
-//! authorization issuance + pinned transport).
+//! authorization issuance + authenticated queue dispatch).
 //! Forbidden authority: no registry mutation, no epoch minting, no cutover,
 //! no activation/retirement of any installation, no archive/phase rules, no
 //! secret export, no live Host-state database copy.
@@ -44,10 +46,16 @@
 use std::path::Path;
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_host_service::runtime_control::{
+    HostRestoreDestinationReceipt, HostRuntimeControlOperation, HostRuntimeControlRequest,
+    HostRuntimeControlResponse, RESTORE_DESTINATION_ISSUER, RESTORE_DESTINATION_WIRE,
+    runtime_control_unknown_ref,
+};
 use eliot_installation::{
     ActivationCommitFence, ApprovedGeneration, ApprovedGenerationRegistry, RedbInstallationRegistry,
     RuntimeStateRoots,
 };
+use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{ProtectedRootLease, windows_paths_equal};
 use serde::{Deserialize, Serialize};
 
@@ -60,8 +68,6 @@ pub const DESTINATION_AUTHORIZATION_WIRE: &str =
 /// Issuer identity every authorization carries. The Kernel verifier requires
 /// this exact value.
 pub const DESTINATION_AUTHORIZATION_ISSUER: &str = "host-restore-destination-owner";
-/// Pinned transport filename inside the isolated destination.
-pub const DESTINATION_AUTHORIZATION_FILE: &str = "destination-authorization.json";
 /// Maximum accepted serialized authorization bytes (bounded frame).
 pub const MAX_AUTHORIZATION_BYTES: usize = 16_384;
 
@@ -129,8 +135,8 @@ impl DestinationAuthRequest {
 ///
 /// The issuing owner is this Host module; the Kernel verifier names this
 /// issuer and cannot substitute its own bytes. Field names form the
-/// cross-process contract the Kernel verifier parses; both halves pin the
-/// same [`DESTINATION_AUTHORIZATION_WIRE`] and [`DESTINATION_AUTHORIZATION_FILE`].
+/// cross-process contract the Kernel delivery codec rebuilds; both halves
+/// pin the same [`DESTINATION_AUTHORIZATION_WIRE`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationAuthorization {
@@ -181,8 +187,7 @@ impl DestinationAuthorization {
         Ok(())
     }
 
-    /// Canonical bytes of this authorization for stable digesting and
-    /// pinned-file comparison.
+    /// Canonical bytes of this authorization for stable digesting.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, DestinationAuthError> {
         self.validate()?;
         canonical_json_bytes(self).map_err(|_| DestinationAuthError::OwnerEvidenceWithheld("encode"))
@@ -346,46 +351,6 @@ impl HostRestoreDestinationAuth {
         auth.validate()?;
         Ok(auth)
     }
-
-    /// Pins one issued authorization into the isolated destination for the
-    /// Kernel verifier (atomic temp-write + rename: a crash never leaves a
-    /// torn authorization that later reads as issued).
-    pub fn pin_authorization_file(
-        destination_root: &Path,
-        auth: &DestinationAuthorization,
-    ) -> Result<(), DestinationAuthError> {
-        let bytes = auth.canonical_bytes()?;
-        if bytes.len() > MAX_AUTHORIZATION_BYTES {
-            return Err(DestinationAuthError::InvalidRequest("authorization"));
-        }
-        let path = destination_root.join(DESTINATION_AUTHORIZATION_FILE);
-        let tmp = path.with_extension("tmp-destination-auth");
-        std::fs::write(&tmp, &bytes)
-            .map_err(|_| DestinationAuthError::FilesystemEffect("stage authorization"))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|_| DestinationAuthError::FilesystemEffect("pin authorization"))?;
-        Ok(())
-    }
-
-    /// Re-reads the pinned authorization for reconciliation after response
-    /// loss. Returns the exact pinned bytes when they parse and validate;
-    /// absence or invalidity is a fail-closed refusal, never re-issuance
-    /// from memory and never a guessed authorization.
-    pub fn read_pinned_authorization(
-        destination_root: &Path,
-    ) -> Result<DestinationAuthorization, DestinationAuthError> {
-        let bytes = std::fs::read(destination_root.join(DESTINATION_AUTHORIZATION_FILE))
-            .map_err(|_| DestinationAuthError::OwnerEvidenceWithheld("pinned authorization"))?;
-        if bytes.is_empty() || bytes.len() > MAX_AUTHORIZATION_BYTES {
-            return Err(DestinationAuthError::OwnerEvidenceWithheld(
-                "pinned authorization",
-            ));
-        }
-        let auth: DestinationAuthorization = serde_json::from_slice(&bytes)
-            .map_err(|_| DestinationAuthError::OwnerEvidenceWithheld("pinned authorization"))?;
-        auth.validate()?;
-        Ok(auth)
-    }
 }
 
 impl HostComposition {
@@ -394,14 +359,116 @@ impl HostComposition {
     ///
     /// Thin owner delegation into [`HostRestoreDestinationAuth::issue`]:
     /// the retained `registry_host_root` (never caller text) plus the
-    /// presented target/transaction/source descriptors. The caller pins the
-    /// result into the isolated destination with
-    /// [`HostRestoreDestinationAuth::pin_authorization_file`] before any
-    /// restore effect runs.
+    /// presented target/transaction/source descriptors. The issued
+    /// authorization is returned to the authenticated queue dispatcher,
+    /// which answers the digest-bound request with the Host-issued receipt.
     pub fn issue_restore_destination_authorization(
         &self,
         request: &DestinationAuthRequest,
     ) -> Result<DestinationAuthorization, DestinationAuthError> {
         HostRestoreDestinationAuth::issue(&self.registry_host_root, request)
+    }
+
+    /// Serves one restore-destination authorization request from the
+    /// authenticated runtime-control queue: validates the digest-bound
+    /// descriptors, requires the live owner lease, issues fresh from live
+    /// inspection, and returns the Host-issued receipt.
+    ///
+    /// Failures stay typed `Unknown` preserving identity; never
+    /// false-success. Issuance is effect-free read-only: a repeated request
+    /// re-inspects and returns current owner facts rather than replaying
+    /// possibly stale bytes.
+    pub fn handle_restore_destination_request(
+        &self,
+        request: &HostRuntimeControlRequest,
+    ) -> HostRuntimeControlResponse {
+        let unknown = |reason: &str| {
+            super::host_lifecycle_observe_terminal("host-restore-destination-unknown");
+            HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref(reason, request),
+            )
+        };
+        super::host_lifecycle_observe_scm("host.restore-destination requested");
+        if request.operation != HostRuntimeControlOperation::DeliverRestoreDestinationAuth
+            || request.validate().is_err()
+        {
+            return unknown("restore-destination-authorization");
+        }
+        if self
+            .owner_lease
+            .activation_capability()
+            .live_guard()
+            .is_err()
+        {
+            return unknown("restore-destination-authorization");
+        }
+        let Some(input) = request.restore_destination.as_ref() else {
+            return unknown("restore-destination-authorization");
+        };
+        let issue_request = DestinationAuthRequest {
+            source_installation_id: input.source_installation_id.as_str().to_owned(),
+            target_id: input.target_id.as_str().to_owned(),
+            transaction_id: input.transaction_id.as_str().to_owned(),
+        };
+        let Ok(auth) =
+            HostRestoreDestinationAuth::issue(&self.registry_host_root, &issue_request)
+        else {
+            return unknown("restore-destination-authorization");
+        };
+        let handle = |value: &str| PlatformHandle::new(value.to_owned());
+        let mut receipt = HostRestoreDestinationReceipt {
+            mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            wire: match handle(RESTORE_DESTINATION_WIRE) {
+                Ok(wire) => wire,
+                Err(_) => return unknown("restore-destination-authorization"),
+            },
+            issuer: match handle(RESTORE_DESTINATION_ISSUER) {
+                Ok(issuer) => issuer,
+                Err(_) => return unknown("restore-destination-authorization"),
+            },
+            source_installation_id: match handle(&auth.source_installation_id) {
+                Ok(value) => value,
+                Err(_) => return unknown("restore-destination-authorization"),
+            },
+            target_id: match handle(&auth.target_id) {
+                Ok(value) => value,
+                Err(_) => return unknown("restore-destination-authorization"),
+            },
+            transaction_id: match handle(&auth.transaction_id) {
+                Ok(value) => value,
+                Err(_) => return unknown("restore-destination-authorization"),
+            },
+            manifest_digest: match handle(&auth.manifest_digest) {
+                Ok(value) => value,
+                Err(_) => return unknown("restore-destination-authorization"),
+            },
+            roots_digest: match handle(&auth.roots_digest) {
+                Ok(value) => value,
+                Err(_) => return unknown("restore-destination-authorization"),
+            },
+            registry_revision: auth.registry_revision,
+            kernel_work_root: match handle(&auth.kernel_work_root) {
+                Ok(value) => value,
+                Err(_) => return unknown("restore-destination-authorization"),
+            },
+            approved_generation: match handle(&auth.approved_generation) {
+                Ok(value) => value,
+                Err(_) => return unknown("restore-destination-authorization"),
+            },
+            // Placeholder replaced by the computed digest below; the
+            // request digest is a valid handle of the right shape.
+            receipt_digest: request.request_digest.clone(),
+        };
+        receipt.receipt_digest = match receipt.computed_digest() {
+            Ok(digest) => digest,
+            Err(_) => return unknown("restore-destination-authorization"),
+        };
+        if receipt.validate().is_err() {
+            return unknown("restore-destination-authorization");
+        }
+        super::host_lifecycle_observe_scm("host.restore-destination receipt completion");
+        HostRuntimeControlResponse::destination_authorized_for(request, receipt)
     }
 }

@@ -62,7 +62,7 @@ pub use backup_owner_clients::{
     AuthorizationExpectation, BackupOwnerChannels, BlobOwnerClient, CanonicalOwnerClient,
     CanonicalStoreImportClient, ImportReconciliation, InvalidationKind, InvalidationOwnerClient,
     OrsOwnerClient, OwnerChannelError, PurgeOwnerClient, VerifiedDestinationBinding,
-    DESTINATION_AUTHORIZATION_FILE, DESTINATION_AUTHORIZATION_ISSUER,
+    DESTINATION_AUTHORIZATION_ISSUER,
     DESTINATION_AUTHORIZATION_WIRE, PURGE_MEMBER_SUPPRESSION, STORE_IMPORT_CHANNEL,
     verify_destination_authorization,
 };
@@ -145,6 +145,7 @@ mod front_door_session;
 mod generation_control;
 mod generation_recovery;
 mod health_view;
+mod host_auth_delivery;
 #[cfg(windows)]
 mod host_request_route;
 pub mod kernel_unavailability;

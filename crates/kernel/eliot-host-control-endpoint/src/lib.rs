@@ -18,13 +18,17 @@ use std::time::Duration;
 
 pub use eliot_host_service::runtime_control::{
     HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR, HostKernelRestartReceipt,
-    HostReactiveContextRuntimeRequest, HostRuntimeControlOperation, HostRuntimeControlRequest,
+    HostReactiveContextRuntimeRequest, HostRestoreDestinationReceipt,
+    HostRestoreDestinationRuntimeRequest, HostRuntimeControlOperation, HostRuntimeControlRequest,
     HostRuntimeControlResponse, HostStoreRecoveryReceipt, decode_runtime_control_request_frame,
     runtime_control_response_frame, runtime_control_unknown_ref,
 };
+pub use backup::{HostRestoreDestinationClient, RestoreDestinationDeliveryError};
 use eliot_host_service::runtime_control::{operation_unknown_ref, response_matches_request};
 use eliot_ipc::{NamedPipeServer, TransportLimits};
 use tokio::sync::oneshot;
+
+pub mod backup;
 
 pub const HOST_RUNTIME_CONTROL_PIPE: &str = r"\\.\pipe\eliot\host\runtime-control-v1";
 const MAX_QUEUE_DEPTH: usize = 32;
