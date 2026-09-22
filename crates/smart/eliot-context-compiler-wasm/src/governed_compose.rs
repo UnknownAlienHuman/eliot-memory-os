@@ -37,10 +37,10 @@ use eliot_context_contracts::{
     SerializedContextMeasurement,
 };
 use eliot_improvement::{
-    BoundsError, LearningProduction, PresentedLearning, datetime_from_unix, produce_learning_candidate,
+    LearningProduction, PresentedLearning, datetime_from_unix, produce_learning_candidate,
 };
 use eliot_improvement::candidate_bounds::{
-    GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
+    BoundsError, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
 };
 use thiserror::Error;
 
