@@ -49,6 +49,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private OperatorRecordView? _selectedRecord;
     private OperatorActionView? _selectedAction;
     private SavedFilterViewModel? _selectedSavedFilter;
+    private readonly List<OperatorPendingOperation> _pendingOperations = [];
+    private string? _lastRuntimeId;
+    private string? _lastAuthGeneration;
     private bool _isBusy;
     private string _projectId = string.Empty;
     private string _taskId = string.Empty;
@@ -92,6 +95,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public ObservableCollection<OperatorRecordView> Records { get; } = [];
     public ObservableCollection<SavedFilterViewModel> SavedFilters { get; } = [];
     public ObservableCollection<string> PaletteSuggestions { get; } = [];
+    /// Retained operations awaiting a terminal receipt. Unknown-outcome
+    /// entries reconcile under the same identity; they are never resubmitted
+    /// as new mutations.
+    public IReadOnlyList<OperatorPendingOperation> PendingOperations => _pendingOperations.AsReadOnly();
+    public bool HasUnknownOperations =>
+        _pendingOperations.Any(operation => operation.Phase == OperatorOperationPhase.UnknownReconciling);
     public IReadOnlyList<string> QueryOperations { get; } =
         ["current_state", "recall_preview", "exact_evidence", "relationship_slice", "trace_replay", "health_report"];
     public IReadOnlyList<string> ResultModes { get; } = ["human", "json", "graph"];
@@ -282,7 +291,42 @@ public sealed class MainViewModel : INotifyPropertyChanged
             task,
             ActionInput.Trim(),
             CandidateDisposition);
-        await ExecuteCommandAsync(command, task, SelectedAction.Command);
+        // One identity per user action: the typed envelope mints the
+        // operation id once and the exact bytes are retained until a terminal
+        // receipt. A retry of this action reconciles the same identity.
+        var envelope = OperatorIntentEnvelope.Create(
+            task.ProjectId,
+            task.TaskId,
+            task.Revision,
+            JsonSerializer.SerializeToElement(command));
+        await SubmitIntentAsync(envelope, SelectedAction.Command, isReconcile: false);
+    }
+
+    /// Reconciles every pending unknown-outcome operation under its retained
+    /// identity. No second logical mutation is ever minted here.
+    public async Task ReconcilePendingAsync()
+    {
+        var unknown = _pendingOperations
+            .Where(operation => operation.Phase == OperatorOperationPhase.UnknownReconciling)
+            .ToList();
+        if (unknown.Count == 0)
+        {
+            SetBanner("Nothing to reconcile", "No operation is waiting for unknown-outcome reconciliation.", OperatorBannerSeverity.Informational);
+            return;
+        }
+        foreach (var pending in unknown)
+        {
+            using var document = JsonDocument.Parse(pending.EnvelopeJson);
+            var envelope = OperatorIntentEnvelope.Create(
+                document.RootElement.GetProperty("project_id").GetString()!,
+                document.RootElement.GetProperty("task_id").GetString()!,
+                document.RootElement.GetProperty("expected_revision").GetUInt64(),
+                document.RootElement.GetProperty("command").Clone());
+            // Preserve the original identity: reconciliation resends the same
+            // operation, so the minted key is replaced with the retained one.
+            var reconciling = envelope with { OperationId = pending.OperationId };
+            await SubmitIntentAsync(reconciling, pending.CommandName, isReconcile: true);
+        }
     }
 
     public async Task RunCommandAsync(string command)
@@ -301,7 +345,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
             "start_run" or "resume_run" => new { command, autonomy_run_id = runId },
             _ => throw new InvalidOperationException($"Unsupported operator run command: {command}")
         };
-        await ExecuteCommandAsync(payload, task, command);
+        // One identity per user action, retained for reconciliation.
+        var envelope = OperatorIntentEnvelope.Create(
+            task.ProjectId,
+            task.TaskId,
+            task.Revision,
+            JsonSerializer.SerializeToElement(payload));
+        await SubmitIntentAsync(envelope, command, isReconcile: false);
     }
 
     /// Sends one closed UserAutomation operator operation through the existing
@@ -412,7 +462,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 && page.TaskRevision is not null
                     ? new OperatorTaskContext(page.ProjectId, page.TaskId, page.TaskRevision.Value)
                     : null;
-            if (!append)
+            // Generation/revision/fence changes invalidate all dependent UI
+            // state before use: cached rows, cursors, and selections are
+            // rebuildable projections, never authority.
+            var rotated = InvalidateOnRotation(page);
+            if (!append || rotated)
             {
                 Records.Clear();
                 SelectedRecord = null;
@@ -425,7 +479,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
             ResultSummary = $"Showing {Records.Count} of {totalQualifier}{page.TotalMatching}; page generated {page.GeneratedAt.LocalDateTime:g}.";
             SetBanner(
                 "Connected",
-                $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection.",
+                rotated
+                    ? $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection. Runtime rotated: dependent state was invalidated before use."
+                    : $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection.",
                 OperatorBannerSeverity.Success);
         }
         catch (OperationCanceledException)
@@ -443,32 +499,85 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    private async Task ExecuteCommandAsync(object command, OperatorTaskContext task, string action)
+    /// Sends one typed intent: first send mints nothing (the envelope already
+    /// carries the per-action identity); reconciliation resends the retained
+    /// identity. Unknown transport outcomes retain the pending operation for
+    /// exact reconciliation instead of a second mutation.
+    private async Task SubmitIntentAsync(OperatorIntentEnvelope envelope, string action, bool isReconcile)
     {
         IsBusy = true;
         NotifyCounts();
+        var pending = new OperatorPendingOperation(
+            envelope.OperationId,
+            JsonSerializer.Serialize(envelope),
+            envelope.ExpectedRevision,
+            action,
+            OperatorOperationPhase.Submitted,
+            DateTimeOffset.UtcNow);
+        if (!isReconcile)
+        {
+            _pendingOperations.Add(pending);
+            RefreshPendingState();
+        }
         try
         {
-            var receipt = await _client.CommandAsync(new
+            JsonElement receipt = isReconcile
+                ? await _client.ReconcileAsync(
+                    JsonSerializer.SerializeToElement(envelope),
+                    _requestCancellation?.Token ?? CancellationToken.None)
+                : await _client.CommandAsync(
+                    envelope,
+                    _requestCancellation?.Token ?? CancellationToken.None);
+            bool accepted;
+            bool executed;
+            string outcome;
+            string? receiptId;
+            try
             {
-                project_id = task.ProjectId,
-                task_id = task.TaskId,
-                expected_revision = task.Revision,
-                idempotency_key = Guid.NewGuid().ToString("N"),
-                command
-            }, _requestCancellation?.Token ?? CancellationToken.None);
-            var accepted = receipt.GetProperty("accepted").GetBoolean();
-            var executed = receipt.GetProperty("executed").GetBoolean();
-            var outcome = receipt.GetProperty("outcome").GetString() ?? "unknown";
-            var receiptId = receipt.TryGetProperty("canonical_receipt", out var canonicalReceipt)
-                && canonicalReceipt.ValueKind == JsonValueKind.Object
-                && canonicalReceipt.TryGetProperty("receipt_id", out var canonicalReceiptId)
-                    ? canonicalReceiptId.GetString()
-                    : null;
+                accepted = receipt.GetProperty("accepted").GetBoolean();
+                executed = receipt.GetProperty("executed").GetBoolean();
+                outcome = receipt.GetProperty("outcome").GetString() ?? "unknown";
+                receiptId = receipt.TryGetProperty("canonical_receipt", out var canonicalReceipt)
+                    && canonicalReceipt.ValueKind == JsonValueKind.Object
+                    && canonicalReceipt.TryGetProperty("receipt_id", out var canonicalReceiptId)
+                        ? canonicalReceiptId.GetString()
+                        : null;
+            }
+            catch (Exception error) when (error is InvalidOperationException or KeyNotFoundException)
+            {
+                // The owner answered but the receipt shape proves nothing:
+                // retain the same identity for reconciliation.
+                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+                RefreshPendingState();
+                SetBanner(
+                    "Unknown outcome — reconcile, do not resubmit",
+                    $"{action}: {pending.OperationId} returned an unreadable receipt; use Reconcile before any retry.",
+                    OperatorBannerSeverity.Warning);
+                return;
+            }
             if (accepted && executed && receiptId is null)
             {
-                throw new InvalidOperationException("Governor accepted a durable mutation without a canonical receipt.");
+                // The owner claims a durable mutation but proves nothing:
+                // retain the same identity for reconciliation, never resubmit.
+                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+                RefreshPendingState();
+                SetBanner(
+                    "Unknown outcome — reconcile, do not resubmit",
+                    $"{action}: {pending.OperationId} was accepted without a canonical receipt; use Reconcile before any retry.",
+                    OperatorBannerSeverity.Warning);
+                return;
             }
+            if (accepted && executed)
+            {
+                ReplacePending(pending.OperationId, OperatorOperationPhase.Receipted);
+                _pendingOperations.RemoveAll(operation => operation.OperationId == pending.OperationId);
+            }
+            else if (!accepted)
+            {
+                ReplacePending(pending.OperationId, OperatorOperationPhase.Rejected);
+                _pendingOperations.RemoveAll(operation => operation.OperationId == pending.OperationId);
+            }
+            RefreshPendingState();
             if (executed) await RefreshAsync();
             SetBanner(
                 accepted ? "Command accepted" : "Command rejected",
@@ -477,8 +586,41 @@ public sealed class MainViewModel : INotifyPropertyChanged
                     : $"{action}: {outcome}; canonical receipt {receiptId}.",
                 accepted ? OperatorBannerSeverity.Success : OperatorBannerSeverity.Warning);
         }
+        catch (OperatorUnknownOutcomeException unknown)
+        {
+            // Possibly executed: retain the same identity for reconciliation.
+            // First sends update the entry added above in place; reconciliations
+            // leave the retained entry untouched.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner(
+                "Unknown outcome — reconcile, do not resubmit",
+                $"{action}: {unknown.OperationId} may have executed; use Reconcile before any retry.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperatorRestartRequiredException restart)
+        {
+            SetBanner(
+                "Restart required",
+                $"{action}: {restart.Message} Obtain a fresh broker handoff; the pending operation is retained.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperationCanceledException)
+        {
+            // Transport cancelled: the effect may still have committed, so the
+            // same identity stays reconciliable instead of a terminal cancel.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner("Command cancelled", "The nonblocking Governor request was cancelled; a possibly committed effect stays reconciliable under the same operation identity.", OperatorBannerSeverity.Informational);
+        }
         catch (Exception error)
         {
+            // Terminal local or owner-refusal failure: the owner answered (or
+            // nothing was sent), so the pending entry closes as rejected and
+            // no reconciliation handle is retained.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.Rejected);
+            _pendingOperations.RemoveAll(operation => operation.OperationId == pending.OperationId);
+            RefreshPendingState();
             SetBanner("Command failed", error.Message, OperatorBannerSeverity.Error);
         }
         finally
@@ -486,6 +628,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
             IsBusy = false;
             NotifyCounts();
         }
+    }
+
+    private void ReplacePending(string operationId, OperatorOperationPhase phase)
+    {
+        var index = _pendingOperations.FindIndex(operation => operation.OperationId == operationId);
+        if (index >= 0) _pendingOperations[index] = _pendingOperations[index].WithPhase(phase);
+    }
+
+    private void RefreshPendingState()
+    {
+        OnPropertyChanged(nameof(PendingOperations));
+        OnPropertyChanged(nameof(HasUnknownOperations));
     }
 
     private static object BuildCommand(
@@ -526,6 +680,23 @@ public sealed class MainViewModel : INotifyPropertyChanged
             throw new InvalidOperationException("Typed Operator parameters must be one JSON object.");
         }
         return document.RootElement.Clone();
+    }
+
+    /// Tracks the runtime/auth-generation binding of the last applied page.
+    /// Returns true when the binding rotated: the caller must discard cached
+    /// rows, cursors, and selections before use. Pending unknown-outcome
+    /// operations are retained under their own identities for reconciliation.
+    private bool InvalidateOnRotation(OperatorProjectionPage page)
+    {
+        var rotated = _lastRuntimeId is not null
+            && (_lastRuntimeId != page.RuntimeId || _lastAuthGeneration != page.AuthGeneration);
+        _lastRuntimeId = page.RuntimeId;
+        _lastAuthGeneration = page.AuthGeneration;
+        if (rotated)
+        {
+            _nextCursor = null;
+        }
+        return rotated;
     }
 
     private void ValidateScope()

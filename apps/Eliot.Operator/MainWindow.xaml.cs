@@ -22,8 +22,10 @@ public sealed partial class MainWindow : Window
         ViewModel.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName == nameof(MainViewModel.StatusSeverity)) SyncBannerSeverity();
+            if (args.PropertyName == nameof(MainViewModel.HasUnknownOperations)) SyncReconcileVisibility();
         };
         SyncBannerSeverity();
+        SyncReconcileVisibility();
         Navigation.SelectedItem = Navigation.MenuItems[0];
         Closed += MainWindow_OnClosed;
         _ = RefreshProjectionAsync();
@@ -83,6 +85,12 @@ public sealed partial class MainWindow : Window
     private async void ExecuteAction_OnClick(object sender, RoutedEventArgs e)
     {
         await ViewModel.ExecuteSelectedActionAsync();
+        RenderGraph();
+    }
+
+    private async void ReconcileUnknown_OnClick(object sender, RoutedEventArgs e)
+    {
+        await ViewModel.ReconcilePendingAsync();
         RenderGraph();
     }
 
@@ -246,6 +254,11 @@ public sealed partial class MainWindow : Window
             OperatorBannerSeverity.Error => InfoBarSeverity.Error,
             _ => InfoBarSeverity.Informational
         };
+    }
+
+    private void SyncReconcileVisibility()
+    {
+        UnknownOutcomePanel.Visibility = ViewModel.HasUnknownOperations ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private async void MainWindow_OnClosed(object sender, WindowEventArgs args) => await _client.DisposeAsync();

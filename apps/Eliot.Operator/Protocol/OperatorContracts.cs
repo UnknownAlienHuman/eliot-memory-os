@@ -9,6 +9,24 @@ public static class OperatorProtocol
     public const string IpcProtocolVersion = "eliot-ipc-l3-v2";
     public const string PinnedContractHash = "b00a82807e003ad1e1b9b717a9759024335ffe461a0cc3f5d67867ec8750394f";
     public const int MaxPageSize = 100;
+
+    /// Structured inline ceiling for one framed response line: 256 KiB,
+    /// mirroring the runtime-status transport ceiling. Over-ceiling input
+    /// fails closed and is never truncated into a valid object.
+    public const int MaxLineChars = 262_144;
+    /// Independent cap for one decoded response body in bytes.
+    public const int MaxDecodedBytes = 262_144;
+    /// The inherited one-shot endpoint authenticator is tiny; anything larger
+    /// is not the broker-issued shape.
+    public const int MaxEndpointChars = 4_096;
+    /// Closed control shapes (endpoint, handshake, receipt control fields)
+    /// stay small and flat.
+    public const int MaxControlMembers = 32;
+    public const int MaxControlStringChars = 1_024;
+    public const int MaxControlDepth = 4;
+    public const int MaxControlTokens = 512;
+    /// Bounded connect/handshake timeouts in seconds.
+    public const int ConnectTimeoutSeconds = 10;
 }
 
 /// One broker-owned, one-shot UI binding. It contains no bearer credential.

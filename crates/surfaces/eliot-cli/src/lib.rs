@@ -1202,8 +1202,7 @@ pub mod kernel_client {
                 "status": "restart_required",
                 "receipt": {},
             });
-            let (status, _) =
-                decode_operator_launch_receipt(&restart).expect("restart receipt");
+            let (status, _) = decode_operator_launch_receipt(&restart).expect("restart receipt");
             assert_eq!(status, OperatorLaunchStatus::RestartRequired);
         }
 
