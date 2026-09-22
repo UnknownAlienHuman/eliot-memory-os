@@ -31,13 +31,38 @@ contract = "integrations/opencode/plugin-bridge-contract.json"
 manifest = "integrations/opencode/opencode.json"
 
 [external_executables.surrealdb]
-name = "surrealdb"
-version = "2.2.1"
+name = "surreal.exe"
+version = "3.1.4"
 license = "BSL-1.1"
 consumer = "crates/storage/eliot-store-surreal"
 trust_model = "local-loopback-service-only"
 removal_boundary = "pluggable-storage-facade"
 owner = "crates/storage/eliot-store-surreal"
+sha256 = "13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1"
+catalog = "docs/release/SURREALDB_WINDOWS_X64.lock.json"
+observed_path = "C:/Tools/SurrealDB/surreal.exe"
+version_args = ["version"]
+release_source = "https://github.com/surrealdb/surrealdb/releases/tag/v3.1.4"
+release_asset = "https://github.com/surrealdb/surrealdb/releases/download/v3.1.4/surreal-v3.1.4.windows-amd64.exe"
+source_tag = "v3.1.4"
+advisory_package = "surrealdb"
+advisory_ecosystem = "crates.io"
+advisory_scope = "rust-crate"
+distributed_binary_applicability = "unestablished"
+advisory_source = "https://api.osv.dev/v1/query"
+advisory_query = '{"package":{"name":"surrealdb","ecosystem":"crates.io"},"version":"3.1.4"}'
+advisory_checked_at = "2026-09-22T14:38:31.9718905Z"
+advisory_digest = "ca3ee13e6d878ee2613ea4adb337648ff4819f99c4d1bdd654222e59e17f0a30"
+advisory_response_digest = "c0829c54133c5d4e870686c7a02af8d72cac46326694ef37b5b24f445c751f94"
+advisory_status = "findings"
+advisory_findings = [
+    "GHSA-848m-r628-vrxw",
+    "GHSA-cc8f-fcx3-gpjr",
+    "GHSA-h4h3-3rfj-x6fq",
+    "GHSA-h5rg-8p7f-47g2",
+    "GHSA-hv6h-hc26-q48p",
+    "GHSA-jv2j-mqmw-xvv5",
+]
 
 [direct_dependencies.aes-gcm]
 ecosystem = "rust"

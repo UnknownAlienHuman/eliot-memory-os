@@ -50,6 +50,7 @@ IDENTITY_BINDING_FINDING = "DEP-014"
 NODE_ECOSYSTEM_FINDING = "DEP-015"
 
 _HEX64 = re.compile(r"[0-9a-fA-F]{64}")
+_GHSA_ID = re.compile(r"GHSA-[0-9A-Za-z]+-[0-9A-Za-z]+-[0-9A-Za-z]+$")
 _TARGET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _SCANNER_RECORD_TYPES = {"diagnostic", "summary"}
 _DIAGNOSTIC_SEVERITIES = {"error", "warning", "note", "help"}
@@ -460,18 +461,41 @@ def collect_locked_dependency_identity(
 
 
 def _validated_node_input(
-    root: Path, raw_value: object, label: str
+    root: Path,
+    raw_value: object,
+    label: str,
+    findings: list[Finding] | None = None,
 ) -> tuple[Path | None, str | None]:
-    path, _ = _configured_repo_path(root, raw_value, label, NODE_ECOSYSTEM_FINDING)
+    path, path_findings = _configured_repo_path(root, raw_value, label, NODE_ECOSYSTEM_FINDING)
+    if findings is not None:
+        findings.extend(path_findings)
     if path is None:
         return None, None
     try:
         resolved_path = path.resolve()
         relative_path = resolved_path.relative_to(root.resolve())
     except (OSError, ValueError):
+        if findings is not None:
+            findings.append(
+                Finding(
+                    NODE_ECOSYSTEM_FINDING,
+                    "config/dependency-policy.toml",
+                    1,
+                    f"{label} must resolve within the repository",
+                )
+            )
         return None, None
     relative = str(relative_path).replace("\\", "/")
     if not relative or relative == ".":
+        if findings is not None:
+            findings.append(
+                Finding(
+                    NODE_ECOSYSTEM_FINDING,
+                    "config/dependency-policy.toml",
+                    1,
+                    f"{label} must resolve to a non-root repository path",
+                )
+            )
         return None, None
     return resolved_path, relative
 
@@ -528,21 +552,25 @@ def _node_input_paths(root: Path, node_policy: dict | None) -> list[str]:
 def check_node_ecosystem(root: Path, node_policy: dict | None = None) -> list[Finding]:
     findings: list[Finding] = []
     policy = node_policy if isinstance(node_policy, dict) else {}
-    contract_path, path_findings = _configured_repo_path(
-        root, policy.get("contract"), "[ecosystems.node].contract", NODE_ECOSYSTEM_FINDING
+    contract_path, contract_relative = _validated_node_input(
+        root,
+        policy.get("contract"),
+        "[ecosystems.node].contract",
+        findings,
     )
-    findings.extend(path_findings)
-    manifest_path, path_findings = _configured_repo_path(
-        root, policy.get("manifest"), "[ecosystems.node].manifest", NODE_ECOSYSTEM_FINDING
+    manifest_path, manifest_relative = _validated_node_input(
+        root,
+        policy.get("manifest"),
+        "[ecosystems.node].manifest",
+        findings,
     )
-    findings.extend(path_findings)
     if contract_path is None or manifest_path is None:
         return findings
 
     contract: dict = {}
     if not contract_path.is_file():
         findings.append(
-            Finding(NODE_ECOSYSTEM_FINDING, str(contract_path.relative_to(root)).replace("\\", "/"), 0, "configured Node contract is missing")
+            Finding(NODE_ECOSYSTEM_FINDING, contract_relative or "config/dependency-policy.toml", 0, "configured Node contract is missing")
         )
     else:
         try:
@@ -554,7 +582,7 @@ def check_node_ecosystem(root: Path, node_policy: dict | None = None) -> list[Fi
             findings.append(
                 Finding(
                     NODE_ECOSYSTEM_FINDING,
-                    str(contract_path.relative_to(root)).replace("\\", "/"),
+                    contract_relative or "config/dependency-policy.toml",
                     1,
                     f"malformed configured Node contract: {exc}",
                 )
@@ -565,18 +593,22 @@ def check_node_ecosystem(root: Path, node_policy: dict | None = None) -> list[Fi
                     findings.append(Finding(NODE_ECOSYSTEM_FINDING, "config/dependency-policy.toml", 1, f"Node contract missing '{field}'"))
             surface = contract.get("surface")
             if isinstance(surface, str) and surface.strip():
-                surface_path, surface_findings = _configured_repo_path(
-                    root, surface, "Node contract surface", NODE_ECOSYSTEM_FINDING
+                surface_path, surface_relative = _validated_node_input(
+                    root, surface, "Node contract surface", findings
                 )
-                findings.extend(surface_findings)
                 if surface_path is not None and not surface_path.is_file():
                     findings.append(
-                        Finding(NODE_ECOSYSTEM_FINDING, surface.replace("\\", "/"), 0, "Node contract surface is missing")
+                        Finding(
+                            NODE_ECOSYSTEM_FINDING,
+                            surface_relative or "config/dependency-policy.toml",
+                            0,
+                            "Node contract surface is missing",
+                        )
                     )
 
     if not manifest_path.is_file():
         findings.append(
-            Finding(NODE_ECOSYSTEM_FINDING, str(manifest_path.relative_to(root)).replace("\\", "/"), 0, "configured Node manifest is missing")
+            Finding(NODE_ECOSYSTEM_FINDING, manifest_relative or "config/dependency-policy.toml", 0, "configured Node manifest is missing")
         )
     else:
         try:
@@ -587,7 +619,7 @@ def check_node_ecosystem(root: Path, node_policy: dict | None = None) -> list[Fi
             findings.append(
                 Finding(
                     NODE_ECOSYSTEM_FINDING,
-                    str(manifest_path.relative_to(root)).replace("\\", "/"),
+                    manifest_relative or "config/dependency-policy.toml",
                     1,
                     f"malformed configured Node manifest: {exc}",
                 )
@@ -670,27 +702,271 @@ def check_python_ecosystem(root: Path) -> list[Finding]:
     return findings
 
 
-def check_external_executables(manifest_data: dict) -> list[Finding]:
+def _extract_external_version(output: str) -> str | None:
+    match = re.search(r"(?<!\d)(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)(?!\d)", output)
+    return match.group(1) if match else None
+
+
+def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
+    evidence: dict = {}
     externals = manifest_data.get("external_executables", {})
-    if not externals or "surrealdb" not in externals:
+    if not isinstance(externals, dict) or "surrealdb" not in externals:
         findings.append(
             Finding("DEP-009", "config/dependency-policy.toml", 1, "missing 'surrealdb' in [external_executables]")
         )
-        return findings
+        return findings, evidence
 
     surreal = externals["surrealdb"]
-    for req in ("name", "version", "license", "consumer", "trust_model", "removal_boundary", "sha256", "advisory_digest"):
+    name = "surrealdb"
+    if not isinstance(surreal, dict):
+        finding = Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb external executable configuration must be a table")
+        return [finding], {name: {"status": "invalid_configuration"}}
+
+    required = (
+        "name",
+        "version",
+        "license",
+        "consumer",
+        "trust_model",
+        "removal_boundary",
+        "sha256",
+        "catalog",
+        "observed_path",
+        "version_args",
+        "release_source",
+        "release_asset",
+        "source_tag",
+        "advisory_package",
+        "advisory_ecosystem",
+        "advisory_scope",
+        "distributed_binary_applicability",
+        "advisory_source",
+        "advisory_query",
+        "advisory_checked_at",
+        "advisory_digest",
+        "advisory_response_digest",
+        "advisory_status",
+        "advisory_findings",
+    )
+    for req in required:
         if req not in surreal:
             findings.append(
                 Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb external executable missing '{req}'")
             )
 
-    if "sha256" in surreal and not _HEX64.fullmatch(str(surreal.get("sha256", ""))):
+    configured_sha = str(surreal.get("sha256", "")).lower()
+    if not _HEX64.fullmatch(configured_sha):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb sha256 must be a 64-character hexadecimal digest"))
-    if "advisory_digest" in surreal and not _HEX64.fullmatch(str(surreal.get("advisory_digest", ""))):
+
+    advisory_digest = str(surreal.get("advisory_digest", "")).lower()
+    if not _HEX64.fullmatch(advisory_digest):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_digest must be a 64-character hexadecimal digest"))
 
+    advisory_response_digest = str(surreal.get("advisory_response_digest", "")).lower()
+    if not _HEX64.fullmatch(advisory_response_digest):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_response_digest must be a 64-character hexadecimal digest"))
+
+    release_source = surreal.get("release_source")
+    release_asset = surreal.get("release_asset")
+    source_tag = surreal.get("source_tag")
+    if not isinstance(release_source, str) or not release_source.startswith("https://"):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb release_source must be an HTTPS URL"))
+    if not isinstance(release_asset, str) or not release_asset.startswith("https://"):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb release_asset must be an HTTPS URL"))
+    if not isinstance(source_tag, str) or not source_tag.strip() or source_tag.removeprefix("v") != str(surreal.get("version", "")):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb source_tag must identify the configured release version"))
+
+    advisory_package = surreal.get("advisory_package")
+    advisory_ecosystem = surreal.get("advisory_ecosystem")
+    advisory_scope = surreal.get("advisory_scope")
+    binary_applicability = surreal.get("distributed_binary_applicability")
+    if advisory_package != "surrealdb" or advisory_ecosystem != "crates.io":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory evidence must target crates.io package surrealdb"))
+    if advisory_scope != "rust-crate":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_scope must be rust-crate"))
+    if binary_applicability not in {"unestablished", "established"}:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb distributed_binary_applicability is unsupported"))
+
+    advisory_query = surreal.get("advisory_query")
+    if not isinstance(advisory_query, str) or not advisory_query.strip():
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_query must be a non-empty JSON request body"))
+    else:
+        try:
+            query_data = json.loads(advisory_query)
+            expected_query = {
+                "package": {"ecosystem": advisory_ecosystem, "name": advisory_package},
+                "version": surreal.get("version"),
+            }
+            if query_data != expected_query:
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_query does not bind the configured package, ecosystem and version"))
+        except (TypeError, json.JSONDecodeError) as exc:
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb advisory_query is not valid JSON: {exc}"))
+
+    advisory_source = surreal.get("advisory_source")
+    if not isinstance(advisory_source, str) or not advisory_source.startswith("https://"):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_source must be an HTTPS URL"))
+
+    advisory_checked_at = surreal.get("advisory_checked_at")
+    if not isinstance(advisory_checked_at, str):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_checked_at must be an RFC3339 timestamp"))
+    else:
+        try:
+            parsed_at = datetime.fromisoformat(advisory_checked_at.replace("Z", "+00:00"))
+            if parsed_at.tzinfo is None:
+                raise ValueError("timestamp has no timezone")
+        except ValueError as exc:
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb advisory_checked_at is invalid: {exc}"))
+
+    advisory_findings = surreal.get("advisory_findings")
+    if not isinstance(advisory_findings, list) or any(not isinstance(item, str) or not item.strip() for item in advisory_findings):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_findings must be a list of advisory identifiers"))
+        advisory_findings = []
+    else:
+        invalid_advisories = [item for item in advisory_findings if not _GHSA_ID.fullmatch(item)]
+        if invalid_advisories:
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb advisory_findings contains invalid identifiers: {', '.join(invalid_advisories)}"))
+        if len(set(advisory_findings)) != len(advisory_findings):
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_findings contains duplicate identifiers"))
+    advisory_status = surreal.get("advisory_status")
+    if advisory_status not in {"findings", "no_known_vulnerabilities", "unavailable"}:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_status is unsupported"))
+    elif advisory_status == "findings" and not advisory_findings:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_status=findings requires advisory_findings"))
+    elif advisory_status == "no_known_vulnerabilities" and advisory_findings:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_status=no_known_vulnerabilities conflicts with advisory_findings"))
+    if advisory_status == "findings" and advisory_findings:
+        for advisory_id in sorted(advisory_findings):
+            findings.append(
+                Finding(
+                    "DEP-009",
+                    "config/dependency-policy.toml",
+                    1,
+                    "surrealdb Rust-crate advisory "
+                    f"{advisory_id} affects {advisory_ecosystem}/{advisory_package} "
+                    f"{surreal.get('version', 'unknown')}; distributed binary applicability="
+                    f"{binary_applicability}",
+                )
+            )
+
+    observed_path_value = surreal.get("observed_path")
+    observed_path: Path | None = None
+    observed_sha = None
+    observed_version = None
+    version_probe: dict = {"status": "not_executed"}
+    if not isinstance(observed_path_value, str) or not Path(observed_path_value).is_absolute():
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb observed_path must be an absolute path"))
+    else:
+        observed_path = Path(observed_path_value)
+        if observed_path.name.lower() != str(surreal.get("name", "")).lower():
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb observed_path filename does not match configured executable name"))
+        if not observed_path.is_file() or observed_path.is_symlink():
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb observed executable is not a regular file: {observed_path}"))
+        else:
+            try:
+                observed_sha = sha256_file(observed_path).lower()
+            except OSError as exc:
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"cannot hash observed surrealdb executable: {exc}"))
+            if observed_sha and _HEX64.fullmatch(configured_sha) and observed_sha != configured_sha:
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb observed SHA-256 {observed_sha} differs from pinned {configured_sha}"))
+
+            version_args = surreal.get("version_args")
+            if not isinstance(version_args, list) or any(not isinstance(arg, str) or not arg for arg in version_args):
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb version_args must be a non-empty string list"))
+                version_args = []
+            if version_args:
+                command = [str(observed_path), *version_args]
+                version_probe = {"command": command}
+                try:
+                    proc = subprocess.run(command, cwd=str(root), capture_output=True, text=True, timeout=30, check=False)
+                    combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+                    observed_version = _extract_external_version(combined)
+                    version_probe.update(
+                        {
+                            "status": "observed" if proc.returncode == 0 and observed_version else "invalid",
+                            "exit_code": proc.returncode,
+                            "observed_version": observed_version,
+                            "output_sha256": hashlib.sha256(combined.encode("utf-8")).hexdigest(),
+                        }
+                    )
+                    if proc.returncode != 0 or not observed_version:
+                        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb version probe did not produce a version"))
+                    elif observed_version != str(surreal.get("version", "")):
+                        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb observed version {observed_version} differs from pinned {surreal.get('version')}"))
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    version_probe = {"status": "unavailable", "error": str(exc), "command": command}
+                    findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb version probe failed: {exc}"))
+
+    catalog_path, catalog_findings = _configured_repo_path(
+        root, surreal.get("catalog"), "surrealdb catalog", "DEP-009"
+    )
+    findings.extend(catalog_findings)
+    catalog_evidence: dict = {"status": "not_observed"}
+    if catalog_path is not None:
+        catalog_rel = str(catalog_path.relative_to(root)).replace("\\", "/")
+        try:
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            catalog_sha = sha256_file(catalog_path).lower()
+            catalog_evidence = {
+                "status": "observed",
+                "path": catalog_rel,
+                "sha256": catalog_sha,
+                "artifact": catalog.get("artifact"),
+                "version": catalog.get("version"),
+                "sha256_pin": catalog.get("sha256"),
+                "architecture": catalog.get("architecture"),
+            }
+            if catalog.get("artifact") != str(surreal.get("name", "")):
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb catalog artifact does not match executable name"))
+            if catalog.get("version") != surreal.get("version") or str(catalog.get("sha256", "")).lower() != configured_sha:
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb catalog identity differs from configured version/SHA-256 pin"))
+        except (OSError, json.JSONDecodeError) as exc:
+            catalog_evidence = {"status": "invalid", "path": catalog_rel}
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"malformed surrealdb catalog: {exc}"))
+
+    evidence[name] = {
+        "status": "findings" if findings else "observed",
+        "configured": surreal,
+        "pinned_artifact": {
+            "version": surreal.get("version"),
+            "sha256": configured_sha,
+            "catalog": catalog_evidence,
+        },
+        "observed_installed": {
+            "path": str(observed_path.resolve()) if observed_path else None,
+            "version": observed_version,
+            "sha256": observed_sha,
+            "version_probe": version_probe,
+        },
+        "advisory_snapshot": {
+            "source": advisory_source,
+            "query": surreal.get("advisory_query"),
+            "package": advisory_package,
+            "ecosystem": advisory_ecosystem,
+            "scope": advisory_scope,
+            "checked_at": advisory_checked_at,
+            "digest": advisory_digest,
+            "response_digest": advisory_response_digest,
+            "status": advisory_status,
+            "findings": sorted(advisory_findings),
+            "distributed_binary_applicability": binary_applicability,
+            "release_source": release_source,
+            "release_asset": release_asset,
+            "source_tag": source_tag,
+        },
+    }
+    return findings, evidence
+
+
+def check_external_executables(
+    root: Path | dict, manifest_data: dict | None = None
+) -> list[Finding]:
+    # Keep the one-argument helper form compatible with the existing focused
+    # verifier tests while allowing the real run to probe from its repository root.
+    if manifest_data is None:
+        manifest_data = root if isinstance(root, dict) else {}
+        root = Path(".")
+    findings, _ = _collect_external_evidence(root, manifest_data)
     return findings
 
 
@@ -972,32 +1248,24 @@ def _receipt_input_paths(root: Path, manifest_data: dict) -> list[str]:
                     paths.add(value.replace("\\", "/"))
         node = ecosystems.get("node", {})
         paths.update(_node_input_paths(root, node))
+    externals = manifest_data.get("external_executables", {})
+    if isinstance(externals, dict):
+        for config in externals.values():
+            if not isinstance(config, dict):
+                continue
+            catalog_path, _ = _configured_repo_path(
+                root, config.get("catalog"), "external executable catalog", "DEP-009"
+            )
+            if catalog_path is not None:
+                try:
+                    paths.add(str(catalog_path.relative_to(root)).replace("\\", "/"))
+                except ValueError:
+                    continue
     return sorted(paths)
 
 
 def _external_receipt_evidence(root: Path, manifest_data: dict) -> dict:
-    externals = manifest_data.get("external_executables", {})
-    if not isinstance(externals, dict):
-        return {}
-    evidence: dict = {}
-    for name, config in externals.items():
-        if not isinstance(config, dict):
-            evidence[str(name)] = {"status": "invalid_configuration"}
-            continue
-        configured_name = config.get("name", name)
-        observed_path = shutil.which(str(configured_name)) if configured_name else None
-        observed_digest = None
-        if observed_path:
-            try:
-                observed_digest = sha256_file(Path(observed_path))
-            except OSError:
-                observed_digest = None
-        evidence[str(name)] = {
-            "configured": config,
-            "observed_executable": str(Path(observed_path).resolve()) if observed_path else None,
-            "observed_sha256": observed_digest,
-            "status": "observed" if observed_path and observed_digest else "not_observed",
-        }
+    _, evidence = _collect_external_evidence(root, manifest_data)
     return evidence
 
 
@@ -1294,6 +1562,7 @@ def build_receipt(
     manifest_data: dict,
     cargo_summary: dict,
     direct_deps: set[str] | int,
+    external_evidence: dict | None = None,
 ) -> dict:
     source_sha, source_provenance, source_finding = _git_source_provenance(root)
     if source_finding is not None:
@@ -1396,7 +1665,9 @@ def build_receipt(
         "direct_dependency_identity": cargo_summary.get("_direct_dependency_identity", {})
         if isinstance(cargo_summary, dict)
         else {},
-        "external_executable_evidence": _external_receipt_evidence(root, manifest_data),
+        "external_executable_evidence": external_evidence
+        if external_evidence is not None
+        else _external_receipt_evidence(root, manifest_data),
         "scanner_summary": scanner_summary,
         "scanner_execution": scanner_execution,
         "findings_count": len(findings),
@@ -1489,8 +1760,8 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
     node_findings = check_node_ecosystem(root, node_policy if isinstance(node_policy, dict) else {})
     all_findings.extend(node_findings)
 
-    # 7. Check external executables
-    ext_findings = check_external_executables(manifest_data)
+    # 7. Check external executables and retain the exact observation for the receipt.
+    ext_findings, external_evidence = _collect_external_evidence(root, manifest_data)
     all_findings.extend(ext_findings)
 
     # 8. Run cargo deny scanner
@@ -1520,7 +1791,14 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
     overall_status = _derive_overall_status(scanner_status, all_findings)
 
     receipt = build_receipt(
-        root, profile, overall_status, all_findings, manifest_data, cargo_summary, direct_deps
+        root,
+        profile,
+        overall_status,
+        all_findings,
+        manifest_data,
+        cargo_summary,
+        direct_deps,
+        external_evidence=external_evidence,
     )
     all_findings = _deduplicate_findings(all_findings)
     overall_status = _derive_overall_status(scanner_status, all_findings)
@@ -1611,7 +1889,7 @@ def run_self_tests() -> int:
             return 1
 
     # Case 6: missing external executable inventory
-    findings = check_external_executables({})
+    findings = check_external_executables(Path("."), {})
     if not any(f.code == "DEP-009" and "surrealdb" in f.detail for f in findings):
         print("SELF_TEST_FAILURE: expected DEP-009 for missing external executable", file=sys.stderr)
         return 1
