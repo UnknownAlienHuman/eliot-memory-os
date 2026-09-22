@@ -60,7 +60,9 @@ pub use dispatch_authority::{
 };
 pub use dispatch_drive::{DispatchDriveResponse, DriveError, drive_dispatch};
 pub use dispatch_material::{
-    DISPATCH_MATERIAL_MAX_BYTES, MaterialError, ValidatedDispatchMaterial, ValidatedGuestCeilings,
+    DISPATCH_MATERIAL_MAX_BYTES, MaterialError, ValidatedAssuranceRecord,
+    ValidatedDispatchMaterial, ValidatedGuestCeilings, ValidatedManifestRecord,
+    ValidatedPromotionRecord, ValidatedSnapshotRecord, ValidatedWorkRecord,
     WASM_DISPATCH_MATERIAL_WIRE_ID, WASM_DISPATCH_MATERIAL_WIRE_VERSION,
     WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
     WASM_HOST_MATERIAL_FILE_NAME, admitted_material_path, read_dispatch_material,
@@ -98,7 +100,8 @@ pub use typed_execution::{
     domain_handoff, execute_describe_experimental, execute_governed_refusal,
 };
 pub use wasmtime_provider::{
-    WasmtimeBuildError, WasmtimeComponentEngine, provider_configuration_digest,
+    WasmtimeBuildError, WasmtimeComponentEngine, guest_wit_bytes, provider_configuration_bytes,
+    provider_configuration_digest,
 };
 
 /// B-12's injected component-host runner.

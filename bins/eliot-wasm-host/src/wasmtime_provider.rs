@@ -606,6 +606,22 @@ pub fn provider_configuration_digest() -> Sha256Digest {
     configuration_digest()
 }
 
+/// Returns the exact provider configuration bytes the digest binds.
+/// The dispatch contour hashes these real bytes for the manifest
+/// configuration digest; the value is single-sourced with the digest.
+#[must_use]
+pub fn provider_configuration_bytes() -> &'static [u8] {
+    canonical_configuration_descriptor()
+}
+
+/// Returns the exact frozen guest-world WIT bytes the guest interface
+/// digest binds. Single-sourced: the provider, the proof, and the dispatch
+/// contour all hash these bytes, never a pasted constant.
+#[must_use]
+pub fn guest_wit_bytes() -> &'static [u8] {
+    include_bytes!("../wit/guest.wit")
+}
+
 fn canonical_configuration_descriptor() -> &'static [u8] {
     b"wasmtime=47.0.4;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;max_epoch_deadline_ticks=1024;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
 }
