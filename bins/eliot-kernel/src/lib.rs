@@ -41,6 +41,7 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+pub mod automation_notification_client;
 mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;

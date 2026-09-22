@@ -2020,6 +2020,7 @@ dependencies = [
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",
+ "eliot-notify-core",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
