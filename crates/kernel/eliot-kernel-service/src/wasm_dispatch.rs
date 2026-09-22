@@ -746,6 +746,125 @@ pub fn material_bytes(material: &WasmDispatchMaterial) -> Result<Vec<u8>, WasmDi
     serde_json::to_vec(material).map_err(|_| WasmDispatchError::Gate)
 }
 
+/// Owner-authored claim bundle for one dispatch publication: every record
+/// the envelope carries plus the guest bytes to stage. Beauvoir's hook
+/// fills this from live owners; the publisher validates, binds the
+/// registry host digest, and stages the delivery set. No file paths enter
+/// here — delivery targets derive from the registry descriptor.
+pub struct WasmOwnerClaim {
+    /// Admitted claim identity.
+    pub claim_id: String,
+    /// Admitted operation identity.
+    pub operation_id: String,
+    /// Claiming generation (non-zero).
+    pub generation: u64,
+    /// Live authority epoch bound at admission.
+    pub authority_epoch: EpochId,
+    /// Claim-bound launch nonce.
+    pub launch_nonce: String,
+    /// Durable admission time in Unix milliseconds.
+    pub admitted_at_unix_ms: u64,
+    /// Admission-bound identity digest (hex).
+    pub identity_digest: String,
+    /// Guest ceilings and pinned identities.
+    pub guest: WasmGuestCeilings,
+    /// Owner-selected composition profile.
+    pub profile: String,
+    /// Owner-authored manifest record.
+    pub manifest: WasmManifestRecord,
+    /// Owner-authored work record.
+    pub work: WasmWorkRecord,
+    /// Owner-authored assurance record.
+    pub assurance: WasmAssuranceRecord,
+    /// Owner-authored promotion record.
+    pub promotion: WasmPromotionRecord,
+    /// Owner-attested snapshot record.
+    pub snapshot: WasmSnapshotRecord,
+    /// Exact guest artifact bytes to stage.
+    pub artifact_bytes: Vec<u8>,
+    /// Exact guest input bytes to stage.
+    pub input_bytes: Vec<u8>,
+}
+
+/// Published delivery set: the envelope plus the exact paths staged next
+/// to the installed image. Paths derive from the registry descriptor,
+/// never from caller strings.
+pub struct WasmPublishedBundle {
+    /// Validated envelope as published.
+    pub material: WasmDispatchMaterial,
+    /// Staged material file path.
+    pub material_path: std::path::PathBuf,
+    /// Staged artifact file path.
+    pub artifact_path: std::path::PathBuf,
+    /// Staged input file path.
+    pub input_path: std::path::PathBuf,
+}
+
+/// Publishes one dispatch bundle from retained actual owner state plus the
+/// authenticated installation registry: validates every record, reads the
+/// installation-approved host binding through the descriptor's validated
+/// accessor (the descriptor self-validates first — an unvalidated registry
+/// denies here, never downstream), binds the registry digest into the
+/// grant and the envelope, re-hashes the staged bytes against the bound
+/// digests, and stages the three delivery files beside the installed
+/// image. No ambient paths, no caller-asserted digests, no minted window:
+/// freshness opens at the durable admission time through the grant expiry.
+///
+/// # Errors
+///
+/// Returns [`WasmDispatchError`] when any record, the registry
+/// descriptor, the byte bindings, or the file staging fails closed.
+pub fn publish_wasm_dispatch_bundle(
+    descriptor: &eliot_installation::RuntimeLaunchDescriptor,
+    claim: &WasmOwnerClaim,
+) -> Result<WasmPublishedBundle, WasmDispatchError> {
+    if claim.artifact_bytes.is_empty() || claim.input_bytes.is_empty() {
+        return Err(invalid("guest-bytes"));
+    }
+    if sha256_hex(&claim.artifact_bytes) != claim.guest.artifact_digest
+        || sha256_hex(&claim.input_bytes) != claim.guest.input_digest
+    {
+        return Err(invalid("guest-bytes-binding"));
+    }
+    let (host_path, host_digest) = descriptor
+        .wasm_host_artifact_binding()
+        .map_err(|_| invalid("registry-descriptor"))?;
+    let install_dir = std::path::Path::new(host_path.as_str())
+        .parent()
+        .ok_or_else(|| invalid("registry-host-path"))?
+        .to_path_buf();
+    let material = publish_wasm_dispatch_material(
+        &claim.claim_id,
+        &claim.operation_id,
+        eliot_process::Generation::new(claim.generation).map_err(|_| invalid("generation"))?,
+        &claim.authority_epoch,
+        &claim.launch_nonce,
+        claim.admitted_at_unix_ms,
+        &claim.identity_digest,
+        host_digest.as_str(),
+        claim.guest.clone(),
+        &claim.profile,
+        claim.manifest.clone(),
+        claim.work.clone(),
+        claim.assurance.clone(),
+        claim.promotion.clone(),
+        claim.snapshot.clone(),
+    )?;
+    let material_path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
+    let artifact_path = install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME);
+    let input_path = install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME);
+    let io_denied = |_| invalid("delivery-io");
+    std::fs::write(&material_path, material_bytes(&material)?).map_err(io_denied)?;
+    std::fs::write(&artifact_path, &claim.artifact_bytes).map_err(io_denied)?;
+    std::fs::write(&input_path, &claim.input_bytes).map_err(io_denied)?;
+    Ok(WasmPublishedBundle {
+        material,
+        material_path,
+        artifact_path,
+        input_path,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -947,6 +1066,131 @@ mod tests {
                 4_000_000_000_000,
                 &"d".repeat(64),
             ),
+            Err(WasmDispatchError::InvalidMaterial(_))
+        ));
+    }
+
+    #[test]
+    fn bundle_rejects_unvalidated_registry_without_touching_filesystem() {
+        use eliot_installation::{
+            InstallationEpoch, InstallationProfile, RuntimeLaunchDescriptor, RuntimeStateRoots,
+            SupervisionAuthorityBinding,
+        };
+        use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
+
+        fn placeholder(value: &str) -> eliot_installation::PlatformHandle {
+            eliot_installation::PlatformHandle::new(value).expect("placeholder handle")
+        }
+
+        fn garbage_descriptor() -> RuntimeLaunchDescriptor {
+            let epoch: EpochId = serde_json::from_value(serde_json::json!({
+                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                "sequence": 3
+            }))
+            .expect("test epoch parses");
+            let handle = || placeholder("placeholder");
+            RuntimeLaunchDescriptor {
+                profile: InstallationProfile::PortableDev,
+                portable_root: None,
+                installation_epoch: InstallationEpoch {
+                    installation: handle(),
+                    lineage_id: handle(),
+                    sequence: 1,
+                },
+                generation: handle(),
+                authority_generation: ResourceGeneration::genesis(),
+                authority_state_fence: StateFence::new(epoch, ResourceGeneration::genesis()),
+                authority_descriptor_path: handle(),
+                authority_descriptor_digest: handle(),
+                supervision_authority: SupervisionAuthorityBinding::Pending {
+                    supervision_lease_scope_id: handle(),
+                },
+                runtime_state_roots: RuntimeStateRoots {
+                    profile: InstallationProfile::PortableDev,
+                    profile_anchor_root: handle(),
+                    installation_root: handle(),
+                    host_state_root: handle(),
+                    kernel_ors_root: handle(),
+                    kernel_work_root: handle(),
+                    store_data_root: handle(),
+                    store_work_root: handle(),
+                    store_temp_root: handle(),
+                    watchdog_state_root: handle(),
+                    roots_digest: handle(),
+                },
+                kernel_work_root: handle(),
+                kernel_artifact_digest: handle(),
+                eliotd_executable_path: handle(),
+                eliotd_artifact_digest: handle(),
+                eliotd_config_path: handle(),
+                eliotd_config_digest: handle(),
+                protected_snapshot_digest: handle(),
+                eliotd_descriptor_path: handle(),
+                eliotd_descriptor_digest: handle(),
+                eliotd_launch_nonce: handle(),
+                store_config_path: handle(),
+                store_credential_target: handle(),
+                store_bridge_executable_path: handle(),
+                store_bridge_artifact_digest: handle(),
+                store_bootstrap_descriptor_path: handle(),
+                store_bootstrap_descriptor_digest: handle(),
+                canonical_store_executable_path: handle(),
+                canonical_store_artifact_digest: handle(),
+                kernel_arguments: Vec::new(),
+                store_bridge_arguments: Vec::new(),
+                canonical_store_arguments: Vec::new(),
+                host_executable_path: handle(),
+                host_artifact_digest: handle(),
+                watchdog_executable_path: handle(),
+                watchdog_artifact_digest: handle(),
+                doctor_artifact_digest: handle(),
+                testd_artifact_digest: handle(),
+                native_worker_artifact_digest: handle(),
+                wasm_host_artifact_digest: handle(),
+                doctor_executable_path: handle(),
+                testd_executable_path: handle(),
+                native_worker_executable_path: handle(),
+                wasm_host_executable_path: handle(),
+                descriptor_digest: handle(),
+            }
+        }
+
+        fn test_claim() -> WasmOwnerClaim {
+            WasmOwnerClaim {
+                claim_id: "claim-bundle-001".to_owned(),
+                operation_id: "operation-bundle-001".to_owned(),
+                generation: 7,
+                authority_epoch: serde_json::from_value(serde_json::json!({
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 3
+                }))
+                .expect("test epoch parses"),
+                launch_nonce: "launch-nonce-bundle-0001".to_owned(),
+                admitted_at_unix_ms: 4_000_000_000_000,
+                identity_digest: "a".repeat(64),
+                guest: test_guest(),
+                profile: "D2_OPERATIONAL".to_owned(),
+                manifest: test_manifest(),
+                work: test_work(),
+                assurance: test_assurance(),
+                promotion: test_promotion(),
+                snapshot: test_snapshot(),
+                artifact_bytes: b"bundle-artifact-bytes".to_vec(),
+                input_bytes: b"bundle-input-bytes".to_vec(),
+            }
+        }
+
+        // Byte binding fails before any registry or filesystem touch: the
+        // claim digests (fixture hex) do not match the staged bytes.
+        assert!(matches!(
+            publish_wasm_dispatch_bundle(&garbage_descriptor(), &test_claim()),
+            Err(WasmDispatchError::InvalidMaterial(_))
+        ));
+        // Empty bytes fail closed first of all.
+        let mut empty = test_claim();
+        empty.artifact_bytes.clear();
+        assert!(matches!(
+            publish_wasm_dispatch_bundle(&garbage_descriptor(), &empty),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));
     }

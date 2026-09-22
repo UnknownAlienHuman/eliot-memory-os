@@ -2140,6 +2140,7 @@ dependencies = [
  "eliot-epistemic",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-installation",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-mcp",

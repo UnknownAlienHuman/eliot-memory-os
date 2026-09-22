@@ -34,7 +34,7 @@
 
 use std::path::Path;
 
-use eliot_wasm_runtime::EngineBinding;
+use eliot_wasm_runtime::{EngineBinding, Sha256Digest};
 
 use crate::artifact_preflight::{PreflightError, read_bounded_artifact};
 use crate::child_engine::ISOLATED_CHILD_IMPLEMENTATION_ID;
@@ -45,7 +45,6 @@ use crate::grant_client::{
     GrantChannel, GrantClientError, build_grant_bundle, request_grant_via_transport,
 };
 use crate::installed_binary::{InstalledBinary, InstalledBinaryError, resolve_installed_binary};
-use crate::typed_bindings::{typed_wit_bytes, typed_wit_digest};
 use crate::wasmtime_provider::provider_configuration_digest;
 
 /// Allocation guard for the installation descriptor file: JSON text of a
@@ -148,7 +147,7 @@ pub fn grant_engine_binding(installed: &InstalledBinary) -> EngineBinding {
         exact_version: PINNED_WASMTIME_VERSION.to_owned(),
         engine_artifact_digest: installed.digest().clone(),
         engine_configuration_digest: provider_configuration_digest(),
-        wit_interface_digest: typed_wit_digest(),
+        wit_interface_digest: Sha256Digest::of_bytes(crate::wasmtime_provider::guest_wit_bytes()),
     }
 }
 
@@ -227,7 +226,11 @@ fn read_launch_inputs(
                 field,
             }
         })?;
-    Ok((descriptor, artifact_bytes, typed_wit_bytes()))
+    Ok((
+        descriptor,
+        artifact_bytes,
+        crate::wasmtime_provider::guest_wit_bytes().to_vec(),
+    ))
 }
 
 /// Builds the request bundle from real bytes and performs the authenticated
@@ -612,7 +615,10 @@ mod tests {
         assert_eq!(engine.implementation_id, ISOLATED_CHILD_IMPLEMENTATION_ID);
         assert_eq!(engine.exact_version, PINNED_WASMTIME_VERSION);
         assert_eq!(engine.engine_artifact_digest.as_str(), digest_hex.as_str());
-        assert_eq!(engine.wit_interface_digest, typed_wit_digest());
+        assert_eq!(
+            engine.wit_interface_digest,
+            Sha256Digest::of_bytes(crate::wasmtime_provider::guest_wit_bytes())
+        );
         let _ = std::fs::remove_file(&path);
     }
 

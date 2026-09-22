@@ -213,8 +213,9 @@ pub use wasm_dispatch::{
     WASM_DISPATCH_MATERIAL_WIRE_VERSION, WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
     WASM_HOST_GUEST_INPUT_FILE_NAME, WASM_HOST_MATERIAL_FILE_NAME, WasmAssuranceRecord,
     WasmDispatchDerivation, WasmDispatchError, WasmDispatchGrant, WasmDispatchMaterial,
-    WasmGuestCeilings, WasmManifestRecord, WasmPromotionRecord, WasmSnapshotRecord,
-    WasmWorkRecord, material_bytes, publish_wasm_dispatch_material, wasm_dispatch_derivation,
+    WasmGuestCeilings, WasmManifestRecord, WasmOwnerClaim, WasmPromotionRecord,
+    WasmPublishedBundle, WasmSnapshotRecord, WasmWorkRecord, material_bytes,
+    publish_wasm_dispatch_bundle, publish_wasm_dispatch_material, wasm_dispatch_derivation,
     wasm_dispatch_derivation_from_epoch_json, wasm_dispatch_grant_for,
 };
 
