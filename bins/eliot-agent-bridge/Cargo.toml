@@ -19,6 +19,7 @@ eliot-profile-spine-functional = []
 eliot-profile-full-composition = []
 
 [dependencies]
+eliot-agent-api.workspace = true
 eliot-agent-bridge-core.workspace = true
 eliot-contracts.workspace = true
 eliot-governor.workspace = true

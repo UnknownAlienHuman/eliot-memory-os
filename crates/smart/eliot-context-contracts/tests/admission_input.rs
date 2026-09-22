@@ -57,6 +57,7 @@ fn candidate(context: &ContextBinding) -> ContextCandidate {
             provider: ProviderId::new("provider").expect("provider"),
             role: SemanticRole::Goal,
         },
+        learning: None,
         source: SourceSnapshot {
             source_id: eliot_contracts::SourceId::new("source").expect("source"),
             owner: ProviderId::new("provider").expect("owner"),

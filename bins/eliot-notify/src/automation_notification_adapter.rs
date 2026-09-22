@@ -23,10 +23,10 @@ use eliot_kernel_service::{
     UserAutomationNotificationPort, UserAutomationRuntimeError,
 };
 use eliot_notify_core::{
-    DeliveryObservation, NotifyError, Recipient, UserAutomationFailureRequest,
+    DeliveryObservation, NotifyError, UserAutomationFailureRequest, audience_for_envelope,
+    failure_artifact_digest,
 };
 use eliot_platform::{NotificationRequest, PlatformHandle};
-use eliot_receipts::{ArtifactBinding, ReceiptKind};
 
 /// Production automation-failure notification adapter.
 ///
@@ -57,35 +57,11 @@ where
     }
 }
 
-/// Owner-designated primary recipient: the first bound envelope recipient.
-/// An empty recipient list fails closed; the adapter never invents one.
-fn audience_for(recipients: &[Recipient]) -> Result<PlatformHandle, UserAutomationRuntimeError> {
-    recipients
-        .first()
-        .map(|recipient| recipient.principal.clone())
-        .ok_or_else(|| {
-            UserAutomationRuntimeError::Rejected("automation envelope has no recipient".to_owned())
-        })
-}
-
-/// The single `Artifact`-role digest bound in the owner source receipt.
-/// Zero or several fail closed; the adapter never guesses which evidence
-/// the failure means.
-fn failure_artifact_digest(
-    artifacts: &[ArtifactBinding],
-) -> Result<String, UserAutomationRuntimeError> {
-    let mut digests = artifacts
-        .iter()
-        .filter(|artifact| artifact.role == ReceiptKind::Artifact)
-        .map(|artifact| artifact.sha256.clone());
-    match (digests.next(), digests.next()) {
-        (Some(only), None) => Ok(only),
-        _ => Err(UserAutomationRuntimeError::Rejected(
-            "automation source receipt must bind exactly one artifact".to_owned(),
-        )),
-    }
-}
-
+/// Owner-designated primary recipient and single bound artifact digest are
+/// shared derivations owned by `eliot-notify-core` (see
+/// [`audience_for_envelope`] and [`failure_artifact_digest`]); this adapter
+/// only maps their failures into the port error vocabulary.
+///
 /// Provider gaps stay unavailable; every other adapter failure rejects.
 fn map_notify_error(error: &NotifyError) -> UserAutomationRuntimeError {
     match error {
@@ -125,7 +101,8 @@ where
             .clone()
             .into_notification_envelope()
             .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
-        let body_digest = failure_artifact_digest(&source_receipt.core.artifacts)?;
+        let body_digest = failure_artifact_digest(&source_receipt.core.artifacts)
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
         let parent = NotificationRequest {
             context: request.context.clone(),
             notification: envelope.notification_id.clone(),
@@ -135,7 +112,8 @@ where
                         "automation canonical request hash invalid".to_owned(),
                     )
                 })?,
-            audience: audience_for(&envelope.recipients)?,
+            audience: audience_for_envelope(&envelope.recipients)
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?,
             body_digest: PlatformHandle::new(body_digest).map_err(|_| {
                 UserAutomationRuntimeError::Rejected("automation body digest invalid".to_owned())
             })?,
@@ -161,7 +139,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_notify_core::{ProviderId, RecipientRole};
+    use eliot_contracts::ArtifactId;
+    use eliot_notify_core::{ProviderId, Recipient, RecipientRole};
+    use eliot_receipts::{ArtifactBinding, ReceiptKind};
 
     fn recipient(principal: &str) -> Recipient {
         Recipient {
@@ -172,7 +152,7 @@ mod tests {
 
     fn artifact(sha256: &str, role: ReceiptKind) -> ArtifactBinding {
         ArtifactBinding {
-            artifact_id: eliot_contracts::ArtifactId::new("evidence-1").expect("artifact id"),
+            artifact_id: ArtifactId::new("evidence-1").expect("artifact id"),
             sha256: sha256.to_owned(),
             role,
             source_revision: None,
@@ -182,12 +162,9 @@ mod tests {
     #[test]
     fn audience_picks_primary_recipient_and_rejects_empty() {
         let audience =
-            audience_for(&[recipient("human-1"), recipient("human-2")]).expect("audience");
+            audience_for_envelope(&[recipient("human-1"), recipient("human-2")]).expect("audience");
         assert_eq!(audience.as_str(), "human-1");
-        assert!(matches!(
-            audience_for(&[]),
-            Err(UserAutomationRuntimeError::Rejected(_))
-        ));
+        assert!(audience_for_envelope(&[]).is_err());
     }
 
     #[test]

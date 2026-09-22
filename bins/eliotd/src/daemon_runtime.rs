@@ -22,7 +22,7 @@ use eliot_governor::KernelTransitionPort;
 use eliot_protocol::{
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
-    AgentActivationResultReconcile,
+    AgentActivationResultReconcile, HostRequestEnvelope,
 };
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
@@ -262,10 +262,15 @@ pub(super) fn run() -> Result<(), String> {
     match eliotd::notification_board_attach::attach_notification_snapshot(&kernel, &mut composition)
     {
         eliotd::notification_board_attach::NotificationBoardAttach::Ready(records) => {
+            let evidence = eliotd::notification_board_attach::board_inbox_evidence(&records);
             tracing::info!(
                 target: "eliotd::diagnostics",
                 event = "eliotd.notification_snapshot_attached",
                 record_count = records.len(),
+                inbox_unresolved = evidence.unresolved,
+                inbox_critical_unresolved = evidence.critical_unresolved,
+                inbox_failed_delivery = evidence.failed_delivery_unresolved,
+                inbox_acknowledged_unresolved = evidence.acknowledged_unresolved,
             );
         }
         eliotd::notification_board_attach::NotificationBoardAttach::Unavailable { reason } => {
@@ -656,6 +661,23 @@ async fn run_loop(
                 // gate: it must start even while an activation is in flight,
                 // so its gate is checked before the activation early-continue.
                 maybe_start_local_read_poll(&kernel, &composition, &mut local_read_flight);
+                // Reactive planning rides this existing activation cadence;
+                // it does not create a second scheduler. A registered source
+                // is read under a fresh authenticated activation and every
+                // malformed/stale owner projection fails the daemon loop
+                // closed. Until the real A4 source is registered, `None` is
+                // an explicit unconfigured state and no empty plan is made.
+                let now = unix_ms(SystemTime::now())?;
+                if let Some(outcome) = composition
+                    .drive_registered_reactive_feed(now)
+                    .map_err(|error| format!("daemon reactive feed tick: {error}"))?
+                {
+                    tracing::debug!(
+                        target: "eliotd::reactive_feed",
+                        ?outcome,
+                        event = "eliotd.reactive_feed_tick",
+                    );
+                }
                 if decide_activation_tick(&flight) == ActivationTickDecision::StartClaim {
                     flight = ActivationFlight::InFlight(ActivationFlightState {
                         future: start_activation_claim(&kernel),
@@ -899,6 +921,52 @@ fn settle_local_read_completion(
     }
 }
 
+/// Serves the board inbox for one claimed envelope when it carries the live
+/// owner session claim (#1780, per-request consumer/server dispatch).
+///
+/// Observation evidence only — this is NOT server completion: a served inbox
+/// publishes its counts (never payload bytes) with the observed request
+/// identity; a serve gap publishes an error record; a foreign or absent
+/// session claim skips without a record (not our principal — the privacy
+/// posture, never a gap). Transmission of served rows to a remote board
+/// client stays with the owning consumer route (kernel `controlboard.status`
+/// serving per tracker #1213, notify `ReadInbox` over its stdio route).
+/// The caller's pair handling is untouched either way: board observation
+/// degrades to diagnostics, never to a pair failure, redirect, or
+/// duplicate. Synchronous in-memory board read; no transport, no new
+/// scheduler — the existing local-read poller drives it.
+fn serve_board_for_claim(
+    composition: &DaemonComposition,
+    envelope: &HostRequestEnvelope,
+    attempt: &eliot_protocol::LocalReadAttempt,
+) {
+    match composition.serve_board_for_envelope(envelope, attempt) {
+        Ok(eliotd::controlboard_serve::BoardServeDispatch::Served(served)) => {
+            let evidence = eliotd::controlboard_serve::served_inbox_evidence(&served);
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.controlboard_inbox_observed",
+                board_request_id = envelope.identity.request_id.as_str(),
+                inbox_total = evidence.total,
+                inbox_unresolved = evidence.unresolved,
+                inbox_critical_unresolved = evidence.critical_unresolved,
+                inbox_failed_delivery = evidence.failed_delivery_unresolved,
+                inbox_acknowledged_unresolved = evidence.acknowledged_unresolved,
+                inbox_resolved = evidence.resolved,
+            );
+        }
+        Ok(eliotd::controlboard_serve::BoardServeDispatch::SkippedForeignSession) => {}
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "controlboard-inbox",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
+}
+
 /// Runs one local-read poll step: `local_read_claim` (pair plus fenced
 /// attempt capability, or null meaning backoff), then
 /// [`forward_admitted_local_read`] for the admitted pair under that attempt,
@@ -922,6 +990,14 @@ async fn run_local_read_poll(
     let Some((envelope, tool, attempt)) = pair else {
         return Ok(LocalReadPollOutcome::IdleBackoff);
     };
+    // #1780: per-request board consumer/server dispatch on the observed
+    // claim. When the envelope carries the live owner session claim, serve
+    // the board inbox from its observed fields (attempt fencing generation
+    // included) and publish the served counts as observation evidence;
+    // gaps degrade to diagnostics, foreign/absent claims skip.
+    // Observation only: pair handling below is byte-identical either way —
+    // board serving never fails, redirects, or duplicates the claimed step.
+    serve_board_for_claim(&composition, &envelope, &attempt);
     // #1882: Skill pairs serve locally through the composition Skill driver
     // instead of forwarding on the Kernel `local_read` leg (which serves
     // store reads only). Recognition is the shared Skill tool predicate over

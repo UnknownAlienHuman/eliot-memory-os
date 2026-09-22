@@ -35,7 +35,8 @@ pub use eliot_agent_bridge_core::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
-use eliot_mcp::{HostInvocationOutcome, KernelHostRequestPort, ResponseKind};
+use eliot_contracts::{ResourceGeneration, StateFence, sha256_hex};
+use eliot_mcp::{HostInvocationOutcome, KernelHostRequestPort, ResponseKind, ToolRequest};
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
     AgentBridgePeerChallenge, EventEnvelope,
@@ -48,6 +49,7 @@ mod kernel_host_request_client;
 pub mod memory_handle_join;
 pub mod reactive_injection_receipts;
 pub mod reactive_runtime_composition;
+pub mod result_flow;
 pub mod settled_plan_transport;
 mod understanding_bootstrap;
 pub(crate) use cli_contract::validate_client_declaration_path;
@@ -65,6 +67,7 @@ pub use reactive_injection_receipts::{
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
 };
+pub use result_flow::{LiveToolResult, project_measured_tool_result};
 pub use settled_plan_transport::{
     AdmittedPlanItem, FeedAdmissionOutcome, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS,
     PlanAdmissionError, PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem,
@@ -419,6 +422,28 @@ impl BridgeRunner {
             .map(|view| view.binding().session_id().as_str().to_owned())
             .ok_or(BridgeError::NotAttached)
     }
+    /// Live attach scope for invocation binding: the activation-sealed
+    /// session identity plus the canonical [`StateFence`] the Store
+    /// projections are keyed by (epoch clone + generation value, revisions
+    /// `None` exactly like the frame fence the pipe already carries).
+    /// Authority stays with the binding and the serving owners; this echo
+    /// mints none. Detached callers fail closed.
+    fn live_invocation_scope(&self) -> Result<(String, StateFence), BridgeError> {
+        let view = self.attach_view().ok_or(BridgeError::NotAttached)?;
+        let session = view.binding().session_id().as_str().to_owned();
+        let generation = ResourceGeneration::new(view.binding().state_fence().generation().get())
+            .map_err(|_| BridgeError::InvalidContract {
+                field: "attach.state_fence.generation",
+                reason: "generation must be non-zero",
+            })?;
+        Ok((
+            session,
+            StateFence::new(
+                view.binding().state_fence().authority_epoch().clone(),
+                generation,
+            ),
+        ))
+    }
     /// Admits one caller-supplied reactive-context injection as pending for
     /// the live session (I7.19 admit step).
     ///
@@ -652,6 +677,14 @@ impl BridgeRunner {
     /// WITHOUT affecting forwarding: the emitted response stays authoritative and this
     /// substrate is purely auxiliary delivery-record augmentation.
     ///
+    /// Canonical publishing at a caller-named URI is deliberately absent
+    /// here: only owner-served URI/bytes/revision/digest bindings may
+    /// publish canonically (the restore composition path, served through
+    /// the authenticated front door). A caller-requested URI next to opaque
+    /// response bytes is not a binding — relabeling it would mint
+    /// addressability the serving owner never attested, so this function
+    /// withholds.
+    ///
     /// Evidence content-addressing is NOT admission authority: the URI is a pure function
     /// of the exact delivered bytes, grants nothing, admits nothing, and resolves nothing.
     /// The bytes were already delivered inline to the host in the same response, so no new
@@ -674,6 +707,107 @@ impl BridgeRunner {
             return None;
         }
         self.core.publish_evidence(bytes).ok()
+    }
+    /// Publishes one owner-served snapshot at its exact canonical URI and
+    /// returns its bounded hot-response projection.
+    ///
+    /// `uri_text` is the exact resource identity the serving owner attested,
+    /// `content` the exact bytes served, and `content_sha256` the owner-side
+    /// digest over those bytes (lowercase SHA-256 hex). Canonical grammar is
+    /// enforced by [`ResourceUri::parse`]; the digest is re-verified here
+    /// before anything lands, so a mismatch withholds with
+    /// [`BridgeError::ProviderContract`] and publishes nothing — opaque
+    /// bytes are never relabelled at a caller-named URI. The 1MiB ceiling
+    /// and the immutable-conflict rule are enforced inside
+    /// [`Self::publish_canonical_resource`]. Requires the live attach, which
+    /// is the scope authorization on resolution.
+    ///
+    /// The caller (result-flow composition) owns the remaining invocation
+    /// binding: it passes only the URI named by the explicitly queried tool,
+    /// only bytes and a digest carried by the same digest-bound authenticated
+    /// outcome, and only when the served session/fence echo the live attach
+    /// binding. This function mints no addressability beyond what the owner
+    /// served.
+    pub fn publish_served_snapshot(
+        &mut self,
+        uri_text: &str,
+        content: Vec<u8>,
+        content_sha256: &str,
+    ) -> Result<HotResourceView, BridgeError> {
+        let uri = ResourceUri::parse(uri_text)?;
+        if sha256_hex(&content) != content_sha256 {
+            return Err(BridgeError::ProviderContract(
+                "served snapshot digest does not bind the exact bytes".to_owned(),
+            ));
+        }
+        self.publish_canonical_resource(&uri, content)
+    }
+    /// Records one owner-attested exact-resource delivery into the
+    /// attach-scoped evidence projection, at the normal Invoke callsite
+    /// after the gateway returns with the exact authenticated outcome.
+    ///
+    /// Only an `eliot.query` tool naming an `exact_resource_uri` whose
+    /// outcome carries the serving owner's attestation in
+    /// `response.resource` publishes: the handle URI must equal the queried
+    /// URI exactly (never relabelled), the canonical content bytes must
+    /// digest to the handle's artifact digest with exact byte size, and the
+    /// handle's session/fence scope must echo the live attach binding.
+    /// Anything else — non-query tools, absent URIs, unattested responses,
+    /// gaps, rejections, session/fence divergence — yields `None` and
+    /// publishes nothing, so opaque bytes are never relabelled at a
+    /// caller-named URI. A `None` leaves the gateway-shaped response
+    /// exactly as produced; the dispatch falls through to the existing
+    /// overflow-evidence path untouched.
+    pub fn record_exact_resource_delivery(
+        &mut self,
+        tool: &ToolRequest,
+        outcome: &HostInvocationOutcome,
+    ) -> Option<HotResourceView> {
+        let ToolRequest::Query(input) = tool else {
+            return None;
+        };
+        let uri_text = input.exact_resource_uri.as_deref()?;
+        let HostInvocationOutcome::Responded { response, .. } = outcome else {
+            return None;
+        };
+        match response.kind {
+            ResponseKind::Candidate | ResponseKind::Projection => {}
+            ResponseKind::PlanGap | ResponseKind::Unsupported => return None,
+        }
+        let handle = response.resource.as_ref()?;
+        if handle.uri != uri_text {
+            return None;
+        }
+        let bytes = serde_json::to_vec(&response.content).ok()?;
+        if handle.artifact.sha256 != sha256_hex(&bytes)
+            || handle.size_bytes != bytes.len() as u64
+        {
+            return None;
+        }
+        let (live_session, live_fence) = self.live_invocation_scope().ok()?;
+        if handle.session.session_id.as_str() != live_session
+            || handle.session.state_fence != live_fence
+        {
+            return None;
+        }
+        self.publish_served_snapshot(uri_text, bytes, &handle.artifact.sha256)
+            .ok()
+    }
+    /// Projects one route-owner measured attestation into its byte-bound
+    /// delivery receipt (issue #1941 result flow): the holder joins the
+    /// attested count/digest with the physical observation, current
+    /// admission plus execution binding, admissible source handle, and
+    /// owner-observed delivery; see [`project_measured_tool_result`].
+    /// The bridge runs no tokenizer — the attested count passes through
+    /// intake verification unaltered. Typed withhold and contract errors
+    /// propagate for the attaching caller; this runner entry only supplies
+    /// the live core.
+    pub fn project_measured_tool_result(
+        &self,
+        result_bytes: &[u8],
+        flow: &LiveToolResult<'_>,
+    ) -> Result<ToolResultReceipt, BridgeError> {
+        project_measured_tool_result(&self.core, result_bytes, flow)
     }
     /// Notes the owner-supplied bootstrap context for this session.
     ///

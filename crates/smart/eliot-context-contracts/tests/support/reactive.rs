@@ -82,6 +82,7 @@ fn candidate() -> ContextCandidate {
         binding: context_binding(),
         atom_id: id("atom"),
         provider_role: provider_role(),
+        learning: None,
         source: SourceSnapshot {
             source_id: eliot_contracts::SourceId::new("fixture-source").expect("fixture source"),
             owner: ProviderId::new("fixture-provider").expect("fixture owner"),

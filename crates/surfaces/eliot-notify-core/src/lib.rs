@@ -15,7 +15,8 @@ pub use user_automation::{
     UserAutomationFailureNotification, UserAutomationFailureRequest, UserAutomationInvocation,
     UserAutomationNotificationProjection, UserAutomationPreflightDecision,
     UserAutomationPreflightError, UserAutomationPreflightProjection,
-    UserAutomationPreflightReceipt, UserAutomationTrigger, preflight_user_automation,
+    UserAutomationPreflightReceipt, UserAutomationTrigger, audience_for_envelope,
+    failure_artifact_digest, preflight_user_automation,
 };
 
 use std::fmt::Write as _;

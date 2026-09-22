@@ -154,6 +154,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -188,6 +203,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "bstr"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
+dependencies = [
+ "memchr",
+ "regex-automata",
+ "serde_core",
 ]
 
 [[package]]
@@ -637,6 +663,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-doctor",
  "eliot-governor",
+ "eliot-host",
  "eliot-host-state",
  "eliot-installation",
  "eliot-kernel-core",
@@ -694,6 +721,7 @@ dependencies = [
 name = "eliot-agent-bridge"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-api",
  "eliot-agent-bridge-core",
  "eliot-agent-contracts",
  "eliot-context-contracts",
@@ -753,14 +781,19 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-agent-api",
+ "eliot-agent-bridge-core",
  "eliot-agent-coordinator",
  "eliot-contracts",
+ "eliot-platform",
  "eliot-process",
+ "eliot-process-executor",
  "eliot-receipts",
  "eliot-source-assurance",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
+ "tiktoken-rs",
  "tokio",
 ]
 
@@ -1060,6 +1093,7 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-governor",
  "eliot-receipts",
 ]
 
@@ -1068,9 +1102,11 @@ name = "eliot-context-assembly"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-contracts",
+ "eliot-context-admission",
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-governor",
  "eliot-observation-contracts",
  "eliot-receipts",
  "serde",
@@ -1683,10 +1719,14 @@ name = "eliot-engine"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-nextest",
  "eliot-instrument-runner",
+ "eliot-instrument-rustc",
+ "eliot-observability",
+ "eliot-process",
  "eliot-store",
  "eliot-types",
  "eliot-verifier",
@@ -1791,16 +1831,20 @@ dependencies = [
 name = "eliot-governor"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "eliot-authority",
  "eliot-budget",
  "eliot-canonical",
  "eliot-change-monitor",
  "eliot-config",
  "eliot-context-candidates",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-coordination",
+ "eliot-cue-binding",
  "eliot-cue-contracts",
  "eliot-cue-index",
+ "eliot-cue-normalizer",
  "eliot-doctor-core",
  "eliot-epistemic",
  "eliot-epistemic-contracts",
@@ -1814,6 +1858,7 @@ dependencies = [
  "eliot-observation-contracts",
  "eliot-problem",
  "eliot-protocol",
+ "eliot-reactive-context-plan",
  "eliot-read",
  "eliot-receipts",
  "eliot-runtime-contracts",
@@ -1854,6 +1899,7 @@ dependencies = [
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",
+ "eliot-notify",
  "eliot-observation-contracts",
  "eliot-ors",
  "eliot-platform",
@@ -1933,6 +1979,12 @@ name = "eliot-improvement"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-agent-contracts",
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-governor",
+ "eliot-receipts",
  "serde",
  "thiserror",
  "time",
@@ -2017,6 +2069,7 @@ dependencies = [
 name = "eliot-instrument-runner"
 version = "0.1.0"
 dependencies = [
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-cargo",
@@ -2095,6 +2148,7 @@ dependencies = [
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",
+ "eliot-notify-core",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
@@ -2149,6 +2203,7 @@ dependencies = [
  "eliot-epistemic",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-installation",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-mcp",
@@ -2262,9 +2317,11 @@ dependencies = [
 name = "eliot-lsp-bridge"
 version = "0.1.0"
 dependencies = [
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-scip",
+ "eliot-observability",
  "eliot-platform",
  "eliot-process",
  "serde",
@@ -3065,6 +3122,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-cli",
  "eliot-instrument-api",
+ "eliot-notify",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
@@ -3117,16 +3175,23 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-governor",
+ "eliot-installation",
+ "eliot-ipc",
  "eliot-observation-contracts",
  "eliot-platform",
+ "eliot-platform-windows",
  "eliot-process",
  "eliot-process-executor",
+ "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
  "eliot-wasm-runtime",
+ "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
  "wasmtime",
  "wat",
 ]
@@ -3205,6 +3270,7 @@ dependencies = [
  "eliot-agent-coordinator",
  "eliot-authority",
  "eliot-config",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-controlboard",
  "eliot-doctor-core",
@@ -3224,6 +3290,7 @@ dependencies = [
  "eliot-platform-windows",
  "eliot-process",
  "eliot-protocol",
+ "eliot-reactive-context-plan",
  "eliot-read",
  "eliot-receipts",
  "eliot-runtime-contracts",
@@ -3280,6 +3347,17 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -3910,6 +3988,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4281,6 +4371,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "027853bbf8c7763b77c5c595f1c271c7d536ced7d6f83452911b944621e57fc2"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bstr",
+ "fancy-regex",
+ "lazy_static",
+ "regex",
+ "rustc-hash",
 ]
 
 [[package]]

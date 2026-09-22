@@ -33,9 +33,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod kernel_authority_port;
+mod notify_fallback_ensure;
 mod operation_identity;
 mod protected_launch_config;
 use kernel_authority_port::KernelAuthorityPort;
+pub use notify_fallback_ensure::{
+    LiveNotifyFallbackEffects, NotifyFallbackEffects, NotifyFallbackEnsure,
+    NotifyFallbackRegistration, ensure_notify_fallback_registered,
+};
 use operation_identity::{IssuerHandle, OperationIdentityIssuer};
 use protected_launch_config::{
     BrokerLaunchBinding, REGISTRATION_LEASE_TTL_MS, binding_digest, fresh_registration_request,

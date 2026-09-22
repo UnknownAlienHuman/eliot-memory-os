@@ -19,7 +19,7 @@ use eliot_kernel_core::{
     UserAutomationPreflightProjection as KernelPreflightProjection,
 };
 use eliot_platform::{NotificationRequest, PlatformHandle};
-use eliot_receipts::ReceiptEnvelope;
+use eliot_receipts::{ArtifactBinding, ReceiptEnvelope, ReceiptKind};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -295,6 +295,34 @@ fn map_recipient_role(role: AutomationRecipientRole) -> RecipientRole {
         AutomationRecipientRole::Approver => RecipientRole::Approver,
         AutomationRecipientRole::RecoveryPrincipal => RecipientRole::RecoveryPrincipal,
         AutomationRecipientRole::AuthorizedRole => RecipientRole::AuthorizedRole,
+    }
+}
+
+/// Owner-designated primary recipient for an automation failure envelope.
+///
+/// Shared derivation used by every automation notification caller: the first
+/// bound envelope recipient. An empty recipient list fails closed; no caller
+/// may invent an audience.
+pub fn audience_for_envelope(recipients: &[Recipient]) -> Result<PlatformHandle, NotifyError> {
+    recipients
+        .first()
+        .map(|recipient| recipient.principal.clone())
+        .ok_or(NotifyError::InvalidEnvelope("recipients"))
+}
+
+/// Single `Artifact`-role digest bound in an owner source receipt.
+///
+/// Shared derivation used by every automation notification caller: the body
+/// digest must name exact bound evidence. Zero or several artifact bindings
+/// fail closed; no caller may guess which evidence a failure means.
+pub fn failure_artifact_digest(artifacts: &[ArtifactBinding]) -> Result<String, NotifyError> {
+    let mut digests = artifacts
+        .iter()
+        .filter(|artifact| artifact.role == ReceiptKind::Artifact)
+        .map(|artifact| artifact.sha256.clone());
+    match (digests.next(), digests.next()) {
+        (Some(only), None) => Ok(only),
+        _ => Err(NotifyError::InvalidEnvelope("source_receipt.artifact")),
     }
 }
 

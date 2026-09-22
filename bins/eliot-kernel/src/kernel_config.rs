@@ -64,6 +64,10 @@ pub struct KernelConfig {
     /// Host-approved immutable agent-bridge admission input.  The descriptor
     /// is inert until the Kernel compares it with a live authenticated peer.
     pub agent_bridge_admission: Option<AgentBridgeAdmissionDescriptor>,
+    /// Explicit executable path returned by the installer-owned Notify
+    /// binding. Kernel never resolves this path or reads ambient process
+    /// state; the B2 binding must supply the already validated path.
+    pub notify_executable_path: Option<PathBuf>,
     /// Host-approved protected supervision signing authority.  The absence of
     /// this binding keeps the lease surface unavailable; no in-memory or test
     /// signer is fabricated by the production composition.
@@ -97,6 +101,7 @@ impl KernelConfig {
             native_worker_artifact_sha256: None,
             eliotd_receipt_binding: None,
             agent_bridge_admission: None,
+            notify_executable_path: None,
             #[cfg(windows)]
             supervision_lease_authority: None,
             #[cfg(windows)]
@@ -210,6 +215,15 @@ impl KernelConfig {
         admission: AgentBridgeAdmissionDescriptor,
     ) -> Self {
         self.agent_bridge_admission = Some(admission);
+        self
+    }
+
+    /// Injects the explicit path returned by the installer-owned Notify
+    /// binding. No default, environment lookup, or path resolution occurs
+    /// here; composition validates the path at the single client constructor.
+    #[must_use]
+    pub fn with_notify_executable_path(mut self, path: PathBuf) -> Self {
+        self.notify_executable_path = Some(path);
         self
     }
 

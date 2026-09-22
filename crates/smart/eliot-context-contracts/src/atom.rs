@@ -451,6 +451,57 @@ impl CapacityLimits {
     }
 }
 
+/// Intrinsic learning provenance bound to one Governor-issued admission.
+///
+/// Attached by the legitimate learning pipeline when it emits a
+/// learning-derived atom. The mark cites the exact owner issuance
+/// (`permit_digest`); retrieval and delivery screens compare it against the
+/// owner-verified permit, so a mark transplanted from another issuance
+/// fails. Bare strings here authenticate nothing on their own.
+///
+/// Per I5.26, adapter normalization, compaction, or restatement does not
+/// clear lineage: transports must preserve this field verbatim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LearningProvenance {
+    /// Origin campaign the influence was admitted from.
+    pub campaign_id: String,
+    /// Local overlay subject bound by the issuance.
+    pub overlay_id: Option<String>,
+    /// Reusable candidate subject bound by the issuance.
+    pub candidate_id: Option<String>,
+    /// Closure disposition that closed the reusable candidate.
+    pub closure_ref: Option<String>,
+    /// Owning decision authority.
+    pub owner: Option<String>,
+    /// Draft deltas are ineligible for retrieval and delivery.
+    pub draft: bool,
+    /// Wall-clock expiry of the local admission as unix seconds.
+    pub expires_at_unix_secs: Option<u64>,
+    /// Digest of the exact Governor-issued permit this mark cites.
+    pub permit_digest: String,
+}
+
+impl LearningProvenance {
+    /// Shape validation only; issuance binding happens in the screens.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        validate_text(&self.campaign_id, "learning.campaign_id")?;
+        if self
+            .overlay_id
+            .as_ref()
+            .is_none_or(|id| id.trim().is_empty())
+            && self
+                .candidate_id
+                .as_ref()
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(ContextError::MissingField("learning.subject"));
+        }
+        validate_digest(&self.permit_digest, "learning.permit_digest")?;
+        Ok(())
+    }
+}
+
 /// Candidate whole atom emitted by a provider projection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -463,6 +514,14 @@ pub struct ContextCandidate {
     pub provider_role: ProviderRole,
     /// Immutable source snapshot.
     pub source: SourceSnapshot,
+    /// Intrinsic learning provenance. `None` means ordinary evidence with no
+    /// learning treatment; `Some` marks learning-derived material that the
+    /// retrieval and delivery screens must verify against an owner-verified
+    /// Governor permit before it may influence an attempt. Covered by the
+    /// candidate canonical digest: removal or alteration changes the atom
+    /// identity and breaks bound measurements.
+    #[serde(default)]
+    pub learning: Option<LearningProvenance>,
     /// Whole or explicitly lossy representation.
     pub representation: AtomRepresentation,
     /// Explicit policy governing permissible loss.
@@ -512,6 +571,9 @@ impl ContextCandidate {
         self.binding.validate()?;
         self.provider_role.validate()?;
         self.source.validate()?;
+        if let Some(provenance) = &self.learning {
+            provenance.validate()?;
+        }
         self.representation.validate()?;
         self.measurement.validate()?;
         if self.dependencies.len() > 256 {

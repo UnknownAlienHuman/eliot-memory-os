@@ -50,10 +50,15 @@ pub use cue_composition::{
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 mod controlboard_projection;
+mod learning_admission;
 mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_projection_refresh;
 mod reactive_admission;
+mod reactive_owner_producers;
+mod reactive_owner_projection;
+mod reactive_owner_suppliers;
+mod reactive_projections;
 mod skill_lifecycle;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
@@ -85,6 +90,11 @@ pub use eliot_canonical::CanonicalWriteEnvelope;
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
 pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
+pub use learning_admission::{
+    LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
+    LearningAdmissionError, LearningAdmissionPermit, VerifiedLearningAdmission,
+    issue_learning_admission, verify_learning_admission,
+};
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
     WatchdogEntryKind,
@@ -92,6 +102,16 @@ pub use observation_reconciliation::{
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use reactive_admission::{
     ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier, assess_reactive_risk,
+};
+pub use reactive_owner_projection::{
+    MAX_REACTIVE_OWNER_RECORDS, ReactiveCueBindingOwner, ReactiveObservationCueProjection,
+    ReactiveOwnerProjection, ReactiveOwnerProjectionError, ReactiveOwnerSource,
+    ReactiveTargetAtomBinding, ReactiveTargetAtomOwner, RetainedReactiveOwnerSources,
+    project_reactive_owner, project_reactive_owner_from_sources,
+};
+pub use reactive_owner_suppliers::GovernorReactiveOwnerSuppliers;
+pub use reactive_projections::{
+    GovernorReactiveProjectionOwner, GovernorReactiveProjectionSet, ReactiveProjectionError,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;

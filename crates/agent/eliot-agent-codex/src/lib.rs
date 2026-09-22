@@ -38,6 +38,8 @@ use thiserror::Error;
 
 pub mod catalogue;
 pub mod preflight;
+pub mod route_tokenizer;
+pub mod turn_driver;
 
 pub const CODEX_ADAPTER_ID: &str = "eliot-agent-codex";
 pub const CODEX_HOST_FAMILY: &str = "codex";
@@ -102,6 +104,12 @@ pub enum CodexAdapterError {
     ModelNotInCatalogue,
     #[error("Codex host-event normalization input is invalid: {0}")]
     InvalidInput(&'static str),
+    #[error("Codex model has no owner-published tokenizer mapping: {model_id}")]
+    UnknownTokenizerModel { model_id: String },
+    #[error("Codex result bytes are not countable text for the route tokenizer")]
+    UncountableBytes,
+    #[error("Codex tokenizer unavailable: {0}")]
+    TokenizerUnavailable(&'static str),
 }
 
 /// Exact route constructor.  The resulting value is still the A-01 route
@@ -514,7 +522,7 @@ where
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WireMessageKind {
+pub(crate) enum WireMessageKind {
     Request,
     Notification,
     Response,
@@ -547,7 +555,9 @@ fn valid_method(method: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.'))
 }
 
-fn validate_wire_message(message: &CodexWireMessage) -> Result<WireMessageKind, CodexAdapterError> {
+pub(crate) fn validate_wire_message(
+    message: &CodexWireMessage,
+) -> Result<WireMessageKind, CodexAdapterError> {
     if let Some(id) = &message.id
         && !valid_wire_id(id)
     {
@@ -789,16 +799,21 @@ struct ClassifiedCodexPayload {
 /// Count characters of the first present string field, in Unicode scalar
 /// values. Absent fields yield `0` (absent evidence, never a guessed length).
 fn delta_chars_from(params: &Value, keys: &[&str]) -> u64 {
-    params
-        .as_object()
-        .and_then(|object| {
-            keys.iter()
-                .filter_map(|key| object.get(*key))
-                .filter_map(Value::as_str)
-                .next()
-        })
+    delta_text_from(params, keys)
         .map(|text| text.chars().count() as u64)
         .unwrap_or(0)
+}
+
+/// Borrow the first present string field for turn-text assembly. Same key
+/// order and first-present rule as [`delta_chars_from`]: a single owner of
+/// the wire delta key set. Absent fields yield `None`, never guessed text.
+pub(crate) fn delta_text_from<'a>(params: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    params.as_object().and_then(|object| {
+        keys.iter()
+            .filter_map(|key| object.get(*key))
+            .filter_map(Value::as_str)
+            .next()
+    })
 }
 
 /// Extract an opaque tool name from the wire without publishing arguments.
@@ -834,7 +849,7 @@ fn digest_value(value: &Value) -> Result<LowercaseSha256, CodexAdapterError> {
 /// Only exact `"completed"`/`"failed"` become observed terminal success/failure;
 /// every other status (interrupted, unknown, in-progress, numeric, missing)
 /// stays quarantine and never upgrades to success.
-fn terminal_status_from(params: &Value) -> Option<ProviderTerminalStatus> {
+pub(crate) fn terminal_status_from(params: &Value) -> Option<ProviderTerminalStatus> {
     match params
         .get("turn")
         .and_then(Value::as_object)
@@ -1096,7 +1111,9 @@ fn classify_codex_payload(
 /// Validate that a recorded binding belongs to this adapter family before use:
 /// shape, exact Codex route, and the Codex turn namespace. A foreign-family
 /// binding quarantines as a binding mismatch, never as attributed output.
-fn validate_binding_for_codex(binding: &ProviderExecutionBinding) -> Result<(), CodexAdapterError> {
+pub(crate) fn validate_binding_for_codex(
+    binding: &ProviderExecutionBinding,
+) -> Result<(), CodexAdapterError> {
     binding.validate_internal()?;
     validate_codex_route(&binding.route)?;
     if binding.execution_unit.namespace != CODEX_EXECUTION_UNIT_NAMESPACE {
@@ -1118,7 +1135,7 @@ fn validate_binding_for_codex(binding: &ProviderExecutionBinding) -> Result<(), 
 /// non-string, or blank turn identity is missing evidence, never a guessed
 /// turn. Two present string identities that disagree are conflicting evidence
 /// and yield no turn: the caller fails closed instead of choosing one.
-fn wire_turn_id(params: &Value) -> Option<&str> {
+pub(crate) fn wire_turn_id(params: &Value) -> Option<&str> {
     let nested = params
         .get("turn")
         .and_then(Value::as_object)
@@ -1543,7 +1560,7 @@ fn is_terminal_observation(payload: &NormalizedHostEventPayload) -> bool {
 /// and must be terminal (observed completed/failed, never a quarantined,
 /// usage, or session observation). Provider-effect/attempt linkage beyond this
 /// stays with S5 (`AgentResult::validate_for_binding`).
-fn validate_terminal_observation(
+pub(crate) fn validate_terminal_observation(
     terminal: &NormalizedHostEventEnvelope,
     binding: &ProviderExecutionBinding,
     admission: &AdmittedRouteReceipt,
@@ -3210,6 +3227,806 @@ mod tests {
         Ok(())
     }
 
+    fn bound_binding_with_model(model: &str) -> TestResult<ProviderExecutionBinding> {
+        let mut binding = bound_binding()?;
+        binding.route.model = model.to_owned();
+        Ok(binding)
+    }
+
+    fn attached_with_model(model: &str) -> TestResult<CodexAttachReceipt> {
+        let mut attached = attached()?;
+        // Session validation is model-independent (thread/workdir/hashes
+        // only), so narrowing the model post-attach keeps every agreement.
+        attached.route.model = model.to_owned();
+        Ok(attached)
+    }
+
+    /// Test SHA-256 hex for pinning the real child executable identity.
+    fn test_sha256_file(path: &std::path::Path) -> TestResult<String> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let count = file.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&chunk[..count]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Rebuilds the attach receipt over one explicit process request,
+    /// mirroring `attached()` field for field (launch, authority, route
+    /// with the measured model, session, Q-01 assurance) but binding the
+    /// given owner-issued request instead of the helper's own fixture.
+    /// The session working directory follows the request so attach-time
+    /// agreement holds on the real cwd.
+    fn attach_for_chain(
+        process_request: ProcessRequest,
+        working_directory: &str,
+    ) -> TestResult<CodexAttachReceipt> {
+        let (source_assurance, source_expectation) = source()?;
+        let mut route = route();
+        route.model = "gpt-5-codex".to_owned();
+        Ok(attach(CodexAttachInput {
+            launch: launch()?,
+            authority: AuthorityEnvelope {
+                epoch: test_epoch(TEST_LINEAGE_A, 1),
+                scope_ref: "scope-1".into(),
+                effect_ceiling: ceiling(),
+                lease: serde_json::from_value::<WorkLeaseId>(
+                    serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+                )?,
+                state_fence: StateFence::new(
+                    test_epoch(TEST_LINEAGE_A, 1),
+                    ResourceGeneration::new(1)?,
+                ),
+                valid_until: "never".into(),
+            },
+            route,
+            session: CodexSessionBinding {
+                session_id: SessionId::new("session-1")?,
+                thread_id: "thread-1".into(),
+                runtime_hash: fixture_digest("runtime"),
+                working_directory: working_directory.to_owned(),
+            },
+            process_request,
+            source_assurance,
+            source_expectation,
+        })?)
+    }
+
+    enum FakeRead {
+        Data(Vec<u8>),
+        Eof,
+        Empty,
+    }
+
+    /// Scripted duplex child channel: records stdin writes and replays
+    /// scripted stdout reads, proving write→read causality without a
+    /// process. `Empty` repeats forever (hung server); `Eof` repeats
+    /// terminal EOF; `Data` pops once.
+    struct FakeChannel {
+        writes: std::sync::Mutex<Vec<Vec<u8>>>,
+        reads: std::sync::Mutex<std::collections::VecDeque<FakeRead>>,
+    }
+
+    impl FakeChannel {
+        fn scripted(reads: Vec<FakeRead>) -> Self {
+            Self {
+                writes: std::sync::Mutex::new(Vec::new()),
+                reads: std::sync::Mutex::new(reads.into_iter().collect()),
+            }
+        }
+
+        fn written(&self) -> Vec<Vec<u8>> {
+            self.writes.lock().expect("writes lock").clone()
+        }
+    }
+
+    impl eliot_process::InteractiveChildChannel for FakeChannel {
+        fn write_child_stdin(
+            &self,
+            _operation_id: eliot_process::OperationId,
+            bytes: Vec<u8>,
+        ) -> eliot_process::InteractiveChildFuture<'_, usize> {
+            let len = bytes.len();
+            self.writes.lock().expect("writes lock").push(bytes);
+            Box::pin(async move { Ok(len) })
+        }
+
+        fn read_child_stdout(
+            &self,
+            _operation_id: &eliot_process::OperationId,
+            _max_bytes: usize,
+            _deadline: std::time::Duration,
+        ) -> eliot_process::InteractiveChildFuture<'_, eliot_process::ChildStdoutChunk> {
+            let mut reads = self.reads.lock().expect("reads lock");
+            match reads.front() {
+                // Explicit hang: repeats forever; the driver deadline
+                // bounds the wait.
+                Some(FakeRead::Empty) => Box::pin(async move {
+                    Ok(eliot_process::ChildStdoutChunk {
+                        bytes: Vec::new(),
+                        end_of_stream: false,
+                    })
+                }),
+                // Script exhausted: the scripted server said all it will
+                // say; the stream is over.
+                Some(FakeRead::Eof) | None => Box::pin(async move {
+                    Ok(eliot_process::ChildStdoutChunk {
+                        bytes: Vec::new(),
+                        end_of_stream: true,
+                    })
+                }),
+                Some(FakeRead::Data(_)) => match reads.pop_front() {
+                    Some(FakeRead::Data(bytes)) => Box::pin(async move {
+                        Ok(eliot_process::ChildStdoutChunk {
+                            bytes,
+                            end_of_stream: false,
+                        })
+                    }),
+                    _ => Box::pin(async move {
+                        Ok(eliot_process::ChildStdoutChunk {
+                            bytes: Vec::new(),
+                            end_of_stream: false,
+                        })
+                    }),
+                },
+            }
+        }
+    }
+
+    fn turn_frames() -> Vec<FakeRead> {
+        // Newline-terminated JSONL frames, as a live server emits them.
+        vec![
+            FakeRead::Data(br#"{"id":"turn-1-start","result":{"ok":true}}
+"#.to_vec()),
+            FakeRead::Data(
+                br#"{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Data(
+                br#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"hello world"}}
+"#.to_vec(),
+            ),
+            FakeRead::Data(
+                br#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}
+"#.to_vec(),
+            ),
+            FakeRead::Eof,
+        ]
+    }
+
+    fn turn_owner_event() -> super::turn_driver::TurnOwnerEvent {
+        use super::turn_driver::TurnOwnerEvent;
+        TurnOwnerEvent {
+            event_id: EventId::new("turn-1:1").expect("fixture event"),
+            cursor: EventCursor::new("turn-1:1").expect("fixture cursor"),
+            sequence: 1,
+            previous_sequence: None,
+            observed_at: clock_at(Some(1_786_000_000_100)),
+            predecessors: Vec::new(),
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:turn-1:1")
+                .expect("fixture handle"),
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+        }
+    }
+
+    fn drive_inputs<'a>(
+        executor: Arc<FakeExecutor>,
+        channel: Arc<FakeChannel>,
+        attached: &'a mut CodexAttachReceipt,
+        binding: &'a ProviderExecutionBinding,
+        admission: &'a AdmittedRouteReceipt,
+        sink: Arc<Sink>,
+        timeout: std::time::Duration,
+    ) -> super::turn_driver::CodexTurnDriverInputs<'a, FakeExecutor> {
+        use super::turn_driver::CodexTurnDriverInputs;
+        CodexTurnDriverInputs {
+            executor,
+            channel,
+            attached,
+            binding,
+            admission,
+            evidence_sink: Some(sink),
+            turn_input: serde_json::json!({"prompt": "hello"}),
+            turn_timeout: timeout,
+            owner_event: turn_owner_event(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            continuation: None,
+            proposed_effects: Vec::new(),
+            cancelled: false,
+        }
+    }
+
+    fn live_channel() -> FakeChannel {
+        FakeChannel::scripted(turn_frames())
+    }
+
+    fn default_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(5)
+    }
+
+    fn terminal_for(
+        binding: &ProviderExecutionBinding,
+        observed_at: ClockReading,
+    ) -> TestResult<NormalizedHostEventEnvelope> {
+        let admission = admission_for(binding)?;
+        let message = CodexWireMessage::notification(
+            "turn/completed",
+            Some(completed_params("thread-1", "turn-1", "completed")),
+        );
+        let raw_source_bytes = serde_json::to_vec(&message)?;
+        Ok(normalize_bound_with_bytes(
+            message,
+            raw_source_bytes,
+            binding,
+            &admission,
+            1,
+            None,
+            observed_at,
+        )?
+        .0)
+    }
+
+    #[test]
+    fn measured_tool_result_emits_matched_bound_carrier() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let terminal = terminal_for(&binding, clock_at(Some(1_786_000_000_000)))?;
+        let carrier =
+            observe_measured_tool_result(b"hello world", &terminal, &binding, &admission)?;
+        // Observed route is the wire-attributed binding's route, in full
+        // triangle agreement with requested and admitted-selected.
+        assert_eq!(
+            carrier.observation.route_state,
+            RouteObservationState::Matched
+        );
+        assert_eq!(
+            carrier.observation.observed_route,
+            Some(binding.route.clone())
+        );
+        assert_eq!(carrier.observation.requested_route, binding.route);
+        assert_eq!(
+            carrier.observation.admitted_route_digest,
+            admission.self_digest
+        );
+        // Real tokenizer count and digest for the exact bytes.
+        assert_eq!(carrier.tokens, 2);
+        assert_eq!(
+            carrier.result_digest,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_eq!(carrier.result_bytes, b"hello world");
+        // Turn-level usage never enters; unknown stays unknown, never zero.
+        assert_eq!(carrier.observation.usage.input_tokens, None);
+        assert_eq!(carrier.observation.usage.output_tokens, None);
+        assert_eq!(carrier.observation.usage.quota, QuotaKnowledge::Unknown);
+        // Terminal time is the wire fact's own observation time.
+        assert_eq!(
+            carrier.observation.terminal.valid_time_ms,
+            Some(1_786_000_000_000)
+        );
+        carrier
+            .observation
+            .validate_against(&binding, &admission)
+            .expect("emitted observation links");
+        Ok(())
+    }
+
+    #[test]
+    fn community_only_model_withholds_at_producer() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        let binding = bound_binding_with_model("codex-mini-latest")?;
+        let admission = admission_for(&binding)?;
+        let terminal = terminal_for(&binding, clock_at(Some(1_786_000_000_000)))?;
+        match observe_measured_tool_result(b"hello world", &terminal, &binding, &admission) {
+            Err(CodexAdapterError::UnknownTokenizerModel { model_id }) => {
+                assert_eq!(model_id, "codex-mini-latest");
+                Ok(())
+            }
+            other => panic!("community-only model must withhold: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_utf8_tool_bytes_withhold_at_producer() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let terminal = terminal_for(&binding, clock_at(Some(1_786_000_000_000)))?;
+        assert!(matches!(
+            observe_measured_tool_result(b"\xff\xfe\x00binary", &terminal, &binding, &admission),
+            Err(CodexAdapterError::UncountableBytes)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_terminal_time_withholds_at_producer() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let terminal = terminal_for(&binding, clock_at(None))?;
+        assert!(matches!(
+            observe_measured_tool_result(b"hello world", &terminal, &binding, &admission),
+            Err(CodexAdapterError::InvalidInput(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_terminal_never_binds_measured_result() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let mut foreign_binding = binding.clone();
+        foreign_binding.execution_unit = ExecutionUnit::new("codex", "turn-2")?;
+        let foreign_terminal = translate_bound(
+            "turn/completed",
+            completed_params("thread-1", "turn-2", "completed"),
+            &foreign_binding,
+            1,
+            None,
+        )?;
+        assert!(is_binding_mismatch(&observe_measured_tool_result(
+            b"hello world",
+            &foreign_terminal,
+            &binding,
+            &admission,
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn cross_admission_never_matches_measured_result() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        use eliot_contracts::DecisionId;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let terminal = terminal_for(&binding, clock_at(Some(1_786_000_000_000)))?;
+        let mut other_admission = admission_for(&binding)?;
+        other_admission.decision_id = DecisionId::new("decision-2")?;
+        other_admission.self_digest = other_admission.compute_digest()?;
+        other_admission.validate()?;
+        assert!(is_binding_mismatch(&observe_measured_tool_result(
+            b"hello world",
+            &terminal,
+            &binding,
+            &other_admission,
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_launches_pumps_measures_and_emits() -> TestResult {
+        use super::turn_driver::{CODEX_TURN_WIRE_MAX_BYTES, drive_codex_turn};
+        assert!(CODEX_TURN_WIRE_MAX_BYTES >= 4 * 1024 * 1024);
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let channel = Arc::new(live_channel());
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let drive = drive_codex_turn(drive_inputs(
+            Arc::clone(&executor),
+            Arc::clone(&channel),
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            default_timeout(),
+        ))
+        .await?;
+        // Real P-03 launch through the injected executor, once.
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        assert!(drive.launch.is_some());
+        // Real turn protocol over the live channel: exactly one turn/start
+        // carrying the bound thread and the owner input.
+        let written = channel.written();
+        assert_eq!(written.len(), 1);
+        let sent: serde_json::Value = serde_json::from_slice(&written[0])?;
+        assert_eq!(sent["method"], "turn/start");
+        assert_eq!(sent["params"]["threadId"], "thread-1");
+        assert_eq!(sent["params"]["input"]["prompt"], "hello");
+        assert!(sent["id"].as_str().is_some_and(|id| id.ends_with("-start")));
+        // Canonical turn receipt over the pumped text and derived terminal.
+        assert_eq!(drive.result.disposition, ResultDisposition::Partial);
+        assert_eq!(drive.result.attempt_id, binding.attempt_id);
+        // Measured carrier bound to the exact pumped bytes.
+        let carrier = drive.measured.expect("completed turn measures");
+        assert_eq!(carrier.tokens, 2);
+        assert_eq!(
+            carrier.result_digest,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_eq!(carrier.result_bytes, b"hello world");
+        assert_eq!(
+            carrier.observation.route_state,
+            RouteObservationState::Matched
+        );
+        assert_eq!(
+            carrier.observation.observed_route,
+            Some(binding.route.clone())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_reuses_running_server_without_relaunch() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let first_channel = Arc::new(live_channel());
+        let first = drive_codex_turn(drive_inputs(
+            Arc::clone(&executor),
+            Arc::clone(&first_channel),
+            &mut attached,
+            &binding,
+            &admission,
+            Arc::clone(&sink),
+            default_timeout(),
+        ))
+        .await?;
+        assert!(first.launch.is_some());
+        let second_channel = Arc::new(live_channel());
+        let second = drive_codex_turn(drive_inputs(
+            Arc::clone(&executor),
+            second_channel,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            default_timeout(),
+        ))
+        .await?;
+        // Single-take process request: the second drive reuses the running
+        // server instead of relaunching, opens a fresh turn over the live
+        // channel, and still assembles + measures.
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        assert!(second.launch.is_none());
+        assert_eq!(first_channel.written().len(), 1);
+        assert!(second.measured.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_without_terminal_yields_unknown_without_carrier() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let channel = Arc::new(FakeChannel::scripted(vec![
+            FakeRead::Data(
+                br#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"partial"}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Eof,
+        ]));
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            channel,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            default_timeout(),
+        ))
+        .await?;
+        // No terminal fact exists: unknown outcome preserved, no carrier
+        // estimated — never a zero-count receipt.
+        assert_eq!(drive.result.disposition, ResultDisposition::UnknownOutcome);
+        assert!(drive.result.unknown_reason.is_some());
+        assert!(drive.measured.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_quarantines_foreign_frames() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let channel = Arc::new(FakeChannel::scripted(vec![
+            FakeRead::Data(br#"{"id":"turn-1-start","result":{"ok":true}}
+"#.to_vec()),
+            FakeRead::Data(
+                br#"{"method":"item/agentMessage/delta","params":{"threadId":"other-thread","turnId":"turn-9","itemId":"x-1","delta":"FOREIGN"}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Data(
+                br#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"hello world"}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Data(
+                br#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Eof,
+        ]));
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            channel,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            default_timeout(),
+        ))
+        .await?;
+        // Foreign text never enters our turn: exact own bytes measured.
+        let carrier = drive.measured.expect("own turn still measures");
+        assert_eq!(carrier.result_bytes, b"hello world");
+        assert_eq!(carrier.tokens, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_rejects_malformed_window() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let channel = Arc::new(FakeChannel::scripted(vec![FakeRead::Data(
+            b"not jsonl at all {{{\n".to_vec(),
+        )]));
+        assert!(matches!(
+            drive_codex_turn(drive_inputs(
+                executor,
+                channel,
+                &mut attached,
+                &binding,
+                &admission,
+                sink,
+                default_timeout(),
+            ))
+            .await,
+            Err(CodexAdapterError::MalformedWire(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_rejects_overbound_window() -> TestResult {
+        use super::turn_driver::{CODEX_TURN_WIRE_MAX_BYTES, drive_codex_turn};
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let channel = Arc::new(FakeChannel::scripted(vec![FakeRead::Data(vec![
+            b'x';
+            CODEX_TURN_WIRE_MAX_BYTES
+                + 1
+        ])]));
+        assert!(matches!(
+            drive_codex_turn(drive_inputs(
+                executor,
+                channel,
+                &mut attached,
+                &binding,
+                &admission,
+                sink,
+                default_timeout(),
+            ))
+            .await,
+            Err(CodexAdapterError::WireTooLarge)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_requires_sink_for_launch() -> TestResult {
+        use super::turn_driver::{CodexTurnDriverInputs, drive_codex_turn};
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let channel = Arc::new(live_channel());
+        assert!(matches!(
+            drive_codex_turn(CodexTurnDriverInputs {
+                executor,
+                channel,
+                attached: &mut attached,
+                binding: &binding,
+                admission: &admission,
+                evidence_sink: None,
+                turn_input: serde_json::json!({"prompt": "hello"}),
+                turn_timeout: default_timeout(),
+                owner_event: turn_owner_event(),
+                usage: UsageReceipt {
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_microunits: None,
+                    quota: QuotaKnowledge::Unknown,
+                },
+                continuation: None,
+                proposed_effects: Vec::new(),
+                cancelled: false,
+            })
+            .await,
+            Err(CodexAdapterError::InvalidInput(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_withholds_measurement_for_community_model() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("codex-mini-latest")?;
+        let binding = bound_binding_with_model("codex-mini-latest")?;
+        let admission = admission_for(&binding)?;
+        let channel = Arc::new(live_channel());
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            channel,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            default_timeout(),
+        ))
+        .await?;
+        // The turn receipt stands (translate does not measure); only the
+        // carrier withholds for the community-only mapping.
+        assert_eq!(drive.result.disposition, ResultDisposition::Partial);
+        assert!(drive.measured.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_rejected_start_yields_precise_unknown() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let channel = Arc::new(FakeChannel::scripted(vec![
+            FakeRead::Data(
+                br#"{"id":"turn-1-start","error":{"code":"busy","message":"nope"}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Eof,
+        ]));
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            channel,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            default_timeout(),
+        ))
+        .await?;
+        // Rejected turn never runs: unknown outcome with the precise static
+        // reason (never provider prose), no carrier estimated.
+        assert_eq!(drive.result.disposition, ResultDisposition::UnknownOutcome);
+        assert_eq!(
+            drive.result.unknown_reason.as_deref(),
+            Some("turn start rejected by provider")
+        );
+        assert!(drive.measured.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_assembles_split_frames_across_reads() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let completed =
+            br#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}
+"#;
+        let split_at = completed.len() / 2;
+        let channel = Arc::new(FakeChannel::scripted(vec![
+            FakeRead::Data(br#"{"id":"turn-1-start","result":{"ok":true}}
+"#.to_vec()),
+            FakeRead::Data(
+                br#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"hello world"}}
+"#.to_vec(),
+            ),
+            FakeRead::Data(completed[..split_at].to_vec()),
+            FakeRead::Data(completed[split_at..].to_vec()),
+            FakeRead::Eof,
+        ]));
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            channel,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            default_timeout(),
+        ))
+        .await?;
+        // Streaming remainder logic: the split terminal still derives.
+        let carrier = drive.measured.expect("split terminal still binds");
+        assert_eq!(carrier.result_bytes, b"hello world");
+        assert_eq!(
+            carrier.observation.route_state,
+            RouteObservationState::Matched
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_deadline_bounds_hung_server() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let channel = Arc::new(FakeChannel::scripted(vec![FakeRead::Empty]));
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            channel,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            std::time::Duration::from_millis(50),
+        ))
+        .await?;
+        // No frames ever arrive: the owner deadline bounds the wait and the
+        // outcome stays unknown with no carrier.
+        assert_eq!(drive.result.disposition, ResultDisposition::UnknownOutcome);
+        assert!(drive.measured.is_none());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn launch_uses_only_injected_process_executor() -> TestResult {
         let executor = Arc::new(FakeExecutor {
@@ -3224,6 +4041,496 @@ mod tests {
         );
         assert!(attached.process_request().is_none());
         assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Test-only OS child halves sharing one spawned process per operation:
+    /// the executor spawns and retains stdio under the operation id; the
+    /// channel speaks the contract over the same handles. No Job
+    /// containment here (test scope only; production P-04 contains); the
+    /// child is a PowerShell single-quoted echo (exact JSON bytes,
+    /// immediately exiting, kill-on-drop).
+    #[cfg(windows)]
+    struct OsChildHandles {
+        // The child is retained (kill-on-drop cleanup): dropping it here
+        // would close the pipes the channel must speak.
+        _child: tokio::process::Child,
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+    }
+
+    #[cfg(windows)]
+    struct OsDuplexHarness {
+        children: tokio::sync::Mutex<std::collections::HashMap<String, OsChildHandles>>,
+        starts: AtomicUsize,
+        writes: tokio::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[cfg(windows)]
+    impl OsDuplexHarness {
+        fn script_lines() -> Vec<String> {
+            vec![
+                r#"{"id":"turn-1-start","result":{"ok":true}}"#.to_owned(),
+                r#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"hello world"}}"#.to_owned(),
+                r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}"#.to_owned(),
+            ]
+        }
+
+        fn spawn_echo_child() -> TestResult<tokio::process::Child> {
+            // PowerShell single-quoted literals carry the JSON double
+            // quotes exactly (cmd /c would strip nested quotes); each
+            // Write-Output line is one CRLF-terminated JSONL frame.
+            let script = Self::script_lines()
+                .iter()
+                .map(|line| format!("Write-Output '{line}'"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Ok(tokio::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?)
+        }
+
+        fn child_key(operation_id: &eliot_process::OperationId) -> String {
+            operation_id.as_str().to_owned()
+        }
+    }
+
+    #[cfg(windows)]
+    impl eliot_process::ProcessExecutor for OsDuplexHarness {
+        async fn start(
+            &self,
+            request: ProcessRequest,
+            _sink: Arc<dyn ProcessEvidenceSink>,
+        ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let state = validated_process_state(request)?;
+            let mut child = Self::spawn_echo_child().map_err(|error| {
+                ProcessExecutionError::Unavailable(format!("test spawn: {error}"))
+            })?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| ProcessExecutionError::Unavailable("test child stdin".to_owned()))?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                ProcessExecutionError::Unavailable("test child stdout".to_owned())
+            })?;
+            // Retain the child (kill-on-drop cleanup) alongside its stdio:
+            // dropping here would close the pipes the channel must speak.
+            self.children.lock().await.insert(
+                Self::child_key(state.binding().operation_id()),
+                OsChildHandles {
+                    _child: child,
+                    stdin,
+                    stdout,
+                },
+            );
+            ProcessStartReceipt::new(&state).map_err(ProcessExecutionError::from)
+        }
+
+        async fn inspect(
+            &self,
+            _operation_id: eliot_process::OperationId,
+        ) -> Result<ProcessExecutionView, ProcessExecutionError> {
+            Err(ProcessExecutionError::Unavailable("fixture".into()))
+        }
+
+        async fn cancel(
+            &self,
+            _operation_id: eliot_process::OperationId,
+        ) -> Result<CancellationReceipt, ProcessExecutionError> {
+            Err(ProcessExecutionError::Unavailable("fixture".into()))
+        }
+
+        async fn reconcile(
+            &self,
+            _operation_id: eliot_process::OperationId,
+        ) -> Result<ProcessEvidence, ProcessExecutionError> {
+            Err(ProcessExecutionError::Unavailable("fixture".into()))
+        }
+    }
+
+    #[cfg(windows)]
+    struct OsDuplexChannel {
+        harness: Arc<OsDuplexHarness>,
+    }
+
+    #[cfg(windows)]
+    impl eliot_process::InteractiveChildChannel for OsDuplexChannel {
+        fn write_child_stdin(
+            &self,
+            operation_id: eliot_process::OperationId,
+            bytes: Vec<u8>,
+        ) -> eliot_process::InteractiveChildFuture<'_, usize> {
+            let key = OsDuplexHarness::child_key(&operation_id);
+            let harness = Arc::clone(&self.harness);
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let len = bytes.len();
+                {
+                    let mut children = harness.children.lock().await;
+                    let handles = children
+                        .get_mut(&key)
+                        .ok_or(ProcessExecutionError::NotFound)?;
+                    handles.stdin.write_all(&bytes).await.map_err(|_| {
+                        ProcessExecutionError::Unavailable("test stdin write".to_owned())
+                    })?;
+                }
+                // Record the exact written bytes for protocol assertions.
+                harness.writes.lock().await.push(bytes);
+                Ok(len)
+            })
+        }
+
+        fn read_child_stdout(
+            &self,
+            operation_id: &eliot_process::OperationId,
+            max_bytes: usize,
+            deadline: std::time::Duration,
+        ) -> eliot_process::InteractiveChildFuture<'_, eliot_process::ChildStdoutChunk> {
+            let key = OsDuplexHarness::child_key(operation_id);
+            let harness = Arc::clone(&self.harness);
+            Box::pin(async move {
+                use tokio::io::AsyncReadExt as _;
+                let mut slot: Vec<u8> = vec![0; max_bytes.min(64 * 1024)];
+                let outcome = tokio::time::timeout(deadline, async {
+                    let mut children = harness.children.lock().await;
+                    let handles = children
+                        .get_mut(&key)
+                        .ok_or(ProcessExecutionError::NotFound)?;
+                    handles.stdout.read(&mut slot).await.map_err(|_| {
+                        ProcessExecutionError::Unavailable("test stdout read".to_owned())
+                    })
+                })
+                .await;
+                match outcome {
+                    Err(_) => Ok(eliot_process::ChildStdoutChunk {
+                        bytes: Vec::new(),
+                        end_of_stream: false,
+                    }),
+                    Ok(Err(error)) => Err(error),
+                    Ok(Ok(0)) => Ok(eliot_process::ChildStdoutChunk {
+                        bytes: Vec::new(),
+                        end_of_stream: true,
+                    }),
+                    Ok(Ok(count)) => {
+                        slot.truncate(count);
+                        Ok(eliot_process::ChildStdoutChunk {
+                            bytes: slot,
+                            end_of_stream: false,
+                        })
+                    }
+                }
+            })
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn turn_driver_duplex_real_child_echo() -> TestResult {
+        use super::turn_driver::{CodexTurnDriverInputs, drive_codex_turn};
+        let harness = Arc::new(OsDuplexHarness {
+            children: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            starts: AtomicUsize::new(0),
+            writes: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        // Single real OS child (PowerShell echo, immediately exiting,
+        // kill-on-drop): the harness spawns through the P-03 executor
+        // shape and speaks the channel over the same handles. No Job
+        // containment here — test scope only; production P-04 contains.
+        let drive = drive_codex_turn(CodexTurnDriverInputs {
+            executor: Arc::clone(&harness),
+            channel: Arc::new(OsDuplexChannel {
+                harness: Arc::clone(&harness),
+            }),
+            attached: &mut attached,
+            binding: &binding,
+            admission: &admission,
+            evidence_sink: Some(sink),
+            turn_input: serde_json::json!({"prompt": "hello"}),
+            turn_timeout: std::time::Duration::from_secs(30),
+            owner_event: turn_owner_event(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            continuation: None,
+            proposed_effects: Vec::new(),
+            cancelled: false,
+        })
+        .await?;
+        // Real launch happened exactly once through the executor.
+        assert_eq!(harness.starts.load(Ordering::SeqCst), 1);
+        assert!(drive.launch.is_some());
+        // The turn/start frame really crossed the OS stdin pipe.
+        let writes = harness.writes.lock().await;
+        assert_eq!(writes.len(), 1);
+        let sent: serde_json::Value = serde_json::from_slice(&writes[0])?;
+        assert_eq!(sent["method"], "turn/start");
+        assert_eq!(sent["params"]["threadId"], "thread-1");
+        // The echoed stdout really pumped, derived terminal included.
+        assert_eq!(drive.result.disposition, ResultDisposition::Partial);
+        let carrier = drive.measured.expect("echoed turn measures");
+        assert_eq!(carrier.tokens, 2);
+        assert_eq!(carrier.result_bytes, b"hello world");
+        assert_eq!(
+            carrier.result_digest,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        Ok(())
+    }
+    /// P-04 port for the chain proof: validates the launch against the
+    /// fixture authority exactly like production, over caller-supplied
+    /// records. Mirrors the executor crate's own test port; no authority
+    /// is minted here.
+    #[cfg(windows)]
+    struct ChainPort {
+        authority: std::sync::Mutex<eliot_process::DispatchPermitAuthority>,
+        context: eliot_process::DispatchValidationContext,
+    }
+
+    #[cfg(windows)]
+    impl eliot_process_executor::DispatchValidationPort for ChainPort {
+        fn validate_and_consume(
+            &self,
+            request: ProcessRequest,
+            observed: eliot_process::SuspendedProcessIdentity,
+        ) -> Result<eliot_process::ValidatedDispatch, ProcessExecutionError> {
+            let mut authority = self.authority.lock().map_err(|_| {
+                ProcessExecutionError::Unavailable("dispatch authority lock poisoned".to_owned())
+            })?;
+            authority
+                .validate_and_consume(request, observed, &self.context)
+                .map_err(Into::into)
+        }
+    }
+
+    /// Projects one driven carrier into its bridge receipt through the real
+    /// intake: attested count/digest plus the live admission/binding, with
+    /// the core attached through its real activation port. Mirrors the
+    /// bridge crate's own test core; the join logic under proof is the
+    /// production entry, not a copy.
+    #[cfg(windows)]
+    fn bridge_receipt_for(
+        carrier: &super::route_tokenizer::CodexMeasuredToolResult,
+        admission: &AdmittedRouteReceipt,
+        binding: &ProviderExecutionBinding,
+    ) -> TestResult<eliot_agent_bridge_core::ToolResultReceipt> {
+        use eliot_agent_bridge_core::{
+            AgentBridgeCore, AttachRequest, ConnectionId, DemandId, Generation, ProviderReadiness,
+        };
+        struct StaticHost {
+            result: eliot_agent_bridge_core::ActivationPortResult,
+        }
+        impl eliot_agent_bridge_core::HostActivationPort for StaticHost {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<
+                eliot_agent_bridge_core::ActivationPortOutcome,
+                eliot_agent_bridge_core::ProviderFailure,
+            > {
+                Ok(
+                    eliot_agent_bridge_core::ActivationPortOutcome::Authenticated(
+                        self.result.clone(),
+                    ),
+                )
+            }
+        }
+        let generation = Generation::new(1)?;
+        let fence = eliot_agent_bridge_core::FencingToken::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            Generation::new(1)?,
+            "fence-1".to_owned(),
+        )?;
+        let result = eliot_agent_bridge_core::ActivationPortResult::authenticated(
+            eliot_agent_bridge_core::PrincipalId::new("principal-1")?,
+            eliot_agent_bridge_core::SessionId::new("session-1")?,
+            generation,
+            fence,
+            eliot_agent_bridge_core::TaskId::new("task-1")?,
+            eliot_agent_bridge_core::WorkUnitId::new("work-unit-1")?,
+            "scope-1",
+            "task-revision-1",
+            "plan-1",
+            "plan-revision-1",
+        )?;
+        let mut core = AgentBridgeCore::new(
+            ProviderReadiness::all_admitted(),
+            Some(Box::new(StaticHost { result })),
+            None,
+            eliot_agent_bridge_core::CursorPolicy::new(
+                eliot_agent_bridge_core::AckPhase::Durable,
+                eliot_agent_bridge_core::AckPhase::Normalized,
+            )?,
+        );
+        core.attach(AttachRequest::managed(
+            DemandId::new("demand-1")?,
+            ConnectionId::new("connection-1")?,
+        ))?;
+        let payload = eliot_agent_bridge_core::TokenMeasurementPayload {
+            contract_version: eliot_agent_bridge_core::TOKEN_MEASUREMENT_VERSION,
+            observation: carrier.observation.clone(),
+            result_digest: carrier.result_digest.clone(),
+            tokens: carrier.tokens,
+        };
+        Ok(core.project_produced_tool_result(
+            &carrier.result_bytes,
+            eliot_agent_bridge_core::ResourceUri::parse("eliot://evidence/source")?,
+            Some(&payload),
+            admission,
+            binding,
+            eliot_agent_bridge_core::DeliveryStatus::Full,
+        )?)
+    }
+
+    /// End-to-end realpath proof: a REAL P-04 launch of a REAL child
+    /// speaking REAL turn frames through the REAL channel implementation,
+    /// driven by the REAL turn driver over owner-issued records, with the
+    /// carrier landing in a REAL bridge receipt. Only the owner-issued
+    /// records (attach/binding/admission/event identity — daemon-owned in
+    /// production) are fixture-constructed through their real validators;
+    /// every execution, pump, normalization, measurement, and projection
+    /// step is production code.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn measured_turn_chain_executes_end_to_end() -> TestResult {
+        use super::turn_driver::{CodexTurnDriverInputs, drive_codex_turn};
+        let executable = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let digest = test_sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = eliot_process::OperationId::new("op-t9-chain-01")?;
+        let generation = eliot_process::Generation::new(1)?;
+        let mut test_env = std::collections::BTreeMap::new();
+        test_env.insert("SystemRoot".to_owned(), std::env::var("SystemRoot")?);
+        let temp_dir = std::env::temp_dir().to_string_lossy().into_owned();
+        test_env.insert("TEMP".to_owned(), temp_dir.clone());
+        test_env.insert("TMP".to_owned(), temp_dir);
+        let intent = eliot_process::ProcessIntent::new(
+            operation_id.clone(),
+            eliot_process::ProcessTreeId::new("tree-t9-chain-01")?,
+            eliot_process::JobId::new("job-t9-chain-01")?,
+            eliot_process::ImageId::new("image-t9-chain-01")?,
+            eliot_process::SessionId::new("session-t9-chain-01")?,
+            generation,
+            executable,
+            digest,
+            vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                "Write-Output '{\"id\":\"turn-1-start\",\"result\":{\"ok\":true}}'; Write-Output '{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread-1\",\"turnId\":\"turn-1\",\"itemId\":\"i-1\",\"delta\":\"hello world\"}}'; Write-Output '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-1\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}'".to_owned(),
+            ],
+            working_directory.clone(),
+            eliot_process::EnvironmentProjection::new(
+                test_env,
+                Vec::new(),
+                eliot_process::EnvironmentInheritance::None,
+            )?,
+            eliot_process::ResourceLimits::new(
+                30_000,
+                Some(10_000),
+                Some(512_000_000),
+                4_096,
+                4_096,
+                4,
+            )?,
+        )?
+        .with_interactive_stdin()?;
+        let fence = eliot_process::FencingToken::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            generation,
+            "fence-t9-chain-01",
+        )?;
+        let mut authority = eliot_process::DispatchPermitAuthority::activate(
+            eliot_process::DispatchAuthorityId::new("auth-t9-chain")?,
+            eliot_process::KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            eliot_process::PermitIssuance::new(
+                eliot_process::ActionLeaseRef::new("lease-t9-chain-01")?,
+                fence.clone(),
+                std::collections::BTreeMap::from([
+                    ("authority".to_owned(), "a".repeat(64)),
+                    ("state".to_owned(), "b".repeat(64)),
+                ]),
+                100,
+                10_000,
+                "nonce-t9-chain-01",
+            )?,
+        )?;
+        let process_request = eliot_process::ProcessRequest::new(intent, permit)?;
+        let context = eliot_process::DispatchValidationContext::new(
+            eliot_platform::ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            test_epoch(TEST_LINEAGE_A, 1),
+            std::collections::BTreeMap::from([
+                ("authority".to_owned(), "a".repeat(64)),
+                ("state".to_owned(), "b".repeat(64)),
+            ]),
+            41,
+        )?;
+        let port = ChainPort {
+            authority: std::sync::Mutex::new(authority),
+            context,
+        };
+        let executor = Arc::new(eliot_process_executor::WindowsProcessExecutor::new(
+            Arc::new(port),
+        ));
+        let channel: Arc<dyn eliot_process::InteractiveChildChannel> = executor.clone();
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attach_for_chain(process_request, &working_directory)?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let drive = drive_codex_turn(CodexTurnDriverInputs {
+            executor: Arc::clone(&executor),
+            channel,
+            attached: &mut attached,
+            binding: &binding,
+            admission: &admission,
+            evidence_sink: Some(sink),
+            turn_input: serde_json::json!({"prompt": "hello"}),
+            turn_timeout: std::time::Duration::from_secs(30),
+            owner_event: turn_owner_event(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            continuation: None,
+            proposed_effects: Vec::new(),
+            cancelled: false,
+        })
+        .await?;
+        // Real launch through P-04 exactly once.
+        assert!(drive.launch.is_some());
+        // Canonical turn receipt over really pumped bytes.
+        assert_eq!(drive.result.disposition, ResultDisposition::Partial);
+        // Carrier lands in a real bridge receipt through the real intake.
+        let carrier = drive.measured.expect("live turn measures");
+        let receipt = bridge_receipt_for(&carrier, &admission, &binding)?;
+        assert_eq!(receipt.tokens_rendered(), 2);
+        assert_eq!(
+            receipt.result_digest(),
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert!(receipt.check_complete_evidence().is_ok());
         Ok(())
     }
 

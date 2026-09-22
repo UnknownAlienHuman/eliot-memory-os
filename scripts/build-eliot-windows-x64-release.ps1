@@ -76,6 +76,12 @@ $runtimeArtifactDefinitions = @(
         role = 'wasm_host'
         relative_path = 'runtime/eliot-wasm-host.exe'
     }
+    [pscustomobject]@{
+        package = 'eliot-notify'
+        binary = 'eliot-notify'
+        role = 'notify'
+        relative_path = 'runtime/eliot-notify.exe'
+    }
 )
 
 function Get-RuntimeArtifactDefinitions {
@@ -1162,6 +1168,7 @@ function Test-ReleaseBundle([string]$Path) {
         'runtime/eliot-testd.exe',
         'runtime/eliot-native-worker.exe',
         'runtime/eliot-wasm-host.exe',
+        'runtime/eliot-notify.exe',
         'runtime/surreal.exe',
         'runtime/RUNTIME_ARTIFACTS.json',
         'operator/Eliot.Operator.exe',

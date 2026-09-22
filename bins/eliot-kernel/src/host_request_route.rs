@@ -42,10 +42,16 @@
 //! deadline is `Timeout`. No error prose drives routing.
 
 use super::{
-    Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
-    TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
+    Frame, FrameKind, KernelComposition, KernelFrameAction, KernelStoreGateway, MessageType,
+    ProtocolPayload, Session, TransportError, activation_deadline_expired, sha256_json,
+    status_frame, unix_ms,
 };
-use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
+use eliot_contracts::{
+    ClockReading, ProductId, RequestMetadata, SessionId, SourceId, TaskId, canonical_json_bytes,
+};
+use eliot_kernel_service::{
+    AgentBridgeAdmissionDescriptor, KernelServiceState, ResourceSnapshotReadResponse,
+};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
     HostRequestRecord, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
@@ -55,9 +61,15 @@ use eliot_protocol::{
     AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HOST_REQUEST_INVOKE_READ_WIRE_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
-    host_request_operation_id,
+    REACTIVE_RESTORE_OPERATION, host_request_operation_id,
 };
-use eliot_store_api::{EVIDENCE_PACK_MAX_RECORDS, ScopeId};
+use eliot_store_api::{
+    CanonicalStoreClient, CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, NamedReadRequest,
+    NamedReadResponse, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
+    StoreHealth, WriteReceipt,
+};
+use std::sync::Arc;
 
 /// Prefix of the deterministic opaque operation handle derived by
 /// [`host_request_operation_id`]. A parent operation reference carries the
@@ -89,6 +101,9 @@ pub(crate) const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_requ
 /// digest-only in spirit; the tool bytes only prove the presented operation
 /// is the admitted one.
 pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
+/// Closed authenticated reactive-restore operation. The protocol carrier is
+/// the single source of truth for the literal wire name.
+pub(crate) const AGENT_HOST_REQUEST_REACTIVE_RESTORE_OPERATION: &str = REACTIVE_RESTORE_OPERATION;
 
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
 ///
@@ -96,6 +111,226 @@ pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str = "agent_host_re
 /// record owns lifecycle state, so eviction only drops daemon-leg queue
 /// memory and never fabricates admission.
 const MAX_QUEUED_LOCAL_READS: usize = 64;
+
+/// Read-only production adapter for the reactive restore projection.
+///
+/// `KernelStoreGateway` intentionally exposes a Kernel-admitted named-read
+/// seam instead of implementing the full Store client port. The reactive
+/// service handlers consume the full port for historical layering reasons;
+/// this adapter keeps that boundary narrow and fail-closed: only
+/// `execute_named` reaches the existing gateway, while every write or other
+/// read capability is unavailable. It creates no Store, cache, or alternate
+/// owner.
+pub(crate) struct ReactiveRestoreStoreClient {
+    gateway: Arc<KernelStoreGateway>,
+}
+
+impl ReactiveRestoreStoreClient {
+    pub(crate) fn new(gateway: Arc<KernelStoreGateway>) -> Self {
+        Self { gateway }
+    }
+}
+
+impl CanonicalStoreClient for ReactiveRestoreStoreClient {
+    async fn apply_prepared(
+        &self,
+        _ctx: &eliot_store_api::RequestMeta,
+        _transition: PreparedTransition,
+        _expected_revision_heads: Vec<RevisionHeadExpectation>,
+        _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn receipt(
+        &self,
+        _operation_id: eliot_store_api::OperationId,
+    ) -> Result<Option<WriteReceipt>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn revision_heads(
+        &self,
+        _keys: Vec<RevisionKey>,
+    ) -> Result<Vec<RevisionHead>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn scope_revision_view(
+        &self,
+        _scope_id: ScopeId,
+    ) -> Result<ScopeRevisionView, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn ordering_heads(
+        &self,
+        _scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHead>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+
+    async fn execute_named(
+        &self,
+        query: NamedReadRequest,
+    ) -> Result<NamedReadResponse, StoreError> {
+        self.gateway
+            .execute_named(query)
+            .await
+            .map_err(|_| StoreError::Unavailable)
+    }
+
+    async fn health(&self) -> Result<StoreHealth, StoreError> {
+        Err(StoreError::Unavailable)
+    }
+}
+
+/// Builds the request metadata for one admitted local-read projection.
+///
+/// Every identity is copied from the admitted envelope; this helper creates
+/// no session, task, or authority value. The constants identify this Kernel
+/// composition as the transport source, while the fence remains the exact
+/// admitted fence used by the reactive owner.
+pub(crate) fn local_read_request_metadata(
+    envelope: &HostRequestEnvelope,
+) -> Result<RequestMetadata, TransportError> {
+    let session_id = envelope
+        .identity
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(TransportError::SessionFenced)
+        .and_then(|value| {
+            SessionId::new(value.to_owned()).map_err(|_| TransportError::SessionFenced)
+        })?;
+    let task_id = envelope
+        .identity
+        .task_id
+        .as_deref()
+        .map(|value| TaskId::new(value.to_owned()).map_err(|_| TransportError::SessionFenced))
+        .transpose()?;
+    let metadata = RequestMetadata {
+        request_id: envelope.identity.request_id.clone(),
+        session_id: Some(session_id),
+        task_id,
+        product_id: ProductId::new("eliot-kernel").map_err(|_| TransportError::SessionFenced)?,
+        source_id: SourceId::new("eliot-kernel-host-request")
+            .map_err(|_| TransportError::SessionFenced)?,
+        state_fence: envelope.state_fence.clone(),
+        clock: ClockReading {
+            valid_time_ms: None,
+            known_time_ms: i64::try_from(unix_ms()).ok(),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    metadata
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(metadata)
+}
+
+/// Projects the owner-served exact snapshot into the existing MCP response
+/// carrier. The owner digest is checked against both the stored bytes and the
+/// bytes A3 will verify (`serde_json::to_vec(response.content)`); no local
+/// digest or size replaces an owner observation. Absence is explicit and has
+/// no resource handle, so the bridge's publish gate withholds it.
+pub(crate) fn build_exact_resource_result_body(
+    envelope: &HostRequestEnvelope,
+    uri: &str,
+    served: ResourceSnapshotReadResponse,
+) -> Result<(String, serde_json::Value), TransportError> {
+    if uri.trim().is_empty()
+        || uri.chars().any(char::is_control)
+        || uri.len() > eliot_protocol::MAX_RESTORE_TEXT_BYTES
+        || served.state_fence != envelope.state_fence
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let session_id = envelope
+        .identity
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(TransportError::SessionFenced)?;
+    let request_id = envelope.identity.request_id.as_str().to_owned();
+    let idempotency_key = envelope.identity.idempotency_key.clone();
+    let canonical_request_sha256 = eliot_contracts::sha256_hex(
+        &canonical_json_bytes(&(
+            envelope.envelope_sha256.clone(),
+            request_id.clone(),
+            idempotency_key.clone(),
+        ))
+        .map_err(|_| TransportError::SessionFenced)?,
+    );
+
+    let (content, artifacts, resource) = match (served.content, served.content_sha256) {
+        (None, None) => (
+            serde_json::json!({
+                "resource_uri": uri,
+                "status": "absent",
+                "revision": served.revision,
+            }),
+            serde_json::json!([]),
+            serde_json::Value::Null,
+        ),
+        (Some(bytes), Some(owner_digest)) => {
+            if bytes.is_empty() || eliot_contracts::sha256_hex(&bytes) != owner_digest {
+                return Err(TransportError::SessionFenced);
+            }
+            let content: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| TransportError::SessionFenced)?;
+            let response_bytes =
+                serde_json::to_vec(&content).map_err(|_| TransportError::SessionFenced)?;
+            if response_bytes.len() != bytes.len()
+                || eliot_contracts::sha256_hex(&response_bytes) != owner_digest
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let artifact_id = format!("eliot-resource-{owner_digest}");
+            let artifact = serde_json::json!({
+                "artifact_id": artifact_id,
+                "sha256": owner_digest,
+                "role": "ARTIFACT",
+                "source_revision": served.revision.to_string(),
+            });
+            let resource = serde_json::json!({
+                "uri": uri,
+                "artifact": artifact,
+                "media_type": "application/json",
+                "size_bytes": response_bytes.len() as u64,
+                "session": {
+                    "session_id": session_id,
+                    "authority_epoch": envelope.state_fence.authority_epoch,
+                    "state_fence": envelope.state_fence,
+                },
+            });
+            (content, serde_json::json!([artifact]), resource)
+        }
+        _ => return Err(TransportError::SessionFenced),
+    };
+
+    let body = serde_json::json!({
+        "request_id": request_id,
+        "idempotency_key": idempotency_key,
+        "canonical_request_sha256": canonical_request_sha256,
+        "kind": "PROJECTION",
+        "canonical_tool_name": "eliot.query",
+        "content": content,
+        "artifacts": artifacts,
+        "proof_ceiling": "SCOPED_VERIFICATION",
+        "resource": resource,
+        "job": null,
+    });
+    let digest = eliot_contracts::sha256_hex(
+        &canonical_json_bytes(&body).map_err(|_| TransportError::SessionFenced)?,
+    );
+    Ok((digest, body))
+}
 
 /// Returns whether the operation string selects the P-04 host-request route.
 pub(crate) fn is_host_request_operation(operation: &str) -> bool {
@@ -106,6 +341,7 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
             | AGENT_HOST_REQUEST_RECONCILE_OPERATION
             | AGENT_HOST_REQUEST_REHYDRATE_OPERATION
             | AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
+            | AGENT_HOST_REQUEST_REACTIVE_RESTORE_OPERATION
     )
 }
 
@@ -1700,6 +1936,7 @@ pub(crate) struct LocalReadSelectors {
     pub(crate) subject: String,
     pub(crate) max_records: u32,
     pub(crate) intent_mode: String,
+    pub(crate) exact_resource_uri: Option<String>,
 }
 
 /// Derives the closed local-read selectors from one linked envelope+tool pair.
@@ -1708,8 +1945,8 @@ pub(crate) struct LocalReadSelectors {
 /// admission-only behaviour and never reaches the read leg). Fails closed as
 /// `SessionFenced` for any other tool name, for a capability mismatch, for a
 /// `CurrentPosition` intent (which never admits `GetEvidencePack`), for a
-/// present `exact_resource_uri` (exact expansion uses the resource path, not
-/// a query), for a non-exact `subject:` selector, and for a missing or blank
+/// malformed exact-resource selector, for a non-exact `subject:` selector,
+/// and for a missing or blank
 /// trusted scope. Mirrors the `plan_evidence_pack_query` rules field-for-field
 /// without taking an MCP edge; linkage (capability + payload digest) must
 /// already be proven by the caller through [`HostRequestInvokeReadPayload`].
@@ -1744,19 +1981,17 @@ pub(crate) fn local_read_selectors_from_tool(
     if mode.trim().is_empty() || mode.chars().any(char::is_control) || mode == "current_position" {
         return Err(TransportError::SessionFenced);
     }
-    if arguments
-        .get("exact_resource_uri")
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(TransportError::SessionFenced);
-    }
-    let subject = arguments
-        .get("query")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|query| query.strip_prefix("subject:"))
-        .map(str::trim)
-        .filter(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
-        .ok_or(TransportError::SessionFenced)?;
+    let exact_resource_uri = match arguments.get("exact_resource_uri") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(uri))
+            if !uri.trim().is_empty()
+                && !uri.chars().any(char::is_control)
+                && uri.len() <= eliot_protocol::MAX_RESTORE_TEXT_BYTES =>
+        {
+            Some(uri.to_owned())
+        }
+        Some(_) => return Err(TransportError::SessionFenced),
+    };
     let scope_text = envelope
         .identity
         .work_scope_id
@@ -1771,11 +2006,34 @@ pub(crate) fn local_read_selectors_from_tool(
         })
         .ok_or(TransportError::SessionFenced)?;
     let scope_id = ScopeId::new(scope_text).map_err(|_| TransportError::SessionFenced)?;
+    if let Some(uri) = exact_resource_uri {
+        let query = arguments
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|query| !query.is_empty() && !query.chars().any(char::is_control))
+            .ok_or(TransportError::SessionFenced)?;
+        return Ok(Some(LocalReadSelectors {
+            scope_id,
+            subject: query.to_owned(),
+            max_records: EVIDENCE_PACK_MAX_RECORDS,
+            intent_mode: mode.to_owned(),
+            exact_resource_uri: Some(uri),
+        }));
+    }
+    let subject = arguments
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|query| query.strip_prefix("subject:"))
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
+        .ok_or(TransportError::SessionFenced)?;
     Ok(Some(LocalReadSelectors {
         scope_id,
         subject: subject.to_owned(),
         max_records: EVIDENCE_PACK_MAX_RECORDS,
         intent_mode: mode.to_owned(),
+        exact_resource_uri: None,
     }))
 }
 
@@ -2171,6 +2429,7 @@ mod invoke_read_tool_tests {
         assert_eq!(selectors.scope_id.as_str(), "kernel-session-1");
         assert_eq!(selectors.max_records, 32);
         assert_eq!(selectors.intent_mode, "verification");
+        assert_eq!(selectors.exact_resource_uri, None);
     }
 
     #[test]
@@ -2208,14 +2467,17 @@ mod invoke_read_tool_tests {
             "position intent must be rejected before reading"
         );
 
-        // Exact resource expansion uses the resource path, not a query.
+        // Exact resource expansion uses the resource path, not a named
+        // evidence-pack query.
         let mut with_uri = tool.clone();
         with_uri["arguments"]["exact_resource_uri"] =
             serde_json::json!("eliot://resource/evidence-1");
+        let exact = local_read_selectors_from_tool(&envelope, &with_uri)
+            .expect("exact resource route must validate")
+            .expect("eliot.query remains a local read");
         assert_eq!(
-            local_read_selectors_from_tool(&envelope, &with_uri),
-            Err(TransportError::SessionFenced),
-            "exact resource URI must be rejected before reading"
+            exact.exact_resource_uri.as_deref(),
+            Some("eliot://resource/evidence-1")
         );
 
         // A blank subject proves nothing.
@@ -2244,6 +2506,42 @@ mod invoke_read_tool_tests {
             local_read_selectors_from_tool(&noscope, &tool),
             Err(TransportError::SessionFenced),
             "missing trusted scope must be rejected before reading"
+        );
+    }
+
+    #[test]
+    fn exact_resource_result_binds_owner_bytes_digest_size_and_session() {
+        let content = serde_json::json!({"snapshot": "evidence-alpha"});
+        let bytes = serde_json::to_vec(&content).expect("content serializes");
+        let fence = test_envelope("eliot.query", &tool_digest(&query_tool())).state_fence;
+        let envelope = test_envelope("eliot.query", &tool_digest(&query_tool()));
+        let (digest, body) = build_exact_resource_result_body(
+            &envelope,
+            "eliot://resource/evidence-1",
+            ResourceSnapshotReadResponse {
+                content: Some(bytes.clone()),
+                content_sha256: Some(eliot_contracts::sha256_hex(&bytes)),
+                revision: 7,
+                state_fence: fence,
+            },
+        )
+        .expect("owner-served exact resource binds");
+        assert_eq!(body["resource"]["uri"], "eliot://resource/evidence-1");
+        assert_eq!(body["resource"]["size_bytes"], bytes.len() as u64);
+        assert_eq!(
+            body["resource"]["artifact"]["sha256"],
+            eliot_contracts::sha256_hex(&bytes)
+        );
+        assert_eq!(
+            body["resource"]["session"]["session_id"],
+            "kernel-session-1"
+        );
+        assert_eq!(body["artifacts"][0], body["resource"]["artifact"]);
+        assert_eq!(
+            digest,
+            eliot_contracts::sha256_hex(
+                &eliot_contracts::canonical_json_bytes(&body).expect("body canonicalizes")
+            )
         );
     }
 

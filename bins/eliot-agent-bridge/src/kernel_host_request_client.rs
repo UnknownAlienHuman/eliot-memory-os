@@ -36,7 +36,7 @@ use eliot_protocol::{
     HostRequestEnvelope, HostRequestIdentity, HostRequestKind, HostRequestResultBody, MessageType,
     ProtocolPayload, ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
     REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreQuery, ReactiveRestoreReply, RequestIdentity,
-    host_request_operation_id, restore_correlation,
+    RestoredSnapshot, host_request_operation_id, restore_correlation,
 };
 use eliot_receipts::RequestBinding;
 use serde::Deserialize;
@@ -1620,5 +1620,127 @@ mod tests {
                 Some(canonical)
             );
         }
+    }
+
+    fn restore_test_fence() -> StateFence {
+        StateFence::new(
+            EpochId::new(
+                EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                NonZeroU64::new(3).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch"),
+            ResourceGeneration::new(7).expect("nonzero test generation"),
+        )
+    }
+
+    fn restore_test_query() -> ReactiveRestoreQuery {
+        ReactiveRestoreQuery {
+            session_id: "kernel-session-1".to_owned(),
+            state_fence: restore_test_fence(),
+            uris: vec!["eliot://evidence/source-9".to_owned()],
+        }
+    }
+
+    #[test]
+    fn restore_envelope_binds_capability_session_and_payload_digest() {
+        // Caller-flow admission binding: the restore envelope names the
+        // restore operation (never a tool), echoes the live session, and
+        // digests the exact canonical query bytes. No transport runs here;
+        // the proven units are the pure admission bindings below it.
+        let facts = test_facts("conn-test-1");
+        let query = restore_test_query();
+        query.validate().expect("query must validate");
+        let digest = query.canonical_digest().expect("query must digest");
+        let correlation = restore_correlation("kernel-session-1", &restore_test_fence());
+        let envelope =
+            build_restore_envelope(&correlation, &facts, "kernel-session-1", &digest, 1_000_000)
+                .expect("restore envelope must build");
+        assert_eq!(
+            envelope.identity.capability, REACTIVE_RESTORE_CAPABILITY,
+            "restore capability names the operation, never a tool"
+        );
+        assert_eq!(
+            envelope.identity.session_id.as_deref(),
+            Some("kernel-session-1")
+        );
+        assert_eq!(envelope.identity.payload_sha256, digest);
+        assert_eq!(
+            envelope.identity.payload_schema_id, REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID
+        );
+        // A foreign session binds a different envelope, never an edit.
+        let foreign = build_restore_envelope(
+            &correlation,
+            &facts,
+            "session-foreign-9",
+            &digest,
+            1_000_000,
+        )
+        .expect("envelope must build");
+        assert_ne!(
+            foreign.identity.session_id, envelope.identity.session_id,
+            "foreign session binds a different envelope"
+        );
+    }
+
+    #[test]
+    fn restore_reply_decode_binds_canonical_body_digest() {
+        // Answer-leg binding: only the exact canonical body matching the
+        // served digest decodes; anything else withholds. This is the same
+        // digest join the production exchange enforces before serving.
+        let reply = ReactiveRestoreReply {
+            session_id: "kernel-session-1".to_owned(),
+            state_fence: restore_test_fence(),
+            ledger_json: None,
+            snapshots: vec![RestoredSnapshot {
+                uri: "eliot://evidence/source-9".to_owned(),
+                content: b"snapshot-bytes-9".to_vec(),
+            }],
+            revision: 1,
+        };
+        reply.validate().expect("reply must validate");
+        let body = serde_json::to_value(&reply).expect("reply must serialize");
+        let digest =
+            sha256_hex(&canonical_json_bytes(&body).expect("reply must canonicalize"));
+        let received = AdmittedReplyView {
+            operation_id: "op-restore-1".to_owned(),
+            state: HostRequestRecordState::ResultReceived,
+            result_digest: Some(digest),
+            result_response: Some(body),
+        };
+        let decoded = decode_restore_reply(&received).expect("bound reply must decode");
+        assert_eq!(decoded, reply);
+        // A forged digest withholds.
+        let forged = AdmittedReplyView {
+            result_digest: Some("0".repeat(64)),
+            ..received.clone()
+        };
+        assert!(
+            decode_restore_reply(&forged).is_err(),
+            "forged digest must withhold"
+        );
+        // A digest-bound non-restore body withholds on shape.
+        let foreign_body = serde_json::json!({"forged": true});
+        let foreign_digest = sha256_hex(
+            &canonical_json_bytes(&foreign_body).expect("foreign must canonicalize"),
+        );
+        let foreign = AdmittedReplyView {
+            result_digest: Some(foreign_digest),
+            result_response: Some(foreign_body),
+            ..received.clone()
+        };
+        assert!(
+            decode_restore_reply(&foreign).is_err(),
+            "non-restore body must withhold"
+        );
+        // A missing body withholds.
+        let missing = AdmittedReplyView {
+            result_digest: None,
+            result_response: None,
+            ..received.clone()
+        };
+        assert!(
+            decode_restore_reply(&missing).is_err(),
+            "missing body must withhold"
+        );
     }
 }

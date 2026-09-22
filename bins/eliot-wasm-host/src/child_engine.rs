@@ -36,6 +36,7 @@ use eliot_wasm_runtime::{
     EngineTermination, EngineUsage, P03ProcessPort, PortError, Sha256Digest,
 };
 
+use crate::grant_authorization::AuthorizedGrant;
 use crate::guest_exec::parse_metering_line;
 use crate::shadow::{enforce_shadow_no_effect, shadow_port_error};
 use crate::wasmtime_provider::{PROVIDER_STACK_SIZE, WIT_VERSION, WIT_WORLD};
@@ -81,6 +82,38 @@ impl IsolatedChildEngine {
             artifact_digest,
             component_configuration_digest,
         }
+    }
+
+    /// Composes the isolated engine from an authorized grant.
+    ///
+    /// The engine's admitted artifact identity is the grant-proven digest —
+    /// the digest [`authorize_grant`](crate::grant_authorization::authorize_grant)
+    /// re-hashed against the staged component bytes — never a caller claim.
+    /// The manifest gate at [`invoke`](ComponentEnginePort::invoke) enforces
+    /// exactly this digest. `component_configuration_digest` stays threaded
+    /// from the admitted manifest, alongside the engine binding.
+    pub fn for_authorized_grant(
+        executor: Arc<WindowsProcessExecutor>,
+        sink: Arc<dyn eliot_process::ProcessEvidenceSink>,
+        binding: EngineBinding,
+        grant: &AuthorizedGrant,
+        component_configuration_digest: Sha256Digest,
+    ) -> Self {
+        Self::new(
+            executor,
+            sink,
+            binding,
+            grant.artifact_digest().clone(),
+            component_configuration_digest,
+        )
+    }
+
+    /// Returns the grant-proven artifact digest this engine enforces at
+    /// invoke. Introspection for the composition and its proof only; the
+    /// manifest gate remains the enforcement point.
+    #[must_use]
+    pub const fn admitted_artifact_digest(&self) -> &Sha256Digest {
+        &self.artifact_digest
     }
 }
 
@@ -202,5 +235,94 @@ impl ComponentEnginePort for IsolatedChildEngine {
 
     fn reconcile(&mut self, _invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
         Err(PortError::UnknownOutcome)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use eliot_process::{
+        EvidenceSinkError, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
+        ProcessRequest, SuspendedProcessIdentity, ValidatedDispatch,
+    };
+
+    struct DummyPort;
+
+    impl eliot_process_executor::DispatchValidationPort for DummyPort {
+        fn validate_and_consume(
+            &self,
+            _request: ProcessRequest,
+            _observed: SuspendedProcessIdentity,
+        ) -> Result<ValidatedDispatch, ProcessExecutionError> {
+            Err(ProcessExecutionError::Unavailable(
+                "dummy port must not be called pre-spawn".to_owned(),
+            ))
+        }
+    }
+
+    struct NoopSink;
+
+    impl ProcessEvidenceSink for NoopSink {
+        fn record(&self, _evidence: ProcessEvidence) -> Result<(), EvidenceSinkError> {
+            Ok(())
+        }
+    }
+
+    fn test_fence_epoch() -> (eliot_contracts::StateFence, eliot_contracts::EpochId) {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+        use std::num::NonZeroU64;
+        let lineage =
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("test lineage");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("sequence")).expect("epoch");
+        let fence = StateFence::new(epoch.clone(), ResourceGeneration::genesis());
+        (fence, epoch)
+    }
+
+    #[test]
+    fn authorized_grant_digest_becomes_engine_identity() {
+        use crate::grant_authorization::authorize_grant;
+        use crate::grant_client::AcceptedGrant;
+        let artifact = b"component-artifact-bytes";
+        let interface = b"wit-world-bytes";
+        let host_path = "C:\\Kernel\\eliot-wasm-host.exe";
+        let host_digest = Sha256Digest::of_bytes(b"installed-wasm-host-image-bytes");
+        let (fence, epoch) = test_fence_epoch();
+        let accepted = AcceptedGrant {
+            component_id: "component-1955".to_owned(),
+            artifact_digest: Sha256Digest::of_bytes(artifact),
+            interface_digest: Sha256Digest::of_bytes(interface),
+            fence,
+            epoch,
+            nonce: "nonce-1955".to_owned(),
+            deadline_unix_ms: 9_999_999_999_999,
+            host_executable_path: host_path.to_owned(),
+            host_artifact_digest: host_digest.clone(),
+        };
+        let grant = authorize_grant(&accepted, host_path, &host_digest, artifact, interface)
+            .expect("matching grant authorizes");
+        let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(DummyPort)));
+        let sink: Arc<dyn eliot_process::ProcessEvidenceSink> = Arc::new(NoopSink);
+        let binding = EngineBinding {
+            implementation_id: ISOLATED_CHILD_IMPLEMENTATION_ID.to_owned(),
+            exact_version: "47.0.4".to_owned(),
+            engine_artifact_digest: Sha256Digest::of_bytes(b"engine-fixture"),
+            engine_configuration_digest: Sha256Digest::of_bytes(b"config-fixture"),
+            wit_interface_digest: Sha256Digest::of_bytes(interface),
+        };
+        let engine = IsolatedChildEngine::for_authorized_grant(
+            executor,
+            sink,
+            binding,
+            &grant,
+            Sha256Digest::of_bytes(b"component-config-fixture"),
+        );
+        // The seated engine enforces exactly the grant-proven digest: a
+        // caller-claimed digest cannot reach the manifest gate.
+        assert_eq!(
+            engine.admitted_artifact_digest(),
+            &Sha256Digest::of_bytes(artifact)
+        );
+        assert_eq!(engine.admitted_artifact_digest(), grant.artifact_digest());
     }
 }

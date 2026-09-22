@@ -1182,6 +1182,11 @@ struct JobChildHandles {
     command_line_utf16: Vec<u16>,
     stdout: Option<std::fs::File>,
     stderr: Option<std::fs::File>,
+    /// Retained parent stdin writer (issue #1941 result flow). Kept — never
+    /// inherited, never duplicated — so an interactive turn protocol can
+    /// write post-launch; the P-04 owner closes it immediately for
+    /// non-interactive launches, preserving deterministic EOF there.
+    stdin: Option<std::fs::File>,
     observer: JobProcessObserver,
     terminal: bool,
 }
@@ -1314,6 +1319,11 @@ struct ExistingJobMemberHandles {
     command_line_utf16: Vec<u16>,
     stdout: Option<std::fs::File>,
     stderr: Option<std::fs::File>,
+    /// Retained parent stdin writer (issue #1941 result flow), same
+    /// discipline as `JobChildHandles::stdin` above: kept so an
+    /// interactive turn protocol can write post-launch; closed immediately
+    /// by the P-04 owner for non-interactive launches.
+    stdin: Option<std::fs::File>,
     job_identity: JobObjectIdentity,
     terminal: bool,
 }
@@ -1521,9 +1531,12 @@ fn spawn_existing_job_member(
         return Err(WindowsAdapterError::Failed);
     }
     drop(stdin_read);
-    drop(stdin_write);
     drop(stdout_write);
     drop(stderr_write);
+    // Parent stdin writer retained (not dropped): the P-04 owner closes it
+    // immediately for non-interactive launches (deterministic EOF
+    // preserved) and keeps it for interactive turn protocols.
+    let stdin_write = stdin_write.into_file();
     let process = OwnedProcessHandle::new(information.hProcess)?;
     let thread = OwnedProcessHandle::new(information.hThread)?;
     let mut cleanup = SuspendedProcessCleanup {
@@ -1541,6 +1554,7 @@ fn spawn_existing_job_member(
         command_line_utf16,
         stdout: Some(stdout_read.into_file()),
         stderr: Some(stderr_read.into_file()),
+        stdin: Some(stdin_write),
         job_identity: job.identity().clone(),
         terminal: false,
     };
@@ -1742,6 +1756,14 @@ impl<V> RunningExistingJobChild<'_, V> {
     #[must_use]
     pub fn take_stderr(&mut self) -> Option<std::fs::File> {
         self.inner.stderr.take()
+    }
+
+    /// Takes the retained parent stdin writer, when present. Each take
+    /// consumes the handle: at most one writer exists per child, so no
+    /// second writer can interleave frames on the same stdin.
+    #[must_use]
+    pub fn take_stdin(&mut self) -> Option<std::fs::File> {
+        self.inner.stdin.take()
     }
 
     /// Observes only this process and the current member count of the shared
@@ -2084,10 +2106,12 @@ impl SuspendedJobChild {
             }
             return Err(WindowsAdapterError::Failed);
         }
-        // Parent keeps only the read sides. Closing the sole parent stdin
-        // writer gives the child deterministic EOF instead of inherited input.
+        // Parent keeps only the read sides by default. The stdin writer is
+        // retained (not dropped): the P-04 owner closes it immediately for
+        // non-interactive launches (deterministic EOF preserved) and keeps
+        // it for interactive turn protocols.
         drop(stdin_read);
-        drop(stdin_write);
+        let stdin_write = stdin_write.into_file();
         drop(stdout_write);
         drop(stderr_write);
         let process = OwnedProcessHandle::new(information.hProcess)?;
@@ -2108,6 +2132,7 @@ impl SuspendedJobChild {
             command_line_utf16,
             stdout: Some(stdout_read.into_file()),
             stderr: Some(stderr_read.into_file()),
+            stdin: Some(stdin_write),
             observer,
             terminal: false,
         };
@@ -2252,6 +2277,15 @@ impl<V> RunningJobChild<V> {
     #[must_use]
     pub fn take_stderr(&mut self) -> Option<std::fs::File> {
         self.inner.stderr.take()
+    }
+
+    /// Transfers ownership of the retained parent stdin write handle
+    /// exactly once. Each take consumes the handle: at most one writer
+    /// exists per child, so no second writer can interleave frames on the
+    /// same stdin.
+    #[must_use]
+    pub fn take_stdin(&mut self) -> Option<std::fs::File> {
+        self.inner.stdin.take()
     }
 
     /// Returns an idempotent observation without changing typestate.

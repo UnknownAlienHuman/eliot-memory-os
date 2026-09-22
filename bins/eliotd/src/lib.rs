@@ -41,6 +41,7 @@ mod capability_admission;
 mod capability_evidence_wiring;
 pub mod capability_outcome;
 mod controlboard_adapters;
+pub mod controlboard_serve;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
@@ -58,6 +59,7 @@ mod kernel_transition_client;
 pub mod notification_board_attach;
 mod observation_adapters;
 mod process_origin;
+pub mod reactive_feed;
 mod route_receipts;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -153,12 +155,16 @@ pub use governor_local_read::{
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use process_origin::{
-    CapabilityEvidenceSource, Generation, OperationDisposition,
-    OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant,
-    OriginControlOperation, OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY,
-    PhysicalProcessBinding, ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError,
-    ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
-    request_origin_control,
+    CapabilityEvidenceSource, Generation, OperationDisposition, OriginChallenge,
+    OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
+    OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY, PhysicalProcessBinding,
+    ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError, ProcessOriginEvidence,
+    ProcessStatusReceipt, canonical_origin_digest, gate_process_control, request_origin_control,
+};
+pub use reactive_feed::{
+    BorrowedReactiveFeedOwner, ReactiveFeedOwnerSnapshot, ReactiveFeedOwnerSource,
+    ReactiveFeedSupplyError, drive_daemon_feed, drive_daemon_feed_from_owners,
+    drive_daemon_feed_from_source, project_live_bindings,
 };
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
@@ -322,6 +328,10 @@ pub struct DaemonComposition {
     /// execute. Semantics stay in the Governor registry; this is the
     /// composition root's handle on that view.
     capability_admission: GovernorCapabilityAdmission,
+    /// Optional live A4 owner source. The source is a read-only composition
+    /// hook; it retains no queue or delivery authority and is invoked afresh
+    /// under the Governor activation fence on each scheduling tick.
+    reactive_feed_source: Option<Arc<dyn reactive_feed::ReactiveFeedOwnerSource>>,
 }
 
 impl DaemonComposition {
@@ -367,6 +377,9 @@ impl DaemonComposition {
             &config.launch().kernel,
             QueueLimits::default(),
         )?;
+        let reactive_feed_source = Arc::new(reactive_feed::GovernorReactiveFeedSource::new(
+            governor.reactive_owner_suppliers(),
+        ));
         Ok(Self {
             governor,
             config_lease,
@@ -382,6 +395,7 @@ impl DaemonComposition {
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
+            reactive_feed_source: Some(reactive_feed_source),
         })
     }
 
@@ -455,6 +469,192 @@ impl DaemonComposition {
     #[must_use]
     pub fn policy_owner(&self) -> Option<&eliot_governor::PolicyOwner> {
         self.governor.owners().policy.as_ref()
+    }
+
+    /// Registers the one live A4 owner source used by the daemon scheduler.
+    ///
+    /// Registration only installs a read-only adapter. The adapter must read
+    /// the six typed projections from their real owners for each tick; this
+    /// composition does not retain a projection snapshot, queue, receipt, or
+    /// alternate authority. Duplicate registration is rejected so two
+    /// reactive schedulers cannot race the same activation.
+    pub fn register_reactive_feed_source(
+        &mut self,
+        source: Arc<dyn reactive_feed::ReactiveFeedOwnerSource>,
+    ) -> Result<(), DaemonError> {
+        if self.reactive_feed_source.is_some() {
+            return Err(DaemonError::Lifecycle(
+                "reactive feed owner source is already registered".to_owned(),
+            ));
+        }
+        self.reactive_feed_source = Some(source);
+        Ok(())
+    }
+
+    /// Publishes the owner-issued A15 context view through the Governor's
+    /// authenticated projection boundary.
+    pub fn publish_reactive_context_view(
+        &self,
+        now: u64,
+        view: eliot_context_contracts::ContextPlanningView,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_context_view(now, view)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes the owner-issued A10 cue activation through the Governor.
+    pub fn publish_reactive_cue_activation(
+        &self,
+        now: u64,
+        cue: eliot_reactive_context_plan::ReactiveCueActivation,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_cue_activation(now, cue)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes the session owner's retained delivery snapshot.
+    pub fn publish_reactive_session_delivery(
+        &self,
+        now: u64,
+        session: eliot_context_contracts::SessionDeliverySnapshot,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_session_delivery(now, session)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes the attention owner's retained critical-attention projection.
+    pub fn publish_reactive_critical_attention(
+        &self,
+        now: u64,
+        attention: eliot_context_contracts::CriticalAttentionProjection,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_critical_attention(now, attention)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes the verified coverage/watchdog/trace projection.
+    pub fn publish_reactive_integration_coverage(
+        &self,
+        now: u64,
+        coverage: eliot_context_contracts::IntegrationCoverageProfile,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_integration_coverage(now, coverage)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes the policy owner's exact delivery policy.
+    pub fn publish_reactive_delivery_policy(
+        &self,
+        now: u64,
+        policy: eliot_reactive_context_plan::ReactiveDeliveryPolicy,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_delivery_policy(now, policy)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes one complete set emitted by the reactive semantic owners.
+    ///
+    /// The Governor binds the set to the live activation and accepted
+    /// observation evidence, validates the admitted cue/index rows, and
+    /// installs all six typed inputs atomically for the existing cadence.
+    /// Missing or stale owner material remains a withheld feed rather than a
+    /// synthetic planning input.
+    pub fn publish_reactive_owner_projections(
+        &self,
+        now: u64,
+        projections: eliot_governor::GovernorReactiveProjectionSet,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_owner_projections(now, projections)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes retained cue/index rows from the cue and context owners.
+    pub fn publish_reactive_owner_sources(
+        &self,
+        now: u64,
+        sources: Vec<eliot_governor::ReactiveOwnerSource>,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_owner_sources(now, sources)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Drives the registered owner source from the existing activation-poll
+    /// cadence. `None` means no A4 source has been registered yet; it is an
+    /// explicit unconfigured state and never a fabricated empty feed.
+    pub fn drive_registered_reactive_feed(
+        &self,
+        now: u64,
+    ) -> Result<Option<eliot_reactive_context_plan::SettledPlanFeedOutcome>, DaemonError> {
+        let Some(source) = self.reactive_feed_source.as_ref() else {
+            return Ok(None);
+        };
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let Some(snapshot) = self
+            .governor
+            .prepare_reactive_feed_tick(now)
+            .map_err(DaemonError::Composition)?
+        else {
+            return Ok(None);
+        };
+        match reactive_feed::drive_daemon_feed_from_source(
+            &snapshot,
+            &self.governor.owners().observation,
+            source.as_ref(),
+        ) {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(reactive_feed::ReactiveFeedSupplyError::OwnerWithheld { projection, reason }) => {
+                tracing::debug!(
+                    target: "eliotd::reactive_feed",
+                    projection,
+                    reason = %reason,
+                    event = "eliotd.reactive_feed_withheld",
+                );
+                Ok(None)
+            }
+            Err(error) => Err(DaemonError::Lifecycle(error.to_string())),
+        }
+    }
+
+    /// Drives one reactive Context feed from the live daemon composition.
+    ///
+    /// The daemon obtains the activation snapshot from the authenticated
+    /// Governor owners and the admitted observation journal from that same
+    /// owner set. The caller supplies only the immutable cue/index rows and
+    /// six A4 projections emitted by their owning lanes; the feed adapter
+    /// cross-checks those rows against the journal before planning. This is
+    /// the composition entrypoint used by the Host runtime when its owner
+    /// projections are ready. No queue, receipt, or alternate authority is
+    /// retained here.
+    pub fn drive_reactive_feed(
+        &self,
+        now: u64,
+        owner_sources: &[eliot_governor::ReactiveOwnerSource],
+        inputs: eliot_reactive_context_plan::SettledPlanFeedInputs<'_>,
+    ) -> Result<eliot_reactive_context_plan::SettledPlanFeedOutcome, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let snapshot = self
+            .governor
+            .read_unique_agent_activation(now)
+            .map_err(DaemonError::Composition)?;
+        reactive_feed::drive_daemon_feed_from_owners(
+            &snapshot,
+            &self.governor.owners().observation,
+            owner_sources,
+            inputs,
+        )
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Returns the retained protected daemon state root.
@@ -722,6 +922,33 @@ impl DaemonComposition {
             // attach; empty until that attach lands, never fabricated.
             self.notification_snapshot.clone(),
         ))
+    }
+
+    /// Serves one live `ControlBoard` inbox for one observed envelope (#1780).
+    ///
+    /// Per-request serve dispatch over the current Governor projection
+    /// snapshot: triple-binds the envelope session claim against the held
+    /// Kernel-issued owner facts and the kernel-minted attempt's admitted
+    /// session binding (foreign or absent claim, or attempt bound
+    /// elsewhere, skips explicitly), builds one board through
+    /// [`Self::controlboard`], and serves the fence-pinned inbox from the
+    /// observed fields with the attempt's fencing generation via
+    /// [`controlboard_serve`]. No owner session → typed access-resolver
+    /// gap; Governor not ready → composition error; view refusals → typed
+    /// board gaps. Pure in-memory reads: no I/O, no new thread, no stored
+    /// client, no new scheduler.
+    pub fn serve_board_for_envelope(
+        &self,
+        envelope: &eliot_protocol::HostRequestEnvelope,
+        attempt: &eliot_protocol::LocalReadAttempt,
+    ) -> Result<controlboard_serve::BoardServeDispatch, controlboard_serve::ControlboardServeError>
+    {
+        controlboard_serve::serve_board_for_envelope(
+            self.owner_session.as_ref(),
+            || self.controlboard(),
+            envelope,
+            attempt,
+        )
     }
 
     /// Borrows the single Governor Skill lifecycle owner as a forwarding

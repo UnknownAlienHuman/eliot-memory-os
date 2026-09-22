@@ -70,6 +70,7 @@ pub enum CommandId {
     BackupRestoreTest,
     MaintenanceRun,
     UserAutomation,
+    BoardInbox,
 }
 
 impl CommandId {
@@ -102,6 +103,7 @@ impl CommandId {
             Self::BackupRestoreTest => "backup-restore-test",
             Self::MaintenanceRun => "maintenance-run",
             Self::UserAutomation => "user-automation",
+            Self::BoardInbox => "controlboard-inbox",
         }
     }
 }
@@ -179,6 +181,12 @@ pub enum CommandArguments {
     UserAutomation {
         operation: UserAutomationCommand,
     },
+    /// Fixed board-inbox read: no caller parameters. The serving runtime
+    /// reconciles the closed read (all scopes, resolved records included,
+    /// bounded page) on every request; fences and identity arrive through
+    /// the admitted request path, never through these arguments. The
+    /// variant name mirrors the command id so the schema join resolves.
+    ControlboardInbox,
 }
 
 impl CommandArguments {
@@ -210,6 +218,7 @@ impl CommandArguments {
             Self::BackupRestoreTest => CommandId::BackupRestoreTest,
             Self::MaintenanceRun => CommandId::MaintenanceRun,
             Self::UserAutomation { .. } => CommandId::UserAutomation,
+            Self::ControlboardInbox => CommandId::BoardInbox,
         }
     }
 
@@ -287,6 +296,7 @@ impl CommandArguments {
             | Self::BackupCreate
             | Self::BackupVerify
             | Self::BackupRestoreTest
+            | Self::ControlboardInbox
             | Self::MaintenanceRun => Ok(()),
         }
     }
@@ -1500,6 +1510,20 @@ static COMMANDS: &[CommandSpec] = &[
             dependency: "authenticated Kernel selector eliot_user_automation is not registered",
         },
     },
+    CommandSpec {
+        id: CommandId::BoardInbox,
+        usage: "pipe an admitted board-inbox command request to eliot dispatch",
+        summary: "read the authenticated canonical notification inbox for the operator",
+        owner: "eliot-kernel-service",
+        required_work_id: "1780",
+        argument_kind: ArgumentKind::Empty,
+        effect: EffectClass::Read,
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+        availability: CommandAvailability::PlanGap {
+            missing_work_id: "1780",
+            dependency: "authenticated Kernel board/inbox read is not registered",
+        },
+    },
 ];
 
 /// Errors from catalogue generation or pure client validation.
@@ -1783,9 +1807,10 @@ fn validate_result_for(
         // The catalogue remains an honest PlanGap until the Kernel selector
         // is registered, but an authenticated provider may already expose the
         // exact typed route. Accept that provider projection only for the
-        // UserAutomation command; local `execute` still returns PlanGap.
+        // UserAutomation and BoardInbox commands; local `execute` still
+        // returns PlanGap.
         (CommandAvailability::PlanGap { .. }, CommandResult::Forwarded { .. })
-            if command == CommandId::UserAutomation => {}
+            if command == CommandId::UserAutomation || command == CommandId::BoardInbox => {}
         (
             CommandAvailability::Unsupported { dependency, detail },
             CommandResult::Unavailable {
@@ -2602,6 +2627,46 @@ mod tests {
             ),
             Err(CliError::ResultMismatch)
         );
+    }
+
+    #[test]
+    fn board_inbox_registers_read_only_plan_gap_with_forwarded_acceptance() {
+        use CommandAvailability::PlanGap;
+        // Static catalogue validity covers the new row: uniqueness, enum
+        // order, blank fields, proof ceiling, and provider identities.
+        CommandCatalogue::current()
+            .validate()
+            .expect("catalogue with board inbox validates");
+        let spec = CommandCatalogue::current()
+            .commands()
+            .iter()
+            .find(|spec| spec.id == CommandId::BoardInbox)
+            .expect("board inbox is registered");
+        assert_eq!(spec.id.as_str(), "controlboard-inbox");
+        assert_eq!(spec.required_work_id, "1780");
+        assert_eq!(spec.argument_kind, ArgumentKind::Empty);
+        // Bijection: the unit arguments resolve to the registered command
+        // and validate clean.
+        let arguments = CommandArguments::ControlboardInbox;
+        assert_eq!(arguments.command_id(), CommandId::BoardInbox);
+        arguments
+            .validate()
+            .expect("empty board arguments validate");
+        // A forwarded provider projection is accepted under the honest
+        // PlanGap; local execute still returns PlanGap.
+        let availability = PlanGap {
+            missing_work_id: "1780",
+            dependency: "authenticated Kernel board/inbox read is not registered",
+        };
+        assert_eq!(spec.availability, availability);
+        validate_result_for(
+            CommandId::BoardInbox,
+            &availability,
+            &CommandResult::Forwarded {
+                payload: serde_json::json!({"status": "inbox"}),
+            },
+        )
+        .expect("forwarded board projection is accepted");
     }
 
     #[test]

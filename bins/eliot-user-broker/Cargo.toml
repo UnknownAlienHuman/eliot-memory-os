@@ -20,6 +20,7 @@ eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 eliot-process-executor.workspace = true
+eliot-notify = { path = "../eliot-notify", version = "0.1.0" }
 eliot-protocol.workspace = true
 eliot-user-broker-core.workspace = true
 serde.workspace = true

@@ -41,6 +41,7 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+pub mod automation_notification_client;
 mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
@@ -112,6 +113,7 @@ use eliot_kernel_core::{
     ProcessExecutionReplayRecord, ProcessExecutionReplayState, process_admission_digest,
 };
 
+mod board_inbox_serve;
 mod daemon_live_receipt;
 #[cfg(windows)]
 mod daemon_process_launch;
@@ -140,6 +142,13 @@ pub mod reactive_restore_serve;
 mod runtime_identity;
 mod shutdown_drain;
 mod startup_coordinator;
+mod wasm_runtime_port_grant;
+pub use wasm_runtime_port_grant::{
+    HandlerSession, KernelObservedGrantFacts, WASM_GRANT_REQUEST_WIRE_ID,
+    WASM_GRANT_REQUEST_WIRE_VERSION, WASM_PORT_GRANT_OPERATION, WASM_PORT_GRANT_WIRE_ID,
+    WASM_PORT_GRANT_WIRE_VERSION, WasmGrantError, WasmGrantExpectation, WasmGrantRequest,
+    WasmPortGrant, handle_wasm_port_grant, issue_wasm_port_grant, validate_wasm_port_grant,
+};
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
@@ -209,7 +218,8 @@ pub use doctor_recovery_ledger::{KernelDoctorRecoveryLedger, doctor_recovery_led
 /// worker binding is invented (worker handoff is T12-09).
 pub use dreamer_job_dispatch::DREAMER_JOB_WIRE_ID;
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, RequestId, ResourceGeneration, StateFence,
+    ArtifactId, AuthorityEpoch, ContractId, RequestId, RequestMetadata, ResourceGeneration,
+    StateFence,
 };
 use eliot_ipc::{
     AcceptedAgentBridgeTransport, HandshakeResult, PeerIdentity, ServerFirstConnection,
@@ -323,7 +333,7 @@ use eliot_protocol::{
     AgentBridgeActivationDisposition, AgentBridgeActivationFence, AgentBridgeActivationRequest,
     AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration,
     AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind,
-    MessageType, ProtocolPayload,
+    HostRequestEnvelope, MessageType, ProtocolPayload, ReactiveRestoreQuery,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 #[cfg(test)]
@@ -475,6 +485,10 @@ pub struct KernelComposition {
     /// while no approved blob manifest was injected; `Some` validates the
     /// manifest at startup without starting the generation.
     blob_store: Mutex<Option<BlobStoreController>>,
+    /// One optional, explicitly installer-bound Notify client retained by
+    /// Kernel composition. The client is supplied to the UserAutomation
+    /// runtime owner; this field owns no notification state or policy.
+    notification_client: Option<Arc<automation_notification_client::KernelNotificationClient>>,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
@@ -799,6 +813,35 @@ pub enum KernelFrameAction {
         /// Closed operation name; must equal `DREAMER_JOB_WIRE_ID`.
         operation: String,
         /// Bounded operation payload carrying context plus typed job request.
+        payload: serde_json::Value,
+    },
+    /// Execute one authenticated reactive restore over the existing Host
+    /// request admission and canonical Store projection path.  The query and
+    /// request metadata were decoded and linked by the central Host route;
+    /// Store I/O and durable result landing happen in the async front-door
+    /// arm, never in the decoder.
+    #[cfg(windows)]
+    ReactiveRestore {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Exact admitted Host request envelope.
+        envelope: HostRequestEnvelope,
+        /// Request metadata carried by the authenticated frame identity.
+        context: RequestMetadata,
+        /// Exact restore query whose canonical digest is bound by the envelope.
+        query: ReactiveRestoreQuery,
+    },
+    /// Serve one authenticated operator board-inbox read (#1780). The
+    /// operation carries the exact board-inbox wire identity; canonical
+    /// read admission itself is owned by the serving function in
+    /// `board_inbox_serve` over the retained store gateway. Intake is
+    /// `Ready`-gated. No process is spawned inside this handler.
+    BoardInbox {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name; must equal `BOARD_INBOX_OPERATION`.
+        operation: String,
+        /// Bounded operation payload; must be the empty board-inbox request.
         payload: serde_json::Value,
     },
     /// Return a typed rejection, then fence the connection.
@@ -1199,6 +1242,18 @@ impl KernelComposition {
             .map_err(|_| "bridge connection lock poisoned".to_owned())?
             .values()
             .any(|state| state.session.is_some() || state.activation_completed))
+    }
+
+    /// Returns the single Kernel-owned Notify delivery client, when Host/B2
+    /// supplied an explicit installed binding during composition.
+    ///
+    /// The returned client is a transport port only. UserAutomation remains
+    /// the owner of failure semantics, while Notify remains the owner of
+    /// notification state and delivery policy.
+    pub fn user_automation_notification_client(
+        &self,
+    ) -> Option<Arc<automation_notification_client::KernelNotificationClient>> {
+        self.notification_client.clone()
     }
 
     #[cfg(windows)]

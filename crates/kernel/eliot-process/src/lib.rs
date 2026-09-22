@@ -16,6 +16,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -434,6 +436,14 @@ pub struct ProcessIntent {
     environment: EnvironmentProjection,
     resource_limits: ResourceLimits,
     effect_digest: String,
+    /// Opt-in interactive stdin retention (issue #1941 result flow).
+    /// `false` preserves the default deterministic-EOF behavior for every
+    /// existing non-interactive launch; `true` (via
+    /// [`with_interactive_stdin`](Self::with_interactive_stdin)) keeps the
+    /// parent stdin writer so a turn protocol can write post-launch. The
+    /// flag is digest-bound, so the dispatch permit authorizes it.
+    #[serde(default)]
+    interactive_stdin: bool,
 }
 
 impl ProcessIntent {
@@ -467,10 +477,35 @@ impl ProcessIntent {
             environment,
             resource_limits,
             effect_digest: String::new(),
+            interactive_stdin: false,
         };
         intent.validate_without_digest()?;
         intent.effect_digest = intent.compute_effect_digest()?;
         Ok(intent)
+    }
+
+    /// Opts into interactive stdin retention, resealing the digest.
+    ///
+    /// The dispatch permit issued over the resealed digest authorizes the
+    /// interactive mode explicitly; permits issued before the opt-in do not
+    /// cover it. Validates shape plus digest before return.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError`] when the resealed digest cannot be computed.
+    pub fn with_interactive_stdin(mut self) -> Result<Self, ContractError> {
+        self.interactive_stdin = true;
+        self.effect_digest = self.compute_effect_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Returns whether the parent stdin writer is retained for post-launch
+    /// turn-protocol writes. `false` keeps deterministic EOF for every
+    /// existing non-interactive launch.
+    #[must_use]
+    pub const fn interactive_stdin(&self) -> bool {
+        self.interactive_stdin
     }
 
     /// Validates exact launch material and its digest.
@@ -525,6 +560,7 @@ impl ProcessIntent {
             working_directory: &'a str,
             environment: &'a EnvironmentProjection,
             resource_limits: ResourceLimits,
+            interactive_stdin: bool,
         }
         hash_serialized(&EffectMaterial {
             operation_id: &self.operation_id,
@@ -539,6 +575,7 @@ impl ProcessIntent {
             working_directory: &self.working_directory,
             environment: &self.environment,
             resource_limits: self.resource_limits,
+            interactive_stdin: self.interactive_stdin,
         })
     }
 
@@ -2654,6 +2691,70 @@ pub trait ProcessExecutor: Send + Sync {
         &self,
         operation_id: OperationId,
     ) -> Result<ProcessEvidence, ProcessExecutionError>;
+}
+
+/// Maximum stdin bytes accepted by one interactive write (I7.2 hot-turn
+/// bound: turn protocol frames are small; larger inputs chunk across
+/// writes, never bypass the bound).
+pub const MAX_CHILD_STDIN_WRITE_BYTES: usize = 64 * 1024;
+
+/// One interactive stdout read window: the bytes observed plus whether the
+/// stream ended. An empty non-terminal window is a spurious wakeup, never
+/// EOF: the caller retries within its own deadline. Timeouts surface as
+/// empty windows, never as errors, so the caller (deadline owner) decides
+/// between retry and unknown outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildStdoutChunk {
+    /// Observed stdout bytes (at most the requested maximum).
+    pub bytes: Vec<u8>,
+    /// True only when stdout closed: no further bytes will ever arrive.
+    pub end_of_stream: bool,
+}
+
+/// One explicitly sendable future shape for every interactive child I/O call.
+pub type InteractiveChildFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ProcessExecutionError>> + Send + 'a>>;
+
+/// Bounded interactive child stdio channel for request/response turn
+/// protocols (issue #1941 result flow).
+///
+/// Provider-neutral capability boundary for JSONL-style turn sessions over
+/// an admitted child's stdio: write bounded input frames (turn requests)
+/// and read bounded stdout windows with an explicit per-call deadline.
+/// Methods are async for caller citizenship; implementations back waits
+/// with blocking pipe IO bounded by the deadline (no async runtime
+/// required — the existing P-03 async methods already work this way).
+/// Pipe mechanics, handle retention, Job containment, and deadlines stay
+/// with the physical implementation (P-04); this contract only bounds
+/// shapes, identities, and failure dimensions. It mints nothing: the
+/// operation must already exist (launched through [`ProcessExecutor`]).
+///
+/// Failure mapping (implementors): unknown operation → [`NotFound`](ProcessExecutionError::NotFound);
+/// unavailable executor, closed/broken stdin, or short write →
+/// [`Unavailable`](ProcessExecutionError::Unavailable); over-bound write →
+/// [`Contract`](ProcessExecutionError::Contract)
+/// (`LimitExceeded` on `stdin_write_bytes`); evidence-sink interaction
+/// stays with [`ProcessExecutor`], never this channel.
+#[allow(async_fn_in_trait)]
+pub trait InteractiveChildChannel: Send + Sync {
+    /// Writes one bounded input frame to the admitted child's stdin.
+    /// Implementations write all bytes or fail; short writes are errors,
+    /// never silent truncation.
+    fn write_child_stdin(
+        &self,
+        operation_id: OperationId,
+        bytes: Vec<u8>,
+    ) -> InteractiveChildFuture<'_, usize>;
+
+    /// Reads up to `max_bytes` stdout bytes within `deadline`. Returns
+    /// whatever arrived (possibly empty with `end_of_stream: false` on
+    /// timeout); `end_of_stream: true` means stdout closed.
+    fn read_child_stdout(
+        &self,
+        operation_id: &OperationId,
+        max_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> InteractiveChildFuture<'_, ChildStdoutChunk>;
 }
 
 /// Kernel-owned launch proof checked after suspension and immediately before

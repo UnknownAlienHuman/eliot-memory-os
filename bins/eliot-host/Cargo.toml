@@ -16,6 +16,7 @@ eliot-host-control-endpoint.workspace = true
 eliot-host-service.workspace = true
 eliot-kernel-core.workspace = true
 eliot-installation.workspace = true
+eliot-notify = { path = "../eliot-notify", version = "0.1.0" }
 eliot-ipc.workspace = true
 eliot-kernel-service.workspace = true
 eliot-host-state.workspace = true

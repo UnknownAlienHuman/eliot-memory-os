@@ -3,8 +3,9 @@
 use std::io::{self, Write};
 
 use eliot_wasm_host::{
-    CliError, TypedWorld, default_experimental_limits, execute_describe_experimental, parse_args,
-    read_bounded_artifact, resolve_kernel_port_grant, run_guest_exec,
+    CliError, GrantLaunchArgs, TypedWorld, default_experimental_limits, drive_dispatch,
+    execute_describe_experimental, parse_args, read_bounded_artifact, resolve_kernel_port_grant,
+    run_grant_launch, run_guest_exec,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -28,6 +29,102 @@ fn emit_receipt(fields: &[(&str, &str)]) {
     }
     let _ = writeln!(stdout);
     let _ = writeln!(stdout, "}}");
+}
+
+fn emit_stderr_receipt(fields: &[(&str, &str)]) {
+    let mut stderr = io::stderr().lock();
+    let mut first = true;
+    let _ = write!(stderr, "{{");
+    for (key, value) in fields {
+        if !first {
+            let _ = write!(stderr, ",");
+        }
+        first = false;
+        let _ = write!(stderr, "\"{key}\":\"{value}\"");
+    }
+    let _ = writeln!(stderr);
+    let _ = writeln!(stderr, "}}");
+}
+
+/// Renders one lifecycle verdict as its stable receipt token.
+const fn verdict_text(verdict: eliot_wasm_runtime::VerificationVerdict) -> &'static str {
+    match verdict {
+        eliot_wasm_runtime::VerificationVerdict::Verified => "verified",
+        eliot_wasm_runtime::VerificationVerdict::Rejected => "rejected",
+    }
+}
+
+/// Runs the owner-dispatched parent drive branch: exactly one admitted
+/// operation to the canonical response. Returns true when a dispatch file
+/// was staged (success emitted, raw guest bytes on stdout, receipt on
+/// stderr); false on absence so the caller falls through to CLI modes.
+/// Any other denial exits the process fail-closed.
+fn run_dispatch_drive_branch() -> bool {
+    use eliot_wasm_host::DriveError;
+    match drive_dispatch() {
+        Ok(response) => {
+            let _ = io::stdout().lock().write_all(&response.output);
+            let output_bytes = response.output.len().to_string();
+            let fuel = response.fuel_consumed.to_string();
+            let peak = response.peak_memory_bytes.to_string();
+            let tables = response.table_elements.to_string();
+            let ticks = response.epoch_ticks.to_string();
+            let shadow = verdict_text(response.verdicts.shadow);
+            let canary = verdict_text(response.verdicts.canary);
+            let rollback = verdict_text(response.verdicts.rollback);
+            let cutover = verdict_text(response.verdicts.cutover);
+            emit_stderr_receipt(&[
+                ("status", "dispatch-drive-complete"),
+                ("operation", &response.operation_id),
+                ("component", &response.component_id),
+                ("artifact_digest", &response.artifact_digest),
+                ("input_digest", &response.input_digest),
+                ("host_artifact_digest", &response.host_artifact_digest),
+                ("output_digest", &response.output_digest),
+                ("output_bytes", &output_bytes),
+                ("fuel_consumed", &fuel),
+                ("peak_memory_bytes", &peak),
+                ("table_elements", &tables),
+                ("epoch_ticks", &ticks),
+                ("verdict_shadow", shadow),
+                ("verdict_canary", canary),
+                ("verdict_rollback", rollback),
+                ("verdict_cutover", cutover),
+            ]);
+            true
+        }
+        Err(DriveError::NoMaterial) => false,
+        Err(error) => {
+            emit_error("DISPATCH_DRIVE_DENIED", &error.to_string());
+            std::process::exit(ADMISSION_REQUIRED_EXIT);
+        }
+    }
+}
+
+/// Runs the governed grant-launch branch: full pipeline, staged receipt on
+/// stdout on success, stage-taxonomy denial on stderr otherwise. Returns on
+/// success; exits the process on denial or argument failure upstream.
+fn run_grant_launch_branch(grant: &GrantLaunchArgs) {
+    match run_grant_launch(grant) {
+        Ok(receipt) => {
+            let deadline = receipt.deadline_unix_ms.to_string();
+            emit_receipt(&[
+                ("status", "grant-launch-staged"),
+                ("component", &receipt.component_id),
+                ("artifact_digest", &receipt.artifact_digest),
+                ("interface_digest", &receipt.interface_digest),
+                ("host_artifact_digest", &receipt.host_artifact_digest),
+                ("engine", &receipt.engine_implementation_id),
+                ("engine_artifact_digest", &receipt.engine_artifact_digest),
+                ("nonce", &receipt.nonce),
+                ("deadline_unix_ms", &deadline),
+            ]);
+        }
+        Err(error) => {
+            emit_error("GRANT_LAUNCH_DENIED", &error.to_string());
+            std::process::exit(ADMISSION_REQUIRED_EXIT);
+        }
+    }
 }
 
 fn main() {
@@ -63,6 +160,25 @@ fn main() {
     // contaminate stdout.
     if let Some(guest) = &config.guest_exec {
         std::process::exit(run_guest_exec(guest));
+    }
+
+    // Owner-dispatched parent drive: a staged dispatch file beside this
+    // image means the Kernel admitted exactly one operation. The reaped
+    // child runs the guest; this branch reaps it and emits the canonical
+    // response (raw guest bytes on stdout, receipt on stderr). Absence
+    // falls through to the CLI modes below. Guest-exec stays first so a
+    // reaped child never drives as a parent.
+    if run_dispatch_drive_branch() {
+        return;
+    }
+
+    // Governed grant launch: the dedicated executable consumer path. Runs
+    // the full pipeline — channel binding, bundle from real bytes,
+    // authenticated transport request, descriptor authorization, installed
+    // binary resolution, engine staging — and emits the staged receipt on
+    // success. Every denial stays fail-closed with a stage-taxonomy code.
+    if let Some(grant) = &config.grant_launch {
+        run_grant_launch_branch(grant);
     }
 
     if let (Some(component_path), Some(world_name)) = (
@@ -113,11 +229,10 @@ fn main() {
         return;
     }
 
-    // The live governed path requires a Kernel-admitted RuntimePorts grant.
-    // No admission channel is bound yet, so resolution fails closed before
-    // any engine, runner, or invocation is constructed. A grant that ever
-    // resolves here still has no authenticated request loop to serve it, so
-    // holding it would invent authority: stay denied in that case too.
+    // No mode selected: the live governed path requires a Kernel-admitted
+    // RuntimePorts grant, and no admission channel is bound here, so
+    // resolution fails closed before any engine, runner, or invocation is
+    // constructed. Governed work enters through `--grant-launch` above.
     match resolve_kernel_port_grant() {
         Ok(_grant) => {
             emit_error(
