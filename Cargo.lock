@@ -1173,11 +1173,20 @@ name = "eliot-cues"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-change-monitor",
  "eliot-contracts",
+ "eliot-cue-activation",
+ "eliot-cue-binding",
  "eliot-cue-contracts",
+ "eliot-cue-index",
+ "eliot-cue-normalizer",
  "eliot-evidence",
+ "eliot-observation",
+ "eliot-observation-contracts",
+ "eliot-receipts",
  "schemars",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1828,11 +1837,13 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-store-api",
  "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
