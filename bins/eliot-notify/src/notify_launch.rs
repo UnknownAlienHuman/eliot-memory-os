@@ -39,6 +39,8 @@ pub struct VerifiedNotifyLaunch {
     pub executable_path: PathBuf,
     /// Digest of the exact bytes observed at resolution.
     pub artifact_digest: NotifyDigest,
+    /// Installation identity from the validated declaration record.
+    pub installation_identity: String,
 }
 
 impl VerifiedNotifyLaunch {
@@ -52,6 +54,12 @@ impl VerifiedNotifyLaunch {
     #[must_use]
     pub const fn artifact_digest(&self) -> &NotifyDigest {
         &self.artifact_digest
+    }
+
+    /// Returns the installation identity from the validated record.
+    #[must_use]
+    pub fn installation_identity(&self) -> &str {
+        &self.installation_identity
     }
 }
 
@@ -125,6 +133,7 @@ pub fn resolve_notify_launch_inputs(
     Ok(VerifiedNotifyLaunch {
         executable_path: installed.path().to_path_buf(),
         artifact_digest: installed.digest().clone(),
+        installation_identity: declaration.installation_identity.as_str().to_owned(),
     })
 }
 
@@ -177,6 +186,7 @@ mod tests {
         let resolved = resolve_notify_launch_inputs(&declaration).expect("valid inputs resolve");
         assert_eq!(resolved.executable_path(), path.as_path());
         assert_eq!(resolved.artifact_digest(), &digest);
+        assert_eq!(resolved.installation_identity(), "installation:test");
         let _ = std::fs::remove_file(&path);
     }
 

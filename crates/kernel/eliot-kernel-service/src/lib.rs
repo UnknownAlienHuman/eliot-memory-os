@@ -35,6 +35,7 @@ mod lifecycle_persist_tests;
 mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
+mod notify_grant;
 mod process_execution_client;
 mod protocol;
 mod reactive_state;
@@ -103,6 +104,10 @@ pub use notification_state::{
     NotificationStateReadResponse, NotificationStateRequest, NotificationStateResponse,
     handle_notification_state_read, handle_notification_state_request,
     reconcile_notification_state,
+};
+pub use notify_grant::{
+    NOTIFY_GRANT_OPERATION_PREFIX, NOTIFY_IMAGE_FILE_NAME, NotifyGrantInputs,
+    NotifyLaunchAuthorization, bind_notify_launch_grant,
 };
 pub use process_execution_client::{
     KernelProcessExecutionClient, ProcessOperationFuture, ProcessOperationPort, ProcessStarter,

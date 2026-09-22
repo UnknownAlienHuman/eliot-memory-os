@@ -1066,8 +1066,8 @@ use fallback_verification::{
     load_fallback_material,
 };
 pub use installed_binary::{
-    InstalledNotifyBinary, NotifyBinaryBinding, NotifyBinaryError, NotifyDigest,
-    notify_binding_from_declaration, resolve_notify_binary,
+    InstalledNotifyBinary, NOTIFY_IMAGE_FILE_NAME, NotifyBinaryBinding, NotifyBinaryError,
+    NotifyDigest, notify_binding_from_declaration, resolve_notify_binary,
 };
 pub use notify_declaration::{
     NotifyDeclarationError, NotifyDeclarationInputs, RenderedNotifyDeclaration,
