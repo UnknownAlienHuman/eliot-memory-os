@@ -30,6 +30,7 @@ eliot-dreamer-probe-plan = { path = "../../crates/smart/eliot-dreamer-probe-plan
 eliot-dreamer-rival-model = { path = "../../crates/smart/eliot-dreamer-rival-model", version = "0.1.0" }
 eliot-evaluation-contracts.workspace = true
 eliot-governor.workspace = true
+eliot-testd-core.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-maintenance.workspace = true

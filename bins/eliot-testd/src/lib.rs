@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -703,6 +703,9 @@ pub struct TestdDerivedIntentParams {
     pub executable_absolute: String,
     /// SHA-256 over the resolved tool file bytes.
     pub executable_sha256: String,
+    /// Exact owner-built environment for the productive toolchain. This is
+    /// never copied from the child process ambient environment.
+    pub tool_environment: Vec<(String, String)>,
     /// Admitted generation root used as the working directory.
     pub generation_root: String,
 }
@@ -764,6 +767,17 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
         TestdError::Contract(truncate_dispatch_detail(&error.to_string()))
     };
     let generation = Generation::new(params.generation).map_err(invalid)?;
+    let environment = if params.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        validate_productive_tool_environment(&params.tool_environment, &params.executable_absolute)?
+    } else {
+        if !params.tool_environment.is_empty() {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "the probe profile admits no toolchain environment",
+            });
+        }
+        testd_profile_environment(&binding)?
+    };
     let intent = ProcessIntent::new(
         OperationId::new(params.operation_id.clone()).map_err(invalid)?,
         ProcessTreeId::new(format!("{}-tree", params.job_id)).map_err(invalid)?,
@@ -775,7 +789,7 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
         binding.package_artifact_digest.clone(),
         binding.fixed_argv.clone(),
         params.generation_root.clone(),
-        testd_profile_environment(&binding)?,
+        environment,
         testd_profile_resource_limits(&binding)?,
     )
     .map_err(invalid)?;
@@ -801,14 +815,21 @@ pub struct ResolvedTestdTool {
     pub executable_absolute: String,
     /// SHA-256 over the resolved installed tool file bytes.
     pub executable_sha256: String,
+    /// Exact child environment assembled from the resolved toolchain files
+    /// and owner-selected cargo/rustup homes.
+    pub environment: Vec<(String, String)>,
 }
 
-/// Tool file names probed on `PATH`, in order.
-#[cfg(windows)]
-const TESTD_TOOL_FILE_NAMES: &[&str] = &["cargo.exe", "cargo"];
-/// Tool file names probed on `PATH`, in order.
-#[cfg(not(windows))]
-const TESTD_TOOL_FILE_NAMES: &[&str] = &["cargo"];
+const TESTD_CARGO_TOOL: &str = "cargo";
+const TESTD_RUSTC_TOOL: &str = "rustc";
+const TESTD_ENV_NEXTEST_GATE: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON";
+const TESTD_ENV_CARGO: &str = "CARGO";
+const TESTD_ENV_RUSTC: &str = "RUSTC";
+const TESTD_ENV_CARGO_SHA256: &str = "ELIOT_TESTD_CARGO_SHA256";
+const TESTD_ENV_RUSTC_SHA256: &str = "ELIOT_TESTD_RUSTC_SHA256";
+const TESTD_ENV_CARGO_HOME: &str = "CARGO_HOME";
+const TESTD_ENV_RUSTUP_HOME: &str = "RUSTUP_HOME";
+const TESTD_ENV_PATH: &str = "PATH";
 
 /// Resolves the registry's relative program to its installed file.
 ///
@@ -820,10 +841,12 @@ const TESTD_TOOL_FILE_NAMES: &[&str] = &["cargo"];
 /// (dangling shims, directories, reparse chains that resolve to nothing
 /// usable) are skipped, and exhaustion fails closed.
 pub fn resolve_testd_tool(program_path: &str) -> Result<ResolvedTestdTool, TestdError> {
-    if program_path != eliot_testd_core::TESTD_PROFILE_PROGRAM {
+    if program_path != eliot_testd_core::TESTD_PROFILE_PROGRAM
+        && program_path != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
+    {
         return Err(TestdError::Invalid {
             field: "program_path",
-            reason: "testd admits only the closed relative tool program",
+            reason: "testd admits only the closed probe or cargo-nextest program",
         });
     }
     let probe = Path::new(program_path);
@@ -841,24 +864,55 @@ pub fn resolve_testd_tool(program_path: &str) -> Result<ResolvedTestdTool, Testd
         field: "program_path",
         reason: "the platform tool locator carries no PATH",
     })?;
-    for directory in std::env::split_paths(&path_var) {
-        for file_name in TESTD_TOOL_FILE_NAMES {
+    let executable = resolve_tool_file(program_path, &path_var)?;
+    if program_path == eliot_testd_core::TESTD_PROFILE_PROGRAM {
+        return Ok(ResolvedTestdTool {
+            executable_absolute: executable.path,
+            executable_sha256: executable.sha256,
+            environment: Vec::new(),
+        });
+    }
+    let cargo = resolve_tool_file(TESTD_CARGO_TOOL, &path_var)?;
+    let rustc = resolve_tool_file(TESTD_RUSTC_TOOL, &path_var)?;
+    let environment = productive_tool_environment(&executable, &cargo, &rustc)?;
+    Ok(ResolvedTestdTool {
+        executable_absolute: executable.path,
+        executable_sha256: executable.sha256,
+        environment,
+    })
+}
+
+struct ResolvedToolFile {
+    path: String,
+    sha256: String,
+}
+
+fn resolve_tool_file(
+    program_path: &str,
+    path_var: &std::ffi::OsStr,
+) -> Result<ResolvedToolFile, TestdError> {
+    let names: &[&str] = if cfg!(windows) {
+        match program_path {
+            "cargo" => &["cargo.exe", "cargo"],
+            "cargo-nextest" => &["cargo-nextest.exe", "cargo-nextest"],
+            "rustc" => &["rustc.exe", "rustc"],
+            _ => &[],
+        }
+    } else {
+        &[program_path]
+    };
+    for directory in std::env::split_paths(path_var) {
+        for file_name in names {
             let candidate = directory.join(file_name);
             if !candidate.is_file() {
                 continue;
             }
-            // Follow the platform shim exactly once: the executor pins
-            // real files only, so the intent must name the installed
-            // file, never the reparse point.
             let Ok(canonical) = std::fs::canonicalize(&candidate) else {
                 continue;
             };
             if !canonical.is_file() {
                 continue;
             }
-            // Belt-and-braces: canonicalization already resolves the full
-            // chain, so the target must not be a symlink itself; anything
-            // unstatable fails closed to the next candidate.
             let Ok(canonical_metadata) = std::fs::symlink_metadata(&canonical) else {
                 continue;
             };
@@ -868,9 +922,9 @@ pub fn resolve_testd_tool(program_path: &str) -> Result<ResolvedTestdTool, Testd
             let Ok(bytes) = std::fs::read(&canonical) else {
                 continue;
             };
-            return Ok(ResolvedTestdTool {
-                executable_absolute: canonical.to_string_lossy().into_owned(),
-                executable_sha256: eliot_testd_core::sha256_hex(&bytes),
+            return Ok(ResolvedToolFile {
+                path: canonical.to_string_lossy().into_owned(),
+                sha256: eliot_testd_core::sha256_hex(&bytes),
             });
         }
     }
@@ -878,6 +932,165 @@ pub fn resolve_testd_tool(program_path: &str) -> Result<ResolvedTestdTool, Testd
         field: "program_path",
         reason: "the admitted tool is not installed on the platform PATH",
     })
+}
+
+fn productive_tool_environment(
+    nextest: &ResolvedToolFile,
+    cargo: &ResolvedToolFile,
+    rustc: &ResolvedToolFile,
+) -> Result<Vec<(String, String)>, TestdError> {
+    let cargo_home = owner_home_path("CARGO_HOME", ".cargo")?;
+    let rustup_home = owner_home_path("RUSTUP_HOME", ".rustup")?;
+    let mut directories = BTreeSet::new();
+    for path in [&nextest.path, &cargo.path, &rustc.path] {
+        let parent = Path::new(path).parent().ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "resolved tool has no parent directory",
+        })?;
+        directories.insert(parent.to_path_buf());
+    }
+    let path_value = std::env::join_paths(directories)
+        .map_err(|_| TestdError::Invalid {
+            field: "tool_environment",
+            reason: "resolved tool directories cannot form a bounded PATH",
+        })?
+        .to_string_lossy()
+        .into_owned();
+    Ok(vec![
+        (TESTD_ENV_NEXTEST_GATE.to_owned(), "1".to_owned()),
+        (TESTD_ENV_CARGO.to_owned(), cargo.path.clone()),
+        (TESTD_ENV_RUSTC.to_owned(), rustc.path.clone()),
+        (TESTD_ENV_CARGO_SHA256.to_owned(), cargo.sha256.clone()),
+        (TESTD_ENV_RUSTC_SHA256.to_owned(), rustc.sha256.clone()),
+        (TESTD_ENV_CARGO_HOME.to_owned(), cargo_home),
+        (TESTD_ENV_RUSTUP_HOME.to_owned(), rustup_home),
+        (TESTD_ENV_PATH.to_owned(), path_value),
+    ])
+}
+
+fn owner_home_path(variable: &str, suffix: &str) -> Result<String, TestdError> {
+    let candidate = std::env::var_os(variable)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(|home| PathBuf::from(home).join(suffix).into_os_string())
+        })
+        .ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "required toolchain home is not owner-resolvable",
+        })?;
+    let path = PathBuf::from(candidate);
+    if !path.is_absolute() || !path.is_dir() {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "required toolchain home is not an existing absolute directory",
+        });
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| TestdError::Invalid {
+        field: "tool_environment",
+        reason: "required toolchain home cannot be canonicalized",
+    })?;
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+fn validate_productive_tool_environment(
+    environment: &[(String, String)],
+    nextest_path: &str,
+) -> Result<eliot_process::EnvironmentProjection, TestdError> {
+    let values: BTreeMap<_, _> = environment.iter().cloned().collect();
+    if values.len() != environment.len()
+        || values.get(TESTD_ENV_NEXTEST_GATE).map(String::as_str) != Some("1")
+    {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive environment is not the owner-registered set",
+        });
+    }
+    for key in [TESTD_ENV_CARGO, TESTD_ENV_RUSTC] {
+        let path = values.get(key).ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive environment is missing a tool path",
+        })?;
+        validate_owner_tool_path(path)?;
+    }
+    let nextest = validate_owner_tool_path(nextest_path)?;
+    let cargo = values.get(TESTD_ENV_CARGO).expect("checked above");
+    let rustc = values.get(TESTD_ENV_RUSTC).expect("checked above");
+    let expected_hashes = [
+        (TESTD_ENV_CARGO_SHA256, cargo),
+        (TESTD_ENV_RUSTC_SHA256, rustc),
+    ];
+    for (hash_key, path) in expected_hashes {
+        let expected = values.get(hash_key).ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive environment is missing a tool digest",
+        })?;
+        let bytes = std::fs::read(path).map_err(|_| TestdError::Invalid {
+            field: "tool_environment",
+            reason: "owner-bound tool cannot be reread before launch",
+        })?;
+        if expected != &eliot_testd_core::sha256_hex(&bytes) {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "owner-bound tool changed after resolution",
+            });
+        }
+    }
+    for key in [TESTD_ENV_CARGO_HOME, TESTD_ENV_RUSTUP_HOME] {
+        let path = values.get(key).ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive environment is missing a toolchain home",
+        })?;
+        if !Path::new(path).is_absolute() || !Path::new(path).is_dir() {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "productive toolchain home is not an existing absolute directory",
+            });
+        }
+    }
+    let path_value = values.get(TESTD_ENV_PATH).ok_or(TestdError::Invalid {
+        field: "tool_environment",
+        reason: "productive environment is missing a bounded PATH",
+    })?;
+    let expected_dirs = [nextest, Path::new(cargo), Path::new(rustc)]
+        .iter()
+        .filter_map(|path| path.parent())
+        .map(Path::to_path_buf)
+        .collect::<BTreeSet<_>>();
+    let observed_dirs =
+        std::env::split_paths(std::ffi::OsStr::new(path_value)).collect::<BTreeSet<_>>();
+    if observed_dirs != expected_dirs {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive PATH is not exactly the resolved tool directories",
+        });
+    }
+    eliot_process::EnvironmentProjection::new(
+        environment.iter().cloned().collect(),
+        Vec::new(),
+        eliot_process::EnvironmentInheritance::None,
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))
+}
+
+fn validate_owner_tool_path(path: &str) -> Result<&Path, TestdError> {
+    let path = Path::new(path);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "tool path must be absolute and traversal-free",
+        });
+    }
+    if !path.is_file() {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "tool path is not an installed file",
+        });
+    }
+    Ok(path)
 }
 
 /// Typed outcome of driving one validated dispatch file through the bounded
@@ -949,7 +1162,12 @@ pub async fn drive_validated_dispatch_material(
             job_id: material.job_id.clone(),
         });
     }
-    let tool = resolve_testd_tool(eliot_testd_core::TESTD_PROFILE_PROGRAM)?;
+    let program_path = if material.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
+    } else {
+        eliot_testd_core::TESTD_PROFILE_PROGRAM
+    };
+    let tool = resolve_testd_tool(program_path)?;
     let params = TestdDerivedIntentParams {
         job_id: material.job_id.clone(),
         operation_id: material.operation_id.clone(),
@@ -958,6 +1176,7 @@ pub async fn drive_validated_dispatch_material(
         session_nonce: material.nonce.clone(),
         executable_absolute: tool.executable_absolute,
         executable_sha256: tool.executable_sha256,
+        tool_environment: tool.environment,
         generation_root: generation_root.to_owned(),
     };
     let intent = derive_testd_intent(&params)?;
@@ -1583,6 +1802,7 @@ mod tests {
             session_nonce: "testd-drive-session-01".to_owned(),
             executable_absolute: tool.executable_absolute.clone(),
             executable_sha256: tool.executable_sha256.clone(),
+            tool_environment: Vec::new(),
             generation_root: cwd.to_string_lossy().into_owned(),
         };
         let intent =

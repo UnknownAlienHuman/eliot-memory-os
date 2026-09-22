@@ -4449,6 +4449,7 @@ mod tests {
     ) -> TestdAdmissionEnvelope {
         TestdAdmissionEnvelope {
             job_id: job_id.to_owned(),
+            profile: "cargo-test".to_owned(),
             operation_id: operation.map(str::to_owned),
             cancellation: false,
             fence: FencingToken::new(

@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::EpochId;
+use eliot_contracts::{ArtifactId, ClockReading, ContractId, EpochId, RequestId};
 pub use eliot_instrument_api::KernelProcessAdmissionRequest;
 use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
@@ -52,14 +53,14 @@ pub use claim::{
 // * `program_path` is relative and closed (`cargo` only): absolute paths
 //   and parent traversal are refused, so no caller can redirect execution
 //   by path.
-// * `fixed_argv` is the complete argv. This slice's single profile takes
-//   no typed slots, so any invocation-supplied argument is refused at
-//   registration: there is no caller passthrough. A future profile with
-//   typed slots arrives as a new registry entry with its own slot
-//   validation, never by widening this one.
+// * `fixed_argv` is the complete argv. The probe and productive nextest
+//   profiles take no caller slots, so any invocation-supplied argument is
+//   refused at registration: there is no caller passthrough. A future
+//   profile with typed slots arrives as a new registry entry with its own
+//   slot validation, never by widening these.
 // * `env_allowlist` is the exact non-secret environment for the child.
-//   This profile takes none (`EnvironmentInheritance::None` with an empty
-//   map): the bounded probe needs no environment, so none is supplied.
+//   The productive libtest-json profile receives only the explicitly
+//   registered feature gate below; no ambient environment is inherited.
 // * the working directory is never stored here: the Drive always uses the
 //   generation root supplied with the admitted material, never a
 //   caller-chosen directory.
@@ -72,18 +73,35 @@ pub use claim::{
 // `eliot-kernel-service`); [`testd_binding_digest`] additionally covers
 // the installed artifact digest and binds one Drive registration.
 
-/// The single admitted testd profile in this slice.
+/// The retained harmless process probe profile.
 ///
-/// The name keeps the established `cargo-test` instrument profile spelling
-/// already used across testd fixtures; in this slice it executes the
-/// bounded `cargo --version` tool probe. A real `cargo test` execution with
-/// scoped arguments arrives as a new profile, never by widening this one.
+/// A clean `cargo --version` exit is never promoted into a task verifier
+/// result.
 pub const TESTD_ADMITTED_PROFILE: &str = "cargo-test";
+/// Separately registered productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE: &str = "cargo-nextest";
 /// Relative program for the admitted probe, resolved through the platform
 /// tool locator at Drive time. Never absolute, never parent traversal.
 pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
+/// Relative executable for the productive profile. Resolving the installed
+/// subcommand directly pins nextest rather than hashing the cargo wrapper.
+pub const TESTD_PRODUCTIVE_PROFILE_PROGRAM: &str = "cargo-nextest";
 /// Fixed argv for the admitted probe. No caller slot exists.
 pub const TESTD_PROFILE_ARGV: &[&str] = &["--version"];
+/// Fixed machine-readable argv for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_ARGV: &[&str] =
+    &[
+        "run",
+        "--message-format",
+        "libtest-json-plus",
+        "--message-format-version",
+        "0.1",
+    ];
+/// Exact environment required by nextest 0.9.143's experimental libtest JSON
+/// reporter. The value is owner-registered and is never read from ambient
+/// process state.
+pub const TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT: &[(&str, &str)] =
+    &[("NEXTEST_EXPERIMENTAL_LIBTEST_JSON", "1")];
 /// Bounded wall timeout for the probe, in milliseconds.
 pub const TESTD_PROFILE_WALL_TIMEOUT_MS: u64 = 15_000;
 /// Bounded CPU ceiling for the probe, in milliseconds.
@@ -96,6 +114,18 @@ pub const TESTD_PROFILE_STDOUT_BYTES: u64 = 64 * 1024;
 pub const TESTD_PROFILE_STDERR_BYTES: u64 = 64 * 1024;
 /// Bounded descendant ceiling for the probe.
 pub const TESTD_PROFILE_MAX_DESCENDANTS: u32 = 4;
+/// Independent wall timeout for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
+/// Independent CPU ceiling for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_CPU_TIME_MS: u64 = 10 * 60 * 1_000;
+/// Independent memory ceiling for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Independent stdout capture bound for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
+/// Independent stderr capture bound for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
+/// Independent descendant ceiling for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS: u32 = 32;
 
 /// Closed executable binding for one admitted testd profile.
 ///
@@ -115,8 +145,8 @@ pub struct TestdExecutableBinding {
     pub program_path: String,
     /// Complete fixed argv (`--version` only).
     pub fixed_argv: Vec<String>,
-    /// Exact non-secret environment allowlist (empty for this profile).
-    pub env_allowlist: Vec<String>,
+    /// Exact non-secret environment name/value bindings for this profile.
+    pub env_allowlist: Vec<(String, String)>,
     /// Bounded wall timeout, in milliseconds.
     pub wall_timeout_ms: u64,
     /// Bounded CPU ceiling, in milliseconds.
@@ -134,10 +164,10 @@ pub struct TestdExecutableBinding {
 impl TestdExecutableBinding {
     /// Validates the closed binding shape.
     pub fn validate(&self) -> Result<(), TestdError> {
-        if self.profile != TESTD_ADMITTED_PROFILE {
+        if !is_admitted_testd_profile(&self.profile) {
             return Err(TestdError::Invalid {
                 field: "profile",
-                reason: "testd admits only the closed cargo-test tool-probe profile",
+                reason: "testd admits only registered probe or productive nextest profiles",
             });
         }
         if !is_binding_digest(&self.package_artifact_digest) {
@@ -149,32 +179,54 @@ impl TestdExecutableBinding {
         // Closed by equality: the admitted program is relative by
         // construction, so absolute paths and parent traversal have no
         // spelling that validates.
-        if self.program_path != TESTD_PROFILE_PROGRAM {
+        let expected_program = if self.profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM
+        } else {
+            TESTD_PROFILE_PROGRAM
+        };
+        if self.program_path != expected_program {
             return Err(TestdError::Invalid {
                 field: "program_path",
-                reason: "testd admits only the closed relative tool program",
+                reason: "testd admits only the closed relative cargo tool program",
             });
         }
-        let expected_argv: Vec<String> =
-            TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect();
+        let expected_argv: Vec<String> = if self.profile == TESTD_ADMITTED_PROFILE {
+            TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect()
+        } else {
+            TESTD_PRODUCTIVE_PROFILE_ARGV
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
         if self.fixed_argv != expected_argv {
             return Err(TestdError::Invalid {
                 field: "fixed_argv",
-                reason: "the admitted profile takes fixed argv; caller arguments are refused",
+                reason: "the registered profile takes fixed argv; caller arguments are refused",
             });
         }
-        if !self.env_allowlist.is_empty() {
+        let expected_environment: Vec<(String, String)> = if self.profile == TESTD_PRODUCTIVE_PROFILE
+        {
+            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if self.env_allowlist != expected_environment {
             return Err(TestdError::Invalid {
                 field: "env_allowlist",
-                reason: "the admitted profile takes no environment passthrough",
+                reason: "the admitted profile takes only its registered environment bindings",
             });
         }
-        if self.wall_timeout_ms != TESTD_PROFILE_WALL_TIMEOUT_MS
-            || self.cpu_time_ms != Some(TESTD_PROFILE_CPU_TIME_MS)
-            || self.memory_bytes != Some(TESTD_PROFILE_MEMORY_BYTES)
-            || self.stdout_bytes != TESTD_PROFILE_STDOUT_BYTES
-            || self.stderr_bytes != TESTD_PROFILE_STDERR_BYTES
-            || self.max_descendants != TESTD_PROFILE_MAX_DESCENDANTS
+        let (wall_timeout_ms, cpu_time_ms, memory_bytes, stdout_bytes, stderr_bytes, max_descendants) =
+            profile_limits(&self.profile);
+        if self.wall_timeout_ms != wall_timeout_ms
+            || self.cpu_time_ms != cpu_time_ms
+            || self.memory_bytes != memory_bytes
+            || self.stdout_bytes != stdout_bytes
+            || self.stderr_bytes != stderr_bytes
+            || self.max_descendants != max_descendants
         {
             return Err(TestdError::Invalid {
                 field: "resource_limits",
@@ -185,10 +237,32 @@ impl TestdExecutableBinding {
     }
 }
 
+fn profile_limits(profile: &str) -> (u64, Option<u64>, Option<u64>, u64, u64, u32) {
+    if profile == TESTD_PRODUCTIVE_PROFILE {
+        (
+            TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS,
+            Some(TESTD_PRODUCTIVE_PROFILE_CPU_TIME_MS),
+            Some(TESTD_PRODUCTIVE_PROFILE_MEMORY_BYTES),
+            TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES,
+            TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES,
+            TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS,
+        )
+    } else {
+        (
+            TESTD_PROFILE_WALL_TIMEOUT_MS,
+            Some(TESTD_PROFILE_CPU_TIME_MS),
+            Some(TESTD_PROFILE_MEMORY_BYTES),
+            TESTD_PROFILE_STDOUT_BYTES,
+            TESTD_PROFILE_STDERR_BYTES,
+            TESTD_PROFILE_MAX_DESCENDANTS,
+        )
+    }
+}
+
 /// Returns true only for the closed admitted testd profile name.
 #[must_use]
 pub fn is_admitted_testd_profile(profile: &str) -> bool {
-    profile == TESTD_ADMITTED_PROFILE
+    matches!(profile, TESTD_ADMITTED_PROFILE | TESTD_PRODUCTIVE_PROFILE)
 }
 
 /// Resolves the closed binding for one admitted profile.
@@ -201,18 +275,40 @@ pub fn testd_profile_binding(
     profile: &str,
     package_artifact_digest: &str,
 ) -> Result<TestdExecutableBinding, TestdError> {
+    if !is_admitted_testd_profile(profile) {
+        return Err(TestdError::Invalid {
+            field: "profile",
+            reason: "testd admits only registered probe or productive nextest profiles",
+        });
+    }
+    let fixed_argv = if profile == TESTD_ADMITTED_PROFILE {
+        TESTD_PROFILE_ARGV
+    } else {
+        TESTD_PRODUCTIVE_PROFILE_ARGV
+    };
     let binding = TestdExecutableBinding {
         profile: profile.to_owned(),
         package_artifact_digest: package_artifact_digest.to_owned(),
-        program_path: TESTD_PROFILE_PROGRAM.to_owned(),
-        fixed_argv: TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect(),
-        env_allowlist: Vec::new(),
-        wall_timeout_ms: TESTD_PROFILE_WALL_TIMEOUT_MS,
-        cpu_time_ms: Some(TESTD_PROFILE_CPU_TIME_MS),
-        memory_bytes: Some(TESTD_PROFILE_MEMORY_BYTES),
-        stdout_bytes: TESTD_PROFILE_STDOUT_BYTES,
-        stderr_bytes: TESTD_PROFILE_STDERR_BYTES,
-        max_descendants: TESTD_PROFILE_MAX_DESCENDANTS,
+        program_path: if profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM.to_owned()
+        } else {
+            TESTD_PROFILE_PROGRAM.to_owned()
+        },
+        fixed_argv: fixed_argv.iter().map(ToString::to_string).collect(),
+        env_allowlist: if profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        wall_timeout_ms: profile_limits(profile).0,
+        cpu_time_ms: profile_limits(profile).1,
+        memory_bytes: profile_limits(profile).2,
+        stdout_bytes: profile_limits(profile).3,
+        stderr_bytes: profile_limits(profile).4,
+        max_descendants: profile_limits(profile).5,
     };
     binding.validate()?;
     Ok(binding)
@@ -228,10 +324,21 @@ pub fn testd_profile_binding(
 /// mirrors these constants without a dependency: `canonical_json_bytes`
 /// sorts object keys, so only the field set and values must agree.
 pub fn testd_definition_digest() -> Result<String, TestdError> {
+    testd_definition_digest_for_profile(TESTD_ADMITTED_PROFILE)
+}
+
+/// Canonical definition digest for one registered testd profile.
+pub fn testd_definition_digest_for_profile(profile: &str) -> Result<String, TestdError> {
+    if !is_admitted_testd_profile(profile) {
+        return Err(TestdError::Invalid {
+            field: "profile",
+            reason: "testd admits only registered probe or productive nextest profiles",
+        });
+    }
     #[derive(Serialize)]
     struct Canonical<'a> {
         cpu_time_ms: Option<u64>,
-        env_allowlist: &'a [String],
+        env_allowlist: &'a [(String, String)],
         fixed_argv: &'a [String],
         max_descendants: u32,
         memory_bytes: Option<u64>,
@@ -241,19 +348,37 @@ pub fn testd_definition_digest() -> Result<String, TestdError> {
         stdout_bytes: u64,
         wall_timeout_ms: u64,
     }
-    let empty: Vec<String> = Vec::new();
-    let argv: Vec<String> = TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect();
+    let empty: Vec<(String, String)> = Vec::new();
+    let fixed_argv = if profile == TESTD_ADMITTED_PROFILE {
+        TESTD_PROFILE_ARGV
+    } else {
+        TESTD_PRODUCTIVE_PROFILE_ARGV
+    };
+    let argv: Vec<String> = fixed_argv.iter().map(ToString::to_string).collect();
+    let limits = profile_limits(profile);
+    let env_allowlist = if profile == TESTD_PRODUCTIVE_PROFILE {
+        TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect::<Vec<_>>()
+    } else {
+        empty
+    };
     let canonical = Canonical {
-        cpu_time_ms: Some(TESTD_PROFILE_CPU_TIME_MS),
-        env_allowlist: &empty,
+        cpu_time_ms: limits.1,
+        env_allowlist: &env_allowlist,
         fixed_argv: &argv,
-        max_descendants: TESTD_PROFILE_MAX_DESCENDANTS,
-        memory_bytes: Some(TESTD_PROFILE_MEMORY_BYTES),
-        profile: TESTD_ADMITTED_PROFILE,
-        program_path: TESTD_PROFILE_PROGRAM,
-        stderr_bytes: TESTD_PROFILE_STDERR_BYTES,
-        stdout_bytes: TESTD_PROFILE_STDOUT_BYTES,
-        wall_timeout_ms: TESTD_PROFILE_WALL_TIMEOUT_MS,
+        max_descendants: limits.5,
+        memory_bytes: limits.2,
+        profile,
+        program_path: if profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM
+        } else {
+            TESTD_PROFILE_PROGRAM
+        },
+        stderr_bytes: limits.4,
+        stdout_bytes: limits.3,
+        wall_timeout_ms: limits.0,
     };
     eliot_contracts::canonical_json_bytes(&canonical)
         .map(|bytes| eliot_contracts::sha256_hex(&bytes))
@@ -300,7 +425,7 @@ pub fn testd_profile_resource_limits(
 }
 
 /// Builds the closed environment projection for one validated binding:
-/// no inherited values and no supplied values for this profile.
+/// no inherited values and only the exact registered name/value bindings.
 pub fn testd_profile_environment(
     binding: &TestdExecutableBinding,
 ) -> Result<EnvironmentProjection, TestdError> {
@@ -309,7 +434,7 @@ pub fn testd_profile_environment(
         binding
             .env_allowlist
             .iter()
-            .map(|key| (key.clone(), String::new()))
+            .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         Vec::new(),
         EnvironmentInheritance::None,
@@ -773,6 +898,12 @@ pub struct TestJob {
     pub verification: Option<VerificationRun>,
     /// Exact receipt identity retained with a completed attempt.
     pub receipt: Option<ReceiptBinding>,
+    /// Full validated receipt retained with the durable attempt.  The
+    /// binding above is the compact scheduling projection; this record is
+    /// the only source from which a canonical verifier fact may recover raw
+    /// artifact lineage after the worker has returned.
+    #[serde(default)]
+    pub verification_receipt: Option<VerificationReceipt>,
     /// Last durable mutation time.
     pub updated_at_ms: u64,
     /// Immutable digest of the submitted contracts and scheduling fields.
@@ -814,6 +945,21 @@ pub struct ReceiptBinding {
     pub cache_root: String,
 }
 
+/// Physical stream from which a raw process artifact was captured.
+///
+/// The stream identity is part of the TestD-owned receipt so a verifier can
+/// join stdout chunks before parsing and exclude stderr from the nextest
+/// event dialect. `Unknown` is retained for legacy/unresolved handles and is
+/// deliberately non-certifying.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawArtifactStream {
+    Stdout,
+    Stderr,
+    #[default]
+    Unknown,
+}
+
 /// A raw process artifact captured before any normalization.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -824,6 +970,16 @@ pub struct RawArtifact {
     pub length: u64,
     pub sha256: String,
     pub truncated: bool,
+    /// Monotonic sequence allocated by the TestD capture owner. Handle text
+    /// is not a stream-order authority (`...-10` must not precede `...-2`).
+    #[serde(default)]
+    pub capture_sequence: u64,
+    /// Owning process stream; unknown legacy handles cannot certify parsing.
+    #[serde(default)]
+    pub stream: RawArtifactStream,
+    /// Clock captured by TestD at the stream-retention boundary.
+    #[serde(default)]
+    pub captured_at: ClockReading,
 }
 
 impl RawArtifact {
@@ -843,7 +999,27 @@ impl RawArtifact {
             length,
             sha256,
             truncated,
+            capture_sequence: 0,
+            stream: RawArtifactStream::Unknown,
+            captured_at: ClockReading::default(),
         };
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    /// Captures bytes with the stream and retention clock observed by the
+    /// TestD owner. The clock is never borrowed from request admission.
+    pub fn from_observation(
+        handle: impl Into<String>,
+        content_type: impl Into<String>,
+        bytes: Vec<u8>,
+        truncated: bool,
+        stream: RawArtifactStream,
+        captured_at: ClockReading,
+    ) -> Result<Self, TestdError> {
+        let mut artifact = Self::from_bytes(handle, content_type, bytes, truncated)?;
+        artifact.stream = stream;
+        artifact.captured_at = captured_at;
         artifact.validate()?;
         Ok(artifact)
     }
@@ -865,6 +1041,9 @@ impl RawArtifact {
         {
             return Err(TestdError::InvalidBinding);
         }
+        self.captured_at
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
         Ok(())
     }
 }
@@ -895,8 +1074,78 @@ pub struct VerificationReceipt {
     pub target_root: String,
     pub cache_root: String,
     pub execution: ExecutionStatus,
+    /// TestD-owner observation when the admitted process was resumed.
+    #[serde(default)]
+    pub started_at: ClockReading,
+    /// TestD-owner observation after terminal inspection and stream closure.
+    #[serde(default)]
+    pub finished_at: ClockReading,
     pub raw_artifacts: Vec<RawArtifact>,
     pub normalized: Vec<NormalizedEvidence>,
+}
+
+/// Evaluates the admitted TestD profile after the process observation has
+/// been durably captured. The current closed profile is a bounded cargo tool
+/// probe, so a clean process exit proves only execution of that probe; it
+/// does not prove the requested task. The evaluator therefore records an
+/// explicit `UNKNOWN` semantic outcome with the exact invocation, scope,
+/// fence, and captured raw artifacts. A future profile adds its own
+/// evaluator here and may return `PASS` only from profile-specific evidence.
+pub fn evaluate_testd_verification(
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+    _finished_at_ms: u64,
+) -> Result<VerificationRun, TestdError> {
+    receipt.validate(job)?;
+    let run_id = RequestId::new(format!(
+        "{}:verification",
+        job.invocation.request.request_id.as_str()
+    ))
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let verifier = ContractId::new(job.invocation.profile.clone())
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let raw_evidence = receipt
+        .raw_artifacts
+        .iter()
+        .map(|artifact| {
+            ArtifactId::new(artifact.handle.clone())
+                .map_err(|error| TestdError::Contract(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let run = VerificationRun {
+        run_id,
+        verifier,
+        invocation_id: job.invocation.request.request_id.clone(),
+        property: format!(
+            "admitted {} profile execution has profile-specific verifier evidence",
+            job.invocation.profile
+        ),
+        scope: job.invocation.declared_scope.clone(),
+        execution: receipt.execution,
+        outcome: match receipt.execution {
+            ExecutionStatus::Cancelled => eliot_instrument_api::VerificationOutcome::Cancelled,
+            ExecutionStatus::Blocked => eliot_instrument_api::VerificationOutcome::Blocked,
+            ExecutionStatus::Accepted
+            | ExecutionStatus::Running
+            | ExecutionStatus::Succeeded
+            | ExecutionStatus::Failed
+            | ExecutionStatus::Partial
+            | ExecutionStatus::Unknown => eliot_instrument_api::VerificationOutcome::Unknown,
+        },
+        freshness: eliot_instrument_api::EvidenceFreshness::Unknown,
+        coverage: eliot_instrument_api::EvidenceCoverage::Unknown,
+        // The TestD receipt currently owns raw process evidence only. The
+        // profile evaluator must supply normalized semantic evidence before
+        // this run can certify completion.
+        evidence: Vec::new(),
+        raw_evidence,
+        state_fence: job.invocation.request.state_fence.clone(),
+        started_at: receipt.started_at,
+        finished_at: Some(receipt.finished_at),
+    };
+    run.validate()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    Ok(run)
 }
 
 impl VerificationReceipt {
@@ -922,9 +1171,24 @@ impl VerificationReceipt {
         job.target_roots.validate()?;
         let binding = self.binding();
         validate_receipt_binding(job, &binding)?;
+        self.started_at
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        self.finished_at
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        if let (Some(start), Some(finish)) =
+            (self.started_at.known_time_ms, self.finished_at.known_time_ms)
+            && finish < start
+        {
+            return Err(TestdError::InvalidBinding);
+        }
         let mut artifacts = BTreeMap::new();
         for artifact in &self.raw_artifacts {
             artifact.validate()?;
+            if artifact.capture_sequence == 0 {
+                return Err(TestdError::InvalidBinding);
+            }
             if artifacts
                 .insert(artifact.handle.clone(), artifact)
                 .is_some()
@@ -952,6 +1216,7 @@ impl VerificationReceipt {
 pub struct EvidenceCollector {
     records: Arc<Mutex<Vec<eliot_process::ProcessEvidence>>>,
     raw_artifacts: Arc<Mutex<BTreeMap<String, RawArtifact>>>,
+    next_capture_sequence: Arc<AtomicU64>,
 }
 
 impl EvidenceCollector {
@@ -971,15 +1236,47 @@ impl EvidenceCollector {
         truncated: bool,
     ) -> Result<(), TestdError> {
         let artifact = RawArtifact::from_bytes(handle, content_type, bytes, truncated)?;
+        self.insert_raw_artifact(artifact)
+    }
+
+    /// Captures one stream artifact with the actual TestD retention clock and
+    /// stream boundary observed by the worker.
+    pub fn record_raw_artifact_at(
+        &self,
+        handle: impl Into<String>,
+        content_type: impl Into<String>,
+        bytes: Vec<u8>,
+        truncated: bool,
+        stream: RawArtifactStream,
+        captured_at: ClockReading,
+    ) -> Result<(), TestdError> {
+        let artifact = RawArtifact::from_observation(
+            handle,
+            content_type,
+            bytes,
+            truncated,
+            stream,
+            captured_at,
+        )?;
+        self.insert_raw_artifact(artifact)
+    }
+
+    fn insert_raw_artifact(&self, artifact: RawArtifact) -> Result<(), TestdError> {
+        let mut artifact = artifact;
         let mut artifacts = self
             .raw_artifacts
             .lock()
             .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
         if let Some(existing) = artifacts.get(&artifact.handle) {
+            artifact.capture_sequence = existing.capture_sequence;
             if existing != &artifact {
                 return Err(TestdError::InvalidBinding);
             }
         } else {
+            artifact.capture_sequence = self
+                .next_capture_sequence
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                .saturating_add(1);
             artifacts.insert(artifact.handle.clone(), artifact);
         }
         Ok(())
@@ -990,6 +1287,23 @@ impl EvidenceCollector {
         &self,
         job: &TestJob,
         execution: ExecutionStatus,
+    ) -> VerificationReceipt {
+        self.verification_receipt_at(
+            job,
+            execution,
+            ClockReading::default(),
+            ClockReading::default(),
+        )
+    }
+
+    /// Builds a receipt with the clocks observed by the TestD owner at the
+    /// actual resume and terminal capture boundaries.
+    pub fn verification_receipt_at(
+        &self,
+        job: &TestJob,
+        execution: ExecutionStatus,
+        started_at: ClockReading,
+        finished_at: ClockReading,
     ) -> VerificationReceipt {
         let records = self.snapshot();
         let raw = self
@@ -1010,7 +1324,11 @@ impl EvidenceCollector {
                 }
             }
         }
-        raw_artifacts.sort_by(|left, right| left.handle.cmp(&right.handle));
+        raw_artifacts.sort_by(|left, right| {
+            left.capture_sequence
+                .cmp(&right.capture_sequence)
+                .then_with(|| left.handle.cmp(&right.handle))
+        });
         let normalized = records
             .iter()
             .map(|record| NormalizedEvidence {
@@ -1037,6 +1355,8 @@ impl EvidenceCollector {
             target_root: job.target_roots.target_root.clone(),
             cache_root: job.target_roots.cache_root.clone(),
             execution,
+            started_at,
+            finished_at,
             raw_artifacts,
             normalized,
         }
@@ -1281,14 +1601,14 @@ impl TestdStore {
         if !matches!(invocation.kind, InstrumentKind::Test) {
             return Err(TestdError::WrongInstrumentKind);
         }
-        // Closed-profile registration (issue #20): only the admitted
-        // tool-probe profile registers, and it takes no caller arguments:
-        // the fixed argv comes from the registry binding, never from the
-        // invocation.
+        // Closed-profile registration (issue #20): only registered probe or
+        // productive nextest profiles register, and both take no caller
+        // arguments. Fixed argv comes from the registry binding, never from
+        // the invocation.
         if !is_admitted_testd_profile(&invocation.profile) {
             return Err(TestdError::Invalid {
                 field: "invocation.profile",
-                reason: "testd admits only the closed cargo-test tool-probe profile",
+                reason: "testd admits only registered probe or productive nextest profiles",
             });
         }
         if !invocation.arguments.is_empty() {
@@ -1361,6 +1681,7 @@ impl TestdStore {
             execution: None,
             verification: None,
             receipt: None,
+            verification_receipt: None,
             updated_at_ms: at_ms,
             payload_digest: digest,
         };
@@ -1504,6 +1825,65 @@ impl TestdStore {
         Ok(permit.into_parts().0)
     }
 
+    /// Renews one live worker fence without changing its owner, token, or
+    /// attempt epoch.  The current row read, expiry check, and lease update
+    /// share one write transaction so a reclaimed or cancelled attempt can
+    /// never be renewed by a stale worker.
+    pub fn renew_lease(
+        &self,
+        job_id: &str,
+        lease: &Lease,
+        now: u64,
+        lease_ms: u64,
+    ) -> Result<Lease, TestdError> {
+        validate_text(job_id, "job_id")?;
+        if lease_ms == 0 {
+            return Err(TestdError::Invalid {
+                field: "lease_ms",
+                reason: "must be non-zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        if !lease_matches(&job, lease, now) {
+            return Err(TestdError::LeaseRejected(job_id.to_owned()));
+        }
+        let renewed = Lease {
+            owner: lease.owner.clone(),
+            token: lease.token.clone(),
+            epoch: lease.epoch,
+            expires_at_ms: now.saturating_add(lease_ms),
+        };
+        job.lease = Some(renewed.clone());
+        job.updated_at_ms = now;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job.job_id.as_str(), encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(JobState::Running),
+            JobState::Running,
+            &lease.owner,
+            now,
+            Some("worker lease renewed".to_owned()),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(renewed)
+    }
+
     /// Recovers one fence-expired running job to Unknown/RetryWait.
     ///
     /// Returns `Ok(None)` when the job needs no reconciliation (not running,
@@ -1629,9 +2009,21 @@ impl TestdStore {
             run.validate()
                 .map_err(|error| TestdError::Contract(error.to_string()))?;
         }
-        let mut job = self
-            .get(job_id)?
-            .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+        // The current row and the final mutation share one redb write
+        // transaction.  A read through `self.get` here would leave a race in
+        // which cancel/reclaim commits between the lease check and the
+        // unconditional insert below, allowing a stale worker to overwrite a
+        // newer owner state.
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
         if !lease_matches(&job, lease, now) {
             // Fail closed: an expired or foreign fence never completes an
             // attempt. Recovery flows through `reconcile_expired`
@@ -1654,6 +2046,7 @@ impl TestdStore {
         job.execution = Some(execution);
         job.verification = verification;
         job.receipt = Some(binding);
+        job.verification_receipt = Some(receipt.clone());
         job.lease = None;
         let retryable = matches!(
             execution,
@@ -1682,7 +2075,6 @@ impl TestdStore {
             now
         };
         job.updated_at_ms = now;
-        let write = self.database.begin_write().map_err(database)?;
         let mut table = write.open_table(JOBS).map_err(database)?;
         let encoded =
             serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
@@ -1700,7 +2092,13 @@ impl TestdStore {
             reason,
         )?;
         write.commit().map_err(database)?;
-        Ok(job)
+        // Resolve the owner row after commit so the caller receives the
+        // durable readback rather than a pre-commit projection.  A later
+        // retry claim may legitimately advance a RetryWait row before this
+        // read; returning that current row keeps callers from treating an
+        // obsolete attempt image as current.
+        self.get(job_id)?
+            .ok_or_else(|| TestdError::Corrupt("committed job disappeared".to_owned()))
     }
 
     /// Cancels a queued or currently leased job using its current fence.

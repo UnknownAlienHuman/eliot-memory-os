@@ -18,8 +18,11 @@ eliot-contracts.workspace = true
 eliot-cue-contracts = { path = "../../smart/eliot-cue-contracts", version = "0.1.0" }
 eliot-cue-index = { path = "../../smart/eliot-cue-index", version = "0.1.0" }
 eliot-doctor-core.workspace = true
+eliot-diagnostic = { path = "../../instrument/eliot-diagnostic", version = "0.1.0" }
+eliot-instrument-nextest = { path = "../../instrument/eliot-instrument-nextest", version = "0.1.0" }
 eliot-epistemic = { path = "../../smart/eliot-epistemic", version = "0.1.0" }
 eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", version = "0.1.0" }
+eliot-evaluation-contracts.workspace = true
 eliot-evidence.workspace = true
 eliot-finish.workspace = true
 eliot-integration-coverage.workspace = true
@@ -36,6 +39,9 @@ eliot-session.workspace = true
 eliot-skill.workspace = true
 eliot-store-api.workspace = true
 eliot-task.workspace = true
+eliot-testd-core.workspace = true
+eliot-instrument-api.workspace = true
+eliot-verifier = { path = "../../instrument/eliot-verifier", version = "0.1.0" }
 eliot-workscope.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-security-contracts.workspace = true

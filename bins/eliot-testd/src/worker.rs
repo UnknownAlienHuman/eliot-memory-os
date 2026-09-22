@@ -61,15 +61,18 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
+use eliot_contracts::ClockReading;
 use eliot_instrument_api::{ExecutionStatus, KernelProcessAdmissionRequest};
 use eliot_process::{
-    ExitDisposition, OperationId, ProcessEvidence, ProcessExecutionError, ProcessExecutionView,
+    ExitDisposition, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionView,
     ProcessExecutor, ProcessLifecycle, ProcessRequest,
 };
 use eliot_testd_core::{
-    EvidenceCollector, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, Lease,
-    NormalizedEvidence, TestJob, TestdError, TestdStore, issue_process_admission,
+    EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
+    Lease, NormalizedEvidence, RawArtifactStream, TestJob, TestdError, TestdStore,
+    evaluate_testd_verification, issue_process_admission,
 };
 
 use crate::kernel_client::{
@@ -84,6 +87,11 @@ use crate::{TestReceipt, TestdComposition};
 /// The lease only fences the single consuming attempt; scheduling, backoff,
 /// and retry bounds stay owned by the durable store's retry policy.
 pub const ADMITTED_WORKER_LEASE_MS: u64 = 60_000;
+
+/// Poll interval for the owning worker's terminal lifecycle observation.
+const SUPERVISION_POLL_INTERVAL_MS: u64 = 100;
+/// Bounded grace period after a deadline or durable cancellation request.
+const SUPERVISION_CANCEL_GRACE_MS: u64 = 5_000;
 
 /// Upper bound for free-form reason text recorded on durable transitions.
 ///
@@ -164,7 +172,7 @@ pub fn drive_admitted_one_shot<E: ProcessExecutor + 'static>(
             "no claimable test job for the admitted presentation; nothing was executed".to_owned(),
         )
     })?;
-    let lease = job
+    let mut lease = job
         .lease
         .clone()
         .ok_or_else(|| TestdError::Corrupt("claimed job carries no lease".to_owned()))?;
@@ -172,11 +180,11 @@ pub fn drive_admitted_one_shot<E: ProcessExecutor + 'static>(
         composition,
         store,
         &job,
-        &lease,
+        &mut lease,
         presented,
         executor,
         owner,
-        now,
+        lease_ms,
     )
 }
 
@@ -191,11 +199,11 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     composition: &TestdComposition,
     store: &TestdStore,
     job: &TestJob,
-    lease: &Lease,
+    lease: &mut Lease,
     presented: PresentedAdmission,
     executor: &E,
     owner: &str,
-    now: u64,
+    lease_ms: u64,
 ) -> Result<TestReceipt, TestdError> {
     if let Err(binding) = check_presented_job_binding(job, &presented) {
         finish_unknown(
@@ -203,13 +211,12 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
             job,
             lease,
             &EvidenceCollector::default(),
-            now,
             format!("refused foreign or stale presentation without executing: {binding}"),
         )?;
         return composition.status(&job.job_id);
     }
     if presented.cancelled {
-        store.cancel(&job.job_id, Some(lease), owner, now)?;
+        store.cancel(&job.job_id, Some(lease), owner, current_clock_ms())?;
         return composition.status(&job.job_id);
     }
     // Fresh bound admission: rebuild the Kernel request from the CLAIMED
@@ -245,7 +252,6 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
                 job,
                 lease,
                 &EvidenceCollector::default(),
-                now,
                 format!("fresh admission refused without executing: {error}"),
             )?;
             return composition.status(&job.job_id);
@@ -258,8 +264,19 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     // executor-owned `UnknownOutcome`) onto `TestdError`, so the single
     // `inspect` in `observe_and_finish` is the only observation that
     // dispositions the attempt.
-    let start_result =
-        block_on_one_shot(composition.start_claimed(job, lease, now, permit, executor, sink));
+    let start_result = block_on_one_shot(composition.start_claimed(
+        job,
+        lease,
+        current_clock_ms(),
+        permit,
+        executor,
+        sink,
+    ));
+    let started_at = start_result
+        .as_ref()
+        .ok()
+        .map(|receipt| observation_clock(receipt.identity().resumed_at_unix_ms()))
+        .unwrap_or_default();
     let start_note = match &start_result {
         Ok(_) => None,
         Err(error) => Some(truncate_reason(error.to_string())),
@@ -272,59 +289,143 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         &collector,
         operation_id,
         start_note,
-        now,
+        started_at,
+        lease_ms,
     )?;
     composition.status(&job.job_id)
 }
 
-/// Observes the started operation exactly once and finishes the attempt with
-/// the deterministic disposition plus captured evidence.
+/// Supervises the started operation to a bounded terminal observation and
+/// finishes the attempt with the deterministic disposition plus captured
+/// evidence.
 ///
-/// The observation is one `inspect` of the presented operation: a clean exit
-/// completes locally, cancellation cancels, and anything without terminal
-/// proof (executor-unknown, failed observation, or a still-running view at
-/// the one-shot boundary) finishes as `Unknown` with evidence so the exact
-/// identity reconciles later under the bounded retry policy.
+/// `start` is only a resume receipt. The worker owns repeated lifecycle
+/// inspection until the admitted profile deadline, renews the exact durable
+/// fence while the process is live, requests cancellation once at the
+/// deadline (or after a durable cancellation), and reconciles the exact
+/// operation before accepting an unproven outcome. There is no second claim
+/// or scheduler in this loop.
 #[allow(
     clippy::too_many_arguments,
-    reason = "DISPATCH-LIVE residual: one observation context (store, job, lease, executor, collector, operation, start note, now); a params-struct refactor is deferred until the dispatch-launch seam fixes the call shape, never a bare allow"
+    reason = "DISPATCH-LIVE residual: one observation context (store, job, lease, executor, collector, operation, start note, lease duration); a params-struct refactor is deferred until the dispatch-launch seam fixes the call shape, never a bare allow"
 )]
 fn observe_and_finish<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     job: &TestJob,
-    lease: &Lease,
+    lease: &mut Lease,
     executor: &E,
     collector: &EvidenceCollector,
     operation_id: OperationId,
     start_note: Option<String>,
-    now: u64,
+    started_at: ClockReading,
+    lease_ms: u64,
 ) -> Result<(), TestdError> {
-    let observed = block_on_one_shot(executor.inspect(operation_id));
-    let (execution, reason) = match (&observed, start_note) {
-        (Ok(view), _) => (
-            classify_observation(view),
-            observation_reason(view).to_owned(),
-        ),
-        (Err(ProcessExecutionError::UnknownOutcome), _) => (
-            ExecutionStatus::Unknown,
-            "observation returned UnknownOutcome; reconcile by exact identity, never blind-retry"
-                .to_owned(),
-        ),
-        (Err(error), Some(note)) => (
-            ExecutionStatus::Unknown,
-            format!(
-                "consuming start failed ({note}); observation also failed ({error}) so the outcome is unproven; reconcile by exact identity"
-            ),
-        ),
-        (Err(error), None) => (
-            ExecutionStatus::Unknown,
-            format!(
-                "observation failed ({error}) so the outcome is unproven; reconcile by exact identity"
-            ),
-        ),
-    };
+    let started_at_ms = clock_ms(&started_at).unwrap_or_else(current_clock_ms);
+    let deadline_ms =
+        started_at_ms.saturating_add(profile_wall_timeout_ms(job.invocation.profile.as_str())?);
+    let mut execution = ExecutionStatus::Unknown;
+    let mut reason =
+        "terminal observation did not prove an outcome; reconcile by exact identity".to_owned();
+    let mut reconcile_note = None;
+    let mut owner_lost = false;
+    let mut durable_cancelled = false;
+    let mut cancel_requested = false;
+    let mut cancel_deadline_ms = 0_u64;
+
+    loop {
+        let observed_now = current_clock_ms();
+        let current = store
+            .get(&job.job_id)?
+            .ok_or_else(|| TestdError::Corrupt("job disappeared during supervision".to_owned()))?;
+        if current.state == JobState::Cancelled && current.lease.is_none() {
+            durable_cancelled = true;
+            if !cancel_requested {
+                if let Err(error) = block_on_one_shot(executor.cancel(operation_id.clone())) {
+                    reconcile_note = Some(format!("durable cancellation request failed: {error}"));
+                }
+                cancel_requested = true;
+                cancel_deadline_ms = observed_now.saturating_add(SUPERVISION_CANCEL_GRACE_MS);
+            }
+        } else if current.state != JobState::Running || current.lease.as_ref() != Some(&*lease) {
+            // A different owner or reconciler has taken the durable fence.
+            // Do not cancel or overwrite that owner's process; its exact
+            // identity will be reconciled by the current owner.
+            owner_lost = true;
+            break;
+        } else if lease.expires_at_ms
+            <= observed_now.saturating_add((lease_ms / 2).max(SUPERVISION_POLL_INTERVAL_MS))
+        {
+            *lease = store.renew_lease(&job.job_id, &*lease, observed_now, lease_ms)?;
+        }
+
+        match block_on_one_shot(executor.inspect(operation_id.clone())) {
+            Ok(view) if view.lifecycle().is_terminal() => {
+                execution = classify_observation(&view);
+                reason = observation_reason(&view).to_owned();
+                // A terminal inspect is only a lifecycle observation. The
+                // executor's reconcile owner joins the real stdout/stderr
+                // capture sessions and publishes typed final evidence into
+                // this same collector.
+                reconcile_note = reconcile_operation(executor, collector, &operation_id);
+                break;
+            }
+            Ok(_) => {
+                if !cancel_requested && observed_now >= deadline_ms {
+                    if let Err(error) = block_on_one_shot(executor.cancel(operation_id.clone())) {
+                        reconcile_note = Some(format!(
+                            "wall deadline cancellation request failed: {error}"
+                        ));
+                    }
+                    cancel_requested = true;
+                    cancel_deadline_ms = observed_now.saturating_add(SUPERVISION_CANCEL_GRACE_MS);
+                }
+                if cancel_requested && observed_now >= cancel_deadline_ms {
+                    reason = "bounded terminal supervision expired after cancellation; reconcile by exact identity".to_owned();
+                    reconcile_note = reconcile_operation(executor, collector, &operation_id);
+                    break;
+                }
+            }
+            Err(error) => {
+                execution = ExecutionStatus::Unknown;
+                reason = if let Some(note) = start_note.as_deref() {
+                    format!(
+                        "consuming start failed ({note}); observation also failed ({error}) so the outcome is unproven; reconcile by exact identity"
+                    )
+                } else {
+                    format!(
+                        "observation failed ({error}) so the outcome is unproven; reconcile by exact identity"
+                    )
+                };
+                reconcile_note = reconcile_operation(executor, collector, &operation_id);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(SUPERVISION_POLL_INTERVAL_MS));
+    }
+
+    if durable_cancelled || owner_lost {
+        // A durable cancellation or a replaced fence already removed this
+        // worker's write authority. Physical cancellation above is best
+        // effort; this worker must never write through the cleared/replaced
+        // lease.
+        return Ok(());
+    }
+    let finish_now = current_clock_ms();
+    let current = store
+        .get(&job.job_id)?
+        .ok_or_else(|| TestdError::Corrupt("job disappeared before finish".to_owned()))?;
+    if current.state == JobState::Cancelled && current.lease.is_none() {
+        return Ok(());
+    }
+    if current.state != JobState::Running || current.lease.as_ref() != Some(&*lease) {
+        return Ok(());
+    }
+    if lease.expires_at_ms <= finish_now.saturating_add(SUPERVISION_POLL_INTERVAL_MS) {
+        *lease = store.renew_lease(&job.job_id, &*lease, finish_now, lease_ms)?;
+    }
+    let finished_at = observation_clock(current_clock_ms());
     let records = collector.snapshot();
-    let synthetic = match capture_inline_previews(collector, &records) {
+    let synthetic = match capture_inline_previews(collector, &records, finished_at) {
         Ok(synthetic) => synthetic,
         Err(error) => {
             finish_unknown(
@@ -332,7 +433,6 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
                 job,
                 lease,
                 collector,
-                now,
                 format!(
                     "raw capture failed after execution; outcome rescheduled as unknown: {error}"
                 ),
@@ -340,7 +440,7 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
             return Ok(());
         }
     };
-    let mut receipt = collector.verification_receipt(job, execution);
+    let mut receipt = collector.verification_receipt_at(job, execution, started_at, finished_at);
     for handle in &synthetic {
         receipt.normalized.push(NormalizedEvidence {
             kind: "process.observation".to_owned(),
@@ -355,22 +455,50 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
             job,
             lease,
             &EvidenceCollector::default(),
-            now,
             "enriched receipt failed validation; outcome rescheduled as unknown without evidence promotion"
                 .to_owned(),
         )?;
         return Ok(());
     }
+    let finish_now = current_clock_ms();
+    let verification = match evaluate_testd_verification(job, &receipt, finish_now) {
+        Ok(run) => Some(run),
+        Err(error) => {
+            // A receipt without the raw evidence required by the verifier
+            // contract remains a durable non-certifying TestD outcome. Do
+            // not manufacture a semantic result from the process label.
+            let _ = error;
+            None
+        }
+    };
+    let reason = match reconcile_note {
+        Some(note) => format!("{}; {note}", truncate_reason(reason)),
+        None => reason,
+    };
     store.finish(
         &job.job_id,
         lease,
         execution,
-        None,
+        verification,
         &receipt,
-        now,
+        finish_now,
         Some(truncate_reason(reason)),
     )?;
     Ok(())
+}
+
+fn reconcile_operation<E: ProcessExecutor + 'static>(
+    executor: &E,
+    collector: &EvidenceCollector,
+    operation_id: &OperationId,
+) -> Option<String> {
+    match block_on_one_shot(executor.reconcile(operation_id.clone())) {
+        Ok(evidence) => collector
+            .record(evidence)
+            .err()
+            .map(|error| format!("reconciliation evidence was rejected: {error}")),
+        Err(error) => Some(format!("reconciliation failed: {error}")),
+    }
 }
 
 /// Checks that the claimed durable job is exactly the presented admission.
@@ -472,6 +600,7 @@ fn observation_reason(view: &ProcessExecutionView) -> &'static str {
 fn capture_inline_previews(
     collector: &EvidenceCollector,
     records: &[ProcessEvidence],
+    captured_at: ClockReading,
 ) -> Result<Vec<String>, TestdError> {
     let mut synthetic = Vec::new();
     for (index, record) in records.iter().enumerate() {
@@ -485,16 +614,68 @@ fn capture_inline_previews(
                 continue;
             }
             let handle = format!("{INLINE_STREAM_HANDLE_PREFIX}-{index}-{stream}");
-            collector.record_raw_artifact(
+            let stream_kind = if stream == "stdout" {
+                RawArtifactStream::Stdout
+            } else {
+                RawArtifactStream::Stderr
+            };
+            let content_type = if stream_kind == RawArtifactStream::Stdout {
+                "application/x-nextest-libtest-json-plus"
+            } else {
+                "text/plain"
+            };
+            collector.record_raw_artifact_at(
                 handle.clone(),
-                "application/octet-stream",
+                content_type,
                 bytes.to_vec(),
                 preview.is_truncated(),
+                stream_kind,
+                captured_at,
             )?;
             synthetic.push(handle);
         }
     }
     Ok(synthetic)
+}
+
+fn observation_clock(now: u64) -> ClockReading {
+    let now = now.min(i64::MAX as u64) as i64;
+    ClockReading {
+        valid_time_ms: Some(now),
+        known_time_ms: Some(now),
+        transaction_sequence: None,
+        monotonic_ns: None,
+    }
+}
+
+fn current_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn profile_wall_timeout_ms(profile: &str) -> Result<u64, TestdError> {
+    match profile {
+        eliot_testd_core::TESTD_ADMITTED_PROFILE => {
+            Ok(eliot_testd_core::TESTD_PROFILE_WALL_TIMEOUT_MS)
+        }
+        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE => {
+            Ok(eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS)
+        }
+        _ => Err(TestdError::Invalid {
+            field: "profile",
+            reason: "testd supervision requires a registered profile",
+        }),
+    }
+}
+
+fn clock_ms(clock: &ClockReading) -> Option<u64> {
+    clock
+        .valid_time_ms
+        .or(clock.known_time_ms)
+        .and_then(|value| u64::try_from(value).ok())
 }
 
 /// Finishes one claimed attempt as `Unknown` with the evidence captured so
@@ -507,17 +688,18 @@ fn finish_unknown(
     job: &TestJob,
     lease: &Lease,
     collector: &EvidenceCollector,
-    now: u64,
     reason: String,
 ) -> Result<(), TestdError> {
     let receipt = collector.verification_receipt(job, ExecutionStatus::Unknown);
+    let finish_now = current_clock_ms();
+    let verification = evaluate_testd_verification(job, &receipt, finish_now).ok();
     store.finish(
         &job.job_id,
         lease,
         ExecutionStatus::Unknown,
-        None,
+        verification,
         &receipt,
-        now,
+        finish_now,
         Some(truncate_reason(reason)),
     )?;
     Ok(())
