@@ -341,18 +341,26 @@ mod tests {
     use std::num::NonZeroU64;
     use std::sync::Mutex;
 
-    use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_contracts::{
+        AuthorityEpoch, ContractId, EpochId, EpochLineageId, RequestId, ResourceGeneration,
+    };
+    use eliot_ipc::ProcessBinding;
     use eliot_kernel_service::{
         HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostKernelCandidateBinding,
         HostProcessBinding, KernelActivationPermit, KernelControlCommand, KernelReadyReceipt,
         KernelService, KernelServiceState, ProcessObservation, RestartBudget,
     };
     use eliot_platform::PlatformHandle;
+    use eliot_protocol::{EncodingProfile, ProtocolVersion, RequestIdentity};
     use eliot_runtime_contracts::{
         HealthVector, RegisteredActivityWakePolicy, ServiceProcessState, SupervisionJournalEpoch,
         SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
     };
     use eliot_store_api::NamedReadOperation;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    use crate::KernelConfig;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
     const EPOCH_SEQUENCE: u64 = 4;
@@ -705,5 +713,243 @@ mod tests {
             test_epoch(EPOCH_SEQUENCE),
             ResourceGeneration::new(generation).expect("generation"),
         )
+    }
+
+    fn dispatch_temp_root(slug: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-board-inbox-{slug}-{}-{}",
+            std::process::id(),
+            super::super::unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        root
+    }
+
+    /// Drives one composition to `Ready` so admitted-frame dispatch proves
+    /// exact authority agreement. Mirrors the proven `ready_kernel` driver;
+    /// slugs are board-inbox-scoped.
+    fn ready_dispatch_kernel(root: &Path) -> KernelComposition {
+        let kernel = KernelComposition::new(KernelConfig::new(root)).expect("kernel composition");
+        let candidate = candidate_binding();
+        let mut service = kernel.service.lock().expect("service lock");
+        service.reconcile(candidate.clone()).expect("reconcile");
+        service.apply(KernelControlCommand::Shadow).expect("shadow");
+        service
+            .apply(KernelControlCommand::PrepareHandoff)
+            .expect("handoff");
+        let permit = KernelActivationPermit {
+            operation_id: handle("op-board-dispatch-1"),
+            candidate_binding_digest: candidate.compute_digest().expect("candidate digest"),
+            prior_kernel_disposition_digest: "b".repeat(64),
+            journal_transaction_id: handle("txn-board-dispatch-1"),
+            journal_sequence: 7,
+            generation: live_generation(),
+            authority_epoch: candidate.kernel_epoch.clone(),
+            activation_nonce: eliot_platform::KernelActivationNonce::new(handle(&"a".repeat(64)))
+                .expect("activation nonce"),
+        };
+        service
+            .activate_permit(&permit, live_generation(), "c".repeat(64))
+            .expect("activate");
+        let ready = KernelReadyReceipt {
+            activation_id: candidate.activation_id.clone(),
+            activation_operation_id: permit.operation_id.clone(),
+            activation_nonce_digest: service
+                .activation_receipt()
+                .expect("activation receipt")
+                .activation_nonce_digest
+                .clone(),
+            process: ProcessObservation {
+                process_id: handle("pid:42:start:10"),
+                job_object_id: candidate.job_object_id.clone(),
+                state: ServiceProcessState::Ready,
+                health: HealthVector::healthy(),
+                evidence_refs: vec![handle("ev-board-dispatch-1")],
+            },
+            health: HealthVector::healthy(),
+            evidence_refs: vec![handle("ev-board-dispatch-1")],
+        };
+        service.publish_ready(ready).expect("publish ready");
+        assert_eq!(service.state(), KernelServiceState::Ready);
+        drop(service);
+        kernel
+    }
+
+    /// Admitted requester session shape. Mirrors the proven admitted-session
+    /// construction (policy-derived module generation, authenticated peer);
+    /// caller-module policy beyond peer authentication and fence agreement
+    /// is not asserted here.
+    fn admitted_requester_session(kernel: &KernelComposition) -> Session {
+        let policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy")
+            .clone();
+        let peer = PeerIdentity::authenticated_for_test(
+            ProcessBinding::from_observation(7, 9, r"C:\eliot\host.exe".to_owned())
+                .expect("process binding"),
+            "S-1-5-18".to_owned(),
+            "0".to_owned(),
+        )
+        .expect("peer");
+        let mut module_generation = policy.module_generation.clone();
+        module_generation.module_id = ContractId::new("eliotd").expect("module id");
+        Session {
+            connection_id: "board-inbox-conn".to_owned(),
+            protocol_version: ProtocolVersion::CURRENT,
+            peer,
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
+            module_generation,
+            launch_nonce: policy.launch_nonce.clone(),
+            capabilities: policy.allowed_capabilities.clone(),
+            privacy_classes: policy.allowed_privacy_classes.clone(),
+            effects: policy.allowed_effects.clone(),
+            session_epoch: 1,
+            state: eliot_ipc::SessionState::Open,
+        }
+    }
+
+    fn board_inbox_frame(session: &Session, request_id: &str, payload: serde_json::Value) -> Frame {
+        let frame_request_id = RequestId::new(request_id).expect("frame request id");
+        let fence = session.module_generation.state_fence.clone();
+        let fence_value = serde_json::to_value(&fence).expect("fence json");
+        let identity: RequestIdentity = serde_json::from_value(serde_json::json!({
+            "request": {
+                "metadata": {
+                    "request_id": serde_json::to_value(&frame_request_id).expect("id json"),
+                    "session_id": null,
+                    "task_id": null,
+                    "product_id": "product-board",
+                    "source_id": "board-frame",
+                    "state_fence": fence_value.clone(),
+                    "clock": {
+                        "valid_time_ms": 1000,
+                        "known_time_ms": 1001,
+                        "transaction_sequence": null,
+                        "monotonic_ns": null
+                    },
+                },
+                "state_fence": fence_value,
+            },
+            "idempotency_key": "frame-transport-board",
+            "deadline_unix_ms": 600_000u64,
+            "cancellation_id": "frame-cancel-board",
+        }))
+        .expect("frame identity decodes");
+        Frame {
+            protocol_version: ProtocolVersion::CURRENT,
+            encoding_profile: EncodingProfile::JsonV1,
+            connection_id: session.connection_id.clone(),
+            request_id: Some(frame_request_id),
+            kind: FrameKind::Request,
+            message_type: MessageType::Execute,
+            request_identity: Some(identity),
+            payload: ProtocolPayload::Json(payload),
+            trace_context: BTreeMap::new(),
+        }
+    }
+
+    fn board_operation_payload() -> serde_json::Value {
+        serde_json::json!({"operation": BOARD_INBOX_OPERATION})
+    }
+
+    #[test]
+    fn admitted_request_dispatches_to_board_inbox_action_with_verbatim_payload() {
+        let root = dispatch_temp_root("admit");
+        let kernel = ready_dispatch_kernel(&root);
+        let session = admitted_requester_session(&kernel);
+        let sent = board_operation_payload();
+        let frame = board_inbox_frame(&session, "frame-board-inbox-1", sent.clone());
+        match kernel.dispatch_frame(&session, &frame) {
+            Ok(KernelFrameAction::BoardInbox {
+                request_id,
+                operation,
+                payload,
+            }) => {
+                assert_eq!(operation, BOARD_INBOX_OPERATION);
+                assert_eq!(
+                    request_id,
+                    RequestId::new("frame-board-inbox-1").expect("request id")
+                );
+                assert_eq!(payload, sent);
+            }
+            other => panic!("admitted board frame must reach the BoardInbox branch, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn foreign_operation_shape_and_fence_never_reach_board_inbox() {
+        let root = dispatch_temp_root("deny");
+        let kernel = ready_dispatch_kernel(&root);
+        let session = admitted_requester_session(&kernel);
+        // Wrong closed operation: never the BoardInbox branch.
+        let status = board_inbox_frame(
+            &session,
+            "frame-board-status-1",
+            serde_json::json!({"operation": "controlboard.status"}),
+        );
+        assert!(
+            !matches!(
+                kernel.dispatch_frame(&session, &status),
+                Ok(KernelFrameAction::BoardInbox { .. })
+            ),
+            "foreign operation must not reach BoardInbox"
+        );
+        // Right operation but extra caller parameter: the request is not
+        // the closed empty shape, so it fences.
+        let padded = board_inbox_frame(
+            &session,
+            "frame-board-padded-1",
+            serde_json::json!({"operation": BOARD_INBOX_OPERATION, "scope": "all"}),
+        );
+        assert!(
+            matches!(
+                kernel.dispatch_frame(&session, &padded),
+                Err(TransportError::SessionFenced)
+            ),
+            "padded board request must fence"
+        );
+        // Right operation but foreign fence identity: the sequence is
+        // bumped one past the admitted session fence, so same-authority
+        // fails and the frame fences before any store I/O.
+        let mut drifted =
+            board_inbox_frame(&session, "frame-board-drift-1", board_operation_payload());
+        let session_fence = session.module_generation.state_fence.clone();
+        let foreign = StateFence::new(
+            eliot_contracts::EpochId::new(
+                session_fence.authority_epoch.lineage_id.clone(),
+                NonZeroU64::new(session_fence.authority_epoch.sequence.get() + 1)
+                    .expect("bumped sequence"),
+            )
+            .expect("foreign epoch"),
+            session_fence.resource_generation.clone(),
+        );
+        if let Some(identity) = drifted.request_identity.as_mut() {
+            identity.request.state_fence = foreign.clone();
+            identity.request.metadata.state_fence = foreign;
+        }
+        let drifted_result = kernel.dispatch_frame(&session, &drifted);
+        assert!(
+            matches!(drifted_result, Err(TransportError::SessionFenced)),
+            "foreign-fence board request must fence, got {drifted_result:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_ready_composition_fences_board_read() {
+        let root = dispatch_temp_root("cold");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let session = admitted_requester_session(&kernel);
+        let frame = board_inbox_frame(&session, "frame-board-cold-1", board_operation_payload());
+        assert!(
+            matches!(
+                kernel.dispatch_frame(&session, &frame),
+                Err(TransportError::SessionFenced)
+            ),
+            "cold kernel must fence the board read"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
