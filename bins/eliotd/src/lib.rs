@@ -161,7 +161,10 @@ pub use process_origin::{
     ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
     request_origin_control,
 };
-pub use reactive_view_cue_feed::serve_projection_inputs_under_fence;
+pub use reactive_view_cue_feed::{
+    ReactiveViewCueError, ReactiveViewCueOutcome, drive_reactive_view_cue_feed,
+    serve_projection_inputs_under_fence,
+};
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,

@@ -18,7 +18,7 @@ use eliot_context_contracts::{
     PrivacyClass, ProofBinding, SourceSnapshot,
 };
 use eliot_contracts::{ArtifactId, SourceId, canonical_json_bytes, sha256_hex};
-use eliot_cue_contracts::TargetHandle;
+use eliot_cue_contracts::{ActivationResult, TargetHandle};
 use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness, SourceAssurance};
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceEnvelope};
 
@@ -155,6 +155,75 @@ fn take_measurement(
     index
         .remove(member_id)
         .ok_or(ContextError::MissingField("member.measurement"))
+}
+
+/// Derive the exact owner measurement supply for one admitted activation
+/// result.
+///
+/// Every direct hit maps to its `cue-direct-<target>` member with the digest
+/// of its canonical bytes; every derived hit maps to its
+/// `cue-derived-<target>` member the same way. The `serializer` names the
+/// compilation the supply is derived for (it must equal the candidate
+/// policy serializer downstream); each entry is validated through the owner
+/// [`MeasurementRef::validate`] before return, and a repeated member
+/// identity fails closed as a duplicate. The digests are recomputed here —
+/// beside the [`derive_cue`] content rules they must satisfy — never
+/// accepted from the caller, so a forged measurement cannot survive the
+/// downstream `check_member_bindings` equality.
+pub fn measure_cue_members(
+    result: &ActivationResult,
+    serializer: &str,
+) -> Result<Vec<MemberMeasurement>, ContextError> {
+    result
+        .validate()
+        .map_err(|_| ContextError::InvalidField("cue.result"))?;
+    if serializer.trim().is_empty() || serializer.chars().any(char::is_control) {
+        return Err(ContextError::InvalidField("measurement.serializer"));
+    }
+    let mut out = Vec::with_capacity(
+        result
+            .direct
+            .len()
+            .saturating_add(result.derived.len()),
+    );
+    let mut seen = BTreeSet::new();
+    for hit in &result.direct {
+        let member_id = direct_member_id(&hit.target)?;
+        let (_, digest) = canonical_content(hit)?;
+        push_measurement(&mut out, &mut seen, member_id, digest, serializer)?;
+    }
+    for hit in &result.derived {
+        let member_id = derived_member_id(&hit.target)?;
+        let (_, digest) = canonical_content(hit)?;
+        push_measurement(&mut out, &mut seen, member_id, digest, serializer)?;
+    }
+    Ok(out)
+}
+
+/// Pushes one derived measurement after owner validation and
+/// duplicate detection.
+fn push_measurement(
+    out: &mut Vec<MemberMeasurement>,
+    seen: &mut BTreeSet<ArtifactId>,
+    member_id: ArtifactId,
+    digest: String,
+    serializer: &str,
+) -> Result<(), ContextError> {
+    let measurement = MeasurementRef {
+        digest,
+        serializer: serializer.to_owned(),
+    };
+    measurement
+        .validate()
+        .map_err(|_| ContextError::InvalidField("cue.measurement"))?;
+    if !seen.insert(member_id.clone()) {
+        return Err(ContextError::Duplicate("measurement.member_id"));
+    }
+    out.push(MemberMeasurement {
+        member_id,
+        measurement,
+    });
+    Ok(())
 }
 
 /// Attention kind from member flags: sticky material stays sticky; a member

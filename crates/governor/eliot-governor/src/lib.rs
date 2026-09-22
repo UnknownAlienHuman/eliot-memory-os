@@ -38,6 +38,7 @@ mod capability_evidence;
 mod composition;
 mod context_inputs;
 mod cue_composition;
+mod cue_evaluation;
 mod epistemic_composition;
 pub use context_inputs::{
     BoundCuePair, ContextInputsError, ContextReconstructionRequest, CuePairBindError,
@@ -49,6 +50,7 @@ pub use cue_composition::{
     CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
 };
+pub use cue_evaluation::{CueEvaluationError, LiveCueEvaluation, evaluate_live_cue_pair};
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 mod controlboard_projection;
 mod observation_reconciliation;
