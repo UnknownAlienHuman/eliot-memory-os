@@ -23,6 +23,7 @@ members = [
   "crates/foundation/eliot-contracts",
   "crates/foundation/eliot-evaluation-contracts",
   "crates/foundation/eliot-evidence",
+  "crates/foundation/eliot-memory-projection-contracts",
   "crates/foundation/eliot-observation-contracts",
   "crates/foundation/eliot-protocol",
   "crates/foundation/eliot-receipts",
@@ -105,6 +106,7 @@ members = [
   "crates/meta/eliot-runtime-status",
   "crates/security/eliot-erasure",
   "crates/security/eliot-influence",
+  "crates/smart/eliot-cognitive-quality",  # agent_order 80
   "crates/smart/eliot-context",
   "crates/smart/eliot-cues",
   "crates/smart/eliot-dreamer-core",
@@ -181,6 +183,7 @@ members = [
   "crates/smart/eliot-experience-projection",  # agent_order 48
   "crates/smart/eliot-dreamer-self-query",  # agent_order 49
   "crates/smart/eliot-epistemic-context-provider",  # agent_order 50
+  "crates/smart/eliot-memory-quality",  # agent_order 76
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`
@@ -298,7 +301,10 @@ eliot-task = { path = "crates/governor/eliot-task", version = "0.1.0" }
 eliot-testd-core = { path = "crates/instrument/eliot-testd-core", version = "0.1.0" }
 eliot-doctor-core = { path = "crates/meta/eliot-doctor-core", version = "0.1.0" }
 eliot-runtime-status = { path = "crates/meta/eliot-runtime-status", version = "0.1.0" }
+eliot-cognitive-quality = { path = "crates/smart/eliot-cognitive-quality", version = "0.1.0" }
 eliot-context = { path = "crates/smart/eliot-context", version = "0.1.0" }
+eliot-epistemic-contracts = { path = "crates/smart/eliot-epistemic-contracts", version = "0.1.0" }
+eliot-learning-contracts = { path = "crates/smart/eliot-learning-contracts", version = "0.1.0" }
 eliot-watchdog-core = { path = "crates/supervision/eliot-watchdog-core", version = "0.1.0" }
 eliot-research-exchange = { path = "crates/research/eliot-research-exchange", version = "0.1.0" }
 eliot-research-exchange-api = { path = "crates/research/eliot-research-exchange-api", version = "0.1.0" }
