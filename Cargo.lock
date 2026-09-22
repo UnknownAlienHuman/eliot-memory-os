@@ -3218,6 +3218,7 @@ dependencies = [
  "eliot-governor",
  "eliot-ipc",
  "eliot-kernel-core",
+ "eliot-kernel-service",
  "eliot-maintenance",
  "eliot-observability",
  "eliot-observation",

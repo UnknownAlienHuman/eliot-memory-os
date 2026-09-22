@@ -52,15 +52,20 @@ use eliot_agent_codex::{
     CodexSessionBinding, attach, bind_execution_unit,
 };
 use eliot_agent_coordinator::{
-    AgentCoordinator, CoordinatedAttemptState, CoordinatorError, ExecutionContext,
-    ProviderAdmissionReceipt, ProviderExecutionBindingSubmission, ProviderIdentity,
-    SessionAttemptError, SessionMatchError, VerifiedSessionBinding, produce_session_bound_attempts,
+    AdmittedProviderCapability, AgentCoordinator, CoordinatedAttemptState, CoordinatorConfig,
+    CoordinatorError, ExecutionContext, ProviderAdmissionReceipt,
+    ProviderExecutionBindingSubmission, ProviderIdentity, SessionAttemptError, SessionMatchError,
+    StaffingPlanRequest, VerifiedSessionBinding, produce_session_bound_attempts,
     verify_session_binding,
 };
 use eliot_contracts::{SessionId, StateFence, TaskId, WorkLeaseId, fences_match_exact};
+use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_process::ProcessRequest;
 use eliot_source_assurance::{AdmissionExpectation, SourceAssurance};
 use thiserror::Error;
+
+use crate::controlboard_adapters::parse_kernel_session_binding;
+use crate::daemon_kernel_client::DaemonKernelClient;
 
 /// Typed inputs for dispatching one execution unit through the chain.
 ///
@@ -152,6 +157,17 @@ pub enum ExecutionChainError {
     /// `Admitted` nor `Running`).
     #[error("admitted attempt is not in a dispatchable state")]
     AttemptNotDispatchable,
+    /// No live Kernel owner session exists behind the daemon channel, so no
+    /// Kernel-sourced session, fence, or epoch may be read.
+    #[error("daemon Kernel channel holds no live owner session")]
+    NoLiveOwnerSession,
+    /// The Kernel-issued session binding string fails its strict shape
+    /// (controlboard owner parser, exact `sid=..;session=..` only).
+    #[error("Kernel owner session binding rejected: {0}")]
+    OwnerSessionBinding(#[from] eliot_controlboard::PortError),
+    /// A validated identity constructor rejected owner-presented text.
+    #[error("owner identity rejected: {0}")]
+    OwnerIdentity(#[from] eliot_contracts::ContractError),
 }
 
 /// Dispatch one execution unit through the full production chain.
@@ -354,3 +370,182 @@ pub fn launch_execution_unit(
         provider_start_receipt_ref: input.provider_start_receipt_ref,
     })
 }
+
+/// Durable ORS claim-row projection for one provider capability, as presented
+/// through the Kernel claim path. Every field is validated at capability
+/// construction (`AdmittedProviderCapability::new`) and re-verified by the
+/// sealed verifier on every coordinator call — presence here trusts nothing
+/// by value. Owner: Kernel/ORS claim records; the daemon presents, never
+/// mints, these identities and digests.
+pub struct CapabilityClaimMaterial {
+    /// Provider identity from the claim row.
+    pub identity: ProviderIdentity,
+    /// Durable claim identity.
+    pub claim_id: String,
+    /// Attempt identity bound by the claim row.
+    pub attempt: String,
+    /// Operation identity bound by the claim row.
+    pub operation: String,
+    /// Durable binding digest bound by the claim row.
+    pub binding_digest: String,
+    /// Presented executable binding digest.
+    pub executable_digest: String,
+    /// Presented Governor current route revision.
+    pub route_revision: String,
+    /// Presented Governor current capacity revision.
+    pub capacity_revision: String,
+    /// Replay floor for restored coordinators; zero on first construction.
+    pub minimum_event_sequence: u64,
+}
+
+/// Typed inputs for the closed execution entrypoint, grouped by issuing
+/// owner: Task Controller (staffing request, launch), Governor (admission
+/// receipt, capability expectation), Kernel/ORS claim path (capability claim
+/// material), live Kernel channel (reads, never parameters), Q-01 (source
+/// admission), P-03 (process binding), and execution-observed facts plus
+/// provider-start correlation. No identity, fence, task, digest, or receipt
+/// text appears anywhere here.
+pub struct ClosedExecutionInput<'a> {
+    /// Live Kernel channel for owner session and fence reads.
+    pub kernel: &'a DaemonKernelClient,
+    /// Daemon coordinator configuration.
+    pub config: CoordinatorConfig,
+    /// Frozen Task-Controller staffing request (also planned below).
+    pub staffing: StaffingPlanRequest,
+    /// Task-Controller frozen launch request.
+    pub launch: AgentLaunchRequest,
+    /// Governor grant envelope bounding the launch.
+    pub authority: AuthorityEnvelope,
+    /// Admitted route this execution serves.
+    pub route: RouteFingerprint,
+    /// Observed native thread locator for the adapter session.
+    pub thread_id: String,
+    /// Admitted working directory for the adapter session.
+    pub working_directory: String,
+    /// P-03 process-request binding for the execution.
+    pub process_request: ProcessRequest,
+    /// Q-01 source assurance for the launch source.
+    pub source_assurance: SourceAssurance,
+    /// Q-01 admission expectation for the launch source.
+    pub source_expectation: AdmissionExpectation,
+    /// Governor/provider admission receipt for the staffed candidate.
+    pub admission: ProviderAdmissionReceipt,
+    /// ORS claim-row projection backing the provider capability.
+    pub claim: CapabilityClaimMaterial,
+    /// Governor currentness the capability proof is checked against.
+    pub expectation: ProviderCapabilityExpectation,
+    /// Authenticated provider scope the execution runs under.
+    pub provider_scope_ref: String,
+    /// Observed native session (execution evidence only).
+    pub native_session: NativeSession,
+    /// Execution-unit identity for this turn.
+    pub execution_unit: ExecutionUnit,
+    /// Start-request identity.
+    pub start_request_id: RequestId,
+    /// Canonical start-request bytes (digest computed inside the supplier).
+    pub start_request_bytes: &'a [u8],
+    /// Provider identity for the start correlation.
+    pub provider_identity: ProviderIdentity,
+    /// Provider start-receipt reference for the start correlation.
+    pub provider_start_receipt_ref: String,
+}
+
+/// Launch one execution unit through the closed production entrypoint.
+///
+/// The actual binary-called chain (issue #1942 lane O1): fresh Kernel owner
+/// reads first (live fence plus live owner-session presence — absent reads
+/// fail closed before anything is constructed), then the adapter session
+/// binding is built from the Kernel-issued session text (strict shape,
+/// validated `SessionId`) plus the observed thread, the admitted route hash,
+/// and the admitted working directory. The closed coordinator is constructed
+/// from the assembled capability, the staffing request is planned on it, and
+/// the remainder runs through [`launch_execution_unit`] (attach validates
+/// before any coordinator authority flows) with the live triple re-stated
+/// fresh from owner reads: Kernel session, Kernel fence, Task-Controller
+/// task.
+///
+/// Preservation: replay stays safe — attach is pure validation, admit/plan
+/// echo identical bytes, start branches on owner-read state, and the bind is
+/// idempotent under canonical-input replay; cancellation paths are untouched
+/// (this chain neither cancels nor reconciles); unknown outcomes keep their
+/// identities (every error below names the exact failing owner read).
+/// Session provenance, hop by hop: Kernel binding string → strict parse →
+/// validated `SessionId` → adapter session → attach receipt → supplier →
+/// coordinator record → producer → matcher. No claimant, thread, or native
+/// text ever becomes a session.
+pub fn launch_closed_execution(
+    input: ClosedExecutionInput,
+) -> Result<DispatchedExecution, ExecutionChainError> {
+    // 1. Fresh Kernel owner reads first: the live fence and the live owner
+    //    session presence. No live session means no Kernel-sourced session,
+    //    fence, or epoch may be read.
+    let live_fence = input.kernel.kernel_fence();
+    let owner_facts = input
+        .kernel
+        .owner_session_facts()
+        .ok_or(ExecutionChainError::NoLiveOwnerSession)?;
+    // 2. Strict shape on the Kernel-issued binding (shared parser, exact
+    //    `sid=..;session=..` only), then validated session identity. The
+    //    principal half stays with the Kernel owner; only the session half
+    //    continues, as a validated type.
+    let (_principal_sid, session_text) =
+        parse_kernel_session_binding(&owner_facts.session_binding)?;
+    let kernel_session = SessionId::new(session_text)?;
+    // 3. Capability assembly from claim material plus Governor currentness
+    //    plus the live Kernel epoch. Shapes validated here; the sealed
+    //    verifier re-checks currency on every coordinator call, never cached.
+    let claim = input.claim;
+    let capability = AdmittedProviderCapability::new(
+        claim.identity,
+        claim.claim_id,
+        claim.attempt,
+        claim.operation,
+        claim.binding_digest,
+        claim.executable_digest,
+        claim.route_revision,
+        claim.capacity_revision,
+        input.expectation,
+        live_fence.authority_epoch.clone(),
+        claim.minimum_event_sequence,
+    )?;
+    // 4. Closed coordinator on daemon-held Kernel admission, then plan the
+    //    Task-Controller staffing request on that same instance (admit
+    //    requires its own planned candidate).
+    let mut coordinator =
+        AgentCoordinator::new_with_admitted_provider(input.config, capability)?;
+    coordinator.plan(input.staffing)?;
+    // 5. Adapter session binding: Kernel session plus observed thread plus
+    //    admitted route hash plus admitted working directory. Attach
+    //    validates the route/workdir agreement downstream.
+    let session = CodexSessionBinding {
+        session_id: kernel_session.clone(),
+        thread_id: input.thread_id,
+        runtime_hash: input.route.runtime_hash.clone(),
+        working_directory: input.working_directory,
+    };
+    let live_task = input.launch.task_id.clone();
+    // 6. Full launch chain with the live triple re-stated fresh from owner
+    //    reads (Kernel session, Kernel fence, Task-Controller task).
+    launch_execution_unit(LaunchExecutionInput {
+        launch: input.launch,
+        authority: input.authority,
+        route: input.route,
+        session,
+        process_request: input.process_request,
+        source_assurance: input.source_assurance,
+        source_expectation: input.source_expectation,
+        coordinator: &mut coordinator,
+        admission: input.admission,
+        live_session: &kernel_session,
+        live_fence: &live_fence,
+        live_task: &live_task,
+        provider_scope_ref: input.provider_scope_ref,
+        native_session: input.native_session,
+        execution_unit: input.execution_unit,
+        start_request_id: input.start_request_id,
+        start_request_bytes: input.start_request_bytes,
+        provider_identity: input.provider_identity,
+        provider_start_receipt_ref: input.provider_start_receipt_ref,
+    })
+}
+

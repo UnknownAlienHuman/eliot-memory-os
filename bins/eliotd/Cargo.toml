@@ -33,6 +33,7 @@ eliot-evaluation-contracts.workspace = true
 eliot-governor.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
+eliot-kernel-service.workspace = true
 eliot-maintenance.workspace = true
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
 eliot-observation.workspace = true
