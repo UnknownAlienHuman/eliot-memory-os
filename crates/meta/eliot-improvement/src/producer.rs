@@ -18,6 +18,10 @@
 //!   canonical digest, so downstream screens and measurements bind it.
 //! - Drafts are never produced: this producer emits only admitted local
 //!   updates for a compatible attempt, never speculative deltas.
+//!
+//! The embedded `expires_at_unix_secs` is enforced downstream against the
+//! owner/host clock by the governed screens; the producer never decides
+//! liveness itself.
 
 use blake3::Hasher;
 use eliot_context_contracts::{
