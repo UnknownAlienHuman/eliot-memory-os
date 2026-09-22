@@ -13,8 +13,8 @@
 //!   live-admissible RIGHT NOW (admitting state, live epoch/generation)
 //! → digest equality: caller-built verified handles must cite the exact
 //!   freshly minted issuance for this claim (no transplanted/stale permits)
-//! → compose_governed_compilation: ticket re-verification, overlay
-//!   liveness, backlog backing, cross-task admission, admit, assemble
+//! → produce → retrieve_governed → admit_context_with_learning
+//!   → assemble_active_view_with_learning (or fail closed)
 //! ```
 //!
 //! Authority discipline (mirrors the [`GovernorGrant`] port-grant pattern
@@ -22,27 +22,46 @@
 //! overlay, backlog, and cross-task records from the authenticated owner
 //! channel. This module never fabricates a permit, never mints authority
 //! from ambient input, and never moves Governor state into the WASM guest
-//! (the guest contour refuses marked inputs outright; see
-//! `eliot-context-compiler-wasm`). Re-minting inside these entrypoints
-//! recomputes live admissibility for comparison only.
+//! (the guest contour refuses marked inputs outright). Re-minting inside
+//! these entrypoints recomputes live admissibility for comparison only.
 //!
-//! Host-side honored-output check ([`check_governed_host_output`]) applies
-//! the same live binding to a `GuestResponse` before the host honors
-//! anything admitted in it.
+//! The orchestration here is the host-owned counterpart of the rlib
+//! composition helpers: every security invariant (ticket re-verification,
+//! overlay liveness, backlog backing, cross-task admission, per-mark
+//! binding) lives once in `eliot-improvement`/`eliot-context-admission`
+//! and executes below; this module only sequences the boundary flow with
+//! host-held owner inputs.
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_context_compiler_wasm::{
-    ComposeError, GovernedCompilation, GuestRequest, GuestResponse, HonorError,
-    check_honored_output, compose_governed_compilation,
+use eliot_context_admission::admit_context_with_learning;
+use eliot_context_assembly::{
+    ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view_with_learning,
 };
-use eliot_context_assembly::AssemblyPolicy;
 use eliot_context_contracts::{
-    AdmissionInput, ContextError, ContextRecipe, QualityScorecard, SerializedContextMeasurement,
+    AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe, QualityScorecard,
+    SerializedContextMeasurement,
 };
 use eliot_governor::{Governor, LearningAdmissionClaim, issue_learning_admission};
-use eliot_improvement::{LearningProduction, PresentedLearning};
+use eliot_improvement::{
+    BoundsError, LearningProduction, PresentedLearning, datetime_from_unix, produce_learning_candidate,
+};
+use eliot_improvement::candidate_bounds::{
+    GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
+};
+use eliot_improvement::{
+    CarriageMark, bounds_to_context_error, check_governed_carriage,
+};
+
+/// One host-composed governed learning compilation: retrieval decision,
+/// admission, and the projected view when admission completed.
+#[derive(Clone, Debug)]
+pub struct HostGovernedCompilation {
+    pub retrieval: RetrievalDecision,
+    pub admission: AdmissionResult,
+    pub view: Option<ActiveUnderstandingViewResult>,
+}
 
 /// Fail-closed host admission errors with stable codes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,8 +73,16 @@ pub enum HostAdmitError {
     IssuanceMismatch,
     /// The process clock is unavailable; expiry cannot be decided.
     ClockUnavailable,
-    /// The governed composition refused.
-    ComposeFailed(String),
+    /// Campaign overlay record required for composed retrieval.
+    OverlayRequired,
+    /// Governed production refused.
+    Production(String),
+    /// Governed retrieval refused.
+    Retrieval(String),
+    /// Governed admission refused.
+    Admission(String),
+    /// Governed assembly refused.
+    Assembly(String),
     /// A guest/native response failed the honored-output gate.
     HonorRefused(String),
 }
@@ -66,7 +93,11 @@ impl fmt::Display for HostAdmitError {
             Self::ClaimRefused(reason) => write!(formatter, "CLAIM_REFUSED:{reason}"),
             Self::IssuanceMismatch => formatter.write_str("ISSUANCE_MISMATCH"),
             Self::ClockUnavailable => formatter.write_str("OWNER_CLOCK_UNAVAILABLE"),
-            Self::ComposeFailed(reason) => write!(formatter, "COMPOSE_FAILED:{reason}"),
+            Self::OverlayRequired => formatter.write_str("OVERLAY_REQUIRED"),
+            Self::Production(reason) => write!(formatter, "PRODUCTION_REFUSED:{reason}"),
+            Self::Retrieval(reason) => write!(formatter, "RETRIEVAL_REFUSED:{reason}"),
+            Self::Admission(reason) => write!(formatter, "ADMISSION_REFUSED:{reason}"),
+            Self::Assembly(reason) => write!(formatter, "ASSEMBLY_REFUSED:{reason}"),
             Self::HonorRefused(reason) => write!(formatter, "HONOR_REFUSED:{reason}"),
         }
     }
@@ -112,17 +143,18 @@ fn live_issuance(
 /// underlying screens decide; marked influence passes only with a live
 /// issuance, live overlay, active backlog backing, and (cross-task) fresh
 /// admission. Any failure refuses the whole compilation.
+#[allow(clippy::too_many_arguments)]
 pub fn admit_governed_host<F>(
     governor: &Governor,
     claim: &LearningAdmissionClaim,
     production: LearningProduction<'_>,
     presented: PresentedLearning<'_>,
-    input: AdmissionInput,
+    mut input: AdmissionInput,
     recipe: &ContextRecipe,
     quality: QualityScorecard,
     policy: &AssemblyPolicy,
     measure: F,
-) -> Result<GovernedCompilation, HostAdmitError>
+) -> Result<HostGovernedCompilation, HostAdmitError>
 where
     F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
 {
@@ -131,25 +163,73 @@ where
         now_unix_secs: now,
         ..presented
     };
-    compose_governed_compilation(production, presented, input, recipe, quality, policy, measure)
-        .map_err(|error: ComposeError| HostAdmitError::ComposeFailed(error.to_string()))
+    let overlay = presented.overlay.ok_or(HostAdmitError::OverlayRequired)?;
+    let permit = presented.verified.permit();
+    let produced =
+        produce_learning_candidate(production).map_err(|error| HostAdmitError::Production(error.to_string()))?;
+    let reusable = ReusableCandidateRef {
+        candidate_id: produced
+            .learning
+            .as_ref()
+            .and_then(|mark| mark.candidate_id.clone())
+            .ok_or(HostAdmitError::Retrieval(
+                BoundsError::ReusableBackingMismatch.to_string(),
+            ))?,
+        closure_ref: produced
+            .learning
+            .as_ref()
+            .and_then(|mark| mark.closure_ref.clone()),
+        owner: produced
+            .learning
+            .as_ref()
+            .and_then(|mark| mark.owner.clone()),
+        origin_campaign_id: permit.source_campaign_id().to_string(),
+    };
+    let retrieval = retrieve_governed(GovernedRetrieval {
+        requesting_campaign_id: presented.requesting_campaign_id,
+        requesting_task_id: presented.requesting_task_id,
+        overlay,
+        reusable: Some(&reusable),
+        draft_delta_present: false,
+        cross_task_admission: presented.cross_task_admission,
+        backlog: presented.backlog,
+        verified: presented.verified,
+        now: datetime_from_unix(now).map_err(|error| HostAdmitError::Retrieval(error.to_string()))?,
+    })
+    .map_err(|error| HostAdmitError::Retrieval(error.to_string()))?;
+    input.candidates.candidates.push(produced);
+    input.learning_tickets.push(presented.ticket.clone());
+    let admission = admit_context_with_learning(&input, presented)
+        .map_err(|error| HostAdmitError::Admission(error.to_string()))?;
+    let view = match &admission.outcome {
+        ContextOutcome::Complete(set) => Some(
+            assemble_active_view_with_learning(set, recipe, quality, policy, measure, presented)
+                .map_err(|error: AssemblyError| HostAdmitError::Assembly(error.to_string()))?,
+        ),
+        ContextOutcome::Incomplete(_) => None,
+    };
+    Ok(HostGovernedCompilation {
+        retrieval,
+        admission,
+        view,
+    })
 }
 
-/// Trusted honored-output gate: validate a `GuestResponse` against the
-/// request that produced it and the live Governor issuance before the host
-/// honors anything admitted in it.
+/// Trusted honored-output gate: validate a natively produced admission
+/// result against the input that produced it and the live Governor
+/// issuance before the host honors anything admitted in it.
 ///
-/// Same live binding as [`admit_governed_host`] (fresh mint + digest
-/// equality + owner clock), then the shared honored-output check over the
-/// response content. Unmarked coherent output passes; marked atoms admitted
-/// anywhere without a live issuance refuse here even if the producing
-/// contour passed them structurally.
+/// Envelope coherence (task identity plus exact State Fence), input-digest
+/// rebinding (anti-substitution), then the full live-owner carriage gate
+/// over admitted marked atoms. Unmarked results over unticketed inputs
+/// pass on coherence alone. Intended for the host dispatch that honors
+/// component/native retrieval output once the typed domain handoff lands.
 pub fn check_governed_host_output(
     governor: &Governor,
     claim: &LearningAdmissionClaim,
     presented: PresentedLearning<'_>,
-    request: &GuestRequest,
-    response: &GuestResponse,
+    input: &AdmissionInput,
+    admission: &AdmissionResult,
 ) -> Result<(), HostAdmitError> {
     let now = live_now_secs()?;
     let fresh = issue_learning_admission(governor, claim)
@@ -157,10 +237,60 @@ pub fn check_governed_host_output(
     if presented.verified.permit().digest() != fresh.digest() {
         return Err(HostAdmitError::IssuanceMismatch);
     }
+    if admission.binding.task_id.as_str() != input.binding.task_id.as_str()
+        || !eliot_contracts::fences_match_exact(
+            &admission.binding.state_fence,
+            &input.binding.state_fence,
+        )
+    {
+        return Err(HostAdmitError::HonorRefused(
+            "admission binding drifted from the requested compilation".to_owned(),
+        ));
+    }
+    let input_digest = input
+        .canonical_digest()
+        .map_err(|_| HostAdmitError::HonorRefused("input digest failure".to_owned()))?;
+    if input_digest != admission.input_digest {
+        return Err(HostAdmitError::HonorRefused(
+            "admission answers a different input".to_owned(),
+        ));
+    }
+    let marked = match &admission.outcome {
+        ContextOutcome::Complete(set) => set
+            .records
+            .iter()
+            .any(|record| record.candidate.learning.is_some()),
+        ContextOutcome::Incomplete(_) => false,
+    };
+    if !marked && input.learning_tickets.is_empty() {
+        return Ok(());
+    }
+    let mut marks = Vec::new();
+    if let ContextOutcome::Complete(set) = &admission.outcome {
+        for record in &set.records {
+            if let Some(provenance) = &record.candidate.learning {
+                provenance
+                    .validate()
+                    .map_err(|error| HostAdmitError::HonorRefused(error.to_string()))?;
+                marks.push(CarriageMark {
+                    campaign_id: provenance.campaign_id.as_str(),
+                    overlay_id: provenance.overlay_id.as_deref(),
+                    candidate_id: provenance.candidate_id.as_deref(),
+                    closure_ref: provenance.closure_ref.as_deref(),
+                    owner: provenance.owner.as_deref(),
+                    draft: provenance.draft,
+                    expires_at_unix_secs: provenance.expires_at_unix_secs,
+                    permit_digest: provenance.permit_digest.as_str(),
+                    binding_task_id: record.candidate.binding.task_id.as_str(),
+                });
+            }
+        }
+    }
     let presented = PresentedLearning {
         now_unix_secs: now,
         ..presented
     };
-    check_honored_output(request, response, presented)
-        .map_err(|error: HonorError| HostAdmitError::HonorRefused(error.to_string()))
+    eliot_improvement::check_governed_carriage(&presented, &admission.binding.state_fence, &marks)
+        .map_err(bounds_to_context_error)
+        .map_err(|error| HostAdmitError::HonorRefused(error.to_string()))
 }
