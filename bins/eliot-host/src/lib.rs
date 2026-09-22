@@ -6025,23 +6025,30 @@ impl HostComposition {
                 return self.cleanup_launched_contour(error);
             }
         }
-        let (kernel_artifact, approved_store_artifact) = manifest
-            .host_child_artifact_digests()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let (kernel_artifact, approved_store_artifact) = match manifest.host_child_artifact_digests()
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return self.cleanup_launched_contour(HostError::ProcessContour(error.to_string()));
+            }
+        };
         if approved_store_artifact != store_artifact {
-            return Err(HostError::ProcessContour(
+            return self.cleanup_launched_contour(HostError::ProcessContour(
                 "Store bridge artifact digest is not the approved manifest digest".to_owned(),
             ));
         }
         let (approved_kernel_path, approved_store_path, approved_config_path) =
             manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
-        let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
+        let (prior_kernel, kernel_generation, kernel_authority_epoch) = match self
             .next_kernel_activation_context(
                 phase_b.launch.authority_state_fence.authority_epoch.clone(),
                 None,
-            )?;
-        self.jobs.start_approved(
+            ) {
+                Ok(value) => value,
+                Err(error) => return self.cleanup_launched_contour(error),
+            };
+        if let Err(error) = self.jobs.start_approved(
             kernel_executable,
             store_executable,
             &manifest.generation,
@@ -6054,7 +6061,9 @@ impl HostComposition {
             store_artifact,
             &self.host,
             &phase_b.launch,
-        )?;
+        ) {
+            return self.cleanup_launched_contour(error);
+        }
         let agent_bridge_admission = match (phase_b.agent_bridge(), phase_b.final_agent_bridge()) {
             (Some(_prepared), None) => Err(HostError::RecoveryRequired(
                 "Agent Bridge admission requires the final provider binding".to_owned(),
