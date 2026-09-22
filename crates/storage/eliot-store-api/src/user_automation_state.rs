@@ -250,6 +250,10 @@ pub struct DecodedAutomationRead {
     pub query: String,
     /// Exact automation selector (required except list).
     pub automation_id: Option<String>,
+    /// Optional exact immutable revision selector for current/history owner reads.
+    pub requested_revision: Option<String>,
+    /// Optional exact occurrence selector for invocation-owner reads.
+    pub requested_occurrence_id: Option<String>,
     /// Retired-row inclusion (list only).
     pub include_retired: bool,
     /// Page-size bound (list/history/invocations only).
@@ -442,6 +446,59 @@ pub fn automation_read_request(
     Ok(request)
 }
 
+/// Builds an exact immutable-revision read for the canonical owner boundary.
+///
+/// The selector is accepted only by the closed `current`/`history` read
+/// contract. Provider adapters must use it to address the immutable row by
+/// identity; it is not a page cursor or a caller-authored revision document.
+pub fn automation_revision_read_request(
+    query: String,
+    automation_id: String,
+    revision: String,
+    include_retired: bool,
+    max_records: u16,
+    state_fence: StateFence,
+) -> Result<NamedReadRequest, StoreError> {
+    let mut request = automation_read_request(
+        query,
+        Some(automation_id),
+        include_retired,
+        max_records,
+        state_fence,
+    )?;
+    request.parameters.insert(
+        AUTOMATION_PARAM_REVISION.to_owned(),
+        Value::String(revision),
+    );
+    request.validate()?;
+    Ok(request)
+}
+
+/// Builds an exact invocation read for one owner-issued occurrence.
+///
+/// The selector addresses the immutable invocation row by its occurrence
+/// identity. It is accepted only by the closed `invocations` query and never
+/// falls back to the bounded invocation page.
+pub fn automation_invocation_read_request(
+    automation_id: String,
+    occurrence_id: String,
+    state_fence: StateFence,
+) -> Result<NamedReadRequest, StoreError> {
+    let mut request = automation_read_request(
+        AUTOMATION_QUERY_INVOCATIONS.to_owned(),
+        Some(automation_id),
+        false,
+        1,
+        state_fence,
+    )?;
+    request.parameters.insert(
+        AUTOMATION_PARAM_OCCURRENCE_ID.to_owned(),
+        Value::String(occurrence_id),
+    );
+    request.validate()?;
+    Ok(request)
+}
+
 /// Validates closed mutation parameters for one automation operation.
 ///
 /// The operation identity is the discriminator: each leg declares exactly
@@ -585,6 +642,20 @@ pub fn validate_automation_read_params(
     if let Some(id) = automation_id.as_deref() {
         validate_automation_id(id)?;
     }
+    let requested_revision = parameters
+        .get(AUTOMATION_PARAM_REVISION)
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(revision) = requested_revision.as_deref() {
+        validate_revision_id(revision)?;
+    }
+    let requested_occurrence_id = parameters
+        .get(AUTOMATION_PARAM_OCCURRENCE_ID)
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(occurrence_id) = requested_occurrence_id.as_deref() {
+        validate_occurrence_id(occurrence_id)?;
+    }
     let include_retired = parameters
         .get(AUTOMATION_PARAM_INCLUDE_RETIRED)
         .and_then(Value::as_str)
@@ -620,16 +691,33 @@ pub fn validate_automation_read_params(
         });
     }
     match query {
-        AUTOMATION_QUERY_LIST => Ok(DecodedAutomationRead {
-            query: query.to_owned(),
-            automation_id: None,
-            include_retired,
-            max_records,
-        }),
-        AUTOMATION_QUERY_CURRENT
-        | AUTOMATION_QUERY_HISTORY
-        | AUTOMATION_QUERY_INVOCATIONS
-        | AUTOMATION_QUERY_FAILURE => {
+        AUTOMATION_QUERY_LIST => {
+            if requested_revision.is_some() || requested_occurrence_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: if requested_revision.is_some() {
+                        AUTOMATION_PARAM_REVISION
+                    } else {
+                        AUTOMATION_PARAM_OCCURRENCE_ID
+                    },
+                    reason: "selector is not valid for list reads",
+                });
+            }
+            Ok(DecodedAutomationRead {
+                query: query.to_owned(),
+                automation_id: None,
+                requested_revision: None,
+                requested_occurrence_id: None,
+                include_retired,
+                max_records,
+            })
+        }
+        AUTOMATION_QUERY_CURRENT | AUTOMATION_QUERY_HISTORY => {
+            if requested_occurrence_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_OCCURRENCE_ID,
+                    reason: "occurrence selector is only valid for invocations reads",
+                });
+            }
             let automation_id = automation_id.ok_or(StoreError::InvalidField {
                 field: "automation.automation_id",
                 reason: "exact automation selector is required",
@@ -637,6 +725,52 @@ pub fn validate_automation_read_params(
             Ok(DecodedAutomationRead {
                 query: query.to_owned(),
                 automation_id: Some(automation_id),
+                requested_revision,
+                requested_occurrence_id: None,
+                include_retired,
+                max_records,
+            })
+        }
+        AUTOMATION_QUERY_INVOCATIONS => {
+            if requested_revision.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_REVISION,
+                    reason: "revision selector is only valid for current/history reads",
+                });
+            }
+            let automation_id = automation_id.ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            })?;
+            Ok(DecodedAutomationRead {
+                query: query.to_owned(),
+                automation_id: Some(automation_id),
+                requested_revision: None,
+                requested_occurrence_id,
+                include_retired,
+                max_records,
+            })
+        }
+        AUTOMATION_QUERY_FAILURE => {
+            if requested_revision.is_some() || requested_occurrence_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: if requested_revision.is_some() {
+                        AUTOMATION_PARAM_REVISION
+                    } else {
+                        AUTOMATION_PARAM_OCCURRENCE_ID
+                    },
+                    reason: "selector is not valid for failure reads",
+                });
+            }
+            let automation_id = automation_id.ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            })?;
+            Ok(DecodedAutomationRead {
+                query: query.to_owned(),
+                automation_id: Some(automation_id),
+                requested_revision: None,
+                requested_occurrence_id: None,
                 include_retired,
                 max_records,
             })

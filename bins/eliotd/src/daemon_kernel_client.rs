@@ -24,6 +24,7 @@ use eliot_protocol::{
 };
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{NamedReadRequest, NamedReadResponse};
+use serde::Serialize;
 
 #[cfg(windows)]
 use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
@@ -76,6 +77,33 @@ pub struct OwnerSessionFacts {
     pub(crate) launch_nonce: String,
     pub(crate) artifact_digest: String,
     pub(crate) protected_snapshot_digest: String,
+}
+
+/// Selector-only carrier for one manual UserAutomation producer request.
+///
+/// Kernel derives the authenticated principal, current fence, immutable
+/// revision material, and occurrence identity. These three fields are never
+/// treated as authority by the daemon or Kernel route.
+#[derive(Clone, Debug, Serialize)]
+pub struct UserAutomationDaemonTrigger {
+    pub automation_id: String,
+    pub requested_revision: String,
+    pub manual_nonce: String,
+}
+
+impl UserAutomationDaemonTrigger {
+    pub fn validate(&self) -> Result<(), String> {
+        for (value, field) in [
+            (&self.automation_id, "automation_id"),
+            (&self.requested_revision, "requested_revision"),
+            (&self.manual_nonce, "manual_nonce"),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) || value.len() > 256 {
+                return Err(format!("UserAutomation trigger {field} is invalid"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]

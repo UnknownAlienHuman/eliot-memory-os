@@ -717,11 +717,32 @@ impl UserAutomationInvocation {
     /// Returns the stable revision-bound occurrence identity.
     pub fn occurrence_identity(&self) -> Result<String, UserAutomationError> {
         self.validate()?;
-        let bytes = canonical_json_bytes(&(
-            OCCURRENCE_IDENTITY_DOMAIN,
+        Self::occurrence_identity_for(
             &self.automation_id,
             &self.automation_revision,
             &self.trigger,
+        )
+    }
+
+    /// Derives the stable occurrence identity from owner-selected immutable
+    /// identity and trigger material without constructing an invocation.
+    ///
+    /// This is a selector operation only. It does not assign a principal,
+    /// trigger origin, child depth, mode, or work scope; those fields must be
+    /// recovered from the owner-issued persisted invocation before admission.
+    pub fn occurrence_identity_for(
+        automation_id: &str,
+        automation_revision: &str,
+        trigger: &UserAutomationTrigger,
+    ) -> Result<String, UserAutomationError> {
+        text(automation_id, "automation_id")?;
+        text(automation_revision, "automation_revision")?;
+        trigger.validate()?;
+        let bytes = canonical_json_bytes(&(
+            OCCURRENCE_IDENTITY_DOMAIN,
+            automation_id,
+            automation_revision,
+            trigger,
         ))
         .map_err(|error| UserAutomationError::Serialization(error.to_string()))?;
         Ok(format!("user-automation-occurrence:{}", sha256_hex(&bytes)))

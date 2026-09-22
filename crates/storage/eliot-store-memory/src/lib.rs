@@ -1447,7 +1447,13 @@ fn automation_state_payload(
                 serde_json::Error::custom("exact automation selector is required")
             })?;
             let (current, revision) = match state.automation_currents.get(&id) {
-                Some(row) if row.state_fence == *fence => (
+                Some(row)
+                    if row.state_fence == *fence
+                        && decoded
+                            .requested_revision
+                            .as_deref()
+                            .is_none_or(|revision| revision == row.revision) =>
+                (
                     json!({
                         "automation_id": row.automation_id,
                         "revision": row.revision,
@@ -1468,18 +1474,32 @@ fn automation_state_payload(
                 serde_json::Error::custom("exact automation selector is required")
             })?;
             let mut revisions = Vec::new();
-            for row in state.automation_revisions.values() {
-                if row.automation_id != id || row.state_fence != *fence {
-                    continue;
+            if let Some(requested_revision) = decoded.requested_revision.as_deref() {
+                if let Some(row) = state.automation_revisions.values().find(|row| {
+                    row.automation_id == id
+                        && row.revision == requested_revision
+                        && row.state_fence == *fence
+                }) {
+                    revisions.push(json!({
+                        "automation_id": row.automation_id,
+                        "revision": row.revision,
+                        "revision_json": row.revision_json,
+                    }));
                 }
-                if revisions.len() >= limit {
-                    break;
+            } else {
+                for row in state.automation_revisions.values() {
+                    if row.automation_id != id || row.state_fence != *fence {
+                        continue;
+                    }
+                    if revisions.len() >= limit {
+                        break;
+                    }
+                    revisions.push(json!({
+                        "automation_id": row.automation_id,
+                        "revision": row.revision,
+                        "revision_json": row.revision_json,
+                    }));
                 }
-                revisions.push(json!({
-                    "automation_id": row.automation_id,
-                    "revision": row.revision,
-                    "revision_json": row.revision_json,
-                }));
             }
             serde_json::to_value(json!({
                 "revisions": revisions,
@@ -1491,7 +1511,13 @@ fn automation_state_payload(
             let id = decoded.automation_id.clone().ok_or_else(|| {
                 serde_json::Error::custom("exact automation selector is required")
             })?;
-            automation_invocations_payload(state, fence, &id, limit)
+            automation_invocations_payload(
+                state,
+                fence,
+                &id,
+                limit,
+                decoded.requested_occurrence_id.as_deref(),
+            )
         }
         AUTOMATION_QUERY_FAILURE => {
             let id = decoded.automation_id.clone().ok_or_else(|| {
@@ -1509,10 +1535,16 @@ fn automation_invocations_payload(
     fence: &StateFence,
     automation_id: &str,
     limit: usize,
+    requested_occurrence_id: Option<&str>,
 ) -> Result<Value, serde_json::Error> {
     let mut invocations = Vec::new();
     for row in state.automation_invocations.values() {
         if row.automation_id != automation_id || row.state_fence != *fence {
+            continue;
+        }
+        if requested_occurrence_id.is_some_and(|occurrence_id| {
+            row.occurrence_id != occurrence_id
+        }) {
             continue;
         }
         if invocations.len() >= limit {

@@ -1116,6 +1116,18 @@ pub(crate) async fn read_current_for_read(
     read_current_row(db, config, automation_id).await
 }
 
+/// Reads one immutable revision by its exact record identity for an owner
+/// read. This bypasses the bounded history page; a current pointer may name a
+/// revision outside the first page after enough edits.
+pub(crate) async fn read_revision_for_read(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    automation_id: &str,
+    revision: &str,
+) -> Result<Option<StoredAutomationRevision>, AdapterError> {
+    read_revision_row(db, config, automation_id, revision).await
+}
+
 /// Reads revision rows for one automation in deterministic key order.
 pub(crate) async fn read_revisions_for_read(
     db: &RpcTransport,
@@ -1170,6 +1182,17 @@ pub(crate) async fn read_invocations_for_read(
     }
     let rows: Vec<Value> = response.take(0)?;
     rows.iter().map(decode_invocation_row).collect()
+}
+
+/// Reads one invocation row by exact occurrence and automation identity.
+pub(crate) async fn read_invocation_for_read(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    automation_id: &str,
+    occurrence_id: &str,
+) -> Result<Option<StoredAutomationInvocation>, AdapterError> {
+    let row = read_invocation_row(db, config, occurrence_id).await?;
+    Ok(row.filter(|row| row.automation_id == automation_id))
 }
 
 /// Reads the last failure row for one automation, if any.

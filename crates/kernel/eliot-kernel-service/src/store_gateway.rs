@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use eliot_contracts::{EpochId, OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
+use eliot_kernel_core::user_automation::UserAutomationInvocation;
 use eliot_kernel_core::GenerationRoute;
 use eliot_ors::{RedbRecoveryStore, ReservationRecord, WriterReservationToken};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
@@ -36,7 +37,8 @@ use crate::store_write_reservation::{
 };
 use crate::{
     EbpCanonicalStoreClient, EbpStoreTransport, KernelService, StoreClientFault,
-    StoreClientFaultHarness,
+    StoreClientFaultHarness, CanonicalUserAutomationStore, UserAutomationOwnerLookup,
+    UserAutomationOwnerSnapshot,
 };
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
@@ -781,6 +783,62 @@ impl KernelStoreGateway {
             request,
         )
         .await
+    }
+
+    /// Reads and authenticates the current UserAutomation owner material through
+    /// the active generation-routed Store contour. The UserAutomation adapter
+    /// constructs and projects the closed named reads; this gateway remains the
+    /// only production path that performs their Store IO.
+    pub async fn read_user_automation_owner(
+        &self,
+        lookup: &UserAutomationOwnerLookup,
+    ) -> Result<UserAutomationOwnerSnapshot, String> {
+        let (current_request, history_request) =
+            CanonicalUserAutomationStore::<EbpCanonicalStoreClient<NamedPipeTransport>>::owner_read_requests(
+                lookup,
+            )
+            .map_err(|error| error.to_string())?;
+        let current_response = self.execute_named(current_request.clone()).await?;
+        let history_response = self.execute_named(history_request.clone()).await?;
+        let current_after_response = self.execute_named(current_request.clone()).await?;
+        CanonicalUserAutomationStore::<EbpCanonicalStoreClient<NamedPipeTransport>>::project_owner_snapshot(
+            lookup,
+            &current_request,
+            current_response,
+            &history_request,
+            history_response,
+            &current_request,
+            current_after_response,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Reads one owner-issued invocation by its exact occurrence identity
+    /// through the active generation route. The bounded invocation page is
+    /// never used for production provenance recovery.
+    pub async fn read_user_automation_invocation(
+        &self,
+        state_fence: &StateFence,
+        automation_id: &str,
+        occurrence_id: &str,
+    ) -> Result<UserAutomationInvocation, String> {
+        state_fence.validate().map_err(|error| error.to_string())?;
+        let request = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::invocation_read_request(
+            automation_id.to_owned(),
+            occurrence_id.to_owned(),
+            state_fence.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let response = self.execute_named(request.clone()).await?;
+        CanonicalUserAutomationStore::<EbpCanonicalStoreClient<NamedPipeTransport>>::project_invocation(
+            automation_id,
+            occurrence_id,
+            &request,
+            response,
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// Seeds the Store's all-absent genesis state under the active Kernel

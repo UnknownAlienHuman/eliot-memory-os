@@ -215,7 +215,10 @@ pub use user_automation_execution_client::AuthenticatedUserAutomationHostExecuti
 pub use user_automation_failure_history::{
     StoreUserAutomationFailureHistory, build_failure_transition,
 };
-pub use user_automation_store::CanonicalUserAutomationStore;
+pub use user_automation_store::{
+    CanonicalUserAutomationStore, UserAutomationNamedReadProvenance,
+    UserAutomationOwnerLookup, UserAutomationOwnerReadProvenance, UserAutomationOwnerSnapshot,
+};
 pub use write_coordinator::{
     CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,
     default_executor_lanes,

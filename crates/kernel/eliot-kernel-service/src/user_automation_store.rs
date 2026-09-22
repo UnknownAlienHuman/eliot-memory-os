@@ -30,13 +30,17 @@ use eliot_kernel_core::user_automation::{
     UserAutomationRevision,
 };
 use eliot_store_api::{
-    CanonicalRequestView, CanonicalStoreClient, OrderingScopeId, PreparedTransition, ScopeId,
+    CanonicalRequestView, CanonicalStoreClient, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OrderingScopeId, PreparedTransition, RevisionHead, ScopeId,
     SecurityContext, StateFence, StoreError, TransitionClass, USER_AUTOMATION_SCOPE, WriteReceipt,
     WriteReceiptStatus, automation_create_params, automation_edit_params,
-    automation_mutation_request, automation_read_request, automation_run_now_params,
+    automation_invocation_read_request, automation_mutation_request, automation_read_request,
+    automation_revision_read_request, automation_run_now_params,
     automation_state_transition_params, canonical_json_bytes, canonical_request_hash,
     generated_operation_manifests, operation_manifest_set_digest, sha256_hex,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
@@ -54,10 +58,319 @@ pub struct CanonicalUserAutomationStore<C> {
     client: C,
 }
 
+/// Kernel-authenticated selector for one production UserAutomation occurrence.
+///
+/// The daemon contributes only the automation and immutable revision selectors.
+/// Kernel supplies the authenticated principal and current State Fence before
+/// this value reaches the canonical Store owner. The selector therefore cannot
+/// grant authority or replace the owner-issued revision.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationOwnerLookup {
+    /// Stable automation identity selected by the operator trigger.
+    pub automation_id: String,
+    /// Immutable revision selected by the operator trigger.
+    pub requested_revision: String,
+    /// Principal copied from the authenticated Kernel session.
+    pub authenticated_principal: String,
+    /// Current generation fence copied from the authenticated Kernel session.
+    pub state_fence: StateFence,
+}
+
+impl UserAutomationOwnerLookup {
+    /// Validates selector shape and the current owner fence before Store IO.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        for (value, field) in [
+            (&self.automation_id, "automation.automation_id"),
+            (&self.requested_revision, "automation.requested_revision"),
+            (
+                &self.authenticated_principal,
+                "automation.authenticated_principal",
+            ),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(StoreError::InvalidField {
+                    field,
+                    reason: "must be non-blank text",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exact named-read evidence retained beside one owner lookup.
+///
+/// The payload itself is projected into the typed immutable revision. These
+/// fields retain the closed operation, selectors, fence, and response heads so
+/// later preflight can prove which canonical read supplied the owner material.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationNamedReadProvenance {
+    /// Closed Store named operation used for the read.
+    pub operation: NamedReadOperation,
+    /// Exact closed parameters sent to the Store.
+    pub parameters: BTreeMap<String, Value>,
+    /// Fence placed on the Store request.
+    pub request_state_fence: StateFence,
+    /// Fence returned by the Store response.
+    pub response_state_fence: StateFence,
+    /// Store revision heads returned with the named response.
+    pub response_revision_heads: Vec<RevisionHead>,
+}
+
+/// Provenance for the two canonical reads needed to bind a current revision.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationOwnerReadProvenance {
+    /// First current-pointer read proving the requested revision is current.
+    pub current_before: UserAutomationNamedReadProvenance,
+    /// History read supplying the immutable revision document.
+    pub history: UserAutomationNamedReadProvenance,
+    /// Bounded revalidation read proving the pointer stayed unchanged.
+    pub current_after: UserAutomationNamedReadProvenance,
+}
+
+/// Owner-issued current revision bound to the authenticated principal and fence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationOwnerSnapshot {
+    /// Stable automation identity.
+    pub automation_id: String,
+    /// The immutable revision read from canonical history.
+    pub revision: UserAutomationRevision,
+    /// Live admission state from the current pointer. It may differ from the
+    /// immutable revision document after pause/resume and is never written
+    /// back into that historical document.
+    pub current_configuration_state:
+        eliot_kernel_core::user_automation::UserAutomationConfigurationState,
+    /// Principal that the revision was checked against.
+    pub authenticated_principal: String,
+    /// Fence under which both named reads were observed.
+    pub state_fence: StateFence,
+    /// Exact named-read evidence for the snapshot.
+    pub provenance: UserAutomationOwnerReadProvenance,
+}
+
 impl<C> CanonicalUserAutomationStore<C> {
     /// Binds the port to the composed canonical Store client.
     pub fn new(client: C) -> Self {
         Self { client }
+    }
+
+    /// Builds the exact current-pointer and immutable-history reads for one
+    /// authenticated owner lookup. This is the Store owner's only selector
+    /// construction path for production occurrence preflight.
+    pub fn owner_read_requests(
+        lookup: &UserAutomationOwnerLookup,
+    ) -> Result<(NamedReadRequest, NamedReadRequest), StoreError> {
+        lookup.validate()?;
+        let current = automation_revision_read_request(
+            QUERY_CURRENT.to_owned(),
+            lookup.automation_id.clone(),
+            lookup.requested_revision.clone(),
+            false,
+            1,
+            lookup.state_fence.clone(),
+        )?;
+        let history = automation_revision_read_request(
+            QUERY_HISTORY.to_owned(),
+            lookup.automation_id.clone(),
+            lookup.requested_revision.clone(),
+            false,
+            1,
+            lookup.state_fence.clone(),
+        )?;
+        Ok((current, history))
+    }
+
+    /// Builds the exact invocation read used to recover owner-issued
+    /// provenance. The occurrence selector addresses one retained row and
+    /// cannot widen into the bounded invocation page.
+    pub fn invocation_read_request(
+        automation_id: String,
+        occurrence_id: String,
+        state_fence: StateFence,
+    ) -> Result<NamedReadRequest, StoreError> {
+        automation_invocation_read_request(automation_id, occurrence_id, state_fence)
+    }
+
+    /// Projects one exact owner-issued invocation response.
+    pub fn project_invocation(
+        automation_id: &str,
+        occurrence_id: &str,
+        request: &NamedReadRequest,
+        response: NamedReadResponse,
+    ) -> Result<UserAutomationInvocation, StoreError> {
+        let expected = Self::invocation_read_request(
+            automation_id.to_owned(),
+            occurrence_id.to_owned(),
+            request.state_fence.clone(),
+        )?;
+        if request != &expected {
+            return Err(StoreError::IdentityConflict);
+        }
+        validate_named_response(request, &response)?;
+        let entries = response
+            .payload
+            .get(eliot_store_api::AUTOMATION_PAGE_INVOCATIONS)
+            .and_then(Value::as_array)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.invocations",
+                reason: "exact invocation projection malformed",
+            })?;
+        if entries.len() != 1 {
+            return Err(StoreError::InvalidField {
+                field: "automation.invocations",
+                reason: "exact invocation read is incomplete",
+            });
+        }
+        let entry = &entries[0];
+        if entry.get("automation_id").and_then(Value::as_str) != Some(automation_id)
+            || entry.get("occurrence_id").and_then(Value::as_str) != Some(occurrence_id)
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        let document = entry
+            .get("invocation_json")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.invocation_json",
+                reason: "stored invocation document malformed",
+            })?;
+        let invocation: UserAutomationInvocation = serde_json::from_str(document)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        invocation.validate().map_err(|_| StoreError::InvalidField {
+            field: "automation.invocation",
+            reason: "stored invocation failed domain validation",
+        })?;
+        if invocation.automation_id != automation_id
+            || invocation.occurrence_identity().map_err(|_| StoreError::InvalidField {
+                field: "automation.occurrence_id",
+                reason: "stored invocation identity failed",
+            })? != occurrence_id
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        Ok(invocation)
+    }
+
+    /// Projects a current/history/current bounded revalidation sequence into
+    /// an authenticated owner snapshot. The method performs no Store IO and
+    /// never accepts a revision, principal, or fence from response payload as
+    /// authority.
+    pub fn project_owner_snapshot(
+        lookup: &UserAutomationOwnerLookup,
+        current_request: &NamedReadRequest,
+        current_response: NamedReadResponse,
+        history_request: &NamedReadRequest,
+        history_response: NamedReadResponse,
+        current_after_request: &NamedReadRequest,
+        current_after_response: NamedReadResponse,
+    ) -> Result<UserAutomationOwnerSnapshot, StoreError> {
+        let (expected_current, expected_history) = Self::owner_read_requests(lookup)?;
+        if current_request != &expected_current
+            || history_request != &expected_history
+            || current_after_request != &expected_current
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        validate_owner_named_response(lookup, current_request, &current_response)?;
+        validate_owner_named_response(lookup, history_request, &history_response)?;
+        validate_owner_named_response(
+            lookup,
+            current_after_request,
+            &current_after_response,
+        )?;
+
+        if current_response.revision_heads != history_response.revision_heads
+            || current_response.revision_heads != current_after_response.revision_heads
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+
+        let current = owner_current_row(&current_response)?;
+        let current_after = owner_current_row(&current_after_response)?;
+        let (current_automation_id, current_revision, current_state) =
+            owner_current_fields(current)?;
+        let (after_automation_id, after_revision, after_state) =
+            owner_current_fields(current_after)?;
+        if current_automation_id != after_automation_id
+            || current_revision != after_revision
+            || current_state != after_state
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+        if current_automation_id != lookup.automation_id
+            || current_revision != lookup.requested_revision
+        {
+            return Err(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "requested revision is not the current immutable revision",
+            });
+        }
+
+        let entries = history_response
+            .payload
+            .get(eliot_store_api::AUTOMATION_PAGE_REVISIONS)
+            .and_then(Value::as_array)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revisions",
+                reason: "owner history projection malformed",
+            })?;
+        if entries.len() != 1 {
+            return Err(StoreError::InvalidField {
+                field: "automation.revisions",
+                reason: "exact immutable revision read is incomplete",
+            });
+        }
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry.get("revision").and_then(Value::as_str)
+                    == Some(lookup.requested_revision.as_str())
+            })
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "requested immutable revision is not retained",
+            })?;
+        let document = entry
+            .get("revision_json")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revision_json",
+                reason: "stored owner revision document is malformed",
+            })?;
+        let revision: UserAutomationRevision = serde_json::from_str(document)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        revision.validate().map_err(|_| StoreError::InvalidField {
+            field: "automation.revision",
+            reason: "stored owner revision failed domain validation",
+        })?;
+        if revision.automation_id != lookup.automation_id
+            || revision.revision != lookup.requested_revision
+            || revision.owner_principal != lookup.authenticated_principal
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        Ok(UserAutomationOwnerSnapshot {
+            automation_id: lookup.automation_id.clone(),
+            revision,
+            current_configuration_state: current_state,
+            authenticated_principal: lookup.authenticated_principal.clone(),
+            state_fence: lookup.state_fence.clone(),
+            provenance: UserAutomationOwnerReadProvenance {
+                current_before: owner_read_provenance(current_request, &current_response),
+                history: owner_read_provenance(history_request, &history_response),
+                current_after: owner_read_provenance(
+                    current_after_request,
+                    &current_after_response,
+                ),
+            },
+        })
     }
 
     /// Borrows the composed client (test seam only).
@@ -67,14 +380,131 @@ impl<C> CanonicalUserAutomationStore<C> {
     }
 }
 
+fn validate_owner_named_response(
+    lookup: &UserAutomationOwnerLookup,
+    request: &NamedReadRequest,
+    response: &NamedReadResponse,
+) -> Result<(), StoreError> {
+    validate_named_response(request, response)?;
+    let payload_fence = response
+        .payload
+        .get(eliot_store_api::AUTOMATION_PAGE_STATE_FENCE)
+        .cloned()
+        .ok_or(StoreError::InvalidField {
+            field: "automation.state_fence",
+            reason: "owner read omitted its projection fence",
+        })?;
+    let payload_fence: StateFence = serde_json::from_value(payload_fence).map_err(|_| {
+        StoreError::InvalidField {
+            field: "automation.state_fence",
+            reason: "owner read projection fence is malformed",
+        }
+    })?;
+    if payload_fence != lookup.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    Ok(())
+}
+
+fn validate_named_response(
+    request: &NamedReadRequest,
+    response: &NamedReadResponse,
+) -> Result<(), StoreError> {
+    request.validate()?;
+    response.validate()?;
+    if response.operation != request.operation || response.state_fence != request.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let payload_fence = response
+        .payload
+        .get(eliot_store_api::AUTOMATION_PAGE_STATE_FENCE)
+        .cloned()
+        .ok_or(StoreError::InvalidField {
+            field: "automation.state_fence",
+            reason: "owner read omitted its projection fence",
+        })?;
+    let payload_fence: StateFence = serde_json::from_value(payload_fence).map_err(|_| {
+        StoreError::InvalidField {
+            field: "automation.state_fence",
+            reason: "owner read projection fence is malformed",
+        }
+    })?;
+    if payload_fence != request.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    Ok(())
+}
+
+fn owner_current_row(response: &NamedReadResponse) -> Result<&Value, StoreError> {
+    response
+        .payload
+        .get(eliot_store_api::AUTOMATION_PAGE_CURRENT)
+        .filter(|value| !value.is_null())
+        .ok_or(StoreError::InvalidField {
+            field: "automation.automation_id",
+            reason: "unknown automation",
+        })
+}
+
+fn owner_current_fields(
+    current: &Value,
+) -> Result<
+    (
+        &str,
+        &str,
+        eliot_kernel_core::user_automation::UserAutomationConfigurationState,
+    ),
+    StoreError,
+> {
+    let automation_id = current
+        .get("automation_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "automation.automation_id",
+            reason: "current owner row is malformed",
+        })?;
+    let revision = current
+        .get("revision")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "automation.revision",
+            reason: "current owner row is malformed",
+        })?;
+    let state = serde_json::from_value(
+        current
+            .get("configuration_state")
+            .cloned()
+            .ok_or(StoreError::InvalidField {
+                field: "automation.configuration_state",
+                reason: "current owner row is malformed",
+            })?,
+    )
+    .map_err(|_| StoreError::InvalidField {
+        field: "automation.configuration_state",
+        reason: "current owner state is not closed",
+    })?;
+    Ok((automation_id, revision, state))
+}
+
+fn owner_read_provenance(
+    request: &NamedReadRequest,
+    response: &NamedReadResponse,
+) -> UserAutomationNamedReadProvenance {
+    UserAutomationNamedReadProvenance {
+        operation: request.operation,
+        parameters: request.parameters.clone(),
+        request_state_fence: request.state_fence.clone(),
+        response_state_fence: response.state_fence.clone(),
+        response_revision_heads: response.revision_heads.clone(),
+    }
+}
+
 /// Closed automation-state query kinds carried to the store read.
 const QUERY_LIST: &str = "list";
 /// Closed automation-state query kinds carried to the store read.
 const QUERY_CURRENT: &str = "current";
 /// Closed automation-state query kinds carried to the store read.
 const QUERY_HISTORY: &str = "history";
-/// Closed automation-state query kinds carried to the store read.
-const QUERY_INVOCATIONS: &str = "invocations";
 /// Closed automation-state query kinds carried to the store read.
 const QUERY_FAILURE: &str = "failure";
 
@@ -345,11 +775,12 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         automation_id: &str,
         revision: &str,
     ) -> Result<UserAutomationRevision, StoreError> {
-        let query = automation_read_request(
+        let query = automation_revision_read_request(
             QUERY_HISTORY.to_owned(),
-            Some(automation_id.to_owned()),
+            automation_id.to_owned(),
+            revision.to_owned(),
             false,
-            eliot_store_api::MAX_AUTOMATION_PAGE_RECORDS,
+            1,
             fence.clone(),
         )?;
         let payload = self.client.execute_named(query).await?.payload;
@@ -360,34 +791,35 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 field: "automation.revisions",
                 reason: "store history projection malformed",
             })?;
-        for entry in entries {
-            if entry.get("revision").and_then(Value::as_str) != Some(revision) {
-                continue;
-            }
-            let document = entry.get("revision_json").and_then(Value::as_str).ok_or(
-                StoreError::InvalidField {
-                    field: "automation.revision_json",
-                    reason: "stored revision document malformed",
-                },
-            )?;
-            let parsed: UserAutomationRevision = serde_json::from_str(document)
-                .map_err(|error| StoreError::Serialization(error.to_string()))?;
-            parsed.validate().map_err(|_| StoreError::InvalidField {
-                field: "automation.revision",
-                reason: "stored revision failed domain validation",
-            })?;
-            if parsed.automation_id != automation_id || parsed.revision != revision {
-                return Err(StoreError::InvalidField {
-                    field: "automation.revision",
-                    reason: "stored revision identity mismatch",
-                });
-            }
-            return Ok(parsed);
+        if entries.len() != 1 {
+            return Err(StoreError::InvalidField {
+                field: "automation.revisions",
+                reason: "exact immutable revision read is incomplete",
+            });
         }
-        Err(StoreError::InvalidField {
+        let entry = &entries[0];
+        let document = entry.get("revision_json").and_then(Value::as_str).ok_or(
+            StoreError::InvalidField {
+                field: "automation.revision_json",
+                reason: "stored revision document malformed",
+            },
+        )?;
+        let parsed: UserAutomationRevision = serde_json::from_str(document)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        parsed.validate().map_err(|_| StoreError::InvalidField {
             field: "automation.revision",
-            reason: "unknown automation revision",
-        })
+            reason: "stored revision failed domain validation",
+        })?;
+        if entry.get("revision").and_then(Value::as_str) != Some(revision)
+            || parsed.automation_id != automation_id
+            || parsed.revision != revision
+        {
+            return Err(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "stored revision identity mismatch",
+            });
+        }
+        Ok(parsed)
     }
 
     /// Composes the execution projection from one validated revision.
@@ -815,43 +1247,25 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 return Err(StoreError::UnknownOperation);
             }
         };
-        let query = automation_read_request(
-            QUERY_INVOCATIONS.to_owned(),
-            Some(automation_id),
-            false,
-            eliot_store_api::MAX_AUTOMATION_PAGE_RECORDS,
+        let query = automation_invocation_read_request(
+            automation_id,
+            occurrence_id.to_owned(),
             request.context.state_fence.clone(),
         )?;
-        let payload = self.client.execute_named(query).await?.payload;
-        let entries = payload
-            .get(eliot_store_api::AUTOMATION_PAGE_INVOCATIONS)
-            .and_then(Value::as_array)
-            .ok_or(StoreError::InvalidField {
-                field: "automation.invocations",
-                reason: "store invocations projection malformed",
-            })?;
-        for entry in entries {
-            if entry.get("occurrence_id").and_then(Value::as_str) != Some(occurrence_id) {
-                continue;
-            }
-            let document = entry.get("invocation_json").and_then(Value::as_str).ok_or(
-                StoreError::InvalidField {
-                    field: "automation.invocation_json",
-                    reason: "stored invocation document malformed",
-                },
-            )?;
-            let parsed: UserAutomationInvocation = serde_json::from_str(document)
-                .map_err(|error| StoreError::Serialization(error.to_string()))?;
-            parsed.validate().map_err(|_| StoreError::InvalidField {
-                field: "automation.invocation",
-                reason: "stored invocation failed domain validation",
-            })?;
-            return Ok(parsed);
-        }
-        Err(StoreError::InvalidField {
-            field: "automation.occurrence_id",
-            reason: "unknown occurrence",
-        })
+        let response = self.client.execute_named(query.clone()).await?;
+        CanonicalUserAutomationStore::<C>::project_invocation(
+            query
+                .parameters
+                .get(eliot_store_api::AUTOMATION_PARAM_AUTOMATION_ID)
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "automation.automation_id",
+                    reason: "exact invocation request omitted automation selector",
+                })?,
+            occurrence_id,
+            &query,
+            response,
+        )
     }
 }
 

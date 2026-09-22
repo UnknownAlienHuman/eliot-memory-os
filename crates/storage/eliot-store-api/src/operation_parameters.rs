@@ -677,9 +677,11 @@ static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 9] = [
 ];
 
 /// Owner-approved user-automation read selectors (issue #1779): the query
-/// discriminator, the optional exact automation selector, the retired-row
-/// inclusion flag, and the decimal page bound.
-static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 4] = [
+/// discriminator, the optional exact automation selector, the optional exact
+/// immutable revision selector for current/history reads, the retired-row
+/// inclusion flag, the decimal page bound, and the optional exact occurrence
+/// selector for invocation reads.
+static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 6] = [
     ParameterDeclaration {
         name: "query",
         shape: ParameterShape::Subject,
@@ -687,6 +689,16 @@ static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 4] = [
     },
     ParameterDeclaration {
         name: "automation_id",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "revision",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "occurrence_id",
         shape: ParameterShape::Subject,
         required: false,
     },
