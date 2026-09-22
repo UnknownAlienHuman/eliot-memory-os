@@ -12,18 +12,24 @@ namespace Eliot.Operator;
 public sealed partial class MainWindow : Window
 {
     private readonly GovernorPipeClient _client;
+    private readonly OperatorPendingOperationJournal _pendingJournal;
     public MainViewModel ViewModel { get; }
 
     public MainWindow()
     {
         _client = new GovernorPipeClient(new RuntimeDiscoveryService());
-        ViewModel = new MainViewModel(_client);
+        _pendingJournal = OperatorPendingOperationJournal.CreateDefault();
+        ViewModel = new MainViewModel(
+            _client,
+            _pendingJournal);
         InitializeComponent();
         ViewModel.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName == nameof(MainViewModel.StatusSeverity)) SyncBannerSeverity();
+            if (args.PropertyName == nameof(MainViewModel.HasUnknownOperations)) SyncReconcileVisibility();
         };
         SyncBannerSeverity();
+        SyncReconcileVisibility();
         Navigation.SelectedItem = Navigation.MenuItems[0];
         Closed += MainWindow_OnClosed;
         _ = RefreshProjectionAsync();
@@ -83,6 +89,12 @@ public sealed partial class MainWindow : Window
     private async void ExecuteAction_OnClick(object sender, RoutedEventArgs e)
     {
         await ViewModel.ExecuteSelectedActionAsync();
+        RenderGraph();
+    }
+
+    private async void ReconcileUnknown_OnClick(object sender, RoutedEventArgs e)
+    {
+        await ViewModel.ReconcilePendingAsync();
         RenderGraph();
     }
 
@@ -248,5 +260,20 @@ public sealed partial class MainWindow : Window
         };
     }
 
-    private async void MainWindow_OnClosed(object sender, WindowEventArgs args) => await _client.DisposeAsync();
+    private void SyncReconcileVisibility()
+    {
+        UnknownOutcomePanel.Visibility = ViewModel.HasUnknownOperations ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private async void MainWindow_OnClosed(object sender, WindowEventArgs args)
+    {
+        try
+        {
+            await _client.DisposeAsync();
+        }
+        finally
+        {
+            _pendingJournal.Dispose();
+        }
+    }
 }

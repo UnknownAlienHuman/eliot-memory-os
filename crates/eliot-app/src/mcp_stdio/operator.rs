@@ -4718,6 +4718,8 @@ pub(super) async fn dispatch_operator_command(
         };
     }
     serde_json::to_value(OperatorCommandReceipt {
+        operation_id: input.idempotency_key.clone(),
+        expected_revision: input.expected_revision,
         command_id: format!(
             "operator-command:{}",
             blake3::hash(input.idempotency_key.as_bytes())

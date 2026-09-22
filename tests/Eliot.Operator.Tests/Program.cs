@@ -86,11 +86,19 @@ True(!string.IsNullOrWhiteSpace(client.LastIdempotencyKey), "logical action gene
 True(viewModel.StatusMessage.Contains("canonical receipt", StringComparison.Ordinal), "canonical receipt surfaced");
 client.OmitCanonicalReceipt = true;
 await viewModel.ExecuteSelectedActionAsync();
-Equal("Command failed", viewModel.StatusTitle, "durable command without receipt fails closed");
+Equal(
+    "Unknown outcome — reconcile, do not resubmit",
+    viewModel.StatusTitle,
+    "durable command without receipt stays reconciling, not failed");
 True(
     viewModel.StatusMessage.Contains("without a canonical receipt", StringComparison.Ordinal),
     "missing canonical receipt failure explained");
+True(viewModel.HasUnknownOperations, "unproven mutation retained for reconciliation");
 client.OmitCanonicalReceipt = false;
+await viewModel.ReconcilePendingAsync();
+True(!viewModel.HasUnknownOperations, "reconciled operation leaves the unknown set");
+Equal("Command accepted", viewModel.StatusTitle, "reconciliation resolves the retained operation");
+Equal(1, client.ReconcileCount, "exact reconciliation of the retained operation");
 
 await viewModel.SelectSectionAsync("query_lab");
 viewModel.QueryOperation = "relationship_slice";
@@ -133,7 +141,112 @@ viewModel.CancelActiveRequest();
 await cancelled;
 Equal("Request cancelled", viewModel.StatusTitle, "nonblocking cancellation surfaced");
 
-Console.WriteLine("ELIOT Operator protocol, auth, paging, view-model and command tests passed");
+// Lost transport response keeps one identity through send, reconnect and
+// reconciliation; a retry never mints a second logical mutation.
+await viewModel.SelectSectionAsync("autonomy");
+viewModel.SelectedRecord = viewModel.Records[0];
+viewModel.SelectedAction = viewModel.SelectedRecord.Actions[0];
+client.ThrowUnknownOnce = true;
+var commandsBefore = client.CommandCount;
+await viewModel.ExecuteSelectedActionAsync();
+Equal(commandsBefore + 1, client.CommandCount, "unknown-outcome action sent once");
+Equal(
+    "Unknown outcome — reconcile, do not resubmit",
+    viewModel.StatusTitle,
+    "pipe loss surfaces unknown outcome");
+var retainedKey = client.LastIdempotencyKey;
+True(!string.IsNullOrWhiteSpace(retainedKey), "lost response kept its operation identity");
+True(viewModel.HasUnknownOperations, "lost response retained for reconciliation");
+await viewModel.ReconcilePendingAsync();
+Equal(retainedKey, client.LastReconciledKey, "reconciliation reuses the retained identity");
+Equal(commandsBefore + 1, client.CommandCount, "reconciliation never resubmits a new command");
+True(!viewModel.HasUnknownOperations, "reconciled set drains");
+await viewModel.ExecuteSelectedActionAsync();
+True(client.LastIdempotencyKey != retainedKey, "a new user action mints a new identity");
+
+// Runtime/generation rotation invalidates dependent UI state before use.
+client.RotateGeneration = true;
+await viewModel.RefreshAsync();
+True(
+    viewModel.StatusMessage.Contains("invalidated", StringComparison.Ordinal),
+    "generation rotation invalidates dependent state");
+client.RotateGeneration = false;
+
+// The legacy wire path is one versioned adapter with one consumer, a proof
+// ceiling, and removal criteria; it gains no new shape here.
+Equal(OperatorProtocol.SchemaVersion, LegacyOperatorAdapter.SchemaVersion, "legacy adapter pins current schema");
+Equal(OperatorProtocol.PinnedContractHash, LegacyOperatorAdapter.ContractHash, "legacy adapter pins current hash");
+Equal("Eliot.Operator.Services.GovernorPipeClient", LegacyOperatorAdapter.Consumer, "legacy adapter has one consumer");
+True(!string.IsNullOrWhiteSpace(LegacyOperatorAdapter.ExpiryRemoval), "legacy adapter carries removal criteria");
+
+// Typed intent envelope: one identity per action in the exact owner shape.
+var intent = OperatorIntentEnvelope.Create(
+    "00000000-0000-0000-0000-000000000001",
+    "00000000-0000-0000-0000-000000000002",
+    7,
+    JsonSerializer.SerializeToElement(new { command = "resume_run" }));
+Equal(32, intent.OperationId.Length, "per-action operation identity");
+var intentWire = JsonSerializer.Serialize(intent);
+foreach (var field in new[] { "project_id", "task_id", "expected_revision", "idempotency_key", "command" })
+{
+    True(intentWire.Contains($"\"{field}\"", StringComparison.Ordinal), $"intent carries {field}");
+}
+
+// Closed decoding: unknown and duplicate protected fields fail before use.
+var endpointJson = JsonSerializer.Serialize(endpoint);
+OperatorJsonGuard.ValidateClosedObject(
+    endpointJson,
+    ["pipe_name", "broker_epoch", "interactive_session_id", "handoff_nonce", "role", "capabilities"],
+    32, 1024, 4, 512, "endpoint");
+var unknownRejected = false;
+try
+{
+    OperatorJsonGuard.ValidateClosedObject(
+        "{\"pipe_name\":\"x\",\"roleX\":\"y\"}", ["pipe_name"], 32, 1024, 4, 512, "endpoint");
+}
+catch (OperatorProtocolException error) when (error.Reason.StartsWith("unknown:", StringComparison.Ordinal))
+{
+    unknownRejected = true;
+}
+True(unknownRejected, "closed decode rejects unknown protected fields");
+var duplicateRejected = false;
+try
+{
+    OperatorJsonGuard.ValidateClosedObject(
+        "{\"pipe_name\":\"x\",\"pipe_name\":\"y\"}", ["pipe_name"], 32, 1024, 4, 512, "endpoint");
+}
+catch (OperatorProtocolException error) when (error.Reason.StartsWith("duplicate:", StringComparison.Ordinal))
+{
+    duplicateRejected = true;
+}
+True(duplicateRejected, "closed decode rejects duplicate protected fields");
+var capped = false;
+try
+{
+    OperatorJsonGuard.ValidateFramedLine(
+        "{\"pipe_name\":\"" + new string('x', OperatorProtocol.MaxControlStringChars + 1) + "\"}",
+        32, OperatorProtocol.MaxControlStringChars, 4, 512, "response");
+}
+catch (OperatorProtocolException error) when (error.Reason == "string_cap")
+{
+    capped = true;
+}
+True(capped, "oversized strings fail closed before allocation completes");
+Equal(262_144, OperatorProtocol.MaxLineChars, "framed line ceiling pinned");
+
+// Bounded redacted diagnostics: type and HRESULT only, never message/stack,
+// endpoint, nonce, credential, or command body (absent by construction: the
+// formatter accepts no such input).
+var record = OperatorDiagnostics.FormatStartupRecord(
+    "launch:begin", "System.IO.IOException", unchecked((int)0x80070005));
+True(record.Contains("launch:begin", StringComparison.Ordinal), "diagnostic keeps the stage");
+True(record.Contains("System.IO.IOException", StringComparison.Ordinal), "diagnostic keeps the type");
+True(!record.Contains(" at ", StringComparison.Ordinal), "diagnostic carries no stack trace");
+True(record.Length <= OperatorDiagnostics.MaxRecordChars, "diagnostic record bounded");
+True(OperatorDiagnostics.ShouldRotate(OperatorDiagnostics.MaxLogBytes + 1), "log rotates at the cap");
+True(!OperatorDiagnostics.ShouldRotate(0), "empty log does not rotate");
+
+Console.WriteLine("ELIOT Operator protocol, auth, paging, view-model, command, reconcile, bounds, redaction and invalidation tests passed");
 
 static void True(bool condition, string label)
 {
@@ -158,11 +271,15 @@ sealed class FakeGovernorClient : IGovernorClient
 
     public OperatorQueryRequest? LastQuery { get; private set; }
     public int CommandCount { get; private set; }
+    public int ReconcileCount { get; private set; }
     public int UserAutomationCount { get; private set; }
     public UserAutomationOperation? LastUserAutomation { get; private set; }
     public string? LastIdempotencyKey { get; private set; }
+    public string? LastReconciledKey { get; private set; }
     public bool DelayQueries { get; set; }
     public bool OmitCanonicalReceipt { get; set; }
+    public bool ThrowUnknownOnce { get; set; }
+    public bool RotateGeneration { get; set; }
 
     public Task<OperatorSnapshot> SnapshotAsync(
         string? projectId = null,
@@ -221,8 +338,9 @@ sealed class FakeGovernorClient : IGovernorClient
                     new OperatorFieldView("source_commit", "commit:1", true),
                     new OperatorFieldView("policy_snapshot_id", "policy:1", true)
                 ], [], []);
+            var generation = RotateGeneration ? "generation-b" : "generation-a";
             return new OperatorProjectionPage(
-                OperatorProtocol.SchemaVersion, "runtime-a", "generation-a", "memory_explorer",
+                OperatorProtocol.SchemaVersion, "runtime-a", generation, "memory_explorer",
                 request.ProjectId, request.TaskId, 19, request.Cursor, null, request.PageSize,
                 3, 3, true, false, [rank, suppressed, disposition], request.ResultMode,
                 JsonSerializer.SerializeToElement(new { operation = request.QueryOperation }),
@@ -244,7 +362,7 @@ sealed class FakeGovernorClient : IGovernorClient
         return new OperatorProjectionPage(
             OperatorProtocol.SchemaVersion,
             "runtime-a",
-            "generation-a",
+            RotateGeneration ? "generation-b" : "generation-a",
             request.Projection,
             request.ProjectId,
             request.TaskId,
@@ -269,9 +387,28 @@ sealed class FakeGovernorClient : IGovernorClient
         CommandCount++;
         var envelope = JsonSerializer.SerializeToElement(commandEnvelope);
         LastIdempotencyKey = envelope.GetProperty("idempotency_key").GetString();
+        if (ThrowUnknownOnce)
+        {
+            ThrowUnknownOnce = false;
+            throw new OperatorUnknownOutcomeException(
+                LastIdempotencyKey ?? "unknown", "eliot_operator_command", "simulated pipe loss");
+        }
         using var document = JsonDocument.Parse(OmitCanonicalReceipt
             ? """{"accepted":true,"executed":true,"outcome":"canonical_mutation_committed"}"""
             : """{"accepted":true,"executed":true,"outcome":"canonical_mutation_committed","canonical_receipt":{"receipt_id":"receipt-1","write_id":"write-1"}}""");
+        return Task.FromResult(document.RootElement.Clone());
+    }
+
+    public Task<JsonElement> ReconcileAsync(
+        JsonElement commandEnvelope,
+        CancellationToken cancellationToken = default)
+    {
+        // Same-identity reconciliation: the retained envelope resends under
+        // its original key; no second logical mutation is minted.
+        ReconcileCount++;
+        LastReconciledKey = commandEnvelope.GetProperty("idempotency_key").GetString();
+        using var document = JsonDocument.Parse(
+            """{"accepted":true,"executed":true,"outcome":"canonical_mutation_committed","canonical_receipt":{"receipt_id":"receipt-r","write_id":"write-r"}}""");
         return Task.FromResult(document.RootElement.Clone());
     }
 
