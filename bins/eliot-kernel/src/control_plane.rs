@@ -20,6 +20,9 @@
 
 use super::*;
 
+const RUNTIME_LEASE_TTL_MS: u64 = 5 * 60 * 1_000;
+const RUNTIME_LEASE_RENEW_BEFORE_MS: u64 = 60 * 1_000;
+
 /// F-LOG-KERNEL-4 (#903): control-plane boundary observations.
 ///
 /// Observation only, via #895's facade: fixed `kernel.control.*` event names
@@ -620,7 +623,13 @@ impl KernelComposition {
                 | KernelControlCommand::ReconcileActivation(_)
                 | KernelControlCommand::RebindStore(_)
                 | KernelControlCommand::ReconcileRebindStore(_)
-                | KernelControlCommand::ReportHostStartupEvidence(_) => {}
+                | KernelControlCommand::ReportHostStartupEvidence(_)
+                | KernelControlCommand::AcquireRuntimeLease(_)
+                | KernelControlCommand::RenewRuntimeLease(_)
+                | KernelControlCommand::RevokeRuntimeLease(_)
+                | KernelControlCommand::ExpireRuntimeLease(_)
+                | KernelControlCommand::CloseRuntimeLease(_)
+                | KernelControlCommand::ReconcileRuntimeLease(_) => {}
                 command => {
                     self.apply_control(command.clone())
                         .map_err(|_| TransportError::SessionFenced)?;
@@ -633,6 +642,28 @@ impl KernelComposition {
         {
             self.promote_agent_bridge_profile(next)?;
         }
+        let runtime_lease = match &request.command {
+            KernelControlCommand::AcquireRuntimeLease(admission) => {
+                Some(self.acquire_runtime_lease(&request, admission)?)
+            }
+            KernelControlCommand::RenewRuntimeLease(renewal) => {
+                Some(self.renew_runtime_lease(&request, renewal)?)
+            }
+            KernelControlCommand::RevokeRuntimeLease(terminal) => Some(
+                self.transition_runtime_lease(&request, terminal, LeaseState::Released)?,
+            ),
+            KernelControlCommand::ExpireRuntimeLease(terminal) => Some(
+                self.transition_runtime_lease(&request, terminal, LeaseState::Expired)?,
+            ),
+            KernelControlCommand::CloseRuntimeLease(terminal) => Some(
+                self.transition_runtime_lease(&request, terminal, LeaseState::Closed)?,
+            ),
+            KernelControlCommand::ReconcileRuntimeLease(reconcile) => {
+                self.reconcile_runtime_lease(&request, reconcile)?
+            }
+            KernelControlCommand::ProbeReady => None,
+            _ => None,
+        };
         let state = self
             .service_state()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -655,11 +686,207 @@ impl KernelComposition {
             activation_receipt,
             store_rebind_receipt,
             supervision_lease,
+            runtime_lease,
             error: None,
             payload_digest: String::new(),
         }
         .with_computed_digest()
         .map_err(|_| TransportError::SessionFenced)
+    }
+
+    fn validate_runtime_lease_owner(
+        &self,
+        request: &KernelControlRequest,
+        lease: &RuntimeLease,
+    ) -> Result<(), TransportError> {
+        lease
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let candidate_digest = request
+            .candidate
+            .compute_digest()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let candidate_ref = format!("kernel-candidate:{candidate_digest}");
+        if lease.authority_epoch != request.candidate.kernel_epoch
+            || lease.state_fence
+                != StateFence::new(request.candidate.kernel_epoch.clone(), request.generation)
+            || !lease
+                .obligation
+                .obligation_refs
+                .iter()
+                .any(|value| value == &candidate_ref)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    fn acquire_runtime_lease(
+        &self,
+        request: &KernelControlRequest,
+        admission: &RuntimeLeaseAdmission,
+    ) -> Result<RuntimeLease, TransportError> {
+        admission
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let candidate_digest = request
+            .candidate
+            .compute_digest()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut canonical = admission.clone();
+        let candidate_ref = PlatformHandle::new(format!("kernel-candidate:{candidate_digest}"))
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !canonical.obligation_refs.contains(&candidate_ref) {
+            canonical.obligation_refs.push(candidate_ref);
+        }
+        let issued_at_ms = unix_ms();
+        let expires_at_ms = issued_at_ms
+            .checked_add(RUNTIME_LEASE_TTL_MS)
+            .ok_or(TransportError::SessionFenced)?;
+        let renew_before_ms = issued_at_ms
+            .checked_add(RUNTIME_LEASE_RENEW_BEFORE_MS)
+            .ok_or(TransportError::SessionFenced)?;
+        let expected = eliot_kernel_service::expected_runtime_lease(
+            &request.candidate,
+            request.generation,
+            &canonical,
+            issued_at_ms,
+            expires_at_ms,
+            renew_before_ms,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let acquired = self
+            .generation_gateway
+            .ors
+            .acquire_runtime_lease(&expected)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let readback = self
+            .generation_gateway
+            .ors
+            .load_current_runtime_lease(&expected.lease_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        self.validate_runtime_lease_owner(request, &readback)?;
+        if acquired != expected || readback != expected {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(readback)
+    }
+
+    fn renew_runtime_lease(
+        &self,
+        request: &KernelControlRequest,
+        renewal: &RuntimeLeaseRenewal,
+    ) -> Result<RuntimeLease, TransportError> {
+        let current = self
+            .generation_gateway
+            .ors
+            .load_current_runtime_lease(&renewal.lease_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        self.validate_runtime_lease_owner(request, &current)?;
+        if current.revision != renewal.expected_revision
+            || current.state_fence != renewal.state_fence
+            || current.state != LeaseState::Active
+            || unix_ms() < current.obligation.renew_before_ms
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let now_ms = unix_ms();
+        let expires_at_ms = now_ms
+            .checked_add(RUNTIME_LEASE_TTL_MS)
+            .ok_or(TransportError::SessionFenced)?;
+        let renew_before_ms = now_ms
+            .checked_add(RUNTIME_LEASE_RENEW_BEFORE_MS)
+            .ok_or(TransportError::SessionFenced)?;
+        let mut evidence = renewal
+            .evidence_refs
+            .iter()
+            .map(|value| value.as_str().to_owned())
+            .collect::<Vec<_>>();
+        evidence.push(format!("kernel-progress:{}", request.payload_digest));
+        if renewal.admitted_wait {
+            evidence.push("kernel-admitted-wait".to_owned());
+        }
+        let renewed = self
+            .generation_gateway
+            .ors
+            .renew_runtime_lease(
+                &renewal.lease_id,
+                renewal.expected_revision,
+                &renewal.state_fence,
+                evidence,
+                now_ms,
+                expires_at_ms,
+                renew_before_ms,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.validate_runtime_lease_owner(request, &renewed)?;
+        Ok(renewed)
+    }
+
+    fn transition_runtime_lease(
+        &self,
+        request: &KernelControlRequest,
+        terminal: &RuntimeLeaseTerminal,
+        next_state: LeaseState,
+    ) -> Result<RuntimeLease, TransportError> {
+        let current = self
+            .generation_gateway
+            .ors
+            .load_current_runtime_lease(&terminal.lease_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        self.validate_runtime_lease_owner(request, &current)?;
+        if current.revision != terminal.expected_revision
+            || current.state_fence != terminal.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if next_state == LeaseState::Expired && unix_ms() < current.obligation.expires_at_ms {
+            return Err(TransportError::SessionFenced);
+        }
+        let evidence = terminal
+            .evidence_refs
+            .iter()
+            .map(|value| value.as_str().to_owned())
+            .collect();
+        let transitioned = self
+            .generation_gateway
+            .ors
+            .transition_runtime_lease(
+                &terminal.lease_id,
+                terminal.expected_revision,
+                &terminal.state_fence,
+                next_state,
+                terminal.disposition.as_str().to_owned(),
+                evidence,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.validate_runtime_lease_owner(request, &transitioned)?;
+        Ok(transitioned)
+    }
+
+    fn reconcile_runtime_lease(
+        &self,
+        request: &KernelControlRequest,
+        reconcile: &RuntimeLeaseReconcile,
+    ) -> Result<Option<RuntimeLease>, TransportError> {
+        let evidence = vec![format!("kernel-reconcile:{}", request.payload_digest)];
+        let lease = self
+            .generation_gateway
+            .ors
+            .reconcile_runtime_lease(
+                &reconcile.lease_id,
+                &reconcile.state_fence,
+                evidence,
+                unix_ms(),
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        if let Some(lease) = &lease {
+            self.validate_runtime_lease_owner(request, lease)?;
+        }
+        Ok(lease)
     }
 
     /// Consumes one authenticated Host startup-evidence carrier. Host owns

@@ -45,7 +45,8 @@ pub use model::{
     NonceState, OneTimeNonceState, PriorKernelDisposition, PriorKernelSource,
     ReadinessApprovedContour, ReadinessEvidence, RecordFence, RecoveryLineageEvidence,
     RecoveryLineageReason, ServiceSafetyClass, StoreRebindRecord, StoreRebindState,
-    WakeDisposition, WakeRecord, host_owner_epoch_digest,
+    WakeCancellationBatchEntry, WakeCancellationBatchRecord, WakeDisposition, WakeRecord,
+    host_owner_epoch_digest,
 };
 pub use reactive_context::{
     DEFAULT_REACTIVE_CONTEXT_MAX_ATTEMPT_ITEMS, DEFAULT_REACTIVE_CONTEXT_MAX_BYTES,

@@ -790,7 +790,87 @@ impl fmt::Display for LeaseState {
     }
 }
 
-/// Non-semantic runtime liveness lease stored in ORS.
+/// The authenticated, observable obligation that keeps a runtime contour
+/// admitted.  Process survival, an open pipe, and a generation identity are
+/// deliberately absent: renewal must carry fresh evidence for this exact
+/// holder, reason, and obligation set.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLeaseObligation {
+    /// Authenticated Session/Attempt/Job/effect holder.
+    pub holder: String,
+    /// Human or scheduler reason for the active obligation.
+    pub reason: String,
+    /// Runtime branches that must remain available for the obligation.
+    pub required_runtime_branches: Vec<String>,
+    /// Capabilities admitted for the obligation.
+    pub required_capabilities: Vec<String>,
+    /// Canonical Session/Attempt/Job/effect references.
+    pub obligation_refs: Vec<String>,
+    /// Owner observation time at issuance.
+    pub issued_at_ms: u64,
+    /// Terminal deadline for this lease revision.
+    pub expires_at_ms: u64,
+    /// Earliest time at which a fresh owner observation may renew it.
+    pub renew_before_ms: u64,
+    /// Fresh owner evidence used for the current revision.
+    pub renewal_evidence: Vec<String>,
+    /// Durable terminal reason, when the obligation has ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_disposition: Option<String>,
+}
+
+impl RuntimeLeaseObligation {
+    /// Validates the immutable obligation and its bounded time window.
+    pub fn validate(&self) -> Result<(), RuntimeContractError> {
+        text(&self.holder, "runtime_lease.obligation.holder")?;
+        text(&self.reason, "runtime_lease.obligation.reason")?;
+        if self.required_runtime_branches.is_empty() {
+            return Err(RuntimeContractError::InvalidField {
+                field: "runtime_lease.obligation.required_runtime_branches",
+                reason: "must contain at least one branch",
+            });
+        }
+        for value in &self.required_runtime_branches {
+            text(value, "runtime_lease.obligation.required_runtime_branches")?;
+        }
+        for value in &self.required_capabilities {
+            text(value, "runtime_lease.obligation.required_capabilities")?;
+        }
+        if self.obligation_refs.is_empty() {
+            return Err(RuntimeContractError::InvalidField {
+                field: "runtime_lease.obligation.obligation_refs",
+                reason: "must bind at least one authenticated obligation",
+            });
+        }
+        for value in &self.obligation_refs {
+            text(value, "runtime_lease.obligation.obligation_refs")?;
+        }
+        if self.issued_at_ms == 0 || self.expires_at_ms <= self.issued_at_ms {
+            return Err(RuntimeContractError::InvalidField {
+                field: "runtime_lease.obligation.expires_at_ms",
+                reason: "must be later than a non-zero issued_at_ms",
+            });
+        }
+        if self.renew_before_ms < self.issued_at_ms
+            || self.renew_before_ms >= self.expires_at_ms
+        {
+            return Err(RuntimeContractError::InvalidField {
+                field: "runtime_lease.obligation.renew_before_ms",
+                reason: "must be within the issue and expiry window",
+            });
+        }
+        for value in &self.renewal_evidence {
+            text(value, "runtime_lease.obligation.renewal_evidence")?;
+        }
+        if let Some(value) = &self.terminal_disposition {
+            text(value, "runtime_lease.obligation.terminal_disposition")?;
+        }
+        Ok(())
+    }
+}
+
+/// Kernel-owned runtime liveness lease stored in ORS.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeLease {
@@ -801,6 +881,10 @@ pub struct RuntimeLease {
     /// Authority epoch and fence at issue.
     pub authority_epoch: EpochId,
     pub state_fence: StateFence,
+    /// Monotonic ORS revision used by every renewal and terminal CAS.
+    pub revision: u64,
+    /// Authenticated use obligation bound to this lease identity.
+    pub obligation: RuntimeLeaseObligation,
     /// Current lifecycle state.
     pub state: LeaseState,
 }
@@ -846,6 +930,27 @@ impl RuntimeLease {
         text(&self.lease_id, "lease_id")?;
         text(&self.scope_ref, "scope_ref")?;
         self.state_fence.validate()?;
+        if self.revision == 0 {
+            return Err(RuntimeContractError::InvalidField {
+                field: "runtime_lease.revision",
+                reason: "must be non-zero",
+            });
+        }
+        self.obligation.validate()?;
+        if matches!(
+            self.state,
+            LeaseState::Expired
+                | LeaseState::Released
+                | LeaseState::Revoked
+                | LeaseState::Superseded
+                | LeaseState::Closed
+        ) && self.obligation.terminal_disposition.is_none()
+        {
+            return Err(RuntimeContractError::InvalidField {
+                field: "runtime_lease.obligation.terminal_disposition",
+                reason: "terminal lease requires a durable disposition",
+            });
+        }
         Ok(())
     }
 }

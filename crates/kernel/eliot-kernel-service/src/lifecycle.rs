@@ -575,6 +575,17 @@ impl KernelService {
                 // observations and call `publish_ready` with its own receipt.
                 return Err(KernelServiceError::ReadinessNotProven);
             }
+            KernelControlCommand::AcquireRuntimeLease(_)
+            | KernelControlCommand::RenewRuntimeLease(_)
+            | KernelControlCommand::RevokeRuntimeLease(_)
+            | KernelControlCommand::ExpireRuntimeLease(_)
+            | KernelControlCommand::CloseRuntimeLease(_)
+            | KernelControlCommand::ReconcileRuntimeLease(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "runtime_lease",
+                    reason: "RuntimeLease commands require the authenticated Kernel composition boundary",
+                });
+            }
             // Luna (startup consumer): replace this fail-closed placeholder
             // with validate plus record_startup_evidence steps 1/2/4 wiring.
             // It exists only so the shared carrier compiles before the

@@ -3,11 +3,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use eliot_contracts::StateFence;
 use eliot_platform::PlatformHandle;
 use eliot_receipts::{ReceiptDispositionKind, ReceiptEnvelope};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
-    SignedSupervisionLease, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
+    LeaseState, RuntimeLease, SignedSupervisionLease, VerifiedSupervisionLease,
+    VerifiedSupervisionLeaseTerminalTransition,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use serde_json::json;
@@ -92,6 +94,8 @@ const SUPERVISION_LEASE_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_results_v1");
 const SUPERVISION_LEASE_STAGE_RESOLUTIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
+const RUNTIME_LEASE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_runtime_lease_current_v1");
 const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_rebind_replay_v1");
 const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
@@ -726,6 +730,15 @@ impl persistence_codec::PersistedValue for crate::DoctorBudgetLedger {
     }
 }
 
+impl persistence_codec::PersistedValue for RuntimeLease {
+    const RECORD_TYPE: &'static str = "runtime_lease";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))
+    }
+}
+
 fn doctor_storage(error: impl std::fmt::Display) -> crate::DoctorLedgerError {
     crate::DoctorLedgerError::Storage(error.to_string())
 }
@@ -738,6 +751,323 @@ fn map_ors_to_doctor(error: OrsError) -> crate::DoctorLedgerError {
 }
 
 impl RedbRecoveryStore {
+    /// Reads the Kernel-owned current runtime lease by its exact lease id.
+    ///
+    /// The row is an owner projection, not caller-supplied authority. The
+    /// stored lease id must agree with the table key and the contract must
+    /// validate before it is returned to a consumer.
+    pub fn load_current_runtime_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<Option<RuntimeLease>, OrsError> {
+        if lease_id.trim().is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "runtime_lease.lease_id",
+                reason: "must be non-blank",
+            });
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
+        table
+            .get(lease_id)
+            .map_err(storage)?
+            .map(|value| {
+                let lease: RuntimeLease = decode(value.value())?;
+                lease
+                    .validate()
+                    .map_err(|error| OrsError::Contract(error.to_string()))?;
+                if lease.lease_id != lease_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "runtime_lease",
+                        reason: "current row key does not match lease identity".to_owned(),
+                    });
+                }
+                Ok(lease)
+            })
+            .transpose()
+    }
+
+    /// Atomically installs one Kernel-owned runtime lease and reads it back.
+    ///
+    /// A repeated exact acquire is idempotent. Any replacement, including a
+    /// changed scope, epoch, fence, or lifecycle state under the same lease
+    /// id, is an integrity conflict and cannot be used to advance admission.
+    pub fn acquire_runtime_lease(&self, lease: &RuntimeLease) -> Result<RuntimeLease, OrsError> {
+        lease
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let mut table = write.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
+            if let Some(value) = table.get(lease.lease_id.as_str()).map_err(storage)? {
+                let existing: RuntimeLease = decode(value.value())?;
+                existing
+                    .validate()
+                    .map_err(|error| OrsError::Contract(error.to_string()))?;
+                if existing != *lease {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "runtime_lease",
+                        reason: "existing lease identity, scope, fence, or state conflicts"
+                            .to_owned(),
+                    });
+                }
+                existing
+            } else {
+                let encoded = encode(lease)?;
+                table
+                    .insert(lease.lease_id.as_str(), encoded.as_str())
+                    .map_err(storage)?;
+                lease.clone()
+            }
+        };
+        drop(write.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?);
+        write.commit().map_err(storage)?;
+        let readback = self
+            .load_current_runtime_lease(existing.lease_id.as_str())?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "runtime_lease",
+                reason: "acquired lease disappeared before readback".to_owned(),
+            })?;
+        if readback != existing {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "runtime_lease",
+                reason: "acquired lease changed before readback".to_owned(),
+            });
+        }
+        Ok(readback)
+    }
+
+    /// Renews one exact active RuntimeLease revision with fresh owner
+    /// evidence.  This is the only non-terminal lifecycle replacement path;
+    /// process liveness and a matching candidate never authorize it.
+    pub fn renew_runtime_lease(
+        &self,
+        lease_id: &str,
+        expected_revision: u64,
+        expected_fence: &StateFence,
+        evidence: Vec<String>,
+        now_ms: u64,
+        expires_at_ms: u64,
+        renew_before_ms: u64,
+    ) -> Result<RuntimeLease, OrsError> {
+        if lease_id.trim().is_empty() || expected_revision == 0 || evidence.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "runtime_lease_renewal",
+                reason: "lease id, revision, and fresh evidence are required",
+            });
+        }
+        if expires_at_ms <= now_ms || renew_before_ms < now_ms || renew_before_ms >= expires_at_ms {
+            return Err(OrsError::InvalidField {
+                field: "runtime_lease_renewal.window",
+                reason: "renewal window is not future and ordered",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let next = {
+            let mut table = write.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
+            let current: RuntimeLease = {
+                let value = table
+                    .get(lease_id)
+                    .map_err(storage)?
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "runtime_lease",
+                        reason: "renewal target is absent".to_owned(),
+                    })?;
+                decode(value.value())?
+            };
+            current
+                .validate()
+                .map_err(|error| OrsError::Contract(error.to_string()))?;
+            if current.lease_id != lease_id
+                || current.revision != expected_revision
+                || current.state_fence != *expected_fence
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "runtime_lease",
+                    reason: "renewal revision, identity, or fence is stale".to_owned(),
+                });
+            }
+            if current.state != LeaseState::Active || now_ms >= current.obligation.expires_at_ms {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "runtime_lease",
+                    reason: "only a current non-expired active lease may renew".to_owned(),
+                });
+            }
+            let mut next = current.clone();
+            next.revision = current.revision.checked_add(1).ok_or_else(|| {
+                OrsError::IntegrityProblem {
+                    record_type: "runtime_lease",
+                    reason: "revision overflow".to_owned(),
+                }
+            })?;
+            next.obligation.expires_at_ms = expires_at_ms;
+            next.obligation.renew_before_ms = renew_before_ms;
+            next.obligation.renewal_evidence = evidence;
+            next.validate()
+                .map_err(|error| OrsError::Contract(error.to_string()))?;
+            let payload = encode(&next)?;
+            table
+                .insert(lease_id, payload.as_str())
+                .map_err(storage)?;
+            next
+        };
+        write.commit().map_err(storage)?;
+        let readback = self
+            .load_current_runtime_lease(lease_id)?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "runtime_lease",
+                reason: "renewed lease disappeared before readback".to_owned(),
+            })?;
+        if readback != next {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "runtime_lease",
+                reason: "renewed lease changed before readback".to_owned(),
+            });
+        }
+        Ok(readback)
+    }
+
+    /// Applies one exact owner-controlled RuntimeLease state transition using
+    /// compare-and-swap over the current ORS revision.
+    pub fn transition_runtime_lease(
+        &self,
+        lease_id: &str,
+        expected_revision: u64,
+        expected_fence: &StateFence,
+        next_state: LeaseState,
+        disposition: String,
+        evidence: Vec<String>,
+    ) -> Result<RuntimeLease, OrsError> {
+        if lease_id.trim().is_empty()
+            || expected_revision == 0
+            || disposition.trim().is_empty()
+            || evidence.is_empty()
+        {
+            return Err(OrsError::InvalidField {
+                field: "runtime_lease_transition",
+                reason: "identity, revision, disposition, and evidence are required",
+            });
+        }
+        if !matches!(
+            next_state,
+            LeaseState::Expired
+                | LeaseState::Revoked
+                | LeaseState::Released
+                | LeaseState::Reconciling
+                | LeaseState::Closed
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "runtime_lease_transition.state",
+                reason: "transition command is terminal or reconciliation only",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let next = {
+            let mut table = write.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
+            let current: RuntimeLease = {
+                let value = table
+                    .get(lease_id)
+                    .map_err(storage)?
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "runtime_lease",
+                        reason: "transition target is absent".to_owned(),
+                    })?;
+                decode(value.value())?
+            };
+            current
+                .validate()
+                .map_err(|error| OrsError::Contract(error.to_string()))?;
+            if current.lease_id != lease_id
+                || current.revision != expected_revision
+                || current.state_fence != *expected_fence
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "runtime_lease",
+                    reason: "transition revision, identity, or fence is stale".to_owned(),
+                });
+            }
+            let legal = matches!(
+                (current.state, next_state),
+                (LeaseState::Active, LeaseState::Expired | LeaseState::Revoked | LeaseState::Released | LeaseState::Reconciling)
+                    | (LeaseState::Expiring, LeaseState::Expired | LeaseState::Revoked | LeaseState::Closed)
+                    | (LeaseState::Reconciling, LeaseState::Closed | LeaseState::Released | LeaseState::Expired | LeaseState::Revoked)
+            );
+            if !legal {
+                return Err(OrsError::InvalidTransition);
+            }
+            let mut next = current.clone();
+            next.state = next_state;
+            next.revision = current.revision.checked_add(1).ok_or_else(|| {
+                OrsError::IntegrityProblem {
+                    record_type: "runtime_lease",
+                    reason: "revision overflow".to_owned(),
+                }
+            })?;
+            next.obligation.renewal_evidence = evidence;
+            next.obligation.terminal_disposition = Some(disposition);
+            next.validate()
+                .map_err(|error| OrsError::Contract(error.to_string()))?;
+            let payload = encode(&next)?;
+            table
+                .insert(lease_id, payload.as_str())
+                .map_err(storage)?;
+            next
+        };
+        write.commit().map_err(storage)?;
+        let readback = self
+            .load_current_runtime_lease(lease_id)?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "runtime_lease",
+                reason: "transitioned lease disappeared before readback".to_owned(),
+            })?;
+        if readback != next {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "runtime_lease",
+                reason: "transitioned lease changed before readback".to_owned(),
+            });
+        }
+        Ok(readback)
+    }
+
+    /// Reconciles an exact lease without reviving or replacing it.  An active
+    /// lease at or beyond its owner deadline enters RECONCILING; terminal rows
+    /// are returned unchanged for replay.
+    pub fn reconcile_runtime_lease(
+        &self,
+        lease_id: &str,
+        expected_fence: &StateFence,
+        evidence: Vec<String>,
+        now_ms: u64,
+    ) -> Result<Option<RuntimeLease>, OrsError> {
+        let current = self.load_current_runtime_lease(lease_id)?;
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        if current.state_fence != *expected_fence {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "runtime_lease",
+                reason: "reconciliation fence is stale".to_owned(),
+            });
+        }
+        if current.state == LeaseState::Active && now_ms >= current.obligation.expires_at_ms {
+            return self
+                .transition_runtime_lease(
+                    lease_id,
+                    current.revision,
+                    expected_fence,
+                    LeaseState::Reconciling,
+                    "expired-awaiting-reconciliation".to_owned(),
+                    if evidence.is_empty() {
+                        vec!["kernel-reconciliation-after-expiry".to_owned()]
+                    } else {
+                        evidence
+                    },
+                )
+                .map(Some);
+        }
+        Ok(Some(current))
+    }
+
     #[cfg(test)]
     pub(crate) fn write_process_start_raw_for_test(
         &self,
@@ -4675,6 +5005,11 @@ impl RedbRecoveryStore {
             drop(
                 write
                     .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
+                    .map_err(storage)?,
+            );
+            drop(
+                write
+                    .open_table(RUNTIME_LEASE_CURRENT)
                     .map_err(storage)?,
             );
             drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);

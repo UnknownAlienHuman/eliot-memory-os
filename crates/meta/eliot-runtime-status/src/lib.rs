@@ -3661,6 +3661,7 @@ mod store_currentness_production_tests {
         let applied = AppliedOperation {
             identity: op,
             checksum: "chk".to_owned(),
+            compatibility_checksum: None,
             sequence: seq,
         };
         (rec, applied)
@@ -4174,6 +4175,7 @@ mod live_production_observer_tests {
                 idempotency_key: h("key-store"),
             },
             checksum: "chk".to_owned(),
+            compatibility_checksum: None,
             sequence: 5,
         };
         let host_state = HostState {

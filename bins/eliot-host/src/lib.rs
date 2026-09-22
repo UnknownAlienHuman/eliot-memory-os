@@ -202,6 +202,7 @@ use eliot_kernel_service::{
     KernelReadyReceipt, KernelServiceState, ProcessAuthorityHandoffDescriptor, RestartBudget,
     StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
     StoreRebindReceipt, control_request_frame, decode_control_response_frame,
+    expected_runtime_lease,
     semantic_store_config_hash_from_json,
 };
 use eliot_observation_contracts::{
@@ -230,8 +231,8 @@ use eliot_platform_windows::{
 use eliot_process::DispatchAuthorityId;
 use eliot_runtime_contracts::{
     HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord,
-    ServiceProcessState, SupervisionJournalEpoch, SupervisionLeaseIncarnationBinding, WakeIntent,
-    WakeIntentState,
+    RuntimeLease, ServiceProcessState, SupervisionJournalEpoch,
+    SupervisionLeaseIncarnationBinding, WakeIntent, WakeIntentState,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -520,6 +521,17 @@ fn validate_probe_response(
     response
         .validate()
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let expected_runtime_lease = expected_runtime_lease(&request.candidate, request.generation)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let runtime_lease = response.runtime_lease.as_ref().ok_or_else(|| {
+        HostError::ProcessContour("Kernel did not return a RuntimeLease readback".to_owned())
+    })?;
+    if runtime_lease != &expected_runtime_lease {
+        return Err(HostError::ProcessContour(
+            "Kernel RuntimeLease is not bound to the exact candidate, authority, generation, and scope"
+                .to_owned(),
+        ));
+    }
     if !matches!(&request.command, KernelControlCommand::ProbeReady)
         || response.message_id != request.message_id
         || response.request_digest != request.payload_digest
@@ -590,6 +602,7 @@ struct AuthenticatedKernelReadiness {
     response: KernelControlResponse,
     ready: KernelReadyReceipt,
     runtime_health: KernelRuntimeHealthEvidence,
+    runtime_lease: RuntimeLease,
     supervision_lease: eliot_ors::SupervisionLeaseSnapshot,
     store_fence: PlatformHandle,
     peer_evidence: PlatformHandle,
@@ -681,6 +694,8 @@ pub(crate) struct HostJobBranches {
     agent_bridge_admission: Option<eliot_kernel_service::AgentBridgeAdmissionDescriptor>,
     kernel_candidate: Option<HostKernelCandidateBinding>,
     kernel_activation_receipt: Option<KernelActivationReceipt>,
+    kernel_runtime_lease: Option<RuntimeLease>,
+    kernel_supervision_lease: Option<eliot_ors::SupervisionLeaseSnapshot>,
     kernel_restart_attempts: u8,
     store_restart_attempts: u8,
 }
@@ -1022,6 +1037,8 @@ impl HostJobBranches {
             agent_bridge_admission: None,
             kernel_candidate: None,
             kernel_activation_receipt: None,
+            kernel_runtime_lease: None,
+            kernel_supervision_lease: None,
             kernel_restart_attempts: 0,
             store_restart_attempts: 0,
         })
@@ -1091,6 +1108,8 @@ impl HostJobBranches {
             agent_bridge_admission: None,
             kernel_candidate: None,
             kernel_activation_receipt: None,
+            kernel_runtime_lease: None,
+            kernel_supervision_lease: None,
             kernel_restart_attempts: 0,
             store_restart_attempts: 0,
         };
@@ -1836,9 +1855,19 @@ impl HostJobBranches {
             // and health vector before Host commits Active.
             let (ready, _runtime_health) =
                 validate_probe_response(&probe_request, &activation_receipt, &response)?;
-            Ok((activation_receipt, ready))
+            let runtime_lease = response.runtime_lease.clone().ok_or_else(|| {
+                HostError::ProcessContour(
+                    "Kernel ProbeReady response lost its RuntimeLease readback".to_owned(),
+                )
+            })?;
+            let supervision_lease = response.supervision_lease.clone().ok_or_else(|| {
+                HostError::ProcessContour(
+                    "Kernel ProbeReady response lost its supervision readback".to_owned(),
+                )
+            })?;
+            Ok((activation_receipt, ready, runtime_lease, supervision_lease))
         });
-        let (activation_receipt, ready) = match ready {
+        let (activation_receipt, ready, runtime_lease, supervision_lease) = match ready {
             Ok(receipts) => receipts,
             Err(error) => {
                 let failure = activation.fail("kernel-control-activation-failed");
@@ -1850,6 +1879,8 @@ impl HostJobBranches {
                 });
             }
         };
+        self.kernel_runtime_lease = Some(runtime_lease);
+        self.kernel_supervision_lease = Some(supervision_lease);
         if let Err(error) = activation.active(&candidate, &activation_receipt, &ready) {
             let failure = activation.fail("kernel-active-commit-failed");
             return Err(match failure {
@@ -2634,7 +2665,7 @@ impl HostJobBranches {
         reason = "the authenticated repeat keeps retained contour, peer, request, response, and Store proof checks in one fail-closed boundary"
     )]
     fn probe_kernel_readiness(
-        &self,
+        &mut self,
         approved_generation: &PlatformHandle,
         approved_kernel_artifact: &PlatformHandle,
         approved_store_artifact: &PlatformHandle,
@@ -2707,7 +2738,7 @@ impl HostJobBranches {
             .enable_all()
             .build()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        runtime.block_on(async {
+        let proof = runtime.block_on(async {
             let mut transport = connect_authenticated_kernel_front_door(candidate, process).await?;
             validate_authenticated_kernel_peer(
                 transport.peer_identity(),
@@ -2764,6 +2795,11 @@ impl HostJobBranches {
             let response = decode_control_response_frame(&frame)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let (ready, runtime_health) = validate_probe_response(&request, activation, &response)?;
+            let runtime_lease = response.runtime_lease.clone().ok_or_else(|| {
+                HostError::ProcessContour(
+                    "Kernel did not return the exact current RuntimeLease readback".to_owned(),
+                )
+            })?;
             let supervision_lease = response.supervision_lease.clone().ok_or_else(|| {
                 HostError::ProcessContour(
                     "Kernel did not return the exact current supervision ORS snapshot".to_owned(),
@@ -2781,11 +2817,15 @@ impl HostJobBranches {
                 response,
                 ready,
                 runtime_health,
+                runtime_lease,
                 supervision_lease,
                 store_fence,
                 peer_evidence,
             })
-        })
+        })?;
+        self.kernel_runtime_lease = Some(proof.runtime_lease.clone());
+        self.kernel_supervision_lease = Some(proof.supervision_lease.clone());
+        Ok(proof)
     }
 
     #[allow(
@@ -3607,8 +3647,6 @@ fn bind_demand_activation(
     activation.requester_principal_session_or_scheduler = demand.requester_principal.clone();
     activation.requested_capabilities = demand.requested_capabilities.clone();
     activation.candidate_scope = demand.candidate_scope.clone();
-    activation.runtime_lease_refs = vec![demand.runtime_lease_ref.clone()];
-    activation.supervision_lease_refs = vec![demand.supervision_lease_ref.clone()];
     Ok(())
 }
 
@@ -4998,6 +5036,66 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    fn bind_verified_demand_leases(
+        &mut self,
+        demand: &HostDemandStartRuntimeRequest,
+    ) -> Result<(), HostError> {
+        let runtime_lease = self
+            .jobs
+            .kernel_runtime_lease
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::OwnerLeaseRecovery(
+                    "Kernel did not retain a current RuntimeLease after readiness".to_owned(),
+                )
+            })?;
+        runtime_lease
+            .validate()
+            .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
+        let supervision_lease = self
+            .jobs
+            .kernel_supervision_lease
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::OwnerLeaseRecovery(
+                    "Kernel did not retain a current supervision lease after readiness"
+                        .to_owned(),
+                )
+            })?;
+        supervision_lease
+            .validate()
+            .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
+        let runtime_ref = PlatformHandle::new(runtime_lease.lease_id.clone())
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let supervision_ref = PlatformHandle::new(supervision_lease.record.lease_id.as_str())
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        if demand
+            .runtime_lease_ref
+            .as_ref()
+            .is_some_and(|value| value != &runtime_ref)
+            || demand
+                .supervision_lease_ref
+                .as_ref()
+                .is_some_and(|value| value != &supervision_ref)
+        {
+            return Err(HostError::RecoveryRequired(
+                "demand-start supplied a lease reference different from the current Kernel readback"
+                    .to_owned(),
+            ));
+        }
+        let current = self.journal.snapshot()?.activation.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "demand-start has no activation while binding current Kernel leases".to_owned(),
+            )
+        })?;
+        let mut next = current;
+        next.runtime_lease_refs = vec![runtime_ref];
+        next.supervision_lease_refs = vec![supervision_ref];
+        self.append_record(HostStateRecord::Activation(next))?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
     fn execute_demand_start(
         &mut self,
         request: &HostRuntimeControlRequest,
@@ -5028,6 +5126,7 @@ impl HostComposition {
                     request,
                     demand,
                 )?;
+                self.bind_verified_demand_leases(demand)?;
                 let _ = store_artifact;
             }
             ActivationState::ControlReady => {
@@ -5037,6 +5136,7 @@ impl HostComposition {
                         "demand-start reconcile did not prove readiness: {disposition:?}"
                     )));
                 }
+                self.bind_verified_demand_leases(demand)?;
                 self.transition_activation_with_drain_disposition(
                     ActivationState::Active,
                     "host-demand-start-active",
@@ -5052,10 +5152,14 @@ impl HostComposition {
                         .all(|capability| activation.requested_capabilities.contains(capability))
                     || !activation
                         .runtime_lease_refs
-                        .contains(&demand.runtime_lease_ref)
+                        .iter()
+                        .any(|value| demand.runtime_lease_ref.as_ref() == Some(value))
+                            && demand.runtime_lease_ref.is_some()
                     || !activation
                         .supervision_lease_refs
-                        .contains(&demand.supervision_lease_ref)
+                        .iter()
+                        .any(|value| demand.supervision_lease_ref.as_ref() == Some(value))
+                            && demand.supervision_lease_ref.is_some()
                 {
                     return Err(HostError::RecoveryRequired(
                         "active activation does not carry the exact demand lease binding"
@@ -5068,6 +5172,7 @@ impl HostComposition {
                         "demand-start reconcile did not prove readiness: {disposition:?}"
                     )));
                 }
+                self.bind_verified_demand_leases(demand)?;
             }
             ActivationState::Draining => {
                 if initial.drain_commit.is_some() {
@@ -5107,6 +5212,7 @@ impl HostComposition {
                             .to_owned(),
                     ));
                 }
+                self.bind_verified_demand_leases(demand)?;
                 self.transition_activation_with_drain_disposition(
                     ActivationState::Active,
                     "host-demand-start-drain-cancelled",
@@ -5144,6 +5250,25 @@ impl HostComposition {
             current.fence.activation_generation.current.sequence
         ))
         .map_err(|error| HostError::Platform(error.to_string()))?;
+        let runtime_lease_ref = current
+            .runtime_lease_refs
+            .first()
+            .cloned()
+            .ok_or_else(|| {
+                HostError::OwnerLeaseRecovery(
+                    "demand-start completion has no current RuntimeLease reference".to_owned(),
+                )
+            })?;
+        let supervision_lease_ref = current
+            .supervision_lease_refs
+            .first()
+            .cloned()
+            .ok_or_else(|| {
+                HostError::OwnerLeaseRecovery(
+                    "demand-start completion has no current supervision lease reference"
+                        .to_owned(),
+                )
+            })?;
         let mut receipt = HostDemandStartReceipt {
             mutation_digest: request.mutation_digest.clone(),
             request_digest: request.request_digest.clone(),
@@ -5153,8 +5278,8 @@ impl HostComposition {
             candidate_scope: demand.candidate_scope.clone(),
             governance_profile: current.governance_profile,
             readiness_evidence_refs: current.readiness.evidence_refs,
-            runtime_lease_ref: demand.runtime_lease_ref.clone(),
-            supervision_lease_ref: demand.supervision_lease_ref.clone(),
+            runtime_lease_ref,
+            supervision_lease_ref,
             drain_disposition,
             receipt_digest: PlatformHandle::new("pending")
                 .map_err(|error| HostError::Platform(error.to_string()))?,
@@ -5188,13 +5313,15 @@ impl HostComposition {
                 ServiceSafetyClass::UserSessionRequired
             }
         };
+        let origin_operation = demand_operation(request, "queue-wake")?;
         let expected = WakeRecord {
             fence: record_fence(
                 &self.host,
                 &activation.activation_id,
                 &activation.fence.activation_generation,
             ),
-            operation: demand_operation(request, "queue-wake")?,
+            origin_operation: origin_operation.clone(),
+            operation: origin_operation,
             wake_id: wake.wake_id.clone(),
             intent,
             reason_evidence_refs: demand.trigger_evidence.clone(),
@@ -5212,28 +5339,11 @@ impl HostComposition {
             .iter()
             .find(|existing| existing.wake_id == wake.wake_id)
         {
-            // Wake lifecycle state is mutable after the first durable append;
-            // every other field is the immutable identity of this wake.  A
-            // replay may therefore observe CLAIMED/STARTED/etc., but a
-            // changed deadline, expiry, capability, safety, budget, trigger
-            // evidence, operation, or record fence is a conflicting reuse of
-            // the same wake_id and must fail closed.
-            let same_immutable_material = existing.fence == expected.fence
-                && existing.operation == expected.operation
-                && existing.wake_id == expected.wake_id
-                && existing.intent.wake_id == expected.intent.wake_id
-                && existing.intent.reason == expected.intent.reason
-                && existing.intent.state_fence == expected.intent.state_fence
-                && existing.reason_evidence_refs == expected.reason_evidence_refs
-                && existing.earliest_start == expected.earliest_start
-                && existing.deadline == expected.deadline
-                && existing.expiry == expected.expiry
-                && existing.required_capabilities == expected.required_capabilities
-                && existing.maintenance_family == expected.maintenance_family
-                && existing.safety_class == expected.safety_class
-                && existing.state_fence_revalidation_ref == expected.state_fence_revalidation_ref
-                && existing.budget_ref == expected.budget_ref;
-            if same_immutable_material {
+            // A replay may observe a changed lifecycle operation and
+            // CLAIMED/STARTED/etc. state. The retained origin operation and
+            // every other admission field, including the original activation
+            // fence, must still match exactly.
+            if existing.same_admission_material(&expected) {
                 return Ok(());
             }
             return Err(HostError::RecoveryRequired(
@@ -7271,7 +7381,7 @@ impl HostComposition {
             .manifest
             .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let materialized_config_digest = self.jobs.config_digest.as_ref().ok_or_else(|| {
+        let materialized_config_digest = self.jobs.config_digest.clone().ok_or_else(|| {
             HostError::ProcessContour(
                 "readiness probe has no materialized Store config digest".to_owned(),
             )
@@ -7280,13 +7390,13 @@ impl HostComposition {
             generation,
             kernel_artifact,
             store_artifact,
-            materialized_config_digest,
+            &materialized_config_digest,
         )?;
         let proof = self.jobs.probe_kernel_readiness(
             generation,
             kernel_artifact,
             store_artifact,
-            materialized_config_digest,
+            &materialized_config_digest,
         )?;
         let registry_authority = self
             .registry
@@ -7347,7 +7457,7 @@ impl HostComposition {
             &self.journal,
             &proof,
             kernel_artifact,
-            materialized_config_digest,
+            &materialized_config_digest,
             &watchdog_template,
             &heartbeat_refs,
         )?;
@@ -7359,7 +7469,7 @@ impl HostComposition {
             generation,
             kernel_artifact,
             store_artifact,
-            materialized_config_digest,
+            &materialized_config_digest,
         )?;
         if !confirmed.same_probe_input_contour(&contour)
             || confirmed.store_proof_fence.as_ref() != Some(&proof.store_fence)

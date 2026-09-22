@@ -683,6 +683,7 @@ fn wake(
     .unwrap_or_else(|_| unreachable!());
     HostStateRecord::Wake(WakeRecord {
         fence: fence(host, generation),
+        origin_operation: operation(op),
         operation: operation(op),
         wake_id: h(wake_id),
         intent,

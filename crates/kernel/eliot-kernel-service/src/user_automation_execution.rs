@@ -154,7 +154,10 @@ pub struct UserAutomationWakeCancellationTarget {
     pub automation_revision: String,
     /// Exact Host wake identity.
     pub wake_id: String,
-    /// Exact Host journal operation identity.
+    /// Retained original Host admission operation identity.
+    ///
+    /// Cancellation has a separate batch operation and never replaces this
+    /// lifecycle record field.
     pub operation_id: String,
     /// Exact Host journal idempotency key.
     pub idempotency_key: String,

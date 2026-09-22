@@ -1245,6 +1245,11 @@ pub enum ServiceSafetyClass {
 #[serde(deny_unknown_fields)]
 pub struct WakeRecord {
     pub fence: RecordFence,
+    /// Immutable operation identity of the original wake admission. The
+    /// lifecycle `operation` below may change when the owner records
+    /// cancellation, claim, or completion; this identity never changes.
+    pub origin_operation: IdempotencyIdentity,
+    /// Current lifecycle operation for this durable wake projection.
     pub operation: IdempotencyIdentity,
     pub wake_id: PlatformHandle,
     pub intent: WakeIntent,
@@ -1262,6 +1267,7 @@ pub struct WakeRecord {
 impl WakeRecord {
     fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
+        self.origin_operation.validate()?;
         self.operation.validate()?;
         handle(&self.wake_id, "wake_id")?;
         self.intent
@@ -1291,6 +1297,95 @@ impl WakeRecord {
             "wake.state_fence_revalidation_ref",
         )?;
         handle(&self.budget_ref, "wake.budget_ref")
+    }
+
+    /// Returns whether two records describe the same originally admitted
+    /// wake. Lifecycle state and lifecycle operation are intentionally
+    /// excluded: both are mutable owner projections. Every other field is
+    /// the admission identity, including the activation fence, so a record
+    /// from a rotated generation cannot be replayed into the current one.
+    pub fn same_admission_material(&self, other: &Self) -> bool {
+        self.fence == other.fence
+            && self.origin_operation == other.origin_operation
+            && self.wake_id == other.wake_id
+            && self.intent.wake_id == other.intent.wake_id
+            && self.intent.reason == other.intent.reason
+            && self.intent.state_fence == other.intent.state_fence
+            && self.reason_evidence_refs == other.reason_evidence_refs
+            && self.earliest_start == other.earliest_start
+            && self.deadline == other.deadline
+            && self.expiry == other.expiry
+            && self.required_capabilities == other.required_capabilities
+            && self.maintenance_family == other.maintenance_family
+            && self.safety_class == other.safety_class
+            && self.state_fence_revalidation_ref == other.state_fence_revalidation_ref
+            && self.budget_ref == other.budget_ref
+    }
+}
+
+/// One compare-and-swap member of an atomic UserAutomation wake
+/// cancellation. The expected checksum binds the transition to the exact
+/// snapshot validated by the caller; the journal reducer checks every member
+/// before changing any member.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeCancellationBatchEntry {
+    pub expected_record_checksum: PlatformHandle,
+    pub wake: WakeRecord,
+}
+
+impl WakeCancellationBatchEntry {
+    fn validate(&self, batch_fence: &RecordFence) -> Result<(), JournalError> {
+        digest(
+            &self.expected_record_checksum,
+            "wake_cancellation.expected_record_checksum",
+        )?;
+        self.wake.validate()?;
+        if self.wake.fence != *batch_fence {
+            return Err(JournalError::StaleFence);
+        }
+        if self.wake.intent.state != WakeIntentState::Cancelled {
+            return Err(JournalError::Invalid(
+                "wake cancellation batch entries must be Cancelled".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Atomic journal record for cancelling several unadmitted wakes.
+///
+/// The record is one journal transaction and one idempotency identity. Its
+/// reducer validates every expected checksum and lifecycle transition before
+/// applying any replacement, so a stale later target cannot leave earlier
+/// targets durably cancelled.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeCancellationBatchRecord {
+    pub fence: RecordFence,
+    pub operation: IdempotencyIdentity,
+    pub entries: Vec<WakeCancellationBatchEntry>,
+}
+
+impl WakeCancellationBatchRecord {
+    fn validate(&self) -> Result<(), JournalError> {
+        self.fence.validate()?;
+        self.operation.validate()?;
+        if self.entries.is_empty() {
+            return Err(JournalError::Invalid(
+                "wake cancellation batch must not be empty".into(),
+            ));
+        }
+        let mut wake_ids = std::collections::BTreeSet::new();
+        for entry in &self.entries {
+            entry.validate(&self.fence)?;
+            if !wake_ids.insert(entry.wake.wake_id.clone()) {
+                return Err(JournalError::Invalid(
+                    "wake cancellation batch contains duplicate wake ids".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1671,6 +1766,7 @@ pub enum HostStateRecord {
     Drain(DrainRecord),
     DrainCommit(DrainCommitRecord),
     Wake(WakeRecord),
+    WakeCancellationBatch(WakeCancellationBatchRecord),
     Observation(HostObservationRecord),
     ReadinessObservation(KernelReadinessObservationRecord),
     CleanMarker(CleanMarker),
@@ -1688,6 +1784,7 @@ impl HostStateRecord {
             Self::Drain(value) => value.validate(),
             Self::DrainCommit(value) => value.validate(),
             Self::Wake(value) => value.validate(),
+            Self::WakeCancellationBatch(value) => value.validate(),
             Self::Observation(value) => value.validate(),
             Self::ReadinessObservation(value) => value.validate(),
             Self::CleanMarker(value) => value.validate(),
@@ -1713,6 +1810,7 @@ impl HostStateRecord {
             Self::Drain(value) => &value.fence,
             Self::DrainCommit(value) => &value.fence,
             Self::Wake(value) => &value.fence,
+            Self::WakeCancellationBatch(value) => &value.fence,
             Self::Observation(value) => &value.fence,
             Self::ReadinessObservation(value) => &value.fence,
             Self::CleanMarker(value) => &value.fence,
@@ -1730,6 +1828,7 @@ impl HostStateRecord {
             Self::Drain(value) => &value.operation,
             Self::DrainCommit(value) => &value.operation,
             Self::Wake(value) => &value.operation,
+            Self::WakeCancellationBatch(value) => &value.operation,
             Self::Observation(value) => &value.operation,
             Self::ReadinessObservation(value) => &value.operation,
             Self::CleanMarker(value) => &value.operation,
@@ -1743,7 +1842,15 @@ impl HostStateRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppliedOperation {
     pub identity: IdempotencyIdentity,
+    /// Checksum of the exact durable frame. This remains the authoritative
+    /// checksum for committed receipts and forensic frame evidence.
     pub checksum: String,
+    /// Checksum of the canonical in-memory record produced by an explicitly
+    /// supported wire migration. A compatibility match is accepted only for
+    /// the same operation identity and the complete migrated record; it never
+    /// replaces the raw frame checksum above.
+    #[serde(default)]
+    pub compatibility_checksum: Option<String>,
     pub sequence: u64,
 }
 
@@ -2246,12 +2353,21 @@ pub(crate) fn wake_transition(
     next: &WakeRecord,
 ) -> Result<(), JournalError> {
     let Some(current) = current else {
-        return if next.intent.state == WakeIntentState::Pending {
-            Ok(())
-        } else {
-            Err(illegal("wake", "NONE", next.intent.state))
-        };
+        if next.intent.state != WakeIntentState::Pending {
+            return Err(illegal("wake", "NONE", next.intent.state));
+        }
+        if next.origin_operation != next.operation {
+            return Err(JournalError::Invalid(
+                "initial Pending WakeRecord origin_operation must equal operation".into(),
+            ));
+        }
+        return Ok(());
     };
+    if !current.same_admission_material(next) {
+        return Err(JournalError::Invalid(
+            "wake lifecycle transition changed immutable admission material".into(),
+        ));
+    }
     let legal = matches!(
         (current.intent.state, next.intent.state),
         (

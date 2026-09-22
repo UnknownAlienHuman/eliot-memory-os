@@ -121,6 +121,7 @@ fn wake_record(host: &HostInstallationEpoch, state_fence: StateFence) -> HostSta
     let wake_id = "wake-automation-1";
     HostStateRecord::Wake(WakeRecord {
         fence: record_fence(host),
+        origin_operation: operation("wake-create"),
         operation: operation("wake-create"),
         wake_id: handle(wake_id),
         intent: WakeIntent {

@@ -242,11 +242,13 @@ impl HostDemandStartWakeRequest {
     }
 }
 
-/// Authenticated, Kernel-owned demand-start input accepted by Host.
+/// Authenticated demand-start input accepted by Host.
 ///
-/// Lease references are opaque owner references. Host binds and persists
-/// them but never manufactures a RuntimeLease or SupervisionLease and never
-/// treats a caller-shaped reference as authority.
+/// Lease references are optional at the pre-start boundary: a stopped
+/// installation cannot require a RuntimeLease from the Kernel that it is
+/// asking Host to start. When present, they are opaque owner references that
+/// Host compares with the current Kernel readback; Host never manufactures
+/// either lease or treats a caller-shaped reference as authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostDemandStartRuntimeRequest {
@@ -256,8 +258,10 @@ pub struct HostDemandStartRuntimeRequest {
     pub trigger_evidence: Vec<PlatformHandle>,
     pub requested_capabilities: Vec<PlatformHandle>,
     pub state_fence: StateFence,
-    pub runtime_lease_ref: PlatformHandle,
-    pub supervision_lease_ref: PlatformHandle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_lease_ref: Option<PlatformHandle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision_lease_ref: Option<PlatformHandle>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<HostDemandStartWakeRequest>,
 }
@@ -268,13 +272,14 @@ impl HostDemandStartRuntimeRequest {
             (&self.requester_principal, "demand_start.requester_principal"),
             (&self.candidate_scope, "demand_start.candidate_scope"),
             (&self.trigger_class, "demand_start.trigger_class"),
-            (&self.runtime_lease_ref, "demand_start.runtime_lease_ref"),
-            (
-                &self.supervision_lease_ref,
-                "demand_start.supervision_lease_ref",
-            ),
         ] {
             validate_demand_handle(value, field)?;
+        }
+        if let Some(value) = &self.runtime_lease_ref {
+            validate_demand_handle(value, "demand_start.runtime_lease_ref")?;
+        }
+        if let Some(value) = &self.supervision_lease_ref {
+            validate_demand_handle(value, "demand_start.supervision_lease_ref")?;
         }
         validate_demand_handles(
             &self.trigger_evidence,

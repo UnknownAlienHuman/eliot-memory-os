@@ -1,15 +1,16 @@
 use std::sync::Mutex;
 
 use eliot_platform::{KernelActivationNonce, PlatformHandle};
+use eliot_runtime_contracts::WakeIntentState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
     AppliedOperation, EpochEvidence, HostInstallationEpoch, HostState, HostStateRecord,
-    IdempotencyIdentity, RecoveryLineageReason, activation_transition, dependency_transition,
-    drain_transition, epoch_transition_is_direct_child_of, kernel_transition,
-    store_rebind_transition, wake_transition,
+    IdempotencyIdentity, RecoveryLineageReason, WakeRecord, activation_transition,
+    dependency_transition, drain_transition, epoch_transition_is_direct_child_of,
+    kernel_transition, store_rebind_transition, wake_transition,
 };
 use crate::reactive_context::{
     ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,
@@ -84,11 +85,77 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, JournalError> {
     serde_json::from_slice(bytes).map_err(|error| JournalError::Invalid(error.to_string()))
 }
 
-fn decode_record_for_replay(bytes: &[u8]) -> Result<HostStateRecord, JournalError> {
+enum LegacyWakeOrigin {
+    None,
+    TopLevel,
+    Batch(Vec<usize>),
+}
+
+struct DecodedRecord {
+    record: HostStateRecord,
+    /// Version 3 frames written before `WakeRecord::origin_operation` was
+    /// added. The frame envelope is still authoritative; only the in-memory
+    /// projection needs an explicit, stateful migration before apply.
+    legacy_wake_origin_missing: LegacyWakeOrigin,
+}
+
+fn inject_legacy_wake_origin(wake: &mut serde_json::Value) -> Result<bool, JournalError> {
+    let Some(wake) = wake.as_object_mut() else {
+        return Ok(false);
+    };
+    if wake.contains_key("origin_operation") {
+        return Ok(false);
+    }
+    let operation = wake
+        .get("operation")
+        .cloned()
+        .ok_or_else(|| JournalError::Invalid("legacy WakeRecord has no operation".into()))?;
+    wake.insert("origin_operation".into(), operation);
+    Ok(true)
+}
+
+fn decode_record_for_replay(bytes: &[u8]) -> Result<DecodedRecord, JournalError> {
     let mut wire: serde_json::Value = decode(bytes)?;
     match serde_json::from_value(wire.clone()) {
-        Ok(record) => Ok(record),
+        Ok(record) => Ok(DecodedRecord {
+            record,
+            legacy_wake_origin_missing: LegacyWakeOrigin::None,
+        }),
         Err(strict_error) => {
+            if let Some(wake) = wire.get_mut("wake")
+                && inject_legacy_wake_origin(wake)?
+            {
+                let record: HostStateRecord = serde_json::from_value(wire)
+                    .map_err(|error| JournalError::Invalid(error.to_string()))?;
+                return Ok(DecodedRecord {
+                    record,
+                    legacy_wake_origin_missing: LegacyWakeOrigin::TopLevel,
+                });
+            }
+            if let Some(batch) = wire
+                .get_mut("wake_cancellation_batch")
+                .and_then(serde_json::Value::as_object_mut)
+                && let Some(entries) = batch
+                    .get_mut("entries")
+                    .and_then(serde_json::Value::as_array_mut)
+            {
+                let mut missing = Vec::new();
+                for (index, entry) in entries.iter_mut().enumerate() {
+                    if let Some(wake) = entry.get_mut("wake")
+                        && inject_legacy_wake_origin(wake)?
+                    {
+                        missing.push(index);
+                    }
+                }
+                if !missing.is_empty() {
+                    let record: HostStateRecord = serde_json::from_value(wire)
+                        .map_err(|error| JournalError::Invalid(error.to_string()))?;
+                    return Ok(DecodedRecord {
+                        record,
+                        legacy_wake_origin_missing: LegacyWakeOrigin::Batch(missing),
+                    });
+                }
+            }
             let nonce_slot = wire
                 .pointer_mut("/kernel/one_time_nonce/nonce_ref")
                 .ok_or_else(|| JournalError::Invalid(strict_error.to_string()))?;
@@ -108,7 +175,10 @@ fn decode_record_for_replay(bytes: &[u8]) -> Result<HostStateRecord, JournalErro
                 return Err(JournalError::Invalid(strict_error.to_string()));
             };
             kernel.restore_legacy_nonce_for_replay(legacy_nonce)?;
-            Ok(record)
+            Ok(DecodedRecord {
+                record,
+                legacy_wake_origin_missing: LegacyWakeOrigin::None,
+            })
         }
     }
 }
@@ -170,13 +240,26 @@ fn replay(
 ) -> Result<HostState, JournalError> {
     host.validate()?;
     let mut state = HostState::new(host, retained);
+    let mut migration = WakeReplayContext::default();
     for frame in scan_frames(bytes)? {
-        apply(
+        let legacy_wake_origin = !matches!(
+            &frame.record.legacy_wake_origin_missing,
+            LegacyWakeOrigin::None
+        );
+        let record = migration.migrate(frame.record)?;
+        let compatibility_checksum = legacy_wake_origin
+            .then(|| record_checksum(&record))
+            .transpose()?;
+        let disposition = apply(
             &mut state,
-            &frame.record,
+            &record,
             frame.header.sequence,
             &frame.header.checksum,
+            compatibility_checksum.as_deref(),
         )?;
+        if matches!(disposition, ApplyDisposition::Applied) {
+            migration.note_applied(&record, &frame.header.checksum)?;
+        }
         state.sequence = frame.header.sequence;
         state.last_checksum = Some(frame.header.checksum);
     }
@@ -191,7 +274,185 @@ fn replay(
 struct ScannedFrame<'a> {
     raw: &'a [u8],
     header: FrameHeader,
-    record: HostStateRecord,
+    record: DecodedRecord,
+}
+
+/// Stateful compatibility context for the additive `WakeRecord` field.
+///
+/// A legacy lifecycle frame is never allowed to define its own origin. It can
+/// inherit only the origin retained from the same wake's first durable
+/// `Pending` admission. The small applied-operation ledger prevents an exact
+/// old-frame replay after cancellation from rewriting the migration context.
+#[derive(Default)]
+struct WakeReplayContext {
+    activation_generation: Option<eliot_contracts::EpochTransition>,
+    wakes: Vec<RetainedWake>,
+    applied_operations: Vec<AppliedOperation>,
+}
+
+struct RetainedWake {
+    record: WakeRecord,
+    raw_checksum: String,
+}
+
+impl WakeReplayContext {
+    fn migrate(&self, decoded: DecodedRecord) -> Result<HostStateRecord, JournalError> {
+        let DecodedRecord {
+            mut record,
+            legacy_wake_origin_missing,
+        } = decoded;
+        match legacy_wake_origin_missing {
+            LegacyWakeOrigin::None => return Ok(record),
+            LegacyWakeOrigin::TopLevel => {
+                let HostStateRecord::Wake(wake) = &mut record else {
+                    return Err(JournalError::Invalid(
+                        "legacy origin migration marked a non-Wake record".into(),
+                    ));
+                };
+                self.migrate_wake(wake)?;
+            }
+            LegacyWakeOrigin::Batch(missing) => {
+                let HostStateRecord::WakeCancellationBatch(batch) = &mut record else {
+                    return Err(JournalError::Invalid(
+                        "legacy batch origin migration marked a non-batch record".into(),
+                    ));
+                };
+                for index in missing {
+                    let entry = batch.entries.get_mut(index).ok_or_else(|| {
+                        JournalError::Invalid(
+                            "legacy wake cancellation batch entry index is invalid".into(),
+                        )
+                    })?;
+                    let existing = self.retained_wake(&entry.wake.wake_id)?;
+                    if existing.record.intent.state == WakeIntentState::Pending {
+                        if entry.expected_record_checksum.as_str() != existing.raw_checksum {
+                            return Err(JournalError::StaleFence);
+                        }
+                        let canonical_checksum = record_checksum(&HostStateRecord::Wake(
+                            existing.record.clone(),
+                        ))?;
+                        entry.expected_record_checksum = PlatformHandle::new(canonical_checksum)
+                            .map_err(|_| {
+                                JournalError::Invalid(
+                                    "legacy wake cancellation checksum is invalid".into(),
+                                )
+                            })?;
+                    }
+                    entry.wake.origin_operation = existing.record.origin_operation.clone();
+                }
+            }
+        }
+        Ok(record)
+    }
+
+    fn retained_wake(&self, wake_id: &PlatformHandle) -> Result<&RetainedWake, JournalError> {
+        self.wakes
+            .iter()
+            .find(|existing| existing.record.wake_id == *wake_id)
+            .ok_or_else(|| {
+                JournalError::Invalid(
+                    "legacy WakeRecord is missing origin_operation and no retained initial Pending admission exists".into(),
+                )
+            })
+    }
+
+    fn migrate_wake(&self, wake: &mut WakeRecord) -> Result<(), JournalError> {
+        let origin = self
+            .wakes
+            .iter()
+            .find(|existing| existing.record.wake_id == wake.wake_id)
+            .map(|existing| existing.record.origin_operation.clone())
+            .or_else(|| {
+                (wake.intent.state == WakeIntentState::Pending)
+                    .then(|| wake.operation.clone())
+            })
+            .ok_or_else(|| {
+                JournalError::Invalid(
+                    "legacy WakeRecord is missing origin_operation and no retained initial Pending admission exists".into(),
+                )
+            })?;
+        wake.origin_operation = origin;
+        Ok(())
+    }
+
+    fn accept_operation(
+        &mut self,
+        record: &HostStateRecord,
+        checksum: &str,
+        sequence: u64,
+        compatibility_checksum: Option<&str>,
+    ) -> Result<bool, JournalError> {
+        if let Some(existing) = self
+            .applied_operations
+            .iter()
+            .find(|item| item.identity == *record.operation())
+        {
+            return if existing.checksum == checksum
+                || compatibility_checksum.is_some_and(|candidate| {
+                    existing.compatibility_checksum.as_deref() == Some(candidate)
+                })
+            {
+                Ok(false)
+            } else {
+                Err(JournalError::IdempotencyConflict)
+            };
+        }
+        self.applied_operations.push(AppliedOperation {
+            identity: record.operation().clone(),
+            checksum: checksum.to_owned(),
+            compatibility_checksum: compatibility_checksum.map(str::to_owned),
+            sequence,
+        });
+        Ok(true)
+    }
+
+    fn note_applied(
+        &mut self,
+        record: &HostStateRecord,
+        raw_checksum: &str,
+    ) -> Result<(), JournalError> {
+        match record {
+            HostStateRecord::Activation(next) => {
+                let new_generation = self
+                    .activation_generation
+                    .as_ref()
+                    .is_some_and(|current| current != &next.fence.activation_generation);
+                if new_generation {
+                    self.wakes.clear();
+                }
+                self.activation_generation = Some(next.fence.activation_generation.clone());
+            }
+            HostStateRecord::Wake(next) => {
+                self.retain_wake(next, raw_checksum.to_owned());
+            }
+            HostStateRecord::WakeCancellationBatch(next) => {
+                for entry in &next.entries {
+                    let canonical_checksum = record_checksum(&HostStateRecord::Wake(
+                        entry.wake.clone(),
+                    ))?;
+                    self.retain_wake(&entry.wake, canonical_checksum);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn retain_wake(&mut self, next: &WakeRecord, raw_checksum: String) {
+        let retained = RetainedWake {
+            record: next.clone(),
+            raw_checksum,
+        };
+        if let Some(index) = self
+            .wakes
+            .iter()
+            .position(|existing| existing.record.wake_id == next.wake_id)
+        {
+            self.wakes[index] = retained;
+        } else {
+            self.wakes.push(retained);
+        }
+    }
 }
 
 fn scan_frames(bytes: &[u8]) -> Result<Vec<ScannedFrame<'_>>, JournalError> {
@@ -267,13 +528,31 @@ pub(crate) fn frame_bindings(
 ) -> Result<Vec<FrameBinding>, JournalError> {
     host.validate()?;
     let mut bindings = Vec::new();
+    let mut migration = WakeReplayContext::default();
     for frame in scan_frames(epoch_bytes)? {
-        frame.record.validate()?;
-        if frame.record.fence().host != *host {
+        let legacy_wake_origin = !matches!(
+            &frame.record.legacy_wake_origin_missing,
+            LegacyWakeOrigin::None
+        );
+        let record = migration.migrate(frame.record)?;
+        let compatibility_checksum = legacy_wake_origin
+            .then(|| record_checksum(&record))
+            .transpose()?;
+        record.validate()?;
+        if record.fence().host != *host {
             return Err(JournalError::StaleFence);
         }
+        let applied = migration.accept_operation(
+            &record,
+            &frame.header.checksum,
+            frame.header.sequence,
+            compatibility_checksum.as_deref(),
+        )?;
+        if applied {
+            migration.note_applied(&record, &frame.header.checksum)?;
+        }
         bindings.push(FrameBinding {
-            operation: frame.record.operation().clone(),
+            operation: record.operation().clone(),
             record_checksum: frame.header.checksum,
             payload_digest: checksum(frame.raw),
         });
@@ -289,6 +568,7 @@ fn apply(
     record: &HostStateRecord,
     sequence: u64,
     applied_record_checksum: &str,
+    compatibility_record_checksum: Option<&str>,
 ) -> Result<ApplyDisposition, JournalError> {
     record.validate()?;
     if record.fence().host != state.host {
@@ -299,7 +579,11 @@ fn apply(
         .iter()
         .find(|item| item.identity == *record.operation())
     {
-        return if existing.checksum == applied_record_checksum {
+        return if existing.checksum == applied_record_checksum
+            || compatibility_record_checksum.is_some_and(|candidate| {
+                existing.compatibility_checksum.as_deref() == Some(candidate)
+            })
+        {
             Ok(ApplyDisposition::Replayed(existing.sequence))
         } else {
             Err(JournalError::IdempotencyConflict)
@@ -503,6 +787,30 @@ fn apply(
             }
             state.clean_marker = None;
         }
+        HostStateRecord::WakeCancellationBatch(next) => {
+            // Validate every compare-and-swap member against the same locked
+            // snapshot before replacing any WakeRecord. A stale later target
+            // therefore cannot leave an earlier target durably cancelled.
+            let mut indexes = Vec::with_capacity(next.entries.len());
+            for entry in &next.entries {
+                let index = state
+                    .wakes
+                    .iter()
+                    .position(|item| item.wake_id == entry.wake.wake_id)
+                    .ok_or(JournalError::StaleFence)?;
+                let current_checksum =
+                    record_checksum(&HostStateRecord::Wake(state.wakes[index].clone()))?;
+                if current_checksum != entry.expected_record_checksum.as_str() {
+                    return Err(JournalError::StaleFence);
+                }
+                wake_transition(Some(&state.wakes[index]), &entry.wake)?;
+                indexes.push(index);
+            }
+            for (index, entry) in indexes.into_iter().zip(&next.entries) {
+                state.wakes[index] = entry.wake.clone();
+            }
+            state.clean_marker = None;
+        }
         HostStateRecord::Observation(next) => {
             state.observations.push(next.clone());
             state.clean_marker = None;
@@ -595,6 +903,9 @@ fn apply(
     state.applied_operations.push(AppliedOperation {
         identity: record.operation().clone(),
         checksum: applied_record_checksum.to_owned(),
+        compatibility_checksum: compatibility_record_checksum
+            .filter(|candidate| *candidate != applied_record_checksum)
+            .map(str::to_owned),
         sequence,
     });
     Ok(ApplyDisposition::Applied)
@@ -1063,7 +1374,6 @@ impl<B: JournalBackend> HostStateJournal<B> {
     fn append_inner(&self, record: HostStateRecord) -> Result<AppendReceipt, JournalError> {
         record.validate_live_admission()?;
         let record_checksum = record_checksum(&record)?;
-        let transaction_id = journal_transaction_id(&record, &record_checksum)?;
         let mut state = self
             .state
             .lock()
@@ -1073,8 +1383,27 @@ impl<B: JournalBackend> HostStateJournal<B> {
             .checked_add(1)
             .ok_or(JournalError::Sequence)?;
         let mut next = state.clone();
-        match apply(&mut next, &record, sequence, &record_checksum)? {
+        match apply(
+            &mut next,
+            &record,
+            sequence,
+            &record_checksum,
+            Some(record_checksum.as_str()),
+        )? {
             ApplyDisposition::Replayed(original) => {
+                let existing = next
+                    .applied_operations
+                    .iter()
+                    .find(|item| item.identity == *record.operation())
+                    .ok_or_else(|| {
+                        JournalError::Invalid(
+                            "replayed operation is missing its durable checksum evidence".into(),
+                        )
+                    })?;
+                let transaction_id = journal_transaction_id(
+                    &record,
+                    &existing.checksum,
+                )?;
                 return Ok(AppendReceipt {
                     sequence: original,
                     disposition: AppendDisposition::Replayed,
@@ -1083,6 +1412,7 @@ impl<B: JournalBackend> HostStateJournal<B> {
             }
             ApplyDisposition::Applied => {}
         }
+        let transaction_id = journal_transaction_id(&record, &record_checksum)?;
         let bytes = frame(sequence, &record)?;
         let prepared = PreparedAppend {
             transaction_id: transaction_id.clone(),

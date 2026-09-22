@@ -229,7 +229,8 @@ use eliot_kernel_service::{
     KernelActivationPermit, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
     KernelControlResponse, KernelReadyReceipt, KernelService, KernelServiceError,
     KernelServiceState, ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest,
-    ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
+    ProcessExecutionResponse, ProcessObservation, RuntimeLeaseAdmission, RuntimeLeaseReconcile,
+    RuntimeLeaseRenewal, RuntimeLeaseTerminal, StoreBootstrapHandoff,
 };
 /// P-07 Doctor wire seam for the front-door dispatch/driver arms (T6-D2 Slice B).
 ///
@@ -345,7 +346,8 @@ pub use eliot_runtime_contracts::{
     SupervisionSealedKeyReference, SupervisionTrustAnchor,
 };
 use eliot_runtime_contracts::{
-    HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState, SupervisionGenerationBinding,
+    HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState, RuntimeLease,
+    SupervisionGenerationBinding,
 };
 use eliot_store_api::StoreHealth;
 #[cfg(test)]

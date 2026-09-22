@@ -15,7 +15,8 @@ use eliot_protocol::{
     HostRequestEnvelope, MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
 };
 use eliot_runtime_contracts::{
-    HealthVector, ServiceProcessState, SupervisionLeaseIncarnationBinding,
+    HealthVector, LeaseState, RuntimeLease, RuntimeLeaseObligation, ServiceProcessState,
+    SupervisionLeaseIncarnationBinding,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -63,7 +64,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 5;
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 6;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
@@ -1336,6 +1337,61 @@ impl KernelControlRequest {
         if let KernelControlCommand::ReconcileRebindStore(query) = &self.command {
             query.validate()?;
         }
+        if let KernelControlCommand::AcquireRuntimeLease(admission) = &self.command {
+            admission.validate()?;
+            if admission.state_fence.resource_generation != self.generation
+                || !admission
+                    .state_fence
+                    .authority_epoch
+                    .is_same_authority(&self.candidate.kernel_epoch)
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "runtime_lease_admission.fence",
+                });
+            }
+        }
+        if let KernelControlCommand::RenewRuntimeLease(renewal) = &self.command {
+            renewal.validate()?;
+            if renewal.state_fence.resource_generation != self.generation
+                || !renewal
+                    .state_fence
+                    .authority_epoch
+                    .is_same_authority(&self.candidate.kernel_epoch)
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "runtime_lease_renewal.fence",
+                });
+            }
+        }
+        if let KernelControlCommand::RevokeRuntimeLease(terminal)
+        | KernelControlCommand::ExpireRuntimeLease(terminal)
+        | KernelControlCommand::CloseRuntimeLease(terminal) = &self.command
+        {
+            terminal.validate()?;
+            if terminal.state_fence.resource_generation != self.generation
+                || !terminal
+                    .state_fence
+                    .authority_epoch
+                    .is_same_authority(&self.candidate.kernel_epoch)
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "runtime_lease_terminal.fence",
+                });
+            }
+        }
+        if let KernelControlCommand::ReconcileRuntimeLease(reconcile) = &self.command {
+            reconcile.validate()?;
+            if reconcile.state_fence.resource_generation != self.generation
+                || !reconcile
+                    .state_fence
+                    .authority_epoch
+                    .is_same_authority(&self.candidate.kernel_epoch)
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "runtime_lease_reconcile.fence",
+                });
+            }
+        }
         if let KernelControlCommand::Activate(permit) = &self.command {
             permit.validate(&self.candidate, self.generation)?;
         }
@@ -1410,6 +1466,10 @@ pub struct KernelControlResponse {
     /// signing authority; Host must compare it with the manifest-selected ORS
     /// head before publishing its signed artifact to Watchdog.
     pub supervision_lease: Option<SupervisionLeaseSnapshot>,
+    /// Exact current RuntimeLease acquired and read back by the Kernel owner.
+    /// Host may use its identity only after validating this response and the
+    /// matching readiness/scope fence.
+    pub runtime_lease: Option<RuntimeLease>,
     /// Stable rejection detail, when the command was not accepted.
     pub error: Option<String>,
     /// Digest over all fields except this digest.
@@ -1431,6 +1491,7 @@ impl KernelControlResponse {
             activation_receipt: &'a Option<KernelActivationReceipt>,
             store_rebind_receipt: &'a Option<StoreRebindReceipt>,
             supervision_lease: &'a Option<SupervisionLeaseSnapshot>,
+            runtime_lease: &'a Option<RuntimeLease>,
             error: &'a Option<String>,
         }
         serde_json::to_vec(&Unsigned {
@@ -1444,6 +1505,7 @@ impl KernelControlResponse {
             activation_receipt: &self.activation_receipt,
             store_rebind_receipt: &self.store_rebind_receipt,
             supervision_lease: &self.supervision_lease,
+            runtime_lease: &self.runtime_lease,
             error: &self.error,
         })
         .map_err(|_| KernelServiceError::InvalidField {
@@ -1499,6 +1561,14 @@ impl KernelControlResponse {
                 field: "control.runtime_health",
                 reason: "must accompany exactly one Kernel-authored ready receipt",
             });
+        }
+        if let Some(runtime_lease) = &self.runtime_lease {
+            runtime_lease
+                .validate()
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "control.runtime_lease",
+                    reason: "must be an exact validated Kernel-owned lease",
+                })?;
         }
         if let (Some(receipt), Some(runtime_health)) = (&self.receipt, &self.runtime_health) {
             runtime_health
@@ -2610,6 +2680,80 @@ impl HostKernelCandidateBinding {
     }
 }
 
+/// Builds the deterministic RuntimeLease identity for one exact Kernel
+/// candidate/readiness contour. The returned value is an expected binding,
+/// not caller authority; Kernel acquires it in ORS and reads the committed row
+/// back before exposing it on the control response, while Host compares the
+/// readback with this same independently recomputed value.
+pub fn expected_runtime_lease(
+    candidate: &HostKernelCandidateBinding,
+    generation: ResourceGeneration,
+    admission: &RuntimeLeaseAdmission,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+    renew_before_ms: u64,
+) -> Result<RuntimeLease, KernelServiceError> {
+    let candidate_digest = candidate.compute_digest()?;
+    let material = serde_json::to_vec(&(
+        "eliot.kernel.runtime-lease:v2",
+        candidate_digest,
+        candidate.installation_id.as_str(),
+        candidate.host_epoch.clone(),
+        candidate.kernel_epoch.clone(),
+        candidate.activation_id.as_str(),
+        generation,
+        admission,
+    ))
+    .map_err(|_| KernelServiceError::InvalidField {
+        field: "control.runtime_lease",
+        reason: "cannot canonicalize runtime lease binding",
+    })?;
+    let digest = sha256_hex(&material);
+    let lease = RuntimeLease {
+        lease_id: format!("eliot-runtime-lease:v1:{digest}"),
+        scope_ref: format!("eliot-runtime-scope:v1:{digest}"),
+        authority_epoch: candidate.kernel_epoch.clone(),
+        state_fence: StateFence::new(candidate.kernel_epoch.clone(), generation),
+        state: LeaseState::Active,
+        revision: 1,
+        obligation: RuntimeLeaseObligation {
+            holder: admission.holder.as_str().to_owned(),
+            reason: admission.reason.as_str().to_owned(),
+            required_runtime_branches: admission
+                .required_runtime_branches
+                .iter()
+                .map(|value| value.as_str().to_owned())
+                .collect(),
+            required_capabilities: admission
+                .required_capabilities
+                .iter()
+                .map(|value| value.as_str().to_owned())
+                .collect(),
+            obligation_refs: admission
+                .obligation_refs
+                .iter()
+                .map(|value| value.as_str().to_owned())
+                .collect(),
+            issued_at_ms,
+            expires_at_ms,
+            renew_before_ms,
+            renewal_evidence: admission
+                .evidence_refs
+                .iter()
+                .map(|value| value.as_str().to_owned())
+                .collect(),
+            terminal_disposition: None,
+        },
+    };
+    lease
+        .validate()
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "control.runtime_lease",
+            reason: "constructed obligation is invalid",
+        })?;
+    Ok(lease)
+}
+
 /// Durable one-use permit for one exact candidate activation.
 ///
 /// The nonce is a canonical typed 256-bit value.  The remaining fields bind
@@ -3016,6 +3160,163 @@ impl HostStartupEvidence {
     }
 }
 
+/// Authenticated demand context from Host to the Kernel RuntimeLease owner.
+/// The caller supplies the obligation identity and evidence references; the
+/// Kernel chooses the lease times, revision, and durable ORS identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLeaseAdmission {
+    pub holder: PlatformHandle,
+    pub reason: PlatformHandle,
+    pub required_runtime_branches: Vec<PlatformHandle>,
+    pub required_capabilities: Vec<PlatformHandle>,
+    pub obligation_refs: Vec<PlatformHandle>,
+    pub evidence_refs: Vec<PlatformHandle>,
+    pub state_fence: StateFence,
+}
+
+impl RuntimeLeaseAdmission {
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        for (value, field) in [
+            (&self.holder, "runtime_lease_admission.holder"),
+            (&self.reason, "runtime_lease_admission.reason"),
+        ] {
+            handle(value, field)?;
+        }
+        for value in &self.required_runtime_branches {
+            handle(value, "runtime_lease_admission.required_runtime_branches")?;
+        }
+        if self.required_runtime_branches.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "runtime_lease_admission.required_runtime_branches",
+                reason: "must contain at least one branch",
+            });
+        }
+        for value in &self.required_capabilities {
+            handle(value, "runtime_lease_admission.required_capabilities")?;
+        }
+        for value in &self.obligation_refs {
+            handle(value, "runtime_lease_admission.obligation_refs")?;
+        }
+        if self.obligation_refs.is_empty() || self.evidence_refs.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "runtime_lease_admission.obligation_refs_or_evidence_refs",
+                reason: "an authenticated obligation and evidence are required",
+            });
+        }
+        for value in &self.evidence_refs {
+            handle(value, "runtime_lease_admission.evidence_refs")?;
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "runtime_lease_admission.state_fence",
+                reason: "must be a valid non-zero state fence",
+            })
+    }
+}
+
+/// Fresh observable progress or an explicitly admitted wait that may renew a
+/// current RuntimeLease revision. Process liveness alone cannot populate this.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLeaseRenewal {
+    pub lease_id: String,
+    pub expected_revision: u64,
+    pub state_fence: StateFence,
+    pub evidence_refs: Vec<PlatformHandle>,
+    pub admitted_wait: bool,
+}
+
+impl RuntimeLeaseRenewal {
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        validate_text(&self.lease_id, "runtime_lease_renewal.lease_id")?;
+        if self.expected_revision == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "runtime_lease_renewal.expected_revision",
+                reason: "must be non-zero",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "runtime_lease_renewal.state_fence",
+                reason: "must be valid",
+            })?;
+        for value in &self.evidence_refs {
+            handle(value, "runtime_lease_renewal.evidence_refs")?;
+        }
+        if self.evidence_refs.is_empty() && !self.admitted_wait {
+            return Err(KernelServiceError::InvalidField {
+                field: "runtime_lease_renewal.evidence_refs",
+                reason: "renewal requires observable evidence or an admitted wait",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Exact terminal RuntimeLease transition, guarded by the current ORS
+/// revision and owner state fence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLeaseTerminal {
+    pub lease_id: String,
+    pub expected_revision: u64,
+    pub state_fence: StateFence,
+    pub disposition: PlatformHandle,
+    pub evidence_refs: Vec<PlatformHandle>,
+}
+
+impl RuntimeLeaseTerminal {
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        validate_text(&self.lease_id, "runtime_lease_terminal.lease_id")?;
+        if self.expected_revision == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "runtime_lease_terminal.expected_revision",
+                reason: "must be non-zero",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "runtime_lease_terminal.state_fence",
+                reason: "must be valid",
+            })?;
+        handle(&self.disposition, "runtime_lease_terminal.disposition")?;
+        if self.evidence_refs.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "runtime_lease_terminal.evidence_refs",
+                reason: "terminal transition requires owner evidence",
+            });
+        }
+        for value in &self.evidence_refs {
+            handle(value, "runtime_lease_terminal.evidence_refs")?;
+        }
+        Ok(())
+    }
+}
+
+/// Exact lease reconciliation query. It never creates a new lease.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLeaseReconcile {
+    pub lease_id: String,
+    pub state_fence: StateFence,
+}
+
+impl RuntimeLeaseReconcile {
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        validate_text(&self.lease_id, "runtime_lease_reconcile.lease_id")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "runtime_lease_reconcile.state_fence",
+                reason: "must be valid",
+            })
+    }
+}
+
 /// Control messages accepted by the Kernel service boundary.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -3047,6 +3348,19 @@ pub enum KernelControlCommand {
     /// Ask Kernel to prove readiness from live observations and self-author a
     /// receipt.  No caller-shaped receipt is accepted on this wire.
     ProbeReady,
+    /// Issue one obligation-bound RuntimeLease through the Kernel ORS owner.
+    AcquireRuntimeLease(RuntimeLeaseAdmission),
+    /// Renew one current RuntimeLease only with fresh progress or an admitted
+    /// wait and an exact expected ORS revision.
+    RenewRuntimeLease(RuntimeLeaseRenewal),
+    /// Revoke one current RuntimeLease through the Kernel owner.
+    RevokeRuntimeLease(RuntimeLeaseTerminal),
+    /// Mark one expired RuntimeLease terminal after owner reconciliation.
+    ExpireRuntimeLease(RuntimeLeaseTerminal),
+    /// Close one reconciled RuntimeLease through the Kernel owner.
+    CloseRuntimeLease(RuntimeLeaseTerminal),
+    /// Read or reconcile one exact lease without issuing a replacement.
+    ReconcileRuntimeLease(RuntimeLeaseReconcile),
     /// Close normal admission while retaining recovery control.
     Degrade(PlatformHandle),
     /// Drain normal work before stopping.
