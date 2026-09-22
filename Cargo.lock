@@ -587,7 +587,6 @@ dependencies = [
  "eliot-installation",
  "eliot-kernel-service",
  "eliot-live-canary",
- "eliot-notify",
  "eliot-ors",
  "eliot-platform-windows",
  "eliot-protocol",
