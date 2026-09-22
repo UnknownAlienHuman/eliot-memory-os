@@ -12,7 +12,8 @@ eliot-budget.workspace = true
 eliot-canonical.workspace = true
 eliot-change-monitor.workspace = true
 eliot-config.workspace = true
-eliot-context-candidates = { path = "../../smart/eliot-context-candidates", version = "0.1.0" }
+<eliot-context-candidates = { path = "../../smart/eliot-context-candidates", version = "0.1.0" }
+eliot-context-contracts = { path = "../../smart/eliot-context-contracts", version = "0.1.0" }
 eliot-coordination.workspace = true
 eliot-contracts.workspace = true
 eliot-cue-contracts = { path = "../../smart/eliot-cue-contracts", version = "0.1.0" }

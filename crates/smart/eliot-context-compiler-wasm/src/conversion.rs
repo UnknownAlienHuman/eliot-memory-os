@@ -390,6 +390,12 @@ pub fn handle_with_ledger(request: &GuestRequest, ledger: &CallLedger) -> GuestR
     if let Err(error) = check_envelope(request) {
         return respond(None, Some(error), 0);
     }
+    // Learning bypass closure (I12.24, #1869): marked atoms require covering
+    // owner-minted tickets bound to this compilation. Refusal precedes the
+    // native gate, so an unverified mark can never reach admission here.
+    if let Err(error) = crate::guest_gate::check_guest_tickets(&request.input) {
+        return respond(None, Some(GuestError::from(&error)), 0);
+    }
     let before = ledger.calls();
     ledger.record_call();
     match admit_context(&request.input) {

@@ -37,7 +37,7 @@ pub use admission_input::{
 };
 pub use atom::{
     AdmissionDisposition, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,
-    CapacityLimits, ContextCandidate, ContextRecipe, LossPolicy, MeasurementRef, PrivacyClass,
+    CapacityLimits, ContextCandidate, ContextRecipe, LearningProvenance, LossPolicy, MeasurementRef, PrivacyClass,
     ProviderDisposition, ProviderRoleDenominator, RepresentationKind, RoleLossRule,
 };
 pub use canonical_projections::{
