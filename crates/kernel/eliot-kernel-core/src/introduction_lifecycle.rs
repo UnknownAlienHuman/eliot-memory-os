@@ -32,7 +32,8 @@ use crate::grant_activation_port::IntroductionActivationIntent;
 /// semantic default, resolves no supporting grant, and invents no facet,
 /// holder, or revision. Without this material the thin introduction path
 /// stays fail-closed.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntroductionHydration {
     /// Complete semantic activation intent from the canonical Governor owner.
     pub intent: IntroductionActivationIntent,

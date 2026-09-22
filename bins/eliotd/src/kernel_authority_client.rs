@@ -42,6 +42,11 @@ const ACTIVATE_GRANT_OPERATION: &str = "activate_grant";
 const REVOKE_GRANT_OPERATION: &str = "revoke_grant";
 const ACTIVATE_INTRODUCTION_OPERATION: &str = "activate_introduction";
 const REVOKE_INTRODUCTION_OPERATION: &str = "revoke_introduction";
+/// Owner-bundle publish route: the daemon serves the canonical Governor
+/// closure restore for the Kernel-side owner bind. Served by the Kernel
+/// front-door owner route; until it lands the Kernel rejects the operation
+/// and publishing fails closed through the typed mapping below.
+const PUBLISH_OWNER_BUNDLE_OPERATION: &str = "publish_owner_bundle";
 
 const ACTIVATION_RECEIPT_KIND: &str = "authority_activation_receipt";
 const REVOCATION_RECEIPT_KIND: &str = "authority_revocation_receipt";
@@ -72,6 +77,48 @@ impl KernelAuthorityClient {
 
     fn active_fence(&self) -> StateFence {
         self.kernel.snapshot().state_fence()
+    }
+
+    /// Publishes one canonical Governor closure restore toward the Kernel
+    /// owner route and returns the Kernel-bound revision from the
+    /// acknowledgement.
+    ///
+    /// The bundle travels the existing daemon→Kernel transport as one JSON
+    /// operation; the Kernel binds it through its composition owner step
+    /// and acknowledges the bound revision. Until the Kernel serves the
+    /// route the call fails closed through the typed transport mapping —
+    /// honest diagnosed degradation, never invented rights.
+    pub(crate) fn publish_owner_bundle(
+        &self,
+        bundle: &eliot_kernel_core::GovernorClosureRestore,
+    ) -> Result<u64, P07PortError> {
+        let payload = serde_json::json!({
+            "bundle": bundle,
+        });
+        let value = self
+            .kernel
+            .request_blocking(PUBLISH_OWNER_BUNDLE_OPERATION, payload)
+            .map_err(|error| match error {
+                KernelPortError::NotAdmitted(reason)
+                    if reason == PRE_ADMISSION_RECEIPT_PENDING =>
+                {
+                    P07PortError::Unavailable
+                }
+                KernelPortError::NotAdmitted(_) => P07PortError::NotAdmitted,
+                KernelPortError::Contract(_) => P07PortError::InvalidBinding,
+                // An unproven publish outcome is retryable: rebinding the
+                // same bundle is idempotent at the Kernel owner step (same
+                // revision, same watermark, same admitted bytes), so no
+                // reconciliation identity is lost by reporting unavailable.
+                KernelPortError::Unknown(_) => P07PortError::Unavailable,
+            })?;
+        let value = kind_value(&value, "owner_bundle_receipt")
+            .map_err(|_| P07PortError::InvalidBinding)?;
+        value
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .ok_or(P07PortError::InvalidBinding)
     }
 }
 

@@ -43,6 +43,7 @@ use crate::grant_activation_port::{
     GrantClosureEnumeration, GrantClosureMember, GrantClosureSurvivor, RootGrantHydration,
     RootGrantHydrationSource,
 };
+use crate::introduction_lifecycle::IntroductionHydration;
 
 /// Governor-admitted closure material used to build (or refresh) a
 /// [`GovernorClosureSource`].
@@ -59,9 +60,12 @@ use crate::grant_activation_port::{
 ///   identity on restore;
 /// - `roots` are the complete root hydrations for single-root requests the
 ///   service resolved, keyed by grant identity;
+/// - `introductions` are the complete introduction hydrations the service
+///   resolved, keyed by introduction identity on restore;
 /// - `preserved` are the owner-declared alternate-path survivors keyed by
 ///   closure target grant identity.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GovernorClosureRestore {
     /// Durable grant-graph snapshot the closure is enumerated from.
     pub graph_snapshot: GrantGraphRecoverySnapshot,
@@ -75,6 +79,11 @@ pub struct GovernorClosureRestore {
     /// Complete root hydrations for single-root requests the service
     /// resolved.
     pub roots: Vec<RootGrantHydration>,
+    /// Complete introduction hydrations the service resolved for admitted
+    /// introductions. The introduction-hydration owner serves thin
+    /// introduction activation from this material; absent material stays a
+    /// typed refusal, never a fabricated introduction.
+    pub introductions: Vec<IntroductionHydration>,
     /// Owner-declared alternate-path survivors keyed by closure target
     /// grant identity.
     pub preserved: Vec<(String, Vec<GrantClosureSurvivor>)>,
@@ -86,6 +95,7 @@ struct AdmittedClosureState {
     graph: GrantGraph,
     members: BTreeMap<String, GrantClosureMember>,
     roots: BTreeMap<String, RootGrantHydration>,
+    introductions: BTreeMap<String, IntroductionHydration>,
     preserved: BTreeMap<String, Vec<GrantClosureSurvivor>>,
 }
 
@@ -150,10 +160,10 @@ impl GovernorClosureSource {
     /// Returns the distinct lineage roots admitted in the current restore, in
     /// sorted order.
     ///
-    /// Roots are collected from the admitted member and root intents the
-    /// Governor service resolved; the graph itself is never re-derived here.
-    /// The bootstrap advances the durable per-root revision watermark for
-    /// exactly these roots.
+    /// Roots are collected from the admitted member, root, and introduction
+    /// intents the Governor service resolved; the graph itself is never
+    /// re-derived here. The bootstrap advances the durable per-root revision
+    /// watermark for exactly these roots.
     #[must_use]
     pub fn authority_roots(&self) -> Vec<String> {
         let state = self.lock_state();
@@ -163,6 +173,9 @@ impl GovernorClosureSource {
         }
         for root in state.roots.values() {
             roots.insert(root.intent.authority_root_ref.clone());
+        }
+        for hydration in state.introductions.values() {
+            roots.insert(hydration.intent.authority_root_ref.clone());
         }
         roots.into_iter().collect()
     }
@@ -209,10 +222,31 @@ impl GovernorClosureSource {
                 });
             }
         }
+        let mut introductions = BTreeMap::new();
+        for hydration in restore.introductions {
+            hydration.validate_complete().map_err(|_| {
+                KernelError::RecoveryUnavailable(
+                    "admitted introduction hydration failed validation".to_owned(),
+                )
+            })?;
+            if introductions
+                .insert(
+                    hydration.intent.introduction_id.clone(),
+                    hydration,
+                )
+                .is_some()
+            {
+                return Err(KernelError::InvalidField {
+                    field: "restore.introductions",
+                    reason: "duplicate admitted introduction identity",
+                });
+            }
+        }
         Ok(AdmittedClosureState {
             graph: outcome.graph,
             members,
             roots,
+            introductions,
             preserved,
         })
     }
@@ -264,11 +298,44 @@ impl RootGrantHydrationSource for GovernorClosureSource {
             })
     }
 
+    fn hydrate_introduction(
+        &self,
+        request: &eliot_authority::IntroductionActivationRequest,
+    ) -> Result<IntroductionHydration, KernelError> {
+        validate_id(
+            request.introduction_id.as_str(),
+            "introduction_activation.introduction_id",
+        )?;
+        let state = self.lock_state();
+        let hydration = state
+            .introductions
+            .get(request.introduction_id.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                KernelError::RecoveryUnavailable(
+                    "no canonical introduction hydration admitted for the requested introduction"
+                        .to_owned(),
+                )
+            })?;
+        // Exact-identity agreement, mirroring the root hydration gate: the
+        // admitted hydration must name the requested introduction, snapshot,
+        // and binding, or the request does not describe admitted authority.
+        if hydration.intent.introduction_id != request.introduction_id.as_str()
+            || hydration.intent.snapshot_id != request.snapshot_id.as_str()
+            || hydration.intent.binding != request.binding
+        {
+            return Err(KernelError::InvalidField {
+                field: "introduction_activation",
+                reason: "admitted introduction hydration disagrees with the thin request",
+            });
+        }
+        Ok(hydration)
+    }
+
     fn enumerate_grant_closure(
         &self,
         grant_id: &str,
-    ) -> Result<GrantClosureEnumeration, KernelError> {
-        validate_id(grant_id, "grant_id")?;
+    ) -> Result<GrantClosureEnumeration, KernelError> {        validate_id(grant_id, "grant_id")?;
         let target = GrantId::new(grant_id).map_err(|_| KernelError::InvalidField {
             field: "grant_id",
             reason: "grant identity must validate",
@@ -460,6 +527,7 @@ mod tests {
             }),
             members: vec![member],
             roots: vec![hydration],
+            introductions: Vec::new(),
             preserved: Vec::new(),
         })
     }

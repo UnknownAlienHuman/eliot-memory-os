@@ -55,6 +55,7 @@ mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+mod owner_bundle_feed;
 pub mod notification_board_attach;
 mod observation_adapters;
 mod process_origin;
@@ -152,6 +153,9 @@ pub use governor_local_read::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use owner_bundle_feed::{
+    OwnerBundleFeed, build_owner_feed, persist_owner_feed, publish_owner_bundle,
+};
 pub use process_origin::{
     CapabilityEvidenceSource, Generation, OperationDisposition,
     OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant,

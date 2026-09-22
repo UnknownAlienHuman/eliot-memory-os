@@ -98,7 +98,8 @@ use crate::introduction_lifecycle::{IntroductionHydration, introduction_fence_in
 /// The port validates every field before mutation and binds the full payload
 /// into the idempotency digest, so any change under one operation identity is
 /// an identity conflict rather than a second activation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantActivationIntent {
     /// Idempotency identity. Ledger key and receipt-derivation root.
     pub operation_id: String,
@@ -166,7 +167,8 @@ pub struct GrantRevocationIntent {
 /// Complete Governor-owned material needed to activate one authority-root
 /// grant. The hydration source must provide every field; the Kernel supplies
 /// no semantic default and rejects child/delegated lineage in this slice.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RootGrantHydration {
     /// Complete semantic activation intent from the canonical Governor owner.
     pub intent: GrantActivationIntent,
@@ -317,6 +319,23 @@ pub trait RootGrantHydrationSource: Send + Sync {
             "grant-closure enumeration owner is not bound".to_owned(),
         ))
     }
+
+    /// Resolves a thin introduction-activation request to the complete
+    /// canonical introduction hydration.
+    ///
+    /// The Governor introduction-hydration owner serves the admitted intent
+    /// plus its opaque ORS record; the port validates identity, fence, and
+    /// lifecycle agreement before any mutation, mirroring the grant
+    /// hydration gate. The default implementation reports the missing owner
+    /// so callers fail closed without fabricating an introduction.
+    fn hydrate_introduction(
+        &self,
+        _request: &eliot_authority::IntroductionActivationRequest,
+    ) -> Result<IntroductionHydration, KernelError> {
+        Err(KernelError::DependencyUnavailable(
+            "introduction-hydration owner is not bound".to_owned(),
+        ))
+    }
 }
 
 /// Live introduction-activation intent presented to the one P-07 port.
@@ -324,7 +343,8 @@ pub trait RootGrantHydrationSource: Send + Sync {
 /// Every supporting grant must be recorded, active, unexpired, on the same
 /// root and fence, and its recorded ceilings must cover the requested
 /// effect and proof ceiling.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntroductionActivationIntent {
     /// Idempotency identity. Ledger key and receipt-derivation root.
     pub operation_id: String,
@@ -398,7 +418,8 @@ pub struct IntroductionRevocationIntent {
 /// root. Unlike the first durable slice, `intent.parent_grant_id` may name the
 /// delegating parent: the parent must appear earlier in the same enumeration
 /// or already be recorded, active, and on the exact same root and fence.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantClosureMember {
     /// Complete semantic activation intent from the canonical Governor owner.
     pub intent: GrantActivationIntent,
@@ -438,7 +459,8 @@ pub struct GrantClosureEnumeration {
 /// The covering path is Governor semantic evidence recorded verbatim: the
 /// Kernel never evaluates, widens, or re-derives it. It only checks identity
 /// shape and disjointness from the fenced set.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantClosureSurvivor {
     /// Preserved descendant grant identity.
     pub grant_id: String,
@@ -4843,15 +4865,28 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
                 return Err(P07PortError::InvalidBinding);
             }
         }
-        // Missing owners: durable GrantGraph CAS plus the thin-request
-        // hydration source for supporting grants, resource handle, facet
-        // manifest, holder principal/session/scope, graph revision,
-        // issuance/expiry times and receipt obligations. A thin introduction
-        // request carries none of them, and I6.15 forbids this port from
-        // creating lineage, so Slice A fail-closes instead of fabricating a
-        // supporting path, facet or holder. Durability/restart rehydration is
-        // an explicit follow-up residual.
-        Err(P07PortError::Unavailable)
+        // Owner-hydrated durable activation (`#2100`/`#1110`): the Governor
+        // introduction-hydration owner resolves the thin request to the
+        // complete admitted intent plus its opaque ORS record, and the
+        // durable gate validates identity, fence, and lifecycle agreement
+        // before any mutation — mirroring the grant hydration gate with the
+        // hydration's own observation time. Without the owner the request
+        // stays fail-closed: a thin introduction request carries no
+        // supporting grants, facet, holder, or revision, and I6.15 forbids
+        // this port from creating lineage.
+        let Some(boundary) = self.durable_boundary() else {
+            return Err(P07PortError::Unavailable);
+        };
+        let hydration = boundary
+            .hydration
+            .hydrate_introduction(request)
+            .map_err(|error| map_thin_error(&error))?;
+        self.activate_introduction_durable(
+            &hydration,
+            &active_epoch,
+            hydration.observed_at_ms,
+        )
+        .map_err(|error| map_thin_error(&error))
     }
 
     fn revoke_introduction(
