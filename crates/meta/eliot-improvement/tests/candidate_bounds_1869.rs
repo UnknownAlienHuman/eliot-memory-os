@@ -5,7 +5,16 @@
 
 use eliot_improvement::candidate_bounds::{
     AdmitOutcome, ArchiveCause, BoundedBacklog, BoundsError, CandidateBoundPolicy,
-    CrossTaskAdmission, GovernedOverlay, OverlayState, ReusableCandidateRef, retrieve_for_attempt,
+    CrossTaskAdmission, GovernedClosureError, GovernedOverlay, GovernedRetrieval,
+    GovernorOwnerEvidence, OverlayState, ReusableCandidateRef,
+    governed_assemble_campaign_learning_closure, retrieve_for_attempt, retrieve_governed,
+};
+use eliot_improvement::learning_closure::{
+    AdmissionState, AttemptDelta, AttemptOutcomesAndDeltas, AttemptRecord, AttemptStatus,
+    CampaignAndTarget, CausalAttribution, ClosureAssembly, ClosurePolicy, ClosureStatus, DeltaKind,
+    EconomicsRecord, EvidenceSource, HarmRecord, LifecycleStage, OutcomeHarmAndEconomicsEvidence,
+    OutcomeKind, OutcomeRecord, OverlayAndActivationAssessments, OverlayRecord,
+    PriorClosureHistory, StageAssessment,
 };
 use eliot_improvement::{ImprovementCandidate, ImprovementSurface, ReplayPlan};
 use std::collections::BTreeMap;
@@ -237,4 +246,324 @@ fn bound_refuses_until_explicit_archive() {
         ),
         Ok(AdmitOutcome::Admitted { .. })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Round 2: governed consumer path (I12.24 closure assembly as the actual
+// retrieval consumer; Governor refs confirmed against owner evidence).
+// ---------------------------------------------------------------------------
+
+const CAMPAIGN_1869: &str = "campaign-1869-a";
+const TASK_1869: &str = "task-1869-a";
+const OVERLAY_1869: &str = "overlay-1869-live";
+const ATTEMPT_1869: &str = "attempt-1869-1";
+const POLICY_OWNER_1869: &str = "governor-1869-policy-1";
+const OVERLAY_ADMISSION_1869: &str = "admission-1869-live";
+const EXTERNAL_OWNER_1869: &str = "governor-1869";
+const ROLLBACK_OWNER_1869: &str = "rollback-1869";
+
+/// Live Governor-minted evidence for the fixtures: the bound-policy owner,
+/// the closure owners, and the overlay admission are all minted here.
+/// Anything else is forged by construction.
+fn governor_evidence_1869() -> GovernorOwnerEvidence {
+    GovernorOwnerEvidence {
+        authority_binding: "epoch-1869:gen-7".to_string(),
+        minted_authorities: [POLICY_OWNER_1869, EXTERNAL_OWNER_1869, ROLLBACK_OWNER_1869]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        minted_admissions: [OVERLAY_ADMISSION_1869]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+fn backing_overlay_1869(now: OffsetDateTime) -> GovernedOverlay {
+    GovernedOverlay {
+        overlay_id: OVERLAY_1869.to_string(),
+        campaign_id: CAMPAIGN_1869.to_string(),
+        task_id: TASK_1869.to_string(),
+        fence_ref: "fence-1869-a".to_string(),
+        compatible_recipe_ref: "recipe-1869".to_string(),
+        state: OverlayState::LocalAdmitted,
+        admission_ref: Some(OVERLAY_ADMISSION_1869.to_string()),
+        expires_at: Some(now + Duration::hours(1)),
+    }
+}
+
+fn closure_campaign_1869() -> CampaignAndTarget {
+    CampaignAndTarget {
+        campaign_id: CAMPAIGN_1869.to_string(),
+        target_id: "target-1869-a".to_string(),
+        task_id: TASK_1869.to_string(),
+        scope_ref: "scope-1869-a".to_string(),
+        fence_ref: "fence-1869-a".to_string(),
+        objective_ref: "objective-1869-a".to_string(),
+        acceptance_ref: "acceptance-1869-a".to_string(),
+        evaluator_id: "evaluator-1869-a".to_string(),
+        holdout_ref: "holdout-1869-a".to_string(),
+    }
+}
+
+fn closure_policy_1869() -> ClosurePolicy {
+    ClosurePolicy {
+        schema_version: 1,
+        allow_checkpoint: true,
+        max_attempts: 16,
+        max_bytes: 1_000_000,
+        require_independent_verifier: true,
+        external_owner_id: EXTERNAL_OWNER_1869.to_string(),
+        rollback_owner_id: ROLLBACK_OWNER_1869.to_string(),
+        idempotency_key: "idem-1869-a".to_string(),
+        operation_ref: "op-1869-a".to_string(),
+    }
+}
+
+fn closure_attempt_1869() -> AttemptRecord {
+    AttemptRecord {
+        attempt_id: ATTEMPT_1869.to_string(),
+        consequential: true,
+        non_consequential_reason: None,
+        status: AttemptStatus::Available,
+        has_outcome: true,
+        delta: Some(AttemptDelta {
+            delta_id: "delta-1869-1".to_string(),
+            attempt_id: ATTEMPT_1869.to_string(),
+            target_id: "target-1869-a".to_string(),
+            base_state_ref: "state-1869-before".to_string(),
+            stale_base: false,
+            kind: DeltaKind::Changed {
+                before_ref: "state-1869-before".to_string(),
+                after_ref: "state-1869-after".to_string(),
+            },
+        }),
+    }
+}
+
+fn closure_overlays_1869() -> OverlayAndActivationAssessments {
+    OverlayAndActivationAssessments {
+        overlays: vec![OverlayRecord {
+            overlay_id: OVERLAY_1869.to_string(),
+            attempt_id: ATTEMPT_1869.to_string(),
+            base_ref: "base-1869-live".to_string(),
+            parent_ref: "parent-1869-live".to_string(),
+            admission: AdmissionState::Admitted,
+            admission_ref: OVERLAY_ADMISSION_1869.to_string(),
+        }],
+        assessments: vec![
+            closure_stage_1869(LifecycleStage::Delivery, false),
+            closure_stage_1869(LifecycleStage::Use, true),
+            closure_stage_1869(LifecycleStage::Outcome, true),
+        ],
+    }
+}
+
+fn closure_stage_1869(stage: LifecycleStage, use_linked: bool) -> StageAssessment {
+    StageAssessment {
+        attempt_id: ATTEMPT_1869.to_string(),
+        overlay_id: OVERLAY_1869.to_string(),
+        stage,
+        observed: true,
+        evidence_ref: Some(format!("ev-1869-{stage:?}")),
+        use_linked,
+        causally_attributed: false,
+        source: EvidenceSource::IndependentVerifier {
+            verifier_id: "verifier-1869-a".to_string(),
+        },
+    }
+}
+
+fn closure_evidence_1869() -> OutcomeHarmAndEconomicsEvidence {
+    OutcomeHarmAndEconomicsEvidence {
+        outcomes: vec![OutcomeRecord {
+            attempt_id: ATTEMPT_1869.to_string(),
+            metric: "task-success-rate".to_string(),
+            unit: "ratio".to_string(),
+            population: "holdout-1869-a".to_string(),
+            window: "window-1869-a".to_string(),
+            source_id: "source-1869-a".to_string(),
+            evaluator_id: "evaluator-1869-a".to_string(),
+            baseline_ref: "baseline-1869-a".to_string(),
+            control_ref: Some("control-1869-a".to_string()),
+            kind: OutcomeKind::Positive,
+            harm: HarmRecord {
+                harm_observed: false,
+                harm_ref: None,
+            },
+            use_linked: true,
+            causal: CausalAttribution::Attributed {
+                control_ref: "control-1869-a".to_string(),
+            },
+        }],
+        economics: vec![EconomicsRecord {
+            attempt_id: ATTEMPT_1869.to_string(),
+            cost_known: true,
+            cost: 12.5,
+            currency: "USD".to_string(),
+            unit: "attempt".to_string(),
+        }],
+    }
+}
+
+fn assemble_through_consumer(
+    backlog: &BoundedBacklog,
+    governor: &GovernorOwnerEvidence,
+    overlay: &GovernedOverlay,
+    reusable: Option<&ReusableCandidateRef>,
+    now: OffsetDateTime,
+) -> Result<ClosureAssembly, GovernedClosureError> {
+    governed_assemble_campaign_learning_closure(
+        closure_campaign_1869(),
+        AttemptOutcomesAndDeltas {
+            expected_attempt_ids: vec![ATTEMPT_1869.to_string()],
+            attempts: vec![closure_attempt_1869()],
+        },
+        closure_overlays_1869(),
+        closure_evidence_1869(),
+        PriorClosureHistory { prior: Vec::new() },
+        closure_policy_1869(),
+        GovernedRetrieval {
+            requesting_campaign_id: CAMPAIGN_1869,
+            requesting_task_id: TASK_1869,
+            overlay,
+            reusable,
+            draft_delta_present: false,
+            cross_task_admission: None,
+            backlog: Some(backlog),
+            governor,
+            now,
+        },
+    )
+}
+
+#[test]
+fn governed_consumer_closes_with_live_backed_overlay() {
+    let now = OffsetDateTime::now_utc();
+    let governor = governor_evidence_1869();
+    let mut backlog = BoundedBacklog::new(vec![policy(8)]).expect("policy validates");
+    // Bound-policy owner is Governor-minted: governed admission succeeds.
+    let admitted = candidate(&["ev-1869-consumer-a"]);
+    let admitted_id = admitted.candidate_id.clone();
+    assert!(matches!(
+        backlog.admit_governed(
+            admitted,
+            3.0,
+            Some(EXTERNAL_OWNER_1869.to_string()),
+            &governor
+        ),
+        Ok(AdmitOutcome::Admitted { .. })
+    ));
+    let reusable = ReusableCandidateRef {
+        candidate_id: admitted_id,
+        closure_ref: Some("closure-1869-a".to_string()),
+        owner: Some(EXTERNAL_OWNER_1869.to_string()),
+        origin_campaign_id: CAMPAIGN_1869.to_string(),
+    };
+    match assemble_through_consumer(
+        &backlog,
+        &governor,
+        &backing_overlay_1869(now),
+        Some(&reusable),
+        now,
+    ) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
+            assert_eq!(candidate.handoff.external_owner_id, EXTERNAL_OWNER_1869);
+        }
+        other => panic!("governed consumer must close task-local, got {other:?}"),
+    }
+}
+
+#[test]
+fn governed_consumer_refuses_expired_backing() {
+    let now = OffsetDateTime::now_utc();
+    let governor = governor_evidence_1869();
+    let backlog = BoundedBacklog::new(vec![policy(8)]).expect("policy validates");
+    let mut expired = backing_overlay_1869(now);
+    expired.expires_at = Some(now - Duration::minutes(1));
+    let err = assemble_through_consumer(&backlog, &governor, &expired, None, now)
+        .expect_err("expired backing never reaches assembly");
+    assert_eq!(
+        err,
+        GovernedClosureError::Bounds(BoundsError::ExpiredOverlay)
+    );
+}
+
+#[test]
+fn forged_governor_strings_are_refused() {
+    let governor = governor_evidence_1869();
+    let backlog = BoundedBacklog::new(vec![policy(8)]).expect("policy validates");
+    // Well-formed but unminted authority: governed admission refuses.
+    let mut forged_policy = policy(8);
+    forged_policy.governor_authority_ref = "governor-forged".to_string();
+    let mut forged_backlog = BoundedBacklog::new(vec![forged_policy]).expect("shape validates");
+    let err = forged_backlog
+        .admit_governed(
+            candidate(&["ev-1869-forged-a"]),
+            3.0,
+            Some(EXTERNAL_OWNER_1869.to_string()),
+            &governor,
+        )
+        .expect_err("forged authority never admits");
+    assert_eq!(err, BoundsError::GovernorAuthorityUnconfirmed);
+
+    // Well-formed but unminted overlay admission: governed retrieval refuses.
+    let now = OffsetDateTime::now_utc();
+    let mut forged_overlay = backing_overlay_1869(now);
+    forged_overlay.admission_ref = Some("admission-forged".to_string());
+    let err = retrieve_governed(GovernedRetrieval {
+        requesting_campaign_id: CAMPAIGN_1869,
+        requesting_task_id: TASK_1869,
+        overlay: &forged_overlay,
+        reusable: None,
+        draft_delta_present: false,
+        cross_task_admission: None,
+        backlog: Some(&backlog),
+        governor: &governor,
+        now,
+    })
+    .expect_err("forged admission never retrieves");
+    assert_eq!(err, BoundsError::GovernorAdmissionUnconfirmed);
+}
+
+#[test]
+fn archived_reusable_loses_retrieval() {
+    let now = OffsetDateTime::now_utc();
+    let governor = governor_evidence_1869();
+    let mut backlog = BoundedBacklog::new(vec![policy(8)]).expect("policy validates");
+    let admitted = candidate(&["ev-1869-archive-a"]);
+    let admitted_id = admitted.candidate_id.clone();
+    assert!(matches!(
+        backlog.admit(admitted, 2.0, Some(EXTERNAL_OWNER_1869.to_string())),
+        Ok(AdmitOutcome::Admitted { .. })
+    ));
+    let reusable = ReusableCandidateRef {
+        candidate_id: admitted_id.clone(),
+        closure_ref: Some("closure-1869-a".to_string()),
+        owner: Some(EXTERNAL_OWNER_1869.to_string()),
+        origin_campaign_id: CAMPAIGN_1869.to_string(),
+    };
+    let gate = |backlog: &BoundedBacklog| {
+        retrieve_governed(GovernedRetrieval {
+            requesting_campaign_id: CAMPAIGN_1869,
+            requesting_task_id: TASK_1869,
+            overlay: &backing_overlay_1869(now),
+            reusable: Some(&reusable),
+            draft_delta_present: false,
+            cross_task_admission: None,
+            backlog: Some(backlog),
+            governor: &governor,
+            now,
+        })
+    };
+    assert!(gate(&backlog).is_ok());
+    backlog
+        .archive(
+            &admitted_id,
+            ArchiveCause::Stale,
+            "stale after window".to_string(),
+        )
+        .expect("explicit archive");
+    assert_eq!(gate(&backlog), Err(BoundsError::NotBacklogAdmitted));
 }
