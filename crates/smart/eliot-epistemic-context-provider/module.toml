@@ -1,0 +1,67 @@
+schema_version = 4
+module_id = "smart.epistemic.context_provider"
+crate = "eliot-epistemic-context-provider"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 50
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.epistemic.context_provider"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "The admitted Current Epistemic Position reaches context candidates as a typed provider contribution without a parallel contribution schema."
+causal_property = "epistemic Context provider contribution"
+old_failure_or_missing_capability = "Context candidates either link the epistemic resolver algorithm or invent a provider contribution type instead of consuming the admitted position contract (CC-PROVIDER-CONTRIBUTION-SCHEMA)."
+discriminator = "the contribution echoes the admitted position digest and claim exactly, carries the shared ProviderId and fence, rejects superseded positions, and never resolves, acquires, ranks, stores, or applies"
+primary_responsibility = "Contribute one EpistemicContextContribution read from an admitted CurrentEpistemicPosition under one scope and fence."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["admitted CurrentEpistemicPosition by reference (frozen contract)"]
+outputs = ["EpistemicContextContribution"]
+depends_on = ["eliot-epistemic-contracts", "eliot-context-contracts", "eliot-contracts", "eliot-receipts"]
+providers = ["eliot-epistemic position owner (admission supply only)"]
+consumers = ["eliot-context-candidates"]
+non_goals = ["epistemic resolution", "second admission pass", "owner-neutral ProviderContribution schema", "support/truth promotion", "fence compatibility inference"]
+invariants = ["position digest and claim echoed exactly, never reinterpreted", "superseded positions rejected, never contributed", "fence is carried, not gated: the consumer edge gates compatibility", "no resolver, acquisition, ranking, storage, or application behavior"]
+failure_behavior = "Reject superseded positions, version drift, malformed digests, and invalid scope/fence explicitly."
+proof_surface = ["digest/claim echo", "superseded rejection", "version drift", "wire roundtrip"]
+proof_ceiling = "PACKAGE_PROOF_ONLY"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+disposition = "frozen upstream surface: CurrentEpistemicPosition, AdmittedKind, Currentness, ProviderId, StateFence bindings; owner-neutral ProviderContribution recorded NOT_FROZEN"
+
+[agent_task]
+objective = "Contribute the admitted epistemic position to context candidates as a typed read-only envelope."
+write_scope = ["crates/smart/eliot-epistemic-context-provider/**"]
+deliverables = ["contribution contract", "read-only contribution constructor", "consumer compile fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification", "provider-specific duplicate contribution type"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, resolution behavior, hidden state, or a new contribution schema."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main rebase and integration-owner review"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
