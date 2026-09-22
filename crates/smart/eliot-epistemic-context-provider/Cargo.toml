@@ -1,0 +1,34 @@
+[package]
+name = "eliot-epistemic-context-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Epistemic Context provider contribution over the admitted Current Epistemic Position (#223)"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "IMPLEMENTED_PROTOTYPE"
+workspace_admission = "admitted to workspace membership for integration candidate; package/edge proof pending"
+functional_cell = "smart.epistemic.context_provider"
+freeze_ref = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+source_layer = "C1"
+agent_order = 50
+
+[dependencies]
+eliot-context-contracts = { path = "../eliot-context-contracts", version = "0.1.0" }
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts", version = "0.1.0" }
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+eliot-contracts.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
