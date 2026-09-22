@@ -7,7 +7,7 @@
   "pe_machine": "8664",
   "sha256": "13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1",
   "patched_candidate": {
-    "status": "release_locked_not_staged",
+    "status": "project_local_artifact_required",
     "name": "surreal.exe",
     "version": "3.2.0",
     "architecture": "windows-x64",
@@ -18,9 +18,30 @@
     "source_tag": "v3.2.0",
     "source_commit": "5bebfcdcfa9166131618f768dfe0c0e6fb486f4f",
     "build_target": "x86_64-pc-windows-msvc",
-    "build_features": ["default", "storage-tikv", "jwks", "ml"],
+    "build_features": [
+      "default",
+      "storage-tikv",
+      "jwks",
+      "ml"
+    ],
     "build_command": "cargo build --no-default-features --features default --features storage-tikv,jwks,ml --locked --target x86_64-pc-windows-msvc",
-    "provisioning": "project_local_lock_only",
-    "installation_approval": "not-issued"
+    "provisioning": "project_local_provisioner",
+    "installation_approval": "not-issued",
+    "artifact_path": ".eliot/dependency-policy/surrealdb/v3.2.0/surreal-v3.2.0.windows-amd64.exe",
+    "artifact_size": 114430464,
+    "source_archive_path": ".eliot/dependency-policy/surrealdb/v3.2.0/surrealdb-v3.2.0.tar.gz",
+    "source_archive_sha256": "669f077b43c8a2910a2e0091d2cf2f4082e3279d4f6d2d3fbba0e5e30a0f15f6",
+    "source_paths": [
+      "surrealdb/server/src/ntw/api.rs",
+      "surrealdb/core/src/idx/ft/analyzer/mapper.rs",
+      "surrealdb/core/src/exec/planner/select/mod.rs",
+      "surrealdb/core/src/iam/jwks.rs",
+      "surrealdb/core/src/doc/field.rs",
+      "surrealdb/core/src/syn/parser/expression.rs"
+    ],
+    "source_tag_ref_path": ".eliot/dependency-policy/surrealdb/v3.2.0/github-tag-v3.2.0.json",
+    "release_metadata_path": ".eliot/dependency-policy/surrealdb/v3.2.0/github-release-v3.2.0.json",
+    "advisory_query_path": ".eliot/dependency-policy/surrealdb/v3.2.0/osv-query.json",
+    "advisory_response_path": ".eliot/dependency-policy/surrealdb/v3.2.0/osv-response.json"
   }
 }

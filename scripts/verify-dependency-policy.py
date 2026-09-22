@@ -17,12 +17,15 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tomllib
 
 
@@ -514,7 +517,115 @@ def _validated_node_input(
     return resolved_path, relative
 
 
-def _node_input_paths(root: Path, node_policy: dict | None) -> list[str]:
+def _open_node_read_handle(path: Path) -> int:
+    """Open one Node input without following its final reparse component."""
+
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80000000,  # GENERIC_READ
+            0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
+            None,
+            3,  # OPEN_EXISTING
+            0x00000080 | 0x00200000,  # FILE_ATTRIBUTE_NORMAL | OPEN_REPARSE_POINT
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            error = ctypes.get_last_error()
+            raise OSError(error, f"CreateFileW failed for {path}")
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags)
+
+
+def _node_stat_identity(stat_result: os.stat_result) -> tuple[object, ...]:
+    return (
+        getattr(stat_result, "st_dev", None),
+        getattr(stat_result, "st_ino", None),
+        getattr(stat_result, "st_size", None),
+        getattr(stat_result, "st_mtime_ns", None),
+    )
+
+
+def _read_validated_node_bytes(
+    root: Path,
+    relative_path: str,
+    label: str,
+    findings: list[Finding] | None = None,
+) -> bytes | None:
+    """Read the bytes from one validated Node input and close its path race.
+
+    The path is rejected for reparse components before opening, opened with a
+    no-follow final component, read through that handle, then revalidated and
+    compared with the handle identity after the read. A path string is never
+    treated as the receipt's byte authority.
+    """
+
+    path, relative = _validated_node_input(root, relative_path, label, findings)
+    if path is None or relative is None:
+        return None
+
+    fd: int | None = None
+    try:
+        fd = _open_node_read_handle(path)
+        before = os.fstat(fd)
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(fd)
+    except (OSError, ValueError) as exc:
+        if findings is not None:
+            findings.append(Finding(NODE_ECOSYSTEM_FINDING, relative, 0, f"{label} cannot be read through a safe handle: {exc}"))
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    if _node_stat_identity(before) != _node_stat_identity(after):
+        if findings is not None:
+            findings.append(Finding(NODE_ECOSYSTEM_FINDING, relative, 0, f"{label} changed while it was being read"))
+        return None
+
+    revalidated, revalidated_relative = _validated_node_input(root, relative_path, label, findings)
+    if revalidated is None or revalidated_relative != relative:
+        if findings is not None:
+            findings.append(Finding(NODE_ECOSYSTEM_FINDING, relative, 0, f"{label} failed repository revalidation after read"))
+        return None
+    try:
+        path_stat = revalidated.stat()
+    except OSError as exc:
+        if findings is not None:
+            findings.append(Finding(NODE_ECOSYSTEM_FINDING, relative, 0, f"{label} cannot be re-stat'ed after read: {exc}"))
+        return None
+    if _node_stat_identity(after) != _node_stat_identity(path_stat):
+        if findings is not None:
+            findings.append(Finding(NODE_ECOSYSTEM_FINDING, relative, 0, f"{label} path identity changed during read/hash"))
+        return None
+    return b"".join(chunks)
+
+
+def _node_input_paths(
+    root: Path, node_policy: dict | None, findings: list[Finding] | None = None
+) -> list[str]:
     policy = node_policy if isinstance(node_policy, dict) else {}
     paths: list[str] = []
 
@@ -524,14 +635,19 @@ def _node_input_paths(root: Path, node_policy: dict | None) -> list[str]:
     if contract_relative:
         paths.append(contract_relative)
 
-    if contract_path is not None:
+    if contract_path is not None and contract_relative:
+        contract_bytes = _read_validated_node_bytes(
+            root, contract_relative, "Node contract", findings
+        )
         try:
-            contract = json.loads(contract_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            contract = json.loads(contract_bytes.decode("utf-8")) if contract_bytes is not None else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
             contract = {}
         surface = contract.get("surface") if isinstance(contract, dict) else None
         if isinstance(surface, str) and surface.strip():
-            _, surface_relative = _validated_node_input(root, surface, "Node contract surface")
+            _, surface_relative = _validated_node_input(
+                root, surface, "Node contract surface", findings
+            )
             if surface_relative:
                 paths.append(surface_relative)
 
@@ -541,10 +657,13 @@ def _node_input_paths(root: Path, node_policy: dict | None) -> list[str]:
     if manifest_relative:
         paths.append(manifest_relative)
 
-    if manifest_path is not None:
+    if manifest_path is not None and manifest_relative:
+        manifest_bytes = _read_validated_node_bytes(
+            root, manifest_relative, "Node manifest", findings
+        )
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            manifest = json.loads(manifest_bytes.decode("utf-8")) if manifest_bytes is not None else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
             manifest = {}
         instructions = manifest.get("instructions", []) if isinstance(manifest, dict) else []
         if isinstance(instructions, list):
@@ -581,17 +700,22 @@ def check_node_ecosystem(root: Path, node_policy: dict | None = None) -> list[Fi
         return findings
 
     contract: dict = {}
-    if not contract_path.is_file():
+    contract_bytes = (
+        _read_validated_node_bytes(root, contract_relative, "Node contract", findings)
+        if contract_relative
+        else None
+    )
+    if contract_bytes is None:
         findings.append(
             Finding(NODE_ECOSYSTEM_FINDING, contract_relative or "config/dependency-policy.toml", 0, "configured Node contract is missing")
         )
     else:
         try:
-            value = json.loads(contract_path.read_text(encoding="utf-8"))
+            value = json.loads(contract_bytes.decode("utf-8"))
             if not isinstance(value, dict):
                 raise ValueError("top-level value must be an object")
             contract = value
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             findings.append(
                 Finding(
                     NODE_ECOSYSTEM_FINDING,
@@ -605,11 +729,25 @@ def check_node_ecosystem(root: Path, node_policy: dict | None = None) -> list[Fi
                 if field not in contract:
                     findings.append(Finding(NODE_ECOSYSTEM_FINDING, "config/dependency-policy.toml", 1, f"Node contract missing '{field}'"))
             surface = contract.get("surface")
-            if isinstance(surface, str) and surface.strip():
+            if not isinstance(surface, str) or not surface.strip():
+                findings.append(
+                    Finding(
+                        NODE_ECOSYSTEM_FINDING,
+                        contract_relative or "config/dependency-policy.toml",
+                        1,
+                        "Node contract surface must be a non-empty string",
+                    )
+                )
+            else:
                 surface_path, surface_relative = _validated_node_input(
                     root, surface, "Node contract surface", findings
                 )
-                if surface_path is not None and not surface_path.is_file():
+                surface_bytes = (
+                    _read_validated_node_bytes(root, surface_relative, "Node contract surface", findings)
+                    if surface_relative
+                    else None
+                )
+                if surface_path is not None and surface_bytes is None:
                     findings.append(
                         Finding(
                             NODE_ECOSYSTEM_FINDING,
@@ -619,16 +757,21 @@ def check_node_ecosystem(root: Path, node_policy: dict | None = None) -> list[Fi
                         )
                     )
 
-    if not manifest_path.is_file():
+    manifest_bytes = (
+        _read_validated_node_bytes(root, manifest_relative, "Node manifest", findings)
+        if manifest_relative
+        else None
+    )
+    if manifest_bytes is None:
         findings.append(
             Finding(NODE_ECOSYSTEM_FINDING, manifest_relative or "config/dependency-policy.toml", 0, "configured Node manifest is missing")
         )
     else:
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
             if not isinstance(manifest, dict):
                 raise ValueError("top-level value must be an object")
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             findings.append(
                 Finding(
                     NODE_ECOSYSTEM_FINDING,
@@ -654,7 +797,17 @@ def check_node_ecosystem(root: Path, node_policy: dict | None = None) -> list[Fi
                         instruction_path, instruction_relative = _validated_node_input(
                             root, str(relative_instruction), "Node manifest instruction", findings
                         )
-                        if instruction_path is not None and not instruction_path.is_file():
+                        instruction_bytes = (
+                            _read_validated_node_bytes(
+                                root,
+                                instruction_relative,
+                                "Node manifest instruction",
+                                findings,
+                            )
+                            if instruction_relative
+                            else None
+                        )
+                        if instruction_path is not None and instruction_bytes is None:
                             findings.append(Finding(NODE_ECOSYSTEM_FINDING, instruction.replace("\\", "/"), 0, "Node manifest instruction is missing"))
 
             mcp = manifest.get("mcp")
@@ -727,10 +880,213 @@ def _release_version(value: object) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups()) if match else None
 
 
-def _validate_surreal_binary_evidence(
-    surreal: dict, advisory_findings: list[str], findings: list[Finding]
+def _read_external_evidence_file(
+    root: Path,
+    raw_value: object,
+    label: str,
+    findings: list[Finding],
+) -> tuple[Path | None, bytes | None]:
+    path, path_findings = _configured_repo_path(root, raw_value, label, "DEP-009")
+    findings.extend(path_findings)
+    if path is None:
+        return None, None
+    try:
+        relative = str(path.relative_to(root)).replace("\\", "/")
+    except ValueError:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"{label} escaped the repository"))
+        return None, None
+    if not relative.startswith(".eliot/dependency-policy/surrealdb/"):
+        findings.append(Finding("DEP-009", relative, 1, f"{label} must be a project-local provisioner artifact"))
+        return None, None
+    if path.is_symlink() or not path.is_file():
+        findings.append(Finding("DEP-009", relative, 0, f"{label} is not a regular local evidence file"))
+        return None, None
+    try:
+        return path, path.read_bytes()
+    except OSError as exc:
+        findings.append(Finding("DEP-009", relative, 1, f"{label} cannot be read: {exc}"))
+        return None, None
+
+
+def _parse_external_json(
+    root: Path,
+    raw_value: object,
+    label: str,
+    findings: list[Finding],
+) -> tuple[Path | None, bytes | None, object | None]:
+    path, payload = _read_external_evidence_file(root, raw_value, label, findings)
+    if path is None or payload is None:
+        return path, payload, None
+    try:
+        return path, payload, json.loads(payload.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        findings.append(Finding("DEP-009", str(path.relative_to(root)).replace("\\", "/"), 1, f"{label} is not valid JSON: {exc}"))
+        return path, payload, None
+
+
+def _validate_source_archive(
+    root: Path,
+    archive_path_value: object,
+    archive_sha256: object,
+    source_paths: object,
+    label: str,
+    findings: list[Finding],
 ) -> dict:
-    """Require official source/build evidence before marking crate findings binary-applicable."""
+    path, payload = _read_external_evidence_file(root, archive_path_value, label, findings)
+    if path is None or payload is None:
+        return {"status": "missing", "path": archive_path_value}
+    relative = str(path.relative_to(root)).replace("\\", "/")
+    actual_sha = hashlib.sha256(payload).hexdigest()
+    expected_sha = str(archive_sha256).lower()
+    if not _HEX64.fullmatch(expected_sha) or actual_sha != expected_sha:
+        findings.append(Finding("DEP-009", relative, 1, f"{label} bytes do not match the configured SHA-256"))
+    if not isinstance(source_paths, list) or not source_paths or any(
+        not isinstance(source_path, str) or not source_path.strip() or Path(source_path).is_absolute() or ".." in Path(source_path).parts
+        for source_path in source_paths
+    ):
+        findings.append(Finding("DEP-009", relative, 1, f"{label} source_paths are missing or unsafe"))
+        source_paths = []
+
+    present_paths: set[str] = set()
+    archive_prefix = None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+            names = {name.replace("\\", "/").lstrip("./") for name in archive.getnames()}
+        prefixes = {name.split("/", 1)[0] for name in names if "/" in name}
+        if len(prefixes) == 1:
+            archive_prefix = next(iter(prefixes))
+        if archive_prefix:
+            for source_path in source_paths:
+                candidate = f"{archive_prefix}/{source_path}"
+                if candidate in names:
+                    present_paths.add(source_path)
+                else:
+                    findings.append(Finding("DEP-009", relative, 1, f"{label} does not contain {source_path}"))
+        else:
+            findings.append(Finding("DEP-009", relative, 1, f"{label} has no single source-tree root"))
+    except (OSError, tarfile.TarError) as exc:
+        findings.append(Finding("DEP-009", relative, 1, f"{label} is not a readable gzip source archive: {exc}"))
+
+    return {
+        "status": "verified" if len(present_paths) == len(source_paths) and actual_sha == expected_sha else "findings",
+        "path": relative,
+        "sha256": actual_sha,
+        "bytes": len(payload),
+        "archive_root": archive_prefix,
+        "source_paths": sorted(present_paths),
+    }
+
+
+def _validate_osv_snapshot(
+    root: Path,
+    surreal: dict,
+    advisory_findings: list[str],
+    fixes: dict,
+    conditions: dict,
+    advisory_paths: dict,
+    source_archive: dict,
+    findings: list[Finding],
+) -> dict:
+    query_path, query_bytes, query_data = _parse_external_json(
+        root, surreal.get("advisory_query_path"), "SurrealDB OSV query evidence", findings
+    )
+    response_path, response_bytes, response_data = _parse_external_json(
+        root, surreal.get("advisory_response_path"), "SurrealDB OSV response evidence", findings
+    )
+    query_sha = hashlib.sha256(query_bytes).hexdigest() if query_bytes is not None else None
+    response_sha = hashlib.sha256(response_bytes).hexdigest() if response_bytes is not None else None
+    if query_sha != str(surreal.get("advisory_query_sha256", "")).lower():
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "SurrealDB OSV query bytes do not match advisory_query_sha256"))
+    if response_sha != str(surreal.get("advisory_response_digest", "")).lower():
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "SurrealDB OSV response bytes do not match advisory_response_digest"))
+    canonical_response_sha = _canonical_digest(response_data) if response_data is not None else None
+    if canonical_response_sha != str(surreal.get("advisory_digest", "")).lower():
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "SurrealDB OSV response canonical bytes do not match advisory_digest"))
+
+    expected_query = None
+    try:
+        expected_query = json.loads(str(surreal.get("advisory_query", "")))
+    except json.JSONDecodeError:
+        pass
+    if query_data != expected_query:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "saved SurrealDB OSV query does not equal the configured query"))
+
+    observed: dict[str, dict] = {}
+    if isinstance(response_data, dict) and isinstance(response_data.get("vulns"), list):
+        for vulnerability in response_data["vulns"]:
+            if not isinstance(vulnerability, dict) or not isinstance(vulnerability.get("id"), str):
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "saved SurrealDB OSV response contains a malformed vulnerability record"))
+                continue
+            observed[vulnerability["id"]] = vulnerability
+    if set(observed) != set(advisory_findings):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "saved SurrealDB OSV response IDs do not equal advisory_findings"))
+
+    source_present = set(source_archive.get("source_paths", []))
+    for advisory_id in sorted(advisory_findings):
+        vulnerability = observed.get(advisory_id)
+        if not isinstance(vulnerability, dict):
+            continue
+        affected = vulnerability.get("affected")
+        if not isinstance(affected, list) or not any(
+            isinstance(item, dict)
+            and isinstance(item.get("package"), dict)
+            and item["package"].get("ecosystem") == surreal.get("advisory_ecosystem")
+            and item["package"].get("name") == surreal.get("advisory_package")
+            for item in affected
+        ):
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"saved OSV record {advisory_id} is not for the configured package/ecosystem"))
+        observed_fixed: set[str] = set()
+        for affected_item in affected if isinstance(affected, list) else []:
+            for range_item in affected_item.get("ranges", []) if isinstance(affected_item, dict) else []:
+                for event in range_item.get("events", []) if isinstance(range_item, dict) else []:
+                    if isinstance(event, dict) and isinstance(event.get("fixed"), str):
+                        observed_fixed.add(event["fixed"])
+        configured_fixed = fixes.get(advisory_id) if isinstance(fixes, dict) else None
+        if observed_fixed != {configured_fixed}:
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"OSV fixed versions for {advisory_id} do not match the configured fix version"))
+        configured_paths = advisory_paths.get(advisory_id) if isinstance(advisory_paths, dict) else None
+        if not isinstance(configured_paths, list) or not set(configured_paths).issubset(source_present):
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"source archive does not contain every advisory path for {advisory_id}"))
+        condition = conditions.get(advisory_id) if isinstance(conditions, dict) else None
+        details = vulnerability.get("details", "")
+        tokens = {token for token in re.findall(r"[a-z0-9]+", str(condition).lower()) if len(token) >= 4}
+        detail_tokens = set(re.findall(r"[a-z0-9]+", str(details).lower()))
+        if not isinstance(condition, str) or not condition.strip() or len(tokens & detail_tokens) < max(2, len(tokens) // 4):
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"configured advisory condition for {advisory_id} is not bound to saved OSV details"))
+
+    return {
+        "status": "verified" if not any(
+            finding.path == "config/dependency-policy.toml" and "OSV" in finding.detail
+            for finding in findings
+        ) else "findings",
+        "query_path": str(query_path.relative_to(root)).replace("\\", "/") if query_path else None,
+        "query_sha256": query_sha,
+        "response_path": str(response_path.relative_to(root)).replace("\\", "/") if response_path else None,
+        "response_sha256": response_sha,
+        "canonical_response_sha256": canonical_response_sha,
+        "ids": sorted(observed),
+        "fixed_versions": {key: sorted(
+            {
+                event["fixed"]
+                for affected in observed[key].get("affected", [])
+                if isinstance(affected, dict)
+                for range_item in affected.get("ranges", [])
+                if isinstance(range_item, dict)
+                for event in range_item.get("events", [])
+                if isinstance(event, dict) and isinstance(event.get("fixed"), str)
+            }
+        ) for key in sorted(observed)},
+        "condition_binding_digest": _canonical_digest({
+            key: {"condition": conditions.get(key), "fix_version": fixes.get(key), "source_paths": advisory_paths.get(key)}
+            for key in sorted(advisory_findings)
+        }),
+    }
+
+
+def _validate_surreal_binary_evidence(
+    root: Path, surreal: dict, advisory_findings: list[str], findings: list[Finding]
+) -> dict:
+    """Consume source/advisory bytes without upgrading crate evidence to binary proof."""
 
     evidence = surreal.get("distributed_binary_evidence")
     if not isinstance(evidence, dict):
@@ -739,7 +1095,7 @@ def _validate_surreal_binary_evidence(
                 "DEP-009",
                 "config/dependency-policy.toml",
                 1,
-                "surrealdb distributed_binary_evidence must be an official source-build table",
+                "surrealdb distributed_binary_evidence must be a source/advisory evidence table",
             )
         )
         return {}
@@ -748,8 +1104,10 @@ def _validate_surreal_binary_evidence(
         "cargo build --no-default-features --features default "
         "--features storage-tikv,jwks,ml --locked --target x86_64-pc-windows-msvc"
     )
-    if evidence.get("status") != "official-source-build":
-        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence status must be official-source-build"))
+    if evidence.get("status") != "source-and-advisory-verified":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence status must be source-and-advisory-verified"))
+    if evidence.get("build_status") != "not_executed":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary applicability cannot be established without an observed source build"))
     if evidence.get("source_repository") != "https://github.com/surrealdb/surrealdb":
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence must name the official source repository"))
     if evidence.get("source_tag") != surreal.get("source_tag"):
@@ -777,6 +1135,26 @@ def _validate_surreal_binary_evidence(
         for path in source_paths
     ):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence source_paths must be non-empty safe upstream-relative paths"))
+        source_paths = []
+
+    source_archive = _validate_source_archive(
+        root,
+        evidence.get("source_archive_path"),
+        evidence.get("source_archive_sha256"),
+        source_paths,
+        "SurrealDB vulnerable-release source archive",
+        findings,
+    )
+    tag_path, _, tag_ref = _parse_external_json(
+        root, evidence.get("source_tag_ref_path"), "SurrealDB vulnerable-release tag evidence", findings
+    )
+    if not isinstance(tag_ref, dict):
+        tag_ref = {}
+    tag_object = tag_ref.get("object") if isinstance(tag_ref.get("object"), dict) else {}
+    if tag_ref.get("ref") != f"refs/tags/{evidence.get('source_tag')}":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "saved source tag evidence does not match source_tag"))
+    if tag_object.get("type") != "commit" or tag_object.get("sha") != source_commit:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "saved source tag evidence does not bind source_commit"))
 
     fixes = evidence.get("advisory_fix_versions")
     conditions = evidence.get("advisory_conditions")
@@ -815,6 +1193,17 @@ def _validate_surreal_binary_evidence(
         ):
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb binary evidence features for {advisory_id} are missing or outside the official build"))
 
+    advisory_snapshot = _validate_osv_snapshot(
+        root,
+        surreal,
+        advisory_findings,
+        fixes,
+        conditions,
+        advisory_paths,
+        source_archive,
+        findings,
+    )
+
     return {
         "status": evidence.get("status"),
         "source_repository": evidence.get("source_repository"),
@@ -828,13 +1217,21 @@ def _validate_surreal_binary_evidence(
         "advisory_conditions": conditions,
         "advisory_source_paths": advisory_paths,
         "advisory_features": advisory_features,
+        "build_status": evidence.get("build_status"),
+        "source_archive": source_archive,
+        "source_tag_ref": {
+            "status": "verified" if tag_path and tag_object.get("sha") == source_commit else "findings",
+            "path": str(tag_path.relative_to(root)).replace("\\", "/") if tag_path else None,
+            "sha256": hashlib.sha256(tag_path.read_bytes()).hexdigest() if tag_path else None,
+        },
+        "advisory_snapshot": advisory_snapshot,
     }
 
 
 def _validate_patched_candidate(
-    surreal: dict, catalog: dict, advisory_fix_versions: dict, findings: list[Finding]
+    root: Path, surreal: dict, catalog: dict, advisory_fix_versions: dict, findings: list[Finding]
 ) -> dict:
-    """Validate a project-local release lock without treating metadata as installed bytes."""
+    """Validate the project-local release bytes selected by the release lock."""
 
     candidate = surreal.get("patched_candidate")
     required = (
@@ -853,6 +1250,15 @@ def _validate_patched_candidate(
         "build_command",
         "provisioning",
         "installation_approval",
+        "artifact_path",
+        "artifact_size",
+        "source_archive_path",
+        "source_archive_sha256",
+        "source_paths",
+        "source_tag_ref_path",
+        "release_metadata_path",
+        "advisory_query_path",
+        "advisory_response_path",
     )
     if not isinstance(candidate, dict):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate must be a project-local release lock table"))
@@ -861,12 +1267,10 @@ def _validate_patched_candidate(
         if field not in candidate:
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb patched_candidate missing '{field}'"))
 
-    if candidate.get("status") != "release_locked_not_staged":
-        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate status must remain release_locked_not_staged until a project-local artifact is staged"))
-    if candidate.get("provisioning") != "project_local_lock_only":
-        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate provisioning must be project_local_lock_only"))
-    if candidate.get("installation_approval") != "not-issued":
-        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate cannot issue installation approval"))
+    if candidate.get("status") not in {"project_local_artifact_required", "project_local_artifact_verified"}:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate status must describe project-local artifact provisioning"))
+    if candidate.get("provisioning") != "project_local_provisioner":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate must use the project-local provisioner"))
     if candidate.get("name") != surreal.get("name"):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate name must match the external executable"))
     if candidate.get("architecture") != "windows-x64" or candidate.get("pe_machine") != "8664":
@@ -905,6 +1309,82 @@ def _validate_patched_candidate(
     if candidate.get("build_command") != expected_command:
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate build_command does not match the official Windows action"))
 
+    candidate_start = len(findings)
+    artifact_path, artifact_bytes = _read_external_evidence_file(
+        root, candidate.get("artifact_path"), "SurrealDB patched candidate artifact", findings
+    )
+    artifact_sha = hashlib.sha256(artifact_bytes).hexdigest() if artifact_bytes is not None else None
+    if artifact_bytes is None:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate artifact has not been provisioned locally"))
+    else:
+        if artifact_sha != candidate_sha:
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate bytes do not match the pinned SHA-256"))
+        if candidate.get("artifact_size") != len(artifact_bytes):
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate byte length does not match the release asset"))
+        if len(artifact_bytes) < 0x40 or artifact_bytes[:2] != b"MZ":
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate is not a Windows PE artifact"))
+        else:
+            pe_offset = int.from_bytes(artifact_bytes[0x3C:0x40], "little")
+            machine = (
+                int.from_bytes(artifact_bytes[pe_offset + 4 : pe_offset + 6], "little")
+                if pe_offset + 6 <= len(artifact_bytes) and artifact_bytes[pe_offset : pe_offset + 4] == b"PE\0\0"
+                else None
+            )
+            if machine != 0x8664:
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate PE machine is not x86_64"))
+        if artifact_path is not None:
+            try:
+                proc = subprocess.run(
+                    [str(artifact_path), "version"],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+                observed_candidate_version = _extract_external_version(combined)
+                if proc.returncode != 0 or observed_candidate_version != str(candidate.get("version")):
+                    findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate version probe does not match the pinned release"))
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb patched candidate version probe failed: {exc}"))
+
+    release_path, _, release_data = _parse_external_json(
+        root, candidate.get("release_metadata_path"), "SurrealDB patched candidate release metadata", findings
+    )
+    if not isinstance(release_data, dict) or release_data.get("tag_name") != candidate.get("source_tag"):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "saved release metadata does not bind the candidate source tag"))
+    release_assets = release_data.get("assets", []) if isinstance(release_data, dict) else []
+    matching_assets = [
+        asset for asset in release_assets
+        if isinstance(asset, dict) and asset.get("name") == Path(str(candidate.get("release_asset", ""))).name
+    ]
+    if not matching_assets or not any(
+        asset.get("browser_download_url") == candidate.get("release_asset")
+        and asset.get("size") == candidate.get("artifact_size")
+        and asset.get("digest") == f"sha256:{candidate_sha}"
+        for asset in matching_assets
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "saved release metadata does not bind the candidate URL, size and digest"))
+
+    tag_path, _, tag_data = _parse_external_json(
+        root, candidate.get("source_tag_ref_path"), "SurrealDB patched candidate tag evidence", findings
+    )
+    tag_object = tag_data.get("object", {}) if isinstance(tag_data, dict) else {}
+    if not isinstance(tag_object, dict) or tag_data.get("ref") != f"refs/tags/{candidate.get('source_tag')}" or tag_object.get("type") != "commit" or tag_object.get("sha") != candidate.get("source_commit"):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "saved candidate tag evidence does not bind source_commit"))
+
+    candidate_source_archive = _validate_source_archive(
+        root,
+        candidate.get("source_archive_path"),
+        candidate.get("source_archive_sha256"),
+        candidate.get("source_paths"),
+        "SurrealDB patched candidate source archive",
+        findings,
+    )
+    if candidate.get("advisory_query_path") != surreal.get("advisory_query_path") or candidate.get("advisory_response_path") != surreal.get("advisory_response_path"):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "patched candidate advisory evidence must use the actual configured OSV snapshot"))
+
     catalog_candidate = catalog.get("patched_candidate") if isinstance(catalog, dict) else None
     if not isinstance(catalog_candidate, dict):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb catalog is missing the patched_candidate release lock"))
@@ -929,6 +1409,21 @@ def _validate_patched_candidate(
         "build_command": candidate.get("build_command"),
         "provisioning": candidate.get("provisioning"),
         "installation_approval": candidate.get("installation_approval"),
+        "artifact": {
+            "status": "verified" if artifact_bytes is not None and len(findings) == candidate_start else "findings",
+            "path": str(artifact_path.relative_to(root)).replace("\\", "/") if artifact_path else None,
+            "sha256": artifact_sha,
+            "bytes": len(artifact_bytes) if artifact_bytes is not None else None,
+        },
+        "release_metadata": {
+            "status": "observed" if release_path and isinstance(release_data, dict) else "missing",
+            "path": str(release_path.relative_to(root)).replace("\\", "/") if release_path else None,
+        },
+        "tag_ref": {
+            "status": "verified" if tag_path and isinstance(tag_data, dict) and tag_object.get("sha") == candidate.get("source_commit") else "findings",
+            "path": str(tag_path.relative_to(root)).replace("\\", "/") if tag_path else None,
+        },
+        "source_archive": candidate_source_archive,
     }
 
 
@@ -973,6 +1468,9 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
         "advisory_checked_at",
         "advisory_digest",
         "advisory_response_digest",
+        "advisory_query_sha256",
+        "advisory_query_path",
+        "advisory_response_path",
         "advisory_status",
         "advisory_findings",
     )
@@ -1015,7 +1513,7 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
     if binary_applicability not in {"unestablished", "established"}:
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb distributed_binary_applicability is unsupported"))
     elif binary_applicability != "established":
-        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb distributed_binary_applicability must be established by official source-build evidence"))
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb distributed binary applicability remains unestablished: no observed source build is bound to the installed 3.1.4 binary"))
 
     advisory_query = surreal.get("advisory_query")
     if not isinstance(advisory_query, str) or not advisory_query.strip():
@@ -1078,7 +1576,7 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
                 )
             )
 
-    binary_evidence = _validate_surreal_binary_evidence(surreal, advisory_findings, findings)
+    binary_evidence = _validate_surreal_binary_evidence(root, surreal, advisory_findings, findings)
 
     observed_path_value = surreal.get("observed_path")
     observed_path: Path | None = None
@@ -1158,6 +1656,7 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"malformed surrealdb catalog: {exc}"))
 
     candidate_evidence = _validate_patched_candidate(
+        root,
         surreal,
         catalog,
         binary_evidence.get("advisory_fix_versions", {}),
@@ -1440,6 +1939,53 @@ def _canonical_digest(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _scanner_input_snapshot(root: Path, rust_policy: dict | None) -> dict:
+    policy = rust_policy if isinstance(rust_policy, dict) else {}
+    snapshot: dict[str, str | None] = {}
+    for key, default in (
+        ("manifest", "Cargo.toml"),
+        ("lockfile", "Cargo.lock"),
+        ("policy_file", "deny.toml"),
+    ):
+        raw_path = policy.get(key, default)
+        if not isinstance(raw_path, str) or not raw_path.strip() or Path(raw_path).is_absolute() or ".." in Path(raw_path).parts:
+            snapshot[key] = None
+            continue
+        path = root / raw_path
+        relative = str(Path(raw_path)).replace("\\", "/")
+        try:
+            snapshot[relative] = sha256_file(path) if path.is_file() and not path.is_symlink() else None
+        except OSError:
+            snapshot[relative] = None
+    return snapshot
+
+
+def _scanner_advisory_binding_digest(execution: dict) -> str:
+    return _canonical_digest(
+        {
+            "profile": execution.get("profile"),
+            "checks": execution.get("checks"),
+            "command": execution.get("command"),
+            "input_snapshot_digest": execution.get("input_snapshot_digest"),
+            "advisory_content_digest": execution.get("advisory_content_digest"),
+        }
+    )
+
+
+def _scanner_advisory_binding_is_valid(cargo_summary: dict) -> bool:
+    execution = cargo_summary.get("_execution") if isinstance(cargo_summary, dict) else None
+    if not isinstance(execution, dict):
+        return False
+    required = (
+        "advisory_content_digest",
+        "input_snapshot_digest",
+        "advisory_binding_digest",
+    )
+    if any(not isinstance(execution.get(key), str) or not execution[key] for key in required):
+        return False
+    return execution.get("advisory_binding_digest") == _scanner_advisory_binding_digest(execution)
+
+
 def _git_source_provenance(root: Path) -> tuple[str, dict, Finding | None]:
     try:
         result = subprocess.run(
@@ -1465,7 +2011,35 @@ def _git_source_provenance(root: Path) -> tuple[str, dict, Finding | None]:
     return source_sha, {"status": "verified", "command": ["git", "rev-parse", "--verify", "HEAD"]}, None
 
 
-def _receipt_input_paths(root: Path, manifest_data: dict) -> list[str]:
+def _node_surface_observation(
+    root: Path, node_policy: dict | None, findings: list[Finding] | None = None
+) -> dict:
+    policy = node_policy if isinstance(node_policy, dict) else {}
+    _, contract_relative = _validated_node_input(
+        root, policy.get("contract"), "[ecosystems.node].contract", findings
+    )
+    if not contract_relative:
+        return {"status": "missing", "surface": None}
+    contract_bytes = _read_validated_node_bytes(root, contract_relative, "Node contract", findings)
+    if contract_bytes is None:
+        return {"status": "unreadable", "surface": None}
+    try:
+        contract = json.loads(contract_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"status": "malformed", "surface": None}
+    if not isinstance(contract, dict):
+        return {"status": "malformed", "surface": None}
+    surface = contract.get("surface")
+    return {
+        "status": "observed",
+        "surface": surface,
+        "surface_type": type(surface).__name__,
+    }
+
+
+def _receipt_input_paths(
+    root: Path, manifest_data: dict, findings: list[Finding] | None = None
+) -> list[str]:
     paths = {
         "Cargo.toml",
         "Cargo.lock",
@@ -1489,7 +2063,7 @@ def _receipt_input_paths(root: Path, manifest_data: dict) -> list[str]:
                 if isinstance(value, str) and value.strip() and not Path(value).is_absolute() and ".." not in Path(value).parts:
                     paths.add(value.replace("\\", "/"))
         node = ecosystems.get("node", {})
-        paths.update(_node_input_paths(root, node))
+        paths.update(_node_input_paths(root, node, findings))
     externals = manifest_data.get("external_executables", {})
     if isinstance(externals, dict):
         for config in externals.values():
@@ -1633,7 +2207,7 @@ def run_cargo_deny(
             cmd,
             cwd=str(root),
             capture_output=True,
-            text=True,
+            text=False,
             timeout=180,
             check=False,
         )
@@ -1647,13 +2221,24 @@ def run_cargo_deny(
         return findings, STATUS_TOOL_UNAVAILABLE, {"_execution": execution}
 
     execution["exit_code"] = proc.returncode
+    stdout_bytes = proc.stdout or b""
+    stderr_bytes = proc.stderr or b""
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+    execution["advisory_content_digest"] = hashlib.sha256(
+        stdout_bytes + b"\n" + stderr_bytes
+    ).hexdigest()
+    input_snapshot = _scanner_input_snapshot(root, rust_policy)
+    execution["input_snapshot"] = input_snapshot
+    execution["input_snapshot_digest"] = _canonical_digest(input_snapshot)
+    execution["advisory_binding_digest"] = _scanner_advisory_binding_digest(execution)
     summary: dict = {}
     seen_findings: set[tuple[str, str]] = set()
     stdout_result = _parse_scanner_stream(
-        proc.stdout, "stdout", findings, summary, seen_findings
+        stdout_text, "stdout", findings, summary, seen_findings
     )
     stderr_result = _parse_scanner_stream(
-        proc.stderr, "stderr", findings, summary, seen_findings
+        stderr_text, "stderr", findings, summary, seen_findings
     )
     severity_counts: dict[str, int] = {}
     for result in (stdout_result, stderr_result):
@@ -1729,7 +2314,7 @@ def run_cargo_deny(
             )
         )
 
-    combined_output = f"{proc.stdout}\n{proc.stderr}".lower()
+    combined_output = f"{stdout_text}\n{stderr_text}".lower()
     advisory_policy_finding = any(
         f.code == "DEP-006" and re.search(r"rustsec-\d{4}-\d+", f.detail, re.IGNORECASE) for f in findings
     )
@@ -1810,15 +2395,27 @@ def build_receipt(
     if source_finding is not None:
         findings.append(source_finding)
 
-    input_paths = _receipt_input_paths(root, manifest_data)
+    ecosystems = manifest_data.get("ecosystems", {})
+    node_policy = ecosystems.get("node", {}) if isinstance(ecosystems, dict) else {}
+    if not isinstance(node_policy, dict):
+        node_policy = {}
+    node_input_paths = set(_node_input_paths(root, node_policy, findings))
+    input_paths = _receipt_input_paths(root, manifest_data, findings)
     digests = {}
     missing_inputs = []
     for relative_path in input_paths:
-        fp = root / relative_path
-        if fp.is_file():
-            digests[relative_path] = sha256_file(fp)
+        if relative_path in node_input_paths:
+            payload = _read_validated_node_bytes(root, relative_path, f"Node receipt input {relative_path}", findings)
+            if payload is not None:
+                digests[relative_path] = hashlib.sha256(payload).hexdigest()
+            else:
+                missing_inputs.append(relative_path)
         else:
-            missing_inputs.append(relative_path)
+            fp = root / relative_path
+            if fp.is_file():
+                digests[relative_path] = sha256_file(fp)
+            else:
+                missing_inputs.append(relative_path)
 
     scanner = manifest_data.get("scanner", {})
     if not isinstance(scanner, dict):
@@ -1829,7 +2426,6 @@ def build_receipt(
         if isinstance(cargo_summary, dict)
         else {}
     )
-    ecosystems = manifest_data.get("ecosystems", {})
     rust_policy = ecosystems.get("rust", {}) if isinstance(ecosystems, dict) else {}
     if not isinstance(rust_policy, dict):
         rust_policy = {}
@@ -1868,6 +2464,9 @@ def build_receipt(
             "observed_version": scanner_execution.get("observed_version"),
             "observed_executable_sha256": scanner_execution.get("observed_sha256"),
             "identity_verified": scanner_execution.get("identity_verified", False),
+            "advisory_content_digest": scanner_execution.get("advisory_content_digest"),
+            "input_snapshot_digest": scanner_execution.get("input_snapshot_digest"),
+            "advisory_binding_digest": scanner_execution.get("advisory_binding_digest"),
         },
         "ecosystem_denominator": {
             "rust": {
@@ -1894,10 +2493,11 @@ def build_receipt(
                 "hash_locked": True,
             },
             "node": {
-                "contract": node_policy.get("contract"),
-                "manifest": node_policy.get("manifest"),
-                "inputs": _node_input_paths(root, node_policy),
-            },
+            "contract": node_policy.get("contract"),
+            "manifest": node_policy.get("manifest"),
+            "inputs": _node_input_paths(root, node_policy),
+            "surface_observation": _node_surface_observation(root, node_policy, findings),
+        },
             "external_executables": list(manifest_data.get("external_executables", {}).keys()),
         },
         "input_digests": digests,
@@ -1931,8 +2531,14 @@ def build_receipt(
             "source": "https://github.com/rustsec/advisory-db",
             "evaluated_at_utc": receipt["timestamp_utc"],
             "status": advisory_status,
-            "digest": None,
-            "digest_status": "not_bound_by_cargo-deny_receipt",
+            "digest": scanner_execution.get("advisory_content_digest"),
+            "input_snapshot_digest": scanner_execution.get("input_snapshot_digest"),
+            "binding_digest": scanner_execution.get("advisory_binding_digest"),
+            "digest_status": (
+                "bound_to_observed_cargo_deny_output_and_inputs"
+                if _scanner_advisory_binding_is_valid(cargo_summary)
+                else "not_bound"
+            ),
         }
 
     return receipt
@@ -2019,13 +2625,13 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
     all_findings.extend(scanner_findings)
     if isinstance(cargo_summary, dict):
         cargo_summary["_direct_dependency_identity"] = direct_dependency_identity
-    if profile == "current-advisories":
+    if profile == "current-advisories" and not _scanner_advisory_binding_is_valid(cargo_summary):
         all_findings.append(
             Finding(
                 IDENTITY_BINDING_FINDING,
                 "config/dependency-policy.toml",
                 1,
-                "current advisory evidence has no content digest binding in cargo-deny's receipt",
+                "current advisory evidence lacks a verified cargo-deny content/input snapshot binding",
             )
         )
 

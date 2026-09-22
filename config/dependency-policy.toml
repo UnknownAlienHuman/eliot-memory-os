@@ -48,12 +48,15 @@ source_tag = "v3.1.4"
 advisory_package = "surrealdb"
 advisory_ecosystem = "crates.io"
 advisory_scope = "rust-crate"
-distributed_binary_applicability = "established"
+distributed_binary_applicability = "unestablished"
 advisory_source = "https://api.osv.dev/v1/query"
 advisory_query = '{"package":{"name":"surrealdb","ecosystem":"crates.io"},"version":"3.1.4"}'
 advisory_checked_at = "2026-09-22T14:38:31.9718905Z"
 advisory_digest = "ca3ee13e6d878ee2613ea4adb337648ff4819f99c4d1bdd654222e59e17f0a30"
-advisory_response_digest = "c0829c54133c5d4e870686c7a02af8d72cac46326694ef37b5b24f445c751f94"
+advisory_response_digest = "a3e6a2595a54def2ff791c962c74891fd8795c042aff9c498a6b4b779e81d4f0"
+advisory_query_sha256 = "08a71d32c9f3e8a31c35c6e6b82d8cc2201b271aa3ec7779e04796fb07e7611c"
+advisory_query_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-query.json"
+advisory_response_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-response.json"
 advisory_status = "findings"
 advisory_findings = [
     "GHSA-848m-r628-vrxw",
@@ -65,7 +68,8 @@ advisory_findings = [
 ]
 
 [external_executables.surrealdb.distributed_binary_evidence]
-status = "official-source-build"
+status = "source-and-advisory-verified"
+build_status = "not_executed"
 source_repository = "https://github.com/surrealdb/surrealdb"
 source_tag = "v3.1.4"
 source_commit = "c9e039542e85c3853f26219198df1ae64291edda"
@@ -80,13 +84,16 @@ source_paths = [
     "surrealdb/core/src/doc/field.rs",
     "surrealdb/core/src/syn/parser/expression.rs",
 ]
+source_archive_path = ".eliot/dependency-policy/surrealdb/v3.1.4/surrealdb-v3.1.4.tar.gz"
+source_archive_sha256 = "88d748727ce85ed713dd632ed71bb716bbbe56f2af1031542d78f3196853b6b5"
+source_tag_ref_path = ".eliot/dependency-policy/surrealdb/v3.1.4/github-tag-v3.1.4.json"
 advisory_fix_versions = { "GHSA-848m-r628-vrxw" = "3.2.0", "GHSA-cc8f-fcx3-gpjr" = "3.1.5", "GHSA-h4h3-3rfj-x6fq" = "3.1.5", "GHSA-h5rg-8p7f-47g2" = "3.1.5", "GHSA-hv6h-hc26-q48p" = "3.1.5", "GHSA-jv2j-mqmw-xvv5" = "3.1.5" }
 advisory_conditions = { "GHSA-848m-r628-vrxw" = "authenticated non-root caller invokes a custom API outside its authenticated namespace or database scope", "GHSA-cc8f-fcx3-gpjr" = "EDITOR or OWNER mapper filter reads a process-readable file when SURREAL_FILE_ALLOWLIST is empty", "GHSA-h4h3-3rfj-x6fq" = "record user orders by an indexed field hidden by field-level SELECT permission", "GHSA-h5rg-8p7f-47g2" = "database-level OWNER JWKS access follows a redirect to a blocked network target", "GHSA-hv6h-hc26-q48p" = "record user reaches a field-hidden record through graph or reference traversal", "GHSA-jv2j-mqmw-xvv5" = "authenticated query user submits a deep operator chain that exceeds safe expression depth" }
 advisory_source_paths = { "GHSA-848m-r628-vrxw" = ["surrealdb/server/src/ntw/api.rs"], "GHSA-cc8f-fcx3-gpjr" = ["surrealdb/core/src/idx/ft/analyzer/mapper.rs"], "GHSA-h4h3-3rfj-x6fq" = ["surrealdb/core/src/exec/planner/select/mod.rs"], "GHSA-h5rg-8p7f-47g2" = ["surrealdb/core/src/iam/jwks.rs"], "GHSA-hv6h-hc26-q48p" = ["surrealdb/core/src/doc/field.rs", "surrealdb/core/src/exec/planner/select/mod.rs"], "GHSA-jv2j-mqmw-xvv5" = ["surrealdb/core/src/syn/parser/expression.rs"] }
 advisory_features = { "GHSA-848m-r628-vrxw" = ["default"], "GHSA-cc8f-fcx3-gpjr" = ["default"], "GHSA-h4h3-3rfj-x6fq" = ["default"], "GHSA-h5rg-8p7f-47g2" = ["default", "jwks"], "GHSA-hv6h-hc26-q48p" = ["default"], "GHSA-jv2j-mqmw-xvv5" = ["default"] }
 
 [external_executables.surrealdb.patched_candidate]
-status = "release_locked_not_staged"
+status = "project_local_artifact_required"
 name = "surreal.exe"
 version = "3.2.0"
 architecture = "windows-x64"
@@ -99,8 +106,24 @@ source_commit = "5bebfcdcfa9166131618f768dfe0c0e6fb486f4f"
 build_target = "x86_64-pc-windows-msvc"
 build_features = ["default", "storage-tikv", "jwks", "ml"]
 build_command = "cargo build --no-default-features --features default --features storage-tikv,jwks,ml --locked --target x86_64-pc-windows-msvc"
-provisioning = "project_local_lock_only"
+provisioning = "project_local_provisioner"
 installation_approval = "not-issued"
+artifact_path = ".eliot/dependency-policy/surrealdb/v3.2.0/surreal-v3.2.0.windows-amd64.exe"
+artifact_size = 114430464
+source_archive_path = ".eliot/dependency-policy/surrealdb/v3.2.0/surrealdb-v3.2.0.tar.gz"
+source_archive_sha256 = "669f077b43c8a2910a2e0091d2cf2f4082e3279d4f6d2d3fbba0e5e30a0f15f6"
+source_paths = [
+    "surrealdb/server/src/ntw/api.rs",
+    "surrealdb/core/src/idx/ft/analyzer/mapper.rs",
+    "surrealdb/core/src/exec/planner/select/mod.rs",
+    "surrealdb/core/src/iam/jwks.rs",
+    "surrealdb/core/src/doc/field.rs",
+    "surrealdb/core/src/syn/parser/expression.rs",
+]
+source_tag_ref_path = ".eliot/dependency-policy/surrealdb/v3.2.0/github-tag-v3.2.0.json"
+release_metadata_path = ".eliot/dependency-policy/surrealdb/v3.2.0/github-release-v3.2.0.json"
+advisory_query_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-query.json"
+advisory_response_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-response.json"
 
 [direct_dependencies.aes-gcm]
 ecosystem = "rust"

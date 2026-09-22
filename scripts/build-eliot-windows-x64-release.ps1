@@ -6,6 +6,7 @@ param(
     [string]$SurrealExe,
     [string]$SurrealSha256,
     [string]$SurrealVersion,
+    [switch]$UseProjectLocalSurreal,
     [switch]$SkipBuild,
     [switch]$PlanOnly,
     [Alias('VerifyBundle')]
@@ -229,6 +230,19 @@ function Get-VerifiedSurrealCatalog([string]$Repo, [string]$SourceCommit) {
         [string]$catalog.sha256 -cnotmatch '^[0-9a-f]{64}$') {
         throw 'tracked SurrealDB artifact catalog is missing its canonical filename/version/architecture/digest binding'
     }
+    $candidate = $catalog.patched_candidate
+    if (-not $candidate -or
+        [string]$candidate.status -cne 'project_local_artifact_required' -or
+        [string]$candidate.name -cne 'surreal.exe' -or
+        [string]$candidate.version -cne '3.2.0' -or
+        [string]$candidate.architecture -cne 'windows-x64' -or
+        [string]$candidate.pe_machine -cne '8664' -or
+        [string]$candidate.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$candidate.provisioning -cne 'project_local_provisioner' -or
+        [string]$candidate.artifact_path -notlike '.eliot/dependency-policy/surrealdb/*' -or
+        [int64]$candidate.artifact_size -le 0) {
+        throw 'tracked SurrealDB artifact catalog is missing its project-local 3.2.0 candidate binding'
+    }
     [pscustomobject]@{
         path = $catalogPath
         relative_path = $surrealCatalogRelativePath
@@ -240,6 +254,7 @@ function Get-VerifiedSurrealCatalog([string]$Repo, [string]$SourceCommit) {
         architecture = [string]$catalog.architecture
         pe_machine = [string]$catalog.pe_machine
         artifact_sha256 = ([string]$catalog.sha256).ToLowerInvariant()
+        patched_candidate = $candidate
     }
 }
 
@@ -284,6 +299,89 @@ function Get-VerifiedPinnedSurrealArtifact([string]$Path, [string]$ExpectedSha25
         catalog_sha256 = $Catalog.sha256
         catalog_source_commit = $Catalog.source_commit
         pe_machine = $Catalog.pe_machine
+        sha256 = $actualSha256
+        bytes = $file.Length
+        signature_policy = 'pre-release-unsigned'
+        signature_evidence = 'not-issued'
+    }
+}
+
+function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]$Materialize) {
+    $candidate = $Catalog.patched_candidate
+    $candidateRelative = Assert-SafeRelativePath ([string]$candidate.artifact_path) 'project-local SurrealDB artifact'
+    if (-not $candidateRelative.StartsWith('.eliot/dependency-policy/surrealdb/', [System.StringComparison]::Ordinal)) {
+        throw "project-local SurrealDB artifact is outside the evidence root: $candidateRelative"
+    }
+    $receiptRelative = '.eliot/dependency-policy/surrealdb/provisioning-receipt.json'
+    $candidatePath = [System.IO.Path]::GetFullPath((Join-Path $Repo $candidateRelative.Replace('/', '\')))
+    $receiptPath = [System.IO.Path]::GetFullPath((Join-Path $Repo $receiptRelative.Replace('/', '\')))
+    $provisionerPath = [System.IO.Path]::GetFullPath((Join-Path $Repo 'scripts\provision-surrealdb-release.py'))
+
+    if ($Materialize) {
+        if (-not (Test-Path -LiteralPath $provisionerPath -PathType Leaf)) {
+            throw "project-local SurrealDB provisioner is missing: $provisionerPath"
+        }
+        $python = Get-PinnedCommandFile 'python' 'SurrealDB project-local provisioner'
+        $provisionOutput = & $python.FullName $provisionerPath '--root' $Repo 2>&1 | Out-String
+        $provisionExitCode = $LASTEXITCODE
+        if ($provisionExitCode -ne 0) {
+            throw "project-local SurrealDB provisioner failed with exit code ${provisionExitCode}: $provisionOutput"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+        throw "project-local SurrealDB provisioning receipt is missing: $receiptPath"
+    }
+    try {
+        $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        throw "project-local SurrealDB provisioning receipt is not valid JSON: $receiptPath"
+    }
+    if ([string]$receipt.schema -cne 'eliot.surrealdb-project-local-provisioning.v1' -or
+        [bool]$receipt.shared_installation_touched) {
+        throw 'project-local SurrealDB provisioning receipt is missing the no-shared-installation boundary'
+    }
+    $records = @($receipt.records | Where-Object { [string]$_.url -ceq [string]$candidate.release_asset })
+    if ($records.Count -ne 1) {
+        throw 'project-local SurrealDB provisioning receipt does not contain exactly one pinned Windows artifact record'
+    }
+    $record = $records[0]
+    $recordPath = [System.IO.Path]::GetFullPath([string]$record.path)
+    if (-not $candidatePath.Equals($recordPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]$record.sha256 -cne ([string]$candidate.sha256).ToLowerInvariant() -or
+        [int64]$record.bytes -ne [int64]$candidate.artifact_size) {
+        throw 'project-local SurrealDB provisioning receipt does not bind the locked artifact path, size, and digest'
+    }
+    $assetLeaf = Split-Path -Leaf ([string]$candidate.release_asset)
+    if ((Split-Path -Leaf $candidatePath) -cne $assetLeaf) {
+        throw 'project-local SurrealDB artifact filename does not match the pinned release asset'
+    }
+    $file = Assert-PinnedExternalPath $candidatePath 'project-local SurrealDB artifact'
+    $actualSha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualSha256 -cne ([string]$candidate.sha256).ToLowerInvariant() -or
+        $file.Length -ne [int64]$candidate.artifact_size) {
+        throw 'project-local SurrealDB artifact bytes do not match the tracked candidate lock'
+    }
+    [void](Assert-WindowsX64Pe $file.FullName 'runtime/surreal.exe')
+    if ((Get-WindowsPeMachine $file.FullName 'runtime/surreal.exe') -cne [string]$candidate.pe_machine) {
+        throw "project-local SurrealDB artifact PE machine does not match the candidate lock: expected $($candidate.pe_machine)"
+    }
+    [ordered]@{
+        package = 'surrealdb'
+        binary = 'surreal'
+        role = 'database'
+        path = 'runtime/surreal.exe'
+        source = 'project-local-provisioner'
+        project_local_input_path = $candidateRelative
+        provisioner = 'scripts/provision-surrealdb-release.py'
+        provisioning_receipt_input_path = $receiptRelative
+        provisioning_receipt_sha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        version = [string]$candidate.version
+        architecture = [string]$candidate.architecture
+        catalog_path = $Catalog.relative_path
+        catalog_sha256 = $Catalog.sha256
+        catalog_source_commit = $Catalog.source_commit
+        pe_machine = [string]$candidate.pe_machine
         sha256 = $actualSha256
         bytes = $file.Length
         signature_policy = 'pre-release-unsigned'
@@ -970,7 +1068,7 @@ function Get-VerifiedOperatorBuildReceipt([string]$Repo, [string]$SourceCommit, 
     }
 }
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -985,12 +1083,28 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
     }
     $entries += [ordered]@{
         path = 'runtime/surreal.exe'
-        selection = 'caller-pinned-absolute-path bound to tracked SurrealDB artifact catalog'
+        selection = if ([string]$SurrealArtifact.source -ceq 'project-local-provisioner') {
+            'project-local provisioner artifact bound to tracked SurrealDB candidate lock'
+        }
+        else {
+            'caller-pinned-absolute-path bound to tracked SurrealDB artifact catalog'
+        }
         owner = 'external-lock:docs/release/SURREALDB_WINDOWS_X64.lock.json'
         install_destination = 'runtime/'
         generation = $SourceCommit
         proof_ceiling = 'unsigned-build-evidence with explicit pre-release-unsigned disposition (Authenticode scope is Part B)'
         gate = $null
+    }
+    if ([string]$SurrealArtifact.source -ceq 'project-local-provisioner') {
+        $entries += [ordered]@{
+            path = 'runtime/SURREALDB_PROVISIONING_RECEIPT.json'
+            selection = 'project-local provisioner receipt copied with the consumed artifact'
+            owner = 'scripts/provision-surrealdb-release.py'
+            install_destination = 'runtime/'
+            generation = $SourceCommit
+            proof_ceiling = 'unsigned-build-evidence with project-local provisioning provenance'
+            gate = $null
+        }
     }
     $entries += [ordered]@{
         path = 'runtime/RUNTIME_ARTIFACTS.json'
@@ -1393,7 +1507,7 @@ function Test-ReleaseBundle([string]$Path) {
     $surrealEntry = $surrealEntries[0]
     if ([string]$surrealEntry.role -ne 'database' -or
         [string]$surrealEntry.path -ne 'runtime/surreal.exe' -or
-        [string]$surrealEntry.source -ne 'caller-pinned-absolute-path' -or
+        [string]$surrealEntry.source -notin @('caller-pinned-absolute-path', 'project-local-provisioner') -or
         [string]$surrealEntry.catalog_path -ne $surrealCatalogRelativePath -or
         [string]$surrealEntry.catalog_source_commit -ne [string]$runtimeManifest.source_commit -or
         [string]$surrealEntry.catalog_sha256 -notmatch '^[0-9a-f]{64}$' -or
@@ -1422,14 +1536,46 @@ function Test-ReleaseBundle([string]$Path) {
         throw 'bundled SurrealDB artifact catalog digest mismatch'
     }
     $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
+    $catalogBinding = if ([string]$surrealEntry.source -ceq 'project-local-provisioner') {
+        $catalog.patched_candidate
+    }
+    else {
+        $catalog
+    }
     if ([string]$catalog.schema -ne 'eliot-external-release-artifact-lock-v1' -or
         [string]$catalog.artifact -cne 'surreal.exe' -or
         [string]$catalog.relative_path -cne 'runtime/surreal.exe' -or
-        [string]$catalog.version -cne [string]$surrealEntry.version -or
-        [string]$catalog.architecture -ne 'windows-x64' -or
-        [string]$catalog.pe_machine -ne [string]$surrealEntry.pe_machine -or
-        [string]$catalog.sha256 -cne [string]$surrealEntry.sha256) {
+        [string]$catalogBinding.version -cne [string]$surrealEntry.version -or
+        [string]$catalogBinding.architecture -ne 'windows-x64' -or
+        [string]$catalogBinding.pe_machine -ne [string]$surrealEntry.pe_machine -or
+        [string]$catalogBinding.sha256 -cne [string]$surrealEntry.sha256) {
         throw 'bundled SurrealDB artifact catalog content does not bind the shipped artifact'
+    }
+    if ([string]$surrealEntry.source -ceq 'project-local-provisioner') {
+        if ([string]$surrealEntry.project_local_input_path -notlike '.eliot/dependency-policy/surrealdb/*' -or
+            [string]$surrealEntry.provisioner -cne 'scripts/provision-surrealdb-release.py' -or
+            [string]$surrealEntry.provisioning_receipt_input_path -cne '.eliot/dependency-policy/surrealdb/provisioning-receipt.json' -or
+            [string]$surrealEntry.provisioning_receipt_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'project-local SurrealDB runtime metadata is missing its provisioner and receipt binding'
+        }
+        $stagedReceiptPath = Join-Path $resolved 'runtime/SURREALDB_PROVISIONING_RECEIPT.json'
+        if (-not (Test-Path -LiteralPath $stagedReceiptPath -PathType Leaf) -or
+            (Get-FileHash -LiteralPath $stagedReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne [string]$surrealEntry.provisioning_receipt_sha256) {
+            throw 'project-local SurrealDB provisioning receipt is missing or changed in the staged bundle'
+        }
+        $stagedReceipt = Get-Content -LiteralPath $stagedReceiptPath -Raw | ConvertFrom-Json
+        if ([string]$stagedReceipt.schema -cne 'eliot.surrealdb-project-local-provisioning.v1' -or
+            [bool]$stagedReceipt.shared_installation_touched) {
+            throw 'staged SurrealDB provisioning receipt does not preserve the no-shared-installation boundary'
+        }
+        $candidateRecord = @($stagedReceipt.records | Where-Object {
+                [string]$_.url -ceq [string]$catalogBinding.release_asset -and
+                [string]$_.sha256 -ceq [string]$surrealEntry.sha256 -and
+                [int64]$_.bytes -eq [int64]$surrealEntry.bytes
+            })
+        if ($candidateRecord.Count -ne 1) {
+            throw 'staged SurrealDB provisioning receipt does not bind the consumed release asset bytes'
+        }
     }
     $releaseRuntimeEntries = @($release.runtime_artifacts)
     if ([string]$release.runtime_artifact_catalog_path -ne $surrealCatalogRelativePath -or
@@ -1577,7 +1723,22 @@ if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
     throw 'failed to resolve the release source commit'
 }
 $surrealCatalog = Get-VerifiedSurrealCatalog $repo $sourceCommit
-$verifiedPinnedSurreal = Get-VerifiedPinnedSurrealArtifact $SurrealExe $SurrealSha256 $SurrealVersion $surrealCatalog
+$projectLocalSurreal = $null
+if ($UseProjectLocalSurreal) {
+    if ($SurrealExe -or $SurrealSha256 -or $SurrealVersion) {
+        throw '-UseProjectLocalSurreal cannot be combined with -SurrealExe, -SurrealSha256, or -SurrealVersion'
+    }
+    $projectLocalSurreal = Get-ProjectLocalSurrealArtifact $repo $surrealCatalog (-not $PlanOnly)
+    $SurrealExe = Join-Path $repo ([string]$projectLocalSurreal.project_local_input_path).Replace('/', '\')
+    $SurrealSha256 = [string]$projectLocalSurreal.sha256
+    $SurrealVersion = [string]$projectLocalSurreal.version
+}
+$verifiedPinnedSurreal = if ($UseProjectLocalSurreal) {
+    $projectLocalSurreal
+}
+else {
+    Get-VerifiedPinnedSurrealArtifact $SurrealExe $SurrealSha256 $SurrealVersion $surrealCatalog
+}
 $planToolchain = Get-ToolchainBuildReceipt $repo $sourceCommit $cargoMetadata 'plan'
 $resolvedSurrealExe = (Resolve-Path -LiteralPath $SurrealExe).Path
 $codexPluginSource = Join-Path $repo 'plugin/eliot-governor'
@@ -1633,6 +1794,10 @@ $plan = [ordered]@{
         catalog_path = $surrealCatalog.relative_path
         catalog_sha256 = $surrealCatalog.sha256
         catalog_source_commit = $surrealCatalog.source_commit
+        project_local_input_path = $verifiedPinnedSurreal.project_local_input_path
+        provisioner = $verifiedPinnedSurreal.provisioner
+        provisioning_receipt_input_path = $verifiedPinnedSurreal.provisioning_receipt_input_path
+        provisioning_receipt_sha256 = $verifiedPinnedSurreal.provisioning_receipt_sha256
     }
     runtime_artifacts = @($runtimeArtifactPlan | ForEach-Object {
             [ordered]@{
@@ -1703,6 +1868,16 @@ try {
         Copy-Item -LiteralPath $artifact.path -Destination (Join-Path $bundle $artifact.relative_path)
     }
     Copy-Item -LiteralPath $resolvedSurrealExe -Destination (Join-Path $bundle 'runtime/surreal.exe')
+    if ($verifiedPinnedSurreal.source -ceq 'project-local-provisioner') {
+        $stagedProvisioningReceipt = Join-Path $runtimeRoot 'SURREALDB_PROVISIONING_RECEIPT.json'
+        $sourceProvisioningReceipt = Join-Path $repo ([string]$verifiedPinnedSurreal.provisioning_receipt_input_path).Replace('/', '\')
+        Copy-Item -LiteralPath $sourceProvisioningReceipt -Destination $stagedProvisioningReceipt
+        Assert-NoSecretFile (Get-Item -LiteralPath $stagedProvisioningReceipt) 'runtime/SURREALDB_PROVISIONING_RECEIPT.json'
+        $stagedReceiptSha256 = (Get-FileHash -LiteralPath $stagedProvisioningReceipt -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($stagedReceiptSha256 -cne [string]$verifiedPinnedSurreal.provisioning_receipt_sha256) {
+            throw 'staged SurrealDB provisioning receipt changed while being copied'
+        }
+    }
     [ordered]@{
         schema = 'eliot-runtime-artifact-set-v1'
         component = 'eliot_runtime_verified_build_artifacts'
@@ -1744,7 +1919,7 @@ try {
     $verifiedOperator = Get-VerifiedOperatorBuildReceipt $repo $sourceCommit $OperatorSource
     Copy-OperatorPayload $verifiedOperator.source (Join-Path $bundle 'operator')
     Copy-Item -LiteralPath $verifiedOperator.receipt_path -Destination (Join-Path $bundle 'operator/OPERATOR_BUILD_RECEIPT.json')
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal
     $stagedPayloadManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     [ordered]@{
@@ -1773,6 +1948,10 @@ try {
                     architecture = $_.architecture
                     sha256 = $_.sha256
                     bytes = $_.bytes
+                    project_local_input_path = $_.project_local_input_path
+                    provisioner = $_.provisioner
+                    provisioning_receipt_input_path = $_.provisioning_receipt_input_path
+                    provisioning_receipt_sha256 = $_.provisioning_receipt_sha256
                 }
             })
         architecture = 'windows-x64'
