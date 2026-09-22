@@ -1,11 +1,18 @@
 //! In-guest learning ticket enforcement for Context Compiler retrieval (#1869).
 //!
-//! This code executes in the component contour (WASM guest or native
-//! adapter): it imports contract types only — never Governor state. Every
-//! learning-marked atom in the input must be covered by a matching owner-
-//! minted ticket carried in the same input, and the mark, ticket, and
-//! compilation binding must agree exactly. Violations refuse the retrieval
-//! before the native gate runs (`native_calls == 0`).
+//! Structural prefilter, NOT authority: every learning-marked atom in the
+//! input must be covered by a matching owner-minted ticket carried in the
+//! same input, and the mark, ticket, and compilation binding must agree
+//! exactly. Violations refuse the retrieval before the native gate runs
+//! (`native_calls == 0`).
+//!
+//! On the guest contour this screen runs AFTER the
+//! `LearningRequiresGovernedPath` refusal in `conversion.rs`, which rejects
+//! any marked/ticketed input outright: the guest cannot owner-verify
+//! issuance, liveness, or expiry, so marked influence admits only through
+//! the governed native path (`admit_context_with_learning`). This screen
+//! remains as defense in depth and as the binding rulebook for host-side
+//! rlib callers presenting marks with owner verification in hand.
 //!
 //! Honest boundary (read before relying on this):
 //!

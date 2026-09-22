@@ -37,6 +37,7 @@ wasmparser = "0.256.0"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 eliot-context-assembly = { path = "../eliot-context-assembly", version = "0.1.0" }
 eliot-improvement = { path = "../../meta/eliot-improvement", version = "0.1.0" }
+time = { version = "0.3.44", features = ["serde", "formatting", "parsing"] }
 
 [dev-dependencies]
 eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts", version = "0.1.0" }

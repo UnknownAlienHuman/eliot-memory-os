@@ -53,6 +53,9 @@ pub struct LearningSubject<'a> {
 
 /// Screen learning-marked atoms against an owner-verified permit.
 ///
+/// `now_unix_secs` MUST be owner/host-sourced live time, never a
+/// requester-envelope value (see [`admit_context_with_learning`]).
+///
 /// Fail-closed: the first violation refuses the whole retrieval. Order:
 /// origin campaign, target task, exact fence, cited issuance digest,
 /// overlay subject, candidate subject, expiry, draft state, reusable
