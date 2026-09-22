@@ -1,6 +1,6 @@
 use eliot_types::{
     AgentCandidateSubmitInput, BlobRef, CUE_BINDING_PAGE_SCHEMA_VERSION_V1,
-    CUE_BINDING_PAGE_SCHEMA_VERSION_V2, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength,
+    CUE_BINDING_PAGE_SCHEMA_VERSION_V2, CueBinding, CueMatchMode, CueStrength, LegacyCueKindV1,
     ObserveInput, agent_candidate_input_schema, command_pattern, cue_binding_page_id,
     error_signature, normalize_binding, normalize_binding_pages, normalize_path,
     normalize_query_tokens, observe_input_schema, path_matches_boundary,
