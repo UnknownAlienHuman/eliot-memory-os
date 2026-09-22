@@ -1,5 +1,8 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r2"
+revision = 2
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22"
+supersedes_freeze_digest = "sha256:8aad397375a1c71da433a55d8a3881c5c009524e51fa7ec70f3ed77376727f13"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
@@ -321,7 +324,7 @@ order = 44
 crate = "eliot-memory-projection-contracts"
 functional_cell = "foundation.memory.projection-contracts"
 frozen_inputs = ["foundation identities/fences/lifecycle labels", "evidence epistemic/provenance vocabulary"]
-frozen_outputs = ["MemoryProjectionRecord", "MemoryProjectionBatch", "ApplicableMemorySet"]
+frozen_outputs = ["MemoryProjectionRecord", "MemoryProjectionBatch", "ApplicableMemorySet", "MemoryQueryIntent", "MemorySelectionPolicy", "MemorySelectionTrace"]
 
 [[cell_binding]]
 order = 46
@@ -382,18 +385,45 @@ frozen_inputs = ["ActiveUnderstandingView by handle"]
 blocked_inputs = ["accepted-source projection (NOT_FROZEN, CC-006)"]
 consumer_of_freeze = true
 
-[[not_frozen]]
-name = "MemoryQueryIntent"
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::MemoryQueryIntent"
+fields = ["contract_version", "binding", "kinds", "limit"]
+scope_fence_fields = ["binding"]
+denominator_note = "Intent carries no denominator; it selects from a batch that carries its own."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::MemorySelectionPolicy"
+fields = ["contract_version", "max_selected"]
+denominator_note = "Policy bounds emission; it carries no denominator."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+fields = ["contract_version", "binding", "allowlist", "intent_digest", "entries", "coverage"]
+scope_fence_fields = ["binding"]
+denominator_note = "SelectionCoverage{considered, selected, not_selected} counts exactly the presented records; the batch denominator is never echoed under a filtered set."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::SelectionEntry"
+fields = ["handle", "kind", "disposition"]
+denominator_note = "Selected entries passed the allowlist; NotSelected entries carry ExclusionReason::Rejected with trace-local meaning (rejected by the explicit allowlist in this trace, not a governed verdict)."
+
+[[challenge_closure]]
 challenge = "CC-MEMORY-PROJECTION-SCHEMA"
-reason = "No field-complete owner-neutral definition exists in the normative pair, rev11 materialization, or retained donors."
-[[not_frozen]]
-name = "MemorySelectionPolicy"
-challenge = "CC-MEMORY-PROJECTION-SCHEMA"
-reason = "No field-complete owner-neutral definition exists."
-[[not_frozen]]
-name = "MemorySelectionTrace"
-challenge = "CC-MEMORY-PROJECTION-SCHEMA"
-reason = "No field-complete owner-neutral definition exists."
+status = "CLOSED_BY_OWNER_CONTRACT"
+closed_by = "eliot-memory-projection-contracts selection.rs (MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace, select)"
+note = "MemoryContextProjectionRequest remains NOT_FROZEN below; it is a separate consumer request shape, not this selection schema."
+
+[[removed_package]]
+crate = "eliot-memory-projection"
+paths = ["crates/smart/eliot-memory-projection/**"]
+removed_in = "work/223-rev12-freeze commit 1e69357a"
+disposition = "REMOVED_SUPERSEDED"
+reason = "Candidate-query package duplicated the then-NOT_FROZEN selection surface and lost coverage semantics. Superseded by the owner selection schema above; the batch-to-applicability edge is preserved untouched. Recorded here so the removal is explicit, not silent."
+
 [[not_frozen]]
 name = "MemoryContextProjectionRequest"
 challenge = "CC-MEMORY-PROJECTION-SCHEMA"
