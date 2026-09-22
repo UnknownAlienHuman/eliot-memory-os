@@ -17,8 +17,9 @@
 //! every candidate still verifies its own derivation.
 
 use eliot_build_test_graph::{
-    ArtifactLineage, CacheCounters, CacheLookup, CachedArtifact, DerivedCacheIdentity,
-    DerivedCacheStore, FreshDerivation, RejectedCacheRecord, RootDisposition, TrustPolicy,
+    ArtifactLineage, CacheCounters, CacheLookup, CacheStoreError, CachedArtifact,
+    DerivedCacheIdentity, DerivedCacheStore, FreshDerivation, RejectedCacheRecord, RootDisposition,
+    TrustPolicy,
 };
 use thiserror::Error;
 
@@ -161,6 +162,38 @@ impl CacheLane {
             .validate()
             .map_err(|error| CacheLaneError::InvalidIdentity(error.to_string()))?;
         Ok(identity)
+    }
+
+    /// Consults the cache for a prebuilt identity without deriving anything.
+    ///
+    /// This is the pre-execution check of the two-phase production shape
+    /// (`lookup` → run the real derivation on a miss → [`CacheLane::publish_identity`]):
+    /// asynchronous composition roots consult the lane before spawning work
+    /// and publish the collected evidence afterwards. Any miss means the
+    /// caller must run the genuine uncached derivation.
+    pub fn lookup_identity(&mut self, identity: &DerivedCacheIdentity) -> CacheLookup {
+        self.store.lookup(identity, &self.trust)
+    }
+
+    /// Publishes one fresh derivation under a prebuilt identity.
+    ///
+    /// This is the post-execution step of the two-phase production shape:
+    /// the caller ran the real derivation (usually after a
+    /// [`CacheLane::lookup_identity`] miss) and hands over the collected
+    /// bytes. A publish failure is returned typed and never fails the
+    /// derivation the bytes came from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheStoreError`] when the identity is invalid, untrusted,
+    /// schema-unsupported, content-mismatched, oversized, or a narrower
+    /// subset overwrite without declared replacement semantics.
+    pub fn publish_identity(
+        &mut self,
+        identity: &DerivedCacheIdentity,
+        fresh: FreshDerivation,
+    ) -> Result<CachedArtifact, CacheStoreError> {
+        self.store.publish(identity, &self.trust, fresh)
     }
 
     /// Reuses a verified entry or runs the real uncached derivation.

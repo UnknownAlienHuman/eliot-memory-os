@@ -1611,10 +1611,13 @@ name = "eliot-engine"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-nextest",
  "eliot-instrument-runner",
+ "eliot-instrument-rustc",
+ "eliot-observability",
  "eliot-store",
  "eliot-types",
  "eliot-verifier",
