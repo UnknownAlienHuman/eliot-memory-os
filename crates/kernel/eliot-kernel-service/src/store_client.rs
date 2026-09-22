@@ -35,6 +35,9 @@ use crate::{HostStoreBootstrapRequirement, STORE_MODULE_IDENTITY};
 #[path = "store_exchange.rs"]
 mod store_exchange;
 
+#[path = "store_backup_client.rs"]
+mod store_backup_client;
+
 use store_exchange::RequestFailure;
 
 /// Transport boundary used by the neutral EBP store client.

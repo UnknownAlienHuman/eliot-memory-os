@@ -21,8 +21,13 @@ use crate::{
     ExactJsonBytes, MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest, NamedReadResponse, OperationId,
     OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
     RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
-    StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot,
-    WriteReceipt, dreamer_job::map_durable_error, json_shape_name, verify_canonical_request_hash,
+    StateFence, StoreBackupBeginRequest, StoreBackupCompletionReceipt, StoreBackupConsistency,
+    StoreBackupEndRequest, StoreBackupPage, StoreBackupPageRequest,
+    StoreBackupReconcileRequest, StoreBackupReconciliation, StoreBackupStatusReport,
+    StoreBackupStatusRequest, StoreBackupValidationReceipt, StoreBackupValidationRequest,
+    StoreError, StoreEvidencePack, StoreGenesisRequest, StoreHealth, StoreIsolatedRestoreRequest,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, dreamer_job::map_durable_error,
+    json_shape_name, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -68,6 +73,15 @@ pub const CAPABILITY_DREAMER_JOB_STATUS: &str = "store.dreamer_job.status";
 pub const CAPABILITY_DREAMER_JOB_REQUEST_CANCEL: &str = "store.dreamer_job.request_cancel";
 pub const CAPABILITY_DREAMER_JOB_RECONCILE: &str = "store.dreamer_job.reconcile";
 
+/// Declared (not advertised) capability for the Store backup edge
+/// (issue #975).
+///
+/// The wire variant selects this capability through
+/// [`StoreRequest::capability`], but it is deliberately absent from
+/// [`CAPABILITIES`]: API enum presence is not readiness, and the capability
+/// stays unadvertised until the #951/#952 backends are accepted. A session
+/// without this admitted capability rejects the operation before dispatch.
+pub const CAPABILITY_STORE_BACKUP: &str = "store.backup";
 /// Capabilities advertised by the canonical store process.
 pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_HEALTH,
@@ -249,6 +263,16 @@ pub enum StoreRequest {
         context: RequestMeta,
         request: DurableJobRequest,
     },
+    /// Store backup edge carrying #950's closed capture/page/end,
+    /// isolated-restore, validation, status and reconciliation operations
+    /// through the existing authenticated Store path (issue #975).
+    ///
+    /// One coordinated wire integration: the exact closed backup operation
+    /// travels as one closed variant reusing the #950 semantic types. An
+    /// unsupported backup request never falls back to any other operation.
+    Backup {
+        request: StoreBackupEnvelope,
+    },
 }
 
 impl StoreRequest {
@@ -312,6 +336,7 @@ impl StoreRequest {
                 }
                 Ok(())
             }
+            Self::Backup { request } => request.validate(),
         }
     }
 
@@ -323,6 +348,7 @@ impl StoreRequest {
             Self::Named { .. } => CAPABILITY_NAMED_READ,
             Self::Apply { .. } => CAPABILITY_APPLY,
             Self::ReservedWrite { .. } => CAPABILITY_RESERVED_WRITE,
+            Self::Backup { .. } => CAPABILITY_STORE_BACKUP,
             Self::Receipt { .. } => CAPABILITY_RECEIPT,
             Self::RevisionHeads { .. } => CAPABILITY_REVISION_HEADS,
             Self::OrderingHeads { .. } => CAPABILITY_ORDERING_HEADS,
@@ -467,6 +493,10 @@ impl StoreRequest {
                 request.validate_for_identity(request_id, identity)?;
                 Ok(())
             }
+            Self::Backup { request } => {
+                request.validate_for_identity(request_id, identity)?;
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -606,6 +636,12 @@ pub enum StoreResponse {
     DreamerJob {
         response: DurableJobResponse,
     },
+    /// Closed Store backup answer reusing the #950 semantic outcome types
+    /// (issue #975). Transport identity is bound by the frame correlation;
+    /// the envelope additionally binds operation, fence and outcome.
+    Backup {
+        response: StoreBackupEnvelopeResponse,
+    },
     /// Typed provider-neutral failure introduced by the v2 failure contract.
     Failure {
         failure: crate::StoreFailure,
@@ -708,6 +744,7 @@ impl StoreResponse {
             Self::DreamerJob { response } => response
                 .validate()
                 .map_err(|error| StoreWireError::Store(map_durable_error(error))),
+            Self::Backup { response } => response.validate(),
             Self::Genesis { receipt } => {
                 if receipt.transition_class != crate::TransitionClass::RecoverySchema {
                     return Err(StoreWireError::Store(StoreError::InvalidField {
@@ -1232,6 +1269,306 @@ fn validate_erasure_surface_request(
         return Err(StoreError::UnknownOperation);
     }
     Ok(())
+}
+
+/// Closed Store backup operation catalogue (issue #975).
+///
+/// Every supported #950 capture/page/end, isolated-restore, validation,
+/// status and reconciliation operation has exactly one representation here,
+/// reusing its semantic request type. No duplicate field family and no
+/// arbitrarily extensible operation string.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "backup_op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StoreBackupOperation {
+    /// Open one bounded coherent canonical snapshot.
+    Begin {
+        request: StoreBackupBeginRequest,
+    },
+    /// Read one page of an open capture.
+    Page {
+        request: StoreBackupPageRequest,
+    },
+    /// Close one capture and issue its completion receipt.
+    End {
+        request: StoreBackupEndRequest,
+    },
+    /// Restore validated canonical records into the admitted isolated
+    /// destination only.
+    IsolatedRestore {
+        request: StoreIsolatedRestoreRequest,
+    },
+    /// Validate one captured snapshot without restoring it.
+    Validate {
+        request: StoreBackupValidationRequest,
+    },
+    /// Observe the status of one backup operation.
+    Status {
+        request: StoreBackupStatusRequest,
+    },
+    /// Reconcile one uncertain backup mutation by exact identity.
+    Reconcile {
+        request: StoreBackupReconcileRequest,
+    },
+}
+
+impl StoreBackupOperation {
+    /// Returns the stable mutation operation identity of this operation.
+    #[must_use]
+    pub fn operation_id(&self) -> &OperationId {
+        match self {
+            Self::Begin { request } => &request.identity.operation_id,
+            Self::Page { request } => &request.operation_id,
+            Self::End { request } => &request.operation_id,
+            Self::IsolatedRestore { request } => &request.identity.operation_id,
+            Self::Validate { request } => &request.operation_id,
+            Self::Status { request } => &request.operation_id,
+            Self::Reconcile { request } => &request.operation_id,
+        }
+    }
+
+    /// Returns the transport idempotency key of this operation.
+    #[must_use]
+    pub fn idempotency_key(&self) -> String {
+        match self {
+            Self::Begin { request } => request.identity.idempotency_key.clone(),
+            Self::Page { request } => backup_read_key(&request.operation_id, "page"),
+            Self::End { request } => backup_read_key(&request.operation_id, "end"),
+            Self::IsolatedRestore { request } => request.identity.idempotency_key.clone(),
+            Self::Validate { request } => backup_read_key(&request.operation_id, "validate"),
+            Self::Status { request } => backup_read_key(&request.operation_id, "status"),
+            Self::Reconcile { request } => backup_read_key(&request.operation_id, "reconcile"),
+        }
+    }
+
+    /// Validates the closed backup operation.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        match self {
+            Self::Begin { request } => request.validate(),
+            Self::Page { request } => request.validate(),
+            Self::End { request } => request.validate(),
+            Self::IsolatedRestore { request } => request.validate(),
+            Self::Validate { request } => request.validate(),
+            Self::Status { request } => request.validate(),
+            Self::Reconcile { request } => request.validate(),
+        }
+    }
+}
+
+/// Derives the deterministic transport correlation key for a backup
+/// observation. Observations cross no effect boundary, so a stable per
+/// operation-and-kind key keeps correlation distinct from the stable
+/// mutation identity without minting a fresh mutation.
+fn backup_read_key(operation_id: &OperationId, kind: &str) -> String {
+    format!("store-backup-{kind}:{operation_id}")
+}
+
+/// Closed authenticated Store backup request envelope (issue #975).
+///
+/// Carries the stable mutation identity, the fence separately from the
+/// payload, and exactly one closed backup operation. Transport identity
+/// (frame `request_id`, EBP `RequestIdentity`) is added by the wire framing
+/// in [`request_frame`]; digests carried inside the operation are compared
+/// for equality downstream and never re-derived here.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreBackupEnvelope {
+    /// Stable mutation identity minted by Kernel admission.
+    pub identity: OperationIdentity,
+    /// Fence this backup operation is bound to.
+    pub state_fence: StateFence,
+    /// Exactly one closed backup operation.
+    pub operation: StoreBackupOperation,
+}
+
+impl StoreBackupEnvelope {
+    /// Returns the exact capability required to dispatch this envelope.
+    #[must_use]
+    pub const fn required_capability() -> &'static str {
+        CAPABILITY_STORE_BACKUP
+    }
+
+    /// Validates the envelope and its closed operation without granting
+    /// authority.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.identity.validate()?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        self.operation.validate()?;
+        if self.operation.operation_id() != &self.identity.operation_id {
+            return Err(StoreError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Binds the decoded envelope to the authenticated EBP request identity.
+    ///
+    /// Mirrors the `Apply` binding: the transported fence must equal the
+    /// authenticated fence, the envelope mutation identity must equal the
+    /// transport identity, and the frame correlation must match. A claimed
+    /// operation id, self-consistent digest, or well-formed scope never
+    /// replaces the trusted transport identity; the identity always wins
+    /// over payload mirrors.
+    pub fn validate_for_identity(
+        &self,
+        request_id: &RequestId,
+        identity: &RequestIdentity,
+    ) -> Result<(), StoreWireError> {
+        self.validate().map_err(StoreWireError::Store)?;
+        identity
+            .validate()
+            .map_err(|error| StoreWireError::Protocol(error.to_string()))?;
+        if request_id != &identity.request.metadata.request_id {
+            return Err(StoreWireError::Identity(
+                "frame request_id does not match request identity metadata".to_owned(),
+            ));
+        }
+        if self.identity.idempotency_key != identity.idempotency_key {
+            return Err(StoreWireError::Identity(
+                "backup idempotency key does not match request identity".to_owned(),
+            ));
+        }
+        if self.state_fence != identity.request.state_fence {
+            return Err(StoreWireError::Identity(
+                "backup fence does not match request identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Closed Store backup outcome catalogue (issue #975).
+///
+/// Exactly one answer shape per operation family, reusing the #950 semantic
+/// types. Unsupported, partial, expired and unknown states travel here as
+/// explicit outcomes or as the typed `Failure` response; they never travel
+/// as success.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "backup_outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StoreBackupOutcome {
+    /// Opened capture consistency handle.
+    Begun {
+        consistency: StoreBackupConsistency,
+    },
+    /// One bounded capture page.
+    Page {
+        page: StoreBackupPage,
+    },
+    /// Capture or isolated-restore completion receipt.
+    Completion {
+        receipt: StoreBackupCompletionReceipt,
+    },
+    /// Consumer evidence pack for the completed capture.
+    Evidence {
+        pack: StoreEvidencePack,
+    },
+    /// Snapshot validation receipt.
+    Validation {
+        receipt: StoreBackupValidationReceipt,
+    },
+    /// Backup operation status report.
+    Status {
+        report: StoreBackupStatusReport,
+    },
+    /// Reconciliation outcome for one backup operation.
+    Reconciliation {
+        reconciliation: StoreBackupReconciliation,
+    },
+}
+
+impl StoreBackupOutcome {
+    /// Validates the closed backup outcome.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        match self {
+            Self::Begun { consistency } => consistency.validate(),
+            Self::Page { page } => page.validate(),
+            Self::Completion { receipt } => receipt.validate(),
+            Self::Evidence { pack } => pack.validate(),
+            Self::Validation { receipt } => receipt.validate(),
+            Self::Status { report } => report.validate(),
+            Self::Reconciliation { .. } => Ok(()),
+        }
+    }
+}
+
+/// Closed authenticated Store backup response envelope (issue #975).
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreBackupEnvelopeResponse {
+    /// Backup operation this answer belongs to.
+    pub operation_id: OperationId,
+    /// Fence this answer is bound to.
+    pub state_fence: StateFence,
+    /// Exactly one closed backup outcome.
+    pub outcome: StoreBackupOutcome,
+}
+
+impl StoreBackupEnvelopeResponse {
+    /// Validates the envelope and binds every inner outcome identity to the
+    /// envelope operation. An echoed payload with a foreign operation id is
+    /// not a receipt.
+    pub fn validate(&self) -> Result<(), StoreWireError> {
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        self.outcome.validate().map_err(StoreWireError::Store)?;
+        match &self.outcome {
+            StoreBackupOutcome::Begun { consistency } => {
+                if consistency.operation_id != self.operation_id
+                    || consistency.state_fence != self.state_fence
+                {
+                    return Err(StoreWireError::Invalid(
+                        "backup consistency handle does not match the envelope binding".to_owned(),
+                    ));
+                }
+            }
+            StoreBackupOutcome::Page { page } => {
+                if page.operation_id != self.operation_id || page.state_fence != self.state_fence {
+                    return Err(StoreWireError::Invalid(
+                        "backup page does not match the envelope binding".to_owned(),
+                    ));
+                }
+            }
+            StoreBackupOutcome::Completion { receipt } => {
+                if receipt.operation_id != self.operation_id
+                    || receipt.state_fence != self.state_fence
+                {
+                    return Err(StoreWireError::Invalid(
+                        "backup completion receipt does not match the envelope binding".to_owned(),
+                    ));
+                }
+            }
+            StoreBackupOutcome::Evidence { pack } => {
+                if pack.receipt().operation_id != self.operation_id
+                    || pack.receipt().state_fence != self.state_fence
+                {
+                    return Err(StoreWireError::Invalid(
+                        "backup evidence pack does not match the envelope binding".to_owned(),
+                    ));
+                }
+            }
+            StoreBackupOutcome::Validation { receipt } => {
+                if receipt.operation_id != self.operation_id
+                    || receipt.state_fence != self.state_fence
+                {
+                    return Err(StoreWireError::Invalid(
+                        "backup validation receipt does not match the envelope binding".to_owned(),
+                    ));
+                }
+            }
+            StoreBackupOutcome::Status { report } => {
+                if report.operation_id != self.operation_id
+                    || report.state_fence != self.state_fence
+                {
+                    return Err(StoreWireError::Invalid(
+                        "backup status report does not match the envelope binding".to_owned(),
+                    ));
+                }
+            }
+            StoreBackupOutcome::Reconciliation { .. } => {}
+        }
+        Ok(())
+    }
 }
 
 fn validate_legacy_failure_text(value: &str, field: &'static str) -> Result<(), StoreWireError> {
