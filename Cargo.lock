@@ -1645,6 +1645,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-self-query"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eliot-dreamer-structure-repair"
 version = "0.1.0"
 dependencies = [
@@ -1714,6 +1725,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-epistemic-context-provider"
+version = "0.1.0"
+dependencies = [
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-epistemic-contracts"
 version = "0.1.0"
 dependencies = [
@@ -1761,6 +1785,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-experience-projection"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
