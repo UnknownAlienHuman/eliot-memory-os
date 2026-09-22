@@ -49,7 +49,7 @@ eliot-platform-windows.workspace = true
 # (never the memory adapter) plus the Governor read facade under test. These
 # edges never enter the production dependency graph or the runtime boundary.
 eliot-store-surreal-adapter.workspace = true
-eliot-read = { path = "../../governor/eliot-read" }
+eliot-read = { path = "../../governor/eliot-read", version = "0.1.0" }
 # Issue #1905: lifecycle persist tests admit real curation chains, so the
 # epistemic/evidence contract types behind the fixtures are test-only deps.
 # They never enter the production dependency graph or the runtime boundary.
