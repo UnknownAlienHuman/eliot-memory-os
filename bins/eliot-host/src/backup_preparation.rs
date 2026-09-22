@@ -331,47 +331,26 @@ fn reject_reparse(_path: &Path) -> Result<(), PreparationError> {
 }
 
 /// Captures the OS identity of a root (volume + file index on Windows).
+///
+/// Identity observation belongs to the platform-windows owner: this calls
+/// [`eliot_platform_windows::directory_identity_for_path`], which opens the
+/// directory without following reparse points and reads the stable identity
+/// from the opened handle. Host only formats the observed identity into the
+/// preparation receipt and never touches a raw handle, so this module stays
+/// under the crate's `#![forbid(unsafe_code)]`.
 #[cfg(windows)]
 fn capture_identity(path: &Path) -> Result<RootIdentity, PreparationError> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GetFileInformationByHandle,
-    };
-
-    // Directories open for identity reads only with backup semantics.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
+    eliot_platform_windows::directory_identity_for_path(path)
+        .map(|identity| RootIdentity {
+            identity: format!(
+                "{}:{}",
+                identity.volume_serial_number, identity.file_index
+            ),
+        })
         .map_err(|error| PreparationError::FilesystemEffect {
             path: path.to_string_lossy().into_owned(),
-            reason: format!("cannot open prepared root for identity: {error}"),
-        })?;
-    let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    let ok = unsafe {
-        // SAFETY: the file handle is live for this statement and `information`
-        // is valid zeroed output storage (installer precedent:
-        // `file_identity_from_handle_staged`).
-        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &raw mut information)
-    };
-    if ok == 0 {
-        let code = unsafe { GetLastError() };
-        return Err(PreparationError::FilesystemEffect {
-            path: path.to_string_lossy().into_owned(),
-            reason: format!("root identity query failed (win32 {code})"),
-        });
-    }
-    Ok(RootIdentity {
-        identity: format!(
-            "{}:{}",
-            information.dwVolumeSerialNumber,
-            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow)
-        ),
-    })
+            reason: format!("root identity query failed: {error}"),
+        })
 }
 
 #[cfg(not(windows))]
