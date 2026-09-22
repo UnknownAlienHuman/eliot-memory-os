@@ -1135,6 +1135,8 @@ impl KernelComposition {
             #[cfg(windows)]
             agent_bridge_profile: Mutex::new(None),
             #[cfg(windows)]
+            agent_bridge_transition: std::sync::RwLock::new(()),
+            #[cfg(windows)]
             agent_bridge_admission,
             #[cfg(windows)]
             agent_bridge_peer_set_revision: AtomicU64::new(0),
