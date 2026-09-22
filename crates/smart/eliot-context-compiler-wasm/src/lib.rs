@@ -27,6 +27,8 @@
 pub mod conversion;
 pub mod descriptor;
 pub mod export;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod host;
 
 pub use conversion::{
     CallLedger, ConversionError, GuestError, GuestRequest, GuestResponse, INCOMPLETE_CODE,

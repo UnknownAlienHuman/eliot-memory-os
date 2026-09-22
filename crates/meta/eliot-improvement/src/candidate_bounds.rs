@@ -628,6 +628,10 @@ pub enum BoundsError {
     NotBacklogAdmitted,
     #[error("presented admitted overlay has no live backing overlay")]
     OverlayBackingMismatch,
+    #[error("presented reusable candidate is not bound by the verified permit")]
+    ReusableBackingMismatch,
+    #[error("learning production identity invalid: {0}")]
+    InvalidProduction(&'static str),
     #[error("retrieval campaign does not match the closure campaign")]
     ClosureCampaignMismatch,
     #[error("candidate error: {0}")]
