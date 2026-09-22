@@ -315,7 +315,7 @@ pub enum ConversionError {
     TooLarge,
 }
 
-fn check_envelope(request: &GuestRequest) -> Result<(), GuestError> {
+pub(crate) fn check_envelope(request: &GuestRequest) -> Result<(), GuestError> {
     if request.abi_version != GUEST_ABI_VERSION {
         return Err(GuestError::RejectedEnvelope("abi_version".to_owned()));
     }
