@@ -214,7 +214,7 @@ fn leg_for<'a>(
             if found.is_some() {
                 return Err(OwnerSupplyError::Invalid {
                     projection: slot.name(),
-                    detail: "duplicate snapshot leg".to_string(),
+                    detail: "duplicate snapshot leg".to_owned(),
                 });
             }
             found = Some(leg);
@@ -238,13 +238,13 @@ fn verified_leg_content<'a>(
     if !valid_identity(leg.owner_id) || !valid_identity(leg.source_revision) {
         return Err(OwnerSupplyError::Invalid {
             projection: slot,
-            detail: "snapshot leg identity is invalid".to_string(),
+            detail: "snapshot leg identity is invalid".to_owned(),
         });
     }
     if !valid_digest(leg.content_digest) {
         return Err(OwnerSupplyError::Invalid {
             projection: slot,
-            detail: "snapshot leg digest is invalid".to_string(),
+            detail: "snapshot leg digest is invalid".to_owned(),
         });
     }
     if sha256_hex(leg.content) != leg.content_digest {
@@ -418,4 +418,30 @@ pub fn ingest_served_snapshot_delivery(
         });
     }
     retention.ingest(set, served.reply_revision)
+}
+
+/// Ingest one observed coherent projection set into retention.
+///
+/// Unlike [`ingest_served_snapshot_delivery`], the caller passes validated
+/// slot bytes observed from owner serving state by the feeding driver
+/// (restore reply snapshots that decoded, validated, and fence-bound per
+/// slot — never asserted): the set is still re-validated here through the
+/// supply read, its session echo checked, and only then retained. No owner
+/// revision assertions travel this path beyond `revision`, which is retained
+/// as the observed serving revision.
+pub fn ingest_observed_projection_set(
+    retention: &mut ReactiveOwnerRetention,
+    live_session: &str,
+    live_fence: &StateFence,
+    bytes: &OwnerProjectionBytes<'_>,
+    revision: Option<u64>,
+) -> Result<(), OwnerSupplyError> {
+    let set = read_owner_projection_set(live_fence, bytes)?;
+    if set.session().session_id.as_str() != live_session {
+        return Err(OwnerSupplyError::BindingMismatch {
+            projection: "session",
+            field: "session.session_id",
+        });
+    }
+    retention.ingest(set, revision)
 }

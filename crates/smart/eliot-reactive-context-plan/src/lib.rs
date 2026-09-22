@@ -30,7 +30,7 @@ pub use input::{
 pub use owner_retention::{
     MAX_RETAINED_PROJECTION_SETS, MAX_SNAPSHOT_IDENTITY_BYTES, ProjectionSnapshotSlot,
     ReactiveOwnerRetention, ServedSnapshotDelivery, ServedSnapshotLeg,
-    ingest_served_snapshot_delivery,
+    ingest_observed_projection_set, ingest_served_snapshot_delivery,
 };
 pub use owner_supply::{
     MAX_OWNER_SNAPSHOT_BYTES, OwnerProjectionBytes, OwnerProjectionSet, OwnerSupplyError,
