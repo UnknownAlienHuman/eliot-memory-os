@@ -20,13 +20,18 @@ eliot-profile-full-composition = []
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-governor.workspace = true
 eliot-installation.workspace = true
 eliot-ipc.workspace = true
+eliot-observation-contracts.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process-executor.workspace = true
 eliot-process.workspace = true
 eliot-protocol.workspace = true
+eliot-receipts.workspace = true
+eliot-runtime-contracts.workspace = true
 eliot-runtime.workspace = true
+eliot-security-contracts.workspace = true
 eliot-wasm-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -39,15 +44,14 @@ workspace = true
 
 [dev-dependencies]
 wat.workspace = true
-# Joined admitted-execution proof only: real Governor admission, real P03
-# executor lane, and the owner contract crates they thread. Never used by
-# the production composition below.
+# Joined admitted-execution proof only: real P03 executor lane and owner
+# contract crates not threaded by the production composition below. The
+# Governor/observation/runtime/security contract crates moved to the
+# production composition with the dispatch invocation owner (issue #1955):
+# the parent calls the existing Governor admission factory
+# (`GovernorWasmAdmission::from_owners`) and assembles owner-typed records
+# from admitted material instead of minting them.
 eliot-contracts.workspace = true
-eliot-governor.workspace = true
-eliot-observation-contracts.workspace = true
 eliot-platform.workspace = true
 eliot-process.workspace = true
 eliot-process-executor.workspace = true
-eliot-receipts.workspace = true
-eliot-runtime-contracts.workspace = true
-eliot-security-contracts.workspace = true

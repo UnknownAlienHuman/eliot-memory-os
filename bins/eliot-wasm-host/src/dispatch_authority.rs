@@ -171,6 +171,12 @@ impl ValidatedDispatchGrant {
     pub const fn expires_at(&self) -> u64 {
         self.expires_at
     }
+
+    /// Returns the fence generation bound at admission.
+    #[must_use]
+    pub fn fence_generation(&self) -> u64 {
+        self.fence.generation().get()
+    }
 }
 
 /// In-child P-03 dispatch authority for the WASM contour.
