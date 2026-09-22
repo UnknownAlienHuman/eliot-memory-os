@@ -25,7 +25,8 @@ use eliot_installation::{
     ActivationCommitFence, ApprovedGeneration, ApprovedGenerationRegistry, RedbInstallationRegistry,
     RuntimeStateRoots,
 };
-use eliot_platform_windows::{FileIdentity, ProtectedRootLease, windows_paths_equal};
+use eliot_platform::PlatformHandle;
+use eliot_platform_windows::{FileIdentity, HostOwnerLease, ProtectedRootLease, windows_paths_equal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -1095,4 +1096,73 @@ pub fn verify_staging_parent_lease(parent: &Path) -> Result<PathBuf, Preparation
             reason: format!("staging parent identity changed during admission: {error}"),
         }
     })
+}
+
+/// Authenticated caller control for one delegated preparation (issue #958).
+///
+/// Shape carries the owner-issued caller lease digest and the caller fence
+/// digest so refusals and (later) admissions bind them into the audit trail.
+/// Caller authentication itself is pending #954 role-bound control: until
+/// the #954 owner port lands, [`BackupCallerAuth::authenticate`] fails
+/// closed and no destination effect is reachable through delegation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BackupCallerAuth {
+    /// Owner-issued caller lease digest (hex64; shape-checked only).
+    pub lease_digest: String,
+    /// Caller-observed fence digest bound into the receipt (hex64).
+    pub fence_digest: String,
+}
+
+impl BackupCallerAuth {
+    /// Shape-checks the presented caller digests without granting authority.
+    pub fn check_shapes(&self) -> Result<(), PreparationError> {
+        check_digest(&self.lease_digest, "caller_lease_digest")?;
+        check_digest(&self.fence_digest, "caller_fence_digest")?;
+        Ok(())
+    }
+
+    /// Authenticates the caller against owner-issued control evidence.
+    ///
+    /// Fail-closed pending the #954 caller-control port: there is currently
+    /// no owner-issued caller token to verify against, so every caller is
+    /// refused here before any destination effect. The #954 implementation
+    /// fills this method without changing its signature or callers.
+    pub fn authenticate(&self) -> Result<(), PreparationError> {
+        Err(PreparationError::InvalidRequest {
+            field: "caller_auth",
+            reason: "authenticated caller control pending #954; unauthenticated preparation refused"
+                .to_owned(),
+        })
+    }
+
+    /// Authenticates the caller against held owner facts without minting
+    /// authority.
+    ///
+    /// Verifies digest shapes, then requires the held owner lease to cover
+    /// the launch installation and the presented source to equal it. The
+    /// lease/fence digests stay shape-checked audit-trail evidence: no owner
+    /// digest scheme binds them yet, so they grant nothing here.
+    /// Caller-channel (control-plane principal) authentication awaits the
+    /// #954 role-bound port and is reported as backlog, not assumed.
+    pub fn authenticate_for_owner(
+        &self,
+        lease: &HostOwnerLease,
+        installation: &PlatformHandle,
+        source_installation_id: &str,
+    ) -> Result<(), PreparationError> {
+        self.check_shapes()?;
+        if !lease.is_for_installation(installation) {
+            return Err(PreparationError::InvalidRequest {
+                field: "caller_auth",
+                reason: "held owner lease does not cover the launch installation".to_owned(),
+            });
+        }
+        if source_installation_id != installation.as_str() {
+            return Err(PreparationError::InvalidRequest {
+                field: "caller_auth",
+                reason: "presented source differs from the lease-bound installation".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }

@@ -3946,24 +3946,27 @@ impl HostComposition {
     /// owner evidence (B-BACKUP-HOST-PREP #958, lane E).
     ///
     /// Binds the lane-E delegation sink to live composition authority: the
-    /// held owner lease must cover the launch installation, the presented
-    /// source installation must equal it, and the destination is prepared
-    /// from inspected owner evidence through the caller-supplied journal
-    /// sink. The sink returns alongside the destination so the caller can
-    /// reconcile, cancel, or clean up the same operation later. Durable
-    /// production journal binding awaits the Host-state owner's preparation
-    /// record variant; until then the sink stays a port. Caller-channel
+    /// presented caller passes the
+    /// [`BackupCallerAuth`](crate::backup_preparation::BackupCallerAuth)
+    /// owner gate (held lease covers the launch installation, presented
+    /// source equals it), and the destination is prepared from inspected
+    /// owner evidence through the caller-supplied journal sink. The sink
+    /// returns alongside the destination so the caller can reconcile,
+    /// cancel, or clean up the same operation later. Durable production
+    /// journal binding awaits the Host-state owner's preparation record
+    /// variant; until then the sink stays a port. Caller-channel
     /// authentication beyond this installation binding stays parameterized
     /// pending role-bound control contracts.
     ///
     /// # Errors
     ///
     /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
-    /// when the lease/installation binding, owner evidence, admission, or
-    /// journal persistence fails closed.
+    /// when the caller gate, lease/installation binding, owner evidence,
+    /// admission, or journal persistence fails closed.
     pub fn prepare_backup_destination<J: crate::backup_preparation::PreparationJournal>(
         &self,
         journal: J,
+        caller: &crate::backup_preparation::BackupCallerAuth,
         request: &crate::backup_preparation::PresentedPreparationRequest,
     ) -> Result<
         (
@@ -3972,22 +3975,12 @@ impl HostComposition {
         ),
         crate::backup_preparation::PreparationError,
     > {
-        use crate::backup_preparation::{
-            DelegatedPreparation, OwnerEvidence, PreparationError,
-        };
-        let installation = self.launch_options.installation();
-        if !self.owner_lease.is_for_installation(installation) {
-            return Err(PreparationError::InvalidRequest {
-                field: "source_installation_id",
-                reason: "held owner lease does not cover the launch installation".to_owned(),
-            });
-        }
-        if request.source_installation_id != installation.as_str() {
-            return Err(PreparationError::InvalidRequest {
-                field: "source_installation_id",
-                reason: "presented source differs from the launch installation".to_owned(),
-            });
-        }
+        use crate::backup_preparation::{DelegatedPreparation, OwnerEvidence};
+        caller.authenticate_for_owner(
+            &self.owner_lease,
+            self.launch_options.installation(),
+            &request.source_installation_id,
+        )?;
         let evidence = OwnerEvidence::inspect(&self.registry_host_root)?;
         let mut sink = DelegatedPreparation::new(journal);
         let prepared = sink.prepare(&evidence, request)?;
