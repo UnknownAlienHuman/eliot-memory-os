@@ -21,7 +21,11 @@ use std::path::{Path, PathBuf};
 use crate::backup_config_projection::{
     ApprovedBuildBinding, ProjectionError, bind_approved_build,
 };
-use eliot_installation::{ApprovedGeneration, InstallationProfile, InstallationRoots};
+use eliot_installation::{
+    ApprovedGeneration, ApprovedGenerationRegistry, InstallationProfile, InstallationRoots,
+    RedbInstallationRegistry,
+};
+use eliot_platform_windows::ProtectedRootLease;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -877,4 +881,109 @@ fn projection_to_preparation(error: ProjectionError) -> PreparationError {
             reason: "evidence is not current owner evidence".to_owned(),
         },
     }
+}
+
+/// Read-only owner registry evidence for one protected Host root.
+///
+/// This is the delegation-time read bundle HostComposition holds while
+/// preparing: the installation registry projection is inspected through the
+/// existing read-only owner query
+/// ([`RedbInstallationRegistry::inspect_existing_at`], A13.9 short-lived
+/// poll read — no writer is acquired and no registry mutation is possible
+/// here), so the active generation served below is registry-committed owner
+/// state, never a caller assertion. The bundle owns the projection; every
+/// accessor borrows from it, so evidence cannot outlive its read.
+pub struct OwnerRegistryEvidence {
+    registry: ApprovedGenerationRegistry,
+}
+
+impl OwnerRegistryEvidence {
+    /// Inspects the committed installation registry below one protected Host
+    /// root without acquiring a writer.
+    ///
+    /// Fail-closed: an unprotectable root yields
+    /// [`PreparationError::FilesystemEffect`], a withheld inspection yields
+    /// [`PreparationError::InvalidRequest`] naming `source_registry`, and an
+    /// absent registry file yields the same with a distinct reason — absence
+    /// of proof is never treated as proof of absence.
+    pub fn inspect(host_state_root: &Path) -> Result<Self, PreparationError> {
+        let lease = ProtectedRootLease::open_existing(host_state_root).map_err(|error| {
+            PreparationError::FilesystemEffect {
+                path: host_state_root.to_string_lossy().into_owned(),
+                reason: format!("protected source root unavailable: {error}"),
+            }
+        })?;
+        let registry =
+            RedbInstallationRegistry::inspect_existing_at(lease).map_err(|_| {
+                PreparationError::InvalidRequest {
+                    field: "source_registry",
+                    reason: "owner registry inspection withheld".to_owned(),
+                }
+            })?;
+        let Some(registry) = registry else {
+            return Err(PreparationError::InvalidRequest {
+                field: "source_registry",
+                reason: "no committed installation registry under the protected root".to_owned(),
+            });
+        };
+        Ok(Self { registry })
+    }
+
+    /// Returns the currently active approved generation, if the registry
+    /// carries a committed active record.
+    ///
+    /// `None` means no active generation is committed — callers withhold
+    /// preparation rather than substituting any other record.
+    pub fn active_generation(&self) -> Option<&ApprovedGeneration> {
+        self.registry.active()
+    }
+
+    /// Binds the active generation to owner-verified build facts.
+    ///
+    /// Combines [`OwnerRegistryEvidence::active_generation`] with
+    /// [`bind_approved_build`]: absent, inactive, or owner-invalid records
+    /// fail closed before any destination effect.
+    pub fn approved_binding(&self) -> Result<ApprovedBuildBinding, PreparationError> {
+        let Some(approved) = self.active_generation() else {
+            return Err(PreparationError::InvalidRequest {
+                field: "approved_generation",
+                reason: "no active approved generation committed".to_owned(),
+            });
+        };
+        bind_approved_build(approved).map_err(projection_to_preparation)
+    }
+
+    /// Returns the registry CAS revision observed at inspection time.
+    ///
+    /// Binds "current": HostComposition compares revisions to detect
+    /// registry movement between inspection and preparation. This is the
+    /// registry revision, not the purge-ledger revision, whose authority
+    /// belongs to the backup domain.
+    pub fn revision(&self) -> u64 {
+        self.registry.revision()
+    }
+}
+
+/// Verifies one staging parent against the protected-root owner.
+///
+/// Opens the existing protected-root lease (containment-checked,
+/// identity-pinned) and returns the re-verified canonical path. This is the
+/// production-only lease gate: fixture or explicitly admitted non-protected
+/// parents bypass it by not calling it, while [`prepare_isolated_destination`]
+/// always re-applies the structural admission checks. Fail-closed with
+/// static reasons; lease error internals are echoed only inside
+/// [`PreparationError::FilesystemEffect`], matching file precedent.
+pub fn verify_staging_parent_lease(parent: &Path) -> Result<PathBuf, PreparationError> {
+    let lease = ProtectedRootLease::open_existing(parent).map_err(|error| {
+        PreparationError::FilesystemEffect {
+            path: parent.to_string_lossy().into_owned(),
+            reason: format!("staging parent is not a protected root: {error}"),
+        }
+    })?;
+    lease.canonical_path().map_err(|error| {
+        PreparationError::FilesystemEffect {
+            path: parent.to_string_lossy().into_owned(),
+            reason: format!("staging parent identity changed during admission: {error}"),
+        }
+    })
 }
