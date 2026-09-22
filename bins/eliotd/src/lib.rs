@@ -58,6 +58,7 @@ mod kernel_transition_client;
 pub mod notification_board_attach;
 mod observation_adapters;
 mod process_origin;
+pub mod reactive_feed;
 mod route_receipts;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -159,6 +160,10 @@ pub use process_origin::{
     PhysicalProcessBinding, ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError,
     ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
     request_origin_control,
+};
+pub use reactive_feed::{
+    ReactiveFeedSupplyError, drive_daemon_feed, drive_daemon_feed_from_owners,
+    project_live_bindings,
 };
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
@@ -455,6 +460,38 @@ impl DaemonComposition {
     #[must_use]
     pub fn policy_owner(&self) -> Option<&eliot_governor::PolicyOwner> {
         self.governor.owners().policy.as_ref()
+    }
+
+    /// Drives one reactive Context feed from the live daemon composition.
+    ///
+    /// The daemon obtains the activation snapshot from the authenticated
+    /// Governor owners and the admitted observation journal from that same
+    /// owner set. The caller supplies only the immutable cue/index rows and
+    /// six A4 projections emitted by their owning lanes; the feed adapter
+    /// cross-checks those rows against the journal before planning. This is
+    /// the composition entrypoint used by the Host runtime when its owner
+    /// projections are ready. No queue, receipt, or alternate authority is
+    /// retained here.
+    pub fn drive_reactive_feed(
+        &self,
+        now: u64,
+        owner_sources: &[eliot_governor::ReactiveOwnerSource],
+        inputs: eliot_reactive_context_plan::SettledPlanFeedInputs<'_>,
+    ) -> Result<eliot_reactive_context_plan::SettledPlanFeedOutcome, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let snapshot = self
+            .governor
+            .read_unique_agent_activation(now)
+            .map_err(DaemonError::Composition)?;
+        reactive_feed::drive_daemon_feed_from_owners(
+            &snapshot,
+            &self.governor.owners().observation,
+            owner_sources,
+            inputs,
+        )
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Returns the retained protected daemon state root.

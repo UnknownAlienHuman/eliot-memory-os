@@ -18,7 +18,7 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, StateFence};
-use eliot_cue_binding::{CueBindingResult, derive_cue_binding_candidates};
+use eliot_cue_binding::{derive_cue_binding_candidates, CueBindingResult};
 use eliot_cue_contracts::{BindingCandidateId, Digest, TargetHandle};
 use eliot_observation::{
     ObservationAdmissionReceipt, ObservationAdmissionResult, ObservationJournal,
@@ -158,6 +158,111 @@ pub trait ReactiveTargetAtomOwner {
         admission: &ObservationAdmissionReceipt,
         cue: &CueBindingResult,
     ) -> Result<Vec<ReactiveTargetAtomBinding>, String>;
+}
+
+/// One immutable row of owner-issued reactive state.
+///
+/// The A-12 result carries its own exact admission identity. The atom joins
+/// are retained beside that result by the context owner; this value is only a
+/// read snapshot consumed by [`RetainedReactiveOwnerSources`]. It is not a
+/// queue, cache, or second authority, and it never derives an atom identity
+/// from a cue target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReactiveOwnerSource {
+    /// The retained A-12 result for one admitted observation.
+    pub cue_binding: CueBindingResult,
+    /// The context owner's explicit candidate-to-atom joins for that result.
+    pub target_atom_bindings: Vec<ReactiveTargetAtomBinding>,
+}
+
+impl ReactiveOwnerSource {
+    /// Retain one owner-issued cue result and its explicit atom joins.
+    #[must_use]
+    pub const fn new(
+        cue_binding: CueBindingResult,
+        target_atom_bindings: Vec<ReactiveTargetAtomBinding>,
+    ) -> Self {
+        Self {
+            cue_binding,
+            target_atom_bindings,
+        }
+    }
+}
+
+/// Concrete read-only adapters over the current owner snapshots.
+///
+/// The adapter indexes no state and owns no mutable collection. It searches
+/// the bounded source rows supplied by the actual A-12/context owners for the
+/// exact admission being projected. A row with a matching record identity but
+/// a different full receipt is an error; duplicate rows are also an error.
+/// This makes the production adapter useful without weakening the generic
+/// ports used by other owner implementations.
+pub struct RetainedReactiveOwnerSources<'a> {
+    sources: &'a [ReactiveOwnerSource],
+}
+
+impl<'a> RetainedReactiveOwnerSources<'a> {
+    /// Borrow the owner-issued rows for one projection read.
+    #[must_use]
+    pub const fn new(sources: &'a [ReactiveOwnerSource]) -> Self {
+        Self { sources }
+    }
+
+    fn source_for(
+        &self,
+        admission: &ObservationAdmissionReceipt,
+    ) -> Result<Option<&'a ReactiveOwnerSource>, String> {
+        let mut found = None;
+        for source in self.sources {
+            if source.cue_binding.admission.record_id != admission.record_id {
+                continue;
+            }
+            if found.is_some() {
+                return Err(format!(
+                    "duplicate reactive owner source for admitted record {}",
+                    admission.record_id
+                ));
+            }
+            if source.cue_binding.admission != *admission {
+                return Err(format!(
+                    "reactive owner source receipt disagrees for admitted record {}",
+                    admission.record_id
+                ));
+            }
+            found = Some(source);
+        }
+        Ok(found)
+    }
+}
+
+impl ReactiveCueBindingOwner for RetainedReactiveOwnerSources<'_> {
+    fn read_cue_binding(
+        &self,
+        admission: &ObservationAdmissionReceipt,
+    ) -> Result<Option<&CueBindingResult>, String> {
+        Ok(self
+            .source_for(admission)?
+            .map(|source| &source.cue_binding))
+    }
+}
+
+impl ReactiveTargetAtomOwner for RetainedReactiveOwnerSources<'_> {
+    fn read_target_atom_bindings(
+        &self,
+        admission: &ObservationAdmissionReceipt,
+        cue: &CueBindingResult,
+    ) -> Result<Vec<ReactiveTargetAtomBinding>, String> {
+        let Some(source) = self.source_for(admission)? else {
+            return Ok(Vec::new());
+        };
+        if source.cue_binding != *cue {
+            return Err(format!(
+                "reactive owner source cue changed for admitted record {}",
+                admission.record_id
+            ));
+        }
+        Ok(source.target_atom_bindings.clone())
+    }
 }
 
 /// One admitted observation and its owner-issued cue projection.
@@ -400,6 +505,22 @@ where
     Ok(projection)
 }
 
+/// Project the current journal through the concrete retained owner adapters.
+///
+/// This is the production convenience path: callers provide the immutable
+/// rows emitted by the real cue/context owners, while the journal itself stays
+/// the Governor-owned admitted-record source. No caller-shaped generic port
+/// implementation is needed at the daemon boundary.
+pub fn project_reactive_owner_from_sources(
+    journal: &ObservationJournal,
+    scope_id: &WorkScopeId,
+    state_fence: &StateFence,
+    sources: &[ReactiveOwnerSource],
+) -> Result<ReactiveOwnerProjection, ReactiveOwnerProjectionError> {
+    let owners = RetainedReactiveOwnerSources::new(sources);
+    project_reactive_owner(journal, scope_id, state_fence, &owners, &owners)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -416,10 +537,10 @@ mod tests {
         BindingProfile, BindingRule, ResourceField, TouchedResourceProjection,
     };
     use eliot_cue_contracts::{
-        BindingRole, CONTRACT_REVISION, CueContext, CueKind, NormalizationProfile, ObservedCue,
-        ObservedCueId, PrivacyClass, SourceHandle,
+        BindingRole, CueContext, CueKind, NormalizationProfile, ObservedCue, ObservedCueId,
+        PrivacyClass, SourceHandle, CONTRACT_REVISION,
     };
-    use eliot_cue_normalizer::{NormalizationPolicy, NormalizationRule, PolicyRule, capture_cue};
+    use eliot_cue_normalizer::{capture_cue, NormalizationPolicy, NormalizationRule, PolicyRule};
     use eliot_evidence::{
         Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
         EvidenceFreshness, LifecycleState, Provenance,
@@ -684,6 +805,39 @@ mod tests {
                 .atom_id
                 .as_str(),
             "atom-1"
+        );
+    }
+
+    #[test]
+    fn concrete_retained_owner_adapters_preserve_the_exact_admission_join() {
+        let (journal, receipt, rows, profile) = admitted_fixture();
+        let cue = derive_cue_binding_candidates(&receipt, &rows, None, &profile).expect("derive");
+        let candidate = cue.candidates.first().expect("candidate");
+        let candidate_id = candidate.binding_candidate_id.clone();
+        let candidate_digest = candidate.digest.clone();
+        let target = candidate.target.clone();
+        let source = ReactiveOwnerSource::new(
+            cue,
+            vec![ReactiveTargetAtomBinding {
+                candidate_id,
+                candidate_digest,
+                target,
+                atom_id: ArtifactId::new("atom-1").expect("atom"),
+                source_revision: "rev-1".into(),
+                source_digest: digest(3).as_str().into(),
+            }],
+        );
+        let projection = project_reactive_owner_from_sources(
+            &journal,
+            &WorkScopeId::new("scope").expect("scope"),
+            &fence(),
+            &[source],
+        )
+        .expect("concrete owner adapters project");
+        assert_eq!(projection.observations.len(), 1);
+        assert_eq!(
+            projection.observations[0].target_atom_bindings[0].source_revision,
+            "rev-1"
         );
     }
 

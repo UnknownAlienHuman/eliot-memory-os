@@ -3150,6 +3150,7 @@ dependencies = [
  "eliot-platform-windows",
  "eliot-process",
  "eliot-protocol",
+ "eliot-reactive-context-plan",
  "eliot-read",
  "eliot-receipts",
  "eliot-runtime-contracts",

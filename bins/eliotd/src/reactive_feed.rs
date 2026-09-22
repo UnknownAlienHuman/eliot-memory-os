@@ -54,10 +54,14 @@
 #![allow(clippy::result_large_err)]
 
 use eliot_contracts::{ArtifactId, SessionId};
-use eliot_governor::GovernorActivationSnapshot;
+use eliot_governor::{
+    project_reactive_owner_from_sources, GovernorActivationSnapshot, ReactiveOwnerProjection,
+    ReactiveOwnerProjectionError, ReactiveOwnerSource,
+};
+use eliot_observation::ObservationJournal;
 use eliot_reactive_context_plan::{
-    LiveActivationBindings, SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
-    drive_live_feed,
+    drive_live_feed, LiveActivationBindings, SettledPlanFeedError, SettledPlanFeedInputs,
+    SettledPlanFeedOutcome,
 };
 use eliot_receipts::WorkScopeId;
 
@@ -70,6 +74,12 @@ pub enum ReactiveFeedSupplyError {
     /// constructor: the snapshot never becomes bindings, the planner never
     /// runs. `field` names the rejected snapshot field.
     InvalidSnapshotBinding { field: &'static str, reason: String },
+    /// The Governor journal or an owner-issued cue/atom row failed its
+    /// fail-closed projection checks.
+    OwnerProjection(ReactiveOwnerProjectionError),
+    /// The A4 feed contained a cue or atom binding that was not present in the
+    /// same current owner projection.
+    OwnerFeedBindingMismatch { field: &'static str },
     /// The liveness gate, planner, or producer reported; carried verbatim.
     Feed(SettledPlanFeedError),
 }
@@ -81,6 +91,10 @@ impl std::fmt::Display for ReactiveFeedSupplyError {
                 formatter,
                 "reactive feed snapshot binding {field} rejected: {reason}"
             ),
+            Self::OwnerProjection(error) => write!(formatter, "reactive owner projection: {error}"),
+            Self::OwnerFeedBindingMismatch { field } => {
+                write!(formatter, "reactive feed owner binding mismatch: {field}")
+            }
             Self::Feed(error) => write!(formatter, "reactive feed: {error}"),
         }
     }
@@ -130,6 +144,74 @@ pub fn drive_daemon_feed(
     inputs: SettledPlanFeedInputs<'_>,
 ) -> Result<SettledPlanFeedOutcome, ReactiveFeedSupplyError> {
     let bindings = project_live_bindings(snapshot)?;
+    drive_live_feed(&bindings, inputs).map_err(ReactiveFeedSupplyError::Feed)
+}
+
+fn owner_projection_matches_feed(
+    projection: &ReactiveOwnerProjection,
+    inputs: &SettledPlanFeedInputs<'_>,
+) -> Result<(), ReactiveFeedSupplyError> {
+    for seed in &inputs.cue_activation.request.seeds {
+        let mut matches = projection
+            .observations
+            .iter()
+            .flat_map(|observation| observation.observed_cues())
+            .filter(|observed| *observed == seed);
+        if matches.next().is_none() || matches.next().is_some() {
+            return Err(ReactiveFeedSupplyError::OwnerFeedBindingMismatch {
+                field: "cue_activation.request.seeds",
+            });
+        }
+    }
+    for binding in &inputs.cue_activation.target_bindings {
+        let mut matches = projection
+            .observations
+            .iter()
+            .flat_map(|observation| observation.target_atom_bindings.iter())
+            .filter(|atom| {
+                atom.target == binding.target
+                    && atom.atom_id == binding.item_id
+                    && binding
+                        .source_revision
+                        .as_deref()
+                        .is_none_or(|revision| revision == atom.source_revision)
+                    && binding
+                        .source_digest
+                        .as_deref()
+                        .is_none_or(|digest| digest == atom.source_digest)
+            });
+        if matches.next().is_none() || matches.next().is_some() {
+            return Err(ReactiveFeedSupplyError::OwnerFeedBindingMismatch {
+                field: "cue_activation.target_bindings",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Drive the A4 feed from the retained Governor journal plus concrete
+/// owner-issued cue/index rows.
+///
+/// The journal remains the sole admitted observation source; the supplied rows
+/// are immutable outputs of the real cue/context owners. They are projected
+/// and then cross-checked against every A4 seed and target-to-atom binding
+/// before the liveness gate or planner runs. A caller cannot supply a detached
+/// activation over an unrelated cue.
+pub fn drive_daemon_feed_from_owners(
+    snapshot: &GovernorActivationSnapshot,
+    journal: &ObservationJournal,
+    owner_sources: &[ReactiveOwnerSource],
+    inputs: SettledPlanFeedInputs<'_>,
+) -> Result<SettledPlanFeedOutcome, ReactiveFeedSupplyError> {
+    let bindings = project_live_bindings(snapshot)?;
+    let owner_projection = project_reactive_owner_from_sources(
+        journal,
+        &bindings.scope_id,
+        &bindings.state_fence,
+        owner_sources,
+    )
+    .map_err(ReactiveFeedSupplyError::OwnerProjection)?;
+    owner_projection_matches_feed(&owner_projection, &inputs)?;
     drive_live_feed(&bindings, inputs).map_err(ReactiveFeedSupplyError::Feed)
 }
 

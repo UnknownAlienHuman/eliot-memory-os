@@ -96,8 +96,9 @@ pub use reactive_admission::{
 };
 pub use reactive_owner_projection::{
     MAX_REACTIVE_OWNER_RECORDS, ReactiveCueBindingOwner, ReactiveOwnerProjection,
-    ReactiveOwnerProjectionError, ReactiveObservationCueProjection, ReactiveTargetAtomBinding,
-    ReactiveTargetAtomOwner, project_reactive_owner,
+    ReactiveOwnerProjectionError, ReactiveObservationCueProjection, ReactiveOwnerSource,
+    ReactiveTargetAtomBinding, ReactiveTargetAtomOwner, RetainedReactiveOwnerSources,
+    project_reactive_owner, project_reactive_owner_from_sources,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
