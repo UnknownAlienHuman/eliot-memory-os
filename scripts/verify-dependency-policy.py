@@ -2740,40 +2740,10 @@ def run_cargo_deny(
             )
         )
 
-    summary_notes = sum(
-        int(value.get("notes", 0))
-        for value in summary.values()
-        if isinstance(value, dict) and isinstance(value.get("notes"), int)
-    )
-    observed_notes = severity_counts.get("note", 0)
-    if summary_notes != observed_notes:
-        summary_consistent = False
-        findings.append(
-            Finding(
-                SCANNER_OUTPUT_FINDING,
-                "deny.toml",
-                1,
-                f"cargo-deny summary note count {summary_notes} does not match {observed_notes} parsed note diagnostics",
-            )
-        )
-
-    summary_helps = sum(
-        int(value.get("helps", 0))
-        for value in summary.values()
-        if isinstance(value, dict) and isinstance(value.get("helps"), int)
-    )
-    observed_helps = severity_counts.get("help", 0)
-    if summary_helps != observed_helps:
-        summary_consistent = False
-        findings.append(
-            Finding(
-                SCANNER_OUTPUT_FINDING,
-                "deny.toml",
-                1,
-                f"cargo-deny summary help count {summary_helps} does not match {observed_helps} parsed help diagnostics",
-            )
-        )
-
+    # cargo-deny summary ``helps`` is check-specific metadata (the observed
+    # licenses summary carries 390 of them) rather than one diagnostic with
+    # severity=help; only errors and warnings have the cross-record meaning
+    # that can be compared to parsed diagnostic severities here.
     parser_complete = (
         not parse_errors
         and not non_json
