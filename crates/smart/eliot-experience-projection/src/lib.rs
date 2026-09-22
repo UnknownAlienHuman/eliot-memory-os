@@ -142,3 +142,120 @@ impl ExperienceView {
         self.refs.iter().map(|item| &item.handle).collect()
     }
 }
+
+/// Revalidate view refs against a live bank projection.
+///
+/// Every carried ref must still resolve to a projected ref with identical
+/// revision cursor, scope, and fence. The projection itself is validated
+/// first. This performs no store I/O: the caller supplies the live
+/// projection read through the bank owner.
+pub fn revalidate_bank_refs(
+    view: &ExperienceView,
+    live: &eliot_observation_contracts::BankProjection,
+) -> Result<(), ObservationError> {
+    use eliot_observation_contracts::ExperienceSourceFamily;
+    view.validate()?;
+    live.validate()?;
+    if view.family != ExperienceSourceFamily::SystemExperienceBank {
+        return Err(ObservationError::InvalidField {
+            field: "revalidation.family",
+            reason: "view family is not the bank family",
+        });
+    }
+    for reference in &view.refs {
+        let Some(projected) = live
+            .refs
+            .iter()
+            .find(|candidate| candidate.handle == reference.handle)
+        else {
+            return Err(ObservationError::InvalidField {
+                field: "revalidation.ref",
+                reason: "live owner state advanced",
+            });
+        };
+        if projected.revision != reference.revision
+            || projected.scope != reference.scope
+            || projected.fence != reference.fence
+        {
+            return Err(ObservationError::InvalidField {
+                field: "revalidation.ref",
+                reason: "live owner state advanced",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Revalidate view refs against a live feedback projection.
+///
+/// Same binding as [`revalidate_bank_refs`]: full revision, scope, and
+/// fence equality per ref, with no store I/O in this package.
+pub fn revalidate_feedback_refs(
+    view: &ExperienceView,
+    live: &eliot_observation_contracts::FeedbackProjection,
+) -> Result<(), ObservationError> {
+    use eliot_observation_contracts::ExperienceSourceFamily;
+    view.validate()?;
+    live.validate()?;
+    if view.family != ExperienceSourceFamily::AgentFeedback {
+        return Err(ObservationError::InvalidField {
+            field: "revalidation.family",
+            reason: "view family is not the feedback family",
+        });
+    }
+    for reference in &view.refs {
+        let Some(projected) = live
+            .refs
+            .iter()
+            .find(|candidate| candidate.handle == reference.handle)
+        else {
+            return Err(ObservationError::InvalidField {
+                field: "revalidation.ref",
+                reason: "live owner state advanced",
+            });
+        };
+        if projected.revision != reference.revision
+            || projected.scope != reference.scope
+            || projected.fence != reference.fence
+        {
+            return Err(ObservationError::InvalidField {
+                field: "revalidation.ref",
+                reason: "live owner state advanced",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Revalidate view refs against a live journal projection by presence.
+///
+/// Journal envelopes carry no per-record revision cursor, so only handle
+/// presence revalidates here; revision staleness for journal reads stays a
+/// live-owner capability. Absent handles fail closed.
+pub fn revalidate_journal_presence(
+    view: &ExperienceView,
+    live: &eliot_observation_contracts::JournalProjection,
+) -> Result<(), ObservationError> {
+    use eliot_observation_contracts::ExperienceSourceFamily;
+    view.validate()?;
+    live.validate()?;
+    if view.family != ExperienceSourceFamily::SystemObservationJournal {
+        return Err(ObservationError::InvalidField {
+            field: "revalidation.family",
+            reason: "view family is not the journal family",
+        });
+    }
+    for reference in &view.refs {
+        let present = live
+            .records
+            .iter()
+            .any(|record| record.record_id.as_str() == reference.handle.as_str());
+        if !present {
+            return Err(ObservationError::InvalidField {
+                field: "revalidation.ref",
+                reason: "live owner state advanced",
+            });
+        }
+    }
+    Ok(())
+}

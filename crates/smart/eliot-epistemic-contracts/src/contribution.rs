@@ -3,10 +3,13 @@
 //! [`ProviderContribution`] binds one admitted [`CurrentEpistemicPosition`]
 //! into the neutral handoff Smart providers consume. Every envelope-bound
 //! field is echoed from the validated admission envelope: the position
-//! digest and claim, the admission scope, fence, source revision, coverage
-//! digest, and receipt digest. The constructor takes only the admitted
-//! position, so scope, fence, revision, and coverage provenance cannot be
-//! supplied independently, and there is no synthetic construction path.
+//! digest and claim, the admission owner, position identity and revision,
+//! scope, fence, source revision, and coverage and receipt digests. The
+//! constructor takes only the admitted position, so no envelope field can
+//! be supplied independently, and there is no synthetic construction path.
+//! Per-field echoes give readback exact attribution: owner, position,
+//! scope, fence, revision, and coverage each revalidate separately
+//! against live owner state.
 //!
 //! Ownership is provider-neutral: the contributing provider is the admitted
 //! position owner itself. This envelope carries no per-provider identity,
@@ -28,11 +31,13 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{SourceId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::admitted::{AdmittedKind, CurrentEpistemicPosition, Currentness};
+use crate::admitted::{
+    AdmittedKind, CurrentEpistemicPosition, Currentness, PositionId, PositionRevision,
+};
 use crate::error::{
     ContractError, MAX_SHORT_TEXT, validate_bounded_text, validate_digest,
 };
@@ -55,8 +60,14 @@ pub struct ProviderContribution {
     pub position_digest: String,
     /// Governed claim identity of the admitted position, echoed exactly.
     pub claim: ClaimId,
+    /// Source owning the admitted position, echoed exactly.
+    pub owner: SourceId,
     /// Currentness observed at contribution time; always current.
     pub currentness: Currentness,
+    /// Exact position identity admitted, echoed exactly.
+    pub position: PositionId,
+    /// Exact position revision admitted, echoed exactly.
+    pub position_revision: PositionRevision,
     /// Scope echoed from the admission envelope.
     pub scope: String,
     /// Fence echoed from the admission envelope.
@@ -89,7 +100,10 @@ impl ProviderContribution {
             view_kind: AdmittedKind::CurrentEpistemicPosition,
             position_digest: position.digest.clone(),
             claim: position.claim.clone(),
+            owner: position.admission.owner.clone(),
             currentness: Currentness::Current,
+            position: position.admission.position.clone(),
+            position_revision: position.admission.position_revision,
             scope: position.admission.scope.clone(),
             fence: position.admission.fence.clone(),
             source_revision: position.admission.revision.clone(),

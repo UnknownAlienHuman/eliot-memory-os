@@ -164,6 +164,19 @@ impl AcceptedSourceProjection {
         let mut handles = std::collections::BTreeSet::new();
         for source in &self.sources {
             source.validate()?;
+            // Pair/ref lineage equality mirrors the snapshot rule: a ref
+            // joins this projection only under the pair's acceptor and
+            // acceptance receipt.
+            if source.owner != self.pair.accepted_by {
+                return Err(SelfQueryContractError::BindingMismatch {
+                    field: "projection.acceptance_owner",
+                });
+            }
+            if source.acceptance_receipt != self.pair.acceptance_receipt {
+                return Err(SelfQueryContractError::BindingMismatch {
+                    field: "projection.acceptance_receipt",
+                });
+            }
             if !handles.insert(source.source_handle.clone()) {
                 return Err(SelfQueryContractError::Duplicate {
                     field: "projection.sources",

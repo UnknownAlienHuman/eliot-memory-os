@@ -1346,6 +1346,216 @@ pub(crate) fn load_prior_heartbeat_observation(
     Some(persisted)
 }
 
+/// Loads the persisted observation without the admission path's intentional
+/// corruption-to-`None` downgrade.  Start rollback must distinguish an
+/// absent Host artifact from an unreadable or substituted one: the latter is
+/// an unknown peer outcome and therefore keeps the pending recovery carrier.
+fn load_persisted_heartbeat_observation_strict(
+    host_state_root: &Path,
+) -> Result<Option<PersistedHeartbeatObservation>, HostError> {
+    let path = host_state_root.join(HOST_HEARTBEAT_OBSERVATION_FILE_NAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(HostError::RecoveryRequired(error.to_string())),
+    };
+    if bytes.len() as u64 > TRANSPORT_FILE_LIMIT {
+        return Err(HostError::RecoveryRequired(
+            "heartbeat observation exceeds its bounded size".to_owned(),
+        ));
+    }
+    let persisted: PersistedHeartbeatObservation = serde_json::from_slice(&bytes)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if persisted.schema != HOST_HEARTBEAT_OBSERVATION_SCHEMA {
+        return Err(HostError::RecoveryRequired(
+            "heartbeat observation schema is unsupported".to_owned(),
+        ));
+    }
+    let canonical = HeartbeatObservationCanonical {
+        schema: persisted.schema.as_str(),
+        pipe_name: persisted.pipe_name.as_str(),
+        service_instance_guid: persisted.service_instance_guid.as_str(),
+        kernel_epoch: persisted.kernel_epoch,
+        watchdog_epoch: persisted.watchdog_epoch,
+        tick_interval_ms: persisted.tick_interval_ms,
+        watchdog_readiness_sequence: persisted.watchdog_readiness_sequence,
+        watchdog_incarnation_pid: persisted.watchdog_incarnation_pid,
+        watchdog_incarnation_start_100ns: persisted.watchdog_incarnation_start_100ns,
+        handshake_count: persisted.handshake_count,
+        host_boot_id: persisted.host_boot_id,
+        host_receive_monotonic_ms: persisted.host_receive_monotonic_ms,
+        host_receive_wall_ms: persisted.host_receive_wall_ms,
+        coverage: persisted.coverage.as_str(),
+    };
+    if sha256_json(&canonical).map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+        != persisted.observation_digest
+    {
+        return Err(HostError::RecoveryRequired(
+            "heartbeat observation digest does not match its canonical bytes".to_owned(),
+        ));
+    }
+    verify_transport_file(&path)?;
+    Ok(Some(persisted))
+}
+
+fn same_heartbeat_instance(
+    current: &HeartbeatTransportDescriptor,
+    issued: &HeartbeatTransportDescriptor,
+) -> bool {
+    current.pipe_name == issued.pipe_name
+        && current.host_challenge_nonce == issued.host_challenge_nonce
+        && current.service_instance_guid == issued.service_instance_guid
+        && current.installation_id == issued.installation_id
+        && current.transaction_plan_generation == issued.transaction_plan_generation
+}
+
+fn require_heartbeat_peer_stopped(pid: u32, start_100ns: u64) -> Result<(), HostError> {
+    let alive = eliot_windows_ipc::process_is_alive(pid)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if !alive {
+        return Ok(());
+    }
+    let current_start = eliot_windows_ipc::process_creation_ticks(pid)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if current_start == start_100ns {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog heartbeat peer is still live".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Removes only the exact heartbeat artifacts issued for one Host start.
+///
+/// The caller must first reconcile the approved SCM registration and, when a
+/// bound incarnation existed, prove that its PID/start-time peer is stopped.
+/// This function holds the descriptor lock across both artifact checks and
+/// removals.  Missing files are clean; malformed, substituted, or changed
+/// files are recovery-required and are never deleted.
+pub(crate) fn remove_start_artifacts_exact(
+    host_state_root: &Path,
+    issued: &HeartbeatTransportDescriptor,
+    expected_process: Option<(u32, u64)>,
+) -> Result<(), HostError> {
+    let _lock = TransportDescriptorLock::acquire(host_state_root)?;
+    let descriptor_path = host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
+    let current = HeartbeatTransportDescriptor::load(host_state_root)?;
+    let observation_path = host_state_root.join(HOST_HEARTBEAT_OBSERVATION_FILE_NAME);
+    let observation = load_persisted_heartbeat_observation_strict(host_state_root)?;
+
+    // Validate the complete owned set before deleting either artifact.  The
+    // descriptor is the durable recovery anchor; a malformed or substituted
+    // observation must therefore leave it intact for recovery rather than
+    // turning the later validation error into evidence loss.
+    if let Some(current) = current.as_ref() {
+        if !same_heartbeat_instance(current, issued) {
+            return Err(HostError::RecoveryRequired(
+                "heartbeat descriptor belongs to another start incarnation".to_owned(),
+            ));
+        }
+        match expected_process {
+            Some((pid, start_100ns))
+                if current.watchdog_incarnation_pid == pid
+                    && current.watchdog_incarnation_start_100ns == start_100ns =>
+            {
+                require_heartbeat_peer_stopped(pid, start_100ns)?;
+            }
+            Some(_) => {
+                return Err(HostError::RecoveryRequired(
+                    "heartbeat descriptor peer identity changed during rollback".to_owned(),
+                ));
+            }
+            None if current.is_bound() => {
+                return Err(HostError::RecoveryRequired(
+                    "heartbeat descriptor is bound before rollback peer admission".to_owned(),
+                ));
+            }
+            None => {}
+        }
+    }
+
+    if let Some(observation) = observation.as_ref() {
+        if observation.pipe_name != issued.pipe_name
+            || observation.service_instance_guid != issued.service_instance_guid
+        {
+            return Err(HostError::RecoveryRequired(
+                "heartbeat observation belongs to another start incarnation".to_owned(),
+            ));
+        }
+        let Some((pid, start_100ns)) = expected_process else {
+            return Err(HostError::RecoveryRequired(
+                "heartbeat observation has no exact stopped peer binding".to_owned(),
+            ));
+        };
+        if observation.watchdog_incarnation_pid != pid
+            || observation.watchdog_incarnation_start_100ns != start_100ns
+        {
+            return Err(HostError::RecoveryRequired(
+                "heartbeat observation peer identity changed during rollback".to_owned(),
+            ));
+        }
+        require_heartbeat_peer_stopped(pid, start_100ns)?;
+    }
+
+    // Remove the audit observation first and the descriptor last.  If the
+    // second OS delete is uncertain, the descriptor remains as a durable,
+    // operation-bound recovery anchor and the caller retains its recovery
+    // carrier because this function returns an error.
+    if observation.is_some() {
+        std::fs::remove_file(&observation_path).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "heartbeat observation removal outcome is unknown; durable recovery remains required: {error}"
+            ))
+        })?;
+    }
+    if current.is_some() {
+        std::fs::remove_file(&descriptor_path).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "heartbeat descriptor removal outcome is unknown; durable recovery remains required: {error}"
+            ))
+        })?;
+    }
+
+    for (path, name) in [
+        (&descriptor_path, WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME),
+        (&observation_path, HOST_HEARTBEAT_OBSERVATION_FILE_NAME),
+    ] {
+        match std::fs::metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "heartbeat rollback artifact remains after exact removal: {name}"
+                )));
+            }
+            Err(error) => return Err(HostError::RecoveryRequired(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+/// Confirms that no heartbeat artifact is present when the Host has no
+/// operation-bound carrier from which it could prove ownership.  Presence of
+/// even an unreadable file is recovery-required; metadata is used deliberately
+/// so a corrupt file cannot be mistaken for absence by the tolerant loader.
+pub(crate) fn require_no_start_artifacts(host_state_root: &Path) -> Result<(), HostError> {
+    for name in [
+        WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME,
+        HOST_HEARTBEAT_OBSERVATION_FILE_NAME,
+    ] {
+        let path = host_state_root.join(name);
+        match std::fs::metadata(&path) {
+            Ok(_) => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "heartbeat rollback artifact remains: {name}"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(HostError::RecoveryRequired(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
 /// Handle-bound pipe peer: PID plus executable image resolved from the
 /// live server handle at accept time (I1.6 independent observation).
 #[derive(Clone, Debug, Eq, PartialEq)]
