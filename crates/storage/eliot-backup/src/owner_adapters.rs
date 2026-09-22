@@ -32,6 +32,7 @@ use std::path::Path;
 
 use eliot_blob_api::{BlobId, CryptoDescriptor};
 use eliot_platform_windows::WindowsPlatform;
+use zeroize::Zeroizing;
 
 use super::{
     BackupBlob, BackupError, BlobRestorationReceipt, WrappedKeyEntry, WrappedKeyManifest,
@@ -97,23 +98,18 @@ pub struct RestoredSealedBlob {
     pub key_lineage: String,
 }
 
-/// Memory-only lineage key material. Zeroized on drop; never returned.
+/// Memory-only lineage key material. Zeroized on drop via the vetted
+/// `zeroize` RAII wrapper; never returned.
 struct UnwrappedLineageKey {
     lineage: String,
-    bytes: Vec<u8>,
-}
-
-impl Drop for UnwrappedLineageKey {
-    fn drop(&mut self) {
-        self.bytes.fill(0);
-    }
+    bytes: Zeroizing<Vec<u8>>,
 }
 
 /// Destination Blob/Secret owner adapter.
 ///
 /// Bound to one isolated root for platform scoping; performs no file,
 /// store, credential-manager, or machine writes itself. All secret bytes it
-/// touches are memory-only and zeroized.
+/// touches are memory-only inside vetted zeroizing wrappers.
 pub struct DestinationRestoreAdapter {
     platform: WindowsPlatform,
 }
@@ -183,6 +179,7 @@ impl DestinationRestoreAdapter {
     ) -> Result<&'a WrappedKeyEntry, BackupError> {
         blob.validate()?;
         receipt.validate()?;
+        manifest.validate()?;
         if receipt.blob_hash != blob.locator.hash.as_str() {
             return Err(BackupError::PlanMismatch);
         }
@@ -194,7 +191,9 @@ impl DestinationRestoreAdapter {
                 subject: "restoration receipt manifest binding".to_owned(),
             });
         }
-        if blob.crypto.algorithm.as_str() != RESTORE_ENVELOPE_ALGORITHM {
+        if blob.crypto.algorithm.as_str() != RESTORE_ENVELOPE_ALGORITHM
+            || blob.crypto.version != RESTORE_ENVELOPE_VERSION
+        {
             return Err(BackupError::RestoreCapabilityUnsupported {
                 capability: CAPABILITY_BLOB_OPEN,
             });
@@ -204,7 +203,6 @@ impl DestinationRestoreAdapter {
             .iter()
             .find(|entry| entry.key_lineage == blob.key_lineage.as_str())
             .ok_or(BackupError::MissingRecoveryComponent("blob_key_material"))?;
-        entry.validate()?;
         if entry.algorithm != RESTORE_ENVELOPE_ALGORITHM {
             return Err(BackupError::RestoreCapabilityUnsupported {
                 capability: CAPABILITY_KEY_UNWRAP,
@@ -251,7 +249,7 @@ impl DestinationRestoreAdapter {
             })?;
         Ok(UnwrappedLineageKey {
             lineage: entry.key_lineage.clone(),
-            bytes: secret.expose().to_vec(),
+            bytes: Zeroizing::new(secret.expose().to_vec()),
         })
     }
 
@@ -295,9 +293,11 @@ impl DestinationRestoreAdapter {
 
     /// Opens one sealed envelope and verifies its plaintext digest.
     ///
-    /// Private: plaintext never crosses a public boundary. The production
-    /// path is [`Self::restore_blob_sealed`], which re-seals before return.
-    fn open_envelope(&self, blob: &BackupBlob) -> Result<Vec<u8>, BackupError> {
+    /// Private: plaintext never crosses a public boundary, and the returned
+    /// bytes zeroize on drop — including the digest-mismatch error path.
+    /// The production path is [`Self::restore_blob_sealed`], which re-seals
+    /// before return.
+    fn open_envelope(&self, blob: &BackupBlob) -> Result<Zeroizing<Vec<u8>>, BackupError> {
         let protected =
             eliot_platform_windows::ProtectedSecret::from_ciphertext(blob.sealed_bytes.clone())
                 .map_err(|_| BackupError::InvalidField {
@@ -313,7 +313,7 @@ impl DestinationRestoreAdapter {
                     blob.locator.hash.as_str()
                 ))
             })?;
-        let plaintext = secret.expose().to_vec();
+        let plaintext = Zeroizing::new(secret.expose().to_vec());
         if bytes_sha256(&plaintext) != blob.plaintext_sha256 {
             return Err(BackupError::IntegrityMismatch {
                 subject: format!("restored blob plaintext {}", blob.locator.hash.as_str()),
@@ -350,14 +350,16 @@ impl DestinationRestoreAdapter {
             });
         }
         let _lineage_key = self.unwrap_lineage_key(entry)?;
-        let mut plaintext = self.open_envelope(blob)?;
+        let plaintext = self.open_envelope(blob)?;
         let resealed = self.platform.protect_secret(&plaintext).map_err(|error| {
             BackupError::Target(format!(
                 "destination envelope reseal failed for {}: {error:?}",
                 blob.locator.hash.as_str()
             ))
         })?;
-        plaintext.fill(0);
+        // `plaintext` is Zeroizing: drops (including the ?-early error paths
+        // above) clear it via the vetted RAII wrapper — no manual fill.
+        drop(plaintext);
         let resealed_bytes = resealed.as_bytes().to_vec();
         let dest_crypto = CryptoDescriptor {
             algorithm: BlobId::new(RESTORE_ENVELOPE_ALGORITHM)?,
