@@ -10,10 +10,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use eliot_backup::{
-    BackupBlob, BackupError, BlobRestorationReceipt, DestinationScope, PORTABLE_ENVELOPE_ALGORITHM,
-    WrappedKeyEntry, WrappedKeyManifest, portable_blob_ad, portable_keywrap_ad,
-    restore_portable_blob, rewrap_portable_data_key, seal_portable_envelope,
-    verify_portable_restorable,
+    AdmittedKeyMap, BackupBlob, BackupError, BlobRestorationReceipt, DestinationScope,
+    PORTABLE_ENVELOPE_ALGORITHM, WrappedKeyEntry, WrappedKeyManifest, portable_blob_ad,
+    portable_keywrap_ad, restore_portable_blob, restore_portable_blob_admitted,
+    rewrap_portable_data_key, seal_portable_envelope, verify_portable_restorable,
 };
 use eliot_blob_api::{
     BlobHash, BlobId, BlobLocator, CompressionDescriptor, CryptoDescriptor, ObjectResidencyKey,
@@ -88,8 +88,12 @@ fn wrap_data_key(
     wrapping_id: &str,
     lineage: &str,
 ) -> WrappedKeyEntry {
-    let envelope = seal_portable_envelope(key, kek, &portable_keywrap_ad(BACKUP_ID, lineage))
-        .expect("wrap data key");
+    let envelope = seal_portable_envelope(
+        key,
+        kek,
+        &portable_keywrap_ad(BACKUP_ID, lineage).expect("keywrap ad"),
+    )
+    .expect("wrap data key");
     WrappedKeyEntry {
         key_lineage: lineage.to_owned(),
         wrapping_key_id: wrapping_id.to_owned(),
@@ -111,7 +115,7 @@ fn seal_blob_envelope(plaintext: &[u8]) -> (Vec<u8>, String) {
     let envelope = seal_portable_envelope(
         plaintext,
         &DATA_KEY,
-        &portable_blob_ad(BACKUP_ID, &sha256_hex(b"blob-1873x"), KEY_LINEAGE),
+        &portable_blob_ad(BACKUP_ID, &sha256_hex(b"blob-1873x"), KEY_LINEAGE).expect("blob ad"),
     )
     .expect("seal blob");
     (envelope.sealed_bytes, envelope.plaintext_sha256)
@@ -215,17 +219,35 @@ fn portable_restore_roundtrip_under_destination_keys() {
 }
 
 #[test]
+fn admitted_vault_binds_portable_restore_to_backup_and_ids() {
+    let plaintext = b"admitted-portable-plaintext-1873x";
+    let (blob, manifest, receipt) = full_triple(plaintext);
+    let mut keks = std::collections::BTreeMap::new();
+    keks.insert(WRAPPING_ID.to_owned(), KEK_A);
+    let mut dest_keys = std::collections::BTreeMap::new();
+    dest_keys.insert(DEST_LINEAGE.to_owned(), DEST_KEY);
+    let vault = AdmittedKeyMap::for_backup(BACKUP_ID.to_owned(), keks, dest_keys)
+        .expect("admitted key map");
+
+    let restored =
+        restore_portable_blob_admitted(&blob, &receipt, &manifest, &dest_scope(), &vault)
+            .expect("admitted restore must succeed");
+    assert_eq!(restored.source_plaintext_sha256, sha256_hex(plaintext));
+    assert_eq!(restored.dest_crypto.key_lineage.as_str(), DEST_LINEAGE);
+}
+
+#[test]
 fn portable_seal_uses_fresh_nonce_per_envelope() {
     let first = seal_portable_envelope(
         b"same-plaintext",
         &DATA_KEY,
-        &portable_blob_ad(BACKUP_ID, "hash", KEY_LINEAGE),
+        &portable_blob_ad(BACKUP_ID, "hash", KEY_LINEAGE).expect("blob ad"),
     )
     .expect("first seal");
     let second = seal_portable_envelope(
         b"same-plaintext",
         &DATA_KEY,
-        &portable_blob_ad(BACKUP_ID, "hash", KEY_LINEAGE),
+        &portable_blob_ad(BACKUP_ID, "hash", KEY_LINEAGE).expect("blob ad"),
     )
     .expect("second seal");
     assert_ne!(first.sealed_bytes, second.sealed_bytes);
@@ -276,7 +298,8 @@ fn moved_envelope_across_backup_refused() {
     let foreign = seal_portable_envelope(
         plaintext,
         &DATA_KEY,
-        &portable_blob_ad("backup-other", blob.locator.hash.as_str(), KEY_LINEAGE),
+        &portable_blob_ad("backup-other", blob.locator.hash.as_str(), KEY_LINEAGE)
+            .expect("blob ad"),
     )
     .expect("foreign seal");
     blob.sealed_bytes = foreign.sealed_bytes;
@@ -403,6 +426,51 @@ fn zero_dest_generation_refused() {
         .expect_err("zero destination generation must refuse");
     assert!(
         matches!(error, BackupError::InvalidField { .. }),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn delimiter_collision_cannot_merge_fields() {
+    // The exact ambiguity root named: ('a|b','c') vs ('a','b|c') must differ,
+    // or envelopes could move across identities sharing one serialization.
+    let left = portable_blob_ad("a|b", "c", "d").expect("left ad");
+    let right = portable_blob_ad("a", "b|c", "d").expect("right ad");
+    assert_ne!(left, right);
+    let left_key = portable_keywrap_ad("a|b", "c").expect("left key ad");
+    let right_key = portable_keywrap_ad("a", "b|c").expect("right key ad");
+    assert_ne!(left_key, right_key);
+}
+
+#[test]
+fn envelope_kinds_cannot_cross_bind() {
+    // Same field strings under different domains must never authenticate
+    // as each other: blob and keywrap bindings are disjoint by domain tag.
+    let blob_ad = portable_blob_ad("id", "id", "lineage-x").expect("blob ad");
+    let keywrap_ad = portable_keywrap_ad("id", "lineage-x").expect("keywrap ad");
+    assert_ne!(blob_ad, keywrap_ad);
+}
+
+#[test]
+fn non_v1_envelope_version_refused() {
+    let (mut blob, manifest, receipt) = full_triple(b"plaintext");
+    blob.crypto.version = 2;
+    let error = verify_portable_restorable(&blob, &receipt, &manifest)
+        .expect_err("non-v1 envelope version must refuse");
+    assert!(
+        matches!(error, BackupError::RestoreCapabilityUnsupported { .. }),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn duplicate_manifest_lineage_refused_as_whole() {
+    let (blob, mut manifest, receipt) = full_triple(b"plaintext");
+    manifest.entries.push(manifest.entries[0].clone());
+    let error = verify_portable_restorable(&blob, &receipt, &manifest)
+        .expect_err("duplicate lineage must refuse");
+    assert!(
+        matches!(error, BackupError::Duplicate { .. }),
         "unexpected error: {error}"
     );
 }

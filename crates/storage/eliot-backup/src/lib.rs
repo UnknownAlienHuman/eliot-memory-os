@@ -41,10 +41,11 @@ pub use owner_adapters::{
     RESTORE_ENVELOPE_VERSION, RestoredSealedBlob, SealedEnvelope,
 };
 pub use portable_adapters::{
-    PORTABLE_ENVELOPE_ALGORITHM, PORTABLE_ENVELOPE_VERSION, PORTABLE_KEY_BYTES,
-    PORTABLE_NONCE_BYTES, PORTABLE_TAG_BYTES, PortableSealedEnvelope, portable_blob_ad,
-    portable_keywrap_ad, restore_portable_blob, rewrap_portable_data_key,
-    seal_portable_envelope, verify_portable_restorable,
+    AdmittedKeyMap, PORTABLE_ENVELOPE_ALGORITHM, PORTABLE_ENVELOPE_VERSION, PORTABLE_KEY_BYTES,
+    PORTABLE_NONCE_BYTES, PORTABLE_TAG_BYTES, PortableKeyVault, PortableSealedEnvelope,
+    PortableSecretKey, portable_blob_ad, portable_keywrap_ad, restore_portable_blob,
+    restore_portable_blob_admitted, rewrap_portable_data_key, seal_portable_envelope,
+    verify_portable_restorable,
 };
 pub use portable_recovery::{
     BlobRestorationReceipt, FullRecoveryPackage, MAX_WRAPPED_KEY_BYTES, WrappedKeyEntry,

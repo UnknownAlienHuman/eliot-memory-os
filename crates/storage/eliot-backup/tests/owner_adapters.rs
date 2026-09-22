@@ -134,6 +134,24 @@ fn unknown_blob_algorithm_refused_without_crypto() {
 }
 
 #[test]
+fn non_v1_blob_version_refused_without_crypto() {
+    let root = isolated_root("non-v1-version");
+    let adapter = DestinationRestoreAdapter::bind(&root).expect("adapter bind");
+    let mut blob = blob_for(b"sealed-opaque".to_vec(), sha256_hex(b"plaintext-opaque"));
+    blob.crypto.version = 2;
+    let manifest = manifest_for(b"wrapped-opaque".to_vec());
+    let receipt = receipt_for(blob.locator.hash.as_str());
+    let error = adapter
+        .verify_restorable(&blob, &receipt, &manifest)
+        .expect_err("non-v1 envelope version must refuse");
+    assert!(
+        matches!(error, BackupError::RestoreCapabilityUnsupported { .. }),
+        "unexpected error: {error}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn unknown_key_algorithm_refused_without_crypto() {
     let root = isolated_root("unknown-key-alg");
     let adapter = DestinationRestoreAdapter::bind(&root).expect("adapter bind");
@@ -199,6 +217,24 @@ fn missing_lineage_coverage_refused() {
         .expect_err("missing lineage must refuse");
     assert!(
         matches!(error, BackupError::MissingRecoveryComponent(_)),
+        "unexpected error: {error}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn duplicate_manifest_lineage_refused_as_whole() {
+    let root = isolated_root("duplicate-lineage");
+    let adapter = DestinationRestoreAdapter::bind(&root).expect("adapter bind");
+    let blob = blob_for(b"sealed-opaque".to_vec(), sha256_hex(b"plaintext-opaque"));
+    let mut manifest = manifest_for(b"wrapped-opaque".to_vec());
+    manifest.entries.push(manifest.entries[0].clone());
+    let receipt = receipt_for(blob.locator.hash.as_str());
+    let error = adapter
+        .verify_restorable(&blob, &receipt, &manifest)
+        .expect_err("duplicate lineage must refuse");
+    assert!(
+        matches!(error, BackupError::Duplicate { .. }),
         "unexpected error: {error}"
     );
     std::fs::remove_dir_all(&root).ok();

@@ -44,6 +44,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -874,6 +875,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
