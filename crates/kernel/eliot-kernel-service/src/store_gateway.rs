@@ -34,7 +34,10 @@ use crate::store_write_reservation::{
     mark_unknown_outcome, reconcile_receipt, reserve_for_transition, writer_epoch_for_fence,
     writer_epoch_for_fence_from_epoch,
 };
-use crate::{EbpCanonicalStoreClient, EbpStoreTransport, KernelService};
+use crate::{
+    EbpCanonicalStoreClient, EbpStoreTransport, KernelService, StoreClientFault,
+    StoreClientFaultHarness,
+};
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
@@ -556,6 +559,19 @@ impl KernelStoreGateway {
             return Err("canonical-store route authority epoch is stale".to_owned());
         }
         Ok(lease)
+    }
+
+    /// Arms the production fault hook on the bound store client (issue #2030
+    /// follow-up binding for 994/11-12).
+    ///
+    /// Read-through delegation only: no dispatch, admission, or reservation
+    /// behavior changes. Harness-gated like `arm_fault` itself — only `test`
+    /// or `--features test-support` builds can construct the token, so
+    /// production callers cannot arm faults. The 994 follow-up cases arm the
+    /// hook on the proven kernel route, then drive `apply_reserved` through
+    /// the existing owner-bound path.
+    pub fn arm_store_fault(&self, harness: &StoreClientFaultHarness, fault: StoreClientFault) {
+        self.store.arm_fault(harness, fault);
     }
 
     /// Cancels one reserved write before possible submission (issue #992).
