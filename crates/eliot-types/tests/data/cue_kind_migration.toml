@@ -144,7 +144,7 @@ migration = 831
 expiry = "migrate-to-LegacyCueKindV1-under-#831; alias removal #835"
 risk = "none"
 match_count = 2
-matched_digest = "e193b639fd320db6ff49e3ea9af48fe9c143d74814c7784f8b02fecc5a18a513"
+matched_digest = "ab6bcf9293c8c493bb09609588cfc27212357637683b4962d08b84d5614595e4"
 variants = []
 
 [type_row."crates/eliot-app/src/mcp_stdio/protocol_tests.rs"]
@@ -374,7 +374,7 @@ migration = 831
 expiry = "migrate-under-#831; alias removal #835"
 risk = "none"
 match_count = 80
-matched_digest = "31e4cd9709fafaae1103596924b7a5ff08661ae8b883e177aadbeae07df6425a"
+matched_digest = "e2a3418aa629e9ad2067ec45529b74c8546e109f718c6fb94e27533a20a21d98"
 variants = []
 
 [type_row."crates/eliot-store/src/blob_store.rs"]
@@ -403,8 +403,8 @@ owner = "#706"
 migration = 706
 expiry = "frozen-seam-oracle; lexical duplicate scan authorized under #832 coherent join; alias removal tracked by #835"
 risk = "none"
-match_count = 69
-matched_digest = "521f1d62bca193d8383e945884f03070de3d8039b6ff08d4b6cbccf768e97b32"
+match_count = 85
+matched_digest = "d5fe71b4532dc6609eeb61829cf07923cfd8af922a972306b37dfb91338a6655"
 variants = []
 
 [type_row."crates/smart/eliot-context/src/lib.rs"]

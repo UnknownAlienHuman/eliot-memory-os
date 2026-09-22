@@ -577,7 +577,8 @@ fn scan_files(dirs: &[&str], needle: &str) -> Result<Vec<String>, Box<dyn std::e
 /// counts. Fixture text that legitimately spells definitions (boundary
 /// oracle data, classifier unit snippets) stays invisible to duplicate
 /// detection without weakening it: a real new definition still trips it.
-fn scan_enum_definitions(    dirs: &[&str],
+fn scan_enum_definitions(
+    dirs: &[&str],
     enum_name: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let root = workspace_root()?;
@@ -591,6 +592,55 @@ fn scan_enum_definitions(    dirs: &[&str],
     hits.sort();
     hits.dedup();
     Ok(hits)
+}
+
+/// Whether stripped code declares `enum <name>` as a real definition.
+///
+/// Both token boundaries hold: the `enum` keyword must not extend a
+/// longer identifier, all Rust whitespace forms may separate it from
+/// the name (space, tab, newline), and an `r#` raw-identifier prefix on
+/// the name still counts as a declaration of that name. Longer names on
+/// either side never match. Anything else where the target name is
+/// involved but unparseable (bare `enum` at end of input, unexpected
+/// punctuation) fails closed as a hit so unknown syntax never silently
+/// passes; other identifiers are affirmative non-matches.
+fn declares_enum(stripped: &str, name: &str) -> bool {
+    fn is_ident(cell: u8) -> bool {
+        cell.is_ascii_alphanumeric() || cell == b'_'
+    }
+    let bytes = stripped.as_bytes();
+    let mut index = 0;
+    while index + 4 <= bytes.len() {
+        if &bytes[index..index + 4] == b"enum" && (index == 0 || !is_ident(bytes[index - 1])) {
+            let mut cursor = index + 4;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if bytes.get(cursor..cursor + 2) == Some(b"r#") {
+                cursor += 2;
+            }
+            if bytes
+                .get(cursor..)
+                .is_some_and(|rest| rest.starts_with(name.as_bytes()))
+            {
+                let after = cursor + name.len();
+                if after >= bytes.len() || !is_ident(bytes[after]) {
+                    return true;
+                }
+                index = after;
+                continue;
+            }
+            if cursor >= bytes.len() {
+                return true;
+            }
+            let cell = bytes[cursor];
+            if !(cell.is_ascii_alphabetic() || cell == b'_') {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 fn collect_enum_definitions(
@@ -607,13 +657,7 @@ fn collect_enum_definitions(
         } else if path.extension().is_some_and(|extension| extension == "rs") {
             let text = std::fs::read_to_string(&path).map_err(boxed)?;
             let stripped = strip_code(&text);
-            let needle = format!("enum {enum_name}");
-            let declared = stripped.lines().any(|line| {
-                line.split(&needle).skip(1).any(|after| {
-                    !matches!(after.chars().next(), Some(cell) if cell.is_alphanumeric() || cell == '_')
-                })
-            });
-            if declared {
+            if declares_enum(&stripped, enum_name) {
                 let relative = path
                     .strip_prefix(workspace_root()?)
                     .map_err(boxed)?
@@ -1389,6 +1433,34 @@ fn case_28_new_duplicate_fails() -> TestResult {
     let def_needle = ["enum", "CueKind"].join(" ");
     let synthetic = ["pub ", &def_needle, " {\n    FilePath,\n}\n"].concat();
     assert_eq!(matched_lines(&synthetic, &def_needle).len(), 1);
+    // The live scan shares declares_enum: pin its lexical boundaries on
+    // synthetic inputs (stripped exactly like live files).
+    assert!(declares_enum(
+        &strip_code("pub enum CueKind {\n"),
+        "CueKind"
+    ));
+    assert!(declares_enum(&strip_code("enum\nCueKind {\n"), "CueKind"));
+    assert!(declares_enum(&strip_code("enum\tCueKind {\n"), "CueKind"));
+    assert!(declares_enum(&strip_code("enum r#CueKind {}\n"), "CueKind"));
+    assert!(!declares_enum(&strip_code("// enum CueKind\n"), "CueKind"));
+    assert!(!declares_enum(
+        &strip_code("let s = \"enum CueKind\";\n"),
+        "CueKind"
+    ));
+    assert!(!declares_enum(
+        &strip_code("enum CueKindProvenance {}\n"),
+        "CueKind"
+    ));
+    assert!(!declares_enum(
+        &strip_code("myenum CueKind {}\n"),
+        "CueKind"
+    ));
+    assert!(!declares_enum(
+        &strip_code("fn f() { let q = '\"'; }\nlet s = \"enum CueKind\";\n"),
+        "CueKind"
+    ));
+    assert!(declares_enum(&strip_code("enum"), "CueKind"));
+    assert!(declares_enum(&strip_code("enum {\n"), "CueKind"));
     let live = scan_enum_definitions(
         &["crates/smart", "crates/foundation", "crates/eliot-types"],
         "CueKind",
