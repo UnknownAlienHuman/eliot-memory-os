@@ -90,6 +90,7 @@ fn candidate() -> ContextCandidate {
             content_sha256: digest(),
             predecessor: None,
         },
+        learning: None,
         representation: AtomRepresentation::Whole {
             content: "complete goal".to_owned(),
         },

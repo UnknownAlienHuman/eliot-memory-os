@@ -106,6 +106,7 @@ fn candidate(
             content_sha256: digest(b'b'),
             predecessor: None,
         },
+        learning: None,
         representation: AtomRepresentation::Whole {
             content: content.to_owned(),
         },
@@ -314,6 +315,7 @@ fn input_with_optional(optional_cost: AdmissionMeasuredCost) -> AdmissionInput {
             candidates: vec![required.clone(), optional.clone()],
             denominator: denominator.clone(),
         },
+        learning_tickets: Vec::new(),
         floor: SafetyFloorIdentity {
             floor_id: id("floor"),
             decision: recipe.decision.clone(),

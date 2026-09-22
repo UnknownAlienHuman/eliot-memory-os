@@ -1473,6 +1473,7 @@ fn build_atom(
         atom_id: item.member.member_id.clone(),
         provider_role: slot.clone(),
         source: item.member.source.clone(),
+        learning: None,
         representation: eliot_context_contracts::AtomRepresentation::Whole {
             content: item.member.content.clone(),
         },
