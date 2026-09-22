@@ -1,4 +1,4 @@
-//! Kernel-owned production restore adapter (issue #960, lane F first slice).
+//! Kernel-owned production restore adapter (issue #960, lane F).
 //!
 //! Architecture: A13.7 Backups, Restore, and Migration (isolated restore,
 //! purge-first, suspended ORS import, new lineage, separate cutover
@@ -7,7 +7,9 @@
 //! anchors); I5.13 backup classes (full denominator, degraded ceiling,
 //! key-material rule); I14.21 unknown-commit recovery (reconcile by identity,
 //! never blind retry); A0.3 Hard Boundaries (no revived authority, no minted
-//! epochs, no fabricated receipts).
+//! epochs, no fabricated receipts); I1.8 exact ownership and call paths (one
+//! logical Governor, two internal checks — this adapter never invents
+//! semantics, authorizes them, and commits them alone).
 //! Implementation: the single existing journaled state machine
 //! ([`RestorePlan::execute_with_journal`](eliot_backup::RestorePlan::execute_with_journal))
 //! drives execution and resumption — same-transaction resume is a second call
@@ -19,18 +21,37 @@
 //! the [`RestoreTarget`](eliot_backup::RestoreTarget) adapter
 //! (`apply_restore_effect` / `reconcile_restore_effect`) over the historical
 //! per-phase owner methods the accepted contract retains for owner adapters.
-//! Every phase maps to its responsible owner through [`phase_owner`]. Owner
-//! channels bind in #962: until then every owner phase refuses fail-closed
-//! with the exact responsible capability
-//! ([`RestoreCapabilityUnsupported`](eliot_backup::BackupError::RestoreCapabilityUnsupported)),
-//! and owner-phase reconciliation reports `Unknown` so the outcome propagates
-//! without a new identity and without blind retry (I14.21). `NotApplied` is
-//! returned only where this target proves non-application: the Kernel-owned
-//! prepare phase via persisted-receipt readback, and finalize, whose arm is
-//! statically refuse-only this turn (required owner obligations were not
-//! attempted). The #962 turn must upgrade owner-phase reconciliation to
-//! owner readback-or-`Unknown`; it must never downgrade `Unknown` to a blind
-//! re-apply.
+//! Every phase maps to its responsible owner through [`phase_owner`], and the
+//! apply path executes the genuine owner operation with the exact bindings
+//! the coordinator supplies:
+//!
+//! ```text
+//! prepare/finalize ......... kernel-restore-owner (destination staging,
+//!                              fence gate, observed evidence);
+//! purge .................... purge owner (`apply_purge_ledger`, staged
+//!                              purge-first before any import);
+//! canonical/receipt/
+//! projection/rebuild/verify . canonical owner (`import_*`, chain + count
+//!                              verification over observed destination state);
+//! sealed blobs ............. blob owner (`DestinationRestoreAdapter::
+//!                              restore_blob_sealed` with backup-bound
+//!                              restoration receipts, the admitted key
+//!                              manifest, and the destination scope;
+//!                              re-sealed bytes staged, never plaintext);
+//! ORS suspension ........... ORS owner (`suspended_recovery_entries`,
+//!                              persisted as suspended evidence, never
+//!                              runnable);
+//! ```
+//!
+//! Effects whose bindings are absent refuse fail-closed with the exact
+//! responsible capability; reconciliation answers from persisted identity
+//! receipts (`Applied` on exact transaction/phase/input match, `NotApplied`
+//! otherwise). All effects here are synchronous and local with a persisted
+//! identity receipt per phase, so no ambiguous external commit exists in this
+//! target and no `Unknown` outcome is manufactured: async owner-channel
+//! unknowns belong to the #962 wire layer, which owns
+//! `backup_owner_clients.rs` and must upgrade reconciliation there, never
+//! downgrade readback to a blind re-apply here.
 //!
 //! Capability cell: Kernel restore ownership (isolated import execution).
 //! Forbidden authority: no ORS row reinterpretation, no epoch minting, no
@@ -41,12 +62,18 @@
 use std::path::PathBuf;
 
 use eliot_backup::{
-    BackupBundle, BackupError, RestoreAppliedEffect, RestoreContext, RestoreEffectReceipt,
-    RestoreEvidence, RestoreHistoricalAuthority, RestoreIntent, RestorePhase, RestorePlan,
-    RestoreReceipt, RestoreReconciliation, RestoreStep, RestoreTarget, WrappedKeyManifest,
-    suspended_recovery_entries, verify_key_coverage,
+    BackupBlob, BackupBundle, BackupError, BlobRestorationReceipt, CanonicalRecord,
+    DestinationRestoreAdapter, DestinationScope, OrsSnapshotFence, RestoreAppliedEffect,
+    RestoreArchiveDisposition, RestoreArchiveDispositionKind, RestoreContext, RestoreEffectReceipt,
+    RestoreEvidence, RestoreHistoricalAuthority, RestoreIntent, RestoreObligationState,
+    RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation,
+    RestoreStep, RestoreTarget, RestoredFence, RestoredSealedBlob, WrappedKeyManifest,
+    issue_restoration_receipts, suspended_recovery_entries, verify_key_coverage,
 };
+use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreObligations, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_security_contracts::PurgeLedgerEntry;
+use eliot_store_api::WriteReceipt;
 use serde::Serialize;
 
 use super::backup_restore_ports::{
@@ -57,9 +84,6 @@ use super::backup_restore_ports::{
 ///
 /// The owner vocabulary matches the obligation owner ids carried in restore
 /// evidence, so every executed phase is attributable to exactly one owner.
-/// Steps whose external owner channel is not yet bound (#962) keep their
-/// true owner here and refuse at execution; the mapping never substitutes
-/// the Kernel restore owner for a missing external owner.
 #[must_use]
 pub const fn phase_owner(step: &RestoreStep) -> &'static str {
     match step {
@@ -77,26 +101,32 @@ pub const fn phase_owner(step: &RestoreStep) -> &'static str {
     }
 }
 
-/// Owner obligation identifiers shared by the phase matrix and evidence.
-///
-/// These name the exact owners from the accepted obligation vocabulary; they
-/// are attribution labels and refusal capabilities, never new authority.
+/// Owner obligation identifiers and missing-binding capabilities shared by
+/// the phase matrix, refusal errors, and evidence.
 mod owners {
     pub const PURGE: &str = "purge-owner";
     pub const CANONICAL: &str = "canonical-owner";
+    pub const REFERENCE: &str = "reference-owner";
     pub const BLOB: &str = "blob-owner";
     pub const ORS: &str = "ors-owner";
+    pub const RECONCILIATION: &str = "reconciliation-owner";
+    pub const WATCHDOG: &str = "watchdog-owner";
+    pub const EXTERNAL_SOURCE: &str = "external-source-owner";
+    pub const RUNTIME: &str = "runtime-owner";
+    pub const SESSION: &str = "session-owner";
+    pub const LEASE: &str = "lease-owner";
+    pub const ROUTE: &str = "route-owner";
+    pub const USER_BROKER: &str = "user-broker-owner";
+    /// Missing destination blob-scope admission (#956/#958) for sealed-blob
+    /// restoration under destination ownership.
+    pub const BLOB_SCOPE_BINDING: &str = "blob-destination-scope";
 }
 
 /// Outcome of one Kernel-executed isolated restore: the journaled receipt,
-/// target-observed evidence when this process executed finalize, suspended
-/// work, the exact applied phase log, and the observed paths. No cutover,
-/// activation, or retirement is performed or reported.
-///
-/// `evidence` is `None` until owner channels bind (#962) and this process
-/// executes finalize: no evidence is reconstructed from counts, and a
-/// resumed run whose finalize executed elsewhere reports that run's receipt
-/// without self-attesting evidence it never observed.
+/// target-observed evidence when this process executed finalize (or the
+/// resumed run's evidence file re-validated), suspended work, the exact
+/// applied phase log, and the observed paths. No cutover, activation, or
+/// retirement is performed or reported.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelRestoreOutcome {
     pub receipt: RestoreReceipt,
@@ -111,10 +141,11 @@ pub struct KernelRestoreOutcome {
 ///
 /// Owns the admitted durable journal and the constructed (not accepted)
 /// isolated destination. Execution binds one archive, one plan context, the
-/// Kernel's current effect fence, and optional key material. The adapter
-/// never mints epochs, never activates authority, and never performs
-/// cutover. Re-running with the same bundle and target context resumes the
-/// same transaction from the durable journal instead of re-applying.
+/// Kernel's current effect fence, key material, and the destination blob
+/// scope. The adapter never mints epochs, never activates authority, and
+/// never performs cutover. Re-running with the same bundle and target
+/// context resumes the same transaction from the durable ORS journal instead
+/// of re-applying.
 pub struct KernelBackupRestore {
     journal: KernelRestoreJournal,
     work_root: PathBuf,
@@ -128,9 +159,11 @@ impl KernelBackupRestore {
 
     /// Opens the restore owner on a fresh journal below `work_root`.
     ///
-    /// The journal starts unadmitted: bind owner admission on
-    /// [`KernelRestoreJournal::admit`] before executing. Production
-    /// durability claims additionally require a non-fixture admission (see
+    /// The journal starts unadmitted and unbound: bind owner admission on
+    /// [`KernelRestoreJournal::admit`] and the transaction stream on
+    /// [`KernelRestoreJournal::bind_plan_stream`] (done by
+    /// [`restore`](Self::restore)) before executing. Production durability
+    /// claims additionally require a non-fixture admission (see
     /// [`RestoreJournalAdmission::admits_production_durable_recovery`](eliot_backup::RestoreJournalAdmission::admits_production_durable_recovery)).
     pub fn open(work_root: &std::path::Path) -> Result<Self, KernelRestoreError> {
         Ok(Self {
@@ -139,7 +172,7 @@ impl KernelBackupRestore {
         })
     }
 
-    /// Returns the bound journal (admission, resume inspection).
+    /// Returns the bound journal (admission, stream binding, inspection).
     pub fn journal(&mut self) -> &mut KernelRestoreJournal {
         &mut self.journal
     }
@@ -167,8 +200,8 @@ impl KernelBackupRestore {
     /// production caller (never caller arithmetic inside this adapter): the
     /// archive fence must be compatible with it before any effect, otherwise
     /// the restore is refused with zero target effects. Blob-carrying
-    /// archives without exact key coverage refuse before any effect; a
-    /// fixture-flagged journal admission refuses as not admitted for
+    /// archives require exact key coverage plus the destination blob scope;
+    /// a fixture-flagged journal admission refuses as not admitted for
     /// production. Coordinator failures propagate typed in
     /// [`KernelRestoreError::TargetFailed`]; the primary error is preserved,
     /// never flattened into a fabricated success.
@@ -178,6 +211,7 @@ impl KernelBackupRestore {
         target: RestoreContext,
         kernel_fence: &StateFence,
         keys: Option<&WrappedKeyManifest>,
+        blob_scope: Option<&DestinationScope>,
     ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
         bundle
             .validate()
@@ -192,28 +226,51 @@ impl KernelBackupRestore {
                 "archive fence is not compatible with the Kernel effect fence".to_owned(),
             ));
         }
-        match keys {
-            Some(manifest) => verify_key_coverage(&bundle.blobs, manifest)
-                .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?,
-            None if !bundle.blobs.is_empty() => {
-                return Err(KernelRestoreError::CapabilityMissing {
-                    capability: "blob_key_material",
-                });
-            }
-            None => {}
+        if let Some(manifest) = keys {
+            verify_key_coverage(&bundle.blobs, manifest)
+                .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        } else if !bundle.blobs.is_empty() {
+            return Err(KernelRestoreError::CapabilityMissing {
+                capability: "blob_key_material",
+            });
+        }
+        if !bundle.blobs.is_empty() && blob_scope.is_none() {
+            return Err(KernelRestoreError::CapabilityMissing {
+                capability: owners::BLOB_SCOPE_BINDING,
+            });
         }
         let plan = RestorePlan::compile(bundle, target.clone())
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        self.journal
+            .bind_plan_stream(&plan, bundle, kernel_fence)?;
         let destination = KernelIsolatedDestination::open(&self.work_root, &target.target_id)?;
-        let mut target_impl =
-            KernelRestoreTarget::new(&destination, kernel_fence.clone());
+        let receipts = match keys {
+            Some(manifest) => issue_restoration_receipts(
+                bundle.manifest.backup_id.as_str(),
+                manifest,
+                &bundle.blobs,
+            )
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?,
+            None => Vec::new(),
+        };
+        let mut target_impl = KernelRestoreTarget::new(
+            &destination,
+            kernel_fence.clone(),
+            keys,
+            blob_scope,
+            receipts,
+        );
         let receipt = plan
             .execute_with_journal(bundle, &mut target_impl, &mut self.journal)
             .map_err(KernelRestoreError::TargetFailed)?;
         let suspended = suspended_entries(bundle)?;
+        let evidence = target_impl
+            .final_evidence
+            .clone()
+            .or_else(|| read_resumed_evidence(&target_impl.root));
         Ok(KernelRestoreOutcome {
             receipt,
-            evidence: target_impl.final_evidence,
+            evidence,
             suspended_entries: suspended,
             phase_log: target_impl.calls,
             destination_root: target_impl.root,
@@ -232,6 +289,18 @@ fn suspended_entries(
     }
 }
 
+/// Re-reads the evidence file of a resumed run whose finalize executed in a
+/// previous process. Best effort: the bytes are deterministic for the
+/// transaction, so a present and valid file yields the identical value the
+/// coordinator certified; absence or invalidity yields `None` rather than
+/// self-attested evidence this process never observed.
+fn read_resumed_evidence(root: &std::path::Path) -> Option<RestoreEvidence> {
+    let bytes = std::fs::read(root.join("evidence.json")).ok()?;
+    let evidence: RestoreEvidence = serde_json::from_slice(&bytes).ok()?;
+    evidence.validate().ok()?;
+    Some(evidence)
+}
+
 /// Kernel-observed prepare evidence: the exact intent executed, bound to the
 /// compiled plan and the constructed destination. Observation, not authority.
 #[derive(Serialize)]
@@ -242,29 +311,55 @@ struct ObservedPrepare {
     outcome: String,
 }
 
+/// Kernel-observed blob restoration: re-sealed digest, consumed receipt, and
+/// lineage binding. No plaintext or key bytes cross this boundary.
+#[derive(Serialize)]
+struct ObservedBlobRestore {
+    resealed_sha256: String,
+    receipt_id: String,
+    key_lineage: String,
+    source_plaintext_sha256: String,
+}
+
 /// Kernel restore target over the accepted effect seam.
 ///
 /// Every applicable phase re-checks the Kernel effect fence before touching
-/// state. The Kernel-owned prepare phase validates the exact bundle member
-/// path it touches, persists exact bytes, and returns an observed receipt;
-/// finalize is statically refuse-only until owner channels bind (#962), and
-/// every owner phase refuses with its exact responsible capability. Unknown
-/// owner outcomes propagate as `Unknown`: no new identity, no blind retry.
-struct KernelRestoreTarget {
+/// state, executes the genuine responsible-owner operation with the exact
+/// bindings the coordinator supplies, persists exact bytes, and returns an
+/// observed receipt. Reconciliation answers from persisted identity receipts
+/// only.
+struct KernelRestoreTarget<'a> {
     root: PathBuf,
     kernel_fence: StateFence,
+    keys: Option<&'a WrappedKeyManifest>,
+    blob_scope: Option<&'a DestinationScope>,
+    receipts: Vec<BlobRestorationReceipt>,
     calls: Vec<String>,
     final_evidence: Option<RestoreEvidence>,
 }
 
-impl KernelRestoreTarget {
-    fn new(destination: &KernelIsolatedDestination, kernel_fence: StateFence) -> Self {
+impl<'a> KernelRestoreTarget<'a> {
+    fn new(
+        destination: &KernelIsolatedDestination,
+        kernel_fence: StateFence,
+        keys: Option<&'a WrappedKeyManifest>,
+        blob_scope: Option<&'a DestinationScope>,
+        receipts: Vec<BlobRestorationReceipt>,
+    ) -> Self {
         Self {
             root: destination.root().to_path_buf(),
             kernel_fence,
+            keys,
+            blob_scope,
+            receipts,
             calls: Vec::new(),
             final_evidence: None,
         }
+    }
+
+    /// Re-checks the Kernel effect fence before an applicable phase.
+    fn gate(&self, bundle: &BackupBundle) -> Result<(), BackupError> {
+        check_kernel_effect_fence(&self.kernel_fence, bundle)
     }
 
     fn write_file(&self, relative: &str, bytes: &[u8]) -> Result<(), BackupError> {
@@ -336,9 +431,51 @@ impl KernelRestoreTarget {
         Ok(Some(applied))
     }
 
-    /// Re-checks the Kernel effect fence before an applicable phase.
-    fn gate(&self, bundle: &BackupBundle) -> Result<(), BackupError> {
-        check_kernel_effect_fence(&self.kernel_fence, bundle)
+    fn find_blob<'b>(
+        bundle: &'b BackupBundle,
+        hash: &str,
+    ) -> Result<&'b BackupBlob, BackupError> {
+        bundle
+            .blobs
+            .iter()
+            .find(|blob| blob.locator.hash.as_str() == hash)
+            .ok_or(BackupError::PlanMismatch)
+    }
+
+    fn find_event<'b>(
+        records: &'b [CanonicalRecord],
+        record_id: &str,
+    ) -> Result<&'b CanonicalRecord, BackupError> {
+        records
+            .iter()
+            .find(|record| record.record_id == record_id)
+            .ok_or(BackupError::PlanMismatch)
+    }
+
+    fn staged_bytes(&self, relative: &str) -> Result<Vec<u8>, BackupError> {
+        std::fs::read(self.root.join(relative))
+            .map_err(|error| BackupError::Target(error.to_string()))
+    }
+
+    fn count_dir(&self, relative: &str) -> Result<usize, BackupError> {
+        let path = self.root.join(relative);
+        if !path.exists() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        let entries =
+            std::fs::read_dir(&path).map_err(|error| BackupError::Target(error.to_string()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| BackupError::Target(error.to_string()))?;
+            if entry
+                .file_type()
+                .map_err(|error| BackupError::Target(error.to_string()))?
+                .is_file()
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     fn apply_prepare(
@@ -347,17 +484,8 @@ impl KernelRestoreTarget {
         bundle: &BackupBundle,
         intent: &RestoreIntent,
     ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.prepare_isolated(&plan.target, &plan.restored_fence)?;
         self.gate(bundle)?;
-        for dir in [
-            "blobs",
-            "events",
-            "receipts",
-            "projections",
-            "phase-receipts",
-        ] {
-            std::fs::create_dir_all(self.root.join(dir))
-                .map_err(|error| BackupError::Target(error.to_string()))?;
-        }
         let observed = ObservedPrepare {
             transaction_id: intent.transaction_id.clone(),
             plan_id: plan.plan_id.clone(),
@@ -375,6 +503,198 @@ impl KernelRestoreTarget {
         Ok(applied)
     }
 
+    fn apply_blob(
+        &mut self,
+        bundle: &BackupBundle,
+        intent: &RestoreIntent,
+        hash: &str,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.gate(bundle)?;
+        let blob = Self::find_blob(bundle, hash)?;
+        let receipt = self
+            .receipts
+            .iter()
+            .find(|receipt| receipt.blob_hash == hash)
+            .ok_or(BackupError::PlanMismatch)?;
+        let manifest = self.keys.ok_or(BackupError::MissingRecoveryComponent(
+            "blob_key_material",
+        ))?;
+        let scope = self.blob_scope.ok_or(BackupError::RestoreCapabilityUnsupported {
+            capability: owners::BLOB_SCOPE_BINDING,
+        })?;
+        let adapter = DestinationRestoreAdapter::bind(self.root.as_path())?;
+        let restored: RestoredSealedBlob =
+            adapter.restore_blob_sealed(blob, receipt, manifest, scope)?;
+        self.write_file(&format!("blobs/{hash}"), &restored.resealed_bytes)?;
+        let observed = ObservedBlobRestore {
+            resealed_sha256: restored.resealed_sha256.clone(),
+            receipt_id: restored.receipt_id.clone(),
+            key_lineage: restored.key_lineage.clone(),
+            source_plaintext_sha256: restored.source_plaintext_sha256.clone(),
+        };
+        let evidence_bytes = canonical_json_bytes(&observed)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        let applied = RestoreAppliedEffect {
+            receipt: Self::effect_receipt(intent, &evidence_bytes)?,
+            final_evidence: None,
+        };
+        self.persist_applied(intent, &applied)?;
+        self.calls.push(format!("blob:{hash}"));
+        Ok(applied)
+    }
+
+    fn apply_event(
+        &mut self,
+        bundle: &BackupBundle,
+        intent: &RestoreIntent,
+        record_id: &str,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.gate(bundle)?;
+        let record = Self::find_event(&bundle.canonical_events, record_id)?;
+        self.import_canonical_event(record)?;
+        let evidence_bytes = self.staged_bytes(&format!("events/{record_id}.json"))?;
+        let applied = RestoreAppliedEffect {
+            receipt: Self::effect_receipt(intent, &evidence_bytes)?,
+            final_evidence: None,
+        };
+        self.persist_applied(intent, &applied)?;
+        self.calls.push(format!("event:{record_id}"));
+        Ok(applied)
+    }
+
+    fn apply_receipt_phase(
+        &mut self,
+        bundle: &BackupBundle,
+        intent: &RestoreIntent,
+        operation_id: &str,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.gate(bundle)?;
+        let receipt = bundle
+            .receipts
+            .iter()
+            .find(|receipt| receipt.operation_id.to_string() == operation_id)
+            .ok_or(BackupError::PlanMismatch)?;
+        self.import_receipt(receipt)?;
+        let evidence_bytes = self.staged_bytes(&format!("receipts/{operation_id}.json"))?;
+        let applied = RestoreAppliedEffect {
+            receipt: Self::effect_receipt(intent, &evidence_bytes)?,
+            final_evidence: None,
+        };
+        self.persist_applied(intent, &applied)?;
+        self.calls.push(format!("receipt:{operation_id}"));
+        Ok(applied)
+    }
+
+    fn apply_projection(
+        &mut self,
+        bundle: &BackupBundle,
+        intent: &RestoreIntent,
+        record_id: &str,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.gate(bundle)?;
+        let record = Self::find_event(&bundle.projections, record_id)?;
+        self.import_projection(record)?;
+        let evidence_bytes = self.staged_bytes(&format!("projections/{record_id}.json"))?;
+        let applied = RestoreAppliedEffect {
+            receipt: Self::effect_receipt(intent, &evidence_bytes)?,
+            final_evidence: None,
+        };
+        self.persist_applied(intent, &applied)?;
+        self.calls.push(format!("projection:{record_id}"));
+        Ok(applied)
+    }
+
+    fn apply_suspend(
+        &mut self,
+        bundle: &BackupBundle,
+        intent: &RestoreIntent,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.gate(bundle)?;
+        let snapshot = bundle.ors_snapshot.as_ref().ok_or(BackupError::PlanMismatch)?;
+        self.suspend_ors_operations(snapshot)?;
+        let evidence_bytes = self.staged_bytes("suspended_ors.json")?;
+        let applied = RestoreAppliedEffect {
+            receipt: Self::effect_receipt(intent, &evidence_bytes)?,
+            final_evidence: None,
+        };
+        self.persist_applied(intent, &applied)?;
+        self.calls.push("suspend-ors".to_owned());
+        Ok(applied)
+    }
+
+    fn apply_rebuild(
+        &mut self,
+        bundle: &BackupBundle,
+        intent: &RestoreIntent,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.gate(bundle)?;
+        if self.count_dir("blobs")? != bundle.blobs.len()
+            || self.count_dir("events")? != bundle.canonical_events.len()
+            || self.count_dir("receipts")? != bundle.receipts.len()
+            || self.count_dir("projections")? != bundle.projections.len()
+        {
+            return Err(BackupError::RestoreEvidenceIncomplete);
+        }
+        let marker = serde_json::json!({
+            "blobs": bundle.blobs.len(),
+            "events": bundle.canonical_events.len(),
+            "receipts": bundle.receipts.len(),
+            "projections": bundle.projections.len(),
+        });
+        let evidence_bytes = serde_json::to_vec(&marker)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file("rebuild.json", &evidence_bytes)?;
+        let applied = RestoreAppliedEffect {
+            receipt: Self::effect_receipt(intent, &evidence_bytes)?,
+            final_evidence: None,
+        };
+        self.persist_applied(intent, &applied)?;
+        self.calls.push("rebuild".to_owned());
+        Ok(applied)
+    }
+
+    fn apply_verify(
+        &mut self,
+        bundle: &BackupBundle,
+        intent: &RestoreIntent,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.gate(bundle)?;
+        self.verify_receipt_event_chain(&bundle.receipts, &bundle.canonical_events)?;
+        let marker = serde_json::json!({
+            "verified": true,
+            "receipts": bundle.receipts.len(),
+            "events": bundle.canonical_events.len(),
+        });
+        let evidence_bytes = serde_json::to_vec(&marker)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file("verify.json", &evidence_bytes)?;
+        let applied = RestoreAppliedEffect {
+            receipt: Self::effect_receipt(intent, &evidence_bytes)?,
+            final_evidence: None,
+        };
+        self.persist_applied(intent, &applied)?;
+        self.calls.push("verify".to_owned());
+        Ok(applied)
+    }
+
+    fn apply_purge_phase(
+        &mut self,
+        bundle: &BackupBundle,
+        intent: &RestoreIntent,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.gate(bundle)?;
+        self.apply_purge_ledger(&bundle.purge_ledger)?;
+        let evidence_bytes = self.staged_bytes("purge_ledger.json")?;
+        let applied = RestoreAppliedEffect {
+            receipt: Self::effect_receipt(intent, &evidence_bytes)?,
+            final_evidence: None,
+        };
+        self.persist_applied(intent, &applied)?;
+        self.calls.push("purge".to_owned());
+        Ok(applied)
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn apply_phase(
         &mut self,
         plan: &RestorePlan,
@@ -384,47 +704,347 @@ impl KernelRestoreTarget {
         match &intent.phase {
             RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
             RestorePhase::PrepareIsolatedRoot => self.apply_prepare(plan, bundle, intent),
-            // Owner phases: channels bind in #962. Refuse with the exact
-            // responsible capability; never self-attest an owner effect.
-            RestorePhase::ApplyPurgeLedger => {
-                Err(BackupError::RestoreCapabilityUnsupported {
-                    capability: owners::PURGE,
-                })
+            RestorePhase::ApplyPurgeLedger => self.apply_purge_phase(bundle, intent),
+            RestorePhase::ImportSealedBlob { hash } => self.apply_blob(bundle, intent, hash),
+            RestorePhase::ImportCanonicalEvent { record_id } => {
+                self.apply_event(bundle, intent, record_id)
             }
-            RestorePhase::ImportSealedBlob { .. } => {
-                Err(BackupError::RestoreCapabilityUnsupported {
-                    capability: owners::BLOB,
-                })
+            RestorePhase::ImportReceipt { operation_id } => {
+                self.apply_receipt_phase(bundle, intent, operation_id)
             }
-            RestorePhase::ImportCanonicalEvent { .. }
-            | RestorePhase::ImportReceipt { .. }
-            | RestorePhase::ImportProjection { .. }
-            | RestorePhase::RebuildProjections
-            | RestorePhase::VerifyReceiptEventChain => {
-                Err(BackupError::RestoreCapabilityUnsupported {
-                    capability: owners::CANONICAL,
-                })
+            RestorePhase::ImportProjection { record_id } => {
+                self.apply_projection(bundle, intent, record_id)
             }
-            RestorePhase::SuspendOrsOperations => {
-                Err(BackupError::RestoreCapabilityUnsupported {
-                    capability: owners::ORS,
-                })
-            }
-            // Finalize cannot attest evidence while required owner effects
-            // were not attempted: honest evidence cannot validate
-            // (`RestoreEvidence::validate` requires observed import claims),
-            // so this arm refuses instead of minting invalid evidence. The
-            // #962 turn replaces this arm with observed-evidence assembly.
-            RestorePhase::FinalizeIsolatedRoot => {
-                Err(BackupError::RestoreCapabilityNotAttempted {
-                    capability: "owner-effect-obligations",
-                })
-            }
+            RestorePhase::SuspendOrsOperations => self.apply_suspend(bundle, intent),
+            RestorePhase::RebuildProjections => self.apply_rebuild(bundle, intent),
+            RestorePhase::VerifyReceiptEventChain => self.apply_verify(bundle, intent),
+            RestorePhase::FinalizeIsolatedRoot => self.apply_finalize(plan, bundle, intent),
         }
+    }
+
+    fn obligation(
+        owner_id: &str,
+        evidence_ref: String,
+        state: RestoreObligationState,
+    ) -> RestoreOwnerObligation {
+        RestoreOwnerObligation {
+            owner_id: owner_id.to_owned(),
+            evidence_ref,
+            state,
+        }
+    }
+
+    /// Reads the persisted phase-receipt digest for one obligation group.
+    ///
+    /// Every phase the coordinator journaled as receipt-persisted left its
+    /// observed applied record under the destination; a journaled effect
+    /// without its observation is corruption, never success.
+    fn group_ref(&self, phases: &[RestorePhase]) -> Result<String, BackupError> {
+        let mut digests = Vec::with_capacity(phases.len());
+        for phase in phases {
+            let path = self.phase_receipt_path(phase)?;
+            let bytes = std::fs::read(&path)
+                .map_err(|_| BackupError::RestoreJournalCorrupt)?;
+            digests.push(sha256_hex(&bytes));
+        }
+        Ok(format!(
+            "kernel-restore-phase-receipt:{}",
+            sha256_hex(digests.join(",").as_bytes())
+        ))
+    }
+
+    fn canonical_phases(bundle: &BackupBundle) -> Vec<RestorePhase> {
+        let mut phases = Vec::new();
+        phases.extend(bundle.canonical_events.iter().map(|record| {
+            RestorePhase::ImportCanonicalEvent {
+                record_id: record.record_id.clone(),
+            }
+        }));
+        phases.extend(bundle.receipts.iter().map(|receipt| {
+            RestorePhase::ImportReceipt {
+                operation_id: receipt.operation_id.to_string(),
+            }
+        }));
+        phases.extend(bundle.projections.iter().map(|record| {
+            RestorePhase::ImportProjection {
+                record_id: record.record_id.clone(),
+            }
+        }));
+        phases.push(RestorePhase::RebuildProjections);
+        phases.push(RestorePhase::VerifyReceiptEventChain);
+        phases
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_finalize(
+        &mut self,
+        plan: &RestorePlan,
+        bundle: &BackupBundle,
+        intent: &RestoreIntent,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.gate(bundle)?;
+        let purge_ref = self.group_ref(&[RestorePhase::ApplyPurgeLedger])?;
+        let canonical = Self::canonical_phases(bundle);
+        let canonical_ref = self.group_ref(&canonical)?;
+        let blob_phases: Vec<RestorePhase> = bundle
+            .blobs
+            .iter()
+            .map(|blob| RestorePhase::ImportSealedBlob {
+                hash: blob.locator.hash.to_string(),
+            })
+            .collect();
+        let blob_obligation = if blob_phases.is_empty() {
+            Self::obligation(
+                owners::BLOB,
+                "kernel-restore:archive-carries-no-blobs".to_owned(),
+                RestoreObligationState::NotAttempted,
+            )
+        } else {
+            let blob_ref = self.group_ref(&blob_phases)?;
+            Self::obligation(owners::BLOB, blob_ref, RestoreObligationState::Satisfied)
+        };
+        let ors_obligation = if bundle.ors_snapshot.is_some() {
+            let ors_ref = self.group_ref(&[RestorePhase::SuspendOrsOperations])?;
+            Self::obligation(owners::ORS, ors_ref, RestoreObligationState::Satisfied)
+        } else {
+            Self::obligation(
+                owners::ORS,
+                "kernel-restore:archive-carries-no-ors-snapshot".to_owned(),
+                RestoreObligationState::NotAttempted,
+            )
+        };
+        let missing = |owner_id: &str| {
+            Self::obligation(
+                owner_id,
+                format!("kernel-restore:unbound:{owner_id}"),
+                RestoreObligationState::MissingCapability,
+            )
+        };
+        let obligations = RestoreObligations {
+            purge: Self::obligation(owners::PURGE, purge_ref, RestoreObligationState::Satisfied),
+            canonical_validation: Self::obligation(
+                owners::CANONICAL,
+                canonical_ref.clone(),
+                RestoreObligationState::Satisfied,
+            ),
+            reference_validation: Self::obligation(
+                owners::REFERENCE,
+                canonical_ref,
+                RestoreObligationState::Satisfied,
+            ),
+            blob_validation: blob_obligation,
+            ors_suspension: ors_obligation,
+            unresolved_effect_reconciliation: Self::obligation(
+                owners::RECONCILIATION,
+                "kernel-restore:reconciliation-denominator-absent".to_owned(),
+                RestoreObligationState::Unknown,
+            ),
+            watchdog_signals: missing(owners::WATCHDOG),
+            external_source_revalidation: missing(owners::EXTERNAL_SOURCE),
+            runtime_invalidation: missing(owners::RUNTIME),
+            session_invalidation: missing(owners::SESSION),
+            lease_invalidation: missing(owners::LEASE),
+            route_invalidation: missing(owners::ROUTE),
+            user_broker_invalidation: missing(owners::USER_BROKER),
+        };
+        let build_digest = bundle
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "host_dependency_build")
+            .map_or_else(
+                || bundle.manifest.integrity_sha256.clone(),
+                |artifact| artifact.sha256.clone(),
+            );
+        let validation_bytes = canonical_json_bytes(&(
+            plan.plan_id.as_str(),
+            bundle.bundle_sha256()?.as_str(),
+        ))
+        .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        let owner = OwnerTrustBinding {
+            owner_id: "kernel-restore-owner".to_owned(),
+            trust_binding_ref: "trust-binding-kernel-restore-owner-restore-1".to_owned(),
+        };
+        let evidence = RestoreEvidence {
+            target_id: plan.target.target_id.clone(),
+            isolated_root: true,
+            purge_applied: true,
+            blobs_imported: true,
+            projections_rebuilt: true,
+            receipt_event_chain_verified: true,
+            ors_suspended: bundle.ors_snapshot.is_some(),
+            active_authority_restored: false,
+            authority_epoch: plan.restored_fence.authority_epoch.clone(),
+            resource_generation: plan.restored_fence.resource_generation,
+            provenance: RestoreProvenance {
+                transaction_id: intent.transaction_id.clone(),
+                plan_id: plan.plan_id.clone(),
+                operation_id: format!("restore-operation-{}", plan.plan_id),
+                phase: RestorePhase::FinalizeIsolatedRoot,
+                source_archive_id: bundle.manifest.backup_id.clone(),
+                source_class: bundle.manifest.class,
+                source_digest: bundle.bundle_sha256()?,
+                source_endpoint_ref: bundle.manifest.source_adapter.clone(),
+                isolated_destination_ref: plan.target.target_id.clone(),
+                expected_predecessor_ref: "none".to_owned(),
+                schema_revision: bundle.manifest.schema_generation.clone(),
+                build_manifest_digest: build_digest,
+                purge_ledger_revision: bundle.manifest.purge_ledger_revision,
+                owner: owner.clone(),
+                observed_generation: plan.restored_fence.resource_generation,
+                observed_epoch: plan.restored_fence.authority_epoch.clone(),
+                validation_digest: sha256_hex(&validation_bytes),
+            },
+            obligations,
+            observed_lineage_limits: vec![ObservedLineageLimit {
+                owner_id: owner.owner_id.clone(),
+                observed_epoch: bundle.export_fence.state_fence.authority_epoch.clone(),
+                observed_generation: bundle.export_fence.state_fence.resource_generation,
+            }],
+            owner_epoch: None,
+            reconciliation_denominator: None,
+            operational_validation: None,
+            historical_authority: match &bundle.ors_snapshot {
+                Some(snapshot) => suspended_recovery_entries(snapshot)?,
+                None => Vec::new(),
+            },
+            archive_disposition: RestoreArchiveDisposition {
+                disposition: RestoreArchiveDispositionKind::Current,
+                compatibility_ref: "ecxf-1-current".to_owned(),
+            },
+        };
+        evidence.validate()?;
+        let evidence_bytes = canonical_json_bytes(&evidence)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file("evidence.json", &evidence_bytes)?;
+        let applied = RestoreAppliedEffect {
+            receipt: Self::effect_receipt(intent, &evidence_bytes)?,
+            final_evidence: Some(evidence.clone()),
+        };
+        self.persist_applied(intent, &applied)?;
+        self.final_evidence = Some(evidence);
+        self.calls.push("finalize".to_owned());
+        Ok(applied)
     }
 }
 
-impl RestoreTarget for KernelRestoreTarget {
+impl RestoreTarget for KernelRestoreTarget<'_> {
+    fn prepare_isolated(
+        &mut self,
+        context: &RestoreContext,
+        restored_fence: &RestoredFence,
+    ) -> Result<(), BackupError> {
+        context.validate()?;
+        restored_fence.validate()?;
+        for dir in [
+            "blobs",
+            "events",
+            "receipts",
+            "projections",
+            "phase-receipts",
+        ] {
+            std::fs::create_dir_all(self.root.join(dir))
+                .map_err(|error| BackupError::Target(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn apply_purge_ledger(&mut self, entries: &[PurgeLedgerEntry]) -> Result<(), BackupError> {
+        for entry in entries {
+            entry
+                .validate()
+                .map_err(|error| BackupError::Security(error.to_string()))?;
+        }
+        let bytes = canonical_json_bytes(&entries)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file("purge_ledger.json", &bytes)?;
+        Ok(())
+    }
+
+    fn import_sealed_blob(&mut self, _blob: &BackupBlob) -> Result<(), BackupError> {
+        // The legacy single-argument form cannot carry the restoration
+        // receipt, the admitted key manifest, or the destination scope that
+        // destination-owned re-sealing requires: refusing here instead of
+        // staging sealed bytes without ownership. The journaled apply path
+        // supplies the full binding.
+        Err(BackupError::RestoreCapabilityUnsupported {
+            capability: owners::BLOB_SCOPE_BINDING,
+        })
+    }
+
+    fn import_canonical_event(&mut self, record: &CanonicalRecord) -> Result<(), BackupError> {
+        record.validate()?;
+        let bytes = canonical_json_bytes(&record.payload)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file(&format!("events/{}.json", record.record_id), &bytes)?;
+        Ok(())
+    }
+
+    fn import_receipt(&mut self, receipt: &WriteReceipt) -> Result<(), BackupError> {
+        receipt.validate().map_err(BackupError::Store)?;
+        let bytes = canonical_json_bytes(receipt)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file(&format!("receipts/{}.json", receipt.operation_id), &bytes)?;
+        Ok(())
+    }
+
+    fn import_projection(&mut self, record: &CanonicalRecord) -> Result<(), BackupError> {
+        record.validate()?;
+        let bytes = canonical_json_bytes(&record.payload)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file(&format!("projections/{}.json", record.record_id), &bytes)?;
+        Ok(())
+    }
+
+    fn suspend_ors_operations(&mut self, snapshot: &OrsSnapshotFence) -> Result<(), BackupError> {
+        let entries = suspended_recovery_entries(snapshot)?;
+        let bytes = canonical_json_bytes(&entries)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file("suspended_ors.json", &bytes)?;
+        Ok(())
+    }
+
+    fn rebuild_projections(&mut self, _restored_fence: &RestoredFence) -> Result<(), BackupError> {
+        // The legacy form lacks the bundle counts that make a rebuild claim
+        // verifiable; the journaled apply path verifies observed destination
+        // state instead of attesting an unanchorable marker.
+        Err(BackupError::RestoreCapabilityNotAttempted {
+            capability: "projection-rebuild-counts",
+        })
+    }
+
+    fn verify_receipt_event_chain(
+        &mut self,
+        receipts: &[WriteReceipt],
+        events: &[CanonicalRecord],
+    ) -> Result<(), BackupError> {
+        let event_ids: std::collections::BTreeSet<&str> = events
+            .iter()
+            .map(|event| event.record_id.as_str())
+            .collect();
+        for receipt in receipts {
+            receipt.validate().map_err(BackupError::Store)?;
+            for event_id in &receipt.emitted_event_ids {
+                if !event_ids.contains(event_id.as_str()) {
+                    return Err(BackupError::ReceiptChainGap {
+                        event_id: event_id.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize_isolated(
+        &mut self,
+        _restored_fence: &RestoredFence,
+    ) -> Result<RestoreEvidence, BackupError> {
+        // Plan-bound evidence (plan/bundle identity, transaction digests,
+        // obligation receipts) cannot be assembled from the fence alone: the
+        // receipt-bearing apply path assembles it instead. Legacy callers
+        // must migrate to that seam rather than receive unbound evidence.
+        Err(BackupError::RestoreTargetReceiptRequired)
+    }
+
     fn apply_restore_effect(
         &mut self,
         plan: &RestorePlan,
@@ -441,21 +1061,20 @@ impl RestoreTarget for KernelRestoreTarget {
         &mut self,
         intent: &RestoreIntent,
     ) -> Result<RestoreReconciliation, BackupError> {
+        // Every effect in this target is synchronous and local with one
+        // persisted identity receipt per phase, so reconciliation reads the
+        // observation back by exact identity: a present receipt bound to this
+        // transaction, phase, and input digest is Applied; its absence is
+        // NotApplied and the coordinator re-applies idempotently (byte
+        // staging overwrites, re-sealing mints fresh bytes with a fresh
+        // receipt — no prior receipt exists to contradict). No ambiguous
+        // external commit exists here, hence no manufactured Unknown.
         match &intent.phase {
-            RestorePhase::PrepareIsolatedRoot => match self.load_applied(intent)? {
+            RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
+            _ => match self.load_applied(intent)? {
                 Some(applied) => Ok(RestoreReconciliation::Applied(applied)),
                 None => Ok(RestoreReconciliation::NotApplied),
             },
-            // Statically refuse-only this turn: no finalize effect could have
-            // happened, so re-applying deterministically refuses again. No
-            // duplicate effect is possible through this arm.
-            RestorePhase::FinalizeIsolatedRoot => Ok(RestoreReconciliation::NotApplied),
-            RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
-            // Owner phases: no owner readback exists until #962 binds the
-            // channels, so the outcome stays unknown and propagates. The
-            // coordinator converts this to an explicit rollback-required
-            // disposition; nothing here invents a new identity or retries.
-            _ => Ok(RestoreReconciliation::Unknown),
         }
     }
 }
