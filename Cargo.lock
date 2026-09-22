@@ -1018,6 +1018,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-cognitive-quality"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-learning-contracts",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-config"
 version = "0.1.0"
 dependencies = [
