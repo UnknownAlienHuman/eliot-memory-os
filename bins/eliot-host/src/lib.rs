@@ -122,8 +122,10 @@ pub use eliot_host_control_endpoint::{
 };
 use eliot_host_service::runtime_control::runtime_control_unknown_ref;
 pub use eliot_host_service::runtime_control::{
-    HostKernelRestartReceipt, HostRuntimeControlOperation, HostRuntimeControlRequest,
-    HostRuntimeControlResponse, HostStoreRecoveryReceipt,
+    HostDemandStartReceipt, HostDemandStartRuntimeRequest, HostDemandStartSafetyClass,
+    HostDemandStartState, HostDemandStartWakeRequest, HostKernelRestartReceipt,
+    HostRuntimeControlOperation, HostRuntimeControlRequest, HostRuntimeControlResponse,
+    HostStoreRecoveryReceipt,
 };
 #[cfg(windows)]
 use launch_artifact::{
@@ -165,12 +167,12 @@ use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGener
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_host_state::{
     ActivationState, AppendReceipt, DrainRecord, DrainState, EpochIdentity, EpochLineageId,
-    EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
+    EliotActivationRecord, EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
     HostStateJournalService, HostStateRecord, IdempotencyIdentity, JournalBackend, JournalError,
     KernelJobBinding, KernelRecord, NonceState, OneTimeNonceState, PriorKernelDisposition,
     ProductionHostStateJournal, ReconcileOutcome, RecordFence, RecoveryLineageEvidence,
-    RedbJournalBackend, StoreRebindRecord, StoreRebindState, host_owner_epoch_digest,
-    record_checksum,
+    RedbJournalBackend, ServiceSafetyClass, StoreRebindRecord, StoreRebindState, WakeRecord,
+    WakeDisposition, host_owner_epoch_digest, record_checksum,
 };
 use eliot_installation::{
     ActivationCommitFence, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
@@ -228,7 +230,8 @@ use eliot_platform_windows::{
 use eliot_process::DispatchAuthorityId;
 use eliot_runtime_contracts::{
     HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord,
-    ServiceProcessState, SupervisionJournalEpoch, SupervisionLeaseIncarnationBinding,
+    ServiceProcessState, SupervisionJournalEpoch, SupervisionLeaseIncarnationBinding, WakeIntent,
+    WakeIntentState,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -3565,6 +3568,50 @@ fn operation(label: &str) -> Result<IdempotencyIdentity, HostError> {
     })
 }
 
+#[cfg(windows)]
+fn demand_operation(
+    request: &HostRuntimeControlRequest,
+    label: &str,
+) -> Result<IdempotencyIdentity, HostError> {
+    let identity = sha256_json(&(
+        "eliot-host::demand-start:v1",
+        label,
+        request.request_id.as_str(),
+        request.mutation_digest.as_str(),
+        request.request_digest.as_str(),
+    ))?;
+    let idempotency = sha256_json(&(
+        "eliot-host::demand-start-idempotency:v1",
+        label,
+        request.request_id.as_str(),
+        request.mutation_digest.as_str(),
+        request.request_digest.as_str(),
+    ))?;
+    Ok(IdempotencyIdentity {
+        operation_id: PlatformHandle::new(format!("demand-start-operation:{identity}"))
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        idempotency_key: PlatformHandle::new(format!("demand-start-idempotency:{idempotency}"))
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+    })
+}
+
+#[cfg(windows)]
+fn bind_demand_activation(
+    activation: &mut EliotActivationRecord,
+    request: &HostRuntimeControlRequest,
+    demand: &HostDemandStartRuntimeRequest,
+) -> Result<(), HostError> {
+    activation.operation = demand_operation(request, "activation")?;
+    activation.trigger_class = demand.trigger_class.clone();
+    activation.trigger_evidence = demand.trigger_evidence.clone();
+    activation.requester_principal_session_or_scheduler = demand.requester_principal.clone();
+    activation.requested_capabilities = demand.requested_capabilities.clone();
+    activation.candidate_scope = demand.candidate_scope.clone();
+    activation.runtime_lease_refs = vec![demand.runtime_lease_ref.clone()];
+    activation.supervision_lease_refs = vec![demand.supervision_lease_ref.clone()];
+    Ok(())
+}
+
 fn record_fence(
     host: &HostInstallationEpoch,
     activation_id: &PlatformHandle,
@@ -4886,6 +4933,290 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    /// Handles one authenticated demand-start request through the existing
+    /// Host journal, process contour, and readiness owners.
+    ///
+    /// The request can coalesce on an already-active generation, cancel a
+    /// pre-commit drain and revalidate readiness, or persist a WakeIntent when
+    /// the drain commit has already fenced the current generation. Host never
+    /// creates semantic RuntimeLease/SupervisionLease authority; the opaque
+    /// references must come from the Kernel owner and are carried into the
+    /// receipt only after current readiness is observed.
+    pub fn handle_demand_start_request(
+        &mut self,
+        request: &HostRuntimeControlRequest,
+    ) -> HostRuntimeControlResponse {
+        host_lifecycle_observe_scm("host.demand-start requested");
+        if request.operation != HostRuntimeControlOperation::RequestDemandStart
+            || request.validate().is_err()
+        {
+            host_lifecycle_observe_terminal("host-demand-start-unknown");
+            return HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("demand-start-validation", request),
+            );
+        }
+        if self
+            .owner_lease
+            .activation_capability()
+            .live_guard()
+            .is_err()
+        {
+            host_lifecycle_observe_terminal("host-demand-start-unknown");
+            return HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("demand-start", request),
+            );
+        }
+        let Some(demand) = request.demand_start.as_ref() else {
+            host_lifecycle_observe_terminal("host-demand-start-unknown");
+            return HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("demand-start-validation", request),
+            );
+        };
+        match self.execute_demand_start(request, demand) {
+            Ok(receipt) => {
+                host_lifecycle_observe_scm("host.demand-start active");
+                HostRuntimeControlResponse::demand_started_for(request, receipt)
+            }
+            Err(error) => {
+                let reason = if error.to_string().contains("drain commit") {
+                    "demand-start-drain-committed"
+                } else if error.to_string().contains("reconcile") {
+                    "demand-start-reconcile"
+                } else {
+                    "demand-start"
+                };
+                host_lifecycle_observe_terminal("host-demand-start-unknown");
+                HostRuntimeControlResponse::unknown_for(
+                    request,
+                    runtime_control_unknown_ref(reason, request),
+                )
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn execute_demand_start(
+        &mut self,
+        request: &HostRuntimeControlRequest,
+        demand: &HostDemandStartRuntimeRequest,
+    ) -> Result<HostDemandStartReceipt, HostError> {
+        self.ensure_admission_open()?;
+        let initial = self.journal.snapshot()?;
+        let activation = initial.activation.clone().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("demand-start has no durable activation record".to_owned())
+        })?;
+        let mut drain_disposition = None;
+
+        match activation.state {
+            ActivationState::Stopped => {
+                let active = self.registry.active().cloned().ok_or_else(|| {
+                    HostError::ProcessContour(
+                        "demand-start has no approved active generation".to_owned(),
+                    )
+                })?;
+                let (kernel_path, store_path, _) = active.manifest.host_child_paths();
+                let (_, store_artifact) = active
+                    .manifest
+                    .host_child_artifact_digests()
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                self.start_approved_contour_for_demand(
+                    Path::new(kernel_path.as_str()),
+                    Path::new(store_path.as_str()),
+                    request,
+                    demand,
+                )?;
+                let _ = store_artifact;
+            }
+            ActivationState::ControlReady => {
+                let disposition = self.reconcile_approved_contour()?;
+                if disposition != HostBranchDisposition::Healthy {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "demand-start reconcile did not prove readiness: {disposition:?}"
+                    )));
+                }
+                self.transition_activation_with_drain_disposition(
+                    ActivationState::Active,
+                    "host-demand-start-active",
+                    None,
+                    Some((request, demand)),
+                )?;
+            }
+            ActivationState::Active => {
+                if activation.candidate_scope != demand.candidate_scope
+                    || !demand
+                        .requested_capabilities
+                        .iter()
+                        .all(|capability| activation.requested_capabilities.contains(capability))
+                    || !activation
+                        .runtime_lease_refs
+                        .contains(&demand.runtime_lease_ref)
+                    || !activation
+                        .supervision_lease_refs
+                        .contains(&demand.supervision_lease_ref)
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "active activation does not carry the exact demand lease binding"
+                            .to_owned(),
+                    ));
+                }
+                let disposition = self.reconcile_approved_contour()?;
+                if disposition != HostBranchDisposition::Healthy {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "demand-start reconcile did not prove readiness: {disposition:?}"
+                    )));
+                }
+            }
+            ActivationState::Draining => {
+                if initial.drain_commit.is_some() {
+                    if let Some(wake) = demand.wake.as_ref() {
+                        self.persist_demand_wake(request, demand, wake)?;
+                    } else {
+                        return Err(HostError::RecoveryRequired(
+                            "demand-start drain commit requires a durable WakeIntent".to_owned(),
+                        ));
+                    }
+                    return Err(HostError::RecoveryRequired(
+                        "demand-start queued after drain commit".to_owned(),
+                    ));
+                }
+                let drain = initial.drain.clone().ok_or_else(|| {
+                    HostError::OwnerLeaseRecovery(
+                        "demand-start saw Draining activation without DrainRecord".to_owned(),
+                    )
+                })?;
+                if !matches!(drain.state, DrainState::Requested | DrainState::Draining) {
+                    return Err(HostError::RecoveryRequired(
+                        "demand-start cannot cancel a terminal drain".to_owned(),
+                    ));
+                }
+                let mut cancelled = drain;
+                cancelled.state = DrainState::Cancelled;
+                cancelled.operation = demand_operation(request, "cancel-drain")?;
+                cancelled
+                    .evidence_refs
+                    .push(PlatformHandle::new("authenticated-demand-start")
+                        .map_err(|error| HostError::Platform(error.to_string()))?);
+                self.append_record(HostStateRecord::Drain(cancelled))?;
+                let disposition = self.reconcile_approved_contour()?;
+                if disposition != HostBranchDisposition::Healthy {
+                    return Err(HostError::RecoveryRequired(
+                        "demand-start drain cancellation could not revalidate readiness"
+                            .to_owned(),
+                    ));
+                }
+                self.transition_activation_with_drain_disposition(
+                    ActivationState::Active,
+                    "host-demand-start-drain-cancelled",
+                    Some(WakeDisposition::CancelDrain),
+                    Some((request, demand)),
+                )?;
+                drain_disposition = Some(
+                    PlatformHandle::new("CANCEL_DRAIN")
+                        .map_err(|error| HostError::Platform(error.to_string()))?,
+                );
+            }
+            state => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "demand-start cannot admit from activation state {state:?}"
+                )));
+            }
+        }
+
+        let current = self.journal.snapshot()?.activation.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "demand-start completion has no durable activation record".to_owned(),
+            )
+        })?;
+        if current.state != ActivationState::Active
+            || !current.readiness.control_ready
+            || !current.readiness.supervision_ready
+        {
+            return Err(HostError::RecoveryRequired(
+                "demand-start completion lacks current authenticated readiness".to_owned(),
+            ));
+        }
+        let activation_generation = PlatformHandle::new(format!(
+            "{}:{}",
+            current.fence.activation_generation.current.lineage_id,
+            current.fence.activation_generation.current.sequence
+        ))
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+        let mut receipt = HostDemandStartReceipt {
+            mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            activation_id: current.activation_id,
+            activation_generation,
+            state: HostDemandStartState::Active,
+            candidate_scope: demand.candidate_scope.clone(),
+            governance_profile: current.governance_profile,
+            readiness_evidence_refs: current.readiness.evidence_refs,
+            runtime_lease_ref: demand.runtime_lease_ref.clone(),
+            supervision_lease_ref: demand.supervision_lease_ref.clone(),
+            drain_disposition,
+            receipt_digest: PlatformHandle::new("pending")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        };
+        receipt.receipt_digest = receipt
+            .computed_digest()
+            .map_err(HostError::ProcessContour)?;
+        Ok(receipt)
+    }
+
+    #[cfg(windows)]
+    fn persist_demand_wake(
+        &mut self,
+        request: &HostRuntimeControlRequest,
+        demand: &HostDemandStartRuntimeRequest,
+        wake: &HostDemandStartWakeRequest,
+    ) -> Result<(), HostError> {
+        let snapshot = self.journal.snapshot()?;
+        let activation = snapshot.activation.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("demand-start WakeIntent has no activation".to_owned())
+        })?;
+        let intent = WakeIntent {
+            wake_id: wake.wake_id.as_str().to_owned(),
+            reason: wake.reason.as_str().to_owned(),
+            state_fence: demand.state_fence.clone(),
+            state: WakeIntentState::Pending,
+        };
+        if let Some(existing) = snapshot
+            .wakes
+            .iter()
+            .find(|existing| existing.wake_id == wake.wake_id)
+        {
+            if existing.intent == intent {
+                return Ok(());
+            }
+            return Err(HostError::RecoveryRequired(
+                "demand-start WakeIntent identity conflicts with the Host journal".to_owned(),
+            ));
+        }
+        let safety_class = match wake.safety_class {
+            HostDemandStartSafetyClass::ServiceSafe => ServiceSafetyClass::ServiceSafe,
+            HostDemandStartSafetyClass::UserSessionRequired => ServiceSafetyClass::UserSessionRequired,
+        };
+        self.append_record(HostStateRecord::Wake(WakeRecord {
+            fence: record_fence(&self.host, &activation.activation_id, &activation.fence.activation_generation),
+            operation: demand_operation(request, "queue-wake")?,
+            wake_id: wake.wake_id.clone(),
+            intent,
+            reason_evidence_refs: demand.trigger_evidence.clone(),
+            earliest_start: wake.earliest_start.clone(),
+            deadline: wake.deadline.clone(),
+            expiry: wake.expiry.clone(),
+            required_capabilities: wake.required_capabilities.clone(),
+            maintenance_family: wake.maintenance_family.clone(),
+            safety_class,
+            state_fence_revalidation_ref: wake.state_fence_revalidation_ref.clone(),
+            budget_ref: wake.budget_ref.clone(),
+        }))?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
     pub fn handle_kernel_restart_request(
         &mut self,
         request: &HostRuntimeControlRequest,
@@ -5362,6 +5693,26 @@ impl HostComposition {
         self.append_record(HostStateRecord::Activation(transition_activation_record(
             &current, state, label,
         )?))?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn transition_activation_with_drain_disposition(
+        &mut self,
+        state: ActivationState,
+        label: &str,
+        disposition: Option<WakeDisposition>,
+        demand: Option<(&HostRuntimeControlRequest, &HostDemandStartRuntimeRequest)>,
+    ) -> Result<(), HostError> {
+        let current = self.journal.snapshot()?.activation.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        let mut next = transition_activation_record(&current, state, label)?;
+        if let Some((request, demand)) = demand {
+            bind_demand_activation(&mut next, request, demand)?;
+        }
+        next.wake_during_drain_disposition = disposition;
+        self.append_record(HostStateRecord::Activation(next))?;
         Ok(())
     }
 
@@ -5852,12 +6203,39 @@ impl HostComposition {
             store_executable.as_ref(),
             store_artifact,
             None,
+            None,
         )?;
         host_terminal.disarm();
         // Started is distinct from ready: readiness still requires its own
         // authenticated proof via the readiness contour.
         host_lifecycle_observe_requested("host.start started");
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn start_approved_contour_for_demand(
+        &mut self,
+        kernel_executable: impl AsRef<Path>,
+        store_executable: impl AsRef<Path>,
+        request: &HostRuntimeControlRequest,
+        demand: &HostDemandStartRuntimeRequest,
+    ) -> Result<(), HostError> {
+        self.ensure_admission_open()?;
+        let active = self.registry.active().cloned().ok_or_else(|| {
+            HostError::ProcessContour("no approved active generation".to_owned())
+        })?;
+        let (_, store_artifact) = active
+            .manifest
+            .host_child_artifact_digests()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        self.start_manifest_contour(
+            &active.manifest,
+            kernel_executable.as_ref(),
+            store_executable.as_ref(),
+            store_artifact,
+            None,
+            Some((request, demand)),
+        )
     }
 
     /// Resumes one pending activation after Host Phase B has materialized its
@@ -5944,6 +6322,7 @@ impl HostComposition {
         store_executable: &Path,
         store_artifact: &PlatformHandle,
         pending: Option<&eliot_installation::PendingActivation>,
+        demand: Option<(&HostRuntimeControlRequest, &HostDemandStartRuntimeRequest)>,
     ) -> Result<(), HostError> {
         // F-LOG-HOST-1: inner phase only; outer `start_approved_contour`/`open`
         // owns the single terminal. Requested vs started vs ready preserved:
@@ -5986,6 +6365,9 @@ impl HostComposition {
         if let Some(pending) = pending {
             next.trigger_evidence
                 .push(pending_activation_binding(pending)?);
+        }
+        if let Some((request, demand)) = demand {
+            bind_demand_activation(&mut next, request, demand)?;
         }
         next.trigger_evidence
             .push(phase_b_activation_binding(&phase_b)?);
@@ -7302,6 +7684,7 @@ impl ApprovedHostStartupPort for HostComposition {
             store_bridge_executable,
             store_artifact,
             pending,
+            None,
         )
     }
 }

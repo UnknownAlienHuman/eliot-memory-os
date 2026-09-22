@@ -59,6 +59,13 @@ const UNKNOWN_REF_REASONS: &[&str] = &[
     "reactive-context-queue-full",
     "reactive-context-queue-response",
     "reactive-context",
+    "demand-start-validation",
+    "demand-start-queue-lock",
+    "demand-start-queue-full",
+    "demand-start-queue-response",
+    "demand-start",
+    "demand-start-drain-committed",
+    "demand-start-reconcile",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -69,6 +76,7 @@ pub enum HostRuntimeControlOperation {
     RecoverStore,
     ReconcileStoreRecovery,
     DeliverReactiveContext,
+    RequestDemandStart,
 }
 
 fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
@@ -78,6 +86,7 @@ fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static
         HostRuntimeControlOperation::RecoverStore => "RecoverStore",
         HostRuntimeControlOperation::ReconcileStoreRecovery => "ReconcileStoreRecovery",
         HostRuntimeControlOperation::DeliverReactiveContext => "DeliverReactiveContext",
+        HostRuntimeControlOperation::RequestDemandStart => "RequestDemandStart",
     }
 }
 
@@ -88,6 +97,7 @@ fn operation_unknown_prefix(operation: &HostRuntimeControlOperation) -> &'static
         HostRuntimeControlOperation::RecoverStore
         | HostRuntimeControlOperation::ReconcileStoreRecovery => "store-recovery",
         HostRuntimeControlOperation::DeliverReactiveContext => "reactive-context",
+        HostRuntimeControlOperation::RequestDemandStart => "demand-start",
     }
 }
 
@@ -158,6 +168,144 @@ fn reactive_context_mutation_digest(
     Ok(sha256_hex(&material))
 }
 
+fn validate_demand_handle(value: &PlatformHandle, field: &str) -> Result<(), String> {
+    if value.as_str().trim().is_empty() || value.as_str().chars().any(char::is_control) {
+        return Err(format!("{field} is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_demand_handles(
+    values: &[PlatformHandle],
+    field: &str,
+    require_nonempty: bool,
+) -> Result<(), String> {
+    if require_nonempty && values.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    for value in values {
+        validate_demand_handle(value, field)?;
+    }
+    Ok(())
+}
+
+/// Safety class carried by an owner-issued wake. The Host persists this
+/// value and never treats it as permission to grant semantic authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostDemandStartSafetyClass {
+    ServiceSafe,
+    UserSessionRequired,
+}
+
+/// Complete owner-issued wake material for a demand-start request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDemandStartWakeRequest {
+    pub wake_id: PlatformHandle,
+    pub reason: PlatformHandle,
+    pub earliest_start: PlatformHandle,
+    pub deadline: PlatformHandle,
+    pub expiry: PlatformHandle,
+    pub required_capabilities: Vec<PlatformHandle>,
+    pub maintenance_family: PlatformHandle,
+    pub safety_class: HostDemandStartSafetyClass,
+    pub state_fence_revalidation_ref: PlatformHandle,
+    pub budget_ref: PlatformHandle,
+}
+
+impl HostDemandStartWakeRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        for (value, field) in [
+            (&self.wake_id, "demand_start.wake_id"),
+            (&self.reason, "demand_start.wake.reason"),
+            (&self.earliest_start, "demand_start.wake.earliest_start"),
+            (&self.deadline, "demand_start.wake.deadline"),
+            (&self.expiry, "demand_start.wake.expiry"),
+            (
+                &self.maintenance_family,
+                "demand_start.wake.maintenance_family",
+            ),
+            (
+                &self.state_fence_revalidation_ref,
+                "demand_start.wake.state_fence_revalidation_ref",
+            ),
+            (&self.budget_ref, "demand_start.wake.budget_ref"),
+        ] {
+            validate_demand_handle(value, field)?;
+        }
+        validate_demand_handles(
+            &self.required_capabilities,
+            "demand_start.wake.required_capabilities",
+            true,
+        )
+    }
+}
+
+/// Authenticated, Kernel-owned demand-start input accepted by Host.
+///
+/// Lease references are opaque owner references. Host binds and persists
+/// them but never manufactures a RuntimeLease or SupervisionLease and never
+/// treats a caller-shaped reference as authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDemandStartRuntimeRequest {
+    pub requester_principal: PlatformHandle,
+    pub candidate_scope: PlatformHandle,
+    pub trigger_class: PlatformHandle,
+    pub trigger_evidence: Vec<PlatformHandle>,
+    pub requested_capabilities: Vec<PlatformHandle>,
+    pub state_fence: StateFence,
+    pub runtime_lease_ref: PlatformHandle,
+    pub supervision_lease_ref: PlatformHandle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<HostDemandStartWakeRequest>,
+}
+
+impl HostDemandStartRuntimeRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        for (value, field) in [
+            (&self.requester_principal, "demand_start.requester_principal"),
+            (&self.candidate_scope, "demand_start.candidate_scope"),
+            (&self.trigger_class, "demand_start.trigger_class"),
+            (&self.runtime_lease_ref, "demand_start.runtime_lease_ref"),
+            (
+                &self.supervision_lease_ref,
+                "demand_start.supervision_lease_ref",
+            ),
+        ] {
+            validate_demand_handle(value, field)?;
+        }
+        validate_demand_handles(
+            &self.trigger_evidence,
+            "demand_start.trigger_evidence",
+            true,
+        )?;
+        validate_demand_handles(
+            &self.requested_capabilities,
+            "demand_start.requested_capabilities",
+            true,
+        )?;
+        self.state_fence
+            .validate()
+            .map_err(|error| format!("demand_start.state_fence is invalid: {error}"))?;
+        if let Some(wake) = &self.wake {
+            wake.validate()?;
+        }
+        Ok(())
+    }
+}
+
+fn demand_start_mutation_digest(source: &HostDemandStartRuntimeRequest) -> Result<String, String> {
+    let encoded = serde_json::to_vec(source)
+        .map_err(|_| "demand-start source could not be encoded".to_owned())?;
+    let mut material = Vec::with_capacity(WIRE.len() + encoded.len() + 18);
+    material.extend_from_slice(WIRE.as_bytes());
+    material.extend_from_slice(b":demand-start:");
+    material.extend_from_slice(&encoded);
+    Ok(sha256_hex(&material))
+}
+
 pub fn runtime_control_unknown_ref(
     prefix: &str,
     request: &HostRuntimeControlRequest,
@@ -204,6 +352,7 @@ fn parse_runtime_control_unknown_ref(
         "RecoverStore" => HostRuntimeControlOperation::RecoverStore,
         "ReconcileStoreRecovery" => HostRuntimeControlOperation::ReconcileStoreRecovery,
         "DeliverReactiveContext" => HostRuntimeControlOperation::DeliverReactiveContext,
+        "RequestDemandStart" => HostRuntimeControlOperation::RequestDemandStart,
         _ => return None,
     };
     let request = HostRuntimeControlRequest {
@@ -213,6 +362,7 @@ fn parse_runtime_control_unknown_ref(
         mutation_digest: PlatformHandle::new(mutation_digest).ok()?,
         request_digest: PlatformHandle::new(request_digest).ok()?,
         reactive_context: None,
+        demand_start: None,
     };
     request.validate_identity().ok().map(|_| request)
 }
@@ -260,6 +410,9 @@ pub struct HostRuntimeControlRequest {
     /// Complete typed input for the authenticated reactive Context operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reactive_context: Option<HostReactiveContextRuntimeRequest>,
+    /// Complete owner-issued input for the authenticated demand-start operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demand_start: Option<HostDemandStartRuntimeRequest>,
 }
 
 impl HostRuntimeControlRequest {
@@ -294,6 +447,7 @@ impl HostRuntimeControlRequest {
             mutation_digest,
             request_digest,
             reactive_context: None,
+            demand_start: None,
         };
         value.validate().map_err(|e| e.to_string())?;
         Ok(value)
@@ -329,6 +483,38 @@ impl HostRuntimeControlRequest {
             mutation_digest,
             request_digest,
             reactive_context: Some(reactive_context),
+            demand_start: None,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Construct one authenticated demand-start request. The mutation
+    /// digest covers every owner-issued field, including opaque lease refs
+    /// and the complete optional WakeIntent material.
+    pub fn new_demand_start(
+        request_id: PlatformHandle,
+        demand_start: HostDemandStartRuntimeRequest,
+    ) -> Result<Self, String> {
+        demand_start.validate()?;
+        let wire = PlatformHandle::new(WIRE.to_owned()).map_err(|e| e.to_string())?;
+        let mutation_digest = PlatformHandle::new(demand_start_mutation_digest(&demand_start)?)
+            .map_err(|e| e.to_string())?;
+        let request_digest = PlatformHandle::new(request_digest_for(
+            &wire,
+            &HostRuntimeControlOperation::RequestDemandStart,
+            &request_id,
+            &mutation_digest,
+        ))
+        .map_err(|e| e.to_string())?;
+        let value = Self {
+            wire,
+            operation: HostRuntimeControlOperation::RequestDemandStart,
+            request_id,
+            mutation_digest,
+            request_digest,
+            reactive_context: None,
+            demand_start: Some(demand_start),
         };
         value.validate()?;
         Ok(value)
@@ -358,6 +544,19 @@ impl HostRuntimeControlRequest {
 
     pub fn validate(&self) -> Result<(), String> {
         self.validate_identity()?;
+        if matches!(&self.operation, HostRuntimeControlOperation::RequestDemandStart) {
+            let source = self
+                .demand_start
+                .as_ref()
+                .ok_or_else(|| "demand-start input is required".to_owned())?;
+            source.validate()?;
+            let expected = demand_start_mutation_digest(source)?;
+            if self.mutation_digest.as_str() != expected {
+                return Err("demand-start mutation_digest mismatch".to_owned());
+            }
+        } else if self.demand_start.is_some() {
+            return Err("demand-start input is reserved for RequestDemandStart".to_owned());
+        }
         match (&self.operation, &self.reactive_context) {
             (HostRuntimeControlOperation::DeliverReactiveContext, Some(source)) => {
                 source.validate()?;
@@ -535,6 +734,83 @@ impl HostStoreRecoveryReceipt {
     }
 }
 
+/// Host's authenticated demand-start outcome after journal/reconcile proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostDemandStartState {
+    Active,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDemandStartReceipt {
+    pub mutation_digest: PlatformHandle,
+    pub request_digest: PlatformHandle,
+    pub activation_id: PlatformHandle,
+    pub activation_generation: PlatformHandle,
+    pub state: HostDemandStartState,
+    pub candidate_scope: PlatformHandle,
+    pub governance_profile: PlatformHandle,
+    pub readiness_evidence_refs: Vec<PlatformHandle>,
+    pub runtime_lease_ref: PlatformHandle,
+    pub supervision_lease_ref: PlatformHandle,
+    pub drain_disposition: Option<PlatformHandle>,
+    pub receipt_digest: PlatformHandle,
+}
+
+impl HostDemandStartReceipt {
+    pub fn computed_digest(&self) -> Result<PlatformHandle, String> {
+        let bytes = serde_json::to_vec(&(
+            self.mutation_digest.as_str(),
+            self.request_digest.as_str(),
+            self.activation_id.as_str(),
+            self.activation_generation.as_str(),
+            self.state,
+            self.candidate_scope.as_str(),
+            self.governance_profile.as_str(),
+            &self.readiness_evidence_refs,
+            self.runtime_lease_ref.as_str(),
+            self.supervision_lease_ref.as_str(),
+            self.drain_disposition.as_ref().map(PlatformHandle::as_str),
+        ))
+        .map_err(|error| error.to_string())?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| error.to_string())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (value, name) in [
+            (&self.mutation_digest, "mutation_digest"),
+            (&self.request_digest, "request_digest"),
+            (&self.receipt_digest, "receipt_digest"),
+        ] {
+            if !is_sha256_digest(value) {
+                return Err(format!("{name} must be lowercase sha256"));
+            }
+        }
+        for (value, name) in [
+            (&self.activation_id, "activation_id"),
+            (&self.activation_generation, "activation_generation"),
+            (&self.candidate_scope, "candidate_scope"),
+            (&self.governance_profile, "governance_profile"),
+            (&self.runtime_lease_ref, "runtime_lease_ref"),
+            (&self.supervision_lease_ref, "supervision_lease_ref"),
+        ] {
+            validate_demand_handle(value, name)?;
+        }
+        validate_demand_handles(&self.readiness_evidence_refs, "readiness_evidence_refs", true)?;
+        if let Some(value) = &self.drain_disposition {
+            validate_demand_handle(value, "drain_disposition")?;
+        }
+        if self.state != HostDemandStartState::Active {
+            return Err("demand-start receipt is not active".to_owned());
+        }
+        if self.receipt_digest != self.computed_digest()? {
+            return Err("demand-start receipt_digest mismatch".to_owned());
+        }
+        Ok(())
+    }
+}
+
 #[allow(private_interfaces)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -545,6 +821,7 @@ impl HostStoreRecoveryReceipt {
 pub enum HostRuntimeControlResponse {
     Restarted { receipt: HostKernelRestartReceipt },
     StoreRecovered { receipt: HostStoreRecoveryReceipt },
+    DemandStarted { receipt: HostDemandStartReceipt },
     Unknown { pending_ref: PlatformHandle },
 }
 
@@ -565,6 +842,14 @@ impl HostRuntimeControlResponse {
         Self::StoreRecovered { receipt }
     }
 
+    pub fn demand_started_for(
+        request: &HostRuntimeControlRequest,
+        receipt: HostDemandStartReceipt,
+    ) -> Self {
+        let _ = request;
+        Self::DemandStarted { receipt }
+    }
+
     pub fn unknown_for(request: &HostRuntimeControlRequest, pending_ref: PlatformHandle) -> Self {
         let _ = request;
         Self::Unknown { pending_ref }
@@ -574,6 +859,7 @@ impl HostRuntimeControlResponse {
         match self {
             Self::Restarted { receipt, .. } => receipt.validate(),
             Self::StoreRecovered { receipt, .. } => receipt.validate(),
+            Self::DemandStarted { receipt, .. } => receipt.validate(),
             Self::Unknown { pending_ref, .. } => parse_runtime_control_unknown_ref(pending_ref)
                 .map(|_| ())
                 .ok_or_else(|| "pending_ref is not canonical".to_owned()),
@@ -609,6 +895,10 @@ pub fn response_matches_request(
         HostRuntimeControlResponse::StoreRecovered { receipt } => {
             receipt.request_digest == request.request_digest
                 && receipt.external_control_mutation_digest == request.mutation_digest
+        }
+        HostRuntimeControlResponse::DemandStarted { receipt } => {
+            receipt.request_digest == request.request_digest
+                && receipt.mutation_digest == request.mutation_digest
         }
         HostRuntimeControlResponse::Unknown { pending_ref } => {
             pending_ref_matches_request(pending_ref, request)
@@ -733,6 +1023,9 @@ pub fn runtime_control_response_frame(
         HostRuntimeControlResponse::StoreRecovered { receipt, .. } => {
             receipt.request_digest.as_str().to_owned()
         }
+        HostRuntimeControlResponse::DemandStarted { receipt, .. } => {
+            receipt.request_digest.as_str().to_owned()
+        }
         HostRuntimeControlResponse::Unknown { pending_ref, .. } => {
             parse_runtime_control_unknown_ref(pending_ref)
                 .ok_or_else(|| "SessionFenced".to_owned())?
@@ -797,6 +1090,11 @@ pub fn decode_runtime_control_response_frame(
             }
         }
         HostRuntimeControlResponse::StoreRecovered { receipt, .. } => {
+            if frame_request_id.as_str() != receipt.request_digest.as_str() {
+                return Err("SessionFenced".to_owned());
+            }
+        }
+        HostRuntimeControlResponse::DemandStarted { receipt, .. } => {
             if frame_request_id.as_str() != receipt.request_digest.as_str() {
                 return Err("SessionFenced".to_owned());
             }

@@ -17,10 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use eliot_host_service::runtime_control::{
-    HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR, HostKernelRestartReceipt,
-    HostReactiveContextRuntimeRequest, HostRuntimeControlOperation, HostRuntimeControlRequest,
-    HostRuntimeControlResponse, HostStoreRecoveryReceipt, decode_runtime_control_request_frame,
-    runtime_control_response_frame, runtime_control_unknown_ref,
+    HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR, HostDemandStartReceipt,
+    HostDemandStartRuntimeRequest, HostDemandStartSafetyClass, HostDemandStartState,
+    HostDemandStartWakeRequest, HostKernelRestartReceipt, HostReactiveContextRuntimeRequest,
+    HostRuntimeControlOperation, HostRuntimeControlRequest, HostRuntimeControlResponse,
+    HostStoreRecoveryReceipt, decode_runtime_control_request_frame, runtime_control_response_frame,
+    runtime_control_unknown_ref,
 };
 use eliot_host_service::runtime_control::{operation_unknown_ref, response_matches_request};
 use eliot_ipc::{NamedPipeServer, TransportLimits};

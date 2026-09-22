@@ -989,6 +989,7 @@ enum RuntimeControlDispatch {
     Kernel,
     Store,
     ReactiveContext,
+    DemandStart,
 }
 
 #[cfg(windows)]
@@ -1001,6 +1002,7 @@ fn runtime_control_dispatch(operation: &HostRuntimeControlOperation) -> RuntimeC
         HostRuntimeControlOperation::DeliverReactiveContext => {
             RuntimeControlDispatch::ReactiveContext
         }
+        HostRuntimeControlOperation::RequestDemandStart => RuntimeControlDispatch::DemandStart,
     }
 }
 
@@ -1051,6 +1053,9 @@ fn process_runtime_control_requests(
             RuntimeControlDispatch::Store => host.handle_store_recovery_request(envelope.request()),
             RuntimeControlDispatch::ReactiveContext => {
                 process_reactive_context_request(host, envelope.request())
+            }
+            RuntimeControlDispatch::DemandStart => {
+                host.handle_demand_start_request(envelope.request())
             }
         };
         let _ = envelope.respond(response);
