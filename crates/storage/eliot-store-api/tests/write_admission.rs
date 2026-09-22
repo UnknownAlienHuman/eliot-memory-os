@@ -763,6 +763,27 @@ fn dreamer_wire_request() -> StoreRequest {
     }
 }
 
+fn backup_wire_request() -> StoreRequest {
+    use eliot_store_api::{StoreBackupEnvelope, StoreBackupOperation, StoreBackupStatusRequest};
+    let operation_id = OperationId::new("op-backup-1").unwrap();
+    let operation = StoreBackupOperation::Status {
+        request: StoreBackupStatusRequest {
+            operation_id: operation_id.clone(),
+        },
+    };
+    let envelope = StoreBackupEnvelope {
+        identity: OperationIdentity {
+            operation_id: operation_id.clone(),
+            idempotency_key: format!("store-backup-status:{operation_id}"),
+            canonical_request_hash: "d".repeat(64),
+        },
+        state_fence: fence(),
+        operation,
+    };
+    envelope.validate().unwrap();
+    StoreRequest::Backup { request: envelope }
+}
+
 /// Fixed `op` tag for one wire variant.
 ///
 /// Exhaustive on purpose: adding a `StoreRequest` variant breaks this match
@@ -783,6 +804,7 @@ fn store_request_op_tag(request: &StoreRequest) -> &'static str {
         StoreRequest::OrderingHeads { .. } => "ordering_heads",
         StoreRequest::ValidationSnapshot => "validation_snapshot",
         StoreRequest::DreamerJob { .. } => "dreamer_job",
+        StoreRequest::Backup { .. } => "backup",
     }
 }
 
@@ -804,10 +826,11 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
     assert!(serde_json::from_value::<StoreRequest>(reserved_json).is_err());
     // Closed wire-variant catalogue: every exported `StoreRequest` variant
     // encodes under its fixed `op` tag, round-trips, and validates. Slice
-    // #991 adds exactly one variant (`reserved_write`), covered in the
-    // catalogue below; the legacy eleven keep their exact tags, encodings,
-    // and advertised capabilities unchanged, while the reserved-write
-    // capability stays declared-but-unadvertised (proven in the loop and
+    // #991 adds exactly one variant (`reserved_write`) and slice #975 adds
+    // exactly one variant (`backup`), covered in the catalogue below; the
+    // legacy eleven keep their exact tags, encodings, and advertised
+    // capabilities unchanged, while the reserved-write and backup
+    // capabilities stay declared-but-unadvertised (proven in the loop and
     // again explicitly below).
     let catalogue = vec![
         StoreRequest::Health,
@@ -830,6 +853,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         StoreRequest::ReservedWrite {
             request: valid_request(),
         },
+        backup_wire_request(),
     ];
     let mut tags = Vec::new();
     for variant in &catalogue {
@@ -851,6 +875,15 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
                 !CAPABILITIES.contains(&decoded.capability()),
                 "the reserved-write capability is declared but stays unadvertised"
             );
+        } else if store_request_op_tag(variant) == "backup" {
+            assert_eq!(
+                decoded.capability(),
+                eliot_store_api::CAPABILITY_STORE_BACKUP
+            );
+            assert!(
+                !CAPABILITIES.contains(&decoded.capability()),
+                "the backup capability is declared but stays statically unadvertised; sessions admit it only with provisioning proof"
+            );
         } else {
             assert!(
                 CAPABILITIES.contains(&decoded.capability()),
@@ -863,6 +896,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         tags,
         vec![
             "apply",
+            "backup",
             "dreamer_job",
             "health",
             "initialize_genesis",
@@ -875,7 +909,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
             "revision_heads",
             "validation_snapshot",
         ],
-        "closed wire catalogue contains the legacy variants plus the single #991 reserved-write variant"
+        "closed wire catalogue contains the legacy variants plus the single #991 reserved-write variant and the single #975 backup variant"
     );
     // Reserved-write evidence selects no wire operation by itself: the bare
     // projection carries no `op` tag while every `StoreRequest` encoding
