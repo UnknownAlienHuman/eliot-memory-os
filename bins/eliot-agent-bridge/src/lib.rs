@@ -66,7 +66,7 @@ pub use reactive_injection_receipts::{
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
 };
-pub use result_flow::{ResultFlowInputs, measure_and_project_tool_result};
+pub use result_flow::{LiveToolResult, project_live_tool_result};
 pub use settled_plan_transport::{
     AdmittedPlanItem, FeedAdmissionOutcome, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS,
     PlanAdmissionError, PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem,
@@ -677,36 +677,20 @@ impl BridgeRunner {
         }
         self.core.publish_evidence(bytes).ok()
     }
-    /// Records one measured tool-result delivery with the admitted tool
-    /// binding, at the normal Invoke callsite after the gateway returns
-    /// with the exact authenticated outcome (issue #1941 result flow).
+    /// Projects one live measured tool result into its delivery receipt
+    /// (issue #1941 result flow): the holder joins exact result bytes with
+    /// the admitted route's observed model, physical observation, current
+    /// admission plus execution binding, admissible source handle, and
+    /// owner-observed delivery; see [`project_live_tool_result`].
     ///
-    /// Same auxiliary position as [`Self::record_tool_result_delivery`]:
-    /// only `Responded` outcomes carrying a supported typed result
-    /// (`Candidate` or `Projection`) are measured; everything else yields
-    /// `None` without affecting forwarding. The live measurement inputs the
-    /// bridge cannot source itself — exact provider model, live route
-    /// observation, current admission plus execution binding, admissible
-    /// source handle, owner-observed delivery — arrive in `inputs` from the
-    /// caller holding them; this hook mints nothing. Measurement withhold
-    /// (unknown model, non-text bytes) and intake rejection (misbound or
-    /// diverged evidence, detached core) all yield `None`; the direct
-    /// [`measure_and_project_tool_result`] entry keeps the typed errors for
-    /// the future attaching caller.
-    pub fn record_measured_tool_result_delivery(
+    /// Typed withhold and contract errors propagate for the attaching
+    /// caller; this runner entry only supplies the live core.
+    pub fn project_live_tool_result(
         &self,
-        outcome: &HostInvocationOutcome,
-        inputs: &ResultFlowInputs<'_>,
-    ) -> Option<ToolResultReceipt> {
-        let HostInvocationOutcome::Responded { response, .. } = outcome else {
-            return None;
-        };
-        match response.kind {
-            ResponseKind::Candidate | ResponseKind::Projection => {}
-            ResponseKind::PlanGap | ResponseKind::Unsupported => return None,
-        }
-        let bytes = serde_json::to_vec(&response.content).ok()?;
-        measure_and_project_tool_result(&self.core, &bytes, inputs).ok()
+        result_bytes: &[u8],
+        flow: &LiveToolResult<'_>,
+    ) -> Result<ToolResultReceipt, BridgeError> {
+        project_live_tool_result(&self.core, result_bytes, flow)
     }
     /// Notes the owner-supplied bootstrap context for this session.
     ///

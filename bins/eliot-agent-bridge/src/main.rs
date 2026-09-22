@@ -4,13 +4,12 @@ mod request_input;
 
 use eliot_agent_bridge::{
     BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError, CurrentAssessment,
-    HotResourceView, InjectionReceipt, Profile, ResultFlowInputs, ScopeLevel,
-    UnderstandingBootstrap, kernel_ports_with_declaration, parse_args,
-    reactive_runtime_composition,
+    HotResourceView, InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap,
+    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
-    ReconnectRequest, SessionId, ToolResultReceipt,
+    ReconnectRequest, SessionId,
 };
 use eliot_contracts::EpochId;
 #[cfg(test)]
@@ -786,36 +785,6 @@ fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response
             *evidence = Some(view);
         }
     }
-}
-
-/// Measured tool-result delivery hook (issue #1941 result flow).
-///
-/// Same auxiliary position as [`record_invocation_delivery`]: runs on the
-/// normal Invoke path after the gateway returns, and never touches the
-/// gateway-shaped `result`/`completion`. The live measurement inputs the
-/// BIN cannot source itself (exact provider model, live observation,
-/// current admission plus execution binding, admissible source handle,
-/// owner-observed delivery) arrive in `inputs` from the caller holding
-/// them. Returns the projected receipt for the caller that attaches it to
-/// the Invocation response evidence path; `None` (unsupported outcome,
-/// measurement withhold, intake rejection) leaves the response exactly as
-/// the gateway shaped it. A3 owns the response-slot wiring; this hook only
-/// records through [`BridgeRunner::record_measured_tool_result_delivery`].
-///
-/// Staged: no live holder of [`ResultFlowInputs`] exists yet (the Invoke
-/// path holds bytes plus disposition only), so this stays uncalled until
-/// the input holder is wired — the C1 transport staged the same way
-/// before its Governor assessor landed.
-#[allow(dead_code)]
-fn record_measured_invocation_delivery(
-    runner: &BridgeRunner,
-    response: &Response,
-    inputs: &ResultFlowInputs<'_>,
-) -> Option<ToolResultReceipt> {
-    let Response::Invocation { result, .. } = response else {
-        return None;
-    };
-    runner.record_measured_tool_result_delivery(result.outcome(), inputs)
 }
 
 /// Delivers hook-carried reactive injections through the live stdio consumer.
