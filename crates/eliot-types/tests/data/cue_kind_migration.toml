@@ -403,8 +403,8 @@ owner = "#706"
 migration = 706
 expiry = "frozen-seam-oracle; lexical duplicate scan authorized under #832 coherent join; alias removal tracked by #835"
 risk = "none"
-match_count = 85
-matched_digest = "d5fe71b4532dc6609eeb61829cf07923cfd8af922a972306b37dfb91338a6655"
+match_count = 89
+matched_digest = "900a0dd9c388e078baa54925599e6b4f54ef32ad884a73ae28b164c761e4bbec"
 variants = []
 
 [type_row."crates/smart/eliot-context/src/lib.rs"]

@@ -596,14 +596,17 @@ fn scan_enum_definitions(
 
 /// Whether stripped code declares `enum <name>` as a real definition.
 ///
-/// Both token boundaries hold: the `enum` keyword must not extend a
-/// longer identifier, all Rust whitespace forms may separate it from
-/// the name (space, tab, newline), and an `r#` raw-identifier prefix on
-/// the name still counts as a declaration of that name. Longer names on
-/// either side never match. Anything else where the target name is
-/// involved but unparseable (bare `enum` at end of input, unexpected
-/// punctuation) fails closed as a hit so unknown syntax never silently
-/// passes; other identifiers are affirmative non-matches.
+/// Both token boundaries hold on both sides: the `enum` keyword itself
+/// must start and end on a boundary (longer identifiers such as
+/// `myenum` or `enumCueKind` never match), all Rust whitespace forms
+/// may separate it from the name (space, tab, newline), and an `r#`
+/// raw-identifier prefix on the name still counts as a declaration of
+/// that name. A raw `r#enum` token is an identifier, never a keyword,
+/// and is skipped explicitly. Longer names on either side never match.
+/// Anything else where the target name is involved but unparseable
+/// (bare `enum` at end of input, unexpected punctuation) fails closed
+/// as a hit so unknown syntax never silently passes; other identifiers
+/// are affirmative non-matches.
 fn declares_enum(stripped: &str, name: &str) -> bool {
     fn is_ident(cell: u8) -> bool {
         cell.is_ascii_alphanumeric() || cell == b'_'
@@ -611,8 +614,17 @@ fn declares_enum(stripped: &str, name: &str) -> bool {
     let bytes = stripped.as_bytes();
     let mut index = 0;
     while index + 4 <= bytes.len() {
-        if &bytes[index..index + 4] == b"enum" && (index == 0 || !is_ident(bytes[index - 1])) {
+        if &bytes[index..index + 4] == b"enum"
+            && (index == 0 || !is_ident(bytes[index - 1]))
+            && !is_raw_enum_token(bytes, index)
+        {
             let mut cursor = index + 4;
+            if cursor < bytes.len() && is_ident(bytes[cursor]) {
+                // The keyword never ends here (`enumCueKind` is one
+                // ordinary identifier): not a declaration.
+                index += 1;
+                continue;
+            }
             while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
@@ -641,6 +653,15 @@ fn declares_enum(stripped: &str, name: &str) -> bool {
         index += 1;
     }
     false
+}
+
+/// Whether `enum` at `index` is really a raw `r#enum` identifier token.
+///
+/// `r#` can only prefix non-strict keywords, so `r#enum` never declares;
+/// it is an identifier and must not enter keyword handling. Anything
+/// else (including a `#` from an attribute fragment) is not this token.
+fn is_raw_enum_token(bytes: &[u8], index: usize) -> bool {
+    index >= 2 && bytes[index - 2] == b'r' && bytes[index - 1] == b'#'
 }
 
 fn collect_enum_definitions(
@@ -1455,6 +1476,8 @@ fn case_28_new_duplicate_fails() -> TestResult {
         &strip_code("myenum CueKind {}\n"),
         "CueKind"
     ));
+    assert!(!declares_enum(&strip_code("enumCueKind {}\n"), "CueKind"));
+    assert!(!declares_enum(&strip_code("let r = r#enum;\n"), "CueKind"));
     assert!(!declares_enum(
         &strip_code("fn f() { let q = '\"'; }\nlet s = \"enum CueKind\";\n"),
         "CueKind"
