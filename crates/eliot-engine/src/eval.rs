@@ -709,6 +709,85 @@ impl EvalDatasetManifestService {
     }
 }
 
+/// The validity state of the engine-local I18.47 receipt projection.
+///
+/// This is deliberately separate from `EvalCaseStatus`: a structural case
+/// result can be useful for harness wiring while still being unable to claim
+/// measured runtime behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EvaluationIntegrityStatus {
+    Measured,
+    Inconclusive,
+    Unknown,
+    Stale,
+}
+
+/// Engine-local projection of the canonical `EvaluationIntegrityReceipt`.
+///
+/// The current `EvalCase` API supplies declarations and fixture metadata, but
+/// no runtime artifact, effect trace, independent oracle, or second route.
+/// This projection therefore remains `INCONCLUSIVE` at the explicit
+/// `STRUCTURAL_ONLY` proof ceiling. It is an in-memory advisory projection for
+/// the existing eval result path; `EvalCaseResult` does not retain it, so it is
+/// not ProductProof or a durable canonical receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EvaluationIntegrityReceipt {
+    pub receipt_id: String,
+    pub property: String,
+    pub product_identity: String,
+    pub oracle_owner: String,
+    pub acceptance_relation: String,
+    pub task_subset: Vec<String>,
+    pub sampling_procedure: String,
+    pub model_fingerprint: String,
+    pub harness_fingerprint: String,
+    pub tools_fingerprint: String,
+    pub evaluator_fingerprint: String,
+    pub environment_fingerprint: String,
+    pub budget_fingerprint: String,
+    pub visible_inputs: Vec<String>,
+    pub worker_visible_inputs: Vec<String>,
+    pub evaluator_visible_inputs: Vec<String>,
+    pub human_visible_inputs: Vec<String>,
+    pub reference_leakage_checks: Vec<String>,
+    pub contamination_checks: Vec<String>,
+    pub evidence_family: String,
+    pub source_independence: Vec<String>,
+    pub shared_lineage_limits: Vec<String>,
+    pub raw_result_refs: Vec<String>,
+    pub aggregation_method: String,
+    pub excluded_trials: Vec<String>,
+    pub limits: Vec<String>,
+    pub counter_metrics: Vec<String>,
+    pub known_shortcuts: Vec<String>,
+    pub invalidation_conditions: Vec<String>,
+    pub production_role: String,
+    pub measurement_role: String,
+    pub optimization_feedback_role: String,
+    pub mutation_survivors: Vec<String>,
+    pub historical_escapes: Vec<String>,
+    pub ood_set: Vec<String>,
+    pub false_pass_evidence: Vec<String>,
+    pub false_fail_evidence: Vec<String>,
+    pub actual_route: String,
+    pub requested_route: String,
+    pub resource_fingerprint: String,
+    pub oracle_dependencies: Vec<String>,
+    pub effective_independent_evidence_n: u64,
+    pub collusion_shared_lineage_limits: Vec<String>,
+    pub second_route_or_human_disposition: String,
+    pub budget_equivalence_ledger: String,
+    pub complexity_economics_delta: String,
+    pub assertability: String,
+    pub ground_truth_origin: String,
+    pub artifact_binding: Vec<String>,
+    pub observed_artifact_refs: Vec<String>,
+    pub unobserved_measurement_kinds: Vec<EvalMeasurementKind>,
+    pub status: EvaluationIntegrityStatus,
+    pub proof_ceiling: String,
+}
+
 pub struct EvalRunnerService;
 
 impl EvalRunnerService {
@@ -819,6 +898,9 @@ impl EvalRunnerService {
 
 pub struct EvalMeasurementService;
 
+const NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX: &str = "not yet implemented:";
+const STRUCTURAL_ONLY_PROOF_CEILING: &str = "STRUCTURAL_ONLY";
+
 impl EvalMeasurementService {
     pub fn evaluate_case(case: &EvalCase) -> EvalCaseResult {
         let measurements = case
@@ -826,16 +908,39 @@ impl EvalMeasurementService {
             .iter()
             .map(|spec| Self::measure(case, spec))
             .collect::<Vec<_>>();
+        let receipt = Self::evaluation_integrity_receipt(case, &measurements);
+        let mut errors = Vec::new();
         let failed_required = case.criteria.iter().any(|criterion| {
-            criterion.required
-                && measurements.iter().any(|measurement| {
-                    measurement.measurement_id == criterion.measurement_id && !measurement.passed
-                })
+            if !criterion.required {
+                return false;
+            }
+            match measurements
+                .iter()
+                .find(|measurement| measurement.measurement_id == criterion.measurement_id)
+            {
+                Some(measurement) => !measurement.passed,
+                None => {
+                    errors.push(format!(
+                        "required criterion {} has no matching measurement result ({})",
+                        criterion.criterion_id, criterion.measurement_id
+                    ));
+                    true
+                }
+            }
         });
-        let not_implemented = measurements
-            .iter()
-            .any(|measurement| measurement.observed == "schema placeholder only");
-        let status = if not_implemented {
+        let not_implemented = measurements.iter().any(|measurement| {
+            measurement
+                .observed
+                .starts_with(NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX)
+        });
+        let integrity_not_measured = receipt.status != EvaluationIntegrityStatus::Measured;
+        if integrity_not_measured {
+            errors.push(format!(
+                "evaluation integrity receipt is {:?}; case cannot claim a measured result",
+                receipt.status
+            ));
+        }
+        let status = if integrity_not_measured || not_implemented {
             EvalCaseStatus::NotYetImplemented
         } else if failed_required {
             EvalCaseStatus::Failed
@@ -849,39 +954,186 @@ impl EvalMeasurementService {
             status,
             measurements,
             produced_refs: vec![format!("eval:{}:report", family_slug(case.family))],
-            errors: Vec::new(),
+            errors,
             duration_ms: 0,
         }
     }
 
-    pub fn measure(case: &EvalCase, spec: &EvalMeasurementSpec) -> EvalMeasurementResult {
-        let expected = spec.expected_ref.clone().unwrap_or_default();
-        let passed = match spec.kind {
-            EvalMeasurementKind::MustIncludeEvidence => {
-                !expected.trim().is_empty() && case.expected_evidence_refs.contains(&expected)
-            }
-            EvalMeasurementKind::MustExcludeEvidence => {
-                !case.expected_evidence_refs.contains(&expected)
-            }
-            EvalMeasurementKind::MustBlockAction => case.forbidden_effects.contains(&expected),
-            EvalMeasurementKind::MustRequireVerifier => {
-                case.expected_evidence_refs.contains(&expected)
-            }
+    /// Build the I18.47 receipt projection for the currently available eval
+    /// inputs. The result is intentionally inconclusive: `EvalCase` has no
+    /// runtime observation input from which a measured validity claim could be
+    /// derived.
+    pub fn evaluation_integrity_receipt(
+        case: &EvalCase,
+        measurements: &[EvalMeasurementResult],
+    ) -> EvaluationIntegrityReceipt {
+        let unobserved_measurement_kinds = case
+            .measurement_specs
+            .iter()
+            .filter_map(|spec| {
+                let measurement = measurements
+                    .iter()
+                    .find(|measurement| measurement.measurement_id == spec.measurement_id)?;
+                if measurement
+                    .observed
+                    .starts_with(NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX)
+                {
+                    Some(spec.kind)
+                } else {
+                    None
+                }
+            })
+            .fold(Vec::new(), |mut kinds, kind| {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+                kinds
+            });
+        let raw_result_refs = measurements
+            .iter()
+            .map(|measurement| measurement.measurement_id.clone())
+            .collect::<Vec<_>>();
+        let receipt_binding = format!(
+            "case={};fixture={};measurements={measurements:?}",
+            case.eval_case_id, case.fixture_ref
+        );
+        EvaluationIntegrityReceipt {
+            receipt_id: format!(
+                "evaluation-integrity:{}",
+                checksum_text(&receipt_binding)
+            ),
+            property: case.description.clone(),
+            product_identity: "eliot-memory-os/eliot-engine-eval".to_owned(),
+            oracle_owner: "eliot-engine::EvalMeasurementService".to_owned(),
+            acceptance_relation: "required criterion matches a measurement result".to_owned(),
+            task_subset: vec![case.eval_case_id.to_string()],
+            sampling_procedure: "single declared case; no runtime sampling or replicate unit"
+                .to_owned(),
+            model_fingerprint: "not-applicable:no-model-invocation".to_owned(),
+            harness_fingerprint: "eliot-engine-eval-case-schema".to_owned(),
+            tools_fingerprint: "not-applicable:no-runtime-tools".to_owned(),
+            evaluator_fingerprint: "eliot-engine::EvalMeasurementService".to_owned(),
+            environment_fingerprint: "not-captured:structural-evaluator-process".to_owned(),
+            budget_fingerprint: format!(
+                "declared:max_runtime_ms={};max_input_tokens={};max_output_tokens={};max_tool_calls={}",
+                case.budget.max_runtime_ms,
+                case.budget.max_input_tokens,
+                case.budget.max_output_tokens,
+                case.budget.max_tool_calls
+            ),
+            visible_inputs: vec![
+                "EvalCase.measurement_specs".to_owned(),
+                "EvalCase.criteria".to_owned(),
+                "EvalCase.expected_evidence_refs".to_owned(),
+                "EvalCase.forbidden_effects".to_owned(),
+            ],
+            worker_visible_inputs: vec!["not-applicable:no worker invocation".to_owned()],
+            evaluator_visible_inputs: vec![
+                "EvalCase declarations and fixture metadata".to_owned(),
+            ],
+            human_visible_inputs: vec![
+                "receipt status and proof ceiling; no durable receipt reference is emitted"
+                    .to_owned(),
+            ],
+            reference_leakage_checks: vec![
+                "not run: no blind worker/evaluator separation on this path".to_owned(),
+            ],
+            contamination_checks: vec![
+                "not run: fixture and expectation declarations share one source".to_owned(),
+            ],
+            evidence_family: format!("structural-fixture:{}", case.fixture_ref),
+            source_independence: vec![
+                "not established: fixture, expectation and evaluator share the declaration path"
+                    .to_owned(),
+            ],
+            shared_lineage_limits: vec![
+                "case declarations are not independent runtime evidence".to_owned(),
+            ],
+            raw_result_refs,
+            aggregation_method: "required criteria: any failed measurement".to_owned(),
+            excluded_trials: vec!["no runtime trials were supplied".to_owned()],
+            limits: vec![
+                "criterion-only structural result".to_owned(),
+                "ecological, temporal and transfer validity are not measured".to_owned(),
+            ],
+            counter_metrics: Vec::new(),
+            known_shortcuts: vec![
+                "case-declared expectations can match without observing behavior".to_owned(),
+            ],
+            invalidation_conditions: vec![
+                "route, harness/tool schema, evaluator/oracle, task subset, environment, policy or Product Identity changes"
+                    .to_owned(),
+            ],
+            production_role: "none: structural evaluator only".to_owned(),
+            measurement_role: "structural harness self-check; cannot establish product behavior"
+                .to_owned(),
+            optimization_feedback_role: "none; cannot promote or tune a mechanism".to_owned(),
+            mutation_survivors: vec!["not measured".to_owned()],
+            historical_escapes: vec!["not available".to_owned()],
+            ood_set: vec!["not available".to_owned()],
+            false_pass_evidence: vec![
+                "not measured: no known-valid/known-invalid runtime set".to_owned(),
+            ],
+            false_fail_evidence: vec![
+                "not measured: no known-valid/known-invalid runtime set".to_owned(),
+            ],
+            actual_route: "eliot-engine::EvalMeasurementService::evaluate_case".to_owned(),
+            requested_route: "runtime artifact/effect observation".to_owned(),
+            resource_fingerprint: "not-captured:no runtime execution".to_owned(),
+            oracle_dependencies: vec![
+                "case-declared expectations".to_owned(),
+                "eliot-engine::EvalMeasurementService".to_owned(),
+            ],
+            effective_independent_evidence_n: 0,
+            collusion_shared_lineage_limits: vec![
+                "no independent oracle or second route was supplied".to_owned(),
+            ],
+            second_route_or_human_disposition:
+                "not run; required before measured validity".to_owned(),
+            budget_equivalence_ledger: "UNKNOWN: no execution arms were run".to_owned(),
+            complexity_economics_delta: "UNKNOWN: no product route was executed".to_owned(),
+            assertability: "INCONCLUSIVE: runtime behavior is not assertable from EvalCase alone"
+                .to_owned(),
+            ground_truth_origin: "seeded_script:case-declared fixture metadata".to_owned(),
+            artifact_binding: vec![case.fixture_ref.clone()],
+            observed_artifact_refs: Vec::new(),
+            unobserved_measurement_kinds,
+            status: EvaluationIntegrityStatus::Inconclusive,
+            proof_ceiling: STRUCTURAL_ONLY_PROOF_CEILING.to_owned(),
+        }
+    }
+
+    pub fn measure(_case: &EvalCase, spec: &EvalMeasurementSpec) -> EvalMeasurementResult {
+        let (passed, observed, evidence_refs) = match spec.kind {
+            EvalMeasurementKind::MustIncludeEvidence
+            | EvalMeasurementKind::MustExcludeEvidence
+            | EvalMeasurementKind::MustBlockAction
+            | EvalMeasurementKind::MustRequireVerifier => (
+                false,
+                format!(
+                    "{NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX} {:?} has only a case declaration; a runtime artifact or effect observation is required",
+                    spec.kind
+                ),
+                Vec::new(),
+            ),
             EvalMeasurementKind::MustPreserveTaint
             | EvalMeasurementKind::MustNotMutate
             | EvalMeasurementKind::MustGenerateVerdict
-            | EvalMeasurementKind::MustDetectChecksumMismatch => true,
-            EvalMeasurementKind::NotYetImplemented => false,
+            | EvalMeasurementKind::MustDetectChecksumMismatch
+            | EvalMeasurementKind::NotYetImplemented => (
+                false,
+                format!(
+                    "{NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX} {:?} requires a runtime artifact or effect observation",
+                    spec.kind
+                ),
+                Vec::new(),
+            ),
         };
         EvalMeasurementResult {
             measurement_id: spec.measurement_id.clone(),
             passed,
-            observed: if spec.kind == EvalMeasurementKind::NotYetImplemented {
-                "schema placeholder only".to_owned()
-            } else {
-                "deterministic internal eval check".to_owned()
-            },
-            evidence_refs: case.expected_evidence_refs.clone(),
+            observed,
+            evidence_refs,
         }
     }
 }
