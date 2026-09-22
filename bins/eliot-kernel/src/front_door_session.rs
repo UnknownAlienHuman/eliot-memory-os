@@ -485,10 +485,14 @@ impl KernelComposition {
                 .allowed_privacy_classes
                 .iter()
                 .any(|privacy| privacy == USER_AUTOMATION_KERNEL_PRIVACY_CLASS)
-            || !policy.allowed_effects.is_empty()
         {
             return Err(TransportError::SessionFenced);
         }
+        // `allowed_effects` belongs to the shared daemon policy.  This
+        // server-authored special session deliberately projects no effects;
+        // its Submit request is admitted separately by the typed Dreamer
+        // route and its own canonical request authority.  Do not inherit the
+        // daemon effect set merely because both routes use one front door.
         let mut session = Session::establish(
             connection_id.clone(),
             peer,
