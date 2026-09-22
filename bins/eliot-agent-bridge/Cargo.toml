@@ -19,7 +19,9 @@ eliot-profile-spine-functional = []
 eliot-profile-full-composition = []
 
 [dependencies]
+eliot-agent-api.workspace = true
 eliot-agent-bridge-core.workspace = true
+eliot-agent-codex = { path = "../../crates/agent/eliot-agent-codex" }
 eliot-contracts.workspace = true
 eliot-governor.workspace = true
 eliot-integration-coverage.workspace = true
