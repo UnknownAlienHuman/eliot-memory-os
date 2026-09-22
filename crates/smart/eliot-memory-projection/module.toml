@@ -1,0 +1,67 @@
+schema_version = 4
+module_id = "smart.memory.projection"
+crate = "eliot-memory-projection"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 47
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.memory.projection"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "A bounded deterministic memory candidate query selects handles from an already-validated frozen projection batch without re-deriving applicability."
+causal_property = "bounded deterministic memory candidate query"
+old_failure_or_missing_capability = "Smart has no bounded candidate-query view over the frozen read set: consumers either re-scan raw batches without a limit or invent query/selection types (CC-MEMORY-PROJECTION-SCHEMA)."
+discriminator = "selection echoes the batch binding and denominator exactly, narrows only by the explicit kind allowlist and limit, and fails closed on binding mismatch or unknown denominator"
+primary_responsibility = "Filter one validated MemoryProjectionBatch into a MemoryCandidateSnapshot under an explicit kind allowlist and limit."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["validated MemoryProjectionBatch by value (frozen contract)"]
+outputs = ["MemoryCandidateSnapshot"]
+depends_on = ["eliot-memory-projection-contracts", "eliot-contracts"]
+providers = ["Governor memory projection provider (batch supply only)"]
+consumers = ["memory applicability evaluator", "context candidates memory slot"]
+non_goals = ["store reads", "retrieval scoring", "applicability verdicts", "provider intake observations", "support/influence promotion"]
+invariants = ["binding echoed exactly, never widened", "denominator echoed exactly; Unknown denominator fails closed", "filtering never reorders provider order", "limit never exceeds MEMORY_PROJECTION_MAX_RECORDS"]
+failure_behavior = "Reject binding mismatch, unknown denominator, over-bound limit, empty kind allowlist, and invalid batches explicitly."
+proof_surface = ["allowlist narrowing", "binding mismatch", "unknown denominator", "limit truncation", "invalid batch rejection"]
+proof_ceiling = "PACKAGE_PROOF_ONLY"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+disposition = "frozen upstream surface: MemoryProjectionRecord, MemoryProjectionBatch, DenominatorState, MemoryScopeBinding, MemoryKind, MEMORY_PROJECTION_MAX_RECORDS"
+
+[agent_task]
+objective = "Select candidate handles from a validated frozen batch under an explicit allowlist and limit."
+write_scope = ["crates/smart/eliot-memory-projection/**"]
+deliverables = ["candidate query and snapshot contracts", "fail-closed selection", "consumer compile fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification", "provider-specific duplicate request type"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, store access, model work or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main rebase and integration-owner review"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']

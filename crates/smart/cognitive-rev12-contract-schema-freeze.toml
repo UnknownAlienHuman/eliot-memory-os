@@ -1,0 +1,458 @@
+schema_version = 1
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22"
+status = "FROZEN_STATIC_SCHEMA"
+base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
+normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
+purpose = "Single versioned upstream projection surface for #223 Wave 1 projection packages. Reuses exact public fields, type owners, version-compatibility rules, scope/fence bindings, and denominator definitions from existing memory-projection, context, learning, and epistemic contracts. No invented authority, no guessed cell mapping."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+integration_owner = "cognitive-wave-integrator"
+
+[readback]
+rule = "Reproducible digest is sha256 over these exact file bytes. Any byte change creates a new freeze candidate; verdicts bound to the prior digest are invalidated, not edited."
+rejects = ["generic JSON treated as a projection contract", "prose-invented request/contribution types", "MCP surface DTOs treated as owner-neutral contracts"]
+
+# Historical cell numbers 69, 70, 72, 73, 75 (original #223 record) have no
+# referent in the current topology: cognitive-crate-decisions.toml assigns
+# orders 1-43 and cognitive-wave-09.toml assigns orders 76-86. This freeze
+# binds the current orders below and does not invent mappings for the stale
+# numbers. Code and document disagree here; the disagreement is reported,
+# not resolved by invention.
+[cell_number_note]
+historical_numbers = [69, 70, 72, 73, 75]
+current_topology = "cognitive-crate-decisions.toml orders 1-43 plus cognitive-wave-09.toml orders 76-86"
+disposition = "REPORTED_NOT_INVENTED"
+
+[[upstream_crate]]
+crate = "eliot-memory-projection-contracts"
+source_path = "crates/foundation/eliot-memory-projection-contracts"
+contract_name = "eliot.foundation.memory-projection-contracts"
+contract_version = "0.1.0"
+frozen = true
+role = "Owner-neutral bounded canonical memory projection read set and applicability verdict (CC-008)."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::MemoryProjectionRecord"
+fields = ["contract_version", "handle", "kind", "binding", "state_fence", "projection_revision", "epistemic", "assertability", "lifecycle", "freshness", "provenance", "predecessor", "roles", "influence_eligible", "preconditions", "applicability_limits", "cue_triggers", "negative_trigger", "source_id"]
+scope_fence_fields = ["binding", "state_fence"]
+denominator_note = "Denominator context lives on the batch, not the record. No score, rank, similarity, retrieval-count, or model-judgment field exists by design."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::MemoryScopeBinding"
+fields = ["task_id", "scope_id", "session_id", "state_fence"]
+scope_fence_fields = ["task_id", "scope_id", "session_id", "state_fence"]
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::MemoryProjectionBatch"
+fields = ["contract_version", "binding", "records", "coverage"]
+scope_fence_fields = ["binding"]
+denominator_note = "Every record binding must equal the batch binding; every record fence must satisfy is_compatible_with against the batch fence; handles are unique."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::ProjectionCoverage"
+fields = ["denominator", "truncated", "frontier", "omissions", "revalidation_required"]
+denominator_note = "Known{total} must cover projected plus omitted volume; truncation requires a nonempty resume frontier; truncation or omission requires revalidation."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::DenominatorState"
+fields = ["Known{total}", "Unknown{reason}"]
+denominator_note = "Unknown stays representable but evaluation fails closed: applicability without a denominator is unprovable."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::ApplicableMemorySet"
+fields = ["contract_version", "binding", "applicable", "excluded", "denominator", "truncated", "revalidation_required", "cue_hits_considered"]
+denominator_note = "Denominator, truncation, and revalidation echo the evaluated batch. cue_hit is an advisory flag only and never promotes a record."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::ExclusionReason"
+fields = ["STALE", "CONFLICTED", "REJECTED", "EPISTEMICALLY_UNKNOWN", "PROTECTED", "NEGATIVE_MEMORY", "PRECONDITION_FAILED{id}", "PRECONDITION_UNASSESSED{id}", "LIFECYCLE_INACTIVE", "FENCE_MISMATCH", "SCOPE_MISMATCH"]
+denominator_note = "No cue-hit variant exists: cue activation is advisory evidence, never an applicability rule."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts enums"
+fields = ["MemoryKind{Episode, Observation, Procedure, Concept, NegativeMemory, Counterexample}", "MemoryRole{Protected, Minority, Counterexample, Audit, FailureFingerprint}", "FreshnessState{Current, Stale, Unknown}"]
+
+[[bound]]
+crate = "eliot-memory-projection-contracts"
+name = "MAX_RECORD_ROLES"
+value = 8
+[[bound]]
+crate = "eliot-memory-projection-contracts"
+name = "MAX_PRECONDITIONS"
+value = 32
+[[bound]]
+crate = "eliot-memory-projection-contracts"
+name = "MAX_APPLICABILITY_LIMITS"
+value = 32
+[[bound]]
+crate = "eliot-memory-projection-contracts"
+name = "MAX_CUE_TRIGGERS"
+value = 32
+[[bound]]
+crate = "eliot-memory-projection-contracts"
+name = "MAX_SCOPE_CHARS"
+value = 256
+[[bound]]
+crate = "eliot-memory-projection-contracts"
+name = "MEMORY_PROJECTION_MAX_RECORDS"
+value = 256
+[[bound]]
+crate = "eliot-memory-projection-contracts"
+name = "MAX_BATCH_OMISSIONS"
+value = 256
+[[bound]]
+crate = "eliot-memory-projection-contracts"
+name = "MAX_BATCH_FRONTIER"
+value = 256
+
+[[upstream_crate]]
+crate = "eliot-memory-projection-provider"
+source_path = "crates/governor/eliot-memory-projection-provider"
+contract_version = "0.1.0"
+frozen = true
+role = "Governor-owned bounded projection of admitted observations into one batch (CC-008, store-deferred). Retrieves and projects; Smart evaluates applicability."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-provider"
+rust_path = "eliot_memory_projection_provider::ProjectionRequest"
+fields = ["binding", "projection_revision", "denominator_total", "observations"]
+denominator_note = "Single-read contract: denominator_total must equal the supplied observation count; intake is bounded by MAX_INTAKE_OBSERVATIONS."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-provider"
+rust_path = "eliot_memory_projection_provider::AdmittedMemoryObservation"
+fields = ["handle", "kind", "task_id", "scope_id", "session_id", "state_fence", "epistemic", "assertability", "lifecycle", "freshness", "provenance", "predecessor", "roles", "influence_eligible", "preconditions", "applicability_limits", "cue_triggers", "negative_trigger", "source_id"]
+denominator_note = "Typed provider port supplied by the Governor read side. Maps field-for-field onto MemoryProjectionRecord; the provider adds only the shared binding, the projection revision, and coverage accounting."
+
+[[bound]]
+crate = "eliot-memory-projection-provider"
+name = "MAX_INTAKE_OBSERVATIONS"
+value = 4096
+[[omission_reason]]
+crate = "eliot-memory-projection-provider"
+name = "OMISSION_SCOPE_MISMATCH"
+value = "scope-mismatch"
+[[omission_reason]]
+crate = "eliot-memory-projection-provider"
+name = "OMISSION_FENCE_MISMATCH"
+value = "fence-mismatch"
+
+[[upstream_crate]]
+crate = "eliot-context-contracts"
+source_path = "crates/smart/eliot-context-contracts"
+contract_name = "eliot.smart.context-contracts"
+contract_version = "1.0.0"
+frozen = true
+role = "Provider-neutral context atom, recipe, candidate, admission, omission, selection-integrity, and view schemas (CC-004)."
+
+[[frozen_type]]
+crate = "eliot-context-contracts"
+rust_path = "eliot_context_contracts::ContextBinding"
+fields = ["task_id", "attempt_id", "scope_id", "state_fence", "decision_id", "operation_id"]
+scope_fence_fields = ["task_id", "attempt_id", "scope_id", "state_fence", "decision_id"]
+
+[[frozen_type]]
+crate = "eliot-context-contracts"
+rust_path = "eliot_context_contracts::ProviderRole"
+fields = ["provider", "role"]
+denominator_note = "Current shape is a provider/semantic-role slot struct, NOT a closed seven-class provider enum. The rev12 closed provider set stays NOT_FROZEN."
+
+[[frozen_type]]
+crate = "eliot-context-contracts"
+rust_path = "eliot_context_contracts::SemanticRole"
+fields = ["Authority", "Goal", "Scope", "Acceptance", "Source", "Verifier", "MaterialUnknown", "Negative", "Security", "Evidence", "Instruction", "Optional", "Conflict", "Constraint"]
+
+[[frozen_type]]
+crate = "eliot-context-contracts"
+rust_path = "eliot_context_contracts::CanonicalProjectionSet"
+fields = ["binding", "task", "continuity", "safety", "affordance", "omissions"]
+scope_fence_fields = ["binding"]
+denominator_note = "Every member binding must equal the set binding under a two-way is_compatible_with fence gate; a missing or incompatible projection stays an explicit omission, never filler."
+
+[[frozen_type]]
+crate = "eliot-context-contracts"
+rust_path = "eliot_context_contracts canonical projections"
+fields = ["TaskProjection{schema_version, binding, goal, commitments}", "ContinuityProjection{schema_version, binding, plan_state, continuity_note}", "SafetyProjection{schema_version, binding, safety_note, negative_memory_triggers}", "AffordanceProjection{schema_version, binding, affordances}"]
+denominator_note = "Each projection carries schema_version 1 and its own ContextBinding. Safety negative_memory_triggers are exact trigger identities copied verbatim from the Governor owner."
+
+[[frozen_type]]
+crate = "eliot-context-contracts"
+rust_path = "eliot_context_contracts::ActiveUnderstandingView"
+fields = ["binding", "admitted_ids", "rendered", "selection", "quality", "measurement", "output_digest", "recipe_digest", "fence_digest"]
+scope_fence_fields = ["binding"]
+denominator_note = "Immutable assembled view consumed read-only by understanding assessment. No second compilation, no second admission pass, no mutable UnderstandingState."
+
+[[frozen_type]]
+crate = "eliot-context-contracts"
+rust_path = "eliot_context_contracts::OmissionRecord"
+fields = ["atom_id", "source_id", "provider_role", "decision", "task_revision", "reason", "competing_constraint", "measured_cost", "allowed_representation", "expansion", "non_recoverable_reason", "authorization_requirement", "privacy_requirement", "proof_requirement", "expires", "invalidation", "digest"]
+
+[[frozen_type]]
+crate = "eliot-context-contracts"
+rust_path = "eliot_context_contracts reactive/view types"
+fields = ["ContextCandidateSet", "AdmittedContextSet", "ContextCandidate", "ContextRecipe", "ContextPlanningView", "SessionDeliverySnapshot", "CriticalAttentionProjection", "IntegrationCoverageProfile", "ContextEconomyReceipt"]
+denominator_note = "Reactive path D types are recorded for boundary completeness only; #223 packages must not implement the reactive path."
+
+[[bound]]
+crate = "eliot-context-contracts"
+name = "CANONICAL_PROJECTIONS_SCHEMA_VERSION"
+value = 1
+[[bound]]
+crate = "eliot-context-contracts"
+name = "MAX_PROJECTION_ENTRIES"
+value = 64
+[[bound]]
+crate = "eliot-context-contracts"
+name = "MAX_PROJECTION_TEXT"
+value = 1024
+[[bound]]
+crate = "eliot-context-contracts"
+name = "MAX_SET_OMISSIONS"
+value = 64
+
+[[upstream_crate]]
+crate = "eliot-learning-contracts"
+source_path = "crates/smart/eliot-learning-contracts"
+contract_name = "eliot.smart.learning-contracts"
+schema_version = 1
+frozen = true
+role = "Provider-neutral, candidate-only contracts for bounded online learning. Describes evidence and lineage; owns no aggregate, derivation, invocation, activation, admission, or promotion."
+
+[[frozen_type]]
+crate = "eliot-learning-contracts"
+rust_path = "eliot_learning_contracts::HarnessActivationReceiptCandidate"
+fields = ["binding", "activation_id", "target", "view_digest", "delta_id", "overlay_id", "admission_receipt", "activation_request_receipt", "stages", "member_denominator", "metrics", "attrition", "confounders", "independent_evaluator_receipt", "canonical_digest"]
+scope_fence_fields = ["binding"]
+denominator_note = "Member/stage denominator (SourceDenominator{declared, observed}) is retained separately from observed counts; observed coverage can never exceed declaration."
+
+[[frozen_type]]
+crate = "eliot-learning-contracts"
+rust_path = "eliot_learning_contracts::ContractBinding"
+fields = ["schema_version", "policy_revision", "request_id", "operation_id", "product_id", "task_id", "scope", "state_fence", "source", "proof_ceiling"]
+scope_fence_fields = ["task_id", "scope", "state_fence"]
+
+[[frozen_type]]
+crate = "eliot-learning-contracts"
+rust_path = "eliot_learning_contracts::SourceDenominator"
+fields = ["declared", "observed"]
+denominator_note = "declared must be nonzero; observed above declared is IncompleteCoverage."
+
+[[frozen_type]]
+crate = "eliot-learning-contracts"
+rust_path = "eliot_learning_contracts candidate types"
+fields = ["UseAttributionCandidate", "ImprovementExperimentCandidate", "PromotionBoundaryCandidate", "AttemptLearningDeltaCandidate", "CampaignLearningStateView", "CampaignHarnessOverlayCandidate"]
+
+[[upstream_crate]]
+crate = "eliot-epistemic-contracts"
+source_path = "crates/smart/eliot-epistemic-contracts"
+contract_name = "eliot.smart.epistemic-contracts"
+contract_version = "1.2.0"
+frozen = true
+role = "Versioned store-neutral contracts for the Current Epistemic Position. Resolves, acquires, ranks, stores, and applies nothing."
+
+[[frozen_type]]
+crate = "eliot-epistemic-contracts"
+rust_path = "eliot_epistemic_contracts::CurrentEpistemicPosition"
+fields = ["view_kind", "admission", "currentness", "supersession", "claim", "digest"]
+scope_fence_fields = ["admission"]
+denominator_note = "Read view over an externally admitted position. Coverage completeness is derived only by explicit closed validation with the governing records; store existence is challenged, never claimed."
+
+[[frozen_type]]
+crate = "eliot-epistemic-contracts"
+rust_path = "eliot_epistemic_contracts enums"
+fields = ["AdmittedKind{CURRENT_EPISTEMIC_POSITION}", "Currentness{Current, Superseded}"]
+
+[[version_rule]]
+id = "VR-EXACT-CONTRACT-VERSION"
+rule = "A record, batch, set, or view written against a different ContractVersion triple is rejected with VersionMismatch. Equality only; no range, no negotiation."
+applies_to = ["eliot-memory-projection-contracts", "eliot-memory-projection-provider", "eliot-context-contracts", "eliot-epistemic-contracts"]
+
+[[version_rule]]
+id = "VR-EXACT-SCHEMA-VERSION"
+rule = "Canonical projections require CANONICAL_PROJECTIONS_SCHEMA_VERSION exactly; learning bindings require LEARNING_SCHEMA_VERSION exactly. Mismatch fails closed."
+applies_to = ["eliot-context-contracts", "eliot-learning-contracts"]
+
+[[version_rule]]
+id = "VR-DENY-UNKNOWN-FIELDS"
+rule = "Every frozen wire shape carries deny_unknown_fields (or a checked wire TryFrom route). Unknown fields fail at the boundary; similarity scores, ranks, and model judgments have no field to hide in."
+applies_to = ["all frozen types"]
+
+[[version_rule]]
+id = "VR-NO-AGGREGATE-SCORE"
+rule = "No frozen type carries an aggregate intelligence, confidence, utility, or learning score. Installed, delivered, executed, and useful stay distinct; acknowledgement is not use, use is not adherence, adherence is not benefit."
+applies_to = ["all frozen types"]
+
+[[version_rule]]
+id = "VR-FENCE-GATE"
+rule = "Cross-record or cross-projection acceptance requires StateFence::is_compatible_with against the governing fence. Incompatible material becomes a named omission or exclusion, never silent loss or filler."
+applies_to = ["all frozen types"]
+
+[[denominator]]
+id = "DEN-MEMORY-BATCH"
+definition = "DenominatorState::Known{total} over the read-side observed volume at the named batch fence, with explicit truncation frontier, named omissions, and revalidation flag. Every Complete state requires this exact independently recheckable denominator."
+owner = "eliot-memory-projection-contracts"
+
+[[denominator]]
+id = "DEN-CONTEXT-SET"
+definition = "Provider/semantic-role slot coverage with explicit OmissionRecord entries per missing or incompatible atom, bound to one ContextBinding fence. Completeness without the exact slot denominator is invalid."
+owner = "eliot-context-contracts"
+
+[[denominator]]
+id = "DEN-LEARNING-STATE"
+definition = "SourceDenominator{declared, observed} per recipe: declared nonzero, observed never above declared. Per-sub-assessment denominators recompute from per-attempt HarnessActivationReceipt refs; aggregate counts never substitute."
+owner = "eliot-learning-contracts"
+
+[[denominator]]
+id = "DEN-EPISTEMIC-CLOSURE"
+definition = "Coverage completeness derived only by explicit closed validation with the governing records (admission envelope, evidence, coverage, conflict, proof digests). Unknown, assumed, conflicted, and stale stay distinct."
+owner = "eliot-epistemic-contracts"
+
+[[cell_binding]]
+order = 44
+crate = "eliot-memory-projection-contracts"
+functional_cell = "foundation.memory.projection-contracts"
+frozen_inputs = ["foundation identities/fences/lifecycle labels", "evidence epistemic/provenance vocabulary"]
+frozen_outputs = ["MemoryProjectionRecord", "MemoryProjectionBatch", "ApplicableMemorySet"]
+
+[[cell_binding]]
+order = 46
+crate = "eliot-memory-projection-provider"
+functional_cell = "governor.memory.projection-provider"
+frozen_inputs = ["MemoryScopeBinding", "admitted memory observations", "projection revision", "observed denominator total"]
+frozen_outputs = ["MemoryProjectionBatch"]
+
+[[cell_binding]]
+order = 15
+crate = "eliot-context-contracts"
+functional_cell = "smart.context.contracts"
+frozen_inputs = ["foundation/context vocabulary"]
+frozen_outputs = ["ContextCandidateSet", "ContextRecipe", "AdmittedContextSet", "ActiveUnderstandingView"]
+
+[[cell_binding]]
+order = 32
+crate = "eliot-learning-contracts"
+functional_cell = "smart.learning.contracts"
+frozen_inputs = []
+frozen_outputs = ["CampaignLearningStateView", "AttemptLearningDeltaCandidate", "CampaignHarnessOverlayCandidate", "HarnessActivationReceiptCandidate"]
+
+[[cell_binding]]
+order = 6
+crate = "eliot-epistemic-contracts"
+functional_cell = "smart.epistemic.contracts"
+frozen_inputs = []
+frozen_outputs = ["CurrentEpistemicPosition"]
+
+[[cell_binding]]
+order = 76
+crate = "eliot-memory-quality"
+functional_cell = "smart.memory.ecology"
+frozen_inputs = ["MemoryProjectionRecord read set by handle", "admitted task/continuity/safety projections by handle", "HarnessActivationReceiptCandidate by handle"]
+consumer_of_freeze = true
+
+[[cell_binding]]
+order = 79
+crate = "eliot-dreamer-memory-revision"
+functional_cell = "smart.dreamer.memory_revision"
+frozen_inputs = ["admitted task/safety projections by handle"]
+blocked_inputs = ["FailureObservation (NOT_FROZEN)", "MemoryRevisionEvidence (NOT_FROZEN)"]
+consumer_of_freeze = true
+
+[[cell_binding]]
+order = 80
+crate = "eliot-cognitive-quality"
+functional_cell = "smart.skill.lifecycle"
+frozen_inputs = ["HarnessActivationReceiptCandidate by handle"]
+blocked_inputs = ["Skill execution evidence typed projections (NOT_FROZEN)", "SystemObservationJournal/EliotSystemExperienceBank/AgentFeedbackReceipt typed projections (NOT_FROZEN)"]
+consumer_of_freeze = true
+
+[[cell_binding]]
+order = 85
+crate = "eliot-understanding-assessment"
+functional_cell = "smart.understanding.common_ground"
+frozen_inputs = ["ActiveUnderstandingView by handle"]
+blocked_inputs = ["accepted-source projection (NOT_FROZEN, CC-006)"]
+consumer_of_freeze = true
+
+[[not_frozen]]
+name = "MemoryQueryIntent"
+challenge = "CC-MEMORY-PROJECTION-SCHEMA"
+reason = "No field-complete owner-neutral definition exists in the normative pair, rev11 materialization, or retained donors."
+[[not_frozen]]
+name = "MemorySelectionPolicy"
+challenge = "CC-MEMORY-PROJECTION-SCHEMA"
+reason = "No field-complete owner-neutral definition exists."
+[[not_frozen]]
+name = "MemorySelectionTrace"
+challenge = "CC-MEMORY-PROJECTION-SCHEMA"
+reason = "No field-complete owner-neutral definition exists."
+[[not_frozen]]
+name = "MemoryContextProjectionRequest"
+challenge = "CC-MEMORY-PROJECTION-SCHEMA"
+reason = "No field-complete owner-neutral definition exists. The Governor ProjectionRequest is the provider intake port, not this consumer request shape."
+[[not_frozen]]
+name = "FailureObservation (owner-neutral)"
+challenge = "CC-FAILURE-OBSERVATION-SCHEMA"
+reason = "No versioned owner-neutral observation contract with denominator, fence, scope, and omission semantics exists."
+[[not_frozen]]
+name = "ProviderContribution (owner-neutral)"
+challenge = "CC-PROVIDER-CONTRIBUTION-SCHEMA"
+reason = "No versioned owner-neutral contribution contract with denominator, fence, scope, and omission semantics exists."
+[[not_frozen]]
+name = "rev12 closed seven-class provider enum"
+challenge = "CC-PROVIDER-CONTRIBUTION-SCHEMA"
+reason = "Current ProviderRole is a provider/semantic-role slot struct; the exact rev12 closed seven-class set is not closed in source."
+[[not_frozen]]
+name = "MemoryRevisionEvidence"
+challenge = "CC-W9-MEMORY-REVISION"
+reason = "No owner-neutral revision-evidence refs contract exists."
+[[not_frozen]]
+name = "SystemObservationJournal / EliotSystemExperienceBank / AgentFeedbackReceipt typed projections"
+challenge = "CC-W9-COGNITIVE-QUALITY"
+reason = "Consumed by handle only; no versioned owner-neutral projection types exist in source."
+[[not_frozen]]
+name = "accepted-source projection (CC-006)"
+challenge = "CC-W9-UNDERSTANDING"
+reason = "Exact accepted-source projection with edition identity, section handles, and conflict precedence is deferred to the Researcher/Architecture owner."
+[[not_frozen]]
+name = "strict complete-denominator enforcement for memory/experience selection"
+challenge = "CC-MEMORY-PROJECTION-SCHEMA"
+reason = "Complete coverage without an exact expected count is rejected by rule; the enforcing selection types do not exist yet."
+
+[[rejected]]
+name = "eliot-mcp FailureObservation DTO"
+location = "crates/surfaces/eliot-mcp/src/contract.rs"
+reason = "Surface DTO (failed_path, signature, evidence_refs, next_discriminator) with no denominator, fence, scope, or omission semantics. Wrong plane, wrong owner; must not be treated as the CC-FAILURE-OBSERVATION-SCHEMA contract."
+
+[[rejected]]
+name = "retired eliot-system-experience ownership"
+location = "crates/smart/eliot-system-experience (retired duplicate)"
+reason = "Donor disposition RETIRE_AS_STATE_OWNER_DEFER_READ_PROJECTION_IDEAS: only bounded read/filter/projection mechanics over Governor/Memory OS-owned records may be reused. A second self-memory owner, relation store, or lifecycle transition path is rejected."
+
+[[rejected]]
+name = "provider-specific duplicate request/contribution types"
+reason = "Projection packages consume the exact shared frozen types. A parallel request or contribution shape duplicating ProjectionRequest, CanonicalProjectionSet, or ContractBinding under a new name is rejected at package review."
+
+[[fence]]
+id = "F-NO-MODEL-STORAGE-NETWORK"
+rule = "Projection cells own no model route, storage access, network call, canonical write, admission, delivery/use receipt, lease, or effect behavior."
+[[fence]]
+id = "F-NO-REACTIVE-PATH-D"
+rule = "Projection packages must not implement reactive path D (ContextPlanningView production, cue activation wiring, session delivery, reactive feed). Reactive producers belong to #1942."
+[[fence]]
+id = "F-NO-W9-CONSUMER-INVENTION"
+rule = "Projection packages must not emit W9 consumer assessments (MemoryEcologyAssessment, NegativeMemoryExtinctionCandidate, CognitiveQualityAssessment, CommonGroundAssessment, ScopedUnderstandingAssessment) or their field contracts. Those outputs belong to the W9 consumer crates."
+[[fence]]
+id = "F-NO-AUTO-TRIGGER"
+rule = "No automatic GitHub Actions trigger is introduced. Workflows stay workflow_dispatch only."
+[[fence]]
+id = "F-PACKAGE-PROOF-BEFORE-EDGE"
+rule = "Each target package builds independently against this freeze and exposes only its declared projection/provider contract. Package proof records PACKAGE_PROOF_ONLY before any edge promotion. Package proof alone never reports product support."
