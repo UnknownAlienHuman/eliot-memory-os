@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod admission;
 pub mod antigravity;
 pub mod antigravity_persistent;
+pub mod cached_derivation;
 pub mod codecortex;
 pub mod cognition;
 pub mod cognitive_disposition;

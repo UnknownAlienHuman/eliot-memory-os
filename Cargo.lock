@@ -1650,10 +1650,13 @@ name = "eliot-engine"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-nextest",
  "eliot-instrument-runner",
+ "eliot-instrument-rustc",
+ "eliot-observability",
  "eliot-store",
  "eliot-types",
  "eliot-verifier",
@@ -1984,6 +1987,7 @@ dependencies = [
 name = "eliot-instrument-runner"
 version = "0.1.0"
 dependencies = [
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-cargo",
@@ -2230,9 +2234,11 @@ dependencies = [
 name = "eliot-lsp-bridge"
 version = "0.1.0"
 dependencies = [
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-scip",
+ "eliot-observability",
  "eliot-platform",
  "eliot-process",
  "serde",
