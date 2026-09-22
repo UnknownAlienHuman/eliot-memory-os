@@ -23,11 +23,10 @@
 //! → closed named read `GetUnderstandingProjectionInputs`
 //!   (`crates/storage/eliot-store-api/src/lib.rs:746`)
 //!
-//! this hook (`drive_reactive_view_cue_feed`)
+//! this hook (`drive_reactive_view_cue_feed`, `drive_live_reactive_view_cue_feed`)
 //! → `GovernorContextInputs::reconstruct` (live seven-role closure)
-//! → `evaluate_live_cue_pair` (Governor-owned evaluation over the live
-//!   candidate, caller seeds/profile)
-//! → `bind_cue_pair_to_roles` (pair proven current for the live closure)
+//! → `drive_live_cue_pair` (admission against canonical capture state,
+//!   seed driving, evaluation over the live candidate, pair binding)
 //! → `ReactiveCueActivation` assembly against the owner view (caller target
 //!   bindings, verified by the serving gate — never invented here)
 //! → `drive_served_view_feed` (serve under the bindings fence, then the
@@ -82,9 +81,8 @@ use eliot_cue_activation::ActivationProfile;
 use eliot_cue_contracts::{NormalizationProfile, ObservedCue, SnapshotId};
 use eliot_cue_normalizer::NormalizationPolicy;
 use eliot_governor::{
-    BoundCuePair, ContextInputsError, ContextReconstructionRequest, CueEvaluationError,
-    CuePairBindError, GovernorContextInputs, LiveCueEvaluation, SeedDriveError,
-    SeedExclusion, bind_cue_pair_to_roles, drive_observation_seeds, evaluate_live_cue_pair,
+    ContextInputsError, ContextReconstructionRequest, CuePairError, GovernorContextInputs,
+    LiveCuePair, drive_live_cue_pair,
 };
 use eliot_read::{QueryResult, ReadError, ReadService};
 use eliot_reactive_context_plan::{
@@ -140,27 +138,20 @@ pub async fn serve_projection_inputs_under_fence(
     .await
 }
 
-/// One production caller evaluation through the coherent fence readset: the
-/// evaluated output (carrying the admitted pair and its binding digests),
-/// the pair bound current for the live closure, and the served-view feed
-/// outcome over the assembled owner projections.
+/// One production caller evaluation through the coherent fence readset:
+/// the live cue pair (evaluation, bound pair, exclusions) plus the
+/// served-view feed outcome over the assembled owner projections.
 #[derive(Debug)]
 pub struct ReactiveViewCueOutcome {
-    /// Production evaluation output (admitted pair + binding digests).
-    pub evaluation: eliot_cue_activation::CueActivationEvaluation,
-    /// Pair proven current for the live seven-role closure.
-    pub bound: BoundCuePair,
-    /// Observations excluded from seeding, with reasons (frontier
-    /// evidence — visible here, never silently dropped).
-    pub excluded: Vec<SeedExclusion>,
+    /// Live cue pair proven against the live closure.
+    pub pair: LiveCuePair,
     /// Served mapping plus settled plan outcome in one causal call.
     pub feed: ServedViewFeed,
 }
 
 /// Fail-closed caller errors. Each stage surfaces distinctly: a fence or
-/// composition failure, a reconstruction failure, a seed-driving failure,
-/// an evaluation failure, a binding failure, a resolver failure, or a
-/// serving/planning failure. Nothing downgrades.
+/// composition failure, a reconstruction failure, a live-pair failure, a
+/// resolver failure, or a serving/planning failure. Nothing downgrades.
 #[derive(Debug, Error)]
 pub enum ReactiveViewCueError {
     /// The caller fence does not equal the admitted fence.
@@ -172,15 +163,10 @@ pub enum ReactiveViewCueError {
     /// The seven-role reconstruction failed.
     #[error("seven-role reconstruction failed: {0}")]
     Reconstruction(ContextInputsError),
-    /// Seed driving failed (malformed observation or normalization fault).
-    #[error("seed driving failed: {0}")]
-    Seeds(SeedDriveError),
-    /// The production cue evaluation failed.
-    #[error("cue evaluation failed: {0}")]
-    Evaluation(CueEvaluationError),
-    /// The evaluated pair is not current for the live closure.
-    #[error("cue pair binding failed: {0}")]
-    Bind(CuePairBindError),
+    /// Live cue pair production failed (admission, driving, evaluation,
+    /// or binding).
+    #[error("live cue pair failed: {0}")]
+    Pair(CuePairError),
     /// A six-slot resolver failed: `slot` names it (`session`,
     /// `coverage`, `policy`), `detail` carries its typed message.
     #[error("six-slot resolver failed: {slot}: {detail}")]
@@ -237,15 +223,14 @@ pub trait ReactivePolicyResolver {
 
 /// Drive the production reactive view/cue caller end to end under one fence.
 ///
-/// Drives admitted seeds from the caller observations through the
-/// normalizer owner, gathers the live seven-role closure through the
-/// Governor read owner, evaluates the bounded cue activation over the live
-/// candidate plus the driven seeds/profile, proves the pair current,
-/// assembles the cue activation against the owner view with the caller
-/// target bindings, and drives the served-view feed. Every stage binds
-/// `admitted_fence`: a refresh anywhere fails closed before anything plans.
-/// Holds no state; observations, profiles, bindings, and projections arrive
-/// as caller-owned artifacts and are proven here, never trusted.
+/// Gathers the live seven-role closure through the Governor read owner,
+/// drives the live cue pair (admission against canonical capture state,
+/// seed driving, bounded evaluation, pair binding), assembles the cue
+/// activation against the owner view with the caller target bindings, and
+/// drives the served-view feed. Every stage binds `admitted_fence`: a
+/// refresh anywhere fails closed before anything plans. Holds no state;
+/// observations, profiles, bindings, and projections arrive as caller-owned
+/// artifacts and are proven here, never trusted.
 ///
 /// No new semantics live here: driving, reconstruction, evaluation,
 /// binding, serving, and planning each run in their owning crate through
@@ -282,23 +267,19 @@ pub async fn drive_reactive_view_cue_feed(
         .reconstruct(ctx, reconstruction)
         .await
         .map_err(ReactiveViewCueError::Reconstruction)?;
-    let driven = drive_observation_seeds(&seven, observations, normalization_policy, &normalization_profile)
-        .map_err(ReactiveViewCueError::Seeds)?;
-    let evaluated = evaluate_live_cue_pair(
+    let pair = drive_live_cue_pair(
         &seven,
+        reconstruction,
         snapshot_id,
         normalization_profile,
-        driven.seeds,
+        observations,
+        normalization_policy,
         activation_profile,
     )
-    .map_err(ReactiveViewCueError::Evaluation)?;
-    let LiveCueEvaluation { request, evaluation } = evaluated;
-    let result = evaluation.result.clone();
-    let bound = bind_cue_pair_to_roles(&seven, reconstruction, request, result)
-        .map_err(ReactiveViewCueError::Bind)?;
+    .map_err(ReactiveViewCueError::Pair)?;
     let cue_activation = ReactiveCueActivation {
-        request: bound.request.clone(),
-        result: bound.result.clone(),
+        request: pair.bound.request.clone(),
+        result: pair.bound.result.clone(),
         expected_view_id: Some(view.view_id.clone()),
         expected_admitted_set_digest: Some(view.admitted_canonical_sha256.clone()),
         target_bindings,
@@ -316,9 +297,7 @@ pub async fn drive_reactive_view_cue_feed(
     )
     .map_err(ReactiveViewCueError::Feed)?;
     Ok(ReactiveViewCueOutcome {
-        evaluation,
-        bound,
-        excluded: driven.excluded,
+        pair,
         feed,
     })
 }

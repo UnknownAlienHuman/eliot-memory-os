@@ -36,6 +36,7 @@
 //! nothing here default-enables a profile.
 
 use eliot_contracts::{ClockReading, canonical_json_bytes, sha256_hex};
+use eliot_context_candidates::ProjectionState;
 use eliot_cue_activation::{ActivationProfile, CueActivationEvaluation, evaluate_activation};
 use eliot_cue_contracts::{
     ActivationRequest, ActivationRequestId, ActivationRequestSpec, CONTRACT_REVISION,
@@ -43,10 +44,15 @@ use eliot_cue_contracts::{
     ObservedCue, ObservedCueId, SnapshotId,
 };
 use eliot_cue_normalizer::{NormalizationPolicy, normalize_cue};
+use eliot_store_api::{NamedMutationOperation, named_mutation_operation_name};
 use serde::Serialize;
+use serde_json::Value;
 use thiserror::Error;
 
-use crate::context_inputs::SevenRoleInputs;
+use crate::context_inputs::{
+    BoundCuePair, ContextReconstructionRequest, CuePairBindError, SevenRoleInputs,
+    bind_cue_pair_to_roles,
+};
 use crate::cue_composition::{CueReconstructionCache, reconstruct_cue_snapshot};
 
 /// One production cue evaluation: the admitted request plus its evaluated,
@@ -216,20 +222,29 @@ pub struct SeedExclusion {
     pub reason: &'static str,
 }
 
-/// Fail-closed errors for seed driving. A malformed observation or a
-/// normalization failure aborts the drive (caller shape, never partial
-/// output); per-observation fate otherwise lands in
-/// [`DrivenSeeds::excluded`].
+/// Fail-closed errors for seed driving. A normalization failure aborts
+/// the drive (caller shape, never partial output); per-observation fate
+/// otherwise lands in [`DrivenSeeds::excluded`]. Observation validity is
+/// proven at admission ([`admit_cue_observations`]), never re-asserted here.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SeedDriveError {
-    /// An observation fails its owner validation.
-    #[error("seed observation is invalid: {0}")]
-    InvalidObserved(String),
     /// Normalization itself failed (policy or signature fault, not an
     /// outcome disposition).
     #[error("seed normalization failed: {0}")]
     Normalization(String),
 }
+
+/// Drives admitted evaluation seeds from admitted observations through the
+/// normalizer owner (CPU-side, deterministic, fence-bound).
+///
+/// Takes only [`AdmittedCueObservation`] — capture-proven observations —
+/// so raw caller assertions can never reach seed driving; the type boundary
+/// enforces it. Each admitted observation normalizes under the exact caller
+/// `policy` and `profile`, and passes only with a usable outcome
+/// (`Lossless` or `AuthorizedLoss`), non-empty comparison keys, and a
+/// context fence/scope equal to the live closure. Anything else is excluded
+/// with its reason. Holds no state; the policy, profile, and admitted
+/// observations arrive as caller-owned artifacts.
 
 /// Drives admitted evaluation seeds from live observations through the
 /// normalizer owner (CPU-side, deterministic, fence-bound).
@@ -244,16 +259,14 @@ pub enum SeedDriveError {
 /// observations arrive as caller-owned artifacts.
 pub fn drive_observation_seeds(
     seven: &SevenRoleInputs,
-    observations: Vec<ObservedCue>,
+    admitted: Vec<AdmittedCueObservation>,
     policy: &NormalizationPolicy,
     profile: &NormalizationProfile,
 ) -> Result<DrivenSeeds, SeedDriveError> {
-    let mut seeds = Vec::with_capacity(observations.len());
+    let mut seeds = Vec::with_capacity(admitted.len());
     let mut excluded = Vec::new();
-    for observed in &observations {
-        observed
-            .validate()
-            .map_err(|error| SeedDriveError::InvalidObserved(error.to_string()))?;
+    for admitted in &admitted {
+        let observed = admitted.observed();
         let envelope = normalize_cue(observed, policy, profile)
             .map_err(|error| SeedDriveError::Normalization(error.to_string()))?;
         let normalized = envelope.normalized;
@@ -296,4 +309,241 @@ pub fn drive_observation_seeds(
         seeds.push(normalized);
     }
     Ok(DrivenSeeds { seeds, excluded })
+}
+
+/// One cue observation admitted against canonical capture state.
+///
+/// Private fields enforce the admission boundary: only
+/// [`admit_cue_observations`] constructs this type, so a raw
+/// caller-asserted observation can never reach seed driving. The bound
+/// `capture_index` names the committed capture row that proves the
+/// observation happened.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedCueObservation {
+    observed: ObservedCue,
+    capture_index: u64,
+}
+
+impl AdmittedCueObservation {
+    /// Returns the admitted observation, unchanged.
+    #[must_use]
+    pub const fn observed(&self) -> &ObservedCue {
+        &self.observed
+    }
+
+    /// Returns the committed capture-row index proving the observation.
+    #[must_use]
+    pub const fn capture_index(&self) -> u64 {
+        self.capture_index
+    }
+}
+
+/// Fail-closed errors for cue observation admission.
+///
+/// A malformed observation, an unreadable evidence upstream, an envelope
+/// that disagrees with the live closure, or an observation with no
+/// committed capture row aborts the whole admission: a partially proven
+/// batch never seeds.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CueAdmissionError {
+    /// An observation fails its owner validation.
+    #[error("admission observation is invalid: {0}")]
+    InvalidObserved(String),
+    /// The evidence role carries no readable pack (not `Complete` or no
+    /// payload).
+    #[error("admission evidence upstream is unreadable")]
+    NoEvidence,
+    /// The evidence pack scope or fence disagrees with the live closure.
+    #[error("admission evidence pack disagrees with the live closure: {0}")]
+    PackMismatch(String),
+    /// An observation names no committed capture row for the live pack.
+    #[error("observation has no committed capture: {0}")]
+    NoCapture(String),
+}
+
+/// Admits caller observations against canonical capture owner state.
+///
+/// Each observation validates through its owner, then must match exactly
+/// one committed `CaptureObservation` row in the live evidence pack: same
+/// subject bytes as the observed value, under the pack scope and fence
+/// already checked against the live closure. The earliest matching row
+/// (lowest capture index) binds the admission. Caller classification
+/// (kind, lifecycle, privacy, ceiling) travels as observer declaration and
+/// stays enforced by the owner validators and the evaluation preflight;
+/// existence, scope, and fence are proven here against canonical bytes —
+/// never asserted.
+pub fn admit_cue_observations(
+    seven: &SevenRoleInputs,
+    observations: Vec<ObservedCue>,
+) -> Result<Vec<AdmittedCueObservation>, CueAdmissionError> {
+    for observed in &observations {
+        observed
+            .validate()
+            .map_err(|error| CueAdmissionError::InvalidObserved(error.to_string()))?;
+    }
+    let payload = match &seven.evidence.state {
+        ProjectionState::Complete => seven
+            .evidence
+            .payload
+            .as_ref()
+            .ok_or(CueAdmissionError::NoEvidence)?,
+        _ => return Err(CueAdmissionError::NoEvidence),
+    };
+    check_pack_currency(payload, seven)?;
+    let records = payload
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CueAdmissionError::PackMismatch("evidence pack has no records".to_owned()))?;
+    let capture_operation = named_mutation_operation_name(NamedMutationOperation::CaptureObservation);
+    let mut admitted = Vec::with_capacity(observations.len());
+    for observed in observations {
+        let mut best: Option<u64> = None;
+        for record in records {
+            let operation = record.get("operation").and_then(Value::as_str);
+            let subject = record
+                .get("parameters")
+                .and_then(|parameters| parameters.get("subject"))
+                .and_then(Value::as_str);
+            let index = record.get("capture_index").and_then(Value::as_u64);
+            if operation == Some(capture_operation)
+                && subject == Some(observed.original_value.as_str())
+            {
+                let index =
+                    index.ok_or_else(|| CueAdmissionError::PackMismatch("capture record has no index".to_owned()))?;
+                if best.is_none_or(|current| index < current) {
+                    best = Some(index);
+                }
+            }
+        }
+        match best {
+            Some(capture_index) => admitted.push(AdmittedCueObservation {
+                observed,
+                capture_index,
+            }),
+            None => {
+                return Err(CueAdmissionError::NoCapture(format!(
+                    "no committed capture for {:?} under the live pack",
+                    observed.observed_cue_id.as_str()
+                )));
+            }
+        }
+    }
+    Ok(admitted)
+}
+
+/// Checks one evidence pack envelope against the live closure.
+///
+/// Navigated by field, never redefined: `scope_id` and
+/// `provenance.state_fence` must equal the live closure scope and fence.
+/// A missing or misshapen field fails closed; the pack version is not
+/// pinned (shape-gated, version-agnostic).
+fn check_pack_currency(
+    payload: &Value,
+    seven: &SevenRoleInputs,
+) -> Result<(), CueAdmissionError> {
+    let refused = |detail: &str| CueAdmissionError::PackMismatch(detail.to_owned());
+    let scope = payload
+        .get("scope_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| refused("evidence pack has no scope_id"))?;
+    let fence_value = payload
+        .get("provenance")
+        .and_then(|provenance| provenance.get("state_fence"))
+        .ok_or_else(|| refused("evidence pack has no provenance fence"))?;
+    let fence: eliot_contracts::StateFence = serde_json::from_value(fence_value.clone())
+        .map_err(|_| refused("evidence pack provenance fence is not a state fence"))?;
+    if scope != seven.scope_id.as_str() {
+        return Err(refused(
+            "evidence pack scope differs from the live closure scope",
+        ));
+    }
+    if fence != seven.state_fence {
+        return Err(refused(
+            "evidence pack fence differs from the live closure fence",
+        ));
+    }
+    Ok(())
+}
+
+/// One live cue pair for the real reactive feed path: the production
+/// evaluation, the pair bound current for the live closure, and the seed
+/// frontier that did not evaluate.
+///
+/// This is the D1 production port the feed assembly consumes (D2's
+/// `serve_live_six_slot` joins it with the session/attention/coverage/policy
+/// projections): everything downstream of the seven-role closure that the
+/// cue side owns, proven before anything plans.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveCuePair {
+    /// Production evaluation output (admitted pair + binding digests).
+    pub evaluation: CueActivationEvaluation,
+    /// Pair proven current for the live seven-role closure.
+    pub bound: BoundCuePair,
+    /// Observations excluded from seeding, with reasons.
+    pub excluded: Vec<SeedExclusion>,
+}
+
+/// Fail-closed errors for live cue pair production. Each stage surfaces
+/// distinctly; the evaluation, binding, admission, and driving failures
+/// below never downgrade into each other.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CuePairError {
+    /// Observation admission failed (invalid, unreadable upstream,
+    /// pack mismatch, or no committed capture).
+    #[error("cue observation admission failed: {0}")]
+    Admission(CueAdmissionError),
+    /// Seed driving failed.
+    #[error("cue seed driving failed: {0}")]
+    Drive(SeedDriveError),
+    /// Production evaluation failed.
+    #[error("cue evaluation failed: {0}")]
+    Evaluation(CueEvaluationError),
+    /// Pair binding failed.
+    #[error("cue pair binding failed: {0}")]
+    Bind(CuePairBindError),
+}
+
+/// Drives one live cue pair from the live seven-role closure (T11.4 cue
+/// production port, CPU-side only).
+///
+/// Admits the caller observations against canonical capture state, drives
+/// seeds, evaluates over the live candidate, and binds the pair current —
+/// in that order, failing closed at the first refusal. Deterministic over
+/// its inputs; holds no state. The caller supplies observations, profiles,
+/// snapshot identity, and the reconstruction request the seven was built
+/// from; every one of them is proven here, never trusted.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_live_cue_pair(
+    seven: &SevenRoleInputs,
+    request: &ContextReconstructionRequest,
+    snapshot_id: SnapshotId,
+    normalization_profile: NormalizationProfile,
+    observations: Vec<ObservedCue>,
+    normalization_policy: &NormalizationPolicy,
+    activation_profile: &ActivationProfile,
+) -> Result<LiveCuePair, CuePairError> {
+    let admitted = admit_cue_observations(seven, observations)
+        .map_err(CuePairError::Admission)?;
+    let driven = drive_observation_seeds(seven, admitted, normalization_policy, &normalization_profile)
+        .map_err(CuePairError::Drive)?;
+    let evaluated = evaluate_live_cue_pair(
+        seven,
+        snapshot_id,
+        normalization_profile,
+        driven.seeds,
+        activation_profile,
+    )
+    .map_err(CuePairError::Evaluation)?;
+    let LiveCueEvaluation {
+        request: activation_request,
+        evaluation,
+    } = evaluated;
+    let result = evaluation.result.clone();
+    let bound = bind_cue_pair_to_roles(seven, request, activation_request, result)
+        .map_err(CuePairError::Bind)?;
+    Ok(LiveCuePair {
+        evaluation,
+        bound,
+        excluded: driven.excluded,
+    })
 }
