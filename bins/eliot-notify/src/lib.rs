@@ -1054,6 +1054,8 @@ const DELIVERY_OWNER: &str = "delivery-receipt-verifier";
 
 pub mod automation_notification_adapter;
 mod fallback_verification;
+pub mod installed_binary;
+pub mod notify_declaration;
 pub mod operation_identity;
 pub mod quiet_hours;
 #[cfg(test)]
@@ -1061,6 +1063,14 @@ use fallback_verification::sha256_hex;
 use fallback_verification::{
     FallbackMaterial, FallbackVerificationDeclaration, decode_hex, fallback_provider_error,
     load_fallback_material,
+};
+pub use installed_binary::{
+    InstalledNotifyBinary, NotifyBinaryBinding, NotifyBinaryError, NotifyDigest,
+    notify_binding_from_declaration, resolve_notify_binary,
+};
+pub use notify_declaration::{
+    NotifyDeclarationError, NotifyDeclarationInputs, RenderedNotifyDeclaration,
+    render_notify_fallback_declaration,
 };
 
 /// Registers the installer-owned X-01 fallback task for the current
