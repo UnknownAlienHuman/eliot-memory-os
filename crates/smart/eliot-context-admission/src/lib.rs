@@ -13,8 +13,8 @@ pub mod decision;
 pub use closure::{ClosureParts, assemble_closure};
 
 pub use decision::{
-    MaterialRankTrace, RetrievalAdmissionDecision, RetrievalStaleness, check_retrieval_freshness,
-    trace_material,
+    ClassifiedAdmission, ClassificationEvidence, MaterialRankTrace, RetrievalAdmissionDecision,
+    RetrievalStaleness, check_retrieval_freshness, classify_admission, trace_material,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

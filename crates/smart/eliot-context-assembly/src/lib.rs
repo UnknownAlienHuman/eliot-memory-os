@@ -11,6 +11,7 @@ mod bounds;
 mod cite;
 mod error;
 mod measurement;
+mod packet;
 mod readback;
 mod render;
 
@@ -19,6 +20,7 @@ pub use assemble::{
 };
 pub use cite::project_citation;
 pub use error::AssemblyError;
+pub use packet::{AssembledPacketBinding, AssembledPacketSlot, bind_packet_traces};
 pub use readback::{ReopenedSource, gate_citation};
 
 pub use eliot_context_contracts::{

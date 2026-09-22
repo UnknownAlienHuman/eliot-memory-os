@@ -33,17 +33,18 @@
 //! (no `From`/`Into` bridge); convergence of the two vocabularies is owned
 //! separately with the cognition contract owner. Likewise,
 //! `eliot_context_contracts::AdmissionDisposition` remains the per-candidate
-//! membership disposition; [`RetrievalAdmissionDecision::from_membership`]
-//! resolves only the exact-name counterparts and returns `None` where the
-//! contract determines no outcome, rather than inventing a mapping.
+//! membership disposition; [`classify_admission`] resolves the exact-name
+//! counterparts into [`RetrievalAdmissionDecision`] and carries every other
+//! case on the explicit typed unable-path with its owner evidence preserved,
+//! rather than inventing a mapping the contract did not determine.
 
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_context_contracts::{
-    AdmissionDisposition, AdmissionInput, AdmissionResult, AtomAvailability, ContextCandidate,
-    ContextError, ContextOutcome, OmissionRecord,
+    AdmissionDisposition, AdmissionInput, AdmissionResult, AdmissionRuleIdentity, AtomAvailability,
+    ContextCandidate, ContextError, ContextOutcome, OmissionRecord,
 };
 use eliot_contracts::{ArtifactId, DecisionId, StateFence, fences_match_exact};
 use serde::{Deserialize, Serialize};
@@ -116,36 +117,106 @@ impl RetrievalAdmissionDecision {
             _ => None,
         }
     }
+}
 
-    /// Resolve the contract-determined outcome for one membership disposition.
-    ///
-    /// Only exact-name counterparts resolve: `Include` without warning
-    /// evidence is `include_exact`, `Include` with non-blank warning evidence
-    /// is `include_with_warning`, and `HandleOnly`, `Revalidate`, `Suppress`,
-    /// `Quarantine` resolve to their same-named outcomes. `Unavailable`,
-    /// `Blocked`, and `OverBudget` have no I12.26 counterpart and yield
-    /// `None`, as does `Include` with blank warning text: the contract
-    /// determines no outcome there, and this function refuses to invent one.
-    /// The runtime caller owns the total classification as a later slice.
-    #[must_use]
-    pub fn from_membership(
+/// Owner-backed evidence for classifying one evaluated candidate.
+///
+/// Every field comes from an owning record: the membership disposition from
+/// the admission decision, the optional warning text from explicit caller
+/// evidence (no warning owner exists in-tree; a future warning producer
+/// supplies it here), the rule identity from the admission rule owner, the
+/// availability from the candidate's freshness owner, and the floor flag
+/// from the Safety Floor owner.
+pub struct ClassificationEvidence<'a> {
+    /// Evaluated membership disposition for the candidate.
+    pub disposition: AdmissionDisposition,
+    /// Explicit warning evidence for an admitted unit, if any.
+    pub warning: Option<&'a str>,
+    /// Admission rule that evaluated the candidate.
+    pub rule: &'a AdmissionRuleIdentity,
+    /// Freshness state of the evaluated candidate.
+    pub availability: AtomAvailability,
+    /// Whether the candidate is a mandatory floor member.
+    pub floor_member: bool,
+}
+
+/// Total classification of one evaluated candidate.
+///
+/// Every membership disposition yields exactly one value: the five
+/// contract-determined outcomes resolve to [`RetrievalAdmissionDecision`],
+/// while `Unavailable`, `Blocked`, and `OverBudget` — which have no I12.26
+/// counterpart — and blank warning text take the explicit typed unable-path.
+/// The unable arm carries the exact evaluated disposition with the owner
+/// evidence that was considered, so the runtime can route it without any
+/// renamed quotient: nothing is coerced into `Suppress` or any other outcome
+/// the contract did not determine.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "classification", deny_unknown_fields)]
+pub enum ClassifiedAdmission {
+    /// Contract-determined six-outcome slot.
+    Decided(RetrievalAdmissionDecision),
+    /// No I12.26 counterpart determined; exact evidence preserved verbatim.
+    Undetermined {
+        /// Evaluated membership disposition, unmapped and unrenamed.
         disposition: AdmissionDisposition,
-        warning: Option<&str>,
-    ) -> Option<Self> {
-        match disposition {
-            AdmissionDisposition::Include => match warning {
-                None => Some(Self::IncludeExact),
-                Some(text) if text.trim().is_empty() => None,
-                Some(_) => Some(Self::IncludeWithWarning),
-            },
-            AdmissionDisposition::HandleOnly => Some(Self::IncludeHandle),
-            AdmissionDisposition::Revalidate => Some(Self::RequireRevalidation),
-            AdmissionDisposition::Suppress => Some(Self::Suppress),
-            AdmissionDisposition::Quarantine => Some(Self::Quarantine),
-            AdmissionDisposition::Unavailable
-            | AdmissionDisposition::Blocked
-            | AdmissionDisposition::OverBudget => None,
+        /// Freshness state that was considered.
+        availability: AtomAvailability,
+        /// Floor membership that was considered.
+        floor_member: bool,
+        /// Admission rule that evaluated the candidate.
+        rule_id: ArtifactId,
+    },
+}
+
+impl ClassifiedAdmission {
+    /// The decided outcome, if the contract determined one.
+    #[must_use]
+    pub const fn decided(&self) -> Option<RetrievalAdmissionDecision> {
+        match self {
+            Self::Decided(outcome) => Some(*outcome),
+            Self::Undetermined { .. } => None,
         }
+    }
+}
+
+/// Classify one evaluated candidate over owner-backed evidence.
+///
+/// Total and deterministic: exact-name counterparts
+/// (`Include` without warning evidence, `HandleOnly`, `Revalidate`,
+/// `Suppress`, `Quarantine`) decide their same-named outcome, `Include` with
+/// non-blank warning evidence decides `include_with_warning`, and every
+/// other case — `Unavailable`, `Blocked`, `OverBudget`, blank warning text —
+/// takes the typed unable-path with its evidence preserved. No arm invents a
+/// quotient the contract did not determine.
+#[must_use]
+pub fn classify_admission(evidence: &ClassificationEvidence<'_>) -> ClassifiedAdmission {
+    let undetermined = || ClassifiedAdmission::Undetermined {
+        disposition: evidence.disposition,
+        availability: evidence.availability,
+        floor_member: evidence.floor_member,
+        rule_id: evidence.rule.rule_id.clone(),
+    };
+    match evidence.disposition {
+        AdmissionDisposition::Include => match evidence.warning {
+            None => ClassifiedAdmission::Decided(RetrievalAdmissionDecision::IncludeExact),
+            Some(text) if text.trim().is_empty() => undetermined(),
+            Some(_) => ClassifiedAdmission::Decided(RetrievalAdmissionDecision::IncludeWithWarning),
+        },
+        AdmissionDisposition::HandleOnly => {
+            ClassifiedAdmission::Decided(RetrievalAdmissionDecision::IncludeHandle)
+        }
+        AdmissionDisposition::Revalidate => {
+            ClassifiedAdmission::Decided(RetrievalAdmissionDecision::RequireRevalidation)
+        }
+        AdmissionDisposition::Suppress => {
+            ClassifiedAdmission::Decided(RetrievalAdmissionDecision::Suppress)
+        }
+        AdmissionDisposition::Quarantine => {
+            ClassifiedAdmission::Decided(RetrievalAdmissionDecision::Quarantine)
+        }
+        AdmissionDisposition::Unavailable
+        | AdmissionDisposition::Blocked
+        | AdmissionDisposition::OverBudget => undetermined(),
     }
 }
 
@@ -281,9 +352,10 @@ pub struct MaterialRankTrace {
     pub atom_id: ArtifactId,
     /// Evaluated membership disposition for this material.
     pub disposition: AdmissionDisposition,
-    /// Contract-determined six-outcome slot; `None` where I12.26 determines
-    /// no outcome (see [`RetrievalAdmissionDecision::from_membership`]).
-    pub outcome: Option<RetrievalAdmissionDecision>,
+    /// Total classification for this material: the contract-determined
+    /// six-outcome slot, or the explicit typed unable-path with its owner
+    /// evidence preserved verbatim.
+    pub outcome: ClassifiedAdmission,
     /// Freshness signal for this material, if any.
     pub staleness: Option<RetrievalStaleness>,
     /// Admission rule that evaluated this material (features/exact-relations
@@ -381,7 +453,15 @@ pub fn trace_material(
         let mut trace = MaterialRankTrace {
             atom_id: candidate.atom_id.clone(),
             disposition: decision.disposition,
-            outcome: RetrievalAdmissionDecision::from_membership(decision.disposition, None),
+            outcome: classify_admission(&ClassificationEvidence {
+                disposition: decision.disposition,
+                // No warning owner exists in-tree: explicit caller evidence
+                // arrives here once its producer lands.
+                warning: None,
+                rule: &input.rule,
+                availability: candidate.availability,
+                floor_member: floor_ids.contains(&candidate.atom_id),
+            }),
             staleness: material_staleness(&input.binding.state_fence, candidate, &floor_ids),
             rule_evidence: decision.rule_evidence.clone(),
             suppression_reason: omission.map(|item| item.competing_constraint.clone()),
