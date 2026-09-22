@@ -23,6 +23,7 @@ thiserror.workspace = true
 [dev-dependencies]
 eliot-change-monitor = { path = "../../governor/eliot-change-monitor" }
 eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts" }
+eliot-receipts = { path = "../../foundation/eliot-receipts" }
 serde_json.workspace = true
 
 [lints]
