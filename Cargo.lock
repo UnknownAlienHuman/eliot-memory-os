@@ -2684,6 +2684,7 @@ dependencies = [
  "eliot-host-state",
  "eliot-installation",
  "eliot-ipc",
+ "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-ors",
  "eliot-platform",
