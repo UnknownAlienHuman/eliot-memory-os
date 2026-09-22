@@ -4,6 +4,10 @@
 //! projection provider, the Smart applicability evaluator, and the context
 //! candidate memory slot: [`MemoryProjectionRecord`], the fenced
 //! [`MemoryProjectionBatch`], and the [`ApplicableMemorySet`] verdict.
+//! It also owns the caller selection schema closed under
+//! CC-MEMORY-PROJECTION-SCHEMA: [`MemoryQueryIntent`],
+//! [`MemorySelectionPolicy`], and the [`MemorySelectionTrace`] emitted by
+//! [`select`], which narrows without verdicting.
 //!
 //! The crate owns no store, index, retrieval, ranking, or promotion
 //! authority. It only describes the bounded evidence a projector promises
@@ -14,6 +18,7 @@
 mod batch;
 mod error;
 mod record;
+mod selection;
 mod set;
 
 pub use batch::{
@@ -21,6 +26,10 @@ pub use batch::{
     MEMORY_PROJECTION_MAX_RECORDS, MemoryProjectionBatch, ProjectionCoverage,
 };
 pub use error::MemoryProjectionError;
+pub use selection::{
+    MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace, SelectionCoverage,
+    SelectionDisposition, SelectionEntry, SelectionError, select,
+};
 pub use record::{
     CueTrigger, FreshnessState, MAX_APPLICABILITY_LIMITS, MAX_CUE_TRIGGERS, MAX_PRECONDITIONS,
     MAX_RECORD_ROLES, MAX_SCOPE_CHARS, MemoryFreshness, MemoryKind, MemoryProjectionRecord,
