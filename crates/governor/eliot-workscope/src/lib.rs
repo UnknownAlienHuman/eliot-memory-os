@@ -14,7 +14,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod caller;
 mod identity;
+
+pub use caller::{
+    DescriptorPolicy, ObservedScopeResources, ReceiptAdmission, WithholdReason,
+    describe_observed_scope, propose_scope, verify_receipt_for_admission,
+};
 
 pub use identity::{
     EvidenceStanding, GenerationEvidence, IdentityEvidence, MemoryApplicability, ProposalSource,
