@@ -28,13 +28,23 @@
 //! restore ever lands.
 
 use eliot_agent_bridge_core::{AttachBinding, BridgeError, ResourceUri};
-use eliot_contracts::{ResourceGeneration, StateFence};
+use eliot_contracts::{ResourceGeneration, SessionId, StateFence};
+use eliot_integration_coverage::GovernorCoverageDerivation;
 use eliot_mcp::{KernelHostRequestPort, PortFailure};
 use eliot_protocol::{
     MAX_RESTORE_URIS, ReactiveRestoreQuery, ReactiveRestoreReply, RestoredSnapshot,
 };
+use eliot_reactive_context_plan::{
+    LiveActivationBindings, OwnerSupplyError, ReactiveOwnerRetention,
+    ServedSnapshotDelivery, SettledPlanFeedError, SettledPlanFeedInputs, drive_live_feed,
+    ingest_served_snapshot_delivery,
+};
+use std::fmt;
 
 use super::BridgeRunner;
+use super::settled_plan_transport::{
+    FeedAdmissionOutcome, PlanAdmissionError, SettledPlanAdmission, admit_producer_feed,
+};
 
 /// Outcome of the ledger leg of one restore.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -520,4 +530,148 @@ mod tests {
         assert_eq!(live_ids(&runner).len(), 1, "ledger restore stands");
         assert_eq!(runner.resource_registry_len(), 1, "only the valid snapshot landed");
     }
+}
+
+/// Fail-closed errors for the owner-projection feed driver (#1942 lane D).
+///
+/// Stale projections, planning rejections, and plan defects surface here.
+/// Nothing is admitted after the error point; a withheld owner stays
+/// withheld upstream, never a fabricated batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnerProjectionFeedError {
+    /// Supplied projections disagree with the live activation bindings.
+    Stale {
+        /// Projection whose binding disagreed.
+        projection: &'static str,
+        /// Exact binding field that disagreed.
+        field: &'static str,
+    },
+    /// The planner rejected the projections (invalid, stale, conflicted).
+    Planning(String),
+    /// A settled plan item is unusable as a bridge instruction.
+    Producer(String),
+    /// Admission into the live ledger failed (session, attach, or bridge).
+    Admission(PlanAdmissionError),
+    /// An owner snapshot could not be supplied (absent, oversize,
+    /// undecodable, invalid, or fence/binding-mismatched). Nothing was
+    /// planned or admitted.
+    Supply(OwnerSupplyError),
+}
+
+impl fmt::Display for OwnerProjectionFeedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stale { projection, field } => write!(
+                formatter,
+                "owner projections stale: {projection}.{field} disagrees with the live activation"
+            ),
+            Self::Planning(detail) => write!(formatter, "owner feed planning: {detail}"),
+            Self::Producer(detail) => write!(formatter, "owner feed producer: {detail}"),
+            Self::Admission(error) => write!(formatter, "owner feed admission: {error}"),
+            Self::Supply(error) => write!(formatter, "owner feed supply: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OwnerProjectionFeedError {}
+
+/// Drive one owner-projection feed evaluation into the live ledger.
+///
+/// Composition only (no new cadence, no second ledger): it runs the existing
+/// liveness-gated settled-plan feed
+/// ([`drive_live_feed`](eliot_reactive_context_plan::drive_live_feed)) over
+/// the six owner-issued projections produced by the lane-D producers, then
+/// admits the outcome through the existing governed transport
+/// ([`admit_producer_feed`](admit_producer_feed)) with the live Governor
+/// derivation. Afterwards the existing bridge machinery owns delivery
+/// (host-hook and next-response drains issue receipts).
+///
+/// Authority boundaries (unchanged):
+/// ```text
+/// producers own:  the six immutable projections (assembled + validated);
+/// feed owns:      one causal evaluation (projections → plan → batch);
+/// bridge owns:    session binding, ledger mutation, receipts, stickiness;
+/// governor owns:  per-item risk tier (live derivation, never defaulted).
+/// ```
+pub fn drive_owner_projections_to_ledger(
+    runner: &mut BridgeRunner,
+    derivation: &GovernorCoverageDerivation,
+    admission: &mut SettledPlanAdmission,
+    bindings: &LiveActivationBindings,
+    inputs: SettledPlanFeedInputs<'_>,
+) -> Result<FeedAdmissionOutcome, OwnerProjectionFeedError> {
+    let outcome = drive_live_feed(bindings, inputs).map_err(|error| match error {
+        SettledPlanFeedError::StaleActivation { projection, field } => {
+            OwnerProjectionFeedError::Stale { projection, field }
+        }
+        SettledPlanFeedError::Planning(error) => {
+            OwnerProjectionFeedError::Planning(format!("{error:?}"))
+        }
+        SettledPlanFeedError::Producer(error) => {
+            OwnerProjectionFeedError::Producer(error.to_string())
+        }
+    })?;
+    admit_producer_feed(admission, runner, derivation, outcome)
+        .map_err(OwnerProjectionFeedError::Admission)
+}
+
+/// Supply the six owner projections from a slot-complete served delivery,
+/// retain them, then drive one feed evaluation into the live ledger.
+///
+/// Ingestion edge: the live session and fence come from the runner's own
+/// attach binding (never caller text); the served delivery (reply echo plus
+/// exactly one leg per slot) comes from the serving restore leg. Leg
+/// digests are re-hashed, revisions bound, and the set validated and
+/// retained under the live key, then re-read from retention before the
+/// existing feed/transport runs — the drive below consumes retained state,
+/// never fresh caller bytes. Any incomplete, foreign-session, or unreadable
+/// delivery fails closed here: never a fabricated projection, never a
+/// silent drop.
+pub fn supply_and_drive_owner_projections(
+    runner: &mut BridgeRunner,
+    derivation: &GovernorCoverageDerivation,
+    admission: &mut SettledPlanAdmission,
+    bindings: &LiveActivationBindings,
+    retention: &mut ReactiveOwnerRetention,
+    served: &ServedSnapshotDelivery<'_>,
+) -> Result<FeedAdmissionOutcome, OwnerProjectionFeedError> {
+    let view = runner
+        .attach_view()
+        .ok_or(PlanAdmissionError::NotAttached)
+        .map_err(OwnerProjectionFeedError::Admission)?;
+    let live_session = view.binding().session_id().as_str().to_owned();
+    let live_fence = live_state_fence(view.binding())
+        .map_err(|_| OwnerProjectionFeedError::Supply(OwnerSupplyError::InvalidFence))?;
+    ingest_served_snapshot_delivery(retention, &live_session, &live_fence, served)
+        .map_err(OwnerProjectionFeedError::Supply)?;
+    let session_id = SessionId::new(live_session.as_str()).map_err(|_| {
+        OwnerProjectionFeedError::Supply(OwnerSupplyError::Invalid {
+            projection: "retention",
+            detail: "live session identity is invalid".to_owned(),
+        })
+    })?;
+    let stored = retention
+        .read(&session_id, &live_fence)
+        .map_err(OwnerProjectionFeedError::Supply)?;
+    drive_owner_projections_to_ledger(runner, derivation, admission, bindings, stored.feed_inputs())
+}
+
+/// Drive one feed evaluation from the retained projection set for exactly
+/// the live (session, fence) key.
+///
+/// Pure read path: no bytes are decoded here. Unknown sessions or rotated
+/// fences fail closed via the retention read.
+pub fn drive_retained_projection_set(
+    runner: &mut BridgeRunner,
+    derivation: &GovernorCoverageDerivation,
+    admission: &mut SettledPlanAdmission,
+    bindings: &LiveActivationBindings,
+    retention: &ReactiveOwnerRetention,
+    session_id: &SessionId,
+    fence: &StateFence,
+) -> Result<FeedAdmissionOutcome, OwnerProjectionFeedError> {
+    let stored = retention
+        .read(session_id, fence)
+        .map_err(OwnerProjectionFeedError::Supply)?;
+    drive_owner_projections_to_ledger(runner, derivation, admission, bindings, stored.feed_inputs())
 }
