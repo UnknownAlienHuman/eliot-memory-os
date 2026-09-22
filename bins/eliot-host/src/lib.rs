@@ -119,6 +119,11 @@ impl Drop for HostTerminalGuard<'_> {
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 pub use eliot_host_control_endpoint::{
     HOST_RUNTIME_CONTROL_PIPE, HostRuntimeControl, HostRuntimeControlQueue,
+    HostUserAutomationExecutionEnvelope, HostUserAutomationExecutionQueue,
+    UserAutomationHostExecutionEndpoint, UserAutomationHostExecutionRequest,
+    UserAutomationHostExecutionResponse, UserAutomationRuntimeError,
+    pop_user_automation_execution, process_user_automation_execution_queue,
+    reject_unbound_user_automation_execution,
 };
 use eliot_host_service::runtime_control::runtime_control_unknown_ref;
 pub use eliot_host_service::runtime_control::{
@@ -3684,6 +3689,8 @@ pub struct HostComposition {
     #[cfg(windows)]
     runtime_control_queue: HostRuntimeControlQueue,
     #[cfg(windows)]
+    user_automation_execution_queue: HostUserAutomationExecutionQueue,
+    #[cfg(windows)]
     store_recovery_startup_fence: StoreRecoveryStartupFence,
     active_phase_b_rebind_recovery: ActivePhaseBRebindRecoveryKind,
     owner_lease: HostOwnerLease,
@@ -4091,6 +4098,10 @@ impl HostComposition {
             runtime_restarts: durable_restarts,
             #[cfg(windows)]
             runtime_control_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            #[cfg(windows)]
+            user_automation_execution_queue: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
             #[cfg(windows)]
@@ -4832,8 +4843,9 @@ impl HostComposition {
         let _guard = capability
             .live_guard()
             .map_err(|e| HostError::Platform(e.to_string()))?;
-        let control = HostRuntimeControl::new_with_capability(
+        let control = HostRuntimeControl::new_with_capability_and_user_automation(
             std::sync::Arc::clone(&self.runtime_control_queue),
+            std::sync::Arc::clone(&self.user_automation_execution_queue),
             &capability,
         )
         .map_err(HostError::Platform)?;
@@ -4846,6 +4858,13 @@ impl HostComposition {
     #[allow(missing_docs)]
     pub fn runtime_control_queue(&self) -> HostRuntimeControlQueue {
         std::sync::Arc::clone(&self.runtime_control_queue)
+    }
+
+    /// Returns the bounded UserAutomation owner queue admitted by the
+    /// authenticated runtime-control endpoint.
+    #[cfg(windows)]
+    pub fn user_automation_execution_queue(&self) -> HostUserAutomationExecutionQueue {
+        std::sync::Arc::clone(&self.user_automation_execution_queue)
     }
 
     #[cfg(windows)]

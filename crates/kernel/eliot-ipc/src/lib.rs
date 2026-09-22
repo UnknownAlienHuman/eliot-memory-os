@@ -2293,6 +2293,24 @@ impl NamedPipeTransport {
         Ok(transport)
     }
 
+    /// Connects to an authenticated pipe whose server admits only the local
+    /// built-in Administrators peer.
+    ///
+    /// This keeps the platform expectation construction beside the existing
+    /// authenticated transport owner. Callers still receive the same
+    /// handle-bound authentication proof as [`Self::connect_authenticated`];
+    /// this helper only avoids making every production caller depend directly
+    /// on the Windows platform crate.
+    pub async fn connect_authenticated_builtin_administrators(
+        name: &str,
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        let expectation =
+            eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
+                .map_err(map_platform_error)?;
+        Self::connect_authenticated(name, timeout, &expectation).await
+    }
+
     /// Connects and selects exactly one server role from a sealed peer set.
     /// The client sends the preface only after the server process has been
     /// authenticated from the connected handle.

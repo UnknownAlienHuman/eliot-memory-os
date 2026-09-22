@@ -193,11 +193,17 @@ pub use user_automation_execution::{
     UserAutomationWakeCancellationTarget, UserAutomationWakePort,
 };
 pub use user_automation_execution_client::{
-    USER_AUTOMATION_HOST_EXECUTION_WIRE_ID, USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION,
+    USER_AUTOMATION_HOST_EXECUTION_PIPE, USER_AUTOMATION_HOST_EXECUTION_WIRE_ID,
+    USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION,
     UserAutomationHostChannelBinding, UserAutomationHostExecutionClient,
-    UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest,
-    UserAutomationHostExecutionResponse, UserAutomationHostExecutionTransport,
+    UserAutomationHostExecutionFailure, UserAutomationHostExecutionOperation,
+    UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
+    UserAutomationHostExecutionTransport, decode_user_automation_host_execution_request_frame,
+    decode_user_automation_host_execution_response_frame,
+    user_automation_host_execution_request_frame, user_automation_host_execution_response_frame,
 };
+#[cfg(windows)]
+pub use user_automation_execution_client::AuthenticatedUserAutomationHostExecutionTransport;
 pub use user_automation_failure_history::{
     StoreUserAutomationFailureHistory, build_failure_transition,
 };

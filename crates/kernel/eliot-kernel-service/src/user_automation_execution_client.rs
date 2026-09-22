@@ -6,9 +6,16 @@
 //! scheduler identity, Durable Job identity, or Host journal record.
 
 use std::collections::BTreeSet;
+#[cfg(windows)]
+use std::time::Duration;
 
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{RequestId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::user_automation::AutomationExecutionReference;
+#[cfg(windows)]
+use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
+use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
+    ProtocolVersion, RequestIdentity};
+use eliot_receipts::RequestBinding;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +28,13 @@ use super::{
 pub const USER_AUTOMATION_HOST_EXECUTION_WIRE_ID: &str = "eliot.user_automation.host_execution";
 /// Current semantic revision of the typed UserAutomation Host execution wire.
 pub const USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION: u16 = 1;
+/// Existing authenticated Host runtime-control pipe carrying this typed route.
+pub const USER_AUTOMATION_HOST_EXECUTION_PIPE: &str =
+    r"\\.\pipe\eliot\host\runtime-control-v1";
+const USER_AUTOMATION_HOST_EXECUTION_TRACE_KEY: &str =
+    "eliot.user_automation.host-execution-discriminator";
+const USER_AUTOMATION_HOST_EXECUTION_TRACE_VALUE: &str =
+    "eliot-user-automation::host-execution:v1";
 
 /// Evidence binding supplied by the already authenticated Kernel-to-Host
 /// channel.
@@ -53,6 +67,64 @@ impl UserAutomationHostChannelBinding {
         self.state_fence
             .validate()
             .map_err(|error| rejected(format!("channel state fence: {error}")))
+    }
+}
+
+/// Closed failure projection returned by the Host endpoint when an owner
+/// cannot complete the typed operation. A transport failure remains outside
+/// this enum and is classified as an unknown outcome by the client.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum UserAutomationHostExecutionFailure {
+    /// The Host owner is not currently available.
+    Unavailable {
+        /// Closed reason supplied by the Host owner.
+        reason: String,
+    },
+    /// The owner may have committed and the result must be reconciled.
+    UnknownOutcome {
+        /// Closed reason supplied by the Host owner.
+        reason: String,
+    },
+    /// The typed request was rejected before an owner effect.
+    Rejected {
+        /// Closed reason supplied by the Host owner.
+        reason: String,
+    },
+    /// The response was bound to another request or fence.
+    IdentityConflict,
+}
+
+impl UserAutomationHostExecutionFailure {
+    fn from_runtime_error(error: UserAutomationRuntimeError) -> Self {
+        match error {
+            UserAutomationRuntimeError::Unavailable(reason) => Self::Unavailable { reason },
+            UserAutomationRuntimeError::UnknownOutcome(reason) => {
+                Self::UnknownOutcome { reason }
+            }
+            UserAutomationRuntimeError::Rejected(reason) => Self::Rejected { reason },
+            UserAutomationRuntimeError::IdentityConflict => Self::IdentityConflict,
+        }
+    }
+
+    fn into_runtime_error(self) -> UserAutomationRuntimeError {
+        match self {
+            Self::Unavailable { reason } => UserAutomationRuntimeError::Unavailable(reason),
+            Self::UnknownOutcome { reason } => {
+                UserAutomationRuntimeError::UnknownOutcome(reason)
+            }
+            Self::Rejected { reason } => UserAutomationRuntimeError::Rejected(reason),
+            Self::IdentityConflict => UserAutomationRuntimeError::IdentityConflict,
+        }
+    }
+
+    fn validate(&self) -> Result<(), UserAutomationRuntimeError> {
+        match self {
+            Self::Unavailable { reason }
+            | Self::UnknownOutcome { reason }
+            | Self::Rejected { reason } => validate_text(reason, "failure.reason"),
+            Self::IdentityConflict => Ok(()),
+        }
     }
 }
 
@@ -221,9 +293,31 @@ pub enum UserAutomationHostExecutionResponse {
         /// Exact wake identities whose cancellation was committed or replayed.
         wake_ids: Vec<String>,
     },
+    /// Closed Host-owner failure projection.
+    Failed {
+        /// Digest of the exact request carrier answered.
+        request_sha256: String,
+        /// Fence observed while producing the failure projection.
+        state_fence: StateFence,
+        /// Typed failure class; no success is inferred from an error response.
+        failure: UserAutomationHostExecutionFailure,
+    },
 }
 
 impl UserAutomationHostExecutionResponse {
+    /// Builds a failure response bound to the exact request carrier.
+    #[must_use]
+    pub fn failed_for(
+        request: &UserAutomationHostExecutionRequest,
+        error: UserAutomationRuntimeError,
+    ) -> Self {
+        Self::Failed {
+            request_sha256: request.request_sha256.clone(),
+            state_fence: request.channel.state_fence.clone(),
+            failure: UserAutomationHostExecutionFailure::from_runtime_error(error),
+        }
+    }
+
     /// Validates one response against its exact carrier and operation.
     pub fn validate_for(
         &self,
@@ -241,6 +335,14 @@ impl UserAutomationHostExecutionResponse {
                 state_fence,
                 ..
             } => (request_sha256, state_fence),
+            Self::Failed {
+                request_sha256,
+                state_fence,
+                failure,
+            } => {
+                failure.validate()?;
+                (request_sha256, state_fence)
+            }
         };
         if request_sha256 != &request.request_sha256 || state_fence != request.state_fence() {
             return Err(UserAutomationRuntimeError::IdentityConflict);
@@ -269,6 +371,7 @@ impl UserAutomationHostExecutionResponse {
                 UserAutomationHostExecutionOperation::CancelPendingWakes { .. },
                 Self::Cancelled { wake_ids, .. },
             ) => validate_unique_text(wake_ids),
+            (_, Self::Failed { .. }) => Ok(()),
             (
                 UserAutomationHostExecutionOperation::AdmitOccurrence { .. },
                 Self::Cancelled { .. },
@@ -279,6 +382,190 @@ impl UserAutomationHostExecutionResponse {
             ) => Err(UserAutomationRuntimeError::IdentityConflict),
         }
     }
+}
+
+/// Returns the metadata that binds the protocol frame to the typed carrier.
+fn request_context(request: &UserAutomationHostExecutionRequest) -> &RequestMetadata {
+    match &request.operation {
+        UserAutomationHostExecutionOperation::AdmitOccurrence { request } => &request.context,
+        UserAutomationHostExecutionOperation::CancelPendingWakes { request } => &request.context,
+    }
+}
+
+fn frame_identity(
+    request: &UserAutomationHostExecutionRequest,
+) -> Result<(RequestId, RequestIdentity), UserAutomationRuntimeError> {
+    let request_id = RequestId::new(request.request_sha256.clone())
+        .map_err(|_| rejected("UserAutomation frame request identity is invalid"))?;
+    let mut metadata = request_context(request).clone();
+    metadata.request_id = request_id.clone();
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence: request.channel.state_fence.clone(),
+        },
+        idempotency_key: request.request_sha256.clone(),
+        deadline_unix_ms: u64::MAX,
+        cancellation_id: request.request_sha256.clone(),
+    };
+    identity
+        .validate()
+        .map_err(|_| rejected("UserAutomation frame identity is invalid"))?;
+    Ok((request_id, identity))
+}
+
+fn frame_trace_context() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([(
+        USER_AUTOMATION_HOST_EXECUTION_TRACE_KEY.to_owned(),
+        USER_AUTOMATION_HOST_EXECUTION_TRACE_VALUE.to_owned(),
+    )])
+}
+
+fn validate_frame_trace_context(frame: &Frame) -> Result<(), UserAutomationRuntimeError> {
+    if frame.trace_context.len() != 1
+        || frame
+            .trace_context
+            .get(USER_AUTOMATION_HOST_EXECUTION_TRACE_KEY)
+            .map(String::as_str)
+            != Some(USER_AUTOMATION_HOST_EXECUTION_TRACE_VALUE)
+    {
+        return Err(rejected("UserAutomation frame trace discriminator is invalid"));
+    }
+    Ok(())
+}
+
+/// Serializes one typed UserAutomation request into an authenticated EBP
+/// frame. The frame identity is derived from the carrier digest and the
+/// carrier's existing metadata/fence; no authority is minted here.
+pub fn user_automation_host_execution_request_frame(
+    request: &UserAutomationHostExecutionRequest,
+) -> Result<Frame, UserAutomationRuntimeError> {
+    request.validate()?;
+    let (request_id, request_identity) = frame_identity(request)?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: request.channel.connection_id.clone(),
+        request_id: Some(request_id),
+        kind: FrameKind::Request,
+        message_type: MessageType::Execute,
+        request_identity: Some(request_identity),
+        payload: ProtocolPayload::Json(
+            serde_json::to_value(request)
+                .map_err(|_| rejected("UserAutomation request encoding failed"))?,
+        ),
+        trace_context: frame_trace_context(),
+    };
+    frame
+        .validate()
+        .map_err(|_| rejected("UserAutomation request frame is invalid"))?;
+    Ok(frame)
+}
+
+/// Decodes and validates one typed UserAutomation request frame.
+pub fn decode_user_automation_host_execution_request_frame(
+    frame: &Frame,
+) -> Result<UserAutomationHostExecutionRequest, UserAutomationRuntimeError> {
+    frame
+        .validate()
+        .map_err(|_| rejected("UserAutomation request frame is invalid"))?;
+    validate_frame_trace_context(frame)?;
+    if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+        return Err(rejected("UserAutomation request frame kind is invalid"));
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err(rejected("UserAutomation request frame payload is invalid"));
+    };
+    let request: UserAutomationHostExecutionRequest = serde_json::from_value(payload.clone())
+        .map_err(|_| rejected("UserAutomation request payload is undecodable"))?;
+    request.validate()?;
+    if frame.connection_id != request.channel.connection_id {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    let frame_request_id = frame
+        .request_id
+        .as_ref()
+        .ok_or_else(|| rejected("UserAutomation request frame has no request id"))?;
+    let identity = frame
+        .request_identity
+        .as_ref()
+        .ok_or_else(|| rejected("UserAutomation request frame has no identity"))?;
+    if frame_request_id.as_str() != request.request_sha256
+        || identity.request.metadata.request_id != *frame_request_id
+        || identity.request.state_fence != request.channel.state_fence
+        || identity.idempotency_key != request.request_sha256
+        || identity.cancellation_id != request.request_sha256
+    {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    Ok(request)
+}
+
+/// Serializes one response against the exact request it answers.
+pub fn user_automation_host_execution_response_frame(
+    request: &UserAutomationHostExecutionRequest,
+    response: &UserAutomationHostExecutionResponse,
+) -> Result<Frame, UserAutomationRuntimeError> {
+    response.validate_for(request)?;
+    let (request_id, request_identity) = frame_identity(request)?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: request.channel.connection_id.clone(),
+        request_id: Some(request_id),
+        kind: FrameKind::Response,
+        message_type: MessageType::Result,
+        request_identity: Some(request_identity),
+        payload: ProtocolPayload::Json(
+            serde_json::to_value(response)
+                .map_err(|_| rejected("UserAutomation response encoding failed"))?,
+        ),
+        trace_context: frame_trace_context(),
+    };
+    frame
+        .validate()
+        .map_err(|_| rejected("UserAutomation response frame is invalid"))?;
+    Ok(frame)
+}
+
+/// Decodes one response and binds it to the exact request carrier.
+pub fn decode_user_automation_host_execution_response_frame(
+    frame: &Frame,
+    request: &UserAutomationHostExecutionRequest,
+) -> Result<UserAutomationHostExecutionResponse, UserAutomationRuntimeError> {
+    frame
+        .validate()
+        .map_err(|_| rejected("UserAutomation response frame is invalid"))?;
+    validate_frame_trace_context(frame)?;
+    if frame.kind != FrameKind::Response || frame.message_type != MessageType::Result {
+        return Err(rejected("UserAutomation response frame kind is invalid"));
+    }
+    if frame.connection_id != request.channel.connection_id {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err(rejected("UserAutomation response frame payload is invalid"));
+    };
+    let response: UserAutomationHostExecutionResponse = serde_json::from_value(payload.clone())
+        .map_err(|_| rejected("UserAutomation response payload is undecodable"))?;
+    response.validate_for(request)?;
+    let frame_request_id = frame
+        .request_id
+        .as_ref()
+        .ok_or_else(|| rejected("UserAutomation response frame has no request id"))?;
+    let identity = frame
+        .request_identity
+        .as_ref()
+        .ok_or_else(|| rejected("UserAutomation response frame has no identity"))?;
+    if frame_request_id.as_str() != request.request_sha256
+        || identity.request.metadata.request_id != *frame_request_id
+        || identity.request.state_fence != request.channel.state_fence
+        || identity.idempotency_key != request.request_sha256
+        || identity.cancellation_id != request.request_sha256
+    {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    Ok(response)
 }
 
 /// Authenticated typed transport used by the Kernel execution client.
@@ -297,6 +584,78 @@ pub trait UserAutomationHostExecutionTransport: Send + Sync {
         &self,
         request: UserAutomationHostExecutionRequest,
     ) -> Result<UserAutomationHostExecutionResponse, UserAutomationRuntimeError>;
+}
+
+/// Concrete Windows transport for the authenticated Kernel-to-Host execution
+/// route. The named pipe remains the only transport owner; the mutex only
+/// serializes request/response frames on one connection.
+#[cfg(windows)]
+pub struct AuthenticatedUserAutomationHostExecutionTransport {
+    channel: UserAutomationHostChannelBinding,
+    transport: tokio::sync::Mutex<NamedPipeTransport>,
+    limits: TransportLimits,
+}
+
+#[cfg(windows)]
+impl AuthenticatedUserAutomationHostExecutionTransport {
+    /// Connects to the Host runtime-control pipe with the existing
+    /// handle-bound builtin-administrator authentication policy.
+    pub async fn connect(
+        channel: UserAutomationHostChannelBinding,
+        timeout: Duration,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        channel.validate()?;
+        let transport = eliot_ipc::NamedPipeTransport::connect_authenticated_builtin_administrators(
+            USER_AUTOMATION_HOST_EXECUTION_PIPE,
+            timeout,
+        )
+        .await
+        .map_err(|error| UserAutomationRuntimeError::Unavailable(error.to_string()))?;
+        Ok(Self {
+            channel,
+            transport: tokio::sync::Mutex::new(transport),
+            limits: TransportLimits::default(),
+        })
+    }
+
+    /// Returns the transport-level bounds used for every frame.
+    #[must_use]
+    pub const fn limits(&self) -> TransportLimits {
+        self.limits
+    }
+}
+
+#[cfg(windows)]
+#[allow(async_fn_in_trait)]
+impl UserAutomationHostExecutionTransport for AuthenticatedUserAutomationHostExecutionTransport {
+    fn channel_binding(&self) -> &UserAutomationHostChannelBinding {
+        &self.channel
+    }
+
+    async fn execute(
+        &self,
+        request: UserAutomationHostExecutionRequest,
+    ) -> Result<UserAutomationHostExecutionResponse, UserAutomationRuntimeError> {
+        if request.channel != self.channel {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let frame = user_automation_host_execution_request_frame(&request)?;
+        let mut transport = self.transport.lock().await;
+        let outcome = transport
+            .send_frame(&frame, self.limits)
+            .await
+            .map_err(|error| UserAutomationRuntimeError::UnknownOutcome(error.to_string()))?;
+        if outcome != DeliveryOutcome::Delivered {
+            return Err(UserAutomationRuntimeError::UnknownOutcome(
+                "UserAutomation request delivery crossed an unknown boundary".to_owned(),
+            ));
+        }
+        let response_frame = transport
+            .receive_frame(self.limits)
+            .await
+            .map_err(|error| UserAutomationRuntimeError::UnknownOutcome(error.to_string()))?;
+        decode_user_automation_host_execution_response_frame(&response_frame, &request)
+    }
 }
 
 /// Kernel-side client implementing both UserAutomation runtime owner ports.
@@ -326,7 +685,12 @@ where
     ) -> Result<UserAutomationHostExecutionResponse, UserAutomationRuntimeError> {
         let response = self.transport.execute(request.clone()).await?;
         response.validate_for(&request)?;
-        Ok(response)
+        match response {
+            UserAutomationHostExecutionResponse::Failed { failure, .. } => {
+                Err(failure.into_runtime_error())
+            }
+            response => Ok(response),
+        }
     }
 }
 
@@ -346,6 +710,9 @@ where
             UserAutomationHostExecutionResponse::Admitted { execution, .. } => Ok(execution),
             UserAutomationHostExecutionResponse::Cancelled { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
+            }
+            UserAutomationHostExecutionResponse::Failed { failure, .. } => {
+                Err(failure.into_runtime_error())
             }
         }
     }
@@ -367,6 +734,9 @@ where
             UserAutomationHostExecutionResponse::Cancelled { wake_ids, .. } => Ok(wake_ids),
             UserAutomationHostExecutionResponse::Admitted { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
+            }
+            UserAutomationHostExecutionResponse::Failed { failure, .. } => {
+                Err(failure.into_runtime_error())
             }
         }
     }

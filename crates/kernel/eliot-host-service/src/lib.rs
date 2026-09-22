@@ -44,6 +44,13 @@ pub use user_automation_durable_job::{
 };
 pub use user_automation_execution::UserAutomationHostExecutionEndpoint;
 pub use user_automation_wake::HostWakeIntentAdapter;
+pub use eliot_kernel_service::{
+    USER_AUTOMATION_HOST_EXECUTION_PIPE, UserAutomationHostExecutionFailure,
+    UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
+    UserAutomationDurableJobPort, UserAutomationRuntimeError, UserAutomationWakePort,
+    decode_user_automation_host_execution_request_frame,
+    user_automation_host_execution_response_frame,
+};
 
 use eliot_contracts::{
     ContractIdentity, ContractVersion, contract_identity as make_contract_identity,

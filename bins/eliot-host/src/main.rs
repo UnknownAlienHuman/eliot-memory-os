@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use eliot_host::{
     HostBranchDisposition, HostLivenessTick, HostReactiveContextProducer,
     HostRuntimeControlOperation, HostRuntimeControlResponse,
+    HostUserAutomationExecutionQueue, reject_unbound_user_automation_execution,
 };
 use eliot_host::{
     HostComposition, HostError, HostLaunchOptions, HostPhaseBRequestQueue, PROTOCOL_VERSION,
@@ -842,6 +843,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
         }
     };
     let runtime_queue = runtime_control.queue();
+    let user_automation_queue = runtime_control.user_automation_queue();
     let runtime_thread = match spawn_runtime_control(runtime_control) {
         Ok(thread) => thread,
         Err(error) => {
@@ -865,6 +867,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
     let _ = report_service_status(&handle, &report);
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
         process_phase_b_requests(&mut host, &phase_b_queue);
+        process_user_automation_requests(&user_automation_queue);
         process_runtime_control_requests(&mut host, &runtime_queue);
         match host.has_durable_branch_fence() {
             Ok(true) => {
@@ -1055,6 +1058,16 @@ fn process_runtime_control_requests(
         };
         let _ = envelope.respond(response);
     }
+}
+
+#[cfg(windows)]
+fn process_user_automation_requests(queue: &HostUserAutomationExecutionQueue) {
+    // HostComposition currently has no KernelStoreGateway owner to bind into
+    // UserAutomationHostExecutionEndpoint<D, W>. Drain with an explicit
+    // correlated Unavailable response until root composes that real owner;
+    // silently leaving requests pending would turn owner absence into an
+    // unbounded transport timeout.
+    let _ = reject_unbound_user_automation_execution(queue);
 }
 
 #[cfg(windows)]

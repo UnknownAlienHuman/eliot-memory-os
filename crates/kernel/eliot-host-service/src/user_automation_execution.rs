@@ -72,6 +72,18 @@ where
         }
     }
 
+    /// Handles one carrier while preserving owner failures as a correlated
+    /// typed response for the authenticated transport.
+    pub async fn execute_response(
+        &self,
+        request: UserAutomationHostExecutionRequest,
+    ) -> UserAutomationHostExecutionResponse {
+        match self.execute(request.clone()).await {
+            Ok(response) => response,
+            Err(error) => UserAutomationHostExecutionResponse::failed_for(&request, error),
+        }
+    }
+
     /// Returns the exact channel binding accepted by this endpoint.
     #[must_use]
     pub const fn channel(&self) -> &UserAutomationHostChannelBinding {
