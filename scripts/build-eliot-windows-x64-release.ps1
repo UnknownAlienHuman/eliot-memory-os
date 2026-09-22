@@ -312,6 +312,10 @@ function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]
     if (-not $candidateRelative.StartsWith('.eliot/dependency-policy/surrealdb/', [System.StringComparison]::Ordinal)) {
         throw "project-local SurrealDB artifact is outside the evidence root: $candidateRelative"
     }
+    $expectedCandidateAsset = "https://github.com/surrealdb/surrealdb/releases/download/$([string]$candidate.source_tag)/surreal-$([string]$candidate.source_tag).windows-amd64.exe"
+    if ([string]$candidate.release_asset -cne $expectedCandidateAsset) {
+        throw 'project-local SurrealDB candidate release asset is not the derived official subject'
+    }
     $receiptRelative = '.eliot/dependency-policy/surrealdb/provisioning-receipt.json'
     $candidatePath = [System.IO.Path]::GetFullPath((Join-Path $Repo $candidateRelative.Replace('/', '\')))
     $receiptPath = [System.IO.Path]::GetFullPath((Join-Path $Repo $receiptRelative.Replace('/', '\')))
@@ -331,23 +335,29 @@ function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]
     if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
         throw "project-local SurrealDB provisioning receipt is missing: $receiptPath"
     }
+    $receiptFile = Assert-PinnedExternalPath $receiptPath 'project-local SurrealDB provisioning receipt'
     try {
-        $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+        $receipt = Get-Content -LiteralPath $receiptFile.FullName -Raw | ConvertFrom-Json
     }
     catch {
         throw "project-local SurrealDB provisioning receipt is not valid JSON: $receiptPath"
     }
-    if ([string]$receipt.schema -cne 'eliot.surrealdb-project-local-provisioning.v1' -or
+    if ([string]$receipt.schema -cne 'eliot.surrealdb-project-local-provisioning.v2' -or
         [bool]$receipt.shared_installation_touched) {
         throw 'project-local SurrealDB provisioning receipt is missing the no-shared-installation boundary'
     }
-    $records = @($receipt.records | Where-Object { [string]$_.url -ceq [string]$candidate.release_asset })
+    $candidateSubject = "surrealdb.release-asset.$([string]$candidate.source_tag)"
+    $records = @($receipt.records | Where-Object { [string]$_.subject -ceq $candidateSubject })
     if ($records.Count -ne 1) {
         throw 'project-local SurrealDB provisioning receipt does not contain exactly one pinned Windows artifact record'
     }
     $record = $records[0]
-    $recordPath = [System.IO.Path]::GetFullPath([string]$record.path)
-    if (-not $candidatePath.Equals($recordPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+    $recordRelative = Assert-SafeRelativePath ([string]$record.relative_path) 'provisioning receipt artifact'
+    $recordPath = [System.IO.Path]::GetFullPath((Join-Path $Repo $recordRelative.Replace('/', '\')))
+    if ($recordRelative -cne $candidateRelative -or
+        [string]$record.path -cne $recordRelative -or
+        -not $candidatePath.Equals($recordPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]$record.url -cne [string]$candidate.release_asset -or
         [string]$record.sha256 -cne ([string]$candidate.sha256).ToLowerInvariant() -or
         [int64]$record.bytes -ne [int64]$candidate.artifact_size) {
         throw 'project-local SurrealDB provisioning receipt does not bind the locked artifact path, size, and digest'
@@ -375,7 +385,7 @@ function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]
         project_local_input_path = $candidateRelative
         provisioner = 'scripts/provision-surrealdb-release.py'
         provisioning_receipt_input_path = $receiptRelative
-        provisioning_receipt_sha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        provisioning_receipt_sha256 = (Get-FileHash -LiteralPath $receiptFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         version = [string]$candidate.version
         architecture = [string]$candidate.architecture
         catalog_path = $Catalog.relative_path
@@ -558,17 +568,16 @@ function Copy-OperatorPayload([string]$Source, [string]$Destination) {
 
 function Resolve-PinnedFileTarget([string]$Path, [string]$Purpose) {
     # Rustup shims (cargo/rustc) are symbolic links to rustup.exe and some
-    # vendor installs (Git) expose hardlinks. A hardlink with no outstanding
-    # target is a direct resident directory entry, not a redirection, so it
-    # is accepted; symbolic links are followed to their final resident file
+    # vendor installs (Git) expose hardlinks. A hardlink is a direct resident
+    # file identity, so its provider-reported Target metadata is never
+    # traversed; symbolic links are followed to their final resident file
     # (depth-capped) and every hop is recorded. Reparse points, junctions,
     # and ambiguous targets remain forbidden.
     $candidate = Get-Item -LiteralPath $Path -ErrorAction Stop
     $chain = @([string]$candidate.FullName)
     $depth = 0
     while (-not [string]::IsNullOrWhiteSpace([string]$candidate.LinkType) -and
-        -not ([string]$candidate.LinkType -ceq 'HardLink' -and
-            @($candidate.Target | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count -eq 0)) {
+        [string]$candidate.LinkType -cne 'HardLink') {
         $depth++
         if ($depth -gt 8) {
             throw "$Purpose link chain is too deep: $($chain -join ' -> ')"
@@ -587,7 +596,8 @@ function Resolve-PinnedFileTarget([string]$Path, [string]$Purpose) {
     $pinned = Get-Item -LiteralPath $candidate.FullName -ErrorAction Stop
     if (-not ($pinned -is [System.IO.FileInfo]) -or
         (($pinned.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
-        @($pinned.Target | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count -ne 0 -or
+        ([string]$pinned.LinkType -cne 'HardLink' -and
+            @($pinned.Target | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count -ne 0) -or
         (-not [string]::IsNullOrWhiteSpace([string]$pinned.LinkType) -and [string]$pinned.LinkType -cne 'HardLink')) {
         throw "$Purpose must be a resident regular file: $($pinned.FullName)"
     }
@@ -1552,6 +1562,10 @@ function Test-ReleaseBundle([string]$Path) {
         throw 'bundled SurrealDB artifact catalog content does not bind the shipped artifact'
     }
     if ([string]$surrealEntry.source -ceq 'project-local-provisioner') {
+        $expectedCandidateAsset = "https://github.com/surrealdb/surrealdb/releases/download/$([string]$catalogBinding.source_tag)/surreal-$([string]$catalogBinding.source_tag).windows-amd64.exe"
+        if ([string]$catalogBinding.release_asset -cne $expectedCandidateAsset) {
+            throw 'staged SurrealDB candidate release asset is not the derived official subject'
+        }
         if ([string]$surrealEntry.project_local_input_path -notlike '.eliot/dependency-policy/surrealdb/*' -or
             [string]$surrealEntry.provisioner -cne 'scripts/provision-surrealdb-release.py' -or
             [string]$surrealEntry.provisioning_receipt_input_path -cne '.eliot/dependency-policy/surrealdb/provisioning-receipt.json' -or
@@ -1564,11 +1578,14 @@ function Test-ReleaseBundle([string]$Path) {
             throw 'project-local SurrealDB provisioning receipt is missing or changed in the staged bundle'
         }
         $stagedReceipt = Get-Content -LiteralPath $stagedReceiptPath -Raw | ConvertFrom-Json
-        if ([string]$stagedReceipt.schema -cne 'eliot.surrealdb-project-local-provisioning.v1' -or
+        if ([string]$stagedReceipt.schema -cne 'eliot.surrealdb-project-local-provisioning.v2' -or
             [bool]$stagedReceipt.shared_installation_touched) {
             throw 'staged SurrealDB provisioning receipt does not preserve the no-shared-installation boundary'
         }
         $candidateRecord = @($stagedReceipt.records | Where-Object {
+                [string]$_.subject -ceq "surrealdb.release-asset.$([string]$catalogBinding.source_tag)" -and
+                [string]$_.relative_path -ceq [string]$surrealEntry.project_local_input_path -and
+                [string]$_.path -ceq [string]$_.relative_path -and
                 [string]$_.url -ceq [string]$catalogBinding.release_asset -and
                 [string]$_.sha256 -ceq [string]$surrealEntry.sha256 -and
                 [int64]$_.bytes -eq [int64]$surrealEntry.bytes
