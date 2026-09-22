@@ -3041,10 +3041,13 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-governor",
+ "eliot-ipc",
  "eliot-observation-contracts",
  "eliot-platform",
+ "eliot-platform-windows",
  "eliot-process",
  "eliot-process-executor",
+ "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime",
  "eliot-runtime-contracts",
@@ -3053,6 +3056,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "wasmtime",
  "wat",
 ]

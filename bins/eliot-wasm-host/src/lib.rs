@@ -47,9 +47,11 @@ pub use contour::{
     authorize_host_call, check_activation_imports, check_admitted_request,
 };
 pub use grant_client::{
-    AcceptedGrant, GrantClientBundle, GrantClientError, accept_grant, build_grant_bundle,
-    request_grant,
+    AcceptedGrant, GrantChannel, GrantClientBundle, GrantClientError, accept_grant,
+    build_grant_bundle, request_grant,
 };
+#[cfg(windows)]
+pub use grant_client::{GRANT_ISSUE_OPERATION, request_grant_via_transport};
 pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
     GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,
