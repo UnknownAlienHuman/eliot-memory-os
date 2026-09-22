@@ -31,6 +31,7 @@
 //! keep serving the exact revision each operation committed under.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use eliot_authority::{
@@ -134,6 +135,36 @@ impl GovernorClosureSource {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = admitted;
         Ok(())
+    }
+
+    /// Returns the exact durable graph revision this adapter serves.
+    ///
+    /// The daemon/service bootstrap binds the port at this revision and
+    /// refuses any expected revision that disagrees: the port never serves a
+    /// closure from an unbound revision.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.lock_state().graph.revision()
+    }
+
+    /// Returns the distinct lineage roots admitted in the current restore, in
+    /// sorted order.
+    ///
+    /// Roots are collected from the admitted member and root intents the
+    /// Governor service resolved; the graph itself is never re-derived here.
+    /// The bootstrap advances the durable per-root revision watermark for
+    /// exactly these roots.
+    #[must_use]
+    pub fn authority_roots(&self) -> Vec<String> {
+        let state = self.lock_state();
+        let mut roots = BTreeSet::new();
+        for member in state.members.values() {
+            roots.insert(member.intent.authority_root_ref.clone());
+        }
+        for root in state.roots.values() {
+            roots.insert(root.intent.authority_root_ref.clone());
+        }
+        roots.into_iter().collect()
     }
 
     fn admit(restore: GovernorClosureRestore) -> Result<AdmittedClosureState, KernelError> {

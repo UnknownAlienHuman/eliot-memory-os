@@ -2033,6 +2033,55 @@ impl CapabilityGrantProjection {
     }
 }
 
+/// Read-only ORS evidence for one capability-introduction row (issue #1110).
+///
+/// Introductions never reactivate: only an `Active` row carries usable
+/// authority and only a `Fenced` row carries fence evidence. Any other phase
+/// under this kind is an integrity problem, never a third lifecycle state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityIntroductionProjection {
+    record: OperationalRecordInput,
+    phase: OperationalPhase,
+    operation_order: u64,
+    receipt: OperationalMutationReceipt,
+}
+
+impl CapabilityIntroductionProjection {
+    pub(crate) fn from_store(
+        record: OperationalRecordInput,
+        phase: OperationalPhase,
+        operation_order: u64,
+        receipt: OperationalMutationReceipt,
+    ) -> Self {
+        Self {
+            record,
+            phase,
+            operation_order,
+            receipt,
+        }
+    }
+
+    /// Returns the exact opaque operational input read from ORS.
+    pub const fn record(&self) -> &OperationalRecordInput {
+        &self.record
+    }
+
+    /// Returns the non-semantic ORS lifecycle phase.
+    pub const fn phase(&self) -> OperationalPhase {
+        self.phase
+    }
+
+    /// Returns the monotonic ORS order of this row.
+    pub const fn operation_order(&self) -> u64 {
+        self.operation_order
+    }
+
+    /// Returns the store-issued integrity receipt for this row.
+    pub const fn receipt(&self) -> &OperationalMutationReceipt {
+        &self.receipt
+    }
+}
+
 /// Committed lifecycle state of one durable grant-closure row.
 ///
 /// A closure activates its members (`Active`) or fences them (`Revoked` is
