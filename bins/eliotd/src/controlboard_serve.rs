@@ -18,42 +18,57 @@
 //! → NotifyCore deliver → kernel persist (fenced, idempotent)
 //! → daemon startup GetNotificationState read (notification_board_attach)
 //! → DaemonComposition.notification_snapshot
-//! → local-read poll claims envelope (observed session/connection/request
-//!   fields, Kernel admission receipts, transport fence)
+//! → local-read poll claims envelope + kernel-minted attempt (observed
+//!   session/connection/request fields, fencing generation, admission
+//!   receipts, transport fence)
 //! → DaemonComposition::serve_board_for_envelope (this module's server)
-//! → diagnostics evidence per served request
+//! → served inbox ROWS as canonical response bytes (prove path) +
+//!   counts as observation evidence in diagnostics
 //! ```
 //!
 //! Serve rules:
 //!
 //! - every request field is observed: the session id is the envelope's
-//!   session claim verified equal to the held Kernel-issued owner session
+//!   session claim verified equal to BOTH the held Kernel-issued owner
+//!   session AND the kernel-minted attempt's admitted session binding
 //!   (never a literal, never a default); connection, credential binding,
-//!   challenge, request id, generation correlation, and the fence pin all
-//!   come from the same envelope. Authority comes only from the admitted
-//!   owner facts pinned to the live snapshot fence/revision by the access
-//!   resolver; the envelope fields are per-request correlation the seal
+//!   challenge, and request id come from the same envelope; generation is
+//!   the attempt's kernel-minted fencing generation — the admitted
+//!   envelope deadline is expiry only and never serves as generation.
+//!   Authority comes only from the admitted owner facts pinned to the
+//!   live snapshot fence/revision by the access resolver; the
+//!   envelope/attempt fields are per-request correlation the seal
 //!   re-checks, so no two requests share a binding.
-//! - an envelope with no session claim, or a claim for another principal,
-//!   is explicitly skipped ([`BoardServeDispatch::SkippedForeignSession`]):
-//!   not our principal to serve, pair handling continues untouched. This is
-//!   the privacy posture, not a gap.
+//! - an envelope with no session claim, or a claim (or attempt binding)
+//!   for another principal, is explicitly skipped
+//!   ([`BoardServeDispatch::SkippedForeignSession`]): not our principal
+//!   to serve, pair handling continues untouched. This is the privacy
+//!   posture, not a gap.
 //! - no owner session → typed [`ControlBoardError::PlanGap`], never an
 //!   empty fabrication. Malformed held facts stay fail-closed through the
 //!   admission error, exactly like [`DaemonComposition::controlboard`].
 //! - foreign-fence noted records fail closed through the existing
 //!   `CanonicalState::validate` at view time; a drifted envelope fence
-//!   fails closed as `StaleView` through the request pin.
+//!   fails closed as `StaleView`/`Unauthorized` through the request pin.
 //! - pure in-memory reads over one immutable board snapshot: no I/O, no new
 //!   thread, no new handshake, no stored client, no new scheduler — the
 //!   existing local-read poller is the only driver.
+//!
+//! Observation labeling: per-request diagnostics carry inbox COUNTS as
+//! observation evidence (`eliotd.controlboard_inbox_observed`), never as
+//! server completion. The served ROWS are produced as canonical response
+//! bytes ([`serve_board_response_bytes`]) and proven byte-equal against
+//! the canonical kernel payload; transmission to a remote board client
+//! stays with the owning consumer route (kernel `controlboard.status`
+//! serving per tracker #1213, notify `ReadInbox` over its stdio route),
+//! never with this observation path.
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_controlboard::{
     ControlBoard, ControlBoardError, NotificationInbox, PortError, ReadRequest, RequiredProvider,
     ViewRevision,
 };
-use eliot_protocol::HostRequestEnvelope;
+use eliot_protocol::{HostRequestEnvelope, LocalReadAttempt};
 
 use super::DaemonError;
 use super::controlboard_adapters::AdmittedSessionAccess;
@@ -97,21 +112,25 @@ pub enum BoardServeDispatch {
     SkippedForeignSession,
 }
 
-/// Builds the serve read request for one observed envelope.
+/// Builds the serve read request for one observed envelope and its
+/// kernel-minted attempt.
 ///
-/// Every field is the envelope's own: `session_id` is the caller-verified
-/// live owner session (verified by [`serve_board_for_envelope`], never a
-/// literal); `connection_id` is the Kernel-created transport identity;
+/// Every field is observed: `session_id` is the caller-verified live owner
+/// session (verified by [`serve_board_for_envelope`], never a literal);
+/// `connection_id` is the Kernel-created transport identity;
 /// `credential_binding` is the Kernel-produced transport admission receipt
 /// digest; `challenge` is the exact envelope digest (unique per request);
-/// `request_id` is the envelope's exact request identity; `generation`
-/// carries the envelope's Kernel-owned absolute deadline as per-request
-/// correlation echoed by the resolver (not authority — a zero deadline
-/// fails closed here); the expected fence pins the transport-admission
-/// fence so a drifted snapshot fails closed as `StaleView` at view time.
+/// `request_id` is the envelope's exact request identity; `generation` is
+/// the attempt's kernel-minted fencing generation — the admitted envelope
+/// deadline is expiry only (`expires_at_unix_ms`, never authority) and is
+/// not consulted here; a zero fencing generation fails closed as
+/// `InvalidField("generation")`, never defaulted. The expected fence pins
+/// the transport-admission fence so a drifted snapshot fails closed at
+/// view time.
 pub(crate) fn board_request_for_envelope(
     session_id: &str,
     envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
 ) -> Result<ReadRequest, ControlBoardError> {
     let mut request = ReadRequest::new(
         session_id,
@@ -119,7 +138,7 @@ pub(crate) fn board_request_for_envelope(
         envelope.peer_admission_receipt_sha256.clone(),
         envelope.envelope_sha256.clone(),
         envelope.identity.request_id.as_str(),
-        envelope.identity.deadline_unix_ms,
+        attempt.fencing_generation,
     )?;
     request.expected_fence = Some(envelope.state_fence.clone());
     Ok(request)
@@ -168,29 +187,49 @@ pub fn served_inbox_evidence(served: &ServedBoardInbox) -> BoardInboxEvidence {
 ///
 /// Thin composition seam used by
 /// [`DaemonComposition::serve_board_for_envelope`]: admits the live owner
-/// session from the held facts (unadmitted when absent), verifies the
-/// envelope's session claim against it (foreign or absent claim skips
-/// explicitly), builds one board, and serves the fence-pinned inbox from
-/// the envelope's observed fields. Kept as a free function so the
+/// session from the held facts (unadmitted when absent), triple-binds the
+/// envelope session claim against the held owner session AND the
+/// kernel-minted attempt's admitted session binding (foreign or absent
+/// claim, or attempt bound elsewhere, skips explicitly), builds one board,
+/// and serves the fence-pinned inbox from the observed fields with the
+/// attempt's fencing generation. Kept as a free function so the
 /// verify/build/serve sequencing is unit-covered without a full composition
 /// fixture.
 pub(crate) fn serve_board_for_envelope(
     owner_session: Option<&OwnerSessionFacts>,
     build_board: impl FnOnce() -> Result<ControlBoard, DaemonError>,
     envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
 ) -> Result<BoardServeDispatch, ControlboardServeError> {
     let facts = owner_session.ok_or(ControlboardServeError::Board(ControlBoardError::PlanGap(
         RequiredProvider::AccessResolver,
     )))?;
     let binding = AdmittedSessionAccess::from_kernel_owner_facts(facts)
         .map_err(ControlboardServeError::Admission)?;
-    if envelope.identity.session_id.as_deref() != Some(binding.session_id()) {
+    if envelope.identity.session_id.as_deref() != Some(binding.session_id())
+        || attempt.session_id != binding.session_id()
+    {
         return Ok(BoardServeDispatch::SkippedForeignSession);
     }
-    let request = board_request_for_envelope(binding.session_id(), envelope)
+    let request = board_request_for_envelope(binding.session_id(), envelope, attempt)
         .map_err(ControlboardServeError::Board)?;
     let mut board = build_board().map_err(ControlboardServeError::Composition)?;
     serve_board_inbox(&mut board, &request).map(BoardServeDispatch::Served)
+}
+
+/// Produces the served inbox rows as canonical response bytes.
+///
+/// The byte form the server answers with: canonical JSON over the served
+/// [`NotificationRow`](eliot_controlboard::NotificationRow) slice, so a
+/// consumer comparing bytes observes exactly the projected rows — never
+/// counts in place of rows. Encoding failure fails closed as a provider
+/// error, never as truncated bytes.
+pub fn serve_board_response_bytes(
+    served: &ServedBoardInbox,
+) -> Result<Vec<u8>, ControlboardServeError> {
+    canonical_json_bytes(&served.inbox.rows).map_err(|error| {
+        ControlboardServeError::Board(ControlBoardError::Provider(error.to_string()))
+    })
 }
 
 #[cfg(test)]
@@ -315,7 +354,10 @@ mod tests {
     }
 
     use eliot_contracts::RequestId;
-    use eliot_protocol::{HostRequestEnvelope, HostRequestIdentity, HostRequestKind};
+    use eliot_protocol::{
+        HostRequestEnvelope, HostRequestIdentity, HostRequestKind, LOCAL_READ_ATTEMPT_WIRE_ID,
+        LocalReadAttempt, host_request_operation_id,
+    };
 
     fn envelope(session: Option<&str>, fence: &StateFence) -> HostRequestEnvelope {
         HostRequestEnvelope {
@@ -344,6 +386,27 @@ mod tests {
         }
     }
 
+    fn attempt_for(
+        envelope: &HostRequestEnvelope,
+        session: &str,
+        generation: u64,
+    ) -> LocalReadAttempt {
+        let operation_id = host_request_operation_id(envelope);
+        LocalReadAttempt {
+            wire_id: LOCAL_READ_ATTEMPT_WIRE_ID.to_owned(),
+            wire_version: LocalReadAttempt::CONTRACT_VERSION,
+            operation_id: operation_id.clone(),
+            attempt_id: format!("{operation_id}:attempt:test-boot:7:{generation}"),
+            fencing_generation: generation,
+            session_id: session.to_owned(),
+            authority_epoch: envelope.state_fence.authority_epoch.clone(),
+            scope_id: session.to_owned(),
+            facet_method: "eliot.query".to_owned(),
+            expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+            use_budget: 1,
+        }
+    }
+
     fn board_with(records: Vec<Notification>) -> ControlBoard {
         controlboard_over_snapshot(
             snapshot(),
@@ -357,14 +420,20 @@ mod tests {
         owner: Option<&OwnerSessionFacts>,
         records: Vec<Notification>,
         envelope: &HostRequestEnvelope,
+        attempt: &LocalReadAttempt,
     ) -> Result<BoardServeDispatch, ControlboardServeError> {
-        serve_board_for_envelope(owner, || Ok(board_with(records)), envelope)
+        serve_board_for_envelope(owner, || Ok(board_with(records)), envelope, attempt)
+    }
+
+    fn owner_attempt(envelope: &HostRequestEnvelope) -> LocalReadAttempt {
+        attempt_for(envelope, "0", 3)
     }
 
     #[test]
     fn serve_dispatch_serves_matching_session_claim_with_observed_fields() {
         use NotificationSeverity::{Critical, Information};
         let fence = fence_at(7);
+        let claimed = envelope(Some("0"), &fence);
         let dispatch = serve(
             Some(&owner_facts("sid=S-1-5-18;session=0")),
             vec![
@@ -372,7 +441,8 @@ mod tests {
                 record("routine-sync", Information, false, false, false, &fence),
                 record("old-news", Critical, false, false, true, &fence),
             ],
-            &envelope(Some("0"), &fence),
+            &claimed,
+            &owner_attempt(&claimed),
         )
         .expect("matching claim serves");
         let served = match dispatch {
@@ -418,6 +488,8 @@ mod tests {
         let fence = fence_at(7);
         // The factory must never run for a skip: a build error here would
         // surface as Err, so Ok(Skipped) proves the short-circuit.
+        let live = envelope(Some("0"), &fence);
+        let attempt = owner_attempt(&live);
         let never_build = || {
             Err(super::super::DaemonError::Lifecycle(
                 "board must not build for a foreign claim".to_owned(),
@@ -428,6 +500,7 @@ mod tests {
                 Some(&owner_facts("sid=S-1-5-18;session=0")),
                 never_build,
                 &envelope(None, &fence),
+                &attempt,
             ),
             Ok(BoardServeDispatch::SkippedForeignSession)
         ));
@@ -441,6 +514,24 @@ mod tests {
                 Some(&owner_facts("sid=S-1-5-18;session=0")),
                 never_build,
                 &envelope(Some("9"), &fence),
+                &attempt,
+            ),
+            Ok(BoardServeDispatch::SkippedForeignSession)
+        ));
+        // Envelope claim matches but the kernel-minted attempt is bound
+        // elsewhere: triple-bind fails closed to skip, never serves.
+        let foreign_attempt = attempt_for(&live, "9", 3);
+        let never_build = || {
+            Err(super::super::DaemonError::Lifecycle(
+                "board must not build on attempt mismatch".to_owned(),
+            ))
+        };
+        assert!(matches!(
+            serve_board_for_envelope(
+                Some(&owner_facts("sid=S-1-5-18;session=0")),
+                never_build,
+                &live,
+                &foreign_attempt,
             ),
             Ok(BoardServeDispatch::SkippedForeignSession)
         ));
@@ -450,6 +541,8 @@ mod tests {
     fn serve_dispatch_fails_closed_on_drift_records_and_admission() {
         use NotificationSeverity::Critical;
         let fence = fence_at(7);
+        let live = envelope(Some("0"), &fence);
+        let attempt = owner_attempt(&live);
         // Drifted envelope fence against the live snapshot: the resolver
         // denies the pin before any read.
         assert!(matches!(
@@ -464,6 +557,7 @@ mod tests {
                     &fence,
                 )],
                 &envelope(Some("0"), &fence_at(6)),
+                &attempt,
             ),
             Err(ControlboardServeError::Board(
                 ControlBoardError::Unauthorized
@@ -482,7 +576,8 @@ mod tests {
                     false,
                     &fence_at(6),
                 )],
-                &envelope(Some("0"), &fence),
+                &live,
+                &attempt,
             ),
             Err(ControlboardServeError::Board(_))
         ));
@@ -491,13 +586,14 @@ mod tests {
             serve(
                 Some(&owner_facts("local-user")),
                 Vec::new(),
-                &envelope(Some("0"), &fence),
+                &live,
+                &attempt,
             ),
             Err(ControlboardServeError::Admission(_))
         ));
         // No held owner session: typed gap, never an empty fabrication.
         assert!(matches!(
-            serve(None, Vec::new(), &envelope(Some("0"), &fence)),
+            serve(None, Vec::new(), &live, &attempt),
             Err(ControlboardServeError::Board(ControlBoardError::PlanGap(
                 RequiredProvider::AccessResolver
             )))
@@ -507,29 +603,98 @@ mod tests {
     #[test]
     fn board_request_uses_only_observed_envelope_fields() {
         let fence = fence_at(7);
-        let request = board_request_for_envelope("0", &envelope(Some("0"), &fence))
-            .expect("observed request builds");
+        let live = envelope(Some("0"), &fence);
+        let request = board_request_for_envelope("0", &live, &owner_attempt(&live))
+            .expect("observed request");
         assert_eq!(request.session_id, "0");
         assert_eq!(request.connection_id, "kernel-conn-7");
         assert_eq!(request.credential_binding, "c".repeat(64));
         assert_eq!(request.challenge, "e".repeat(64));
         assert_eq!(request.request_id, "req-7");
-        assert_eq!(request.generation, 1_700_000_007);
+        // Generation is the kernel-minted attempt fencing generation, not
+        // the envelope deadline.
+        assert_eq!(request.generation, 3);
         assert_eq!(request.expected_fence, Some(fence));
-        // A zero deadline is not a generation: fails closed, never defaulted.
+        // The admitted envelope deadline is expiry only: a zero deadline
+        // still builds with the attempt generation, never as generation.
         let mut timeless = envelope(Some("0"), &fence_at(7));
         timeless.identity.deadline_unix_ms = 0;
+        let timeless_request =
+            board_request_for_envelope("0", &timeless, &owner_attempt(&timeless))
+                .expect("deadline never sources generation");
+        assert_eq!(timeless_request.generation, 3);
+        // A zero fencing generation is not a generation: fails closed.
+        let cold = envelope(Some("0"), &fence_at(7));
+        let mut cold_attempt = owner_attempt(&cold);
+        cold_attempt.fencing_generation = 0;
         assert!(matches!(
-            board_request_for_envelope("0", &timeless),
+            board_request_for_envelope("0", &cold, &cold_attempt),
             Err(ControlBoardError::InvalidField("generation"))
         ));
         // A blank admission receipt is not a credential binding.
         let mut bare = envelope(Some("0"), &fence_at(7));
         bare.peer_admission_receipt_sha256 = String::new();
         assert!(matches!(
-            board_request_for_envelope("0", &bare),
+            board_request_for_envelope("0", &bare, &owner_attempt(&bare)),
             Err(ControlBoardError::InvalidField(_))
         ));
+    }
+
+    #[test]
+    fn serve_traces_kernel_payload_bytes_to_served_row_bytes() {
+        use NotificationSeverity::{Critical, Information};
+        let fence = fence_at(7);
+        let canonical = vec![
+            record("backup-failed", Critical, true, true, false, &fence),
+            record("routine-sync", Information, false, false, false, &fence),
+            record("old-news", Critical, false, false, true, &fence),
+        ];
+        // Kernel-shaped read payload: exact canonical record bytes as the
+        // store catalogue serves them.
+        let payload = serde_json::json!({
+            "records": canonical
+                .iter()
+                .map(|item| serde_json::to_value(item).expect("record encodes"))
+                .collect::<Vec<_>>(),
+        });
+        // Real production decode (fence-checked) feeds the board exactly
+        // like the noted startup snapshot does.
+        let decoded =
+            super::super::notification_board_attach::decode_board_records(&payload, &fence)
+                .expect("payload decodes");
+        assert_eq!(decoded.len(), 3);
+        let live = envelope(Some("0"), &fence);
+        let dispatch = serve_board_for_envelope(
+            Some(&owner_facts("sid=S-1-5-18;session=0")),
+            || Ok(board_with(decoded.clone())),
+            &live,
+            &owner_attempt(&live),
+        )
+        .expect("trace serves");
+        let served = match dispatch {
+            BoardServeDispatch::Served(served) => served,
+            BoardServeDispatch::SkippedForeignSession => panic!("owner claim must serve"),
+        };
+        // Served rows as canonical response bytes, byte-compared against
+        // the projected expectation — rows, never counts.
+        let returned = serve_board_response_bytes(&served).expect("response bytes");
+        let expected =
+            eliot_contracts::canonical_json_bytes(&eliot_controlboard::project(&decoded))
+                .expect("expected bytes");
+        assert_eq!(returned, expected);
+        assert!(!returned.is_empty());
+        let rows: serde_json::Value =
+            serde_json::from_slice(&returned).expect("response bytes decode");
+        let rows = rows.as_array().expect("rows array");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["dedup_key"], "backup-failed");
+        assert_eq!(rows[0]["severity"], "CRITICAL");
+        assert_eq!(rows[0]["acknowledged"], true);
+        assert_eq!(rows[0]["delivery_failed"], true);
+        assert_eq!(rows[0]["failure_reason"], "toast provider failed");
+        assert_eq!(rows[1]["dedup_key"], "routine-sync");
+        assert_eq!(rows[2]["dedup_key"], "old-news");
+        assert_eq!(rows[2]["resolved"], true);
     }
 
     #[test]

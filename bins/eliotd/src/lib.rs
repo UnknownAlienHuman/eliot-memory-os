@@ -728,23 +728,27 @@ impl DaemonComposition {
     /// Serves one live `ControlBoard` inbox for one observed envelope (#1780).
     ///
     /// Per-request serve dispatch over the current Governor projection
-    /// snapshot: verifies the envelope's session claim against the held
-    /// Kernel-issued owner facts (foreign or absent claim skips
-    /// explicitly), builds one board through [`Self::controlboard`], and
-    /// serves the fence-pinned inbox from the envelope's observed fields
-    /// via [`controlboard_serve`]. No owner session → typed
-    /// access-resolver gap; Governor not ready → composition error; view
-    /// refusals → typed board gaps. Pure in-memory reads: no I/O, no new
-    /// thread, no stored client, no new scheduler.
+    /// snapshot: triple-binds the envelope session claim against the held
+    /// Kernel-issued owner facts and the kernel-minted attempt's admitted
+    /// session binding (foreign or absent claim, or attempt bound
+    /// elsewhere, skips explicitly), builds one board through
+    /// [`Self::controlboard`], and serves the fence-pinned inbox from the
+    /// observed fields with the attempt's fencing generation via
+    /// [`controlboard_serve`]. No owner session → typed access-resolver
+    /// gap; Governor not ready → composition error; view refusals → typed
+    /// board gaps. Pure in-memory reads: no I/O, no new thread, no stored
+    /// client, no new scheduler.
     pub fn serve_board_for_envelope(
         &self,
         envelope: &eliot_protocol::HostRequestEnvelope,
+        attempt: &eliot_protocol::LocalReadAttempt,
     ) -> Result<controlboard_serve::BoardServeDispatch, controlboard_serve::ControlboardServeError>
     {
         controlboard_serve::serve_board_for_envelope(
             self.owner_session.as_ref(),
             || self.controlboard(),
             envelope,
+            attempt,
         )
     }
 

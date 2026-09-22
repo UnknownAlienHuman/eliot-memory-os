@@ -907,20 +907,28 @@ fn settle_local_read_completion(
 /// Serves the board inbox for one claimed envelope when it carries the live
 /// owner session claim (#1780, per-request consumer/server dispatch).
 ///
-/// Observation only: a served inbox publishes its evidence with the observed
-/// request identity; a serve gap publishes an error record; a foreign or
-/// absent session claim skips without a record (not our principal — the
-/// privacy posture, never a gap). The caller's pair handling is untouched
-/// either way: board observation degrades to diagnostics, never to a pair
-/// failure, redirect, or duplicate. Synchronous in-memory board read; no
-/// transport, no new scheduler — the existing local-read poller drives it.
-fn serve_board_for_claim(composition: &DaemonComposition, envelope: &HostRequestEnvelope) {
-    match composition.serve_board_for_envelope(envelope) {
+/// Observation evidence only — this is NOT server completion: a served inbox
+/// publishes its counts (never payload bytes) with the observed request
+/// identity; a serve gap publishes an error record; a foreign or absent
+/// session claim skips without a record (not our principal — the privacy
+/// posture, never a gap). Transmission of served rows to a remote board
+/// client stays with the owning consumer route (kernel `controlboard.status`
+/// serving per tracker #1213, notify `ReadInbox` over its stdio route).
+/// The caller's pair handling is untouched either way: board observation
+/// degrades to diagnostics, never to a pair failure, redirect, or
+/// duplicate. Synchronous in-memory board read; no transport, no new
+/// scheduler — the existing local-read poller drives it.
+fn serve_board_for_claim(
+    composition: &DaemonComposition,
+    envelope: &HostRequestEnvelope,
+    attempt: &eliot_protocol::LocalReadAttempt,
+) {
+    match composition.serve_board_for_envelope(envelope, attempt) {
         Ok(eliotd::controlboard_serve::BoardServeDispatch::Served(served)) => {
             let evidence = eliotd::controlboard_serve::served_inbox_evidence(&served);
             tracing::info!(
                 target: "eliotd::diagnostics",
-                event = "eliotd.controlboard_inbox_served",
+                event = "eliotd.controlboard_inbox_observed",
                 board_request_id = envelope.identity.request_id.as_str(),
                 inbox_total = evidence.total,
                 inbox_unresolved = evidence.unresolved,
@@ -967,11 +975,12 @@ async fn run_local_read_poll(
     };
     // #1780: per-request board consumer/server dispatch on the observed
     // claim. When the envelope carries the live owner session claim, serve
-    // the board inbox from its observed fields and publish the served
-    // counts; gaps degrade to diagnostics, foreign/absent claims skip.
+    // the board inbox from its observed fields (attempt fencing generation
+    // included) and publish the served counts as observation evidence;
+    // gaps degrade to diagnostics, foreign/absent claims skip.
     // Observation only: pair handling below is byte-identical either way —
     // board serving never fails, redirects, or duplicates the claimed step.
-    serve_board_for_claim(&composition, &envelope);
+    serve_board_for_claim(&composition, &envelope, &attempt);
     // #1882: Skill pairs serve locally through the composition Skill driver
     // instead of forwarding on the Kernel `local_read` leg (which serves
     // store reads only). Recognition is the shared Skill tool predicate over
