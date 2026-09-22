@@ -1,0 +1,9 @@
+{
+  "schema": "eliot-835-capture-receipt-v1",
+  "issue": 835,
+  "unit": "F-CUE-RETIRE",
+  "producer": "F-CUE-RETIRE",
+  "basis": "manager relay 2026-09-22: explicitly admitted offline capture for #835 finalizer; sole 706 inventory writer lane",
+  "snapshot": "scripts/testdata/cue-kind-retirement/admission/835-snapshot.json",
+  "source_revision": "5b7b67e6083c0244aaadc151432bc6edcf4b7115"
+}
