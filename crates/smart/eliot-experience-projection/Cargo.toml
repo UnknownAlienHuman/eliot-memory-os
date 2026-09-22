@@ -1,9 +1,9 @@
 [package]
 name = "eliot-experience-projection"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "Immutable experience read-aid view over owner projection vocabulary (#223)"
 
@@ -13,47 +13,21 @@ path = "src/lib.rs"
 [package.metadata.eliot]
 prototype = true
 source_status = "IMPLEMENTED_PROTOTYPE"
-workspace_admission = "pending_agent_implementation_and_proof"
+workspace_admission = "admitted to workspace membership for integration candidate; package/edge proof pending"
 functional_cell = "smart.experience.projection"
 freeze_ref = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
 source_layer = "C1"
 agent_order = 48
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-contracts.workspace = true
 eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts", version = "0.1.0" }
-schemars = "1.2.1"
-serde = { version = "1.0.228", features = ["derive"] }
+schemars.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
-eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
-serde_json = "1.0.150"
+eliot-receipts.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
-
-# Standalone workspace root. Without this, cargo walks above the repository
-# and can bind this package to an unrelated ancestor manifest, so every
-# per-crate `cargo check|test|clippy` fails before it starts. Remove this
-# table when the cell is promoted into the root workspace `members`.
-[workspace]
-
-# Mirrors the root `[workspace.lints]` verbatim so an excluded cell is linted
-# exactly like an admitted one. Keep in sync; the promotion commit drops this
-# whole `[workspace]` table and restores plain inheritance.
-[workspace.lints.rust]
-unsafe_code = "forbid"
-missing_docs = "allow"
-
-[workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-dbg_macro = "warn"
-expect_used = "warn"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-print_stderr = "warn"
-print_stdout = "warn"
-unwrap_used = "warn"
