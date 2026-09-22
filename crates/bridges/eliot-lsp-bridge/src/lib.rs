@@ -22,6 +22,12 @@
 
 #![forbid(unsafe_code)]
 
+mod scip_cache;
+
+pub use scip_cache::{
+    CachedProjection, CachedScipItems, ScipIndexerProvenance, ScipProjectionCache,
+};
+
 use std::sync::Arc;
 
 use eliot_instrument_scip::ScipIndex;
@@ -1099,8 +1105,79 @@ pub fn finalize_version(
     }
 }
 
+/// Projects one SCIP-served operation into cacheable typed items.
+///
+/// Shared by the cached `finalize_scip` path; the legacy uncached path keeps
+/// its inline arms untouched for review. Diagnostics and version probes never
+/// reach here (they return before any decode).
+fn project_cached_items(
+    index: &ScipIndex,
+    operation: &SemanticOperation,
+) -> Result<CachedScipItems, BridgeError> {
+    match operation {
+        SemanticOperation::Definitions { symbol } => Ok(CachedScipItems::Definitions(
+            project_definitions(index, symbol)?,
+        )),
+        SemanticOperation::References { symbol } => Ok(CachedScipItems::References(
+            project_references(index, symbol)?,
+        )),
+        SemanticOperation::Symbols { path_scope } => Ok(CachedScipItems::Symbols(project_symbols(
+            index, path_scope,
+        )?)),
+        SemanticOperation::Rename { symbol, new_name } => Ok(CachedScipItems::Rename(
+            rename_candidate(index, symbol, new_name)?,
+        )),
+        SemanticOperation::Diagnostics | SemanticOperation::ProbeVersion => {
+            Err(BridgeError::UnsupportedOperation)
+        }
+    }
+}
+
+/// Wraps cached items with a freshly assembled receipt.
+///
+/// The operation is bound into the cache key, so a variant mismatch is
+/// unreachable in practice; it still fails closed with a parse-failed
+/// receipt instead of inventing items.
+fn wrap_cached_items(
+    operation: &SemanticOperation,
+    items: CachedScipItems,
+    receipt: ObservationReceipt,
+) -> NormalizedResult {
+    match (operation, items) {
+        (SemanticOperation::Definitions { .. }, CachedScipItems::Definitions(items)) => {
+            NormalizedResult::Definitions { items, receipt }
+        }
+        (SemanticOperation::References { .. }, CachedScipItems::References(items)) => {
+            NormalizedResult::References { items, receipt }
+        }
+        (SemanticOperation::Symbols { .. }, CachedScipItems::Symbols(items)) => {
+            NormalizedResult::Symbols { items, receipt }
+        }
+        (SemanticOperation::Rename { .. }, CachedScipItems::Rename(candidate)) => {
+            NormalizedResult::Rename { candidate, receipt }
+        }
+        (_, _) => {
+            let mut receipt = receipt;
+            let (freshness, disposition) = normalize_failure(
+                "cached projection mismatched its operation",
+                &BridgeError::ScipDecode("cached projection mismatched its operation".to_owned()),
+            );
+            receipt.freshness = freshness;
+            receipt.disposition = disposition;
+            empty_scip_result(operation, receipt)
+        }
+    }
+}
+
 /// Finalizes decoded SCIP bytes into definitions, references, symbols, or a
 /// rename candidate plus receipt. `operation` must be SCIP-served.
+///
+/// When `cache` is `None`, the call decodes and projects exactly as before
+/// (no behavior change). When `Some`, the call consults the derived
+/// projection cache first: a verified hit skips decode and projection and
+/// returns cached items with a freshly assembled receipt, while any miss or
+/// invalid entry runs the genuine derivation. Failures are never cached, and
+/// a hit never carries a verdict — this subsystem cannot express one.
 #[allow(
     clippy::too_many_lines,
     reason = "operation dispatch is exhaustive and each arm pairs one projection with its receipt; splitting would separate results from their evidence"
@@ -1113,6 +1190,7 @@ pub fn finalize_scip(
     index_bytes: &[u8],
     sidecar_path: &str,
     invoked_at_unix_ms: u64,
+    cache: Option<&mut ScipProjectionCache>,
 ) -> NormalizedResult {
     let coverage = match operation {
         SemanticOperation::Definitions { symbol }
@@ -1164,6 +1242,19 @@ pub fn finalize_scip(
         receipt.freshness = freshness;
         receipt
     };
+    if let Some(cache) = cache {
+        let target = candidate.reference();
+        let config_hash = config.config_hash();
+        match cache.reuse_or_derive(index_bytes, &config_hash, operation, &target, |index| {
+            project_cached_items(index, operation)
+        }) {
+            Ok(cached) => return wrap_cached_items(operation, cached.items, ok_receipt()),
+            Err(error) => {
+                let receipt = parse_failed(&error);
+                return empty_scip_result(operation, receipt);
+            }
+        }
+    }
     let index = match ScipIndex::decode(index_bytes) {
         Ok(index) => index,
         Err(error) => {
@@ -1417,7 +1508,7 @@ fn checked_identifier(value: &str) -> Result<(), BridgeError> {
     Ok(())
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
+pub(crate) fn hex_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1587,6 +1678,7 @@ mod tests {
             TRUNCATED_SCIP,
             "sidecar",
             7,
+            None,
         );
         let NormalizedResult::Definitions { items, receipt } = result else {
             panic!("decode failure must keep the definitions envelope");
@@ -1607,6 +1699,7 @@ mod tests {
             TRUNCATED_SCIP,
             "sidecar",
             7,
+            None,
         );
         let NormalizedResult::References { items, receipt } = result else {
             panic!("decode failure must keep the references envelope");
@@ -1627,6 +1720,7 @@ mod tests {
             TRUNCATED_SCIP,
             "sidecar",
             7,
+            None,
         );
         let NormalizedResult::Rename { candidate, receipt } = result else {
             panic!("decode failure must keep the rename envelope");
@@ -1650,6 +1744,7 @@ mod tests {
             &[],
             "sidecar",
             7,
+            None,
         );
         let NormalizedResult::Diagnostics {
             observations,
@@ -1672,6 +1767,7 @@ mod tests {
             &[],
             "sidecar",
             7,
+            None,
         );
         let NormalizedResult::Version { version, receipt } = result else {
             panic!("unsupported probe must keep the version envelope");
