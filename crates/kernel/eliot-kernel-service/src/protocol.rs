@@ -2694,21 +2694,12 @@ pub fn expected_runtime_lease(
     renew_before_ms: u64,
 ) -> Result<RuntimeLease, KernelServiceError> {
     let candidate_digest = candidate.compute_digest()?;
-    let material = serde_json::to_vec(&(
-        "eliot.kernel.runtime-lease:v2",
-        candidate_digest,
-        candidate.installation_id.as_str(),
-        candidate.host_epoch.clone(),
-        candidate.kernel_epoch.clone(),
-        candidate.activation_id.as_str(),
+    let digest = runtime_lease_identity_digest(
+        &candidate_digest,
+        candidate,
         generation,
         admission,
-    ))
-    .map_err(|_| KernelServiceError::InvalidField {
-        field: "control.runtime_lease",
-        reason: "cannot canonicalize runtime lease binding",
-    })?;
-    let digest = sha256_hex(&material);
+    )?;
     let lease = RuntimeLease {
         lease_id: format!("eliot-runtime-lease:v1:{digest}"),
         scope_ref: format!("eliot-runtime-scope:v1:{digest}"),
@@ -2752,6 +2743,52 @@ pub fn expected_runtime_lease(
             reason: "constructed obligation is invalid",
         })?;
     Ok(lease)
+}
+
+/// Returns the stable identity digest for one owner-admitted RuntimeLease.
+///
+/// Owner evidence is intentionally absent from this identity. Evidence is a
+/// per-revision observation and may advance while the same admitted Session,
+/// Attempt, Job, upgrade, or external effect remains live. Timestamps are also
+/// absent so a lost Acquire response can read back the original committed
+/// lease instead of deriving a conflicting replacement.
+pub fn expected_runtime_lease_id(
+    candidate: &HostKernelCandidateBinding,
+    generation: ResourceGeneration,
+    admission: &RuntimeLeaseAdmission,
+) -> Result<String, KernelServiceError> {
+    let candidate_digest = candidate.compute_digest()?;
+    runtime_lease_identity_digest(&candidate_digest, candidate, generation, admission)
+        .map(|digest| format!("eliot-runtime-lease:v1:{digest}"))
+}
+
+fn runtime_lease_identity_digest(
+    candidate_digest: &str,
+    candidate: &HostKernelCandidateBinding,
+    generation: ResourceGeneration,
+    admission: &RuntimeLeaseAdmission,
+) -> Result<String, KernelServiceError> {
+    let material = serde_json::to_vec(&(
+        "eliot.kernel.runtime-lease:v3",
+        candidate_digest,
+        candidate.installation_id.as_str(),
+        candidate.host_epoch.clone(),
+        candidate.kernel_epoch.clone(),
+        candidate.activation_id.as_str(),
+        generation,
+        admission.owner_admission.as_ref(),
+        admission.holder.as_str(),
+        admission.reason.as_str(),
+        &admission.required_runtime_branches,
+        &admission.required_capabilities,
+        &admission.obligation_refs,
+        &admission.state_fence,
+    ))
+    .map_err(|_| KernelServiceError::InvalidField {
+        field: "control.runtime_lease",
+        reason: "cannot canonicalize runtime lease binding",
+    })?;
+    Ok(sha256_hex(&material))
 }
 
 /// Durable one-use permit for one exact candidate activation.
@@ -3160,12 +3197,78 @@ impl HostStartupEvidence {
     }
 }
 
+/// The durable owner class behind one RuntimeLease admission.
+///
+/// This is a routing discriminator only. The Kernel still resolves the
+/// referenced ORS record and compares its current immutable admission before
+/// issuing or renewing a lease; a caller-shaped kind/ref/digest is never an
+/// authority token by itself.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RuntimeLeaseOwnerKind {
+    /// An authenticated Host request carrying a Session or task owner.
+    Session,
+    /// A durable Doctor/agent attempt admission.
+    Attempt,
+    /// A Kernel-owned Durable Job/native-worker claim.
+    Job,
+    /// A durable upgrade, activation, repair, or maintenance request.
+    Upgrade,
+    /// A durable external effect whose outcome is unresolved.
+    Effect,
+}
+
+/// Typed reference to an actual durable owner admission.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLeaseOwnerAdmission {
+    /// Owner class used to select the exact ORS readback path.
+    pub kind: RuntimeLeaseOwnerKind,
+    /// Canonical owner reference, for example `owner:host-request:*`,
+    /// `owner:doctor-attempt:*`, `owner:native-claim:*`, or
+    /// `owner:doctor-effect:*`.
+    pub owner_ref: PlatformHandle,
+    /// Digest retained by the owner record for its immutable admission.
+    pub admission_digest: String,
+    /// Digest of the complete state fence retained by the owner record.  The
+    /// lease consumer binds this to the exact fence used for the control
+    /// request; a copied sequence projection is insufficient.
+    pub fence_digest: String,
+    /// Digest of the currently registered worker resource envelope, when the
+    /// owner is a native-worker claim.  Other owner kinds have no worker
+    /// registration projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_binding_digest: Option<String>,
+}
+
+impl RuntimeLeaseOwnerAdmission {
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        handle(&self.owner_ref, "runtime_lease_owner.owner_ref")?;
+        validate_digest(
+            &self.admission_digest,
+            "runtime_lease_owner.admission_digest",
+        )?;
+        validate_digest(&self.fence_digest, "runtime_lease_owner.fence_digest")?;
+        if let Some(resource) = &self.resource_binding_digest {
+            validate_digest(resource, "runtime_lease_owner.resource_binding_digest")?;
+        }
+        Ok(())
+    }
+}
+
 /// Authenticated demand context from Host to the Kernel RuntimeLease owner.
-/// The caller supplies the obligation identity and evidence references; the
-/// Kernel chooses the lease times, revision, and durable ORS identity.
+///
+/// The owner reference is resolved against a current durable ORS admission.
+/// The remaining fields are a typed projection that must equal that
+/// readback; they are never promoted to authority merely because the caller
+/// supplied well-shaped strings. The Kernel chooses lease times, revision,
+/// evidence, and durable ORS identity.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeLeaseAdmission {
+    /// The actual Session/Attempt/Job/upgrade/effect owner to read back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_admission: Option<RuntimeLeaseOwnerAdmission>,
     pub holder: PlatformHandle,
     pub reason: PlatformHandle,
     pub required_runtime_branches: Vec<PlatformHandle>,
@@ -3177,6 +3280,13 @@ pub struct RuntimeLeaseAdmission {
 
 impl RuntimeLeaseAdmission {
     pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.owner_admission
+            .as_ref()
+            .ok_or(KernelServiceError::InvalidField {
+                field: "runtime_lease_admission.owner_admission",
+                reason: "a current durable owner admission is required",
+            })?
+            .validate()?;
         for (value, field) in [
             (&self.holder, "runtime_lease_admission.holder"),
             (&self.reason, "runtime_lease_admission.reason"),

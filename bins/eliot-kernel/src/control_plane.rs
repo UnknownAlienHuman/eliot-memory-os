@@ -23,6 +23,184 @@ use super::*;
 const RUNTIME_LEASE_TTL_MS: u64 = 5 * 60 * 1_000;
 const RUNTIME_LEASE_RENEW_BEFORE_MS: u64 = 60 * 1_000;
 
+#[derive(Clone, Debug)]
+enum RuntimeLeaseOwnerRef {
+    HostRequest {
+        operation_id: String,
+        request_digest: String,
+    },
+    DoctorAttempt(String),
+    DoctorEffect(String),
+    NativeWorkerClaim(String),
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeLeaseOwnerObservation {
+    admission: RuntimeLeaseAdmission,
+    renewal_evidence_refs: Vec<PlatformHandle>,
+    renewal_evidence: Vec<String>,
+    admitted_wait: bool,
+    active: bool,
+    renewable: bool,
+}
+
+fn runtime_lease_owner_ref(value: &str) -> Result<RuntimeLeaseOwnerRef, TransportError> {
+    if let Some(value) = value.strip_prefix("owner:host-request:") {
+        let (operation_id, request_digest) = value
+            .rsplit_once("::")
+            .ok_or(TransportError::SessionFenced)?;
+        if operation_id.trim().is_empty()
+            || request_digest.len() != 64
+            || !request_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        return Ok(RuntimeLeaseOwnerRef::HostRequest {
+            operation_id: operation_id.to_owned(),
+            request_digest: request_digest.to_owned(),
+        });
+    }
+    for (prefix, constructor) in [
+        (
+            "owner:doctor-attempt:",
+            RuntimeLeaseOwnerRef::DoctorAttempt as fn(String) -> RuntimeLeaseOwnerRef,
+        ),
+        (
+            "owner:doctor-effect:",
+            RuntimeLeaseOwnerRef::DoctorEffect as fn(String) -> RuntimeLeaseOwnerRef,
+        ),
+        (
+            "owner:native-claim:",
+            RuntimeLeaseOwnerRef::NativeWorkerClaim as fn(String) -> RuntimeLeaseOwnerRef,
+        ),
+    ] {
+        if let Some(identity) = value.strip_prefix(prefix) {
+            if identity.trim().is_empty() {
+                return Err(TransportError::SessionFenced);
+            }
+            return Ok(constructor(identity.to_owned()));
+        }
+    }
+    Err(TransportError::SessionFenced)
+}
+
+fn runtime_lease_owner_ref_string(owner: &RuntimeLeaseOwnerRef) -> String {
+    match owner {
+        RuntimeLeaseOwnerRef::HostRequest {
+            operation_id,
+            request_digest,
+        } => format!("owner:host-request:{operation_id}::{request_digest}"),
+        RuntimeLeaseOwnerRef::DoctorAttempt(identity) => {
+            format!("owner:doctor-attempt:{identity}")
+        }
+        RuntimeLeaseOwnerRef::DoctorEffect(identity) => {
+            format!("owner:doctor-effect:{identity}")
+        }
+        RuntimeLeaseOwnerRef::NativeWorkerClaim(identity) => {
+            format!("owner:native-claim:{identity}")
+        }
+    }
+}
+
+fn runtime_lease_owner_kind(owner: &RuntimeLeaseOwnerRef) -> eliot_kernel_service::RuntimeLeaseOwnerKind {
+    match owner {
+        RuntimeLeaseOwnerRef::HostRequest { .. } => {
+            eliot_kernel_service::RuntimeLeaseOwnerKind::Session
+        }
+        RuntimeLeaseOwnerRef::DoctorAttempt(_) => {
+            eliot_kernel_service::RuntimeLeaseOwnerKind::Attempt
+        }
+        RuntimeLeaseOwnerRef::DoctorEffect(_) => {
+            eliot_kernel_service::RuntimeLeaseOwnerKind::Effect
+        }
+        RuntimeLeaseOwnerRef::NativeWorkerClaim(_) => {
+            eliot_kernel_service::RuntimeLeaseOwnerKind::Job
+        }
+    }
+}
+
+fn runtime_lease_handle(value: impl Into<String>) -> Result<PlatformHandle, TransportError> {
+    PlatformHandle::new(value.into()).map_err(|_| TransportError::SessionFenced)
+}
+
+fn runtime_lease_handles(
+    values: impl IntoIterator<Item = String>,
+) -> Result<Vec<PlatformHandle>, TransportError> {
+    values.into_iter().map(runtime_lease_handle).collect()
+}
+
+fn runtime_lease_digest(value: &str) -> Result<(), TransportError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+fn runtime_lease_state_fence_digest(fence: &StateFence) -> Result<String, TransportError> {
+    let bytes = eliot_contracts::canonical_json_bytes(fence)
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(eliot_contracts::sha256_hex(&bytes))
+}
+
+fn runtime_lease_now_nanos() -> u64 {
+    unix_ms().saturating_mul(1_000_000)
+}
+
+fn runtime_lease_host_request_kind(kind: eliot_ors::HostRequestKind) -> &'static str {
+    match kind {
+        eliot_ors::HostRequestKind::Activation => "activation",
+        eliot_ors::HostRequestKind::Invocation => "invocation",
+        eliot_ors::HostRequestKind::Cancellation => "cancellation",
+        eliot_ors::HostRequestKind::Status => "status",
+        eliot_ors::HostRequestKind::Reconciliation => "reconciliation",
+    }
+}
+
+fn runtime_lease_host_request_active(state: eliot_ors::HostRequestState) -> bool {
+    matches!(
+        state,
+        eliot_ors::HostRequestState::Admitted
+            | eliot_ors::HostRequestState::Routed
+            | eliot_ors::HostRequestState::Submitted
+            | eliot_ors::HostRequestState::PossiblyEffected
+            | eliot_ors::HostRequestState::Unknown
+            | eliot_ors::HostRequestState::Reconciling
+    )
+}
+
+fn runtime_lease_attempt_active(state: eliot_ors::DoctorAttemptState) -> bool {
+    matches!(
+        state,
+        eliot_ors::DoctorAttemptState::Admitted
+            | eliot_ors::DoctorAttemptState::EffectIntended
+            | eliot_ors::DoctorAttemptState::Unknown
+            | eliot_ors::DoctorAttemptState::Reconciling
+    )
+}
+
+fn runtime_lease_effect_active(state: eliot_ors::DoctorEffectState) -> bool {
+    matches!(
+        state,
+        eliot_ors::DoctorEffectState::Intended
+            | eliot_ors::DoctorEffectState::Unknown
+            | eliot_ors::DoctorEffectState::Reconciling
+    )
+}
+
+fn runtime_lease_claim_active(state: eliot_ors::NativeWorkerClaimState) -> bool {
+    !matches!(
+        state,
+        eliot_ors::NativeWorkerClaimState::Requested
+            | eliot_ors::NativeWorkerClaimState::Terminal
+    )
+}
+
 /// F-LOG-KERNEL-4 (#903): control-plane boundary observations.
 ///
 /// Observation only, via #895's facade: fixed `kernel.control.*` event names
@@ -650,7 +828,7 @@ impl KernelComposition {
                 Some(self.renew_runtime_lease(&request, renewal)?)
             }
             KernelControlCommand::RevokeRuntimeLease(terminal) => Some(
-                self.transition_runtime_lease(&request, terminal, LeaseState::Released)?,
+                self.transition_runtime_lease(&request, terminal, LeaseState::Revoked)?,
             ),
             KernelControlCommand::ExpireRuntimeLease(terminal) => Some(
                 self.transition_runtime_lease(&request, terminal, LeaseState::Expired)?,
@@ -706,19 +884,457 @@ impl KernelComposition {
             .candidate
             .compute_digest()
             .map_err(|_| TransportError::SessionFenced)?;
-        let candidate_ref = format!("kernel-candidate:{candidate_digest}");
         if lease.authority_epoch != request.candidate.kernel_epoch
             || lease.state_fence
                 != StateFence::new(request.candidate.kernel_epoch.clone(), request.generation)
-            || !lease
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let activation = self
+            .service
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .activation_receipt()
+            .cloned()
+            .ok_or(TransportError::SessionFenced)?;
+        if activation.candidate_binding_digest != candidate_digest
+            || activation.generation != request.generation
+            || activation.authority_epoch != request.candidate.kernel_epoch
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let owner_ref = runtime_lease_handle(
+            lease
                 .obligation
                 .obligation_refs
-                .iter()
-                .any(|value| value == &candidate_ref)
+                .as_slice()
+                .first()
+                .ok_or(TransportError::SessionFenced)?
+                .clone(),
+        )?;
+        if lease.obligation.obligation_refs.len() != 1 {
+            return Err(TransportError::SessionFenced);
+        }
+        let observed = self.resolve_runtime_lease_owner(
+            request,
+            &owner_ref,
+            None,
+            Some(&lease.state_fence),
+        )?;
+        let canonical = &observed.admission;
+        if lease.lease_id
+            != eliot_kernel_service::expected_runtime_lease_id(
+                &request.candidate,
+                request.generation,
+                canonical,
+            )
+            .map_err(|_| TransportError::SessionFenced)?
+            || lease.scope_ref
+                != format!("eliot-runtime-scope:v1:{}", lease.lease_id.trim_start_matches("eliot-runtime-lease:v1:"))
+            || lease.obligation.holder != canonical.holder.as_str()
+            || lease.obligation.reason != canonical.reason.as_str()
+            || lease.obligation.required_runtime_branches
+                != canonical
+                    .required_runtime_branches
+                    .iter()
+                    .map(|value| value.as_str().to_owned())
+                    .collect::<Vec<_>>()
+            || lease.obligation.required_capabilities
+                != canonical
+                    .required_capabilities
+                    .iter()
+                    .map(|value| value.as_str().to_owned())
+                    .collect::<Vec<_>>()
+            || lease.obligation.obligation_refs
+                != canonical
+                    .obligation_refs
+                    .iter()
+                    .map(|value| value.as_str().to_owned())
+                    .collect::<Vec<_>>()
         {
             return Err(TransportError::SessionFenced);
         }
         Ok(())
+    }
+
+    fn resolve_runtime_lease_owner(
+        &self,
+        request: &KernelControlRequest,
+        owner_ref: &PlatformHandle,
+        expected: Option<&eliot_kernel_service::RuntimeLeaseOwnerAdmission>,
+        expected_fence: Option<&StateFence>,
+    ) -> Result<RuntimeLeaseOwnerObservation, TransportError> {
+        let parsed = runtime_lease_owner_ref(owner_ref.as_str())?;
+        let parsed_kind = runtime_lease_owner_kind(&parsed);
+        if let Some(expected) = expected {
+            if expected.owner_ref != *owner_ref {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        let ref_string = runtime_lease_owner_ref_string(&parsed);
+        let state_fence = expected_fence.cloned().unwrap_or_else(|| {
+            StateFence::new(
+                request.candidate.kernel_epoch.clone(),
+                request.generation,
+            )
+        });
+        if state_fence.resource_generation != request.generation
+            || !state_fence
+                .authority_epoch
+                .is_same_authority(&request.candidate.kernel_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut owner_digest = None;
+        let mut owner_fence_digest = None;
+        let mut resource_binding_digest = None;
+        let mut owner_kind = parsed_kind;
+        let mut holder = None;
+        let mut reason = None;
+        let mut branches = Vec::new();
+        let mut capabilities = Vec::new();
+        let mut immutable_evidence = Vec::new();
+        let mut renewal_evidence = Vec::new();
+        let mut admitted_wait = false;
+        let active;
+        let renewable;
+        match &parsed {
+            RuntimeLeaseOwnerRef::HostRequest {
+                operation_id,
+                request_digest,
+            } => {
+                let operation_id = eliot_ors::OperationIdentity::new(operation_id.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let record = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&operation_id, request_digest)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                if record.operation_id != operation_id
+                    || record.request_digest != *request_digest
+                    || record.generation != request.generation.value()
+                    || !record
+                        .authority_epoch
+                        .is_same_authority(&request.candidate.kernel_epoch)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                runtime_lease_digest(&record.fence_digest)?;
+                owner_fence_digest = Some(record.fence_digest.clone());
+                owner_kind = if record.kind == eliot_ors::HostRequestKind::Activation {
+                    eliot_kernel_service::RuntimeLeaseOwnerKind::Upgrade
+                } else {
+                    eliot_kernel_service::RuntimeLeaseOwnerKind::Session
+                };
+                let deadline_fresh = record.deadline_unix_ms > unix_ms();
+                active = deadline_fresh && runtime_lease_host_request_active(record.state);
+                renewable = active && matches!(
+                    record.state,
+                    eliot_ors::HostRequestState::Routed
+                        | eliot_ors::HostRequestState::Submitted
+                        | eliot_ors::HostRequestState::PossiblyEffected
+                        | eliot_ors::HostRequestState::Unknown
+                        | eliot_ors::HostRequestState::Reconciling
+                );
+                admitted_wait = matches!(
+                    record.state,
+                    eliot_ors::HostRequestState::Admitted
+                        | eliot_ors::HostRequestState::PossiblyEffected
+                        | eliot_ors::HostRequestState::Unknown
+                        | eliot_ors::HostRequestState::Reconciling
+                );
+                owner_digest = Some(record.request_digest.clone());
+                holder = Some(
+                    record
+                        .session_ref
+                        .clone()
+                        .or(record.task_ref.clone())
+                        .unwrap_or(record.connection_ref.clone())
+                        .as_str()
+                        .to_owned(),
+                );
+                reason = Some(format!(
+                    "host-request:{}",
+                    runtime_lease_host_request_kind(record.kind)
+                ));
+                branches.extend(["kernel".to_owned(), "host-request".to_owned()]);
+                capabilities.push(record.capability_ref.as_str().to_owned());
+                immutable_evidence.extend([
+                    format!("host-request-request:{}", record.request_digest),
+                    format!("host-request-payload:{}", record.payload_digest),
+                    format!("host-request-fence:{}", record.fence_digest),
+                    format!("host-request-deadline:{}", record.deadline_unix_ms),
+                ]);
+                renewal_evidence.extend(immutable_evidence.iter().cloned());
+                renewal_evidence.push(format!("host-request-state:{:?}", record.state));
+                renewal_evidence.push(format!(
+                    "host-request-result:{}",
+                    record.result_digest.as_deref().unwrap_or("pending")
+                ));
+            }
+            RuntimeLeaseOwnerRef::DoctorAttempt(identity) => {
+                let identity = eliot_ors::OperationIdentity::new(identity.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let record = self
+                    .generation_gateway
+                    .ors
+                    .load_doctor_attempt(&identity)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                if record.attempt_digest != identity
+                    || record.generation != request.generation.value()
+                    || record
+                        .validate_against_epoch(&request.candidate.kernel_epoch)
+                        .is_err()
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                runtime_lease_digest(&record.fence_digest)?;
+                owner_fence_digest = Some(record.fence_digest.clone());
+                let now_nanos = runtime_lease_now_nanos();
+                let deadline_fresh = record.deadline_unix_nanos > now_nanos
+                    && record.lease_expires_unix_nanos > now_nanos;
+                active = deadline_fresh && runtime_lease_attempt_active(record.state);
+                renewable = active && matches!(
+                    record.state,
+                    eliot_ors::DoctorAttemptState::EffectIntended
+                        | eliot_ors::DoctorAttemptState::Unknown
+                        | eliot_ors::DoctorAttemptState::Reconciling
+                );
+                admitted_wait = matches!(
+                    record.state,
+                    eliot_ors::DoctorAttemptState::Admitted
+                        | eliot_ors::DoctorAttemptState::Unknown
+                        | eliot_ors::DoctorAttemptState::Reconciling
+                );
+                let admission_digest = record
+                    .admission_digest
+                    .clone()
+                    .ok_or(TransportError::SessionFenced)?;
+                owner_digest = Some(admission_digest.clone());
+                holder = Some(record.principal_ref.as_str().to_owned());
+                reason = Some(record.operation_id.as_str().to_owned());
+                branches.extend(["kernel".to_owned(), "doctor".to_owned()]);
+                capabilities.push(record.component_ref.as_str().to_owned());
+                immutable_evidence.extend([
+                    format!("doctor-attempt-admission:{admission_digest}"),
+                    format!("doctor-attempt-binding:{}", record.binding_digest),
+                    format!("doctor-attempt-fence:{}", record.fence_digest),
+                    format!("doctor-attempt-deadline:{}", record.deadline_unix_nanos),
+                    format!(
+                        "doctor-attempt-lease-expiry:{}",
+                        record.lease_expires_unix_nanos
+                    ),
+                ]);
+                renewal_evidence.extend(immutable_evidence.iter().cloned());
+                renewal_evidence.push(format!("doctor-attempt-state:{:?}", record.state));
+                renewal_evidence.push(format!(
+                    "doctor-attempt-admitted-at:{}",
+                    record.admitted_at_unix_nanos.unwrap_or_default()
+                ));
+            }
+            RuntimeLeaseOwnerRef::DoctorEffect(identity) => {
+                let identity = eliot_ors::OperationIdentity::new(identity.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let record = self
+                    .generation_gateway
+                    .ors
+                    .load_doctor_effect(&identity)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                let attempt_identity = eliot_ors::OperationIdentity::new(
+                    record.attempt_digest.clone(),
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                let attempt = self
+                    .generation_gateway
+                    .ors
+                    .load_doctor_attempt(&attempt_identity)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                if record.effect_digest != identity
+                    || attempt.generation != request.generation.value()
+                    || attempt
+                        .validate_against_epoch(&request.candidate.kernel_epoch)
+                        .is_err()
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                runtime_lease_digest(&attempt.fence_digest)?;
+                owner_fence_digest = Some(attempt.fence_digest.clone());
+                let now_nanos = runtime_lease_now_nanos();
+                let attempt_fresh = attempt.deadline_unix_nanos > now_nanos
+                    && attempt.lease_expires_unix_nanos > now_nanos;
+                active = attempt_fresh
+                    && runtime_lease_attempt_active(attempt.state)
+                    && runtime_lease_effect_active(record.state);
+                renewable = active;
+                admitted_wait = active;
+                owner_digest = Some(record.intent_digest.clone());
+                holder = Some(record.attempt_digest.clone());
+                reason = Some(record.operation_id.as_str().to_owned());
+                branches.extend(["kernel".to_owned(), "effect".to_owned()]);
+                capabilities.push("external-effect".to_owned());
+                immutable_evidence.extend([
+                    format!("doctor-effect-intent:{}", record.intent_digest),
+                    format!("doctor-effect-attempt:{}", record.attempt_digest),
+                    format!("doctor-effect-operation:{}", record.operation_id.as_str()),
+                    format!("doctor-effect-fence:{}", attempt.fence_digest),
+                    format!("doctor-effect-deadline:{}", attempt.deadline_unix_nanos),
+                    format!(
+                        "doctor-effect-lease-expiry:{}",
+                        attempt.lease_expires_unix_nanos
+                    ),
+                ]);
+                renewal_evidence.extend(immutable_evidence.iter().cloned());
+                renewal_evidence.push(format!("doctor-effect-state:{:?}", record.state));
+            }
+            RuntimeLeaseOwnerRef::NativeWorkerClaim(identity) => {
+                let identity = eliot_ors::OperationIdentity::new(identity.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let record = self
+                    .generation_gateway
+                    .ors
+                    .load_native_worker_claim(&identity)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                if record.claim_id != identity {
+                    return Err(TransportError::SessionFenced);
+                }
+                // Native-worker ORS keeps the worker-generation scalar only as
+                // a projection.  It is not the Kernel ResourceGeneration and
+                // is never used as the authority check.  The current full
+                // registration fence/resource projection is bound below;
+                // the scalar is checked only for consistency with that owner
+                // record after the full fence digest matches.
+                runtime_lease_digest(&record.fence_digest)?;
+                runtime_lease_digest(&record.resource_envelope_digest)?;
+                owner_fence_digest = Some(record.fence_digest.clone());
+                resource_binding_digest = Some(record.resource_envelope_digest.clone());
+                if record.authority_epoch != state_fence.authority_epoch.sequence.get() {
+                    return Err(TransportError::SessionFenced);
+                }
+                let deadline_fresh = record.deadline_unix_ms > unix_ms();
+                active = deadline_fresh && runtime_lease_claim_active(record.state);
+                renewable = active && matches!(
+                    record.state,
+                    eliot_ors::NativeWorkerClaimState::Ready
+                        | eliot_ors::NativeWorkerClaimState::Active
+                        | eliot_ors::NativeWorkerClaimState::Cancelling
+                        | eliot_ors::NativeWorkerClaimState::Submitted
+                        | eliot_ors::NativeWorkerClaimState::Unknown
+                        | eliot_ors::NativeWorkerClaimState::Reconciling
+                );
+                admitted_wait = matches!(
+                    record.state,
+                    eliot_ors::NativeWorkerClaimState::Admitted
+                        | eliot_ors::NativeWorkerClaimState::Unknown
+                        | eliot_ors::NativeWorkerClaimState::Reconciling
+                );
+                owner_digest = Some(record.binding_digest.clone());
+                holder = Some(record.parent_job_id.as_str().to_owned());
+                reason = Some(record.operation_id.as_str().to_owned());
+                branches.extend(["kernel".to_owned(), "native-worker".to_owned()]);
+                capabilities.push(record.route_class.as_str().to_owned());
+                immutable_evidence.extend([
+                    format!("native-claim-binding:{}", record.binding_digest),
+                    format!("native-claim-request:{}", record.request_digest),
+                    format!("native-claim-fence:{}", record.fence_digest),
+                    format!(
+                        "native-claim-registration:{}",
+                        record.registration_id.as_str()
+                    ),
+                    format!(
+                        "native-claim-resource:{}",
+                        record.resource_envelope_digest
+                    ),
+                    format!("native-claim-deadline:{}", record.deadline_unix_ms),
+                ]);
+                renewal_evidence.extend(immutable_evidence.iter().cloned());
+                renewal_evidence.push(format!("native-claim-state:{:?}", record.state));
+            }
+        }
+        let owner_digest = owner_digest.ok_or(TransportError::SessionFenced)?;
+        let owner_fence_digest = owner_fence_digest.ok_or(TransportError::SessionFenced)?;
+        let expected_fence_digest = runtime_lease_state_fence_digest(&state_fence)?;
+        if owner_fence_digest != expected_fence_digest {
+            return Err(TransportError::SessionFenced);
+        }
+        let holder = runtime_lease_handle(holder.ok_or(TransportError::SessionFenced)?)?;
+        let reason = runtime_lease_handle(reason.ok_or(TransportError::SessionFenced)?)?;
+        let required_runtime_branches = runtime_lease_handles(branches)?;
+        let required_capabilities = runtime_lease_handles(capabilities)?;
+        let obligation_ref = runtime_lease_handle(ref_string)?;
+        let evidence_refs = runtime_lease_handles(immutable_evidence)?;
+        let renewal_evidence_refs = runtime_lease_handles(renewal_evidence.clone())?;
+        let owner_admission = eliot_kernel_service::RuntimeLeaseOwnerAdmission {
+            kind: owner_kind,
+            owner_ref: obligation_ref.clone(),
+            admission_digest: owner_digest.clone(),
+            fence_digest: owner_fence_digest.clone(),
+            resource_binding_digest,
+        };
+        if let Some(expected) = expected {
+            if expected.kind != owner_kind
+                || expected.admission_digest != owner_digest
+                || expected.fence_digest != owner_fence_digest
+                || expected.resource_binding_digest != owner_admission.resource_binding_digest
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        let admission = RuntimeLeaseAdmission {
+            owner_admission: Some(owner_admission),
+            holder,
+            reason,
+            required_runtime_branches,
+            required_capabilities,
+            obligation_refs: vec![obligation_ref],
+            evidence_refs,
+            state_fence,
+        };
+        admission
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(RuntimeLeaseOwnerObservation {
+            admission,
+            renewal_evidence_refs,
+            renewal_evidence,
+            admitted_wait,
+            active,
+            renewable,
+        })
+    }
+
+    fn validate_runtime_lease_admission_projection(
+        &self,
+        request: &KernelControlRequest,
+        supplied: &RuntimeLeaseAdmission,
+    ) -> Result<RuntimeLeaseOwnerObservation, TransportError> {
+        let owner = supplied
+            .owner_admission
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let owner_ref = &owner.owner_ref;
+        let observed = self.resolve_runtime_lease_owner(
+            request,
+            owner_ref,
+            Some(owner),
+            Some(&supplied.state_fence),
+        )?;
+        let canonical = &observed.admission;
+        if supplied.holder != canonical.holder
+            || supplied.reason != canonical.reason
+            || supplied.required_runtime_branches != canonical.required_runtime_branches
+            || supplied.required_capabilities != canonical.required_capabilities
+            || supplied.obligation_refs != canonical.obligation_refs
+            || supplied.evidence_refs != canonical.evidence_refs
+            || supplied.state_fence != canonical.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(observed)
     }
 
     fn acquire_runtime_lease(
@@ -726,19 +1342,59 @@ impl KernelComposition {
         request: &KernelControlRequest,
         admission: &RuntimeLeaseAdmission,
     ) -> Result<RuntimeLease, TransportError> {
+        if self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?
+            != KernelServiceState::Ready
+        {
+            return Err(TransportError::SessionFenced);
+        }
         admission
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
-        let candidate_digest = request
-            .candidate
-            .compute_digest()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let mut canonical = admission.clone();
-        let candidate_ref = PlatformHandle::new(format!("kernel-candidate:{candidate_digest}"))
-            .map_err(|_| TransportError::SessionFenced)?;
-        if !canonical.obligation_refs.contains(&candidate_ref) {
-            canonical.obligation_refs.push(candidate_ref);
+        let observed = self.validate_runtime_lease_admission_projection(request, admission)?;
+        if !observed.active {
+            return Err(TransportError::SessionFenced);
         }
+        let canonical = &observed.admission;
+        let expected_lease_id = eliot_kernel_service::expected_runtime_lease_id(
+            &request.candidate,
+            request.generation,
+            canonical,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+
+        // The stable owner identity is the replay key.  Read it before
+        // generating any new timestamps so a lost first response returns the
+        // original committed row instead of trying to replace it.
+        if let Some(existing) = self
+            .generation_gateway
+            .ors
+            .load_current_runtime_lease(&expected_lease_id)
+            .map_err(|_| TransportError::SessionFenced)?
+        {
+            self.validate_runtime_lease_owner(request, &existing)?;
+            if existing.state != LeaseState::Active || existing.lease_id != expected_lease_id {
+                return Err(TransportError::SessionFenced);
+            }
+            if existing.obligation.expires_at_ms <= unix_ms() {
+                // A stable acquire identity remains idempotent, but an
+                // elapsed row is no longer authority.  Reconcile the
+                // durable row before rejecting the replay so the caller can
+                // observe the owner-controlled terminal path instead of
+                // receiving an expired lease labelled Active.
+                self.reconcile_runtime_lease(
+                    request,
+                    &RuntimeLeaseReconcile {
+                        lease_id: existing.lease_id.clone(),
+                        state_fence: existing.state_fence.clone(),
+                    },
+                )?;
+                return Err(TransportError::SessionFenced);
+            }
+            return Ok(existing);
+        }
+
         let issued_at_ms = unix_ms();
         let expires_at_ms = issued_at_ms
             .checked_add(RUNTIME_LEASE_TTL_MS)
@@ -749,7 +1405,7 @@ impl KernelComposition {
         let expected = eliot_kernel_service::expected_runtime_lease(
             &request.candidate,
             request.generation,
-            &canonical,
+            canonical,
             issued_at_ms,
             expires_at_ms,
             renew_before_ms,
@@ -767,7 +1423,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::SessionFenced)?;
         self.validate_runtime_lease_owner(request, &readback)?;
-        if acquired != expected || readback != expected {
+        if acquired != expected || readback != acquired || readback.lease_id != expected_lease_id {
             return Err(TransportError::SessionFenced);
         }
         Ok(readback)
@@ -778,6 +1434,9 @@ impl KernelComposition {
         request: &KernelControlRequest,
         renewal: &RuntimeLeaseRenewal,
     ) -> Result<RuntimeLease, TransportError> {
+        renewal
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
         let current = self
             .generation_gateway
             .ors
@@ -785,10 +1444,33 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::SessionFenced)?;
         self.validate_runtime_lease_owner(request, &current)?;
+        let owner_ref = runtime_lease_handle(
+            current
+            .obligation
+            .obligation_refs
+            .first()
+            .ok_or(TransportError::SessionFenced)?
+            .clone(),
+        )?;
+        let observed = self.resolve_runtime_lease_owner(
+            request,
+            &owner_ref,
+            None,
+            Some(&current.state_fence),
+        )?;
+        if !observed.active || !(observed.renewable || observed.admitted_wait) {
+            return Err(TransportError::SessionFenced);
+        }
         if current.revision != renewal.expected_revision
             || current.state_fence != renewal.state_fence
             || current.state != LeaseState::Active
             || unix_ms() < current.obligation.renew_before_ms
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if observed.renewal_evidence.is_empty()
+            || (!observed.admitted_wait
+                && observed.renewal_evidence == current.obligation.renewal_evidence)
         {
             return Err(TransportError::SessionFenced);
         }
@@ -799,15 +1481,6 @@ impl KernelComposition {
         let renew_before_ms = now_ms
             .checked_add(RUNTIME_LEASE_RENEW_BEFORE_MS)
             .ok_or(TransportError::SessionFenced)?;
-        let mut evidence = renewal
-            .evidence_refs
-            .iter()
-            .map(|value| value.as_str().to_owned())
-            .collect::<Vec<_>>();
-        evidence.push(format!("kernel-progress:{}", request.payload_digest));
-        if renewal.admitted_wait {
-            evidence.push("kernel-admitted-wait".to_owned());
-        }
         let renewed = self
             .generation_gateway
             .ors
@@ -815,7 +1488,7 @@ impl KernelComposition {
                 &renewal.lease_id,
                 renewal.expected_revision,
                 &renewal.state_fence,
-                evidence,
+                observed.renewal_evidence,
                 now_ms,
                 expires_at_ms,
                 renew_before_ms,
@@ -872,6 +1545,20 @@ impl KernelComposition {
         request: &KernelControlRequest,
         reconcile: &RuntimeLeaseReconcile,
     ) -> Result<Option<RuntimeLease>, TransportError> {
+        let current = self
+            .generation_gateway
+            .ors
+            .load_current_runtime_lease(&reconcile.lease_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        if current.state_fence != reconcile.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        // Reconciliation may transition an expired row, so candidate and
+        // owner binding must be proved before ORS is allowed to mutate it.
+        self.validate_runtime_lease_owner(request, &current)?;
         let evidence = vec![format!("kernel-reconcile:{}", request.payload_digest)];
         let lease = self
             .generation_gateway
