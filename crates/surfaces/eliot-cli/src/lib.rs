@@ -493,6 +493,32 @@ pub mod kernel_client {
         /// proven by an exact typed reply and must be reconciled by operation.
         #[error("kernel front door outcome is unknown: {0}")]
         UnknownOutcome(String),
+        /// The serving owner invalidated the generation/session-bound handoff.
+        /// The caller must restart through a fresh broker-issued handoff; a
+        /// consumed endpoint, PID, pipe name, or cached environment value can
+        /// never re-establish continuity.
+        #[error("kernel operator handoff requires a fresh broker binding: {0}")]
+        RestartRequired(String),
+    }
+
+    /// Operation selector for the broker-owned Operator launch route.
+    ///
+    /// Broker-owned contract (`eliot.surfaces.user-broker-core/v1`) with the
+    /// exact capability pair in
+    /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:29`
+    /// (`OPERATOR_CAPABILITIES = ["controlboard.read", "operator.command"]`).
+    /// The Kernel/User Broker lane serves and admits this operation; a typed
+    /// provider rejection is the admission signal, never a local stub. This
+    /// selector names no authority: the admitted `RequestIdentity` bound via
+    /// [`KernelClient::set_request_identity`] carries the session, fence, and
+    /// operation binding.
+    pub const OPERATOR_LAUNCH_OPERATION: &str = "operator.launch";
+
+    /// Closed launch disposition carried by the serving owner receipt.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum OperatorLaunchStatus {
+        Admitted,
+        RestartRequired,
     }
 
     /// Provider-neutral request for the interactive Operator contour.  The
@@ -575,10 +601,28 @@ pub mod kernel_client {
             self.request_identity = Some(identity);
         }
 
-        /// Requests the broker-owned Operator launch.  This remains closed
-        /// until Kernel advertises the operation and its handshake snapshot
-        /// includes the current fence and observed clock needed to construct
-        /// the request identity.  No local identity is a valid substitute.
+        /// Requests the broker-owned Operator launch through the authenticated
+        /// Kernel/User Broker EBP Execute seam.
+        ///
+        /// The admitted [`RequestIdentity`] bound via
+        /// [`KernelClient::set_request_identity`] carries the exact session,
+        /// fence, deadline, and operation binding from the admitted
+        /// host-request path; this front door never mints principal, session,
+        /// fence, clock, or idempotency identity. Without one the call fails
+        /// closed with [`KernelClientError::MissingRequestIdentity`] before
+        /// any byte is sent.
+        ///
+        /// The request transacts [`OPERATOR_LAUNCH_OPERATION`] with only the
+        /// broker-owned role/capability pair. The CLI supplies no path, image,
+        /// digest, fence, or clock: those bindings arrive with the admitted
+        /// identity and the Kernel handshake snapshot. The typed receipt is
+        /// decoded closed: `admitted` returns the owner receipt,
+        /// `restart_required` becomes the typed
+        /// [`KernelClientError::RestartRequired`] disposition (fresh
+        /// broker-issued handoff required; never PID, pipe-name, or
+        /// cached-environment continuity), and any other shape becomes
+        /// [`KernelClientError::UnknownOutcome`] for same-operation
+        /// reconciliation.
         ///
         /// The `"controlboard.read"` capability string is retained because the
         /// broker contract requires it: `OPERATOR_CAPABILITIES` in
@@ -587,16 +631,53 @@ pub mod kernel_client {
         /// `controlboard.read`; #1213). It is a broker-owned capability name,
         /// not an `eliot-controlboard` crate binding.
         pub fn ensure_operator_launch(&mut self) -> Result<Value, KernelClientError> {
-            let _request = OperatorLaunchRequest {
-                role: "human_operator".to_owned(),
-                capabilities: vec![
-                    "controlboard.read".to_owned(),
-                    "operator.command".to_owned(),
-                ],
-            };
-            Err(KernelClientError::FrontDoorClosed(
-                "Kernel user-broker Operator launch contract with admitted fence/clock snapshot",
-            ))
+            #[cfg(not(windows))]
+            {
+                return Err(KernelClientError::FrontDoorClosed(
+                    "Windows authenticated Kernel front door",
+                ));
+            }
+            #[cfg(windows)]
+            {
+                let identity = self
+                    .request_identity
+                    .clone()
+                    .ok_or(KernelClientError::MissingRequestIdentity)?;
+                let request = OperatorLaunchRequest {
+                    role: "human_operator".to_owned(),
+                    capabilities: vec![
+                        "controlboard.read".to_owned(),
+                        "operator.command".to_owned(),
+                    ],
+                };
+                let payload = serde_json::to_value(&request).map_err(|error| {
+                    KernelClientError::Configuration(format!(
+                        "encode broker-owned operator launch request: {error}"
+                    ))
+                })?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+                let served = runtime.block_on(self.transact_async(
+                    OPERATOR_LAUNCH_OPERATION,
+                    payload,
+                    identity,
+                ))?;
+                let (status, receipt) = decode_operator_launch_receipt(&served)?;
+                match status {
+                    OperatorLaunchStatus::Admitted => Ok(receipt),
+                    OperatorLaunchStatus::RestartRequired => {
+                        Err(KernelClientError::RestartRequired(format!(
+                            "broker invalidated the generation/session-bound operator handoff for operation {}",
+                            receipt
+                                .get("operation_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                        )))
+                    }
+                }
+            }
         }
 
         /// Performs a bounded authenticated health exchange with Kernel.
@@ -971,6 +1052,50 @@ pub mod kernel_client {
         Ok(())
     }
 
+    /// Decodes the serving owner's launch receipt closed: the operation
+    /// identity is non-empty and control-character free, the status is one of
+    /// the two admitted dispositions, and the receipt body is a JSON object.
+    /// Anything else is an unknown outcome for same-operation reconciliation,
+    /// never a rejection and never an admission.
+    fn decode_operator_launch_receipt(
+        served: &Value,
+    ) -> Result<(OperatorLaunchStatus, Value), KernelClientError> {
+        let operation_id = served
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                KernelClientError::UnknownOutcome(
+                    "Kernel operator launch reply has no operation identity".to_owned(),
+                )
+            })?;
+        if operation_id.trim().is_empty()
+            || operation_id.len() > 256
+            || operation_id.chars().any(char::is_control)
+        {
+            return Err(KernelClientError::UnknownOutcome(
+                "Kernel operator launch operation identity is invalid".to_owned(),
+            ));
+        }
+        let status = match served.get("status").and_then(Value::as_str) {
+            Some("admitted") => OperatorLaunchStatus::Admitted,
+            Some("restart_required") => OperatorLaunchStatus::RestartRequired,
+            _ => {
+                return Err(KernelClientError::UnknownOutcome(
+                    "Kernel operator launch disposition is not a closed receipt".to_owned(),
+                ));
+            }
+        };
+        if served
+            .get("receipt")
+            .is_none_or(|receipt| !receipt.is_object())
+        {
+            return Err(KernelClientError::UnknownOutcome(
+                "Kernel operator launch receipt body is not a typed object".to_owned(),
+            ));
+        }
+        Ok((status, served.clone()))
+    }
+
     #[cfg(test)]
     // The platform delivery helper must remain cfg-gated beside production code;
     // fixtures intentionally fail immediately for invalid static identities.
@@ -1059,6 +1184,57 @@ pub mod kernel_client {
                 "generation": 1,
             }));
             assert!(validate_server_snapshot(&hello, &expected, 1, &"a".repeat(64)).is_err());
+        }
+
+        #[test]
+        fn operator_launch_receipt_decodes_closed_admitted_and_restart_required() {
+            let admitted = serde_json::json!({
+                "operation_id": "op-launch-1",
+                "status": "admitted",
+                "receipt": {"handoff": "owner-issued"},
+            });
+            let (status, receipt) =
+                decode_operator_launch_receipt(&admitted).expect("admitted receipt");
+            assert_eq!(status, OperatorLaunchStatus::Admitted);
+            assert_eq!(receipt, admitted);
+            let restart = serde_json::json!({
+                "operation_id": "op-launch-2",
+                "status": "restart_required",
+                "receipt": {},
+            });
+            let (status, _) =
+                decode_operator_launch_receipt(&restart).expect("restart receipt");
+            assert_eq!(status, OperatorLaunchStatus::RestartRequired);
+        }
+
+        #[test]
+        fn operator_launch_receipt_refuses_open_shapes_as_unknown_outcome() {
+            for served in [
+                serde_json::json!({
+                    "operation_id": "op-launch-3",
+                    "status": "pending",
+                    "receipt": {},
+                }),
+                serde_json::json!({
+                    "operation_id": "",
+                    "status": "admitted",
+                    "receipt": {},
+                }),
+                serde_json::json!({
+                    "operation_id": "op-launch-4",
+                    "status": "admitted",
+                    "receipt": "flat-string-is-not-a-receipt",
+                }),
+                serde_json::json!({"status": "admitted", "receipt": {}}),
+            ] {
+                assert!(
+                    matches!(
+                        decode_operator_launch_receipt(&served),
+                        Err(KernelClientError::UnknownOutcome(_))
+                    ),
+                    "open launch shape must stay unknown: {served}"
+                );
+            }
         }
     }
 

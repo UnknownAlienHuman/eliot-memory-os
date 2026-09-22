@@ -59,6 +59,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INVALID_REQUEST_EXIT: i32 = 2;
 const FRONT_DOOR_CLOSED_EXIT: i32 = 69;
 const UNKNOWN_OUTCOME_EXIT: i32 = 75;
+/// The serving owner invalidated the generation/session-bound operator
+/// handoff: the UI must restart through a fresh broker-issued binding.
+const RESTART_REQUIRED_EXIT: i32 = 77;
 const INSTALLATION_INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 const INSTALLATION_CONTRACT_VERSION: &str = "3.0.0";
 const INSTALLATION_SCOPE: &str = "bounded_all_effects_or_exact_rollback";
@@ -3409,6 +3412,27 @@ fn run_ui() -> Result<i32> {
         Err(eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(contract)) => {
             write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
             Ok(FRONT_DOOR_CLOSED_EXIT)
+        }
+        Err(eliot_cli::kernel_client::KernelClientError::RestartRequired(detail)) => {
+            // Generation/session-bound handoff invalidated by the serving
+            // owner: restart through a fresh broker-issued binding. The
+            // consumed endpoint, PID, pipe name, and cached environment are
+            // never continuity evidence.
+            write_json_error("KERNEL_OPERATOR_RESTART_REQUIRED", &detail);
+            Ok(RESTART_REQUIRED_EXIT)
+        }
+        Err(eliot_cli::kernel_client::KernelClientError::UnknownOutcome(detail)) => {
+            // Possibly launched: reconcile the same launch operation by its
+            // operation identity; never resubmit a second launch.
+            write_json_error("KERNEL_OPERATOR_LAUNCH_UNKNOWN", &detail);
+            Ok(UNKNOWN_OUTCOME_EXIT)
+        }
+        Err(eliot_cli::kernel_client::KernelClientError::MissingRequestIdentity) => {
+            write_json_error(
+                "KERNEL_OPERATOR_LAUNCH_NOT_ADMITTED",
+                "no admitted EBP request identity is bound for a broker-admitted operator launch; the identity must arrive through the admitted host request path",
+            );
+            Ok(INVALID_REQUEST_EXIT)
         }
         Err(error) => {
             write_json_error("KERNEL_OPERATOR_LAUNCH_REJECTED", &error.to_string());
