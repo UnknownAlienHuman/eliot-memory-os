@@ -144,7 +144,7 @@ migration = 831
 expiry = "migrate-to-LegacyCueKindV1-under-#831; alias removal #835"
 risk = "none"
 match_count = 2
-matched_digest = "e193b639fd320db6ff49e3ea9af48fe9c143d74814c7784f8b02fecc5a18a513"
+matched_digest = "ab6bcf9293c8c493bb09609588cfc27212357637683b4962d08b84d5614595e4"
 variants = []
 
 [type_row."crates/eliot-app/src/mcp_stdio/protocol_tests.rs"]
@@ -374,7 +374,7 @@ migration = 831
 expiry = "migrate-under-#831; alias removal #835"
 risk = "none"
 match_count = 80
-matched_digest = "31e4cd9709fafaae1103596924b7a5ff08661ae8b883e177aadbeae07df6425a"
+matched_digest = "e2a3418aa629e9ad2067ec45529b74c8546e109f718c6fb94e27533a20a21d98"
 variants = []
 
 [type_row."crates/eliot-store/src/blob_store.rs"]
@@ -401,40 +401,40 @@ variants = []
 role = "oracle"
 owner = "#706"
 migration = 706
-expiry = "frozen-seam-oracle; invalid-on-any-oracle-edit; alias removal tracked by #835"
+expiry = "frozen-seam-oracle; lexical duplicate scan authorized under #832 coherent join; alias removal tracked by #835"
 risk = "none"
-match_count = 68
-matched_digest = "15ab24988d24b0469f63c62c0860950189932d4b7d1cd8711744b90ac7062191"
+match_count = 89
+matched_digest = "900a0dd9c388e078baa54925599e6b4f54ef32ad884a73ae28b164c761e4bbec"
 variants = []
 
 [type_row."crates/smart/eliot-context/src/lib.rs"]
-role = "duplicate"
+role = "internal"
 owner = "#832"
 migration = 832
 expiry = "donor-disposition-under-#832; invalid-on-definition-change"
-risk = "duplicate-definition"
-match_count = 15
-matched_digest = "00e4138427f35573bb5df6f08920f629c89b8cb2c435fed8c36ef980f78bc980"
-variants = ["Path", "Symbol", "Error", "Command", "Service", "TaskClass", "Concept", "Problem"]
+risk = "none"
+match_count = 46
+matched_digest = "bb13ce5a7ba203f62fd0c78b9f6ae400be9b221ada0e20df9366d7a18b6a3142"
+variants = []
 
 [type_row."crates/smart/eliot-cues/src/lib.rs"]
-role = "duplicate"
+role = "internal"
 owner = "#833"
 migration = 833
 expiry = "facade-disposition-under-#833; invalid-on-definition-change"
-risk = "duplicate-definition"
-match_count = 34
-matched_digest = "6434f2969478f134681902e318f4e2217af6df1830f9eb8a55b73ab3f8068826"
-variants = ["FilePath", "DirPath", "Symbol", "ErrorSignature", "CommandPattern", "Dependency", "ApiSurface", "TaskClass", "Subsystem", "Concept"]
+risk = "none"
+match_count = 5
+matched_digest = "52fe5b71c80f39045b257fc409bba3a960b2e443fe7df7ba4db8cda83714aea7"
+variants = []
 
 [type_row."crates/smart/eliot-cues/tests/integrity.rs"]
 role = "duplicate-test"
 owner = "#833"
 migration = 833
 expiry = "facade-disposition-under-#833; invalid-on-definition-change"
-risk = "duplicate-definition"
-match_count = 44
-matched_digest = "cd735a997136a737d47a42e22e6854a6694d441f0fd7f882918281faf05d1416"
+risk = "none"
+match_count = 5
+matched_digest = "188333ab1a99b1cdaa9c2f93b769a26215a45ca96fb30a709d428b0a7d226ad1"
 variants = []
 
 [type_row."crates/smart/eliot-cue-contracts/src/normalization.rs"]
@@ -720,13 +720,13 @@ match_count = 11
 matched_digest = "3cc6054f0d8b45947527416c3ff1bd4c530695a29de4f79d595b6bd9b06d56d7"
 
 [field_row."crates/smart/eliot-context/src/lib.rs"]
-role = "duplicate"
+role = "internal"
 owner = "#832"
 migration = 832
 expiry = "donor-disposition-under-#832; invalid-on-definition-change"
-risk = "duplicate-definition"
-match_count = 1
-matched_digest = "fa63c0e734e76e9d643a9342a1964c4d9886483827b2d3369372d1dc115bf240"
+risk = "none"
+match_count = 9
+matched_digest = "3e49155d2282ecd79d0829e302aa22be1ff114c56628c0805583800263054f1a"
 
 [field_row."crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"]
 role = "current-test"

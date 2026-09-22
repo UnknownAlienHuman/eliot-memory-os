@@ -950,6 +950,8 @@ pub struct CandidateManifest {
     pub testd_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved native worker image.
     pub native_worker_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved WASM-host image.
+    pub wasm_host_artifact_digest: PlatformHandle,
     /// Canonical installation-approved Kernel executable path.
     pub kernel_executable_path: PlatformHandle,
     /// Canonical installation-approved eliot-store-surreal bridge path.
@@ -964,6 +966,8 @@ pub struct CandidateManifest {
     pub testd_executable_path: PlatformHandle,
     /// Canonical installation-approved native worker executable path.
     pub native_worker_executable_path: PlatformHandle,
+    /// Canonical installation-approved WASM-host executable path.
+    pub wasm_host_executable_path: PlatformHandle,
     /// Canonical installation-approved generation configuration path.
     pub config_path: PlatformHandle,
     /// Executable/dependency closure evidence.
@@ -986,7 +990,7 @@ pub struct CandidateManifest {
     /// Runtime Live canary artifact-set evidence reference.
     ///
     /// This is a content-addressed, domain-separated SHA-256 over the
-    /// canonical generation and exact ordered twelve-file Phase-A facts. It is not a
+    /// canonical generation and exact ordered thirteen-file Phase-A facts. It is not a
     /// production release signature; production signing remains unclaimed.
     pub signature_ref: PlatformHandle,
     /// Digest of the exact mutable root topology approved by this manifest.
@@ -1168,12 +1172,16 @@ pub struct RuntimeLaunchDescriptor {
     pub testd_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved native worker image.
     pub native_worker_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved WASM-host image.
+    pub wasm_host_artifact_digest: PlatformHandle,
     /// Explicit installation-approved Doctor executable path.
     pub doctor_executable_path: PlatformHandle,
     /// Explicit installation-approved Testd executable path.
     pub testd_executable_path: PlatformHandle,
     /// Explicit installation-approved native worker executable path.
     pub native_worker_executable_path: PlatformHandle,
+    /// Explicit installation-approved WASM-host executable path.
+    pub wasm_host_executable_path: PlatformHandle,
     /// SHA-256 of the descriptor fields excluding this digest.
     pub descriptor_digest: PlatformHandle,
 }
@@ -1576,6 +1584,23 @@ impl RuntimeLaunchDescriptor {
         Ok((&self.host_executable_path, &self.host_artifact_digest))
     }
 
+    /// Returns the exact approved WASM-host executable path and content digest.
+    ///
+    /// This is the binding B1's Kernel-grant lane feeds to the installed
+    /// binary resolver before staging the reaped P03 child: the descriptor
+    /// self-digest and all path/digest invariants are checked before the
+    /// caller receives it, and the P03 executor re-hashes the file under
+    /// its deny-write lease at launch.
+    pub fn wasm_host_artifact_binding(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.wasm_host_executable_path,
+            &self.wasm_host_artifact_digest,
+        ))
+    }
+
     /// Returns the three dispatch child image digests from the launch
     /// descriptor: Doctor, Testd, and native worker. Validated exactly like
     /// `kernel_artifact_digest`; never defaulted.
@@ -1644,9 +1669,11 @@ impl RuntimeLaunchDescriptor {
             doctor_artifact_digest: &'a PlatformHandle,
             testd_artifact_digest: &'a PlatformHandle,
             native_worker_artifact_digest: &'a PlatformHandle,
+            wasm_host_artifact_digest: &'a PlatformHandle,
             doctor_executable_path: &'a PlatformHandle,
             testd_executable_path: &'a PlatformHandle,
             native_worker_executable_path: &'a PlatformHandle,
+            wasm_host_executable_path: &'a PlatformHandle,
         }
         serde_json::to_vec(&Unsigned {
             profile: self.profile,
@@ -1687,9 +1714,11 @@ impl RuntimeLaunchDescriptor {
             doctor_artifact_digest: &self.doctor_artifact_digest,
             testd_artifact_digest: &self.testd_artifact_digest,
             native_worker_artifact_digest: &self.native_worker_artifact_digest,
+            wasm_host_artifact_digest: &self.wasm_host_artifact_digest,
             doctor_executable_path: &self.doctor_executable_path,
             testd_executable_path: &self.testd_executable_path,
             native_worker_executable_path: &self.native_worker_executable_path,
+            wasm_host_executable_path: &self.wasm_host_executable_path,
         })
         .map_err(|error| InstallationError::InvalidField {
             field: "manifest.runtime_launch".to_owned(),
@@ -1934,9 +1963,25 @@ impl RuntimeLaunchDescriptor {
             &self.native_worker_artifact_digest,
             "runtime_launch.native_worker_artifact_digest",
         )?;
+        approved_path(
+            &self.wasm_host_executable_path,
+            "runtime_launch.wasm_host_executable_path",
+        )?;
+        approved_filename(
+            &self.wasm_host_executable_path,
+            "eliot-wasm-host.exe",
+            "runtime_launch.wasm_host_executable_path",
+        )?;
+        runtime_sha256_handle(
+            &self.wasm_host_artifact_digest,
+            "runtime_launch.wasm_host_artifact_digest",
+        )?;
         if self.doctor_executable_path == self.testd_executable_path
             || self.doctor_executable_path == self.native_worker_executable_path
+            || self.doctor_executable_path == self.wasm_host_executable_path
             || self.testd_executable_path == self.native_worker_executable_path
+            || self.testd_executable_path == self.wasm_host_executable_path
+            || self.native_worker_executable_path == self.wasm_host_executable_path
             || self.doctor_executable_path == self.host_executable_path
             || self.doctor_executable_path == self.watchdog_executable_path
             || self.doctor_executable_path == self.store_bridge_executable_path
@@ -1952,6 +1997,11 @@ impl RuntimeLaunchDescriptor {
             || self.native_worker_executable_path == self.store_bridge_executable_path
             || self.native_worker_executable_path == self.canonical_store_executable_path
             || self.native_worker_executable_path == self.eliotd_executable_path
+            || self.wasm_host_executable_path == self.host_executable_path
+            || self.wasm_host_executable_path == self.watchdog_executable_path
+            || self.wasm_host_executable_path == self.store_bridge_executable_path
+            || self.wasm_host_executable_path == self.canonical_store_executable_path
+            || self.wasm_host_executable_path == self.eliotd_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "runtime_launch.named_artifact_paths".to_owned(),
@@ -2010,6 +2060,10 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.native_worker_executable_path,
                 "runtime_launch.native_worker_executable_path",
+            ),
+            (
+                &self.wasm_host_executable_path,
+                "runtime_launch.wasm_host_executable_path",
             ),
             (&self.store_config_path, "runtime_launch.store_config_path"),
             (
@@ -2088,6 +2142,10 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.native_worker_executable_path,
                 "runtime_launch.native_worker_executable_path",
+            ),
+            (
+                &self.wasm_host_executable_path,
+                "runtime_launch.wasm_host_executable_path",
             ),
         ] {
             self.runtime_state_roots
@@ -2174,6 +2232,10 @@ impl CandidateManifest {
         sha256_handle(
             &self.native_worker_artifact_digest,
             "manifest.native_worker_artifact_digest",
+        )?;
+        sha256_handle(
+            &self.wasm_host_artifact_digest,
+            "manifest.wasm_host_artifact_digest",
         )?;
         approved_path(
             &self.kernel_executable_path,
@@ -2262,27 +2324,49 @@ impl CandidateManifest {
                 &self.native_worker_executable_path,
                 "manifest.native_worker_executable_path",
             )?;
+        approved_path(
+            &self.wasm_host_executable_path,
+            "manifest.wasm_host_executable_path",
+        )?;
+        approved_filename(
+            &self.wasm_host_executable_path,
+            "eliot-wasm-host.exe",
+            "manifest.wasm_host_executable_path",
+        )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(
+                &self.wasm_host_executable_path,
+                "manifest.wasm_host_executable_path",
+            )?;
         if self.kernel_executable_path == self.store_bridge_executable_path
             || self.kernel_executable_path == self.canonical_store_executable_path
             || self.kernel_executable_path == self.host_executable_path
             || self.kernel_executable_path == self.doctor_executable_path
             || self.kernel_executable_path == self.testd_executable_path
             || self.kernel_executable_path == self.native_worker_executable_path
+            || self.kernel_executable_path == self.wasm_host_executable_path
             || self.store_bridge_executable_path == self.canonical_store_executable_path
             || self.store_bridge_executable_path == self.host_executable_path
             || self.store_bridge_executable_path == self.doctor_executable_path
             || self.store_bridge_executable_path == self.testd_executable_path
             || self.store_bridge_executable_path == self.native_worker_executable_path
+            || self.store_bridge_executable_path == self.wasm_host_executable_path
             || self.canonical_store_executable_path == self.host_executable_path
             || self.canonical_store_executable_path == self.doctor_executable_path
             || self.canonical_store_executable_path == self.testd_executable_path
             || self.canonical_store_executable_path == self.native_worker_executable_path
+            || self.canonical_store_executable_path == self.wasm_host_executable_path
             || self.host_executable_path == self.doctor_executable_path
             || self.host_executable_path == self.testd_executable_path
             || self.host_executable_path == self.native_worker_executable_path
+            || self.host_executable_path == self.wasm_host_executable_path
             || self.doctor_executable_path == self.testd_executable_path
             || self.doctor_executable_path == self.native_worker_executable_path
+            || self.doctor_executable_path == self.wasm_host_executable_path
             || self.testd_executable_path == self.native_worker_executable_path
+            || self.testd_executable_path == self.wasm_host_executable_path
+            || self.native_worker_executable_path == self.wasm_host_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
@@ -2331,6 +2415,7 @@ impl CandidateManifest {
             || self.runtime_launch.eliotd_executable_path == self.doctor_executable_path
             || self.runtime_launch.eliotd_executable_path == self.testd_executable_path
             || self.runtime_launch.eliotd_executable_path == self.native_worker_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.wasm_host_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
@@ -2340,6 +2425,7 @@ impl CandidateManifest {
         if self.runtime_launch.doctor_executable_path == self.config_path
             || self.runtime_launch.testd_executable_path == self.config_path
             || self.runtime_launch.native_worker_executable_path == self.config_path
+            || self.runtime_launch.wasm_host_executable_path == self.config_path
         {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.dispatch_executable_path".to_owned(),
@@ -2404,6 +2490,11 @@ impl CandidateManifest {
             &self.native_worker_executable_path,
             "manifest.native_worker_executable_path",
         )?;
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.wasm_host_executable_path,
+            "manifest.wasm_host_executable_path",
+        )?;
         if self.runtime_launch.canonical_store_executable_path
             != self.canonical_store_executable_path
         {
@@ -2427,6 +2518,8 @@ impl CandidateManifest {
                 != self.native_worker_executable_path
             || self.runtime_launch.native_worker_artifact_digest
                 != self.native_worker_artifact_digest
+            || self.runtime_launch.wasm_host_executable_path != self.wasm_host_executable_path
+            || self.runtime_launch.wasm_host_artifact_digest != self.wasm_host_artifact_digest
         {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.artifact_bindings".to_owned(),

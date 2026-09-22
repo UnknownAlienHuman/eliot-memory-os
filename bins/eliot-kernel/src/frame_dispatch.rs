@@ -154,6 +154,42 @@ impl KernelComposition {
             }
             generation
         };
+        let evidence = self.runtime_health_evidence_from_policy_generation(policy_generation)?;
+        serde_json::to_value(evidence).map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Produces the same owner-authenticated carrier for the Host control
+    /// lane. The request boundary has already authenticated the peer and
+    /// candidate; this method rebinds the requested generation and epoch to
+    /// the current front-door policy before reading the Kernel-owned receipts.
+    pub(super) fn runtime_health_evidence_for_control(
+        &self,
+        module_generation: eliot_contracts::ResourceGeneration,
+        authority_epoch: &eliot_contracts::EpochId,
+    ) -> Result<KernelRuntimeHealthEvidence, TransportError> {
+        let policy_generation = {
+            let policy = self
+                .front_door_policy
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if policy.module_generation.generation != module_generation
+                || !policy
+                    .module_generation
+                    .state_fence
+                    .authority_epoch
+                    .is_same_authority(authority_epoch)
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            policy.module_generation.clone()
+        };
+        self.runtime_health_evidence_from_policy_generation(policy_generation)
+    }
+
+    fn runtime_health_evidence_from_policy_generation(
+        &self,
+        policy_generation: eliot_runtime_contracts::ModuleGeneration,
+    ) -> Result<KernelRuntimeHealthEvidence, TransportError> {
         policy_generation
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -247,7 +283,7 @@ impl KernelComposition {
             super::dispatch_launch::doctor_repair_advertised(),
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        serde_json::to_value(evidence).map_err(|_| TransportError::SessionFenced)
+        Ok(evidence)
     }
 
     /// Only an ORS record for this authenticated daemon generation and epoch

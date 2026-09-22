@@ -32,7 +32,7 @@ pub const CURRENT_NORMATIVE_PAIR_KEY: &str =
 /// The transport `status` is deliberately retained beside, rather than used
 /// in place of, the canonical projections. `doctor_repair_advertised` is an
 /// orthogonal observation and carries no readiness authority.
-#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelRuntimeHealthEvidence {
     /// Authenticated front-door state. Only `OPEN` can be consumed.

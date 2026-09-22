@@ -8,6 +8,7 @@ description = "ELIOT Smart context admission, orientation and decision-local vie
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-cue-contracts = { path = "../eliot-cue-contracts", version = "0.1.0" }
 eliot-evidence.workspace = true
 schemars.workspace = true
 serde.workspace = true

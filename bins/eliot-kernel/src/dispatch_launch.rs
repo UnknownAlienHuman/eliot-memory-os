@@ -4233,12 +4233,20 @@ mod tests {
 
     use super::*;
     use eliot_contracts::{EpochLineageId, ResourceGeneration};
+    use eliot_ipc::TransportError;
     use eliot_ipc::{PeerIdentity, Session};
+    use eliot_kernel_core::{
+        CURRENT_IMPLEMENTATION_SOURCE_DIGEST, CURRENT_NORMATIVE_PAIR_KEY,
+        HANDSHAKE_ENVELOPE_VERSION, HealthDimensionKind, KernelRuntimeHealthEvidence,
+        StateMigrationClass, expected_seal_tag,
+    };
     use eliot_kernel_service::{
         KernelActivationPermit, KernelControlCommand, KernelReadyReceipt, KernelServiceState,
         TESTD_ADMISSION_WIRE_ID, TESTD_ADMISSION_WIRE_VERSION, TestdAdmissionResponse,
     };
-    use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
+    use eliot_runtime_contracts::{
+        GenerationCutoverState, HealthDimension, HealthVector, ServiceProcessState,
+    };
     use std::num::NonZeroU64;
 
     use crate::KernelConfig;
@@ -4634,6 +4642,20 @@ mod tests {
         match &frame.payload {
             eliot_protocol::ProtocolPayload::Json(value) => value.clone(),
             _ => panic!("dispatch reply must carry a JSON payload"),
+        }
+    }
+
+    fn health_heartbeat(session: &Session) -> eliot_protocol::Frame {
+        eliot_protocol::Frame {
+            protocol_version: session.protocol_version,
+            encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+            connection_id: session.connection_id.clone(),
+            request_id: None,
+            kind: eliot_protocol::FrameKind::Heartbeat,
+            message_type: eliot_protocol::MessageType::Health,
+            request_identity: None,
+            payload: eliot_protocol::ProtocolPayload::Json(serde_json::json!({"probe": true})),
+            trace_context: BTreeMap::new(),
         }
     }
 
@@ -6036,7 +6058,9 @@ mod tests {
     }
 
     /// The heartbeat reply carries the composed advertisement flag through
-    /// the closed dispatch gateway.
+    /// the closed dispatch gateway and projects the complete authenticated
+    /// I1.10/I1.12 carrier. This is intentionally decoded through the shared
+    /// consumer type so a field omitted or rebound by the producer fails here.
     #[test]
     fn heartbeat_reports_composed_advertisement_flag() {
         // The contour cell may already be composed by the lifecycle test
@@ -6045,17 +6069,7 @@ mod tests {
         let root = temp_root("heartbeat");
         let kernel = ready_kernel(&root);
         let session = worker_session(&kernel, DispatchedWorkerKind::Testd.module_id());
-        let heartbeat = eliot_protocol::Frame {
-            protocol_version: session.protocol_version,
-            encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
-            connection_id: session.connection_id.clone(),
-            request_id: None,
-            kind: eliot_protocol::FrameKind::Heartbeat,
-            message_type: eliot_protocol::MessageType::Health,
-            request_identity: None,
-            payload: eliot_protocol::ProtocolPayload::Json(serde_json::json!({"probe": true})),
-            trace_context: BTreeMap::new(),
-        };
+        let heartbeat = health_heartbeat(&session);
         let expected = doctor_repair_advertised();
         let action = kernel
             .dispatch_frame(&session, &heartbeat)
@@ -6063,6 +6077,9 @@ mod tests {
         match action {
             crate::KernelFrameAction::Reply(frame) => {
                 let payload = reply_payload(&frame);
+                let evidence: KernelRuntimeHealthEvidence =
+                    serde_json::from_value(payload.clone()).expect("canonical health carrier");
+                evidence.validate().expect("producer carrier validates");
                 assert_eq!(
                     payload.get("status").and_then(serde_json::Value::as_str),
                     Some("OPEN")
@@ -6074,9 +6091,127 @@ mod tests {
                     Some(expected),
                     "heartbeat must echo the live composed advertisement"
                 );
+                assert_eq!(evidence.status, "OPEN");
+                assert_eq!(evidence.authority_epoch, session.authority_epoch);
+                assert_eq!(
+                    evidence.module_generation,
+                    session.module_generation.generation
+                );
+
+                let compatibility = evidence.compatibility_evidence();
+                assert_eq!(compatibility.envelope_version(), HANDSHAKE_ENVELOPE_VERSION);
+                assert_eq!(compatibility.protocol_version(), 1);
+                assert_eq!(compatibility.canonical_format_version(), 1);
+                assert_eq!(
+                    compatibility.module_generation(),
+                    session.module_generation.generation
+                );
+                assert_eq!(compatibility.authority_epoch(), &session.authority_epoch);
+                assert_eq!(
+                    compatibility.migration_class(),
+                    StateMigrationClass::NoMigration
+                );
+                assert_eq!(
+                    compatibility.architecture_source_digest(),
+                    eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST
+                );
+                assert_eq!(evidence.normative_pair_key, CURRENT_NORMATIVE_PAIR_KEY);
+                assert_eq!(
+                    evidence.implementation_source_digest,
+                    CURRENT_IMPLEMENTATION_SOURCE_DIGEST
+                );
+                assert_eq!(
+                    expected_seal_tag(compatibility.architecture_source_digest()),
+                    compatibility.seal_tag()
+                );
+
+                let process = evidence.process_health();
+                assert_eq!(process.process_state(), ServiceProcessState::Ready);
+                assert_eq!(process.generation_state(), session.module_generation.state);
+                assert_eq!(process.cutover_state(), GenerationCutoverState::Preparing);
+                assert!(!process.generation_is_active());
+                assert!(!process.cutover_is_complete());
+                let health = process.health();
+                assert_eq!(health.canonical, HealthVector::healthy());
+                for kind in [
+                    HealthDimensionKind::Liveness,
+                    HealthDimensionKind::Readiness,
+                    HealthDimensionKind::Freshness,
+                    HealthDimensionKind::Compatibility,
+                    HealthDimensionKind::Integrity,
+                    HealthDimensionKind::Capacity,
+                ] {
+                    assert_eq!(health.dimension(kind), HealthDimension::Healthy);
+                }
+                assert!(matches!(
+                    health.dimension(HealthDimensionKind::SupervisionCoverage),
+                    HealthDimension::Healthy | HealthDimension::Unknown
+                ));
+                assert_eq!(evidence.capability_readiness().len(), 1);
+                let readiness = &evidence.capability_readiness()[0];
+                assert_eq!(readiness.capability(), "worker.execute");
+                assert_eq!(
+                    readiness.required_dimensions(),
+                    &[
+                        HealthDimensionKind::Liveness,
+                        HealthDimensionKind::Readiness,
+                        HealthDimensionKind::Compatibility,
+                        HealthDimensionKind::Integrity,
+                        HealthDimensionKind::Capacity,
+                        HealthDimensionKind::SupervisionCoverage,
+                    ]
+                );
+                assert_eq!(
+                    process.capability_is_current(readiness),
+                    matches!(health.supervision_coverage, HealthDimension::Healthy)
+                );
             }
             _ => panic!("heartbeat must reply"),
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The same authenticated heartbeat route fences every stale binding
+    /// before it can project health: a stale resource generation, a changed
+    /// state-fence epoch, and a foreign Authority Epoch are all rejected by
+    /// the live Kernel policy join. These cases use the real ready composition
+    /// and mutate only the presented session snapshot.
+    #[test]
+    fn heartbeat_refuses_stale_generation_state_fence_and_authority_epoch() {
+        let root = temp_root("heartbeat-fences");
+        let kernel = ready_kernel(&root);
+        let session = worker_session(&kernel, DispatchedWorkerKind::Testd.module_id());
+        let heartbeat = health_heartbeat(&session);
+
+        let mut stale_generation = session.clone();
+        stale_generation.module_generation.generation =
+            ResourceGeneration::new(2).expect("stale generation");
+        assert!(matches!(
+            kernel.dispatch_frame(&stale_generation, &heartbeat),
+            Err(TransportError::SessionFenced)
+        ));
+
+        let mut mismatched_fence = session.clone();
+        mismatched_fence
+            .module_generation
+            .state_fence
+            .authority_epoch = test_epoch(2);
+        assert!(matches!(
+            kernel.dispatch_frame(&mismatched_fence, &heartbeat),
+            Err(TransportError::SessionFenced)
+        ));
+
+        let mut foreign_epoch = session.clone();
+        foreign_epoch.authority_epoch = EpochId::new(
+            EpochLineageId::new("660e8400-e29b-41d4-a716-446655440000").expect("foreign lineage"),
+            NonZeroU64::new(1).expect("foreign sequence"),
+        )
+        .expect("foreign epoch");
+        assert!(matches!(
+            kernel.dispatch_frame(&foreign_epoch, &heartbeat),
+            Err(TransportError::SessionFenced)
+        ));
+
         let _ = std::fs::remove_dir_all(root);
     }
 

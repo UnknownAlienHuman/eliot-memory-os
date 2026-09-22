@@ -1535,9 +1535,11 @@ fn live_receipt_manifest(
         doctor_artifact_digest: handle("b".repeat(64)),
         testd_artifact_digest: handle("c".repeat(64)),
         native_worker_artifact_digest: handle("d".repeat(64)),
+        wasm_host_artifact_digest: handle("f".repeat(64)),
         doctor_executable_path: path("eliot-doctor.exe"),
         testd_executable_path: path("eliot-testd.exe"),
         native_worker_executable_path: path("eliot-native-worker.exe"),
+        wasm_host_executable_path: path("eliot-wasm-host.exe"),
         descriptor_digest: handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch
@@ -1556,6 +1558,7 @@ fn live_receipt_manifest(
         doctor_artifact_digest: handle("b".repeat(64)),
         testd_artifact_digest: handle("c".repeat(64)),
         native_worker_artifact_digest: handle("d".repeat(64)),
+        wasm_host_artifact_digest: handle("f".repeat(64)),
         kernel_executable_path,
         store_bridge_executable_path,
         canonical_store_executable_path,
@@ -1563,6 +1566,7 @@ fn live_receipt_manifest(
         doctor_executable_path: path("eliot-doctor.exe"),
         testd_executable_path: path("eliot-testd.exe"),
         native_worker_executable_path: path("eliot-native-worker.exe"),
+        wasm_host_executable_path: path("eliot-wasm-host.exe"),
         config_path: store_config_path,
         dependency_closure_refs: vec![handle("evidence:dependency-closure".to_owned())],
         license_refs: vec![handle("evidence:licenses".to_owned())],

@@ -9,11 +9,22 @@ description = "ELIOT bounded, revision-fenced cue projection and activation cont
 [dependencies]
 blake3.workspace = true
 eliot-contracts.workspace = true
+eliot-cue-activation = { path = "../eliot-cue-activation" }
+eliot-cue-binding = { path = "../eliot-cue-binding" }
 eliot-cue-contracts = { path = "../eliot-cue-contracts" }
+eliot-cue-index = { path = "../eliot-cue-index" }
+eliot-cue-normalizer = { path = "../eliot-cue-normalizer" }
 eliot-evidence.workspace = true
+eliot-observation = { path = "../../governor/eliot-observation" }
 schemars.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+eliot-change-monitor = { path = "../../governor/eliot-change-monitor" }
+eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts" }
+eliot-receipts = { path = "../../foundation/eliot-receipts" }
+serde_json.workspace = true
 
 [lints]
 workspace = true
