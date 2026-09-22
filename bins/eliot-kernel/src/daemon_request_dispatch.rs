@@ -17,7 +17,7 @@ mod store_receipt_dispatch;
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, sha256_hex};
-use eliot_kernel_service::AuthenticatedHostSession;
+use eliot_kernel_service::{AuthenticatedHostSession, AuthenticatedReactiveSession};
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlOperation, OriginControlPresentation,
     ProcessExecutionView, ProcessLifecycle,
@@ -1447,46 +1447,88 @@ impl KernelComposition {
         if attempt != self.local_read_attempt_capability(&envelope, &operation_id, &current)? {
             return Err(TransportError::SessionFenced);
         }
-        let mut parameters = BTreeMap::new();
-        parameters.insert(
-            "subject".to_owned(),
-            serde_json::Value::String(selectors.subject.clone()),
-        );
-        parameters.insert(
-            "max_records".to_owned(),
-            serde_json::Value::String(selectors.max_records.to_string()),
-        );
-        let read = NamedReadRequest {
-            operation: NamedReadOperation::GetEvidencePack,
-            scope_id: Some(selectors.scope_id.clone()),
-            consistency: ReadConsistency::Eventual,
-            state_fence: envelope.state_fence.clone(),
-            parameters,
+        let (digest, body) = if let Some(uri) = selectors.exact_resource_uri.as_deref() {
+            // Exact-resource reads stay on the admitted local-read attempt,
+            // but bypass the evidence-pack catalogue. The reactive owner
+            // re-checks live service authority and the exact fence before
+            // entering the retained canonical Store gateway.
+            let context = host_request_route::local_read_request_metadata(&envelope)?;
+            validate_store_session_fence(session, &envelope.state_fence)?;
+            let principal = envelope
+                .identity
+                .session_id
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)?;
+            let gateway = self.retained_store_gateway()?;
+            let client = host_request_route::ReactiveRestoreStoreClient::new(gateway);
+            // KernelService is a synchronous composition owner. Keep its
+            // guard entirely inside the blocking bridge so the daemon
+            // request future remains Send while the existing reactive owner
+            // performs its asynchronous canonical Store read.
+            let service = Arc::clone(&self.service);
+            let fence = envelope.state_fence.clone();
+            let uri = uri.to_owned();
+            let principal = principal.to_owned();
+            let served = tokio::task::block_in_place(|| {
+                let service = service.lock().map_err(|_| TransportError::SessionFenced)?;
+                let reactive_session = AuthenticatedReactiveSession::bind(&service, &principal)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                tokio::runtime::Handle::current()
+                    .block_on(
+                        crate::reactive_restore_serve::serve_exact_resource_snapshot(
+                            &client,
+                            &service,
+                            &reactive_session,
+                            &context,
+                            &fence,
+                            &uri,
+                        ),
+                    )
+                    .map_err(|_| TransportError::SessionFenced)
+            })?;
+            host_request_route::build_exact_resource_result_body(&envelope, &uri, served)?
+        } else {
+            let mut parameters = BTreeMap::new();
+            parameters.insert(
+                "subject".to_owned(),
+                serde_json::Value::String(selectors.subject.clone()),
+            );
+            parameters.insert(
+                "max_records".to_owned(),
+                serde_json::Value::String(selectors.max_records.to_string()),
+            );
+            let read = NamedReadRequest {
+                operation: NamedReadOperation::GetEvidencePack,
+                scope_id: Some(selectors.scope_id.clone()),
+                consistency: ReadConsistency::Eventual,
+                state_fence: envelope.state_fence.clone(),
+                parameters,
+            };
+            if let Err(error) = check_local_read_request(&read) {
+                return Ok(Self::store_error_response_text("local_read", &error));
+            }
+            validate_store_session_fence(session, &read.state_fence)?;
+            let gateway = self.retained_store_gateway()?;
+            let response = match gateway.execute_named(read).await {
+                Ok(response) => response,
+                Err(error) => return Ok(Self::store_error_response_text("local_read", &error)),
+            };
+            if response.operation != NamedReadOperation::GetEvidencePack {
+                return Ok(Self::store_error_response_text(
+                    "local_read",
+                    "named-read operation does not match request",
+                ));
+            }
+            AuthenticatedHostSession::build_local_read_result_body(
+                &envelope,
+                selectors.scope_id.as_str(),
+                &selectors.subject,
+                selectors.max_records,
+                &selectors.intent_mode,
+                response.payload,
+            )
+            .map_err(|_| TransportError::SessionFenced)?
         };
-        if let Err(error) = check_local_read_request(&read) {
-            return Ok(Self::store_error_response_text("local_read", &error));
-        }
-        validate_store_session_fence(session, &read.state_fence)?;
-        let gateway = self.retained_store_gateway()?;
-        let response = match gateway.execute_named(read).await {
-            Ok(response) => response,
-            Err(error) => return Ok(Self::store_error_response_text("local_read", &error)),
-        };
-        if response.operation != NamedReadOperation::GetEvidencePack {
-            return Ok(Self::store_error_response_text(
-                "local_read",
-                "named-read operation does not match request",
-            ));
-        }
-        let (digest, body) = AuthenticatedHostSession::build_local_read_result_body(
-            &envelope,
-            selectors.scope_id.as_str(),
-            &selectors.subject,
-            selectors.max_records,
-            &selectors.intent_mode,
-            response.payload,
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
         // The sync leg completes through the shared submit gate, never
         // through a private persist: attempt currency, deadline, fence, and
         // staleness joins are identical to the async submit leg. A concurrent

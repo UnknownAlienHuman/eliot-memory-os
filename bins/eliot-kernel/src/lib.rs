@@ -217,7 +217,8 @@ pub use doctor_recovery_ledger::{KernelDoctorRecoveryLedger, doctor_recovery_led
 /// worker binding is invented (worker handoff is T12-09).
 pub use dreamer_job_dispatch::DREAMER_JOB_WIRE_ID;
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, RequestId, ResourceGeneration, StateFence,
+    ArtifactId, AuthorityEpoch, ContractId, RequestId, RequestMetadata, ResourceGeneration,
+    StateFence,
 };
 use eliot_ipc::{
     AcceptedAgentBridgeTransport, HandshakeResult, PeerIdentity, ServerFirstConnection,
@@ -331,7 +332,7 @@ use eliot_protocol::{
     AgentBridgeActivationDisposition, AgentBridgeActivationFence, AgentBridgeActivationRequest,
     AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration,
     AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind,
-    MessageType, ProtocolPayload,
+    HostRequestEnvelope, MessageType, ProtocolPayload, ReactiveRestoreQuery,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 #[cfg(test)]
@@ -812,6 +813,22 @@ pub enum KernelFrameAction {
         operation: String,
         /// Bounded operation payload carrying context plus typed job request.
         payload: serde_json::Value,
+    },
+    /// Execute one authenticated reactive restore over the existing Host
+    /// request admission and canonical Store projection path.  The query and
+    /// request metadata were decoded and linked by the central Host route;
+    /// Store I/O and durable result landing happen in the async front-door
+    /// arm, never in the decoder.
+    #[cfg(windows)]
+    ReactiveRestore {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Exact admitted Host request envelope.
+        envelope: HostRequestEnvelope,
+        /// Request metadata carried by the authenticated frame identity.
+        context: RequestMetadata,
+        /// Exact restore query whose canonical digest is bound by the envelope.
+        query: ReactiveRestoreQuery,
     },
     /// Return a typed rejection, then fence the connection.
     Fence(Frame),
