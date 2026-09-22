@@ -194,7 +194,8 @@ pub use user_automation_execution::{
 };
 pub use user_automation_execution_client::{
     USER_AUTOMATION_HOST_EXECUTION_PIPE, USER_AUTOMATION_HOST_EXECUTION_WIRE_ID,
-    USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION,
+    USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION, USER_AUTOMATION_KERNEL_CAPABILITY,
+    USER_AUTOMATION_KERNEL_MODULE_ID, USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING,
     UserAutomationHostChannelBinding, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionFailure, UserAutomationHostExecutionOperation,
     UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,

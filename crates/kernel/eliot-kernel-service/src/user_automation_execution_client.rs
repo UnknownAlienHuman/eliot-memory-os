@@ -28,6 +28,17 @@ use super::{
 pub const USER_AUTOMATION_HOST_EXECUTION_WIRE_ID: &str = "eliot.user_automation.host_execution";
 /// Current semantic revision of the typed UserAutomation Host execution wire.
 pub const USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION: u16 = 1;
+/// Authenticated Kernel front-door module identity used by the Host owner join.
+///
+/// This is a transport principal only.  The Kernel derives its requester role
+/// from this authenticated session and still validates the typed Dreamer
+/// operation and State Fence before calling the canonical Store gateway.
+pub const USER_AUTOMATION_KERNEL_MODULE_ID: &str = "eliot-host-user-automation";
+/// Shared least-privilege capability advertised by the Host owner session.
+pub const USER_AUTOMATION_KERNEL_CAPABILITY: &str = "eliot.kernel.dreamer-job";
+/// Stable server principal projection for the Host owner session.
+pub const USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING: &str =
+    "eliot-kernel::host-user-automation:v1";
 /// Existing authenticated Host runtime-control pipe carrying this typed route.
 pub const USER_AUTOMATION_HOST_EXECUTION_PIPE: &str =
     r"\\.\pipe\eliot\host\runtime-control-v1";

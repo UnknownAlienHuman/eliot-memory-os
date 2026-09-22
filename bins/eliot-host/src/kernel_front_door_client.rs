@@ -14,14 +14,32 @@
 use std::path::Path;
 use std::time::Duration;
 
-use eliot_contracts::ResourceGeneration;
+use eliot_contracts::{ArtifactId, ContractId, ContractVersion, RequestMetadata, ResourceGeneration};
 use eliot_ipc::{NamedPipeTransport, PeerIdentity};
 use eliot_kernel_service::{
     HostKernelCandidateBinding, KernelActivationReceipt, KernelControlCommand,
-    KernelControlRequest, KernelControlResponse,
+    KernelControlRequest, KernelControlResponse, USER_AUTOMATION_KERNEL_CAPABILITY,
+    USER_AUTOMATION_KERNEL_MODULE_ID, USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING,
 };
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{ProcessIdentity, observe_named_pipe_peer_process_in_job};
+
+#[cfg(windows)]
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
+#[cfg(windows)]
+use eliot_host_service::{HostDurableJobOwner, HostDurableJobOwnerError};
+#[cfg(windows)]
+use eliot_ipc::{
+    DeliveryOutcome, TransportLimits, client_hello_frame, decode_server_hello_frame,
+};
+#[cfg(windows)]
+use eliot_protocol::{
+    ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
+};
+#[cfg(windows)]
+use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
+#[cfg(windows)]
+use eliot_runtime_contracts::{HealthVector, ModuleContract, ModuleGeneration, ModuleGenerationState};
 
 use super::{HostError, LOCAL_SERVICE_SID};
 
@@ -248,5 +266,264 @@ pub(super) async fn connect_authenticated_kernel_front_door(
         _ => Err(HostError::ProcessContour(
             "Kernel front-door extra SID does not match the retained bridge policy".to_owned(),
         )),
+    }
+}
+
+/// Host-side Durable Job owner joined to the live Kernel front door.
+///
+/// The owner retains only the Host-approved candidate, the Kernel-authored
+/// activation receipt, and the OS-observed Kernel process. Each operation
+/// opens the existing authenticated front door, proves the generation-bound
+/// Host session, and sends one typed Dreamer request. It never opens Store,
+/// derives a job, or retries an uncertain mutation.
+#[cfg(windows)]
+pub(super) struct HostKernelUserAutomationOwner {
+    candidate: HostKernelCandidateBinding,
+    activation: KernelActivationReceipt,
+    kernel_process: ProcessIdentity,
+    activation_digest: String,
+}
+
+#[cfg(windows)]
+impl HostKernelUserAutomationOwner {
+    pub(super) fn new(
+        candidate: HostKernelCandidateBinding,
+        activation: KernelActivationReceipt,
+        kernel_process: ProcessIdentity,
+    ) -> Result<Self, HostError> {
+        candidate
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if activation.candidate_binding_digest != candidate_digest
+            || activation.authority_epoch != candidate.kernel_epoch
+            || activation.generation.value() == 0
+            || kernel_process.process_id != candidate.job_binding.root.process.process_id
+            || kernel_process.start_time_100ns
+                != candidate.job_binding.root.process.start_time_100ns
+            || !kernel_process
+                .image_path
+                .eq_ignore_ascii_case(&candidate.job_binding.root.process.image_path)
+        {
+            return Err(HostError::ProcessContour(
+                "Kernel UserAutomation owner is not bound to the retained active contour"
+                    .to_owned(),
+            ));
+        }
+        let activation_digest = sha256_hex(
+            &canonical_json_bytes(&activation)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        );
+        Ok(Self {
+            candidate,
+            activation,
+            kernel_process,
+            activation_digest,
+        })
+    }
+
+    fn client_hello(&self) -> Result<ClientHello, HostDurableJobOwnerError> {
+        let module_id = ContractId::new(USER_AUTOMATION_KERNEL_MODULE_ID)
+            .map_err(|error| owner_unavailable(error.to_string()))?;
+        let artifact_id = ArtifactId::new(self.candidate.artifact_hash.as_str())
+            .map_err(|error| owner_unavailable(error.to_string()))?;
+        let state_fence = eliot_contracts::StateFence::new(
+            self.candidate.kernel_epoch.clone(),
+            self.activation.generation.clone(),
+        );
+        let module_contract = ModuleContract {
+            module_id: module_id.clone(),
+            version: ContractVersion::new(1, 0, 0),
+            artifact_id: artifact_id.clone(),
+            protocols: vec![
+                "eliot.s03.ebp.v1".to_owned(),
+                "eliot.kernel.dreamer-job.v1".to_owned(),
+            ],
+            required_capabilities: vec![USER_AUTOMATION_KERNEL_CAPABILITY.to_owned()],
+            optional_capabilities: Vec::new(),
+            advisory_capabilities: Vec::new(),
+            state_owner: "eliot-host".to_owned(),
+            failure_domain: "eliot-host-user-automation".to_owned(),
+            hot_replace: false,
+        };
+        Ok(ClientHello {
+            protocol_range: eliot_protocol::ProtocolRange {
+                minimum: ProtocolVersion::CURRENT,
+                maximum: ProtocolVersion::CURRENT,
+            },
+            module_bridge_identity: USER_AUTOMATION_KERNEL_MODULE_ID.to_owned(),
+            artifact_hash: artifact_id.clone(),
+            module_contract,
+            module_generation: ModuleGeneration {
+                module_id,
+                generation: self.activation.generation.clone(),
+                artifact_id,
+                state: ModuleGenerationState::Active,
+                health: HealthVector::healthy(),
+                state_fence,
+            },
+            launch_nonce: self.activation_digest.clone(),
+            capabilities: vec![USER_AUTOMATION_KERNEL_CAPABILITY.to_owned()],
+            privacy_classes: vec!["PUBLIC".to_owned()],
+            max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
+                .map_err(|error| owner_unavailable(error.to_string()))?,
+            authority_epoch: self.candidate.kernel_epoch.clone(),
+        })
+    }
+
+    async fn execute_dreamer_job(
+        &self,
+        context: &RequestMetadata,
+        request: DurableJobRequest,
+    ) -> Result<DurableJobResponse, HostDurableJobOwnerError> {
+        request
+            .validate()
+            .map_err(|error| HostDurableJobOwnerError::Rejected(error.to_string()))?;
+        let request_id = request.request_identity.request.request.metadata.request_id.clone();
+        let connection_id = format!(
+            "host-user-automation:{}:{}",
+            self.activation.operation_id.as_str(),
+            request_id.as_str()
+        );
+        let mut transport = connect_authenticated_kernel_front_door(
+            &self.candidate,
+            &self.kernel_process,
+        )
+        .await
+        .map_err(|error| owner_unavailable(error.to_string()))?;
+        let limits = TransportLimits::default();
+        let hello = self.client_hello()?;
+        let hello_frame = client_hello_frame(&connection_id, &hello)
+            .map_err(|error| owner_unavailable(error.to_string()))?;
+        match transport
+            .send_frame(&hello_frame, limits)
+            .await
+            .map_err(|error| owner_unavailable(error.to_string()))?
+        {
+            DeliveryOutcome::Delivered => {}
+            DeliveryOutcome::UnknownOutcome => {
+                return Err(owner_unknown(
+                    "Kernel Host UserAutomation handshake delivery is unknown",
+                ));
+            }
+        }
+        let server_frame = transport
+            .receive_frame(limits)
+            .await
+            .map_err(|error| owner_unavailable(error.to_string()))?;
+        let server = decode_server_hello_frame(&server_frame, &connection_id)
+            .map_err(|error| owner_unavailable(error.to_string()))?;
+        if server.authority_epoch != self.candidate.kernel_epoch
+            || server.session_principal_binding != USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING
+            || server.allowed_capabilities.len() != 1
+            || server.allowed_capabilities[0] != USER_AUTOMATION_KERNEL_CAPABILITY
+        {
+            return Err(owner_unavailable(
+                "Kernel Host UserAutomation session binding is not exact",
+            ));
+        }
+
+        let frame = Frame {
+            protocol_version: server.selected_protocol,
+            encoding_profile: EncodingProfile::JsonV1,
+            connection_id: connection_id.clone(),
+            request_id: Some(request_id.clone()),
+            kind: FrameKind::Request,
+            message_type: MessageType::Execute,
+            request_identity: Some(request.request_identity.request.clone()),
+            payload: ProtocolPayload::Json(
+                serde_json::json!({
+                    "operation": USER_AUTOMATION_KERNEL_CAPABILITY,
+                    "context": context,
+                    "request": request,
+                }),
+            ),
+            trace_context: std::collections::BTreeMap::new(),
+        };
+        frame
+            .validate()
+            .map_err(|error| HostDurableJobOwnerError::Rejected(error.to_string()))?;
+        match transport
+            .send_frame(&frame, limits)
+            .await
+            .map_err(|error| owner_unknown(error.to_string()))?
+        {
+            DeliveryOutcome::Delivered => {}
+            DeliveryOutcome::UnknownOutcome => {
+                return Err(owner_unknown(
+                    "Kernel Durable Job delivery crossed an unknown boundary",
+                ));
+            }
+        }
+        let response_frame = transport
+            .receive_frame(limits)
+            .await
+            .map_err(|error| owner_unknown(error.to_string()))?;
+        if response_frame.connection_id != connection_id
+            || response_frame.kind != FrameKind::Response
+            || response_frame.message_type != MessageType::Result
+            || response_frame.request_id.as_ref() != Some(&request_id)
+        {
+            return Err(owner_unknown(
+                "Kernel Durable Job response correlation is not exact",
+            ));
+        }
+        let ProtocolPayload::Json(payload) = response_frame.payload else {
+            return Err(owner_unknown("Kernel Durable Job response payload is invalid"));
+        };
+        if payload.get("status").and_then(serde_json::Value::as_str) == Some("error") {
+            let reason = payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Kernel Durable Job rejected the request")
+                .to_owned();
+            return Err(classify_kernel_owner_error(reason));
+        }
+        let response: DurableJobResponse = serde_json::from_value(payload)
+            .map_err(|error| owner_unknown(error.to_string()))?;
+        response
+            .validate_for(&request)
+            .map_err(|error| HostDurableJobOwnerError::Rejected(error.to_string()))?;
+        Ok(response)
+    }
+}
+
+#[cfg(windows)]
+impl HostDurableJobOwner for HostKernelUserAutomationOwner {
+    async fn dreamer_job(
+        &self,
+        context: &RequestMetadata,
+        request: DurableJobRequest,
+    ) -> Result<DurableJobResponse, eliot_host_service::HostDurableJobOwnerError> {
+        self.execute_dreamer_job(context, request).await
+    }
+}
+
+#[cfg(windows)]
+fn owner_unavailable(reason: impl Into<String>) -> HostDurableJobOwnerError {
+    HostDurableJobOwnerError::Unavailable(reason.into())
+}
+
+#[cfg(windows)]
+fn owner_unknown(reason: impl Into<String>) -> HostDurableJobOwnerError {
+    HostDurableJobOwnerError::UnknownOutcome(reason.into())
+}
+
+#[cfg(windows)]
+fn classify_kernel_owner_error(reason: String) -> HostDurableJobOwnerError {
+    let folded = reason.to_ascii_lowercase();
+    if folded.contains("unknown")
+        || folded.contains("outcome")
+        || folded.contains("timeout")
+        || folded.contains("timed out")
+        || folded.contains("fenced")
+    {
+        owner_unknown(reason)
+    } else if folded.contains("unavailable") || folded.contains("not ready") {
+        owner_unavailable(reason)
+    } else {
+        HostDurableJobOwnerError::Rejected(reason)
     }
 }

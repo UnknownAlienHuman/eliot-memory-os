@@ -167,6 +167,32 @@ fn dreamer_store_error_fences(error: &str) -> bool {
 }
 
 impl KernelComposition {
+    /// Admits the Host UserAutomation requester arm after the front-door
+    /// binder has proven the exact Host process and live activation contour.
+    /// The session capability is still checked here so direct dispatch calls
+    /// cannot bypass the least-privilege boundary.
+    fn admit_host_user_automation_caller(
+        session: &Session,
+        envelope: &DreamerJobEnvelope,
+    ) -> Result<(), TransportError> {
+        if session.module_generation.module_id.as_str() != USER_AUTOMATION_KERNEL_MODULE_ID
+            || !session
+                .capabilities
+                .iter()
+                .any(|capability| capability == USER_AUTOMATION_KERNEL_CAPABILITY)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let derived = JobRole::Requester;
+        if envelope.request.role != derived
+            || !derived.permits(envelope.request.operation.kind())
+            || session.module_generation.state_fence != envelope.context.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
     /// Admits one decoded K2 envelope against the presenting session.
     ///
     /// The role is derived from the actual authenticated session only: the
@@ -262,7 +288,9 @@ impl KernelComposition {
         session: &Session,
         envelope: &DreamerJobEnvelope,
     ) -> Result<(), TransportError> {
-        if session.module_generation.module_id.as_str() == DREAMER_MODULE_ID {
+        if session.module_generation.module_id.as_str() == USER_AUTOMATION_KERNEL_MODULE_ID {
+            Self::admit_host_user_automation_caller(session, envelope)
+        } else if session.module_generation.module_id.as_str() == DREAMER_MODULE_ID {
             Self::admit_dreamer_worker_lease(session, envelope)
         } else {
             self.admit_dreamer_caller(session, envelope)
@@ -359,7 +387,10 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let module = session.module_generation.module_id.as_str();
-        if module != ACTIVE_DAEMON_CALLER && module != DREAMER_MODULE_ID {
+        if module != ACTIVE_DAEMON_CALLER
+            && module != DREAMER_MODULE_ID
+            && module != USER_AUTOMATION_KERNEL_MODULE_ID
+        {
             return Err(TransportError::SessionFenced);
         }
         session

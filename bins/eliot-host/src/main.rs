@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use eliot_host::{
     HostBranchDisposition, HostLivenessTick, HostReactiveContextProducer,
     HostRuntimeControlOperation, HostRuntimeControlResponse,
-    HostUserAutomationExecutionQueue, reject_unbound_user_automation_execution,
+    HostUserAutomationExecutionQueue,
 };
 use eliot_host::{
     HostComposition, HostError, HostLaunchOptions, HostPhaseBRequestQueue, PROTOCOL_VERSION,
@@ -867,7 +867,14 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
     let _ = report_service_status(&handle, &report);
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
         process_phase_b_requests(&mut host, &phase_b_queue);
-        process_user_automation_requests(&user_automation_queue);
+        if let Err(error) = process_user_automation_requests(&host, &user_automation_queue) {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: UserAutomation owner dispatch failed: {error}"
+            );
+            STOP_REQUESTED.store(true, Ordering::Release);
+            break;
+        }
         process_runtime_control_requests(&mut host, &runtime_queue);
         match host.has_durable_branch_fence() {
             Ok(true) => {
@@ -1061,13 +1068,11 @@ fn process_runtime_control_requests(
 }
 
 #[cfg(windows)]
-fn process_user_automation_requests(queue: &HostUserAutomationExecutionQueue) {
-    // HostComposition currently has no KernelStoreGateway owner to bind into
-    // UserAutomationHostExecutionEndpoint<D, W>. Drain with an explicit
-    // correlated Unavailable response until root composes that real owner;
-    // silently leaving requests pending would turn owner absence into an
-    // unbounded transport timeout.
-    let _ = reject_unbound_user_automation_execution(queue);
+fn process_user_automation_requests(
+    host: &HostComposition,
+    queue: &HostUserAutomationExecutionQueue,
+) -> Result<usize, HostError> {
+    host.process_user_automation_requests(queue)
 }
 
 #[cfg(windows)]

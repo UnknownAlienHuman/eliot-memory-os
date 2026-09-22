@@ -373,6 +373,135 @@ impl KernelComposition {
         result
     }
 
+    /// Binds the Host UserAutomation owner to the exact live Kernel
+    /// activation contour.
+    ///
+    /// The named-pipe peer set authenticates the presenting Host process. The
+    /// retained candidate, activation receipt, and ready receipt then bind
+    /// the ClientHello to the current Kernel generation and activation
+    /// receipt digest. This session advertises only the requester-side
+    /// Dreamer capability; no caller payload can widen it.
+    #[cfg(windows)]
+    fn bind_host_user_automation_session(
+        &self,
+        connection_id: impl Into<String>,
+        peer: PeerIdentity,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        observe_front_door_session("kernel.front_door_host_user_automation_bind", "attempt");
+        let connection_id = connection_id.into();
+        if connection_id.trim().is_empty() || connection_id.chars().any(char::is_control) {
+            return Err(TransportError::SessionFenced);
+        }
+        peer.validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+
+        let (candidate, activation, ready) = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if service.state() != KernelServiceState::Ready {
+                return Err(TransportError::SessionFenced);
+            }
+            let candidate = service
+                .candidate_binding()
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?;
+            let activation = service
+                .activation_receipt()
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?;
+            let ready = service
+                .ready_receipt()
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?;
+            (candidate, activation, ready)
+        };
+        candidate
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if activation.candidate_binding_digest
+            != candidate
+                .compute_digest()
+                .map_err(|_| TransportError::SessionFenced)?
+            || activation.authority_epoch != candidate.kernel_epoch
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        ready
+            .validate(&candidate, &activation)
+            .map_err(|_| TransportError::SessionFenced)?;
+
+        let activation_digest = sha256_hex(
+            &canonical_json_bytes(&activation).map_err(|_| TransportError::SessionFenced)?,
+        );
+        let expected_fence = StateFence::new(
+            candidate.kernel_epoch.clone(),
+            activation.generation.clone(),
+        );
+        let peer_binding = peer
+            .process_binding()
+            .ok_or(TransportError::PeerIdentityUnavailable)?;
+        if peer_binding.process_id() != candidate.host_process.process_id
+            || peer_binding.start_time_100ns() != candidate.host_process.start_time_100ns
+            || !peer_binding
+                .image_path()
+                .eq_ignore_ascii_case(&candidate.host_process.image_path)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if client.module_bridge_identity != USER_AUTOMATION_KERNEL_MODULE_ID
+            || client.artifact_hash.as_str() != candidate.artifact_hash.as_str()
+            || client.module_generation.module_id.as_str()
+                != USER_AUTOMATION_KERNEL_MODULE_ID
+            || client.module_generation.generation != activation.generation
+            || client.module_generation.artifact_id.as_str() != candidate.artifact_hash.as_str()
+            || client.module_generation.state != ModuleGenerationState::Active
+            || client.module_generation.state_fence != expected_fence
+            || client.authority_epoch != candidate.kernel_epoch
+            || client.launch_nonce != activation_digest
+            || client.capabilities.len() != 1
+            || client.capabilities[0] != USER_AUTOMATION_KERNEL_CAPABILITY
+            || client.module_contract.required_capabilities.len() != 1
+            || client.module_contract.required_capabilities[0] != USER_AUTOMATION_KERNEL_CAPABILITY
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone();
+        let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
+        session.capabilities = vec![USER_AUTOMATION_KERNEL_CAPABILITY.to_owned()];
+        session.privacy_classes = vec!["PUBLIC".to_owned()];
+        session.effects.clear();
+        let server_hello = eliot_protocol::ServerHello {
+            selected_protocol: session.protocol_version,
+            session_principal_binding: USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING.to_owned(),
+            allowed_capabilities: session.capabilities.clone(),
+            allowed_effects: Vec::new(),
+            config_snapshot: policy.config_snapshot,
+            heartbeat_ms: policy.heartbeat_ms,
+            control_channel: policy.control_channel,
+            rejection_reason: None,
+            authority_epoch: candidate.kernel_epoch,
+        };
+        server_hello
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        observe_front_door_session("kernel.front_door_host_user_automation_bind", "success");
+        Ok(HandshakeResult {
+            capabilities: session.capabilities.clone(),
+            privacy_classes: session.privacy_classes.clone(),
+            effects: Vec::new(),
+            session,
+            server_hello,
+        })
+    }
+
     /// Binds an authenticated local peer to the selected principal/session.
     fn bind_session_inner(
         &self,
@@ -392,6 +521,10 @@ impl KernelComposition {
             // The bridge has a server-first transport owner. It must never
             // enter the legacy client-first Session/dispatch path.
             return Err(TransportError::SessionFenced);
+        }
+        #[cfg(windows)]
+        if client.module_bridge_identity == USER_AUTOMATION_KERNEL_MODULE_ID {
+            return self.bind_host_user_automation_session(connection_id, peer, client);
         }
         #[cfg(windows)]
         if client.module_bridge_identity == ACTIVE_DAEMON_CALLER {
