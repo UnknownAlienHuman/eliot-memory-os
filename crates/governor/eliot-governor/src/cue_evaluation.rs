@@ -39,8 +39,10 @@ use eliot_contracts::{ClockReading, canonical_json_bytes, sha256_hex};
 use eliot_cue_activation::{ActivationProfile, CueActivationEvaluation, evaluate_activation};
 use eliot_cue_contracts::{
     ActivationRequest, ActivationRequestId, ActivationRequestSpec, CONTRACT_REVISION,
-    CueSnapshotBuildCandidate, NormalizedCue, SnapshotId,
+    CueSnapshotBuildCandidate, NormalizationOutcome, NormalizationProfile, NormalizedCue,
+    ObservedCue, ObservedCueId, SnapshotId,
 };
+use eliot_cue_normalizer::{NormalizationPolicy, normalize_cue};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -187,4 +189,111 @@ fn scaffold_request(
         deadline_ms: None,
         cancelled: false,
     }))
+}
+
+/// Admitted seeds driven from live observations, plus their visible frontier.
+///
+/// `seeds` preserves caller observation order (the evaluation canonicalizes
+/// for its input digest, so order here carries no authority). `excluded`
+/// names every observation that produced no seed and why: ambiguous or
+/// unsupported normalizations, keyless results, and stale or foreign
+/// contexts are frontier evidence, never silent drops.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrivenSeeds {
+    /// Normalized seeds admitted for evaluation, in observation order.
+    pub seeds: Vec<NormalizedCue>,
+    /// Observations excluded from seeding, with reasons.
+    pub excluded: Vec<SeedExclusion>,
+}
+
+/// One observation excluded from seeding, with its stable reason.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeedExclusion {
+    /// Identity of the excluded observation.
+    pub observed_cue_id: ObservedCueId,
+    /// Stable reason class (`ambiguous-outcome`, `unsupported-outcome`,
+    /// `unknown-outcome`, `empty-keys`, `stale-fence`, `foreign-scope`).
+    pub reason: &'static str,
+}
+
+/// Fail-closed errors for seed driving. A malformed observation or a
+/// normalization failure aborts the drive (caller shape, never partial
+/// output); per-observation fate otherwise lands in
+/// [`DrivenSeeds::excluded`].
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum SeedDriveError {
+    /// An observation fails its owner validation.
+    #[error("seed observation is invalid: {0}")]
+    InvalidObserved(String),
+    /// Normalization itself failed (policy or signature fault, not an
+    /// outcome disposition).
+    #[error("seed normalization failed: {0}")]
+    Normalization(String),
+}
+
+/// Drives admitted evaluation seeds from live observations through the
+/// normalizer owner (CPU-side, deterministic, fence-bound).
+///
+/// Each observation validates through its owner, normalizes under the exact
+/// caller `policy` and `profile`, and passes only with a usable outcome
+/// (`Lossless` or `AuthorizedLoss`), non-empty comparison keys, and a
+/// context fence/scope equal to the live closure. Anything else is excluded
+/// with its reason — including an empty observation set, which yields zero
+/// seeds (the evaluator then fails closed with `NoSeeds` rather than
+/// synthesizing a pair). Holds no state; the policy, profile, and
+/// observations arrive as caller-owned artifacts.
+pub fn drive_observation_seeds(
+    seven: &SevenRoleInputs,
+    observations: Vec<ObservedCue>,
+    policy: &NormalizationPolicy,
+    profile: &NormalizationProfile,
+) -> Result<DrivenSeeds, SeedDriveError> {
+    let mut seeds = Vec::with_capacity(observations.len());
+    let mut excluded = Vec::new();
+    for observed in &observations {
+        observed
+            .validate()
+            .map_err(|error| SeedDriveError::InvalidObserved(error.to_string()))?;
+        let envelope = normalize_cue(observed, policy, profile)
+            .map_err(|error| SeedDriveError::Normalization(error.to_string()))?;
+        let normalized = envelope.normalized;
+        let exclusion = match &normalized.outcome {
+            NormalizationOutcome::Lossless | NormalizationOutcome::AuthorizedLoss { .. } => None,
+            NormalizationOutcome::Ambiguous { .. } => Some("ambiguous-outcome"),
+            NormalizationOutcome::Unsupported { .. } => Some("unsupported-outcome"),
+            // Future owner variants exclude fail-closed: an unknown outcome
+            // is frontier evidence, never an admitted seed.
+            _ => Some("unknown-outcome"),
+        };
+        if let Some(reason) = exclusion {
+            excluded.push(SeedExclusion {
+                observed_cue_id: observed.observed_cue_id.clone(),
+                reason,
+            });
+            continue;
+        }
+        if normalized.comparison_keys.is_empty() {
+            excluded.push(SeedExclusion {
+                observed_cue_id: observed.observed_cue_id.clone(),
+                reason: "empty-keys",
+            });
+            continue;
+        }
+        if normalized.observed.context.state_fence != seven.state_fence {
+            excluded.push(SeedExclusion {
+                observed_cue_id: observed.observed_cue_id.clone(),
+                reason: "stale-fence",
+            });
+            continue;
+        }
+        if normalized.observed.context.scope_id.as_str() != seven.scope_id.as_str() {
+            excluded.push(SeedExclusion {
+                observed_cue_id: observed.observed_cue_id.clone(),
+                reason: "foreign-scope",
+            });
+            continue;
+        }
+        seeds.push(normalized);
+    }
+    Ok(DrivenSeeds { seeds, excluded })
 }

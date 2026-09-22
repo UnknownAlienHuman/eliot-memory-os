@@ -79,11 +79,12 @@ use eliot_context_contracts::{
     SessionDeliverySnapshot,
 };
 use eliot_cue_activation::ActivationProfile;
-use eliot_cue_contracts::{NormalizationProfile, NormalizedCue, SnapshotId};
+use eliot_cue_contracts::{NormalizationProfile, ObservedCue, SnapshotId};
+use eliot_cue_normalizer::NormalizationPolicy;
 use eliot_governor::{
     BoundCuePair, ContextInputsError, ContextReconstructionRequest, CueEvaluationError,
-    CuePairBindError, GovernorContextInputs, LiveCueEvaluation, bind_cue_pair_to_roles,
-    evaluate_live_cue_pair,
+    CuePairBindError, GovernorContextInputs, LiveCueEvaluation, SeedDriveError,
+    SeedExclusion, bind_cue_pair_to_roles, drive_observation_seeds, evaluate_live_cue_pair,
 };
 use eliot_read::{QueryResult, ReadError, ReadService};
 use eliot_reactive_context_plan::{
@@ -149,13 +150,17 @@ pub struct ReactiveViewCueOutcome {
     pub evaluation: eliot_cue_activation::CueActivationEvaluation,
     /// Pair proven current for the live seven-role closure.
     pub bound: BoundCuePair,
+    /// Observations excluded from seeding, with reasons (frontier
+    /// evidence — visible here, never silently dropped).
+    pub excluded: Vec<SeedExclusion>,
     /// Served mapping plus settled plan outcome in one causal call.
     pub feed: ServedViewFeed,
 }
 
 /// Fail-closed caller errors. Each stage surfaces distinctly: a fence or
-/// composition failure, a reconstruction failure, an evaluation failure, a
-/// binding failure, or a serving/planning failure. Nothing downgrades.
+/// composition failure, a reconstruction failure, a seed-driving failure,
+/// an evaluation failure, a binding failure, a resolver failure, or a
+/// serving/planning failure. Nothing downgrades.
 #[derive(Debug, Error)]
 pub enum ReactiveViewCueError {
     /// The caller fence does not equal the admitted fence.
@@ -167,31 +172,85 @@ pub enum ReactiveViewCueError {
     /// The seven-role reconstruction failed.
     #[error("seven-role reconstruction failed: {0}")]
     Reconstruction(ContextInputsError),
+    /// Seed driving failed (malformed observation or normalization fault).
+    #[error("seed driving failed: {0}")]
+    Seeds(SeedDriveError),
     /// The production cue evaluation failed.
     #[error("cue evaluation failed: {0}")]
     Evaluation(CueEvaluationError),
     /// The evaluated pair is not current for the live closure.
     #[error("cue pair binding failed: {0}")]
     Bind(CuePairBindError),
+    /// A six-slot resolver failed: `slot` names it (`session`,
+    /// `coverage`, `policy`), `detail` carries its typed message.
+    #[error("six-slot resolver failed: {slot}: {detail}")]
+    Resolve {
+        /// Resolver slot that failed.
+        slot: &'static str,
+        /// Resolver's typed failure message.
+        detail: String,
+    },
     /// The served-view feed rejected the assembled inputs.
     #[error("served-view feed failed: {0}")]
     Feed(ServedViewFeedError),
 }
 
+/// Live session-snapshot resolver port (O1 owner child).
+///
+/// Mirrors the D2 resolver call shape: the live fence in, the owner
+/// session snapshot out, typed failure preserved. Implementations live
+/// with the session owner; this hook only consumes through the port.
+pub trait ReactiveSessionResolver {
+    /// Resolver failure type (typed, displayable).
+    type Error: std::fmt::Display;
+    /// Resolves the live session snapshot under the fence.
+    fn resolve_session(
+        &self,
+        fence: &StateFence,
+    ) -> Result<SessionDeliverySnapshot, Self::Error>;
+}
+
+/// Live coverage-profile resolver port (O2 owner child).
+///
+/// Mirrors the D2 resolver call shape: the live fence in, the owner
+/// coverage profile out, typed failure preserved.
+pub trait ReactiveCoverageResolver {
+    /// Resolver failure type (typed, displayable).
+    type Error: std::fmt::Display;
+    /// Resolves the live coverage profile under the fence.
+    fn resolve_coverage(
+        &self,
+        fence: &StateFence,
+    ) -> Result<IntegrationCoverageProfile, Self::Error>;
+}
+
+/// Live delivery-policy resolver port (O2 owner child).
+///
+/// Mirrors the D2 resolver call shape: the live fence in, the owner
+/// delivery policy out, typed failure preserved.
+pub trait ReactivePolicyResolver {
+    /// Resolver failure type (typed, displayable).
+    type Error: std::fmt::Display;
+    /// Resolves the live delivery policy under the fence.
+    fn resolve_policy(&self, fence: &StateFence) -> Result<ReactiveDeliveryPolicy, Self::Error>;
+}
+
 /// Drive the production reactive view/cue caller end to end under one fence.
 ///
-/// Gathers the live seven-role closure through the Governor read owner,
-/// evaluates the bounded cue activation over the live candidate plus the
-/// caller seeds/profile, proves the pair current, assembles the cue
-/// activation against the owner view with the caller target bindings, and
-/// drives the served-view feed. Every stage binds `admitted_fence`: a
-/// refresh anywhere fails closed before anything plans. Holds no state;
-/// seeds, profiles, bindings, and projections arrive as caller-owned
-/// artifacts and are proven here, never trusted.
+/// Drives admitted seeds from the caller observations through the
+/// normalizer owner, gathers the live seven-role closure through the
+/// Governor read owner, evaluates the bounded cue activation over the live
+/// candidate plus the driven seeds/profile, proves the pair current,
+/// assembles the cue activation against the owner view with the caller
+/// target bindings, and drives the served-view feed. Every stage binds
+/// `admitted_fence`: a refresh anywhere fails closed before anything plans.
+/// Holds no state; observations, profiles, bindings, and projections arrive
+/// as caller-owned artifacts and are proven here, never trusted.
 ///
-/// No new semantics live here: reconstruction, evaluation, binding,
-/// serving, and planning each run in their owning crate through their exact
-/// public entrypoints; this hook only composes them in fence order.
+/// No new semantics live here: driving, reconstruction, evaluation,
+/// binding, serving, and planning each run in their owning crate through
+/// their exact public entrypoints; this hook only composes them in fence
+/// order.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_reactive_view_cue_feed(
     composition: &DaemonComposition,
@@ -201,7 +260,8 @@ pub async fn drive_reactive_view_cue_feed(
     reconstruction: &ContextReconstructionRequest,
     snapshot_id: SnapshotId,
     normalization_profile: NormalizationProfile,
-    seeds: Vec<NormalizedCue>,
+    observations: Vec<ObservedCue>,
+    normalization_policy: &NormalizationPolicy,
     activation_profile: &ActivationProfile,
     target_bindings: Vec<ReactiveTargetBinding>,
     view: &ContextPlanningView,
@@ -222,11 +282,13 @@ pub async fn drive_reactive_view_cue_feed(
         .reconstruct(ctx, reconstruction)
         .await
         .map_err(ReactiveViewCueError::Reconstruction)?;
+    let driven = drive_observation_seeds(&seven, observations, normalization_policy, &normalization_profile)
+        .map_err(ReactiveViewCueError::Seeds)?;
     let evaluated = evaluate_live_cue_pair(
         &seven,
         snapshot_id,
         normalization_profile,
-        seeds,
+        driven.seeds,
         activation_profile,
     )
     .map_err(ReactiveViewCueError::Evaluation)?;
@@ -256,6 +318,78 @@ pub async fn drive_reactive_view_cue_feed(
     Ok(ReactiveViewCueOutcome {
         evaluation,
         bound,
+        excluded: driven.excluded,
         feed,
     })
+}
+
+/// Drive the live reactive view/cue caller with six-slot owner resolution.
+///
+/// Same composition as [`drive_reactive_view_cue_feed`], except the
+/// session snapshot, coverage profile, and delivery policy resolve live
+/// through their owner ports (O1 session envelopes, O2 coverage/policy)
+/// under the admitted fence instead of arriving pre-resolved. The view and
+/// critical attention projections arrive as owner artifacts (their resolvers
+/// live in other lanes); everything else is identical, including fence
+/// order and failure vocabulary. First failing resolver aborts the whole
+/// call in resolver order (session → coverage → policy); nothing partial
+/// is ever planned.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_live_reactive_view_cue_feed(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    admitted_fence: &StateFence,
+    ctx: &RequestMetadata,
+    reconstruction: &ContextReconstructionRequest,
+    snapshot_id: SnapshotId,
+    normalization_profile: NormalizationProfile,
+    observations: Vec<ObservedCue>,
+    normalization_policy: &NormalizationPolicy,
+    activation_profile: &ActivationProfile,
+    target_bindings: Vec<ReactiveTargetBinding>,
+    view: &ContextPlanningView,
+    critical_attention: &CriticalAttentionProjection,
+    session: &impl ReactiveSessionResolver,
+    coverage: &impl ReactiveCoverageResolver,
+    policy_resolver: &impl ReactivePolicyResolver,
+    bindings: &LiveActivationBindings,
+) -> Result<ReactiveViewCueOutcome, ReactiveViewCueError> {
+    let session_snapshot = session
+        .resolve_session(admitted_fence)
+        .map_err(|error| ReactiveViewCueError::Resolve {
+            slot: "session",
+            detail: error.to_string(),
+        })?;
+    let integration_coverage = coverage
+        .resolve_coverage(admitted_fence)
+        .map_err(|error| ReactiveViewCueError::Resolve {
+            slot: "coverage",
+            detail: error.to_string(),
+        })?;
+    let policy = policy_resolver
+        .resolve_policy(admitted_fence)
+        .map_err(|error| ReactiveViewCueError::Resolve {
+            slot: "policy",
+            detail: error.to_string(),
+        })?;
+    drive_reactive_view_cue_feed(
+        composition,
+        kernel,
+        admitted_fence,
+        ctx,
+        reconstruction,
+        snapshot_id,
+        normalization_profile,
+        observations,
+        normalization_policy,
+        activation_profile,
+        target_bindings,
+        view,
+        &session_snapshot,
+        critical_attention,
+        &integration_coverage,
+        &policy,
+        bindings,
+    )
+    .await
 }

@@ -50,7 +50,10 @@ pub use cue_composition::{
     CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
 };
-pub use cue_evaluation::{CueEvaluationError, LiveCueEvaluation, evaluate_live_cue_pair};
+pub use cue_evaluation::{
+    CueEvaluationError, DrivenSeeds, LiveCueEvaluation, SeedDriveError, SeedExclusion,
+    drive_observation_seeds, evaluate_live_cue_pair,
+};
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 mod controlboard_projection;
 mod observation_reconciliation;

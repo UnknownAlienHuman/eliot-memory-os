@@ -25,6 +25,7 @@ eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts",
 eliot-controlboard.workspace = true
 eliot-cue-activation = { path = "../../crates/smart/eliot-cue-activation", version = "0.1.0" }
 eliot-cue-contracts = { path = "../../crates/smart/eliot-cue-contracts", version = "0.1.0" }
+eliot-cue-normalizer = { path = "../../crates/smart/eliot-cue-normalizer", version = "0.1.0" }
 eliot-doctor-core.workspace = true
 eliot-dreamer-bundle = { path = "../../crates/smart/eliot-dreamer-bundle" }
 eliot-dreamer-candidate-validation = { path = "../../crates/smart/eliot-dreamer-candidate-validation" }

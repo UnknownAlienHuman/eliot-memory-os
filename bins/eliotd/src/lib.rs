@@ -162,7 +162,8 @@ pub use process_origin::{
     request_origin_control,
 };
 pub use reactive_view_cue_feed::{
-    ReactiveViewCueError, ReactiveViewCueOutcome, drive_reactive_view_cue_feed,
+    ReactiveCoverageResolver, ReactivePolicyResolver, ReactiveSessionResolver, ReactiveViewCueError,
+    ReactiveViewCueOutcome, drive_live_reactive_view_cue_feed, drive_reactive_view_cue_feed,
     serve_projection_inputs_under_fence,
 };
 pub use route_receipts::{

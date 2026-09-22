@@ -17,6 +17,7 @@ eliot-coordination.workspace = true
 eliot-contracts.workspace = true
 eliot-cue-activation = { path = "../../smart/eliot-cue-activation", version = "0.1.0" }
 eliot-cue-contracts = { path = "../../smart/eliot-cue-contracts" }
+eliot-cue-normalizer = { path = "../../smart/eliot-cue-normalizer", version = "0.1.0" }
 eliot-cue-index = { path = "../../smart/eliot-cue-index" }
 eliot-doctor-core.workspace = true
 eliot-epistemic = { path = "../../smart/eliot-epistemic" }
