@@ -570,7 +570,9 @@ struct AgentActivationPendingState {
     /// Governor read. Retention never expires on the ticket deadline; a
     /// terminal accepted result outlives it.
     results: BTreeMap<String, AgentActivationResultRecord>,
-    /// Insertion order of `results` for bounded eviction.
+    /// Insertion order of `results` for bounded eviction. Live pending
+    /// entries are skipped when this order is pruned so an active bridge
+    /// waiter can never lose the result it is waiting to project.
     result_order: VecDeque<String>,
 }
 
@@ -704,23 +706,32 @@ impl AgentActivationPendingState {
     }
 
     /// Retains one exact result record under its ticket identity, evicting the
-    /// oldest retained ticket when the bounded ledger is full. Eviction only
-    /// affects daemon-leg replay/reconcile memory; the bridge leg for an
-    /// evicted ticket is already projected or gone, and a resubmission for an
-    /// evicted ticket without a pending entry is answered `UnknownRequest`
-    /// rather than fabricated.
-    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) {
-        const MAX_RETAINED_ACTIVATION_RESULTS: usize = 64;
+    /// oldest retained ticket that no longer has a live pending bridge entry
+    /// when the bounded ledger is full. A live entry is never evicted: the
+    /// bridge waiter requires both representations until projection. Returns
+    /// `false` only when the state already violates the pending/result bound
+    /// invariant and every retained ticket is still live, so callers can
+    /// fail closed instead of dropping a waiter-visible result.
+    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) -> bool {
         let ticket_id = record.result.ticket_id.clone();
         if !self.results.contains_key(&ticket_id) {
-            self.result_order.push_back(ticket_id.clone());
-            while self.result_order.len() > MAX_RETAINED_ACTIVATION_RESULTS {
-                if let Some(oldest) = self.result_order.pop_front() {
-                    self.results.remove(&oldest);
-                }
+            while self.results.len() >= eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS {
+                let Some(oldest_index) = self
+                    .result_order
+                    .iter()
+                    .position(|candidate| !self.entries.contains_key(candidate))
+                else {
+                    return false;
+                };
+                let Some(oldest) = self.result_order.remove(oldest_index) else {
+                    return false;
+                };
+                self.results.remove(&oldest);
             }
+            self.result_order.push_back(ticket_id.clone());
         }
         self.results.insert(ticket_id, record);
+        true
     }
 }
 

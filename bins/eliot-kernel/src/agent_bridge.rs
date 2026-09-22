@@ -925,6 +925,7 @@ impl KernelComposition {
     #[cfg(windows)]
     fn retain_activation_result_durably(
         &self,
+        pending: &AgentActivationPendingState,
         ticket: &AgentActivationResolutionTicket,
         result: &AgentActivationResolutionResult,
         phase: AgentActivationResultPhase,
@@ -969,9 +970,13 @@ impl KernelComposition {
                 retention_order: retained.retention_order,
             },
         );
+        // The caller holds the pending owner. Never evict a result whose
+        // bridge waiter still has a live pending entry; that waiter needs the
+        // raw compatibility representation until it can project the result.
         while results.len() > eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS {
             let oldest = results
                 .iter()
+                .filter(|(ticket_id, _)| !pending.entries.contains_key(*ticket_id))
                 .min_by_key(|(_, record)| record.retention_order)
                 .map(|(ticket_id, _)| ticket_id.clone())
                 .ok_or(TransportError::SessionFenced)?;
@@ -1034,15 +1039,17 @@ impl KernelComposition {
         }
         let phase = Self::result_phase_for_disposition(&incoming.disposition);
         let retained_durably =
-            self.retain_activation_result_durably(&entry_ticket, &incoming, phase)?;
+            self.retain_activation_result_durably(&pending, &entry_ticket, &incoming, phase)?;
         let ack = AgentActivationResultAck::accepted(&incoming)
             .map_err(|_| TransportError::SessionFenced)?;
-        pending.retain_activation_result(AgentActivationResultRecord {
+        if !pending.retain_activation_result(AgentActivationResultRecord {
             result: incoming,
             phase,
             ticket_connection: entry_ticket.connection_id.clone(),
             retention_order: retained_durably.retention_order,
-        });
+        }) {
+            return Err(TransportError::SessionFenced);
+        }
         self.agent_activation_changed.notify_waiters();
         Ok(ack)
     }
@@ -1148,16 +1155,18 @@ impl KernelComposition {
         }
         let phase = Self::result_phase_for_disposition(&incoming.disposition);
         let retained_durably =
-            self.retain_activation_result_durably(&entry_ticket, &incoming, phase)?;
+            self.retain_activation_result_durably(&pending, &entry_ticket, &incoming, phase)?;
         let ack = AgentActivationResultAck::accepted(&incoming)
             .map_err(|_| TransportError::SessionFenced)?;
         pending.fifo.retain(|queued_id| queued_id != &ticket_id);
-        pending.retain_activation_result(AgentActivationResultRecord {
+        if !pending.retain_activation_result(AgentActivationResultRecord {
             result: incoming,
             phase,
             ticket_connection: entry_ticket.connection_id.clone(),
             retention_order: retained_durably.retention_order,
-        });
+        }) {
+            return Err(TransportError::SessionFenced);
+        }
         drop(pending);
         self.agent_activation_changed.notify_waiters();
         Ok(ack)
@@ -1283,7 +1292,7 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         let phase = Self::result_phase_for_disposition(&result.disposition);
-        self.retain_activation_result_durably(&entry_ticket, &result, phase)?;
+        self.retain_activation_result_durably(&pending, &entry_ticket, &result, phase)?;
         pending.fifo.retain(|queued_id| queued_id != &ticket_id);
         drop(pending);
         drop(result);
