@@ -113,6 +113,7 @@ use eliot_kernel_core::{
     ProcessExecutionReplayRecord, ProcessExecutionReplayState, process_admission_digest,
 };
 
+mod board_inbox_serve;
 mod daemon_live_receipt;
 #[cfg(windows)]
 mod daemon_process_launch;
@@ -829,6 +830,19 @@ pub enum KernelFrameAction {
         context: RequestMetadata,
         /// Exact restore query whose canonical digest is bound by the envelope.
         query: ReactiveRestoreQuery,
+    },
+    /// Serve one authenticated operator board-inbox read (#1780). The
+    /// operation carries the exact board-inbox wire identity; canonical
+    /// read admission itself is owned by the serving function in
+    /// `board_inbox_serve` over the retained store gateway. Intake is
+    /// `Ready`-gated. No process is spawned inside this handler.
+    BoardInbox {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name; must equal `BOARD_INBOX_OPERATION`.
+        operation: String,
+        /// Bounded operation payload; must be the empty board-inbox request.
+        payload: serde_json::Value,
     },
     /// Return a typed rejection, then fence the connection.
     Fence(Frame),

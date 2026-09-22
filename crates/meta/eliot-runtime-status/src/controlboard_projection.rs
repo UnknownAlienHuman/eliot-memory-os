@@ -105,11 +105,15 @@ pub struct ControlBoardProjectionBindings {
 ///
 /// The variants reuse the `eliot-controlboard` enums directly, so the
 /// consumer binding is type-level: a serde or variant change upstream fails
-/// compilation here instead of silently reinterpreting entries.
+/// compilation here instead of silently reinterpreting entries. Notification
+/// rows carry no severity payload: the contour is an index (identity plus
+/// summary), never a reinterpretation of delivery, acknowledgement, or
+/// resolution semantics, which stay with the canonical record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlBoardEntryKind {
     Item(BoardItemKind),
     Review(ReviewLifecycle),
+    Notification,
 }
 
 /// One projected board entry with all six owner bindings attached.
@@ -162,12 +166,17 @@ pub struct ControlBoardContour {
     pub view_revision: u64,
     /// Exact shared fence the view was pinned to (typed, never Debug text).
     pub view_fence: StateFence,
-    /// One row per visible board item and review, in view order.
+    /// One row per visible board item, review, and notification, in view
+    /// order. Notification rows carry the record dedup key plus summary;
+    /// delivery, acknowledgement, and resolution semantics stay with the
+    /// canonical record and are never reinterpreted here.
     pub rows: Vec<ControlBoardStatusRow>,
     /// Count of board items in the exact view.
     pub item_count: usize,
     /// Count of reviews in the exact view.
     pub review_count: usize,
+    /// Count of notification inbox rows in the exact view.
+    pub notification_count: usize,
     /// Count of provenance edges in the exact view (count only; edge bodies
     /// are out of scope for this bounded contour).
     pub provenance_edge_count: usize,
@@ -287,7 +296,11 @@ pub fn project_controlboard_contour(
     bindings: &ControlBoardProjectionBindings,
 ) -> Result<ControlBoardContour, ControlBoardProjectionError> {
     validate_bindings(bindings)?;
-    let entry_total = view.items.len().saturating_add(view.reviews.len());
+    let entry_total = view
+        .items
+        .len()
+        .saturating_add(view.reviews.len())
+        .saturating_add(view.notifications.rows.len());
     if entry_total > MAX_CONTROLBOARD_ROWS {
         return Err(ControlBoardProjectionError::Oversized { field: "rows" });
     }
@@ -333,6 +346,33 @@ pub fn project_controlboard_contour(
             invalidation: bindings.invalidation.clone(),
         });
     }
+    // Notification inbox rows project with the record dedup key as the
+    // entry identity (the contract-named per-record identity) and the
+    // record summary verbatim. No role, privacy, or quiet-hours
+    // filtering applies here — the board never suppresses canonical
+    // creation or visibility, and this projection preserves that 1:1.
+    // A dedup key colliding with an item or review identity fails
+    // closed like any other duplicate.
+    for row in &view.notifications.rows {
+        bound_text(&row.dedup_key, "row.entry_id", MAX_BINDING_CHARS)?;
+        bound_text(&row.summary, "row.summary", MAX_SUMMARY_CHARS)?;
+        if !seen_ids.insert(row.dedup_key.clone()) {
+            return Err(ControlBoardProjectionError::DuplicateEntryId {
+                entry_id: row.dedup_key.clone(),
+            });
+        }
+        rows.push(ControlBoardStatusRow {
+            entry_id: row.dedup_key.clone(),
+            entry: ControlBoardEntryKind::Notification,
+            summary: row.summary.clone(),
+            capability: bindings.capability.clone(),
+            owner: bindings.owner.clone(),
+            generation: bindings.generation.clone(),
+            evidence: bindings.evidence.clone(),
+            expiry: bindings.expiry.clone(),
+            invalidation: bindings.invalidation.clone(),
+        });
+    }
     let revision = view.revision.get();
     let evidence_refs = vec![
         bindings.evidence.clone(),
@@ -355,6 +395,7 @@ pub fn project_controlboard_contour(
         rows,
         item_count: view.items.len(),
         review_count: view.reviews.len(),
+        notification_count: view.notifications.rows.len(),
         provenance_edge_count: view.provenance.len(),
         liveness: ComponentState::Unknown {
             reason: "controlboard view presence does not prove liveness".to_owned(),
@@ -405,9 +446,9 @@ mod tests {
     use eliot_controlboard::{
         AccessBinding, AccessResolverPort, AnchorResolution, AnchorTargetKind, BoardItem,
         BoardItemKind, CanonicalState, CanonicalStatePort, ControlBoard, NotificationInbox,
-        NotificationMetrics, PortError, ProjectionBinding, ProjectionProvider,
-        ProviderCompleteness, ReadRequest, ReviewAnchor, ReviewItem, ReviewLifecycle, Role,
-        ViewRevision, Visibility,
+        NotificationMetrics, NotificationRow, PortError, ProjectedSeverity, ProjectionBinding,
+        ProjectionProvider, ProviderCompleteness, ReadRequest, ReviewAnchor, ReviewItem,
+        ReviewLifecycle, Role, ViewRevision, Visibility,
     };
     use eliot_evaluation_contracts::ObjectiveStatus;
     use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
@@ -645,6 +686,79 @@ mod tests {
         );
         assert_eq!(contour.rows[0].summary, "summary for item-1");
         assert_eq!(contour.rows[2].summary, "content for review-1");
+    }
+
+    fn notification_row(dedup_key: &str, summary: &str) -> NotificationRow {
+        use eliot_controlboard::ProjectedSeverity;
+        NotificationRow {
+            notification_id: format!("notification-{dedup_key}"),
+            dedup_key: dedup_key.to_owned(),
+            severity: ProjectedSeverity::Critical,
+            subject: "subject".to_owned(),
+            summary: summary.to_owned(),
+            evidence_handles: vec!["evidence-1".to_owned()],
+            affected_scope: "scope-1".to_owned(),
+            owner: "owner-1".to_owned(),
+            required_action: "review".to_owned(),
+            deadline_or_review: None,
+            delivery_channels: Vec::new(),
+            occurrences: 1,
+            delivery_failed: false,
+            failure_reason: None,
+            acknowledged: false,
+            resolved: false,
+            revision: 1,
+        }
+    }
+
+    fn inbox_view() -> ControlBoardView {
+        use eliot_controlboard::NotificationMetrics;
+        let mut inbox = view();
+        inbox.notifications = NotificationInbox {
+            rows: vec![
+                notification_row("backup-failed", "backup failed"),
+                notification_row("routine-sync", "routine sync"),
+            ],
+            metrics: NotificationMetrics {
+                total: 2,
+                unresolved: 2,
+                critical_unresolved: 2,
+                action_required_unresolved: 0,
+                failed_delivery: 0,
+                acknowledged_unresolved: 0,
+            },
+        };
+        inbox
+    }
+
+    #[test]
+    fn notification_rows_project_with_dedup_identity_and_counts() {
+        let contour =
+            project_controlboard_contour(&inbox_view(), &bindings()).expect("inbox contour");
+        assert_eq!(contour.rows.len(), 5);
+        assert_eq!(contour.item_count, 2);
+        assert_eq!(contour.review_count, 1);
+        assert_eq!(contour.notification_count, 2);
+        // Notification rows follow items and reviews in view order, keyed
+        // by the contract-named dedup identity with the record summary
+        // verbatim and all six owner bindings stamped.
+        assert_eq!(contour.rows[3].entry_id, "backup-failed");
+        assert_eq!(contour.rows[3].entry, ControlBoardEntryKind::Notification);
+        assert_eq!(contour.rows[3].summary, "backup failed");
+        assert_eq!(contour.rows[3].capability, "controlboard.read");
+        assert_eq!(contour.rows[4].entry_id, "routine-sync");
+        // The contour digest binds the inbox rows: dropping them changes it.
+        let bare = project_controlboard_contour(&view(), &bindings()).expect("bare contour");
+        assert_eq!(bare.notification_count, 0);
+        assert_ne!(contour.contour_digest, bare.contour_digest);
+        // A dedup key colliding with an item identity fails closed like
+        // any other duplicate.
+        let mut collided = inbox_view();
+        collided.notifications.rows[0].dedup_key = "item-1".to_owned();
+        assert!(matches!(
+            project_controlboard_contour(&collided, &bindings()),
+            Err(ControlBoardProjectionError::DuplicateEntryId { .. })
+        ));
     }
 
     #[test]

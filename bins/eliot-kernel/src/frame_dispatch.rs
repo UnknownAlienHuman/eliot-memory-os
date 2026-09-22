@@ -420,6 +420,7 @@ impl KernelComposition {
                     KernelFrameAction::Testd { .. } => "testd_admitted",
                     KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
                     KernelFrameAction::ReactiveRestore { .. } => "reactive_restore_admitted",
+                    KernelFrameAction::BoardInbox { .. } => "board_inbox_admitted",
                     KernelFrameAction::Fence(_) => "fenced_reply",
                 };
                 observe_frame("kernel.frame_validated", "success");
@@ -753,6 +754,34 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 return self.dispatch_dreamer_frame(session, frame);
+            }
+            if super::board_inbox_serve::is_board_inbox_operation(native_operation) {
+                // #1780 operator board-inbox read rides the same admitted
+                // transport through this closed gateway. Intake
+                // (`Request`/`Execute`) requires `Ready`; peer, correlation,
+                // and fence joins mirror the dreamer gate above; session
+                // bind, closed-read admission, and inbox projection live in
+                // the board-inbox serving module. Stale or unauthenticated
+                // sessions fence here and are never granted protected
+                // input. No process is spawned on this path.
+                if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+                    return Err(TransportError::SessionFenced);
+                }
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_board_inbox_frame(session, frame);
             }
             if self
                 .service_state()

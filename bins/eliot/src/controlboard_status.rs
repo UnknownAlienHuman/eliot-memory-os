@@ -115,6 +115,15 @@ pub fn status_request_payload() -> serde_json::Value {
     serde_json::json!({})
 }
 
+/// Request payload for the board-inbox operation. The operation carries no
+/// caller parameters: the serving runtime reconciles the fixed closed read
+/// (all scopes, resolved records included, bounded page) on every request.
+/// Mirrors [`status_request_payload`] for the inbox route.
+#[must_use]
+pub fn inbox_request_payload() -> serde_json::Value {
+    serde_json::json!({})
+}
+
 /// Decodes one served notify inbox response into the canonical read it carries.
 ///
 /// The value is the `Response::Inbox` JSON document the notify `ReadInbox`

@@ -46,8 +46,12 @@ pub use reactive_context::{
     ReactiveContextViewBinding, reactive_context_contract_identity,
 };
 
+pub mod board_inbox;
 pub mod dreamer_job;
 pub mod reactive_restore;
+pub use board_inbox::{
+    BOARD_INBOX_CONTRACT_NAME, BOARD_INBOX_CONTRACT_VERSION, BOARD_INBOX_OPERATION,
+};
 pub use dreamer_job::{
     AdmissionRef, CancellationState, DURABLE_JOB_CANONICAL_ENCODING, DURABLE_JOB_CONTRACT_NAME,
     DURABLE_JOB_CONTRACT_VERSION, DurableJobError, DurableJobRecord, DurableJobRequest,

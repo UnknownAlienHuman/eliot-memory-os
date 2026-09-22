@@ -571,7 +571,8 @@ mod tests {
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use eliot_controlboard::{
         AccessBinding, AccessResolverPort, AnchorResolution, AnchorTargetKind, BoardItem,
-        BoardItemKind, CanonicalState, CanonicalStatePort, ControlBoard, PortError,
+        BoardItemKind, CanonicalState, CanonicalStatePort, ControlBoard, ControlBoardView,
+        NotificationInbox, NotificationMetrics, NotificationRow, PortError, ProjectedSeverity,
         ProjectionBinding, ProjectionProvider, ProviderCompleteness, ReadRequest, ReviewAnchor,
         ReviewItem, ReviewLifecycle, Role, ViewRevision, Visibility,
     };
@@ -580,7 +581,9 @@ mod tests {
     use eliot_observation_contracts::ObservationKind;
     use eliot_security_contracts::PrivacyClass;
 
-    use super::super::controlboard_projection::ControlBoardProjectionBindings;
+    use super::super::controlboard_projection::{
+        ControlBoardProjectionBindings, project_controlboard_contour,
+    };
     use super::*;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -900,6 +903,72 @@ mod tests {
             .find(|row| row.entry_id == "ghost-component")
             .expect("ghost row");
         assert_eq!(ghost.disposition, ControlBoardRowDisposition::Missing);
+    }
+
+    #[test]
+    fn notification_rows_render_through_the_denominator() {
+        use super::super::controlboard_projection::project_controlboard_contour;
+        fn inbox_row(dedup_key: &str, summary: &str) -> NotificationRow {
+            NotificationRow {
+                notification_id: format!("notification-{dedup_key}"),
+                dedup_key: dedup_key.to_owned(),
+                severity: ProjectedSeverity::Critical,
+                subject: "subject".to_owned(),
+                summary: summary.to_owned(),
+                evidence_handles: vec!["evidence-1".to_owned()],
+                affected_scope: "scope-1".to_owned(),
+                owner: "owner-1".to_owned(),
+                required_action: "review".to_owned(),
+                deadline_or_review: None,
+                delivery_channels: Vec::new(),
+                occurrences: 1,
+                delivery_failed: false,
+                failure_reason: None,
+                acknowledged: false,
+                resolved: false,
+                revision: 1,
+            }
+        }
+        let view = ControlBoardView {
+            revision: revision(),
+            fence: fence(),
+            items: Vec::new(),
+            reviews: Vec::new(),
+            provenance: Vec::new(),
+            notifications: NotificationInbox {
+                rows: vec![inbox_row("backup-failed", "backup failed")],
+                metrics: NotificationMetrics::default(),
+            },
+        };
+        let contour = project_controlboard_contour(&view, &bindings()).expect("inbox contour");
+        assert_eq!(contour.notification_count, 1);
+        let expected =
+            ControlBoardExpectedSet::new(vec!["backup-failed".to_owned(), "ghost-2".to_owned()])
+                .expect("expected set");
+        let rendered =
+            render_controlboard_status(&contour, &context(), &expected, &BTreeMap::new())
+                .expect("inbox renders");
+        // Observed inbox rows render with the default Unknown disposition
+        // and the observer context stamped verbatim; absent denominator
+        // entries stay Missing.
+        let row = rendered
+            .rows
+            .iter()
+            .find(|row| row.entry_id == "backup-failed")
+            .expect("inbox row");
+        assert_eq!(row.disposition, ControlBoardRowDisposition::Unknown);
+        assert!(row.disposition.was_observed());
+        assert_eq!(row.summary, Some("backup failed".to_owned()));
+        assert_eq!(row.installation.as_str(), "installation-portable-dev");
+        assert_eq!(row.recovery_owner.as_str(), "recovery-owner-ops");
+        assert_eq!(row.view_revision, 7);
+        let ghost = rendered
+            .rows
+            .iter()
+            .find(|row| row.entry_id == "ghost-2")
+            .expect("ghost row");
+        assert_eq!(ghost.disposition, ControlBoardRowDisposition::Missing);
+        assert_eq!(ghost.summary, None);
     }
 
     #[test]

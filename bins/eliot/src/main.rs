@@ -3946,6 +3946,39 @@ impl CommandPort for AuthenticatedKernelPort {
         request: &CommandRequest,
     ) -> Result<eliot_cli::CommandResponse, CommandPortError> {
         self.client.set_request_identity(request.request.clone());
+        if request.command == eliot_cli::CommandId::BoardInbox {
+            // Fixed board-inbox read under the piped admitted identity: the
+            // serving runtime reconciles the closed read on every request,
+            // so this arm carries no selectors. The kernel board/inbox
+            // operation answers with canonical inbox bytes; the payload
+            // forwards verbatim like any other provider projection.
+            let routed = self
+                .client
+                .transact_json(
+                    eliot_protocol::BOARD_INBOX_OPERATION,
+                    controlboard_status::inbox_request_payload(),
+                )
+                .map_err(|error| match error {
+                    eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(contract) => {
+                        CommandPortError::FrontDoorClosed { contract }
+                    }
+                    other => CommandPortError::Rejected(other.to_string()),
+                })?;
+            let spec = CommandCatalogue::current()
+                .commands()
+                .iter()
+                .find(|spec| spec.id == request.command)
+                .ok_or_else(|| {
+                    CommandPortError::Rejected("BoardInbox command is not catalogued".to_owned())
+                })?;
+            return Ok(eliot_cli::CommandResponse {
+                request: request.request.clone(),
+                command: request.command,
+                effect: spec.effect,
+                proof_ceiling: spec.proof_ceiling,
+                result: eliot_cli::CommandResult::Forwarded { payload: routed },
+            });
+        }
         if request.command == eliot_cli::CommandId::UserAutomation {
             let payload = user_automation_route_payload(request)
                 .map_err(|error| CommandPortError::Rejected(error.to_string()))?;

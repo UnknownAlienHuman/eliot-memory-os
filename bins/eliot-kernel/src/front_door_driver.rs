@@ -362,6 +362,29 @@ async fn serve_connection(
                 session.fence();
                 return Err(TransportError::SessionFenced);
             }
+            KernelFrameAction::BoardInbox {
+                request_id,
+                operation,
+                payload,
+            } => {
+                // #1780 operator board-inbox read: one bounded
+                // request/response through the closed board-inbox handler
+                // (`KernelComposition::execute_board_inbox_request`). Frames
+                // are served strictly in receive order on this connection;
+                // unknown operations never reach this arm (dispatch fences
+                // them) and any handler failure fences the session instead
+                // of silently dropping the read. No process is spawned
+                // here.
+                let reply = Box::pin(
+                    kernel.execute_board_inbox_request(&session, request_id, &operation, payload),
+                )
+                .await?;
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
+            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 session.fence();
@@ -523,14 +546,18 @@ async fn serve_admitted_bridge_host_requests(
             | KernelFrameAction::Doctor { .. }
             | KernelFrameAction::Testd { .. }
             | KernelFrameAction::Dreamer { .. }
-            | KernelFrameAction::ReactiveRestore { .. } => {
+            | KernelFrameAction::ReactiveRestore { .. }
+            | KernelFrameAction::BoardInbox { .. } => {
                 // Bridge transports never carry process, daemon, Doctor,
-                // testd, or Dreamer authority: the Doctor serves only its own
+                // testd, Dreamer, reactive-restore, or board-inbox
+                // authority: the Doctor serves only its own
                 // admitted generation-bound session/connection (T6-D2 P-07),
                 // testd serves only its own admitted generation-bound
-                // session/connection (T6-X1 P-07), and Dreamer serves only
+                // session/connection (T6-X1 P-07), Dreamer serves only
                 // its own admitted eliotd requester session/connection
-                // (T12-05 K2), never the bridge's. Revoke and fence exactly
+                // (T12-05 K2), and the board inbox serves only its own
+                // admitted front-door session/connection (#1780), never
+                // the bridge's. Revoke and fence exactly
                 // as for the other kinds.
                 kernel.revoke_agent_bridge(&connection_id);
                 return Err(TransportError::SessionFenced);
