@@ -1154,7 +1154,7 @@ pub(crate) fn wire_turn_id(params: &Value) -> Option<&str> {
     }
 }
 
-pub(crate) fn validate_wire_session_against_binding(
+fn validate_wire_session_against_binding(
     params: &Value,
     binding: &ProviderExecutionBinding,
 ) -> Result<(), CodexAdapterError> {
@@ -3241,14 +3241,103 @@ mod tests {
         Ok(attached)
     }
 
-    fn turn_wire_window() -> Vec<u8> {
-        [
-            r#"{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}}"#,
-            r#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"hello world"}}"#,
-            r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}"#,
+    enum FakeRead {
+        Data(Vec<u8>),
+        Eof,
+        Empty,
+    }
+
+    /// Scripted duplex child channel: records stdin writes and replays
+    /// scripted stdout reads, proving write→read causality without a
+    /// process. `Empty` repeats forever (hung server); `Eof` repeats
+    /// terminal EOF; `Data` pops once.
+    struct FakeChannel {
+        writes: std::sync::Mutex<Vec<Vec<u8>>>,
+        reads: std::sync::Mutex<std::collections::VecDeque<FakeRead>>,
+    }
+
+    impl FakeChannel {
+        fn scripted(reads: Vec<FakeRead>) -> Self {
+            Self {
+                writes: std::sync::Mutex::new(Vec::new()),
+                reads: std::sync::Mutex::new(reads.into_iter().collect()),
+            }
+        }
+
+        fn written(&self) -> Vec<Vec<u8>> {
+            self.writes.lock().expect("writes lock").clone()
+        }
+    }
+
+    impl eliot_process::InteractiveChildChannel for FakeChannel {
+        fn write_child_stdin(
+            &self,
+            _operation_id: eliot_process::OperationId,
+            bytes: Vec<u8>,
+        ) -> eliot_process::InteractiveChildFuture<'_, usize> {
+            let len = bytes.len();
+            self.writes.lock().expect("writes lock").push(bytes);
+            Box::pin(async move { Ok(len) })
+        }
+
+        fn read_child_stdout(
+            &self,
+            _operation_id: &eliot_process::OperationId,
+            _max_bytes: usize,
+            _deadline: std::time::Duration,
+        ) -> eliot_process::InteractiveChildFuture<'_, eliot_process::ChildStdoutChunk>
+        {
+            let chunk = {
+                let mut reads = self.reads.lock().expect("reads lock");
+                match reads.front() {
+                    // Explicit hang: repeats forever; the driver deadline
+                    // bounds the wait.
+                    Some(FakeRead::Empty) => eliot_process::ChildStdoutChunk {
+                        bytes: Vec::new(),
+                        end_of_stream: false,
+                    },
+                    // Script exhausted: the scripted server said all it will
+                    // say; the stream is over.
+                    Some(FakeRead::Eof) | None => eliot_process::ChildStdoutChunk {
+                        bytes: Vec::new(),
+                        end_of_stream: true,
+                    },
+                    Some(FakeRead::Data(_)) => match reads.pop_front() {
+                        Some(FakeRead::Data(bytes)) => eliot_process::ChildStdoutChunk {
+                            bytes,
+                            end_of_stream: false,
+                        },
+                        _ => eliot_process::ChildStdoutChunk {
+                            bytes: Vec::new(),
+                            end_of_stream: false,
+                        },
+                    },
+                }
+            };
+            Box::pin(async move { Ok(chunk) })
+        }
+    }
+
+    fn turn_frames() -> Vec<FakeRead> {
+        // Newline-terminated JSONL frames, as a live server emits them.
+        vec![
+            FakeRead::Data(br#"{"id":"turn-1-start","result":{"ok":true}}
+"#.to_vec()),
+            FakeRead::Data(
+                br#"{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Data(
+                br#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"hello world"}}
+"#.to_vec(),
+            ),
+            FakeRead::Data(
+                br#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}
+"#.to_vec(),
+            ),
+            FakeRead::Eof,
         ]
-        .join("\n")
-        .into_bytes()
     }
 
     fn turn_owner_event() -> super::turn_driver::TurnOwnerEvent {
@@ -3268,20 +3357,23 @@ mod tests {
 
     fn drive_inputs<'a>(
         executor: Arc<FakeExecutor>,
+        channel: Arc<FakeChannel>,
         attached: &'a mut CodexAttachReceipt,
         binding: &'a ProviderExecutionBinding,
         admission: &'a AdmittedRouteReceipt,
         sink: Arc<Sink>,
-        wire_bytes: &'a [u8],
+        timeout: std::time::Duration,
     ) -> super::turn_driver::CodexTurnDriverInputs<'a, FakeExecutor> {
         use super::turn_driver::CodexTurnDriverInputs;
         CodexTurnDriverInputs {
             executor,
+            channel,
             attached,
             binding,
             admission,
             evidence_sink: Some(sink),
-            wire_bytes,
+            turn_input: serde_json::json!({"prompt": "hello"}),
+            turn_timeout: timeout,
             owner_event: turn_owner_event(),
             usage: UsageReceipt {
                 input_tokens: None,
@@ -3293,6 +3385,14 @@ mod tests {
             proposed_effects: Vec::new(),
             cancelled: false,
         }
+    }
+
+    fn live_channel() -> FakeChannel {
+        FakeChannel::scripted(turn_frames())
+    }
+
+    fn default_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(5)
     }
 
     fn terminal_for(
@@ -3454,22 +3554,34 @@ mod tests {
             starts: AtomicUsize::new(0),
         });
         let sink: Arc<Sink> = Arc::new(Sink);
+        let channel = Arc::new(live_channel());
         let mut attached = attached_with_model("gpt-5-codex")?;
         let binding = bound_binding_with_model("gpt-5-codex")?;
         let admission = admission_for(&binding)?;
-        let window = turn_wire_window();
         let drive = drive_codex_turn(drive_inputs(
             Arc::clone(&executor),
+            Arc::clone(&channel),
             &mut attached,
             &binding,
             &admission,
             sink,
-            &window,
+            default_timeout(),
         ))
         .await?;
         // Real P-03 launch through the injected executor, once.
         assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
         assert!(drive.launch.is_some());
+        // Real turn protocol over the live channel: exactly one turn/start
+        // carrying the bound thread and the owner input.
+        let written = channel.written();
+        assert_eq!(written.len(), 1);
+        let sent: serde_json::Value = serde_json::from_slice(&written[0])?;
+        assert_eq!(sent["method"], "turn/start");
+        assert_eq!(sent["params"]["threadId"], "thread-1");
+        assert_eq!(sent["params"]["input"]["prompt"], "hello");
+        assert!(sent["id"]
+            .as_str()
+            .is_some_and(|id| id.ends_with("-start")));
         // Canonical turn receipt over the pumped text and derived terminal.
         assert_eq!(drive.result.disposition, ResultDisposition::Partial);
         assert_eq!(drive.result.attempt_id, binding.attempt_id);
@@ -3502,30 +3614,35 @@ mod tests {
         let mut attached = attached_with_model("gpt-5-codex")?;
         let binding = bound_binding_with_model("gpt-5-codex")?;
         let admission = admission_for(&binding)?;
-        let window = turn_wire_window();
+        let first_channel = Arc::new(live_channel());
         let first = drive_codex_turn(drive_inputs(
             Arc::clone(&executor),
+            Arc::clone(&first_channel),
             &mut attached,
             &binding,
             &admission,
             Arc::clone(&sink),
-            &window,
+            default_timeout(),
         ))
         .await?;
         assert!(first.launch.is_some());
+        let second_channel = Arc::new(live_channel());
         let second = drive_codex_turn(drive_inputs(
             Arc::clone(&executor),
+            second_channel,
             &mut attached,
             &binding,
             &admission,
             sink,
-            &window,
+            default_timeout(),
         ))
         .await?;
         // Single-take process request: the second drive reuses the running
-        // server instead of relaunching, and still assembles + measures.
+        // server instead of relaunching, opens a fresh turn over the live
+        // channel, and still assembles + measures.
         assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
         assert!(second.launch.is_none());
+        assert_eq!(first_channel.written().len(), 1);
         assert!(second.measured.is_some());
         Ok(())
     }
@@ -3540,14 +3657,22 @@ mod tests {
         let mut attached = attached_with_model("gpt-5-codex")?;
         let binding = bound_binding_with_model("gpt-5-codex")?;
         let admission = admission_for(&binding)?;
-        let window = br#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"partial"}}"#;
+        let channel = Arc::new(FakeChannel::scripted(vec![
+            FakeRead::Data(
+                br#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"partial"}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Eof,
+        ]));
         let drive = drive_codex_turn(drive_inputs(
             executor,
+            channel,
             &mut attached,
             &binding,
             &admission,
             sink,
-            window,
+            default_timeout(),
         ))
         .await?;
         // No terminal fact exists: unknown outcome preserved, no carrier
@@ -3568,16 +3693,34 @@ mod tests {
         let mut attached = attached_with_model("gpt-5-codex")?;
         let binding = bound_binding_with_model("gpt-5-codex")?;
         let admission = admission_for(&binding)?;
-        let mut window = br#"{"method":"item/agentMessage/delta","params":{"threadId":"other-thread","turnId":"turn-9","itemId":"x-1","delta":"FOREIGN"}}"#.to_vec();
-        window.extend_from_slice(b"\n");
-        window.extend_from_slice(&turn_wire_window());
+        let channel = Arc::new(FakeChannel::scripted(vec![
+            FakeRead::Data(br#"{"id":"turn-1-start","result":{"ok":true}}
+"#.to_vec()),
+            FakeRead::Data(
+                br#"{"method":"item/agentMessage/delta","params":{"threadId":"other-thread","turnId":"turn-9","itemId":"x-1","delta":"FOREIGN"}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Data(
+                br#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"hello world"}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Data(
+                br#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Eof,
+        ]));
         let drive = drive_codex_turn(drive_inputs(
             executor,
+            channel,
             &mut attached,
             &binding,
             &admission,
             sink,
-            &window,
+            default_timeout(),
         ))
         .await?;
         // Foreign text never enters our turn: exact own bytes measured.
@@ -3597,15 +3740,18 @@ mod tests {
         let mut attached = attached_with_model("gpt-5-codex")?;
         let binding = bound_binding_with_model("gpt-5-codex")?;
         let admission = admission_for(&binding)?;
-        let window = b"not jsonl at all {{{";
+        let channel = Arc::new(FakeChannel::scripted(vec![FakeRead::Data(
+            b"not jsonl at all {{{\n".to_vec(),
+        )]));
         assert!(matches!(
             drive_codex_turn(drive_inputs(
                 executor,
+                channel,
                 &mut attached,
                 &binding,
                 &admission,
                 sink,
-                window,
+                default_timeout(),
             ))
             .await,
             Err(CodexAdapterError::MalformedWire(_))
@@ -3623,15 +3769,19 @@ mod tests {
         let mut attached = attached_with_model("gpt-5-codex")?;
         let binding = bound_binding_with_model("gpt-5-codex")?;
         let admission = admission_for(&binding)?;
-        let window = vec![b'x'; CODEX_TURN_WIRE_MAX_BYTES + 1];
+        let channel = Arc::new(FakeChannel::scripted(vec![FakeRead::Data(vec![
+            b'x';
+            CODEX_TURN_WIRE_MAX_BYTES + 1
+        ])]));
         assert!(matches!(
             drive_codex_turn(drive_inputs(
                 executor,
+                channel,
                 &mut attached,
                 &binding,
                 &admission,
                 sink,
-                &window,
+                default_timeout(),
             ))
             .await,
             Err(CodexAdapterError::WireTooLarge)
@@ -3648,15 +3798,17 @@ mod tests {
         let mut attached = attached_with_model("gpt-5-codex")?;
         let binding = bound_binding_with_model("gpt-5-codex")?;
         let admission = admission_for(&binding)?;
-        let window = turn_wire_window();
+        let channel = Arc::new(live_channel());
         assert!(matches!(
             drive_codex_turn(CodexTurnDriverInputs {
                 executor,
+                channel,
                 attached: &mut attached,
                 binding: &binding,
                 admission: &admission,
                 evidence_sink: None,
-                wire_bytes: &window,
+                turn_input: serde_json::json!({"prompt": "hello"}),
+                turn_timeout: default_timeout(),
                 owner_event: turn_owner_event(),
                 usage: UsageReceipt {
                     input_tokens: None,
@@ -3684,19 +3836,132 @@ mod tests {
         let mut attached = attached_with_model("codex-mini-latest")?;
         let binding = bound_binding_with_model("codex-mini-latest")?;
         let admission = admission_for(&binding)?;
-        let window = turn_wire_window();
+        let channel = Arc::new(live_channel());
         let drive = drive_codex_turn(drive_inputs(
             executor,
+            channel,
             &mut attached,
             &binding,
             &admission,
             sink,
-            &window,
+            default_timeout(),
         ))
         .await?;
         // The turn receipt stands (translate does not measure); only the
         // carrier withholds for the community-only mapping.
         assert_eq!(drive.result.disposition, ResultDisposition::Partial);
+        assert!(drive.measured.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_rejected_start_yields_precise_unknown() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let channel = Arc::new(FakeChannel::scripted(vec![
+            FakeRead::Data(
+                br#"{"id":"turn-1-start","error":{"code":"busy","message":"nope"}}
+"#
+                .to_vec(),
+            ),
+            FakeRead::Eof,
+        ]));
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            channel,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            default_timeout(),
+        ))
+        .await?;
+        // Rejected turn never runs: unknown outcome with the precise static
+        // reason (never provider prose), no carrier estimated.
+        assert_eq!(drive.result.disposition, ResultDisposition::UnknownOutcome);
+        assert_eq!(
+            drive.result.unknown_reason.as_deref(),
+            Some("turn start rejected by provider")
+        );
+        assert!(drive.measured.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_assembles_split_frames_across_reads() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let completed =
+            br#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}
+"#;
+        let split_at = completed.len() / 2;
+        let channel = Arc::new(FakeChannel::scripted(vec![
+            FakeRead::Data(br#"{"id":"turn-1-start","result":{"ok":true}}
+"#.to_vec()),
+            FakeRead::Data(
+                br#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"hello world"}}
+"#.to_vec(),
+            ),
+            FakeRead::Data(completed[..split_at].to_vec()),
+            FakeRead::Data(completed[split_at..].to_vec()),
+            FakeRead::Eof,
+        ]));
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            channel,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            default_timeout(),
+        ))
+        .await?;
+        // Streaming remainder logic: the split terminal still derives.
+        let carrier = drive.measured.expect("split terminal still binds");
+        assert_eq!(carrier.result_bytes, b"hello world");
+        assert_eq!(
+            carrier.observation.route_state,
+            RouteObservationState::Matched
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_driver_deadline_bounds_hung_server() -> TestResult {
+        use super::turn_driver::drive_codex_turn;
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let channel = Arc::new(FakeChannel::scripted(vec![FakeRead::Empty]));
+        let drive = drive_codex_turn(drive_inputs(
+            executor,
+            channel,
+            &mut attached,
+            &binding,
+            &admission,
+            sink,
+            std::time::Duration::from_millis(50),
+        ))
+        .await?;
+        // No frames ever arrive: the owner deadline bounds the wait and the
+        // outcome stays unknown with no carrier.
+        assert_eq!(drive.result.disposition, ResultDisposition::UnknownOutcome);
         assert!(drive.measured.is_none());
         Ok(())
     }
