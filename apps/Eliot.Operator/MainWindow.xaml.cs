@@ -17,7 +17,9 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         _client = new GovernorPipeClient(new RuntimeDiscoveryService());
-        ViewModel = new MainViewModel(_client);
+        ViewModel = new MainViewModel(
+            _client,
+            OperatorPendingOperationJournal.CreateDefault());
         InitializeComponent();
         ViewModel.PropertyChanged += (_, args) =>
         {

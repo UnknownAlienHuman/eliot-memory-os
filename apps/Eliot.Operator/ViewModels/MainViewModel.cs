@@ -43,6 +43,7 @@ public static class OperatorPageCatalog
 public sealed class MainViewModel : INotifyPropertyChanged
 {
     private readonly IGovernorClient _client;
+    private readonly OperatorPendingOperationJournal? _pendingJournal;
     private OperatorTaskContext? _taskContext;
     private CancellationTokenSource? _requestCancellation;
     private OperatorPageDefinition _currentPage = OperatorPageCatalog.All[0];
@@ -79,10 +80,37 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private string _statusTitle = "Disconnected";
     private string _statusMessage = "Waiting for the active ELIOT runtime.";
     private OperatorBannerSeverity _statusSeverity = OperatorBannerSeverity.Informational;
+    private bool _pendingJournalUnavailable;
 
-    public MainViewModel(IGovernorClient client)
+    public MainViewModel(
+        IGovernorClient client,
+        OperatorPendingOperationJournal? pendingJournal = null)
     {
         _client = client;
+        _pendingJournal = pendingJournal;
+        if (_pendingJournal is not null)
+        {
+            try
+            {
+                _pendingOperations.AddRange(_pendingJournal.LoadForRecovery());
+                if (_pendingOperations.Count > 0)
+                {
+                    _statusTitle = "Reconciliation required";
+                    _statusMessage = $"{_pendingOperations.Count} operator operation(s) survived a restart and require same-operation reconciliation.";
+                    _statusSeverity = OperatorBannerSeverity.Warning;
+                }
+            }
+            catch (OperatorPendingOperationJournalException error)
+            {
+                // Do not overwrite or discard an unreadable journal. The UI
+                // remains available for reads, but no new mutation can be
+                // sent until the owner-local recovery artifact is readable.
+                _pendingJournalUnavailable = true;
+                _statusTitle = "Recovery journal unavailable";
+                _statusMessage = error.Message;
+                _statusSeverity = OperatorBannerSeverity.Error;
+            }
+        }
         foreach (var page in OperatorPageCatalog.All)
         {
             PaletteSuggestions.Add($"Go: {page.Title}");
@@ -508,6 +536,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         IsBusy = true;
         NotifyCounts();
+        if (!isReconcile && _pendingJournalUnavailable)
+        {
+            SetBanner(
+                "Command not sent",
+                "The user-local pending-operation journal is unavailable; recover it before sending another mutation.",
+                OperatorBannerSeverity.Error);
+            IsBusy = false;
+            NotifyCounts();
+            return;
+        }
+
         var pending = new OperatorPendingOperation(
             envelope.OperationId,
             JsonSerializer.Serialize(envelope),
@@ -518,16 +557,31 @@ public sealed class MainViewModel : INotifyPropertyChanged
         if (!isReconcile)
         {
             _pendingOperations.Add(pending);
+            if (!TryPersistPendingState())
+            {
+                _pendingOperations.RemoveAll(operation => operation.OperationId == pending.OperationId);
+                RefreshPendingState();
+                SetBanner(
+                    "Command not sent",
+                    "The pending operation could not be durably journaled; no owner request was sent.",
+                    OperatorBannerSeverity.Error);
+                IsBusy = false;
+                NotifyCounts();
+                return;
+            }
             RefreshPendingState();
         }
         try
         {
+            var requestEnvelope = isReconcile
+                ? ParseRetainedEnvelope(pending.EnvelopeJson)
+                : JsonSerializer.SerializeToElement(envelope);
             JsonElement receipt = isReconcile
                 ? await _client.ReconcileAsync(
-                    JsonSerializer.SerializeToElement(envelope),
+                    requestEnvelope,
                     _requestCancellation?.Token ?? CancellationToken.None)
                 : await _client.CommandAsync(
-                    envelope,
+                    requestEnvelope,
                     _requestCancellation?.Token ?? CancellationToken.None);
             bool accepted;
             bool executed;
@@ -570,22 +624,54 @@ public sealed class MainViewModel : INotifyPropertyChanged
             }
             if (accepted && executed)
             {
-                ReplacePending(pending.OperationId, OperatorOperationPhase.Receipted);
-                _pendingOperations.RemoveAll(operation => operation.OperationId == pending.OperationId);
+                if (!RemovePending(pending.OperationId))
+                {
+                    RefreshPendingState();
+                    SetBanner(
+                        "Receipt received — recovery retained",
+                        $"{action}: the owner returned a receipt, but the local journal could not be compacted; reconcile the retained operation after recovery.",
+                        OperatorBannerSeverity.Warning);
+                    return;
+                }
             }
             else if (!accepted)
             {
-                ReplacePending(pending.OperationId, OperatorOperationPhase.Rejected);
-                _pendingOperations.RemoveAll(operation => operation.OperationId == pending.OperationId);
+                if (!RemovePending(pending.OperationId))
+                {
+                    RefreshPendingState();
+                    SetBanner(
+                        "Rejection received — recovery retained",
+                        $"{action}: the owner rejected the command, but the local journal could not be compacted; retain the exact operation for reconciliation.",
+                        OperatorBannerSeverity.Warning);
+                    return;
+                }
+            }
+            else
+            {
+                // An accepted-but-not-yet-executed response is still an
+                // owner-pending effect. Keep it durable and make the UI
+                // reconcile the same identity rather than treating the
+                // provisional answer as a terminal success.
+                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
             }
             RefreshPendingState();
             if (executed) await RefreshAsync();
+            var bannerTitle = accepted && !executed
+                ? "Command accepted — reconcile pending owner work"
+                : accepted
+                    ? "Command accepted"
+                    : "Command rejected";
+            var bannerSeverity = accepted && !executed
+                ? OperatorBannerSeverity.Warning
+                : accepted
+                    ? OperatorBannerSeverity.Success
+                    : OperatorBannerSeverity.Warning;
             SetBanner(
-                accepted ? "Command accepted" : "Command rejected",
+                bannerTitle,
                 receiptId is null
                     ? $"{action}: {outcome}; no durable mutation executed."
                     : $"{action}: {outcome}; canonical receipt {receiptId}.",
-                accepted ? OperatorBannerSeverity.Success : OperatorBannerSeverity.Warning);
+                bannerSeverity);
         }
         catch (OperatorUnknownOutcomeException unknown)
         {
@@ -601,6 +687,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         catch (OperatorRestartRequiredException restart)
         {
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
             SetBanner(
                 "Restart required",
                 $"{action}: {restart.Message} Obtain a fresh broker handoff; the pending operation is retained.",
@@ -619,8 +707,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
             // Terminal local or owner-refusal failure: the owner answered (or
             // nothing was sent), so the pending entry closes as rejected and
             // no reconciliation handle is retained.
-            ReplacePending(pending.OperationId, OperatorOperationPhase.Rejected);
-            _pendingOperations.RemoveAll(operation => operation.OperationId == pending.OperationId);
+            if (!RemovePending(pending.OperationId))
+            {
+                RefreshPendingState();
+                SetBanner(
+                    "Command failed — recovery retained",
+                    $"{action}: {error.Message}; the local journal could not be compacted, so the exact operation remains pending.",
+                    OperatorBannerSeverity.Warning);
+                return;
+            }
             RefreshPendingState();
             SetBanner("Command failed", error.Message, OperatorBannerSeverity.Error);
         }
@@ -631,10 +726,46 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    private void ReplacePending(string operationId, OperatorOperationPhase phase)
+    private bool ReplacePending(string operationId, OperatorOperationPhase phase)
     {
         var index = _pendingOperations.FindIndex(operation => operation.OperationId == operationId);
-        if (index >= 0) _pendingOperations[index] = _pendingOperations[index].WithPhase(phase);
+        if (index < 0) return true;
+        var original = _pendingOperations[index];
+        _pendingOperations[index] = original.WithPhase(phase);
+        if (TryPersistPendingState()) return true;
+        _pendingOperations[index] = original;
+        return false;
+    }
+
+    private bool RemovePending(string operationId)
+    {
+        var retained = _pendingOperations.ToArray();
+        _pendingOperations.RemoveAll(operation => operation.OperationId == operationId);
+        if (TryPersistPendingState()) return true;
+        _pendingOperations.Clear();
+        _pendingOperations.AddRange(retained);
+        return false;
+    }
+
+    private bool TryPersistPendingState()
+    {
+        if (_pendingJournal is null) return true;
+        try
+        {
+            _pendingJournal.Save(_pendingOperations);
+            return true;
+        }
+        catch (OperatorPendingOperationJournalException)
+        {
+            _pendingJournalUnavailable = true;
+            return false;
+        }
+    }
+
+    private static JsonElement ParseRetainedEnvelope(string envelopeJson)
+    {
+        using var document = JsonDocument.Parse(envelopeJson);
+        return document.RootElement.Clone();
     }
 
     private void RefreshPendingState()
