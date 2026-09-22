@@ -710,6 +710,19 @@ async fn run_loop(
                     }
                     ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
                         Ok(()) => {
+                            // O1 governed execution trigger (issue #1942): an
+                            // activation resolved, so re-evaluate governed
+                            // dispatchability now — new sessions may be
+                            // admitted. The poll reads live owners and
+                            // declines without dispatchable work; execution
+                            // outcomes never fail this activation loop (the
+                            // poll reports Dispatched/Declined/Failed
+                            // internally with diagnostics).
+                            eliotd::attempt_execution_chain::poll_governed_dispatch(
+                                kernel.as_ref(),
+                                composition.as_ref(),
+                                None,
+                            );
                             flight = ActivationFlight::Idle;
                         }
                         Err(ActivationDispatchError::Hard(error)) => return Err(error),
