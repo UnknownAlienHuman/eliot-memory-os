@@ -7,7 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod closure;
 pub mod decision;
+
+pub use closure::{ClosureParts, assemble_closure};
 
 pub use decision::{
     MaterialRankTrace, RetrievalAdmissionDecision, RetrievalStaleness, check_retrieval_freshness,

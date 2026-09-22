@@ -215,10 +215,7 @@ impl RetrievalStaleness {
 /// or mutation; it only classifies the already-typed closure evidence.
 pub fn check_retrieval_freshness(input: &AdmissionInput) -> Result<(), RetrievalStaleness> {
     for candidate in &input.candidates.candidates {
-        if !fences_match_exact(
-            &input.binding.state_fence,
-            &candidate.binding.state_fence,
-        ) {
+        if !fences_match_exact(&input.binding.state_fence, &candidate.binding.state_fence) {
             return Err(RetrievalStaleness::PacketRefreshRequired);
         }
     }
@@ -385,11 +382,7 @@ pub fn trace_material(
             atom_id: candidate.atom_id.clone(),
             disposition: decision.disposition,
             outcome: RetrievalAdmissionDecision::from_membership(decision.disposition, None),
-            staleness: material_staleness(
-                &input.binding.state_fence,
-                candidate,
-                &floor_ids,
-            ),
+            staleness: material_staleness(&input.binding.state_fence, candidate, &floor_ids),
             rule_evidence: decision.rule_evidence.clone(),
             suppression_reason: omission.map(|item| item.competing_constraint.clone()),
             dependencies: candidate.dependencies.clone(),

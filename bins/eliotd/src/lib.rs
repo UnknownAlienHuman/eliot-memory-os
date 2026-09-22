@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
@@ -162,8 +163,9 @@ pub use process_origin::{
     request_origin_control,
 };
 pub use reactive_feed::{
-    RetrievalDriveOutcome, RetrievalObligation, RetrievalSuppliers, SupplierResolution,
-    drive_retrieval_admission, poll_retrieval_drive, resolve_retrieval_suppliers,
+    PacketSlot, RetrievalDriveOutcome, RetrievalDriveState, RetrievalObligation,
+    RetrievalSupplierState, RetrievalSuppliers, SupplierResolution, drive_retrieval_admission,
+    poll_retrieval_drive, resolve_retrieval_suppliers,
 };
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
@@ -327,6 +329,14 @@ pub struct DaemonComposition {
     /// execute. Semantics stay in the Governor registry; this is the
     /// composition root's handle on that view.
     capability_admission: GovernorCapabilityAdmission,
+    /// Retained retrieval supplier postures for the #1947 daemon drive.
+    ///
+    /// Constructed empty at [`DaemonComposition::start`], hydrated by
+    /// [`DaemonComposition::set_retrieval_suppliers`] as the retrieval plan
+    /// compiler and admission input assembler owners land, and consumed by
+    /// the retrieval tick through `reactive_feed`. Interior mutability only:
+    /// the tick never blocks on it.
+    retrieval_drive: Mutex<reactive_feed::RetrievalDriveState>,
 }
 
 impl DaemonComposition {
@@ -387,7 +397,32 @@ impl DaemonComposition {
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
+            retrieval_drive: Mutex::new(reactive_feed::RetrievalDriveState::new()),
         })
+    }
+
+    /// Injects retrieval supplier postures from their owners (Implements #1947).
+    ///
+    /// Called by the retrieval plan compiler and admission input assembler
+    /// landings as they deliver; either side may arrive first or be withdrawn
+    /// with `None`. The retrieval tick drives only when both are present.
+    /// Returns false only when the retained drive state is unavailable, in
+    /// which case nothing was stored.
+    pub fn set_retrieval_suppliers(
+        &self,
+        plan: Option<eliot_reactive_context_plan::RetrievalPlan>,
+        input: Option<eliot_context_contracts::AdmissionInput>,
+    ) -> bool {
+        let Ok(mut drive) = self.retrieval_drive.lock() else {
+            return false;
+        };
+        drive.suppliers.plan = plan;
+        drive.suppliers.input = input;
+        // A changed posture invalidates the retained outcome: the next tick
+        // re-drives instead of replaying evidence for superseded suppliers.
+        drive.last_bundle_digest = None;
+        drive.last_outcome = None;
+        true
     }
 
     /// Commits one Canonical-admitted transition under the exact admitted

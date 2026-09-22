@@ -9,6 +9,7 @@
 #![allow(clippy::result_large_err, clippy::large_enum_variant)]
 
 mod bridge_admission;
+mod compiler;
 mod input;
 mod plan;
 mod result;
@@ -20,6 +21,7 @@ pub use bridge_admission::{
     BridgeAdmissionInstruction, BridgeAdmissionSeverity, MAX_BRIDGE_RELATIONS,
     plan_bridge_admissions,
 };
+pub use compiler::{CampaignQueryParts, PlanParts, compile_retrieval_plan};
 
 pub use input::{
     AttentionDisclosureRule, ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTargetBinding,
