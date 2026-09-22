@@ -7,6 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod decision;
+
+pub use decision::RetrievalAdmissionDecision;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use eliot_context_contracts::{
