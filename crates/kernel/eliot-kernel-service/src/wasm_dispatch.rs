@@ -310,6 +310,13 @@ pub struct WasmDispatchMaterial {
     pub grant: WasmDispatchGrant,
     /// Guest invocation ceilings and pinned identities.
     pub guest: WasmGuestCeilings,
+    /// Composition profile the reaped child runs under
+    /// (`D2_OPERATIONAL` or `FULL_COMPOSITION`). The owner selects the
+    /// composition; the child requires the spelling and refuses unless the
+    /// profile is compiled into its binary. Part of the canonical intent
+    /// argv (`--profile <profile>` first), so the owner join derives it
+    /// identically.
+    pub profile: String,
 }
 
 /// Validates and builds the publishable dispatch material envelope from
@@ -327,6 +334,7 @@ pub fn publish_wasm_dispatch_material(
     identity_digest: &str,
     host_artifact_digest: &str,
     guest: WasmGuestCeilings,
+    profile: &str,
 ) -> Result<WasmDispatchMaterial, WasmDispatchError> {
     require_nonblank(claim_id, "claim-id")?;
     require_nonblank(operation_id, "operation-id")?;
@@ -334,6 +342,9 @@ pub fn publish_wasm_dispatch_material(
     require_nonblank(&guest.component_id, "guest-component-id")?;
     require_digest(&guest.artifact_digest, "guest-artifact-digest")?;
     require_digest(&guest.input_digest, "guest-input-digest")?;
+    if profile != "D2_OPERATIONAL" && profile != "FULL_COMPOSITION" {
+        return Err(invalid("profile"));
+    }
     if admitted_at_unix_ms == 0 {
         return Err(invalid("admitted-at"));
     }
@@ -363,6 +374,7 @@ pub fn publish_wasm_dispatch_material(
         admitted_at_unix_ms,
         grant,
         guest,
+        profile: profile.to_owned(),
     })
 }
 
@@ -500,10 +512,12 @@ mod tests {
             &"a".repeat(64),
             &"d".repeat(64),
             test_guest(),
+            "D2_OPERATIONAL",
         )
         .expect("material publishes");
         assert_eq!(material.wire_id, WASM_DISPATCH_MATERIAL_WIRE_ID);
         assert_eq!(material.wire_version, WASM_DISPATCH_MATERIAL_WIRE_VERSION);
+        assert_eq!(material.profile, "D2_OPERATIONAL");
         let bytes = material_bytes(&material).expect("material serializes");
         let reparsed: WasmDispatchMaterial =
             serde_json::from_slice(&bytes).expect("material reparses");
@@ -520,6 +534,23 @@ mod tests {
                 &"a".repeat(64),
                 &"d".repeat(64),
                 test_guest(),
+                "D2_OPERATIONAL",
+            ),
+            Err(WasmDispatchError::InvalidMaterial(_))
+        ));
+        // Unknown profile fails closed.
+        assert!(matches!(
+            publish_wasm_dispatch_material(
+                "claim-wasm-r1-001",
+                "operation-wasm-r1-001",
+                Generation::new(7).expect("generation"),
+                &test_epoch(),
+                "launch-nonce-wasm-r1-0001",
+                4_000_000_000_000,
+                &"a".repeat(64),
+                &"d".repeat(64),
+                test_guest(),
+                "FANCY_PROFILE",
             ),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));

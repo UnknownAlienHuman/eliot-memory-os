@@ -139,6 +139,7 @@ struct MaterialEnvelopeMirror {
     admitted_at_unix_ms: u64,
     grant: MaterialGrantMirror,
     guest: GuestCeilingsMirror,
+    profile: String,
 }
 
 /// Validated guest ceilings carried for intent derivation.
@@ -186,6 +187,8 @@ pub struct ValidatedDispatchMaterial {
     pub grant: ValidatedDispatchGrant,
     /// Owner-measured installed-image digest.
     pub host_artifact_digest: Sha256Digest,
+    /// Owner-selected composition profile, compiled into this binary.
+    pub profile: crate::cli_contract::Profile,
     /// Validated guest ceilings and pinned identities.
     pub ceilings: ValidatedGuestCeilings,
     /// Observed guest artifact bytes matching the envelope digest.
@@ -258,6 +261,52 @@ fn validate_envelope(
     path: &Path,
 ) -> Result<ValidatedDispatchMaterial, MaterialError> {
     let invalid = |field: &'static str| MaterialError::InvalidRecord { field };
+    check_envelope_identities(envelope)?;
+    let profile: crate::cli_contract::Profile =
+        envelope.profile.parse().map_err(|_| invalid("profile"))?;
+    if !profile.is_compiled() {
+        return Err(invalid("profile"));
+    }
+    let grant = rebuild_grant(envelope)?;
+    let ceilings = check_guest_ceilings(envelope)?;
+    let directory = path.parent().ok_or_else(|| invalid("material-dir"))?;
+    let artifact_bytes = read_colocated(
+        &directory.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME),
+        &ceilings.artifact_digest,
+    )?;
+    let input_bytes = read_colocated(
+        &directory.join(WASM_HOST_GUEST_INPUT_FILE_NAME),
+        &ceilings.input_digest,
+    )?;
+    Ok(ValidatedDispatchMaterial {
+        claim_id: envelope.claim_id.clone(),
+        operation_id: envelope.operation_id.clone(),
+        generation: envelope.generation,
+        authority_epoch: envelope.authority_epoch.clone(),
+        launch_nonce: envelope.launch_nonce.clone(),
+        admitted_at_unix_ms: envelope.admitted_at_unix_ms,
+        grant: grant.grant,
+        host_artifact_digest: grant.host_digest,
+        profile,
+        ceilings: ValidatedGuestCeilings {
+            component_id: ceilings.component_id.clone(),
+            artifact_digest: ceilings.artifact_digest.clone(),
+            input_digest: ceilings.input_digest.clone(),
+            max_output_bytes: ceilings.max_output_bytes,
+            max_fuel: ceilings.max_fuel,
+            max_memory_bytes: ceilings.max_memory_bytes,
+            wall_deadline_ms: ceilings.wall_deadline_ms,
+            epoch_deadline_ticks: ceilings.epoch_deadline_ticks,
+        },
+        artifact_bytes,
+        input_bytes,
+    })
+}
+
+/// Checks envelope wire identity plus claim/operation/generation/nonce/
+/// admission-time shape. Pure record checks; digest and grant proofs below.
+fn check_envelope_identities(envelope: &MaterialEnvelopeMirror) -> Result<(), MaterialError> {
+    let invalid = |field: &'static str| MaterialError::InvalidRecord { field };
     if envelope.wire_id != WASM_DISPATCH_MATERIAL_WIRE_ID
         || envelope.wire_version != WASM_DISPATCH_MATERIAL_WIRE_VERSION
     {
@@ -278,31 +327,27 @@ fn validate_envelope(
     if envelope.admitted_at_unix_ms == 0 {
         return Err(invalid("admitted-at"));
     }
+    Ok(())
+}
+
+/// Rebuilt grant inputs: the validated grant plus the owner-measured host
+/// digest, proven against the envelope records.
+struct RebuiltGrant {
+    grant: ValidatedDispatchGrant,
+    host_digest: Sha256Digest,
+}
+
+/// Rebuilds the fence and lease through the production broker types and
+/// validates the grant window and epoch agreement.
+fn rebuild_grant(envelope: &MaterialEnvelopeMirror) -> Result<RebuiltGrant, MaterialError> {
+    let invalid = |field: &'static str| MaterialError::InvalidRecord { field };
     if envelope.grant.fence_generation == 0 {
         return Err(invalid("fence-generation"));
     }
     if envelope.grant.expires_at <= envelope.admitted_at_unix_ms {
         return Err(invalid("grant-window"));
     }
-    let guest = &envelope.guest;
-    if guest.component_id.trim().is_empty() {
-        return Err(invalid("guest-component-id"));
-    }
-    for value in [
-        guest.max_output_bytes,
-        guest.max_fuel,
-        guest.max_memory_bytes,
-        guest.wall_deadline_ms,
-        guest.epoch_deadline_ticks,
-    ] {
-        if value == 0 {
-            return Err(invalid("guest-ceilings"));
-        }
-    }
-    let artifact_digest = hex_digest(&guest.artifact_digest, "guest-artifact-digest")?;
-    let input_digest = hex_digest(&guest.input_digest, "guest-input-digest")?;
-    let host_artifact_digest =
-        hex_digest(&envelope.grant.host_artifact_digest, "host-artifact-digest")?;
+    let host_digest = hex_digest(&envelope.grant.host_artifact_digest, "host-artifact-digest")?;
     let generation = Generation::new(envelope.grant.fence_generation)
         .map_err(|_| invalid("fence-generation"))?;
     let fence = FencingToken::new(
@@ -324,36 +369,50 @@ fn validate_envelope(
         envelope.grant.expires_at,
     )
     .map_err(MaterialError::Authority)?;
-    let directory = path.parent().ok_or_else(|| invalid("material-dir"))?;
-    let artifact_bytes = read_colocated(
-        &directory.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME),
-        &artifact_digest,
-    )?;
-    let input_bytes = read_colocated(
-        &directory.join(WASM_HOST_GUEST_INPUT_FILE_NAME),
-        &input_digest,
-    )?;
-    Ok(ValidatedDispatchMaterial {
-        claim_id: envelope.claim_id.clone(),
-        operation_id: envelope.operation_id.clone(),
-        generation: envelope.generation,
-        authority_epoch: envelope.authority_epoch.clone(),
-        launch_nonce: envelope.launch_nonce.clone(),
-        admitted_at_unix_ms: envelope.admitted_at_unix_ms,
-        grant,
-        host_artifact_digest,
-        ceilings: ValidatedGuestCeilings {
-            component_id: guest.component_id.clone(),
-            artifact_digest,
-            input_digest,
-            max_output_bytes: guest.max_output_bytes,
-            max_fuel: guest.max_fuel,
-            max_memory_bytes: guest.max_memory_bytes,
-            wall_deadline_ms: guest.wall_deadline_ms,
-            epoch_deadline_ticks: guest.epoch_deadline_ticks,
-        },
-        artifact_bytes,
-        input_bytes,
+    Ok(RebuiltGrant { grant, host_digest })
+}
+
+/// Checked guest ceilings record: non-blank component, non-zero ceilings,
+/// well-shaped digests.
+struct CheckedCeilings {
+    component_id: String,
+    artifact_digest: Sha256Digest,
+    input_digest: Sha256Digest,
+    max_output_bytes: u64,
+    max_fuel: u64,
+    max_memory_bytes: u64,
+    wall_deadline_ms: u64,
+    epoch_deadline_ticks: u64,
+}
+
+fn check_guest_ceilings(
+    envelope: &MaterialEnvelopeMirror,
+) -> Result<CheckedCeilings, MaterialError> {
+    let invalid = |field: &'static str| MaterialError::InvalidRecord { field };
+    let guest = &envelope.guest;
+    if guest.component_id.trim().is_empty() {
+        return Err(invalid("guest-component-id"));
+    }
+    for value in [
+        guest.max_output_bytes,
+        guest.max_fuel,
+        guest.max_memory_bytes,
+        guest.wall_deadline_ms,
+        guest.epoch_deadline_ticks,
+    ] {
+        if value == 0 {
+            return Err(invalid("guest-ceilings"));
+        }
+    }
+    Ok(CheckedCeilings {
+        component_id: guest.component_id.clone(),
+        artifact_digest: hex_digest(&guest.artifact_digest, "guest-artifact-digest")?,
+        input_digest: hex_digest(&guest.input_digest, "guest-input-digest")?,
+        max_output_bytes: guest.max_output_bytes,
+        max_fuel: guest.max_fuel,
+        max_memory_bytes: guest.max_memory_bytes,
+        wall_deadline_ms: guest.wall_deadline_ms,
+        epoch_deadline_ticks: guest.epoch_deadline_ticks,
     })
 }
 
@@ -408,6 +467,7 @@ mod tests {
             }},
             "launch_nonce": "launch-nonce-wasm-r1-0001",
             "admitted_at_unix_ms": 4000000000000,
+            "profile": "D2_OPERATIONAL",
             "grant": {{
                 "grant_digest": "{}",
                 "authority_epoch": {{
@@ -472,9 +532,30 @@ mod tests {
         assert_eq!(material.artifact_bytes, artifact_bytes());
         assert_eq!(material.input_bytes, input_bytes());
         assert_eq!(material.grant.expires_at(), 4_000_000_060_000);
+        assert_eq!(
+            material.profile,
+            crate::cli_contract::Profile::D2Operational
+        );
         // Consumed once: the file is gone, the next read reports missing.
         assert!(!path.exists(), "material file is consumed once");
         assert_eq!(read_dispatch_material_from(&path), Ok(None));
+        unstage(&dir);
+    }
+
+    #[test]
+    fn uncompiled_profile_fails_closed() {
+        // FANCY_PROFILE parses to nothing: the composition selection is
+        // denied before any authority is touched.
+        let dir = stage_fixtures("profile");
+        let path = dir.join(WASM_HOST_MATERIAL_FILE_NAME);
+        let raw = std::fs::read(&path).expect("material fixture");
+        let text = String::from_utf8(raw).expect("envelope is utf8");
+        std::fs::write(&path, text.replace("D2_OPERATIONAL", "FANCY_PROFILE"))
+            .expect("profile fixture");
+        assert!(matches!(
+            read_dispatch_material_from(&path).map(|_| ()),
+            Err(MaterialError::InvalidRecord { .. })
+        ));
         unstage(&dir);
     }
 

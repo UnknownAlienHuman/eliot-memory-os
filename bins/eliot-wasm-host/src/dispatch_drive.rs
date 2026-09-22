@@ -24,8 +24,10 @@
 //! generation    = the claiming generation
 //! executable    = the resolved installed image path (current_exe,
 //!                 re-hashed against the owner-measured digest)
-//! argv          = the exact --guest-exec set: colocated artifact/input
-//!                 paths, their re-hashed digests, and the material ceilings
+//! argv          = the exact --guest-exec set: `--profile` plus the
+//!                 owner-selected composition first, then colocated
+//!                 artifact/input paths, their re-hashed digests, and the
+//!                 material ceilings
 //! working_dir   = the executable parent directory
 //! environment   = empty secret-free projection
 //! limits        = wall/fuel/memory/output ceilings from the material;
@@ -177,7 +179,9 @@ fn resolve_drive_image(
 }
 
 /// Derives the `--guest-exec` argv for the reaped child from proven
-/// material: colocated files plus their re-hashed digests plus ceilings.
+/// material: the owner-selected composition profile first (the child
+/// composition must parse — a profile-less child exits before any guest),
+/// then colocated files plus their re-hashed digests plus ceilings.
 fn guest_exec_argv(
     material: &ValidatedDispatchMaterial,
     directory: &Path,
@@ -191,7 +195,9 @@ fn guest_exec_argv(
         field: "input-path",
     })?;
     let ceilings = &material.ceilings;
-    Ok(vec![
+    let argv = vec![
+        "--profile".to_owned(),
+        material.profile.as_str().to_owned(),
         GUEST_EXEC_ARGV0_HINT.to_owned(),
         "--guest-exec-artifact".to_owned(),
         artifact_text.to_owned(),
@@ -209,7 +215,8 @@ fn guest_exec_argv(
         ceilings.wall_deadline_ms.to_string(),
         "--guest-exec-epoch-ticks".to_owned(),
         ceilings.epoch_deadline_ticks.to_string(),
-    ])
+    ];
+    Ok(argv)
 }
 
 /// Derives the exact immutable `ProcessIntent` for the reaped child per the
@@ -479,6 +486,7 @@ mod tests {
             admitted_at_unix_ms: 4_000_000_000_000,
             grant,
             host_artifact_digest: Sha256Digest::of_bytes(b"intent-host-image"),
+            profile: crate::cli_contract::Profile::D2Operational,
             ceilings: crate::dispatch_material::ValidatedGuestCeilings {
                 component_id: "component-intent".to_owned(),
                 artifact_digest: Sha256Digest::of_bytes(b"intent-artifact"),
@@ -504,7 +512,9 @@ mod tests {
         assert_eq!(shape["executable_sha256"], host_digest.as_str());
         let argv = shape["argv"].as_array().expect("argv array");
         let has = |flag: &str| argv.iter().any(|entry| entry == flag);
-        assert_eq!(argv[0], "--guest-exec");
+        assert_eq!(argv[0], "--profile");
+        assert_eq!(argv[1], "D2_OPERATIONAL");
+        assert_eq!(argv[2], "--guest-exec");
         assert!(has("--guest-exec-artifact-digest"));
         assert!(has(material.ceilings.artifact_digest.as_str()));
         assert!(has("--guest-exec-max-fuel"));
