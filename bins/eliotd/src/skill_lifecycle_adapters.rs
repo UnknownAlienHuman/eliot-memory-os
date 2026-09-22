@@ -410,8 +410,10 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// Drives one wire-decoded intake through the injector call (issue #1882).
     ///
     /// Daemon-side intake handler: takes a decoded
-    /// [`SkillIntakePayload`](eliot_agent_bridge_core::SkillIntakePayload)
-    /// (the transport delivers the bytes and decodes at its boundary),
+    /// [`SkillIntakePayload`](eliot_agent_bridge_core::SkillIntakePayload),
+    /// rebuilds it through the canonical intake producer (re-stamping the
+    /// exact digests and re-binding every part, so the driven object is
+    /// producer-built even when the bytes arrived over the transport),
     /// assembles the delivery act with driver-observed terms, and drives the
     /// full gate order. The admitted version comes from the payload's install
     /// context alone — never a separate re-stated claim — so
@@ -429,6 +431,17 @@ impl<T> ForwardingSkillLifecycle<T> {
         aliases: &ToolAliasTable,
         admitted_fence: &StateFence,
     ) -> Result<(String, HotsetDeliveryReceipt), SkillError> {
+        let payload = eliot_agent_bridge_core::SkillIntakePayload::produce(
+            payload.candidate,
+            payload.package,
+            payload.inputs,
+            payload.context,
+            payload.readiness,
+            payload.scope,
+            payload.hotset_id,
+            payload.approval_ref,
+        )
+        .map_err(|error| SkillError::Surface(error.to_string()))?;
         let admitted = payload.context.admitted_definition_version.clone();
         let request = SkillHotsetRequest {
             candidate: &payload.candidate,

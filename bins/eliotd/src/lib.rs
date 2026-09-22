@@ -59,6 +59,7 @@ pub mod notification_board_attach;
 mod observation_adapters;
 mod process_origin;
 mod route_receipts;
+mod skill_acceptance_read;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
 mod skill_lifecycle_adapters;

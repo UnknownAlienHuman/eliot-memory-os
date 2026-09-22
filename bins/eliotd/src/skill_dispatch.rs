@@ -27,6 +27,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::DaemonComposition;
+use super::daemon_kernel_client::DaemonKernelClient;
 ///
 /// Driver refusals (stale, drift, unavailable, fence) are NOT errors here —
 /// they persist as typed refusal outcomes through [`SkillResultEnvelope`],
@@ -62,27 +63,30 @@ pub fn is_skill_tool(tool: &Value) -> bool {
 /// driver and returns its submit-leg result body.
 ///
 /// Recognizes the tool name through the shared routing predicate, checks
-/// tool/capability coherence, decodes the versioned wire payload, drives
-/// install→receipt (intake) or ack→display (display request) through the
-/// existing composition entries with live hook and fence observation, and
-/// binds the outcome — receipt, display, or typed refusal — into a
-/// digest-bound result body for the submit leg. Synchronous: no await, no
-/// transport of its own.
-pub fn serve_skill_pair(
+/// tool/capability coherence, resolves canonical procedure acceptance over
+/// the authenticated Kernel route, drives install→receipt (intake) or
+/// ack→display (display request) through the existing composition entries
+/// with live hook and fence observation, and binds the outcome — receipt,
+/// display, or typed refusal — into a digest-bound result body for the
+/// submit leg. Async only for the acceptance read; the composition drive
+/// itself stays synchronous with guards never crossing an await.
+pub async fn serve_skill_pair(
     composition: &DaemonComposition,
+    kernel: &DaemonKernelClient,
     envelope: &HostRequestEnvelope,
     tool: &Value,
     attempt: &LocalReadAttempt,
 ) -> HostRequestResultBody {
-    let outcome = drive_skill_request(composition, envelope, tool);
+    let outcome = drive_skill_request(composition, kernel, envelope, tool).await;
     // Body construction is total over validated inputs; a failure here is a
     // local defect, failed closed by the caller, never a silent accept.
     skill_result_body(envelope, attempt, &outcome)
         .unwrap_or_else(|error| skill_refusal_body(envelope, attempt, &error.to_string()))
 }
 
-fn drive_skill_request(
+async fn drive_skill_request(
     composition: &DaemonComposition,
+    kernel: &DaemonKernelClient,
     envelope: &HostRequestEnvelope,
     tool: &Value,
 ) -> SkillResultEnvelope {
@@ -107,15 +111,22 @@ fn drive_skill_request(
         .cloned()
         .unwrap_or(Value::Null);
     match kind {
-        SkillToolKind::Inject => drive_inject(composition, &arguments),
+        SkillToolKind::Inject => drive_inject(composition, kernel, &arguments).await,
         SkillToolKind::Display => drive_display(composition, &arguments),
     }
 }
 
-fn drive_inject(composition: &DaemonComposition, arguments: &Value) -> SkillResultEnvelope {
+async fn drive_inject(
+    composition: &DaemonComposition,
+    kernel: &DaemonKernelClient,
+    arguments: &Value,
+) -> SkillResultEnvelope {
     // The wire intake entry decodes, rehydrates, installs, and issues in one
     // composition call: the poller hands it the exact argument bytes, so no
-    // decoded intermediate crosses this boundary unbound.
+    // decoded intermediate crosses this boundary unbound. Before that, the
+    // presented package digest resolves against the canonical committed
+    // lifecycle-policy rows: only owner-committed acceptance (or the
+    // explicitly provisional unknown) reaches the composition path.
     let bytes = match canonical_json_bytes(&arguments).map_err(|error| error.to_string()) {
         Ok(bytes) => bytes,
         Err(detail) => {
@@ -124,6 +135,41 @@ fn drive_inject(composition: &DaemonComposition, arguments: &Value) -> SkillResu
             )));
         }
     };
+    let payload = match eliot_agent_bridge_core::SkillIntakePayload::decode(&bytes)
+        .map_err(|error| error.to_string())
+    {
+        Ok(payload) => payload,
+        Err(detail) => {
+            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
+                "intake arguments fail their shape: {detail}"
+            )));
+        }
+    };
+    let admitted = composition.kernel_snapshot().state_fence().clone();
+    match super::skill_acceptance_read::resolve_intake_acceptance(
+        kernel,
+        &admitted,
+        &payload.package.registration.skill_id,
+        &payload.package.digests.source_digest,
+    )
+    .await
+    {
+        Ok(
+            super::skill_acceptance_read::AcceptanceVerdict::Accepted(_)
+            | super::skill_acceptance_read::AcceptanceVerdict::Unknown,
+        ) => {}
+        Ok(super::skill_acceptance_read::AcceptanceVerdict::Revoked(_)) => {
+            return SkillResultEnvelope::refused(&eliot_skill::SkillError::InvalidField {
+                field: "procedure.acceptance",
+                reason: "canonical lifecycle revoked this package revision",
+            });
+        }
+        Err(error) => {
+            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(
+                error.to_string(),
+            ));
+        }
+    }
     match composition.skill_ingest_wire_intake(&bytes) {
         Ok((_, receipt)) => SkillResultEnvelope::receipt(receipt),
         Err(error) => SkillResultEnvelope::refused(&error),
