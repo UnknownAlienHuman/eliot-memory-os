@@ -8,7 +8,7 @@
 use eliot_contracts::RequestMetadata;
 use eliot_kernel_service::{
     AutomationExecutionReference, UserAutomationDurableJobPort, UserAutomationRuntimeAdmission,
-    UserAutomationRuntimeError,
+    UserAutomationHostExecutionSession, UserAutomationRuntimeError,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use thiserror::Error;
@@ -36,11 +36,26 @@ pub trait HostDurableJobOwner: Send + Sync {
         context: &RequestMetadata,
         request: DurableJobRequest,
     ) -> Result<DurableJobResponse, HostDurableJobOwnerError>;
+
+    /// Submits one request after the Host runtime-control endpoint has
+    /// retained its server-authored authenticated Kernel session.  The
+    /// default preserves the owner port for existing non-UserAutomation
+    /// callers; the production Kernel front-door owner overrides it so the
+    /// inbound peer/session is checked before opening the canonical route.
+    async fn dreamer_job_authenticated(
+        &self,
+        context: &RequestMetadata,
+        request: DurableJobRequest,
+        _session: &UserAutomationHostExecutionSession,
+    ) -> Result<DurableJobResponse, HostDurableJobOwnerError> {
+        self.dreamer_job(context, request).await
+    }
 }
 
 /// Concrete Host adapter over an existing Durable Job owner.
 pub struct HostDurableJobAdapter<'a, O: ?Sized> {
     owner: &'a O,
+    session: Option<UserAutomationHostExecutionSession>,
 }
 
 impl<'a, O: ?Sized> HostDurableJobAdapter<'a, O> {
@@ -48,7 +63,23 @@ impl<'a, O: ?Sized> HostDurableJobAdapter<'a, O> {
     /// lifecycle or persistence surface.
     #[must_use]
     pub const fn new(owner: &'a O) -> Self {
-        Self { owner }
+        Self {
+            owner,
+            session: None,
+        }
+    }
+
+    /// Borrows the canonical owner and retains the opaque server-authored
+    /// session for the authenticated UserAutomation call path.
+    #[must_use]
+    pub fn new_authenticated(
+        owner: &'a O,
+        session: UserAutomationHostExecutionSession,
+    ) -> Self {
+        Self {
+            owner,
+            session: Some(session),
+        }
     }
 }
 
@@ -73,11 +104,21 @@ impl<O: HostDurableJobOwner + ?Sized> UserAutomationDurableJobPort
             )
             .map_err(|error| rejected(format!("Durable Job material: {error}")))?;
 
-        let response = self
-            .owner
-            .dreamer_job(&request.context, material.request.clone())
-            .await
-            .map_err(map_owner_error)?;
+        let response = match self.session.as_ref() {
+            Some(session) => self
+                .owner
+                .dreamer_job_authenticated(
+                    &request.context,
+                    material.request.clone(),
+                    session,
+                )
+                .await,
+            None => self
+                .owner
+                .dreamer_job(&request.context, material.request.clone())
+                .await,
+        }
+        .map_err(map_owner_error)?;
         response
             .validate_for(&material.request)
             .map_err(|error| rejected(format!("Durable Job response: {error}")))?;

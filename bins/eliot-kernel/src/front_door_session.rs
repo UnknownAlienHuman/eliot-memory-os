@@ -433,6 +433,9 @@ impl KernelComposition {
             .validate(&candidate, &activation)
             .map_err(|_| TransportError::SessionFenced)?;
 
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|_| TransportError::SessionFenced)?;
         let activation_digest = sha256_hex(
             &canonical_json_bytes(&activation).map_err(|_| TransportError::SessionFenced)?,
         );
@@ -474,16 +477,58 @@ impl KernelComposition {
             .lock()
             .map_err(|_| TransportError::SessionFenced)?
             .clone();
-        let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
-        session.capabilities = vec![USER_AUTOMATION_KERNEL_CAPABILITY.to_owned()];
-        session.privacy_classes = vec!["PUBLIC".to_owned()];
+        if !policy
+            .allowed_capabilities
+            .iter()
+            .any(|capability| capability == USER_AUTOMATION_KERNEL_CAPABILITY)
+            || !policy
+                .allowed_privacy_classes
+                .iter()
+                .any(|privacy| privacy == USER_AUTOMATION_KERNEL_PRIVACY_CLASS)
+            || !policy.allowed_effects.is_empty()
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut session = Session::establish(
+            connection_id.clone(),
+            peer,
+            client,
+            policy.protocol_range,
+        )?;
+        session.capabilities = session
+            .capabilities
+            .into_iter()
+            .filter(|capability| policy.allowed_capabilities.contains(capability))
+            .collect();
+        session.privacy_classes = session
+            .privacy_classes
+            .into_iter()
+            .filter(|privacy| policy.allowed_privacy_classes.contains(privacy))
+            .collect();
+        if session.capabilities != vec![USER_AUTOMATION_KERNEL_CAPABILITY.to_owned()]
+            || session.privacy_classes
+                != vec![USER_AUTOMATION_KERNEL_PRIVACY_CLASS.to_owned()]
+        {
+            return Err(TransportError::SessionFenced);
+        }
         session.effects.clear();
+        let config_snapshot = serde_json::json!({
+            "policy": policy.config_snapshot,
+            "eliot.user_automation": {
+                "capability": USER_AUTOMATION_KERNEL_CAPABILITY,
+                "privacy_classes": session.privacy_classes.clone(),
+                "effects": session.effects.clone(),
+                "candidate_binding_sha256": candidate_digest,
+                "activation_receipt_sha256": activation_digest,
+                "connection_id": connection_id,
+            },
+        });
         let server_hello = eliot_protocol::ServerHello {
             selected_protocol: session.protocol_version,
             session_principal_binding: USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING.to_owned(),
             allowed_capabilities: session.capabilities.clone(),
             allowed_effects: Vec::new(),
-            config_snapshot: policy.config_snapshot,
+            config_snapshot,
             heartbeat_ms: policy.heartbeat_ms,
             control_channel: policy.control_channel,
             rejection_reason: None,

@@ -1294,6 +1294,72 @@ impl WakeRecord {
     }
 }
 
+/// One compare-and-swap member of an atomic UserAutomation wake
+/// cancellation.  The expected checksum binds the transition to the exact
+/// snapshot validated by the caller; the journal reducer checks every member
+/// before changing any member.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeCancellationBatchEntry {
+    pub expected_record_checksum: PlatformHandle,
+    pub wake: WakeRecord,
+}
+
+impl WakeCancellationBatchEntry {
+    fn validate(&self, batch_fence: &RecordFence) -> Result<(), JournalError> {
+        digest(
+            &self.expected_record_checksum,
+            "wake_cancellation.expected_record_checksum",
+        )?;
+        self.wake.validate()?;
+        if self.wake.fence != *batch_fence {
+            return Err(JournalError::StaleFence);
+        }
+        if self.wake.intent.state != WakeIntentState::Cancelled {
+            return Err(JournalError::Invalid(
+                "wake cancellation batch entries must be Cancelled".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Atomic journal record for cancelling several unadmitted wakes.
+///
+/// The record is one journal transaction and one idempotency identity.  Its
+/// reducer validates every expected checksum and lifecycle transition before
+/// applying any replacement, so a later target cannot leave earlier targets
+/// durably cancelled while returning an ordinary failure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeCancellationBatchRecord {
+    pub fence: RecordFence,
+    pub operation: IdempotencyIdentity,
+    pub entries: Vec<WakeCancellationBatchEntry>,
+}
+
+impl WakeCancellationBatchRecord {
+    fn validate(&self) -> Result<(), JournalError> {
+        self.fence.validate()?;
+        self.operation.validate()?;
+        if self.entries.is_empty() {
+            return Err(JournalError::Invalid(
+                "wake cancellation batch must not be empty".into(),
+            ));
+        }
+        let mut wake_ids = std::collections::BTreeSet::new();
+        for entry in &self.entries {
+            entry.validate(&self.fence)?;
+            if !wake_ids.insert(entry.wake.wake_id.clone()) {
+                return Err(JournalError::Invalid(
+                    "wake cancellation batch contains duplicate wake ids".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Observation records cannot bypass the Host and activation fence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1671,6 +1737,7 @@ pub enum HostStateRecord {
     Drain(DrainRecord),
     DrainCommit(DrainCommitRecord),
     Wake(WakeRecord),
+    WakeCancellationBatch(WakeCancellationBatchRecord),
     Observation(HostObservationRecord),
     ReadinessObservation(KernelReadinessObservationRecord),
     CleanMarker(CleanMarker),
@@ -1688,6 +1755,7 @@ impl HostStateRecord {
             Self::Drain(value) => value.validate(),
             Self::DrainCommit(value) => value.validate(),
             Self::Wake(value) => value.validate(),
+            Self::WakeCancellationBatch(value) => value.validate(),
             Self::Observation(value) => value.validate(),
             Self::ReadinessObservation(value) => value.validate(),
             Self::CleanMarker(value) => value.validate(),
@@ -1713,6 +1781,7 @@ impl HostStateRecord {
             Self::Drain(value) => &value.fence,
             Self::DrainCommit(value) => &value.fence,
             Self::Wake(value) => &value.fence,
+            Self::WakeCancellationBatch(value) => &value.fence,
             Self::Observation(value) => &value.fence,
             Self::ReadinessObservation(value) => &value.fence,
             Self::CleanMarker(value) => &value.fence,
@@ -1730,6 +1799,7 @@ impl HostStateRecord {
             Self::Drain(value) => &value.operation,
             Self::DrainCommit(value) => &value.operation,
             Self::Wake(value) => &value.operation,
+            Self::WakeCancellationBatch(value) => &value.operation,
             Self::Observation(value) => &value.operation,
             Self::ReadinessObservation(value) => &value.operation,
             Self::CleanMarker(value) => &value.operation,

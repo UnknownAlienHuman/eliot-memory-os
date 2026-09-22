@@ -19,7 +19,9 @@ use eliot_ipc::{NamedPipeTransport, PeerIdentity};
 use eliot_kernel_service::{
     HostKernelCandidateBinding, KernelActivationReceipt, KernelControlCommand,
     KernelControlRequest, KernelControlResponse, USER_AUTOMATION_KERNEL_CAPABILITY,
-    USER_AUTOMATION_KERNEL_MODULE_ID, USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING,
+    USER_AUTOMATION_KERNEL_MODULE_ID, USER_AUTOMATION_KERNEL_OPERATION,
+    USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING, USER_AUTOMATION_KERNEL_PRIVACY_CLASS,
+    UserAutomationHostExecutionSession, UserAutomationHostOwnerBinding,
 };
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{ProcessIdentity, observe_named_pipe_peer_process_in_job};
@@ -324,6 +326,29 @@ impl HostKernelUserAutomationOwner {
         })
     }
 
+    pub(super) fn owner_binding(&self) -> Result<UserAutomationHostOwnerBinding, HostError> {
+        let candidate_binding_sha256 = self
+            .candidate
+            .compute_digest()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let state_fence = eliot_contracts::StateFence::new(
+            self.candidate.kernel_epoch.clone(),
+            self.activation.generation.clone(),
+        );
+        let binding = UserAutomationHostOwnerBinding {
+            candidate_binding_sha256,
+            activation_receipt_sha256: self.activation_digest.clone(),
+            state_fence,
+            expected_peer_process_id: self.kernel_process.process_id,
+            expected_peer_start_time_100ns: self.kernel_process.start_time_100ns,
+            expected_peer_image_path: self.kernel_process.image_path.clone(),
+        };
+        binding
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        Ok(binding)
+    }
+
     fn client_hello(&self) -> Result<ClientHello, HostDurableJobOwnerError> {
         let module_id = ContractId::new(USER_AUTOMATION_KERNEL_MODULE_ID)
             .map_err(|error| owner_unavailable(error.to_string()))?;
@@ -366,7 +391,7 @@ impl HostKernelUserAutomationOwner {
             },
             launch_nonce: self.activation_digest.clone(),
             capabilities: vec![USER_AUTOMATION_KERNEL_CAPABILITY.to_owned()],
-            privacy_classes: vec!["PUBLIC".to_owned()],
+            privacy_classes: vec![USER_AUTOMATION_KERNEL_PRIVACY_CLASS.to_owned()],
             max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
                 .map_err(|error| owner_unavailable(error.to_string()))?,
             authority_epoch: self.candidate.kernel_epoch.clone(),
@@ -393,6 +418,13 @@ impl HostKernelUserAutomationOwner {
         )
         .await
         .map_err(|error| owner_unavailable(error.to_string()))?;
+        validate_authenticated_kernel_peer(
+            transport.peer_identity(),
+            self.kernel_process.process_id,
+            self.kernel_process.start_time_100ns,
+            Path::new(self.kernel_process.image_path.as_str()),
+        )
+        .map_err(|error| owner_unavailable(error.to_string()))?;
         let limits = TransportLimits::default();
         let hello = self.client_hello()?;
         let hello_frame = client_hello_frame(&connection_id, &hello)
@@ -415,10 +447,53 @@ impl HostKernelUserAutomationOwner {
             .map_err(|error| owner_unavailable(error.to_string()))?;
         let server = decode_server_hello_frame(&server_frame, &connection_id)
             .map_err(|error| owner_unavailable(error.to_string()))?;
+        let projection = server
+            .config_snapshot
+            .get("eliot.user_automation")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| owner_unavailable("Kernel UserAutomation server projection is missing"))?;
+        let projected_privacy = projection
+            .get("privacy_classes")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| owner_unavailable("Kernel UserAutomation privacy projection is missing"))?;
+        let projected_capability = projection
+            .get("capability")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| owner_unavailable("Kernel UserAutomation capability projection is missing"))?;
+        let projected_effects = projection
+            .get("effects")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| owner_unavailable("Kernel UserAutomation effects projection is missing"))?;
+        let projected_candidate = projection
+            .get("candidate_binding_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| owner_unavailable("Kernel UserAutomation candidate projection is missing"))?;
+        let projected_activation = projection
+            .get("activation_receipt_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| owner_unavailable("Kernel UserAutomation activation projection is missing"))?;
+        let projected_connection = projection
+            .get("connection_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| owner_unavailable("Kernel UserAutomation connection projection is missing"))?;
+        let candidate_digest = self
+            .candidate
+            .compute_digest()
+            .map_err(|error| owner_unavailable(error.to_string()))?;
+        let projected_privacy_exact = projected_privacy.len() == 1
+            && projected_privacy[0].as_str() == Some(USER_AUTOMATION_KERNEL_PRIVACY_CLASS);
+        let projected_effects_empty = projected_effects.is_empty();
         if server.authority_epoch != self.candidate.kernel_epoch
             || server.session_principal_binding != USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING
             || server.allowed_capabilities.len() != 1
             || server.allowed_capabilities[0] != USER_AUTOMATION_KERNEL_CAPABILITY
+            || !server.allowed_effects.is_empty()
+            || projected_capability != USER_AUTOMATION_KERNEL_CAPABILITY
+            || !projected_privacy_exact
+            || !projected_effects_empty
+            || projected_candidate != candidate_digest
+            || projected_activation != self.activation_digest
+            || projected_connection != connection_id
         {
             return Err(owner_unavailable(
                 "Kernel Host UserAutomation session binding is not exact",
@@ -435,7 +510,7 @@ impl HostKernelUserAutomationOwner {
             request_identity: Some(request.request_identity.request.clone()),
             payload: ProtocolPayload::Json(
                 serde_json::json!({
-                    "operation": USER_AUTOMATION_KERNEL_CAPABILITY,
+                    "operation": USER_AUTOMATION_KERNEL_OPERATION,
                     "context": context,
                     "request": request,
                 }),
@@ -497,6 +572,26 @@ impl HostDurableJobOwner for HostKernelUserAutomationOwner {
         context: &RequestMetadata,
         request: DurableJobRequest,
     ) -> Result<DurableJobResponse, eliot_host_service::HostDurableJobOwnerError> {
+        self.execute_dreamer_job(context, request).await
+    }
+
+    async fn dreamer_job_authenticated(
+        &self,
+        context: &RequestMetadata,
+        request: DurableJobRequest,
+        session: &UserAutomationHostExecutionSession,
+    ) -> Result<DurableJobResponse, eliot_host_service::HostDurableJobOwnerError> {
+        let expected = self
+            .owner_binding()
+            .map_err(|error| owner_unavailable(error.to_string()))?;
+        if session.owner() != &expected {
+            return Err(owner_unavailable(
+                "UserAutomation server session is bound to a different Kernel contour",
+            ));
+        }
+        session
+            .validate_authenticated_peer()
+            .map_err(|error| owner_unavailable(error.to_string()))?;
         self.execute_dreamer_job(context, request).await
     }
 }

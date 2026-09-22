@@ -12,7 +12,7 @@
     reason = "Host runtime-control endpoint keeps explicit production plumbing"
 )]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +27,9 @@ pub use eliot_host_service::{
     UserAutomationHostExecutionResponse, UserAutomationRuntimeError,
     decode_user_automation_host_execution_request_frame,
     user_automation_host_execution_response_frame,
+};
+use eliot_host_service::{
+    UserAutomationHostExecutionSession, UserAutomationHostOwnerBinding,
 };
 use eliot_host_service::runtime_control::{operation_unknown_ref, response_matches_request};
 use eliot_ipc::{NamedPipeServer, TransportLimits};
@@ -81,6 +84,7 @@ struct HostUserAutomationExecutionReply {
 /// correlated response; no queue consumer may replace its carrier.
 pub struct HostUserAutomationExecutionEnvelope {
     request: UserAutomationHostExecutionRequest,
+    session: UserAutomationHostExecutionSession,
     reply: oneshot::Sender<HostUserAutomationExecutionReply>,
     correlation: ResponseCorrelation,
 }
@@ -90,6 +94,12 @@ impl HostUserAutomationExecutionEnvelope {
     #[must_use]
     pub const fn request(&self) -> &UserAutomationHostExecutionRequest {
         &self.request
+    }
+
+    /// Returns the opaque server-authored session retained for this carrier.
+    #[must_use]
+    pub const fn session(&self) -> &UserAutomationHostExecutionSession {
+        &self.session
     }
 
     /// Completes this request with a response bound to the same carrier.
@@ -160,7 +170,9 @@ where
 {
     let mut processed = 0;
     while let Some(envelope) = pop_user_automation_execution(queue) {
-        let response = endpoint.execute_response(envelope.request.clone()).await;
+        let response = endpoint
+            .execute_authenticated_response(envelope.request.clone(), envelope.session.clone())
+            .await;
         let _ = envelope.respond(response);
         processed += 1;
     }
@@ -179,6 +191,8 @@ fn response_matches_private_correlation(
 pub struct HostRuntimeControl {
     queue: HostRuntimeControlQueue,
     user_automation_queue: HostUserAutomationExecutionQueue,
+    user_automation_owner: Option<UserAutomationHostOwnerBinding>,
+    seen_user_automation_requests: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl HostRuntimeControl {
@@ -206,6 +220,30 @@ impl HostRuntimeControl {
         Ok(Self {
             queue,
             user_automation_queue,
+            user_automation_owner: None,
+            seen_user_automation_requests: Arc::new(Mutex::new(BTreeSet::new())),
+        })
+    }
+
+    /// Creates the runtime-control endpoint with the retained Kernel owner
+    /// anchor used to authenticate UserAutomation carriers before enqueue.
+    pub fn new_with_capability_and_user_automation_bound(
+        queue: HostRuntimeControlQueue,
+        user_automation_queue: HostUserAutomationExecutionQueue,
+        capability: &eliot_platform_windows::HostOwnerEpochCapability,
+        owner: UserAutomationHostOwnerBinding,
+    ) -> Result<Self, String> {
+        let _guard = capability
+            .live_guard()
+            .map_err(|_| "Host owner capability is not live".to_owned())?;
+        owner
+            .validate()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            queue,
+            user_automation_queue,
+            user_automation_owner: Some(owner),
+            seen_user_automation_requests: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -267,7 +305,34 @@ impl HostRuntimeControl {
     async fn handle_user_automation(
         &self,
         request: UserAutomationHostExecutionRequest,
+        server: &NamedPipeServer,
+        connection_id: &str,
     ) -> UserAutomationHostExecutionResponse {
+        let Some(owner) = self.user_automation_owner.as_ref() else {
+            return UserAutomationHostExecutionResponse::failed_for(
+                &request,
+                UserAutomationRuntimeError::Unavailable(
+                    "Host UserAutomation owner is not composed".to_owned(),
+                ),
+            );
+        };
+        let session = match UserAutomationHostExecutionSession::issue(
+            connection_id,
+            request.request_sha256.clone(),
+            server.peer_identity().clone(),
+            owner.clone(),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                return UserAutomationHostExecutionResponse::failed_for(&request, error);
+            }
+        };
+        if session.authorize_request(&request).is_err() {
+            return UserAutomationHostExecutionResponse::failed_for(
+                &request,
+                UserAutomationRuntimeError::IdentityConflict,
+            );
+        }
         let (reply, response) = oneshot::channel();
         let correlation = ResponseCorrelation(Arc::new(()));
         {
@@ -287,8 +352,27 @@ impl HostRuntimeControl {
                     ),
                 );
             }
+            let Ok(mut seen) = self.seen_user_automation_requests.lock() else {
+                return UserAutomationHostExecutionResponse::failed_for(
+                    &request,
+                    UserAutomationRuntimeError::Unavailable(
+                        "UserAutomation replay ledger lock is poisoned".to_owned(),
+                    ),
+                );
+            };
+            if !seen.insert(request.request_sha256.clone()) {
+                return UserAutomationHostExecutionResponse::failed_for(
+                    &request,
+                    UserAutomationRuntimeError::IdentityConflict,
+                );
+            }
+            if seen.len() > MAX_QUEUE_DEPTH * 4 {
+                let retained = seen.iter().rev().take(MAX_QUEUE_DEPTH * 2).cloned().collect();
+                *seen = retained;
+            }
             queue.push_back(HostUserAutomationExecutionEnvelope {
                 request: request.clone(),
+                session,
                 reply,
                 correlation: correlation.clone(),
             });
@@ -337,7 +421,9 @@ impl HostRuntimeControl {
             Err(_) => {
                 let request = decode_user_automation_host_execution_request_frame(&frame)
                     .map_err(|error| error.to_string())?;
-                let response = self.handle_user_automation(request.clone()).await;
+                let response = self
+                    .handle_user_automation(request.clone(), &server, &connection_id)
+                    .await;
                 user_automation_host_execution_response_frame(&request, &response)
                     .map_err(|error| error.to_string())?
             }

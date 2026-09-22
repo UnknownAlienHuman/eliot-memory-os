@@ -176,15 +176,14 @@ impl KernelComposition {
         envelope: &DreamerJobEnvelope,
     ) -> Result<(), TransportError> {
         if session.module_generation.module_id.as_str() != USER_AUTOMATION_KERNEL_MODULE_ID
-            || !session
-                .capabilities
-                .iter()
-                .any(|capability| capability == USER_AUTOMATION_KERNEL_CAPABILITY)
+            || session.capabilities.len() != 1
+            || session.capabilities[0] != USER_AUTOMATION_KERNEL_CAPABILITY
         {
             return Err(TransportError::SessionFenced);
         }
         let derived = JobRole::Requester;
         if envelope.request.role != derived
+            || !matches!(envelope.request.operation, JobOperation::Submit { .. })
             || !derived.permits(envelope.request.operation.kind())
             || session.module_generation.state_fence != envelope.context.state_fence
         {

@@ -503,6 +503,30 @@ fn apply(
             }
             state.clean_marker = None;
         }
+        HostStateRecord::WakeCancellationBatch(next) => {
+            // Validate every compare-and-swap member against the same locked
+            // snapshot before replacing any WakeRecord.  A stale later
+            // target therefore cannot leave an earlier target applied.
+            let mut indexes = Vec::with_capacity(next.entries.len());
+            for entry in &next.entries {
+                let index = state
+                    .wakes
+                    .iter()
+                    .position(|item| item.wake_id == entry.wake.wake_id)
+                    .ok_or(JournalError::StaleFence)?;
+                let current_checksum =
+                    record_checksum(&HostStateRecord::Wake(state.wakes[index].clone()))?;
+                if current_checksum != entry.expected_record_checksum.as_str() {
+                    return Err(JournalError::StaleFence);
+                }
+                wake_transition(Some(&state.wakes[index]), &entry.wake)?;
+                indexes.push(index);
+            }
+            for (index, entry) in indexes.into_iter().zip(&next.entries) {
+                state.wakes[index] = entry.wake.clone();
+            }
+            state.clean_marker = None;
+        }
         HostStateRecord::Observation(next) => {
             state.observations.push(next.clone());
             state.clean_marker = None;

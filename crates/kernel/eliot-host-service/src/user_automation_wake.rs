@@ -8,7 +8,8 @@
 use eliot_contracts::sha256_hex;
 use eliot_host_state::{
     AppendDisposition, BackendError, HostStateJournalService, HostStateRecord, IdempotencyIdentity,
-    JournalBackend, JournalError, record_checksum,
+    JournalBackend, JournalError, WakeCancellationBatchEntry, WakeCancellationBatchRecord,
+    record_checksum,
 };
 use eliot_kernel_service::{
     UserAutomationRuntimeError, UserAutomationWakeCancellation,
@@ -47,6 +48,7 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
 
         let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
         let mut cancelled = Vec::with_capacity(request.targets.len());
+        let mut entries = Vec::with_capacity(request.targets.len());
         for target in &request.targets {
             target
                 .validate_for(&request)
@@ -79,16 +81,13 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
                     next.intent.state = WakeIntentState::Cancelled;
                     let operation = cancellation_identity(&request, target)?;
                     next.operation = operation;
-                    match self
-                        .journal
-                        .append(HostStateRecord::Wake(next))
-                        .map_err(map_journal_error)?
-                        .disposition()
-                    {
-                        AppendDisposition::Applied | AppendDisposition::Replayed => {
-                            cancelled.push(target.wake_id.clone());
-                        }
-                    }
+                    let expected_record_checksum = PlatformHandle::new(target.record_checksum.clone())
+                        .map_err(|_| rejected("wake cancellation checksum identity is invalid"))?;
+                    entries.push(WakeCancellationBatchEntry {
+                        expected_record_checksum,
+                        wake: next,
+                    });
+                    cancelled.push(target.wake_id.clone());
                 }
                 WakeIntentState::Cancelled => {
                     // Exact replay is safe only when the target still binds
@@ -108,8 +107,60 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
                 }
             }
         }
+        if entries.is_empty() {
+            return Ok(cancelled);
+        }
+        let fence = entries
+            .first()
+            .map(|entry| entry.wake.fence.clone())
+            .ok_or_else(|| rejected("wake cancellation batch is empty"))?;
+        let operation = cancellation_batch_identity(&request, &entries)?;
+        let record = HostStateRecord::WakeCancellationBatch(WakeCancellationBatchRecord {
+            fence,
+            operation,
+            entries,
+        });
+        match self
+            .journal
+            .append(record)
+            .map_err(map_journal_error)?
+            .disposition()
+        {
+            AppendDisposition::Applied | AppendDisposition::Replayed => {}
+        }
         Ok(cancelled)
     }
+}
+
+fn cancellation_batch_identity(
+    request: &UserAutomationWakeCancellation,
+    entries: &[WakeCancellationBatchEntry],
+) -> Result<IdempotencyIdentity, UserAutomationRuntimeError> {
+    let members: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.wake.wake_id.as_str(),
+                entry.expected_record_checksum.as_str(),
+            )
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&(
+        "eliot.user_automation.wake-cancellation-batch.v1",
+        request.identity.operation_id.as_str(),
+        request.identity.idempotency_key.as_str(),
+        members,
+    ))
+    .map_err(|error| rejected(format!("wake cancellation batch identity: {error}")))?;
+    let digest = sha256_hex(&bytes);
+    let operation_id = PlatformHandle::new(format!("ua-wake-cancel-batch:{digest}"))
+        .map_err(|_| rejected("wake cancellation batch operation identity is invalid"))?;
+    let idempotency_key = PlatformHandle::new(format!("ua-wake-cancel-batch-key:{digest}"))
+        .map_err(|_| rejected("wake cancellation batch idempotency identity is invalid"))?;
+    Ok(IdempotencyIdentity {
+        operation_id,
+        idempotency_key,
+    })
 }
 
 fn cancellation_identity(

@@ -4845,10 +4845,15 @@ impl HostComposition {
         let _guard = capability
             .live_guard()
             .map_err(|e| HostError::Platform(e.to_string()))?;
-        let control = HostRuntimeControl::new_with_capability_and_user_automation(
+        let user_automation_owner = self
+            .user_automation_owner()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let user_automation_binding = user_automation_owner.owner_binding()?;
+        let control = HostRuntimeControl::new_with_capability_and_user_automation_bound(
             std::sync::Arc::clone(&self.runtime_control_queue),
             std::sync::Arc::clone(&self.user_automation_execution_queue),
             &capability,
+            user_automation_binding,
         )
         .map_err(HostError::Platform)?;
         host_terminal.disarm();
@@ -4925,16 +4930,31 @@ impl HostComposition {
             let mut processed = 0;
             while let Some(envelope) = pop_user_automation_execution(queue) {
                 let request = envelope.request().clone();
+                let session = envelope.session().clone();
                 let response = if let Some(owner) = kernel_owner.as_ref() {
-                    let endpoint = UserAutomationHostExecutionEndpoint::new(
-                        request.channel.clone(),
-                        HostDurableJobAdapter::new(owner),
-                        HostWakeIntentAdapter::new(&self.journal),
-                    );
-                    match endpoint {
-                        Ok(endpoint) => endpoint.execute_response(request.clone()).await,
+                    match owner.owner_binding() {
+                        Ok(owner_binding) if session.owner() == &owner_binding => {
+                            let endpoint = UserAutomationHostExecutionEndpoint::new_with_owner_binding(
+                                owner_binding,
+                                HostDurableJobAdapter::new_authenticated(owner, session.clone()),
+                                HostWakeIntentAdapter::new(&self.journal),
+                            );
+                            match endpoint {
+                                Ok(endpoint) => endpoint
+                                    .execute_authenticated_response(request.clone(), session)
+                                    .await,
+                                Err(error) => UserAutomationHostExecutionResponse::failed_for(
+                                    &request, error,
+                                ),
+                            }
+                        }
+                        Ok(_) => UserAutomationHostExecutionResponse::failed_for(
+                            &request,
+                            UserAutomationRuntimeError::IdentityConflict,
+                        ),
                         Err(error) => UserAutomationHostExecutionResponse::failed_for(
-                            &request, error,
+                            &request,
+                            UserAutomationRuntimeError::Unavailable(error.to_string()),
                         ),
                     }
                 } else {

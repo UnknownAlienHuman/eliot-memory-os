@@ -47,6 +47,7 @@ pub use user_automation_wake::HostWakeIntentAdapter;
 pub use eliot_kernel_service::{
     USER_AUTOMATION_HOST_EXECUTION_PIPE, UserAutomationHostExecutionFailure,
     UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
+    UserAutomationHostExecutionSession, UserAutomationHostOwnerBinding,
     UserAutomationDurableJobPort, UserAutomationRuntimeError, UserAutomationWakePort,
     decode_user_automation_host_execution_request_frame,
     user_automation_host_execution_response_frame,

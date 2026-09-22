@@ -6,10 +6,12 @@
 //! scheduler identity, Durable Job identity, or Host journal record.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(windows)]
 use std::time::Duration;
 
 use eliot_contracts::{RequestId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_ipc::PeerIdentity;
 use eliot_kernel_core::user_automation::AutomationExecutionReference;
 #[cfg(windows)]
 use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
@@ -34,8 +36,17 @@ pub const USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION: u16 = 1;
 /// from this authenticated session and still validates the typed Dreamer
 /// operation and State Fence before calling the canonical Store gateway.
 pub const USER_AUTOMATION_KERNEL_MODULE_ID: &str = "eliot-host-user-automation";
-/// Shared least-privilege capability advertised by the Host owner session.
-pub const USER_AUTOMATION_KERNEL_CAPABILITY: &str = "eliot.kernel.dreamer-job";
+/// Dedicated least-privilege capability advertised by the UserAutomation
+/// owner session. The outer Dreamer frame still selects the existing
+/// `eliot.kernel.dreamer-job` dispatch family, but this capability admits only
+/// the UserAutomation Submit arm inside that family.
+pub const USER_AUTOMATION_KERNEL_CAPABILITY: &str = "eliot.kernel.user-automation.submit";
+/// Existing Kernel dispatch family selected by the typed UserAutomation route.
+pub const USER_AUTOMATION_KERNEL_OPERATION: &str = "eliot.kernel.dreamer-job";
+/// Privacy class requested by the least-privilege UserAutomation session.
+/// The live Kernel policy must still admit this class; the value is never
+/// authority by itself.
+pub const USER_AUTOMATION_KERNEL_PRIVACY_CLASS: &str = "PUBLIC";
 /// Stable server principal projection for the Host owner session.
 pub const USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING: &str =
     "eliot-kernel::host-user-automation:v1";
@@ -78,6 +89,171 @@ impl UserAutomationHostChannelBinding {
         self.state_fence
             .validate()
             .map_err(|error| rejected(format!("channel state fence: {error}")))
+    }
+}
+
+/// Kernel/activation evidence retained by the Host owner for one inbound
+/// UserAutomation connection. This is an in-process authority anchor; it is
+/// never accepted from a request payload.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationHostOwnerBinding {
+    /// Digest of the retained Host Kernel candidate binding.
+    pub candidate_binding_sha256: String,
+    /// Digest of the retained Kernel activation receipt.
+    pub activation_receipt_sha256: String,
+    /// State Fence selected by the retained active contour.
+    pub state_fence: StateFence,
+    /// Handle-bound Kernel process expected on the authenticated peer.
+    pub expected_peer_process_id: u32,
+    /// Handle-bound Kernel process start time expected on the peer.
+    pub expected_peer_start_time_100ns: u64,
+    /// Canonical Kernel image expected on the peer.
+    pub expected_peer_image_path: String,
+}
+
+impl UserAutomationHostOwnerBinding {
+    /// Validates the retained owner anchor and the process identity it pins.
+    pub fn validate(&self) -> Result<(), UserAutomationRuntimeError> {
+        validate_sha256(
+            &self.candidate_binding_sha256,
+            "owner.candidate_binding_sha256",
+        )?;
+        validate_sha256(
+            &self.activation_receipt_sha256,
+            "owner.activation_receipt_sha256",
+        )?;
+        self.state_fence
+            .validate()
+            .map_err(|error| rejected(format!("owner state fence: {error}")))?;
+        if self.expected_peer_process_id == 0
+            || self.expected_peer_start_time_100ns == 0
+            || self.expected_peer_image_path.trim().is_empty()
+            || self.expected_peer_image_path.chars().any(char::is_control)
+        {
+            return Err(rejected("owner expected Kernel process binding is invalid"));
+        }
+        Ok(())
+    }
+
+    fn validate_peer(&self, peer: &PeerIdentity) -> Result<(), UserAutomationRuntimeError> {
+        self.validate()?;
+        peer.validate()
+            .map_err(|_| rejected("UserAutomation peer is not authenticated"))?;
+        let process = peer
+            .process_binding()
+            .ok_or_else(|| rejected("UserAutomation peer process binding is unavailable"))?;
+        if process.process_id() != self.expected_peer_process_id
+            || process.start_time_100ns() != self.expected_peer_start_time_100ns
+            || !process
+                .image_path()
+                .eq_ignore_ascii_case(&self.expected_peer_image_path)
+        {
+            return Err(rejected(
+                "UserAutomation peer is not the retained Kernel process",
+            ));
+        }
+        Ok(())
+    }
+}
+
+static USER_AUTOMATION_SESSION_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque server-authored admission context retained beside one queued
+/// carrier. The caller's channel fields remain correlation data; owner calls
+/// require this context and therefore cannot be admitted by copying a carrier
+/// from another connection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserAutomationHostExecutionSession {
+    server_session_id: String,
+    client_connection_id: String,
+    request_sha256: String,
+    peer: PeerIdentity,
+    owner: UserAutomationHostOwnerBinding,
+}
+
+impl UserAutomationHostExecutionSession {
+    /// Issues a fresh session only after the named-pipe server has authenticated
+    /// the actual connected peer. The owner anchor is retained by Host
+    /// composition and cannot be supplied by the wire carrier.
+    pub fn issue(
+        client_connection_id: impl Into<String>,
+        request_sha256: impl Into<String>,
+        peer: PeerIdentity,
+        owner: UserAutomationHostOwnerBinding,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        let client_connection_id = client_connection_id.into();
+        let request_sha256 = request_sha256.into();
+        validate_text(&client_connection_id, "session.client_connection_id")?;
+        validate_sha256(&request_sha256, "session.request_sha256")?;
+        owner.validate_peer(&peer)?;
+        let nonce = USER_AUTOMATION_SESSION_NONCE.fetch_add(1, Ordering::Relaxed);
+        let peer_process = peer
+            .process_binding()
+            .ok_or_else(|| rejected("UserAutomation peer process binding is unavailable"))?;
+        let server_session_id = sha256_hex(
+            &canonical_json_bytes(&(
+                "eliot.user_automation.server-session.v1",
+                nonce,
+                &client_connection_id,
+                &request_sha256,
+                peer_process.process_id(),
+                peer_process.start_time_100ns(),
+                peer_process.image_path(),
+                &owner,
+            ))
+            .map_err(|error| rejected(format!("UserAutomation session encoding: {error}")))?,
+        );
+        Ok(Self {
+            server_session_id,
+            client_connection_id,
+            request_sha256,
+            peer,
+            owner,
+        })
+    }
+
+    /// Validates the exact carrier before it enters the owner queue.
+    pub fn authorize_request(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        request.validate()?;
+        if request.request_sha256 != self.request_sha256
+            || request.channel.connection_id != self.client_connection_id
+            || request.channel.state_fence != self.owner.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        self.owner.validate_peer(&self.peer)?;
+        Ok(())
+    }
+
+    /// Revalidates the live peer retained by this server-authored session.
+    /// Owner adapters call this immediately before crossing into the Kernel
+    /// front door; the wire carrier cannot replace the peer evidence.
+    pub fn validate_authenticated_peer(&self) -> Result<(), UserAutomationRuntimeError> {
+        self.owner.validate_peer(&self.peer)
+    }
+
+    /// Returns the retained server session identity for exact queue
+    /// correlation. It is not a bearer token and is never trusted from a
+    /// serialized request.
+    #[must_use]
+    pub fn server_session_id(&self) -> &str {
+        &self.server_session_id
+    }
+
+    /// Returns the owner anchor captured when this session was issued.
+    #[must_use]
+    pub const fn owner(&self) -> &UserAutomationHostOwnerBinding {
+        &self.owner
+    }
+
+    /// Returns the authenticated peer retained by the server session.
+    #[must_use]
+    pub const fn peer(&self) -> &PeerIdentity {
+        &self.peer
     }
 }
 

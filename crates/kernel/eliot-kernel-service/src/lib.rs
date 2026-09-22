@@ -195,10 +195,13 @@ pub use user_automation_execution::{
 pub use user_automation_execution_client::{
     USER_AUTOMATION_HOST_EXECUTION_PIPE, USER_AUTOMATION_HOST_EXECUTION_WIRE_ID,
     USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION, USER_AUTOMATION_KERNEL_CAPABILITY,
+    USER_AUTOMATION_KERNEL_OPERATION,
     USER_AUTOMATION_KERNEL_MODULE_ID, USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING,
+    USER_AUTOMATION_KERNEL_PRIVACY_CLASS,
     UserAutomationHostChannelBinding, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionFailure, UserAutomationHostExecutionOperation,
     UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
+    UserAutomationHostExecutionSession, UserAutomationHostOwnerBinding,
     UserAutomationHostExecutionTransport, decode_user_automation_host_execution_request_frame,
     decode_user_automation_host_execution_response_frame,
     user_automation_host_execution_request_frame, user_automation_host_execution_response_frame,
