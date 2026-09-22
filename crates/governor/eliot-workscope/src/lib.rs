@@ -15,11 +15,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod caller;
+mod guard;
 mod identity;
+mod issuance;
+mod resolver;
 
 pub use caller::{
     DescriptorPolicy, ObservedScopeResources, ReceiptAdmission, WithholdReason,
     describe_observed_scope, propose_scope, verify_receipt_for_admission,
+};
+pub use guard::{
+    GuardTrigger, GuardVerdict, IdentityLegOutcome, TriggerReport, check_at_trigger, identity_legs,
+    rebind_with_receipt,
 };
 
 pub use identity::{
@@ -27,6 +34,12 @@ pub use identity::{
     ResolutionAuthentication, ResourceExecutionIdentity, ScopeFingerprint, ScopeLifecycle,
     ScopeRelocationKind, ScopeRelocationOrAttachReceipt, SupportingEvidenceClass,
     WorkScopeDescriptor, WorkScopeProposal, WorkScopeResolutionReceipt,
+};
+pub use issuance::{IssuanceRefusal, issuance_refusal, issue_resolution_receipt};
+pub use resolver::{
+    BindingToken, HostObservedHandles, ManifestBoundaryClaim, RegisteredInstanceEvidence,
+    ResolutionOutcome, ResolutionRequest, ResolutionTier, ResumedTaskEvidence, SessionTaskClaim,
+    WorkScopeResolver,
 };
 
 /// The bounded kind of a `WorkScope`.

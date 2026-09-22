@@ -259,6 +259,7 @@ pub struct ScopeRelocationOrAttachReceipt {
     pub receipt_ref: String,
     pub kind: ScopeRelocationKind,
     pub scope_ref: String,
+    pub scope_kind: ScopeKind,
     pub lineage: RepositoryLineageIdentity,
     pub prior_instance: WorkspaceInstanceIdentity,
     pub observed_instance: WorkspaceInstanceIdentity,
