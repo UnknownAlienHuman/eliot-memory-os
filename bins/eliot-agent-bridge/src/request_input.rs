@@ -1,11 +1,13 @@
 //! Binary-private bounded acquisition profile for the Agent Bridge stdin transport.
 //!
-//! Slice A of issue #977 freezes the outer-record acquisition ceiling and the
-//! fail-closed framing policy before the existing `Request` enum is exposed to
-//! a streaming decoder. This module grants no authority and performs no
-//! dispatch: duplicate-key / escape-equivalent member rejection and detailed
-//! depth / member enforcement are deferred to later slices, as are the
-//! compatibility fixtures.
+//! Preparation slice of issue #977: versioned private input profile, finite
+//! compatibility/limit table, and bounded pre-decode enforcement helpers
+//! before the existing `Request` enum is exposed to dispatch. This module
+//! grants no authority and performs no dispatch: duplicate-key /
+//! escape-equivalent member rejection, depth / member / scalar / string
+//! enforcement, envelope-shape checks, and redacted diagnostics are
+//! implemented here as pre-construction gates; dispatch stays in `main.rs`
+//! behind the accepted profile and is a later dispatch, not this preparation.
 //!
 //! Bridge-local decisions: the 1 MiB outer-record ceiling
 //! (`max_record_bytes`), the 2 MiB aggregate buffer ceiling
@@ -16,6 +18,17 @@
 //! decoded body are distinct budgets, and neither that default nor the 64 KiB
 //! hot-response / 256 KiB structured-response figures can be reused as request
 //! limits.
+//!
+//! Accepted baseline: controller-accepted v1 preparation profile at PR #2314
+//! merge `52941612f53450da3b0cd5f06f82067b6421b02a`. Post-acceptance change
+//! in this file is exactly two envelope arms in `check_operation_shape` and
+//! nothing else: `dry_run_invoke | dry_run_cancel` (merge resolution
+//! `f44fdded`, 2293 dry-run lane) and `bootstrap` (commit `4056d007`, 1938
+//! bootstrap lane), each tracking an owner-driven `Request` variant addition
+//! in `main.rs`. Every numeric limit, the oversize disposition, the redaction
+//! bound, and the limit table are retained unchanged from the accepted
+//! baseline; no replacement value is invented here. This preparation is
+//! offered for independent re-review and is NOT self-accepted.
 //!
 //! Time bounds (`idle_timeout_ms`, `lifetime_timeout_ms`) are declared here so
 //! the profile is complete, but they are NOT enforced on blocking stdin by
@@ -581,7 +594,7 @@ fn field_between_backticks(message: &str) -> String {
 ///
 /// Derived read-only from `bins/eliot-agent-bridge/src/main.rs` `Request`;
 /// this table moves with that enum when its owner changes the operation set.
-const GLOBAL_ENVELOPE_KEYS: [&str; 9] = [
+const GLOBAL_ENVELOPE_KEYS: [&str; 12] = [
     "op",
     "request",
     "event",
@@ -591,6 +604,9 @@ const GLOBAL_ENVELOPE_KEYS: [&str; 9] = [
     "activation_generation",
     "authority_epoch",
     "fence_nonce",
+    "context",
+    "tasks",
+    "requested_assessment",
 ];
 
 /// Validates the top-level operation envelope before typed construction.
