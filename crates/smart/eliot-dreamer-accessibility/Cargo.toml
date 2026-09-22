@@ -21,9 +21,9 @@ runtime_bundle = "eliot-dreamer"
 agent_order = 29
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
-eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts", version = "0.1.0" }
 schemars = { version = "1.2.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 
