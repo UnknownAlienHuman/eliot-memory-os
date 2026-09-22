@@ -41,12 +41,14 @@
 //! ```text
 //! codex     turn-level native usage only; translate_result leaves evidence
 //!           unbound and the route Unobserved
-//!           (crates/agent/eliot-agent-codex/src/lib.rs:1050,1671,1676)
+//!           (crates/agent/eliot-agent-codex/src/lib.rs:1057,1678,1683)
 //!           → withhold: no byte-bound count exists. Measurement capability
-//!           exists separately (`CodexRouteTokenizer`: tiktoken `o200k_base`
-//!           for registry-mapped IDs, proven with real encoder output) but
-//!           has no live caller yet; the withhold stands pending evidence
-//!           flow to a callsite holding exact bytes, model, and observation.
+//!           exists separately (`CodexRouteTokenizer`: owner-mapped IDs only
+//!           — upstream `model.py` 0.13.0 coverage such as `gpt-5-codex`;
+//!           community-only `codex-mini`/`gpt-5.*` prefixes and unknown IDs
+//!           withhold) but has no live caller yet; the withhold stands
+//!           pending evidence flow to a callsite holding exact bytes, model,
+//!           and observation.
 //! claude    usage None/None with no production source
 //!           (crates/agent/eliot-agent-claude/src/execution.rs:1413-1416)
 //!           → withhold: unknown preserved, never zero.
