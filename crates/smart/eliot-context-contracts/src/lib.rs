@@ -59,20 +59,22 @@ pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, Omissi
 pub use quality::{QualityDimension, QualityDimensionResult, QualityScorecard};
 pub use reactive_attention::{
     AttentionAcknowledgement, AttentionInfluence, AttentionOwnerClosure, AttentionResolution,
-    CriticalAttentionMember, CriticalAttentionProjection,
+    CriticalAttentionMember, CriticalAttentionProjection, CriticalAttentionProjectionParts,
+    produce_critical_attention_projection,
 };
 pub use reactive_coverage::{
     CoverageAxis, CoverageEvidence, CoverageFreshness, IntegrationCoverageProfile,
-    ReactiveDeliveryMode,
+    IntegrationCoverageProfileParts, ReactiveDeliveryMode, produce_integration_coverage_profile,
 };
 pub(crate) use reactive_input::bounded_preflight;
 pub use reactive_input::{
-    ContextPlanningView, ReactiveInputError, ReactivePlanningBindings, ReactivePlanningBounds,
-    canonical_planning_digest,
+    ContextPlanningView, ContextPlanningViewParts, ReactiveInputError, ReactivePlanningBindings,
+    ReactivePlanningBounds, canonical_planning_digest, produce_context_planning_view,
 };
 pub use reactive_session::{
-    DeliveryEvidenceClosure, PriorDeliveryBinding, SessionDeliverySnapshot, SnapshotCompleteness,
-    SnapshotDenominator,
+    DeliveryEvidenceClosure, PriorDeliveryBinding, SessionDeliverySnapshot,
+    SessionDeliverySnapshotParts, SnapshotCompleteness, SnapshotDenominator,
+    produce_session_delivery_snapshot,
 };
 pub use readback::{
     IndexPreview, MAX_EXCERPT_BYTES, MAX_PREVIEW_BYTES, PreviewAuthority, ProjectedCitation,

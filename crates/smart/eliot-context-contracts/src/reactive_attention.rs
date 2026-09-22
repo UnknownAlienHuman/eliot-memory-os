@@ -554,3 +554,60 @@ impl CriticalAttentionProjection {
         Ok(())
     }
 }
+
+/// Owner-issued parts for one immutable Critical Attention projection (#1942 lane D).
+///
+/// Issued by the attention owner from live obligation state. The projection
+/// digest is computed by [`produce_critical_attention_projection`], never
+/// supplied by callers. Terminal members must already carry their retained
+/// owner closure (verified evidence or resolution receipt); the producer
+/// checks this through validation but never invents it.
+pub struct CriticalAttentionProjectionParts {
+    /// Attention owner identity.
+    pub owner_id: String,
+    /// Owner source revision of the obligations.
+    pub source_revision: String,
+    /// Owner revision of this projection.
+    pub snapshot_revision: String,
+    /// Task the obligations were raised under.
+    pub task_id: TaskId,
+    /// Work scope the obligations were raised under.
+    pub scope_id: WorkScopeId,
+    /// State fence the obligations were evaluated under.
+    pub state_fence: StateFence,
+    /// Complete retained members, including open sticky obligations.
+    pub members: Vec<CriticalAttentionMember>,
+    /// Explicit coverage gaps of the projection.
+    pub missing_coverage: Vec<String>,
+}
+
+/// Produce (assemble + digest + validate) one Critical Attention projection.
+///
+/// Authority boundary: the attention owner owns obligation and resolution
+/// state; this producer only assembles the supplied members, computes the
+/// canonical digest, and runs the existing intrinsic validation. Open
+/// critical members stay sticky downstream until a durable terminal
+/// disposition is recorded by the resolving owner — the producer neither
+/// resolves nor waives anything. Fail-closed: any member, closure, or
+/// digest violation is returned, never defaulted.
+pub fn produce_critical_attention_projection(
+    parts: CriticalAttentionProjectionParts,
+) -> Result<CriticalAttentionProjection, ReactiveInputError> {
+    let mut projection = CriticalAttentionProjection {
+        owner_id: parts.owner_id,
+        source_revision: parts.source_revision,
+        snapshot_revision: parts.snapshot_revision,
+        task_id: parts.task_id,
+        scope_id: parts.scope_id,
+        state_fence: parts.state_fence,
+        members: parts.members,
+        missing_coverage: parts.missing_coverage,
+        projection_digest: String::new(),
+    };
+    // `projection_digest` is not part of the canonical digest input, so it
+    // is computed over the assembled fields before validation binds it.
+    let digest = projection.canonical_digest()?;
+    digest.clone_into(&mut projection.projection_digest);
+    projection.validate()?;
+    Ok(projection)
+}
