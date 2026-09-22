@@ -341,6 +341,90 @@ impl MemorySelectionTrace {
         // type has no field for it.
         Ok(())
     }
+
+    /// Revalidate this trace against the exact intent, policy, and batch it
+    /// was computed from, for consumers before wire use.
+    ///
+    /// A shape-valid trace proves nothing about provenance: this route
+    /// rechecks binding equality across all three governors, allowlist and
+    /// ceiling echoes, the intent digest recomputation, and a handle/kind
+    /// replay of every batch record in provider order. Invented or
+    /// duplicated handles, wrong kinds, reordering, and replays against
+    /// another batch sharing the binding all fail here. This is the
+    /// consumer-side call-through for trace evidence; `select()` runs the
+    /// same checks at construction.
+    pub fn validate_against(
+        &self,
+        intent: &MemoryQueryIntent,
+        policy: &MemorySelectionPolicy,
+        batch: &MemoryProjectionBatch,
+    ) -> Result<(), SelectionError> {
+        intent.validate()?;
+        policy.validate()?;
+        batch.validate()?;
+        if self.binding != intent.binding || self.binding != batch.binding {
+            return Err(SelectionError::BindingMismatch);
+        }
+        if self.allowlist != intent.kinds {
+            return Err(SelectionError::Upstream(
+                MemoryProjectionError::InvalidField {
+                    field: "trace.allowlist",
+                    reason: "allowlist does not match the intent",
+                },
+            ));
+        }
+        if self.intent_digest != intent_digest(intent)? {
+            return Err(SelectionError::Upstream(
+                MemoryProjectionError::InvalidField {
+                    field: "trace.intent_digest",
+                    reason: "digest does not match the intent",
+                },
+            ));
+        }
+        if self.policy_ceiling != policy.max_selected {
+            return Err(SelectionError::Upstream(
+                MemoryProjectionError::InvalidField {
+                    field: "trace.policy_ceiling",
+                    reason: "ceiling does not match the policy",
+                },
+            ));
+        }
+        if self.coverage.selected > intent.limit {
+            return Err(SelectionError::LimitExceeded {
+                passing: self.coverage.selected,
+                limit: intent.limit,
+            });
+        }
+        if self.entries.len() != batch.records.len() {
+            return Err(SelectionError::Upstream(
+                MemoryProjectionError::CoverageMismatch {
+                    reason: "trace entries do not cover every batch record",
+                },
+            ));
+        }
+        for (entry, record) in self.entries.iter().zip(batch.records.iter()) {
+            if entry.handle != record.handle || entry.kind != record.kind {
+                return Err(SelectionError::Upstream(
+                    MemoryProjectionError::CoverageMismatch {
+                        reason: "trace entry does not match its batch record",
+                    },
+                ));
+            }
+            let expected = intent.kinds.contains(&record.kind);
+            let selected = matches!(
+                entry.disposition,
+                SelectionDisposition::Selected
+            );
+            if selected != expected {
+                return Err(SelectionError::Upstream(
+                    MemoryProjectionError::CoverageMismatch {
+                        reason: "trace entry does not follow the intent allowlist",
+                    },
+                ));
+            }
+        }
+        self.validate()
+    }
 }
 
 /// Select from one whole batch under an intent and policy, emitting a trace.

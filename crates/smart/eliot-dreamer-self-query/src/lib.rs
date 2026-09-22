@@ -36,24 +36,40 @@ pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22";
 /// Owner contract this adapter poses over.
 pub const OWNER_CONTRACT: &str = "eliot.smart.dreamer.contracts";
 
-/// A posed self-query: the owner's input digest plus its schema pin.
+/// A posed self-query: the owner's input digest, its schema pin, and the
+/// source citations verified at pose time.
 ///
 /// The digest identifies the exact validated input closure the brief
 /// projectors consume; it proves no admission or source authority beyond
-/// what the owner's own `validate()` established.
+/// what the owner's own `validate()` established. The retained citations
+/// preserve which sources were checked; they authorize nothing by
+/// themselves. A receipt is not durable proof until revalidated with
+/// [`revalidate`] against the live input and projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SelfQueryPoseReceipt {
     /// Owner's canonical digest over the complete input closure.
     pub input_digest: String,
-    /// Input schema version the digest was frozen against.
+    /// Input schema version the digest was frozen against; always 1.
     pub schema_version: u32,
+    /// Source citations verified at pose time, in input order.
+    pub cited: Vec<CitedSource>,
 }
 
 impl SelfQueryPoseReceipt {
-    /// Validate the receipt: digest shape only. The digest's authority is
-    /// the owner's validation at pose time, rechecked by each consumer.
+    /// Validate the receipt: exact schema version, digest shape, and every
+    /// retained citation shape. Citation currency itself is rechecked only
+    /// by [`revalidate`], never inferred from this shape.
     pub fn validate(&self) -> Result<(), SelfQueryContractError> {
+        // Closed schema pin: the pose constructor echoes only the validated
+        // input's schema version, and the owner self-query schema is 1.
+        if self.schema_version != 1 {
+            return Err(SelfQueryContractError::UnsupportedVersion {
+                field: "receipt.schema_version",
+                expected: 1,
+                actual: self.schema_version,
+            });
+        }
         if self.input_digest.len() != 64
             || !self
                 .input_digest
@@ -63,6 +79,19 @@ impl SelfQueryPoseReceipt {
             return Err(SelfQueryContractError::InvalidDigest {
                 field: "receipt.input_digest",
             });
+        }
+        // Sanity ceiling above any constructible input (owner bounds
+        // anchors plus one embedded snapshot); wire values beyond it are
+        // rejected before per-citation checks.
+        if self.cited.len() > 8192 {
+            return Err(SelfQueryContractError::Bound {
+                field: "receipt.cited",
+                maximum: 8192,
+                actual: self.cited.len(),
+            });
+        }
+        for citation in &self.cited {
+            citation.validate()?;
         }
         Ok(())
     }
@@ -162,21 +191,46 @@ pub fn pose_self_query(
     Ok(SelfQueryPoseReceipt {
         input_digest: input.input_digest()?,
         schema_version: input.schema_version,
+        cited: Vec::new(),
     })
 }
 
 /// Pose a self-query with source citation.
 ///
 /// Every source triple the input cites must resolve to a current projected
-/// ref first, and the projection fence must be compatible with the input's
-/// governing job fence; only then does the owner pose run. Stale or uncited
-/// sources, or a drifted projection fence, fail closed before any digest
-/// freezes.
+/// ref first; the input snapshot lineage, when present, must join the
+/// projection pair edition; and the projection fence must be compatible
+/// with the input's governing job fence. Only then does the owner pose
+/// run, and the verified citations are retained in the receipt. Stale or
+/// uncited sources, lineage drift, or a drifted projection fence fail
+/// closed before any digest freezes.
 pub fn pose_with_sources(
     input: &SelfQueryInput,
     sources: &AcceptedSourceProjection,
 ) -> Result<SelfQueryPoseReceipt, SelfQueryContractError> {
-    check_citations(&cited_sources(input), sources)?;
+    let cited = cited_sources(input);
+    check_citations(&cited, sources)?;
+    if let Some(snapshot) = &input.source {
+        // Input-source lineage join: the cited snapshot must live under the
+        // same pair edition, acceptor, and acceptance receipt as the
+        // projection. Anchors carry no pair info, so snapshot-less inputs
+        // bind only through their cited triples.
+        if snapshot.pair != sources.pair {
+            return Err(SelfQueryContractError::BindingMismatch {
+                field: "cited.source_pair",
+            });
+        }
+        if snapshot.owner != sources.pair.accepted_by {
+            return Err(SelfQueryContractError::BindingMismatch {
+                field: "cited.source_owner",
+            });
+        }
+        if snapshot.acceptance_receipt.as_ref() != Some(&sources.pair.acceptance_receipt) {
+            return Err(SelfQueryContractError::BindingMismatch {
+                field: "cited.acceptance_receipt",
+            });
+        }
+    }
     if !sources
         .fence
         .is_compatible_with(&input.validated_candidate.job.state_fence)
@@ -185,5 +239,29 @@ pub fn pose_with_sources(
             field: "cited.projection_fence",
         });
     }
-    pose_self_query(input)
+    let mut receipt = pose_self_query(input)?;
+    receipt.cited = cited;
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+/// Revalidate a retained receipt against live input and projection.
+///
+/// Re-runs receipt shape, citation currency, lineage join, fence binding,
+/// and the owner pose, then requires the fresh digest and citations to
+/// equal the retained ones. Consumers run this before treating any receipt
+/// as durable proof; an unvalidated receipt is advisory only.
+pub fn revalidate(
+    receipt: &SelfQueryPoseReceipt,
+    input: &SelfQueryInput,
+    sources: &AcceptedSourceProjection,
+) -> Result<(), SelfQueryContractError> {
+    receipt.validate()?;
+    let fresh = pose_with_sources(input, sources)?;
+    if fresh != *receipt {
+        return Err(SelfQueryContractError::BindingMismatch {
+            field: "receipt.revalidation",
+        });
+    }
+    Ok(())
 }

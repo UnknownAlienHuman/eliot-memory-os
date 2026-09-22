@@ -106,4 +106,69 @@ impl EpistemicContextContribution {
         }
         Ok(())
     }
+
+    /// Revalidate this contribution against currently admitted owner state.
+    ///
+    /// The caller supplies the live position (read through the admission
+    /// owner, not this package); every echoed field is compared and each
+    /// drift reports its exact aspect. This performs no store I/O itself:
+    /// liveness comes from the supplied live state, and canonical store
+    /// readback stays with the admission owner.
+    pub fn revalidate_against_live(
+        &self,
+        live: &CurrentEpistemicPosition,
+    ) -> Result<(), ContributionError> {
+        use eliot_epistemic_contracts::Currentness;
+        self.validate()?;
+        live.validate()?;
+        if live.currentness != Currentness::Current {
+            return Err(ContributionError::InvalidField {
+                field: "revalidation.currentness",
+                reason: "live position is not current",
+            });
+        }
+        let inner = &self.contribution;
+        if inner.position_digest != live.digest {
+            return Err(ContributionError::InvalidField {
+                field: "revalidation.position_digest",
+                reason: "live owner state advanced",
+            });
+        }
+        if inner.claim != live.claim {
+            return Err(ContributionError::InvalidField {
+                field: "revalidation.claim",
+                reason: "live owner state advanced",
+            });
+        }
+        if inner.owner != live.admission.owner {
+            return Err(ContributionError::InvalidField {
+                field: "revalidation.owner",
+                reason: "live owner state advanced",
+            });
+        }
+        if inner.position != live.admission.position
+            || inner.position_revision != live.admission.position_revision
+        {
+            return Err(ContributionError::InvalidField {
+                field: "revalidation.position",
+                reason: "live owner state advanced",
+            });
+        }
+        if inner.scope != live.admission.scope || inner.fence != live.admission.fence {
+            return Err(ContributionError::InvalidField {
+                field: "revalidation.scope_fence",
+                reason: "live owner state advanced",
+            });
+        }
+        if inner.source_revision != live.admission.revision
+            || inner.coverage_digest != live.admission.coverage_digest
+            || inner.receipt_digest != live.admission.digest
+        {
+            return Err(ContributionError::InvalidField {
+                field: "revalidation.revision_coverage_receipt",
+                reason: "live owner state advanced",
+            });
+        }
+        Ok(())
+    }
 }
