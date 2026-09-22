@@ -218,22 +218,25 @@ fn dispatch(composition: &mut BrokerComposition, line: &str) -> Message {
         }
     };
     match request {
-        Request::Launch { request } => composition.launch(request).map_or_else(
-            |error| composition_error(error.to_string()),
-            |receipt| Message::Launched {
-                receipt: serde_json::json!({
-                    "operation_id": receipt.operation_id.as_str(),
-                    "request_digest": receipt.request_digest,
-                    "registration_digest": receipt.registration_digest,
-                    "user_broker_epoch": receipt.user_broker_epoch,
-                    "fence_id": receipt.fence_id,
-                    "process_receipt": receipt.process_receipt,
-                    "proof_ceiling": receipt.proof_ceiling,
-                    "lineage_verified": receipt.lineage_verified,
-                    "disposition": receipt.disposition,
-                }),
-            },
-        ),
+        Request::Launch { request } => match composition.launch(request) {
+            Err(error) => composition_error(error.to_string()),
+            Ok(receipt) => {
+                let projection = receipt.operator_receipt();
+                match projection.validate() {
+                    Err(error) => Message::Error {
+                        code: "BROKER_RECEIPT_BINDING_REJECTED",
+                        detail: error.to_string(),
+                    },
+                    Ok(()) => match serde_json::to_value(projection) {
+                        Ok(receipt) => Message::Launched { receipt },
+                        Err(error) => Message::Error {
+                            code: "BROKER_RECEIPT_ENCODING",
+                            detail: error.to_string(),
+                        },
+                    },
+                }
+            }
+        },
         Request::Cancel { operation_id } => composition.cancel(&operation_id).map_or_else(
             |error| composition_error(error.to_string()),
             |receipt| Message::Cancelled {
