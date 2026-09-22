@@ -706,3 +706,88 @@ async fn lineage_and_key_conflicts_fail_closed() {
     let payload = read(adapter, "failure", Some("auto-1"), false).await;
     assert!(payload.get("failure").is_some_and(Value::is_null));
 }
+
+/// Canonical failure document for one failure class.
+fn failure_json(fingerprint: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "fingerprint": fingerprint,
+        "reason": "{\"CanonicalBlockedConfig\":{\"class\":\"provider-fingerprint\"}}",
+        "notification_dedup_key": "caller-key",
+    }))
+    .expect("failure document serializes")
+}
+
+#[tokio::test]
+async fn failure_leg_records_converges_and_projects_last() {
+    let harness = Harness::fresh("failure").await;
+    let adapter = harness.adapter();
+    let fingerprint = "c".repeat(64);
+    // Absence stays explicit before any failure write.
+    let payload = read(adapter, "failure", Some("auto-1"), false).await;
+    assert!(payload.get("failure").is_some_and(Value::is_null));
+    // Unknown revisions fail closed.
+    let request =
+        eliot_store_api::automation_mutation_request(eliot_store_api::automation_failure_params(
+            "auto-absent".to_owned(),
+            "r-1".to_owned(),
+            "occ-1".to_owned(),
+            failure_json(&fingerprint),
+        ));
+    assert!(
+        apply(adapter, "failure-absent", request.parameters)
+            .await
+            .is_err(),
+        "unknown revision failures fail closed"
+    );
+    // Create the owning revision, then record the failure.
+    let first = valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active);
+    let request =
+        eliot_store_api::automation_mutation_request(eliot_store_api::automation_create_params(
+            "auto-1".to_owned(),
+            "r-1".to_owned(),
+            eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
+            revision_json(&first),
+        ));
+    apply(adapter, "create-1", request.parameters)
+        .await
+        .expect("create commits");
+    let request =
+        eliot_store_api::automation_mutation_request(eliot_store_api::automation_failure_params(
+            "auto-1".to_owned(),
+            "r-1".to_owned(),
+            "occ-1".to_owned(),
+            failure_json(&fingerprint),
+        ));
+    let receipt = apply(adapter, "failure-1", request.parameters)
+        .await
+        .expect("failure commits");
+    assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+    let payload = read(adapter, "failure", Some("auto-1"), false).await;
+    let row = payload.get("failure").expect("failure row projects");
+    assert_eq!(
+        row.get("fingerprint").and_then(Value::as_str),
+        Some(fingerprint.as_str())
+    );
+    assert_eq!(
+        row.get("history_ref").and_then(Value::as_str),
+        Some(format!("automation-failure:auto-1:r-1:{fingerprint}").as_str()),
+    );
+    assert_eq!(
+        row.get("source_operation_id").and_then(Value::as_str),
+        Some("op-automation-live-failure-1")
+    );
+    // A repeat of one failure class from another occurrence converges:
+    // same reference, first-writer provenance kept.
+    let request =
+        eliot_store_api::automation_mutation_request(eliot_store_api::automation_failure_params(
+            "auto-1".to_owned(),
+            "r-1".to_owned(),
+            "occ-2".to_owned(),
+            failure_json(&fingerprint),
+        ));
+    apply(adapter, "failure-2", request.parameters)
+        .await
+        .expect("repeat converges");
+    let repeat = read(adapter, "failure", Some("auto-1"), false).await;
+    assert_eq!(repeat.get("failure"), payload.get("failure"));
+}

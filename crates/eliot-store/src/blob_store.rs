@@ -847,7 +847,7 @@ mod tests {
         StorageCleanup, StorageExhaustedEffect, StorageExhaustedRetry, StorageExhaustedStage,
     };
     use eliot_types::{
-        AgentId, BlobStoreConfig, CommandContext, CueBinding, CueKind, CueMatchMode, CueStrength,
+        AgentId, BlobStoreConfig, CommandContext, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength,
         LifecycleStatus, ProjectId, SemanticCommand, TaintClass, Visibility, WriteId,
     };
 
@@ -1107,7 +1107,7 @@ mod tests {
             .into_bytes();
         let cues = (0..29)
             .map(|index| CueBinding {
-                cue_kind: CueKind::Concept,
+                cue_kind: LegacyCueKindV1::Concept,
                 cue_value: format!("capacity-concept-{index:02}"),
                 match_mode: CueMatchMode::Exact,
                 strength: if index == 0 {
@@ -1155,14 +1155,14 @@ mod tests {
         )?;
         let mixed_cues = (0..12)
             .map(|index| CueBinding {
-                cue_kind: CueKind::Concept,
+                cue_kind: LegacyCueKindV1::Concept,
                 cue_value: format!("mixed-legacy-{index:02}"),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,
                 expected_reuse_note: Some("legacy v1 note".to_owned()),
             })
             .chain(std::iter::once(CueBinding {
-                cue_kind: CueKind::Concept,
+                cue_kind: LegacyCueKindV1::Concept,
                 cue_value: "mixed-zzzz-cold".to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,

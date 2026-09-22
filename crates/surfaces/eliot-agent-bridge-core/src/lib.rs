@@ -37,8 +37,16 @@ pub use resources::{
 };
 mod skill_transport;
 pub use skill_transport::{
-    MAX_CARRY_BYTES, MAX_INTAKE_BYTES, SKILL_TRANSPORT_CONTRACT_ID, SKILL_TRANSPORT_VERSION,
-    SkillAckPayload, SkillDisplayPayload, SkillIntakePayload, SkillTransportError,
+    MAX_CARRY_BYTES, MAX_INTAKE_BYTES, SKILL_DISPLAY_TOOL, SKILL_INJECT_TOOL,
+    SKILL_TRANSPORT_CONTRACT_ID, SKILL_TRANSPORT_VERSION, SkillAckPayload, SkillDisplayPayload,
+    SkillIntakePayload, SkillResultEnvelope, SkillResultOutcome, SkillToolKind,
+    SkillTransportError, skill_tool_kind,
+};
+mod route_tokens;
+pub use route_tokens::{
+    MAX_MEASUREMENT_WIRE_BYTES, RouteTokenObservation, RouteTokenizer,
+    TOKEN_MEASUREMENT_CONTRACT_ID, TOKEN_MEASUREMENT_VERSION, TokenMeasurementPayload,
+    UnmeasuredReason, produce_route_token_observation,
 };
 mod terminal_inputs;
 pub use terminal_inputs::{
@@ -1863,6 +1871,38 @@ impl AgentBridgeCore {
         ))
     }
 
+    /// Projects one tool result into its delivery receipt from a live
+    /// measurement wire payload: the adapter's attested count passes through
+    /// byte-bound verification by [`produce_route_token_observation`] —
+    /// versioned wire, admission-linked matched route, exact delivered
+    /// bytes — before it may enter the receipt, unaltered. A missing
+    /// payload means the route supports no measurement and withholds with
+    /// [`BridgeError::UnmeasuredTokens`], as do unlinked, diverged,
+    /// unobserved, or misbound payloads; the bridge never estimates the
+    /// count. Delivery completeness stays the owner's observed state, as
+    /// with [`Self::project_tool_result`].
+    pub fn project_produced_tool_result(
+        &self,
+        result_bytes: &[u8],
+        source_handle: ResourceUri,
+        payload: Option<&TokenMeasurementPayload>,
+        admission: &eliot_agent_api::AdmittedRouteReceipt,
+        binding: &eliot_agent_api::ProviderExecutionBinding,
+        delivery: DeliveryStatus,
+    ) -> Result<ToolResultReceipt, BridgeError> {
+        self.require_attached()?;
+        let payload = payload.ok_or(BridgeError::UnmeasuredTokens {
+            reason: UnmeasuredReason::NoObservation,
+        })?;
+        let produced = produce_route_token_observation(result_bytes, payload, admission, binding)?;
+        Ok(ToolResultReceipt::project(
+            result_bytes,
+            source_handle,
+            produced.tokens(),
+            delivery,
+        ))
+    }
+
     /// Number of immutable snapshots retained in the attach-scoped resource
     /// projection. The registry is cleared on every new attach, so this
     /// count describes only the live attach.
@@ -1935,6 +1975,8 @@ pub enum BridgeError {
     ResourceTooLarge { bytes: usize, capacity: usize },
     #[error("incomplete tool-result delivery {delivery:?} cannot satisfy complete evidence")]
     IncompleteDelivery { delivery: DeliveryStatus },
+    #[error("tool-result token cost is unmeasured: {reason}")]
+    UnmeasuredTokens { reason: UnmeasuredReason },
     #[error(transparent)]
     Skill(#[from] SkillError),
 }
