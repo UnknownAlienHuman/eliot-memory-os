@@ -18,9 +18,10 @@ use eliot_agent_api::{
     NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
     PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
     ProviderTerminalObservation, ProviderTerminalStatus, QualifiedSourceDigest, QuotaKnowledge,
-    RawSourceRecord, ReasoningSummaryObservation, RestrictedRawSourceHandle, ResultDisposition,
+    RawSourceRecord, ReasoningSummaryObservation, RequestId, ResourceGeneration,
+    RestrictedRawSourceHandle, ResultDisposition,
     RouteContinuationLocator, RouteFingerprint, RouteObservationState, SessionId,
-    SessionLifecycleObservation, SessionLifecycleTransition, ToolInvocationObservation,
+    SessionLifecycleObservation, SessionLifecycleTransition, StateFence, ToolInvocationObservation,
     ToolOutcomeClass, ToolOutcomeObservation, UnsupportedDisposition, UnsupportedEventObservation,
     UnsupportedEventReason, UsageReceipt, WorkLeaseId,
 };
@@ -457,6 +458,75 @@ pub fn begin_attempt_strict(
 ) -> Result<AgentAttempt, CodexAdapterError> {
     gate.require_ready()?;
     begin_attempt_with_gate(attached, Some(gate), lease, attempt_id, continuity)
+}
+
+/// Owner-admitted inputs for binding one Codex execution unit.
+///
+/// `attached` is the live daemon admission: launch, authority, route, and
+/// session validated together by [`attach`]. `attempt_id`, `lease_id`,
+/// `state_fence`, and `runtime_generation` arrive from the coordinator
+/// admission read the daemon holds for this launch. The remaining fields are
+/// execution facts observed at start: the authenticated provider scope, the
+/// native thread locator, the unit identity, and the start-request identity
+/// plus the canonical bytes its digest is computed from.
+///
+/// There is deliberately no session parameter: `session_id` is sourced
+/// exclusively from the admitted attach receipt, so thread locators and
+/// native claims cannot reach it by construction.
+pub struct CodexBindExecutionInput<'a> {
+    /// Live daemon admission holding the admitted session and route.
+    pub attached: &'a CodexAttachReceipt,
+    /// Coordinator-admitted attempt identity.
+    pub attempt_id: AttemptId,
+    /// Coordinator-admitted lease identity.
+    pub lease_id: WorkLeaseId,
+    /// Admission fence the execution starts under.
+    pub state_fence: StateFence,
+    /// Runtime generation the execution starts under.
+    pub runtime_generation: ResourceGeneration,
+    /// Authenticated provider scope the execution runs under.
+    pub provider_scope_ref: String,
+    /// Observed native thread locator (execution evidence, never session
+    /// authority).
+    pub native_session: NativeSession,
+    /// Execution-unit identity for this turn.
+    pub execution_unit: ExecutionUnit,
+    /// Start-request identity.
+    pub start_request_id: RequestId,
+    /// Canonical start-request bytes; the digest is computed inside, never
+    /// caller-supplied.
+    pub start_request_bytes: &'a [u8],
+}
+
+/// Bind one execution unit from owner-admitted inputs: the production
+/// supplier for coordinator `bind_provider_execution` (issue #1942 lane O1).
+///
+/// Session rule: `session_id` is `Some(attached.session.session_id)` — the
+/// session the daemon admitted at attach — never claimant or thread input.
+/// Route rule: the admitted attach route, never a caller route. Attempt,
+/// lease, fence, and generation agreement against the coordinator admission
+/// is enforced downstream by the frozen S1 validator at bind and by the
+/// pre-dispatch verify; this constructor enforces shape only
+/// (`validate_internal`), creating no grant, introduction, or authority
+/// (per I6.15 adapters never create those).
+pub fn bind_execution_unit(
+    input: CodexBindExecutionInput,
+) -> Result<ProviderExecutionBinding, CodexAdapterError> {
+    let binding = ProviderExecutionBinding {
+        attempt_id: input.attempt_id,
+        lease_id: input.lease_id,
+        state_fence: input.state_fence,
+        runtime_generation: input.runtime_generation,
+        route: input.attached.route().clone(),
+        session_id: Some(input.attached.session().session_id.clone()),
+        provider_scope_ref: input.provider_scope_ref,
+        native_session: input.native_session,
+        execution_unit: input.execution_unit,
+        start_request_id: input.start_request_id,
+        start_request_sha256: eliot_contracts::sha256_hex(input.start_request_bytes),
+    };
+    binding.validate_internal()?;
+    Ok(binding)
 }
 
 /// Codex App Server JSONL envelope.  Provider fields remain opaque `Value`s;

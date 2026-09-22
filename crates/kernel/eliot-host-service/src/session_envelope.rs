@@ -60,6 +60,7 @@ use eliot_host_state::{
 };
 use eliot_platform::{HostStateStore, ServicePort};
 use eliot_protocol::reactive_context::{ReactiveContextPayload, ReactiveContextRecipient};
+use eliot_protocol::ReactiveContextStage;
 use thiserror::Error;
 
 use crate::service::HostService;
@@ -100,6 +101,11 @@ pub struct AdmittedDeliveryFacts {
     /// Host journal fence that admitted this entry (a `RecordFence`, never
     /// converted to the bridge `StateFence`).
     pub entry_fence: RecordFence,
+    /// Exact queue lifecycle stage of this entry at scan time. Terminal
+    /// stages (`DeliveredToExactEndpoint`, acknowledgements, closures) are
+    /// admission history, not liveness: the assembly must never mistake the
+    /// latest terminal entry for a live one.
+    pub stage: ReactiveContextStage,
     /// Queue generation that admitted this entry (ordering within a session).
     pub queue_generation: u64,
 }
@@ -174,6 +180,7 @@ fn admitted_facts_for_entry(entry: &ReactiveContextQueueEntry) -> AdmittedDelive
         request_id: payload.request_id.clone(),
         idempotency_key: payload.idempotency_key.clone(),
         entry_fence: entry.fence.clone(),
+        stage: entry.stage.clone(),
         queue_generation: entry.queue_generation,
     }
 }
@@ -192,7 +199,9 @@ fn admitted_facts_for_entry(entry: &ReactiveContextQueueEntry) -> AdmittedDelive
 ///
 /// Join contract for the D2 assembly (M2): match `session` against the live
 /// attach session, select the maximum `queue_generation` per session, and
-/// render `snapshot.recipient_id` only under a contract-owned derivation
+/// read `stage` before any liveness claim — terminal stages are admission
+/// history and must never be mistaken for live. Render
+/// `snapshot.recipient_id` only under a contract-owned derivation
 /// (see the module docs — no conflation here).
 pub fn produce_admitted_deliveries<Q>(
     queue: &Q,

@@ -40,7 +40,8 @@ pub use crate::provider_account_catalogue::{
 };
 pub use crate::provider_admission::AdmittedProviderCapability;
 pub use crate::session_envelope::{
-    SessionAttemptError, SessionBoundAttemptFacts, produce_session_bound_attempts,
+    SessionAttemptError, SessionBoundAttemptFacts, SessionMatchError, VerifiedSessionBinding,
+    produce_session_bound_attempts, verify_session_binding,
 };
 pub use crate::swarm_command_candidate::*;
 pub use crate::swarm_controlboard::*;
