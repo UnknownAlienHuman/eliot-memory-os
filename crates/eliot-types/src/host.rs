@@ -570,14 +570,14 @@ mod host_event_envelope_summary_tests {
         }
     }
 
-    /// RETAIN_DISTINCT pin: `event_kind` is an opaque summary string, not a
+    /// `RETAIN_DISTINCT` pin: `event_kind` is an opaque summary string, not a
     /// closed policy vocabulary — arbitrary spellings (including
     /// completion-sounding and empty ones) round-trip verbatim and dispatch
     /// nothing. The summary keeps its taint and raw refs and gains no
     /// lineage, receipt, cursor, or admission fields (structural: the type
     /// has none to populate).
     #[test]
-    fn event_kind_is_opaque_and_summary_stays_tainted() {
+    fn event_kind_is_opaque_and_summary_stays_tainted() -> Result<(), serde_json::Error> {
         for kind in [
             "assistant_delta",
             "Completed",
@@ -589,11 +589,11 @@ mod host_event_envelope_summary_tests {
             let envelope = summary(kind);
             assert_eq!(envelope.event_kind, kind);
             assert_eq!(envelope.taint, TaintClass::ExternalAgent);
-            let json = serde_json::to_string(&envelope).expect("summary must serialize");
-            let decoded: HostEventEnvelope =
-                serde_json::from_str(&json).expect("summary must round-trip");
+            let json = serde_json::to_string(&envelope)?;
+            let decoded: HostEventEnvelope = serde_json::from_str(&json)?;
             assert_eq!(decoded, envelope);
         }
+        Ok(())
     }
 }
 
