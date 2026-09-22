@@ -267,23 +267,29 @@ pub fn accept_grant(
 
 /// Requests one grant over an authenticated front-door channel: connects
 /// and authenticates the live Kernel server (SID/session/artifact triple
-/// verified before anything is sent), binds the peer, sends the op frame,
-/// and accepts the response through [`accept_grant`]. Every failure —
-/// including no listener — fails closed with stage-taxonomy denials.
-/// The frame carries no request identity: the route attaches identity
-/// from the authenticated session it just proved (server-derived, never
-/// caller-claimed).
+/// verified before anything is sent), binds the peer, sends the op frame
+/// carrying the admitted request identity, and accepts the response
+/// through [`accept_grant`]. Every failure — including no listener —
+/// fails closed with stage-taxonomy denials. The frame identity threads
+/// owner-retained facts (fence, nonce, deadline, correlation); session
+/// principal and connection binding stay server-derived from the
+/// authenticated session the route just proved, never caller-claimed.
 #[cfg(windows)]
 pub fn request_grant_via_transport(
     bundle: &GrantClientBundle,
     channel: &GrantChannel,
+    channel_fence: &eliot_contracts::StateFence,
 ) -> Result<AcceptedGrant, GrantClientError> {
     channel.validate()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| GrantClientError::Denied { field: "runtime" })?;
-    runtime.block_on(transport::request_grant_inner(bundle, channel))
+    runtime.block_on(transport::request_grant_inner(
+        bundle,
+        channel,
+        channel_fence,
+    ))
 }
 
 #[cfg(not(windows))]
@@ -292,6 +298,7 @@ pub fn request_grant_via_transport(
 pub fn request_grant_via_transport(
     _bundle: &GrantClientBundle,
     _channel: &GrantChannel,
+    _channel_fence: &eliot_contracts::StateFence,
 ) -> Result<AcceptedGrant, GrantClientError> {
     Err(GrantClientError::Denied { field: "transport" })
 }
@@ -301,12 +308,14 @@ mod transport {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use eliot_contracts::RequestId;
+    use eliot_contracts::{ClockReading, ProductId, RequestId, SourceId, StateFence};
     use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
     use eliot_platform_windows::{KernelFrontDoorAclMode, KernelFrontDoorServerExpectation};
     use eliot_protocol::{
         EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
+        RequestIdentity,
     };
+    use eliot_receipts::RequestBinding;
 
     use super::{
         AcceptedGrant, GRANT_ISSUE_OPERATION, GrantChannel, GrantClientBundle, accept_grant,
@@ -315,17 +324,71 @@ mod transport {
 
     static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    /// Product/source identity this client declares on its frames. A
+    /// caller-declared product label, never authority: the fence, the
+    /// session binding, and admission all come from owner records and
+    /// the authenticated session.
+    pub const GRANT_CLIENT_SERVICE: &str = "eliot-wasm-host";
+
     /// Connection identity for one client instance: process-unique,
     /// echoed by the server for correlation (mirrors the daemon client).
     pub fn connection_identity() -> String {
         format!("wasm-host-grant:{}", std::process::id())
     }
 
+    /// Builds the admitted request identity for one grant frame from
+    /// owner-retained facts: the fence threads the owner snapshot fence
+    /// (dispatch material, validated — never minted here), the request id
+    /// repeats the frame correlation id (the protocol cross-checks
+    /// equality), idempotency repeats the bundle nonce (the caller-chosen
+    /// exactly-once key), the deadline repeats the bundle deadline, and
+    /// the cancellation id binds connection/operation/sequence. Session
+    /// and task ids stay absent: the server attaches session binding from
+    /// the authenticated session it just proved (server-derived, never
+    /// caller-claimed).
+    pub fn grant_request_identity(
+        bundle: &GrantClientBundle,
+        channel_fence: &StateFence,
+        connection_id: &str,
+        sequence: u64,
+        request_id: &RequestId,
+        now_unix_ms: u64,
+    ) -> Result<RequestIdentity, GrantClientError> {
+        let denied = |field: &'static str| GrantClientError::Denied { field };
+        let now_ms = i64::try_from(now_unix_ms).map_err(|_| denied("clock"))?;
+        Ok(RequestIdentity {
+            request: RequestBinding {
+                metadata: eliot_contracts::RequestMetadata {
+                    request_id: request_id.clone(),
+                    session_id: None,
+                    task_id: None,
+                    product_id: ProductId::new(GRANT_CLIENT_SERVICE)
+                        .map_err(|_| denied("product"))?,
+                    source_id: SourceId::new(GRANT_CLIENT_SERVICE).map_err(|_| denied("source"))?,
+                    state_fence: channel_fence.clone(),
+                    clock: ClockReading {
+                        valid_time_ms: Some(now_ms),
+                        known_time_ms: Some(now_ms),
+                        transaction_sequence: None,
+                        monotonic_ns: None,
+                    },
+                },
+                state_fence: channel_fence.clone(),
+            },
+            idempotency_key: bundle.nonce.clone(),
+            deadline_unix_ms: bundle.deadline_unix_ms,
+            cancellation_id: format!("{connection_id}:{GRANT_ISSUE_OPERATION}:{sequence}:cancel"),
+        })
+    }
+
     /// Builds the grant-issue op frame: operation string plus the bundle
-    /// payload. Pure constructor — no I/O, no identity claims beyond the
-    /// connection/request correlation the server echoes back.
+    /// payload plus the admitted request identity. Pure constructor — no
+    /// I/O; every identity value threads owner-retained facts, and the
+    /// frame self-validates before return so a malformed frame fails
+    /// closed here instead of at the gate.
     pub fn grant_issue_frame(
         bundle: &GrantClientBundle,
+        channel_fence: &StateFence,
         connection_id: &str,
         sequence: u64,
     ) -> Result<(Frame, String), GrantClientError> {
@@ -334,6 +397,18 @@ mod transport {
             "{connection_id}:{GRANT_ISSUE_OPERATION}:{sequence}"
         ))
         .map_err(|_| denied("request-id"))?;
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .map_err(|_| denied("clock"))?;
+        let identity = grant_request_identity(
+            bundle,
+            channel_fence,
+            connection_id,
+            sequence,
+            &request_id,
+            now_unix_ms,
+        )?;
         let payload = serde_json::json!({
             "operation": GRANT_ISSUE_OPERATION,
             "request": serde_json::to_value(bundle).map_err(|_| denied("payload"))?,
@@ -345,16 +420,18 @@ mod transport {
             request_id: Some(request_id.clone()),
             kind: FrameKind::Request,
             message_type: MessageType::Execute,
-            request_identity: None,
+            request_identity: Some(identity),
             payload: ProtocolPayload::Json(payload),
             trace_context: BTreeMap::new(),
         };
+        frame.validate().map_err(|_| denied("frame"))?;
         Ok((frame, request_id.to_string()))
     }
 
     pub async fn request_grant_inner(
         bundle: &GrantClientBundle,
         channel: &GrantChannel,
+        channel_fence: &StateFence,
     ) -> Result<AcceptedGrant, GrantClientError> {
         let denied = |field: &'static str| GrantClientError::Denied { field };
         let expectation = KernelFrontDoorServerExpectation::new(
@@ -384,7 +461,8 @@ mod transport {
         }
         let connection_id = connection_identity();
         let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let (frame, request_id) = grant_issue_frame(bundle, &connection_id, sequence)?;
+        let (frame, request_id) =
+            grant_issue_frame(bundle, channel_fence, &connection_id, sequence)?;
         let limits = TransportLimits::default();
         if transport
             .send_frame(&frame, limits)
@@ -489,6 +567,18 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn test_fence() -> eliot_contracts::StateFence {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+        use std::num::NonZeroU64;
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            NonZeroU64::new(1).expect("sequence"),
+        )
+        .expect("epoch");
+        StateFence::new(epoch, ResourceGeneration::new(1).expect("gen"))
+    }
+
     #[test]
     #[cfg(windows)]
     fn grant_frame_carries_operation_and_bundle() {
@@ -502,8 +592,20 @@ mod tests {
             9_999_999_999_999,
         )
         .expect("bundle");
-        let (frame, request_id) = grant_issue_frame(&bundle, "conn-test", 7).expect("frame");
+        let (frame, request_id) =
+            grant_issue_frame(&bundle, &test_fence(), "conn-test", 7).expect("frame");
         assert_eq!(request_id, format!("conn-test:{GRANT_ISSUE_OPERATION}:7"));
+        // The frame carries the admitted request identity the gate
+        // requires: fence-bound, correlation-matched, self-validating.
+        let identity = frame.request_identity.as_ref().expect("identity bound");
+        assert_eq!(
+            identity.request.metadata.request_id.as_str(),
+            request_id.as_str()
+        );
+        assert_eq!(identity.idempotency_key.as_str(), "nonce-9");
+        assert_eq!(identity.deadline_unix_ms, 9_999_999_999_999);
+        assert!(identity.cancellation_id.as_str().contains("conn-test"));
+        frame.validate().expect("frame self-validates");
         let ProtocolPayload::Json(payload) = frame.payload else {
             panic!("grant frame carries JSON");
         };
@@ -524,18 +626,43 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn mismatched_identity_fails_frame_validation() {
+        use crate::grant_client::transport::grant_issue_frame;
+        let bundle = build_grant_bundle(
+            "component-1956",
+            b"artifact-bytes",
+            b"wit-bytes",
+            "nonce-9",
+            9_999_999_999_999,
+        )
+        .expect("bundle");
+        let (mut frame, _) =
+            grant_issue_frame(&bundle, &test_fence(), "conn-test", 7).expect("frame");
+        // A substituted request id breaks the identity correlation gate.
+        frame.request_id =
+            Some(eliot_contracts::RequestId::new("conn-test:substituted:9").expect("request id"));
+        assert!(frame.validate().is_err());
+        // A stripped identity breaks the gate requirement itself.
+        let (mut frame, _) =
+            grant_issue_frame(&bundle, &test_fence(), "conn-test", 7).expect("frame");
+        frame.request_identity = None;
+        assert!(frame.validate().is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn bad_channel_fails_before_io() {
         let bundle = build_grant_bundle("c", b"a", b"w", "n", 1).expect("bundle");
         let mut channel = test_channel();
         channel.pipe_name.clear();
         assert_eq!(
-            request_grant_via_transport(&bundle, &channel),
+            request_grant_via_transport(&bundle, &channel, &test_fence()),
             Err(GrantClientError::Denied { field: "channel" })
         );
         let mut channel = test_channel();
         channel.kernel_artifact_sha256 = "ZZZ".to_owned();
         assert_eq!(
-            request_grant_via_transport(&bundle, &channel),
+            request_grant_via_transport(&bundle, &channel, &test_fence()),
             Err(GrantClientError::Denied { field: "channel" })
         );
     }
@@ -548,7 +675,7 @@ mod tests {
         let bundle = build_grant_bundle("c", b"a", b"w", "n", 1).expect("bundle");
         let started = std::time::Instant::now();
         assert_eq!(
-            request_grant_via_transport(&bundle, &test_channel()),
+            request_grant_via_transport(&bundle, &test_channel(), &test_fence()),
             Err(GrantClientError::Denied { field: "connect" })
         );
         assert!(
