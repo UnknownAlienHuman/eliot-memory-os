@@ -2085,6 +2085,12 @@ pub struct GrantClosureCommit {
     pub digest: String,
     pub affected: Vec<OperationIdentity>,
     pub preserved: Vec<GrantClosurePreserved>,
+    /// Introductions fenced live when the closure committed, in sorted
+    /// order. They carry no supporting set here: the fence was verified
+    /// against live supporters at commit time, and this list only reinstalls
+    /// the fence after a restart so a fenced introduction can never read as
+    /// usable again.
+    pub fenced_introductions: Vec<OperationIdentity>,
     pub state: GrantClosureState,
 }
 
@@ -2143,6 +2149,18 @@ impl GrantClosureCommit {
                 });
             }
             previous_survivor = Some(key);
+        }
+        let mut previous_introduction: Option<&str> = None;
+        for introduction_id in &self.fenced_introductions {
+            if let Some(previous) = previous_introduction
+                && previous >= introduction_id.as_str()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "grant_closure_fenced_introductions",
+                    reason: "fenced introductions must be sorted and unique",
+                });
+            }
+            previous_introduction = Some(introduction_id.as_str());
         }
         Ok(())
     }

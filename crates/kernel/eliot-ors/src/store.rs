@@ -6571,11 +6571,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         // `APPLYING` is the durable PendingActivation record. A crash after
         // this commit leaves an opaque, non-active row that a later exact
         // presentation can finish; it can never be recovered as live state.
+        // `Fenced` and `Released` rows are never reactivated: restore never
+        // reactivates a path, so only a missing row may enter `APPLYING`.
         self.mutate_operational(
             OperationalKind::CapabilityGrant,
             input.clone(),
             false,
-            &[OperationalPhase::Fenced, OperationalPhase::Released],
+            &[],
             OperationalPhase::Applying,
         )?;
         self.transition_existing_operational(
