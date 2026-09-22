@@ -1664,6 +1664,7 @@ dependencies = [
  "eliot-instrument-runner",
  "eliot-instrument-rustc",
  "eliot-observability",
+ "eliot-process",
  "eliot-store",
  "eliot-types",
  "eliot-verifier",

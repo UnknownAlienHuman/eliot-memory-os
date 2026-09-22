@@ -20,6 +20,7 @@ pub mod error;
 pub mod eval;
 pub mod external_agent;
 pub mod external_review;
+pub mod governed_build;
 pub mod host;
 pub mod lifecycle;
 pub mod memory_distillation;

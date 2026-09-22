@@ -36,7 +36,7 @@ use eliot_build_test_graph::{
 use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
 use eliot_instrument_runner::cache_lane::{CacheLane, CacheLaneAttestations};
 use eliot_instrument_runner::registry::{
-    ProviderRegistry, RegistryFreshness, ResolvedExecutableIdentity,
+    ProviderRegistry, RegistryEntry, RegistryFreshness, ResolvedExecutableIdentity,
 };
 use eliot_observability::CacheTelemetry;
 
@@ -99,6 +99,42 @@ impl CachedDerivationService {
     #[must_use]
     pub fn rejected(&self) -> Vec<RejectedCacheRecord> {
         self.lane.rejected()
+    }
+
+    /// Validates registry, build-kind, executable, and target admission
+    /// without consulting the cache.
+    ///
+    /// A runtime caller uses this before launching a build when no expected
+    /// artifact digest exists yet. The absence of a cache key must bypass
+    /// reuse, but it must never bypass the BUILD-only admission boundary.
+    pub fn validate_admission(
+        &self,
+        request: &GovernedDerivationRequest<'_>,
+    ) -> Result<(), EngineError> {
+        Self::admitted_entry(request).map(|_| ())
+    }
+
+    /// Consults the cache for an already declared artifact identity.
+    ///
+    /// `Some` is a verified hit and means the caller must not launch the
+    /// underlying build. `None` is every miss shape, including an untrusted or
+    /// corrupt entry; the caller must run its genuine uncached build and then
+    /// use [`Self::publish_governed`] with the observed artifact bytes.
+    pub fn lookup_governed(
+        &mut self,
+        request: &GovernedDerivationRequest<'_>,
+    ) -> Result<Option<CachedDerivation>, EngineError> {
+        let identity = Self::govern(request)?;
+        Ok(match self.lane.lookup_identity(&identity) {
+            eliot_build_test_graph::CacheLookup::Hit(artifact) => Some(Self::finish(
+                request.invocation,
+                &identity,
+                artifact,
+                true,
+                None,
+            )),
+            eliot_build_test_graph::CacheLookup::Miss { .. } => None,
+        })
     }
 
     /// Runs the full governed flow for a pre-declared expected digest.
@@ -205,6 +241,14 @@ impl CachedDerivationService {
     fn govern(
         request: &GovernedDerivationRequest<'_>,
     ) -> Result<DerivedCacheIdentity, EngineError> {
+        let entry = Self::admitted_entry(request)?;
+        CacheLane::identity_for(entry, request.executable, request.attest)
+            .map_err(|error| rejected(&format!("cache identity is unusable: {error}")))
+    }
+
+    fn admitted_entry<'a>(
+        request: &'a GovernedDerivationRequest<'a>,
+    ) -> Result<&'a RegistryEntry, EngineError> {
         let entry = request
             .registry
             .resolve_current(request.invocation, request.freshness)
@@ -227,8 +271,7 @@ impl CachedDerivationService {
         {
             return Err(rejected("derivation target cannot anchor cache telemetry"));
         }
-        CacheLane::identity_for(entry, request.executable, request.attest)
-            .map_err(|error| rejected(&format!("cache identity is unusable: {error}")))
+        Ok(entry)
     }
 
     fn finish(
