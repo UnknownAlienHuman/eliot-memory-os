@@ -16,6 +16,7 @@ use eliot_kernel_core::user_automation::{
     UserAutomationPreflightDecision, UserAutomationPreflightProjection,
     UserAutomationPreflightReceipt, UserAutomationRevision,
 };
+use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
 use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
 use eliot_store_api::{OperationId, OperationIdentity, WriteReceipt};
 use schemars::JsonSchema;
@@ -67,6 +68,134 @@ pub enum UserAutomationExecutionError {
     /// A runtime response did not bind to the occurrence/fence that was sent.
     #[error("UserAutomation runtime response mismatch: {0}")]
     RuntimeResponseMismatch(&'static str),
+}
+
+/// Owner-issued Durable Job material for one admitted UserAutomation
+/// occurrence.
+///
+/// The service cannot derive this request from an automation revision. The
+/// existing Durable Job owner supplies the complete K0 submission, including
+/// its job/attempt identities, content references, admission receipt, and
+/// canonical request hash. The occurrence binding is carried beside that
+/// request so the runtime adapter can prove which automation occurrence the
+/// owner material belongs to.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationDurableJobMaterial {
+    /// Stable UserAutomation occurrence bound by the owner.
+    pub occurrence_id: String,
+    /// Complete owner-issued Durable Job submission request.
+    pub request: DurableJobRequest,
+}
+
+impl UserAutomationDurableJobMaterial {
+    /// Validates the complete owner material against the authenticated
+    /// occurrence that is about to be admitted.
+    pub fn validate_for(
+        &self,
+        context: &RequestMetadata,
+        authenticated_principal: &str,
+        invocation: &UserAutomationInvocation,
+    ) -> Result<(), UserAutomationExecutionError> {
+        validate_text(&self.occurrence_id, "runtime.durable_job.occurrence_id")?;
+        self.request.validate().map_err(|_| {
+            UserAutomationExecutionError::RuntimeResponseMismatch("durable job material shape")
+        })?;
+        if self.request.role != JobRole::Requester
+            || !matches!(self.request.operation, JobOperation::Submit { .. })
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "durable job material operation",
+            ));
+        }
+        if self.occurrence_id != invocation.occurrence_identity()? {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "durable job material occurrence",
+            ));
+        }
+        if self.request.request_identity.request.request.metadata != *context
+            || self.request.request_identity.request.request.state_fence != context.state_fence
+            || self.request.request_identity.operation.state_fence != context.state_fence
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "durable job material fence",
+            ));
+        }
+        let JobOperation::Submit { submission } = &self.request.operation else {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "durable job material operation",
+            ));
+        };
+        if submission.admission.requester_principal != authenticated_principal
+            || submission.work_scope.product_id.as_str() != context.product_id.as_str()
+            || submission.work_scope.state_fence != context.state_fence
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "durable job material principal",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact owner-issued Host wake identity supplied for a cancellation.
+///
+/// Host resolves this identity against its canonical journal before changing
+/// anything. The carrier deliberately contains no replacement record: all
+/// Host-owned fence, timing, capability, safety, budget, and evidence fields
+/// are copied from the journal's existing record and only the lifecycle state
+/// may change.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeCancellationTarget {
+    /// Automation identity assigned by the owner that selected this target.
+    pub automation_id: String,
+    /// Immutable revision identity assigned by the owner.
+    pub automation_revision: String,
+    /// Exact Host wake identity.
+    pub wake_id: String,
+    /// Exact Host journal operation identity.
+    pub operation_id: String,
+    /// Exact Host journal idempotency key.
+    pub idempotency_key: String,
+    /// Digest of the complete current Host wake record.
+    pub record_checksum: String,
+    /// Kernel State Fence carried by the existing wake intent.
+    pub state_fence: StateFence,
+}
+
+impl UserAutomationWakeCancellationTarget {
+    /// Validates one owner-issued target and its parent cancellation binding.
+    pub fn validate_for(
+        &self,
+        cancellation: &UserAutomationWakeCancellation,
+    ) -> Result<(), UserAutomationExecutionError> {
+        for (value, field) in [
+            (&self.automation_id, "cancellation.target.automation_id"),
+            (
+                &self.automation_revision,
+                "cancellation.target.automation_revision",
+            ),
+            (&self.wake_id, "cancellation.target.wake_id"),
+            (&self.operation_id, "cancellation.target.operation_id"),
+            (&self.idempotency_key, "cancellation.target.idempotency_key"),
+        ] {
+            validate_text(value, field)?;
+        }
+        validate_digest(&self.record_checksum, "cancellation.target.record_checksum")?;
+        self.state_fence
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        if self.automation_id != cancellation.automation_id
+            || self.automation_revision != cancellation.automation_revision
+            || self.state_fence != cancellation.state_fence
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "cancellation target binding",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Authenticated occurrence request constructed by the Kernel selector.
@@ -166,6 +295,10 @@ pub struct UserAutomationRuntimeAdmission {
     pub preflight: UserAutomationPreflightReceipt,
     /// Existing pending WakeIntent bound to this occurrence.
     pub wake_intent: WakeIntent,
+    /// Complete owner-issued Durable Job material. Concrete production
+    /// adapters reject an admission that omits this material.
+    #[serde(default)]
+    pub durable_job: Option<UserAutomationDurableJobMaterial>,
 }
 
 impl UserAutomationRuntimeAdmission {
@@ -226,6 +359,13 @@ impl UserAutomationRuntimeAdmission {
                 "runtime admission occurrence/fence",
             ));
         }
+        if let Some(material) = &self.durable_job {
+            material.validate_for(
+                &self.context,
+                &self.authenticated_principal,
+                &self.invocation,
+            )?;
+        }
         Ok(())
     }
 }
@@ -249,6 +389,10 @@ pub struct UserAutomationWakeCancellation {
     pub state_fence: StateFence,
     /// Fixed safety pin: admitted Durable Jobs are never cancelled here.
     pub only_unadmitted: bool,
+    /// Exact owner-issued Host wake targets. Host never discovers targets by
+    /// parsing a wake reason or deriving an identity.
+    #[serde(default)]
+    pub targets: Vec<UserAutomationWakeCancellationTarget>,
 }
 
 impl UserAutomationWakeCancellation {
@@ -274,6 +418,15 @@ impl UserAutomationWakeCancellation {
             return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
                 "cancellation must be same-fence and unadmitted-only",
             ));
+        }
+        let mut wake_ids = BTreeSet::new();
+        for target in &self.targets {
+            target.validate_for(self)?;
+            if !wake_ids.insert(target.wake_id.as_str()) {
+                return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                    "duplicate cancellation target",
+                ));
+            }
         }
         Ok(())
     }
@@ -739,6 +892,30 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
         request: UserAutomationExecutionRequest,
         runtime: &R,
     ) -> Result<UserAutomationExecutionOutcome, UserAutomationExecutionError> {
+        self.execute_occurrence_with_material(request, None, runtime)
+            .await
+    }
+
+    /// Executes one occurrence with the complete owner-issued Durable Job
+    /// material. This is the production entry point used by the authenticated
+    /// selector once the existing Durable Job owner has supplied its typed
+    /// submission.
+    pub async fn execute_occurrence_with_durable_job<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationExecutionRequest,
+        durable_job: UserAutomationDurableJobMaterial,
+        runtime: &R,
+    ) -> Result<UserAutomationExecutionOutcome, UserAutomationExecutionError> {
+        self.execute_occurrence_with_material(request, Some(durable_job), runtime)
+            .await
+    }
+
+    async fn execute_occurrence_with_material<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationExecutionRequest,
+        durable_job: Option<UserAutomationDurableJobMaterial>,
+        runtime: &R,
+    ) -> Result<UserAutomationExecutionOutcome, UserAutomationExecutionError> {
         request.validate()?;
         let context = UserAutomationPreflightContext {
             request_metadata: request.context.clone(),
@@ -756,6 +933,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                     invocation: request.invocation,
                     preflight: receipt.clone(),
                     wake_intent: request.wake_intent,
+                    durable_job,
                 };
                 admission.validate()?;
                 let execution = runtime.admit_occurrence(admission).await?;
@@ -803,6 +981,30 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
         projection: UserAutomationPreflightProjection,
         runtime: &R,
     ) -> Result<UserAutomationExecutionOutcome, UserAutomationExecutionError> {
+        self.run_now_and_execute_with_material(request, projection, None, runtime)
+            .await
+    }
+
+    /// Runs a canonical `run-now` operation and joins its occurrence with
+    /// complete owner-issued Durable Job material.
+    pub async fn run_now_and_execute_with_durable_job<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationServiceRequest,
+        projection: UserAutomationPreflightProjection,
+        durable_job: UserAutomationDurableJobMaterial,
+        runtime: &R,
+    ) -> Result<UserAutomationExecutionOutcome, UserAutomationExecutionError> {
+        self.run_now_and_execute_with_material(request, projection, Some(durable_job), runtime)
+            .await
+    }
+
+    async fn run_now_and_execute_with_material<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationServiceRequest,
+        projection: UserAutomationPreflightProjection,
+        durable_job: Option<UserAutomationDurableJobMaterial>,
+        runtime: &R,
+    ) -> Result<UserAutomationExecutionOutcome, UserAutomationExecutionError> {
         if !matches!(
             &request.intent.operation,
             eliot_kernel_core::UserAutomationOperation::RunNow { .. }
@@ -830,7 +1032,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 "run-now returned a non-run result",
             ));
         };
-        self.execute_occurrence(
+        self.execute_occurrence_with_material(
             UserAutomationExecutionRequest {
                 context: request.context,
                 authenticated_principal: request.authenticated_principal,
@@ -839,6 +1041,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 projection,
                 wake_intent,
             },
+            durable_job,
             runtime,
         )
         .await
@@ -849,6 +1052,18 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
     pub async fn remove_and_cancel<R: UserAutomationRuntimePort + ?Sized>(
         &self,
         request: UserAutomationServiceRequest,
+        runtime: &R,
+    ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
+        self.remove_and_cancel_with_targets(request, Vec::new(), runtime)
+            .await
+    }
+
+    /// Retires one revision and cancels the exact owner-issued pending wake
+    /// targets observed for that revision.
+    pub async fn remove_and_cancel_with_targets<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationServiceRequest,
+        targets: Vec<UserAutomationWakeCancellationTarget>,
         runtime: &R,
     ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
         let (automation_id, automation_revision) = match &request.intent.operation {
@@ -893,6 +1108,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             automation_revision,
             state_fence: request.context.state_fence.clone(),
             only_unadmitted: true,
+            targets,
         };
         cancellation.validate()?;
         let cancelled_wake_ids = runtime.cancel_pending_wakes(cancellation).await?;
@@ -908,6 +1124,20 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), UserAutomationExecutionError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(UserAutomationExecutionError::Contract(
+            UserAutomationError::Invalid(field),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_digest(value: &str, field: &'static str) -> Result<(), UserAutomationExecutionError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(UserAutomationExecutionError::Contract(
+            UserAutomationError::Invalid(field),
+        ));
+    }
+    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
         return Err(UserAutomationExecutionError::Contract(
             UserAutomationError::Invalid(field),
         ));
@@ -1389,6 +1619,7 @@ mod tests {
             automation_id: "automation-1".to_owned(),
             automation_revision: "revision-7".to_owned(),
             only_unadmitted: true,
+            targets: Vec::new(),
         };
         let cancelled = active_composition
             .cancel_pending_wakes(cancellation)

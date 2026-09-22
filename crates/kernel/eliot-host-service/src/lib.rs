@@ -15,6 +15,9 @@
 
 pub mod reactive_context_delivery;
 pub mod runtime_control;
+pub mod user_automation_durable_job;
+pub mod user_automation_execution;
+pub mod user_automation_wake;
 
 mod service;
 
@@ -35,6 +38,12 @@ pub use reactive_context_delivery::{
     ReactiveContextSendRequest, ReactiveContextTransportError, ReactiveContextTransportPort,
     ReactiveContextTransportReceipt, RestartReconciliation, SystemReactiveContextClock,
 };
+
+pub use user_automation_durable_job::{
+    HostDurableJobAdapter, HostDurableJobOwner, HostDurableJobOwnerError,
+};
+pub use user_automation_execution::UserAutomationHostExecutionEndpoint;
+pub use user_automation_wake::HostWakeIntentAdapter;
 
 use eliot_contracts::{
     ContractIdentity, ContractVersion, contract_identity as make_contract_identity,
