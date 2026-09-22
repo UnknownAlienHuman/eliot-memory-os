@@ -3759,6 +3759,7 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
             jobs,
             readiness_gate: HostReadinessGate::with_cadence(ReadinessCadence::default()),
             phase_b: None,
+            watchdog_start_recovery: None,
             runtime_restarts: std::collections::HashMap::new(),
             runtime_control_queue: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),

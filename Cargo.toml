@@ -177,6 +177,9 @@ members = [
   "crates/smart/eliot-learning-overlay",  # agent_order 35
   "crates/meta/eliot-learning-activation-assessment",  # agent_order 36
   "crates/meta/eliot-self-quality",  # agent_order 38
+  "crates/smart/eliot-experience-projection",  # agent_order 48
+  "crates/smart/eliot-dreamer-self-query",  # agent_order 49
+  "crates/smart/eliot-epistemic-context-provider",  # agent_order 50
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`
@@ -304,6 +307,9 @@ eliot-learning-delta = { path = "crates/smart/eliot-learning-delta", version = "
 eliot-learning-overlay = { path = "crates/smart/eliot-learning-overlay", version = "0.1.0" }
 eliot-learning-activation-assessment = { path = "crates/meta/eliot-learning-activation-assessment", version = "0.1.0" }
 eliot-self-quality = { path = "crates/meta/eliot-self-quality", version = "0.1.0" }
+eliot-experience-projection = { path = "crates/smart/eliot-experience-projection", version = "0.1.0" }
+eliot-dreamer-self-query = { path = "crates/smart/eliot-dreamer-self-query", version = "0.1.0" }
+eliot-epistemic-context-provider = { path = "crates/smart/eliot-epistemic-context-provider", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
 wasmtime = { version = "=47.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wat = "=1.256.0"

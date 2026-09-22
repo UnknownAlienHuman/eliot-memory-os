@@ -373,6 +373,9 @@ pub const HOST_OWNER_MUTEX_PREFIX: &str = "Global\\Eliot-Host-Owner-";
 struct HostLeaseAuthority {
     gate: Mutex<()>,
     revoked: AtomicBool,
+    /// Installation identity authenticated when the owner mutex was created.
+    /// A live gate alone does not identify the installation it protects.
+    installation: Option<PlatformHandle>,
 }
 
 /// Failure returned when an explicit owner release cannot classify its
@@ -1427,6 +1430,13 @@ pub struct HostOwnerEpochGuard<'a> {
 }
 
 impl HostOwnerEpochCapability {
+    /// Returns whether this capability was minted for one exact installation.
+    /// The comparison uses the retained owner identity, never caller path text.
+    #[must_use]
+    pub fn is_for_installation(&self, installation: &PlatformHandle) -> bool {
+        self.authority.installation.as_ref() == Some(installation)
+    }
+
     /// Acquires a live guard while this capability is still backed by its
     /// unreleased owner lease.
     ///
@@ -1508,7 +1518,10 @@ impl HostOwnerLease {
                     handle,
                     owns: true,
                     name,
-                    authority: Arc::new(HostLeaseAuthority::default()),
+                    authority: Arc::new(HostLeaseAuthority {
+                        installation: Some(installation.clone()),
+                        ..HostLeaseAuthority::default()
+                    }),
                 }),
                 ERROR_ALREADY_EXISTS => {
                     // Never wait on or join an object we did not create.  Its
