@@ -558,6 +558,23 @@ impl DaemonComposition {
             .map_err(DaemonError::Composition)
     }
 
+    /// Publishes one complete set emitted by the reactive semantic owners.
+    ///
+    /// The Governor binds the set to the live activation and accepted
+    /// observation evidence, validates the admitted cue/index rows, and
+    /// installs all six typed inputs atomically for the existing cadence.
+    /// Missing or stale owner material remains a withheld feed rather than a
+    /// synthetic planning input.
+    pub fn publish_reactive_owner_projections(
+        &self,
+        now: u64,
+        projections: eliot_governor::GovernorReactiveProjectionSet,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_owner_projections(now, projections)
+            .map_err(DaemonError::Composition)
+    }
+
     /// Publishes retained cue/index rows from the cue and context owners.
     pub fn publish_reactive_owner_sources(
         &self,
