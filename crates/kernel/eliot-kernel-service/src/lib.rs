@@ -203,7 +203,11 @@ pub use user_automation_execution_client::{
     UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
     UserAutomationHostExecutionSession, UserAutomationHostOwnerBinding,
     UserAutomationHostExecutionTransport, decode_user_automation_host_execution_request_frame,
+    decode_user_automation_host_execution_open_frame,
+    decode_user_automation_host_execution_open_response_frame,
     decode_user_automation_host_execution_response_frame,
+    user_automation_host_execution_open_frame,
+    user_automation_host_execution_open_response_frame,
     user_automation_host_execution_request_frame, user_automation_host_execution_response_frame,
 };
 #[cfg(windows)]

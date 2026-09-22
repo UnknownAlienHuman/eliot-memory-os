@@ -12,7 +12,7 @@
     reason = "Host runtime-control endpoint keeps explicit production plumbing"
 )]
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,7 +25,10 @@ pub use eliot_host_service::runtime_control::{
 pub use eliot_host_service::{
     UserAutomationHostExecutionEndpoint, UserAutomationHostExecutionRequest,
     UserAutomationHostExecutionResponse, UserAutomationRuntimeError,
+    UserAutomationHostChannelBinding,
     decode_user_automation_host_execution_request_frame,
+    decode_user_automation_host_execution_open_frame,
+    user_automation_host_execution_open_response_frame,
     user_automation_host_execution_response_frame,
 };
 use eliot_host_service::{
@@ -192,7 +195,6 @@ pub struct HostRuntimeControl {
     queue: HostRuntimeControlQueue,
     user_automation_queue: HostUserAutomationExecutionQueue,
     user_automation_owner: Option<UserAutomationHostOwnerBinding>,
-    seen_user_automation_requests: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl HostRuntimeControl {
@@ -221,7 +223,6 @@ impl HostRuntimeControl {
             queue,
             user_automation_queue,
             user_automation_owner: None,
-            seen_user_automation_requests: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -243,7 +244,6 @@ impl HostRuntimeControl {
             queue,
             user_automation_queue,
             user_automation_owner: Some(owner),
-            seen_user_automation_requests: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -306,7 +306,7 @@ impl HostRuntimeControl {
         &self,
         request: UserAutomationHostExecutionRequest,
         server: &NamedPipeServer,
-        connection_id: &str,
+        channel: UserAutomationHostChannelBinding,
     ) -> UserAutomationHostExecutionResponse {
         let Some(owner) = self.user_automation_owner.as_ref() else {
             return UserAutomationHostExecutionResponse::failed_for(
@@ -317,7 +317,7 @@ impl HostRuntimeControl {
             );
         };
         let session = match UserAutomationHostExecutionSession::issue(
-            connection_id,
+            channel,
             request.request_sha256.clone(),
             server.peer_identity().clone(),
             owner.clone(),
@@ -352,24 +352,10 @@ impl HostRuntimeControl {
                     ),
                 );
             }
-            let Ok(mut seen) = self.seen_user_automation_requests.lock() else {
-                return UserAutomationHostExecutionResponse::failed_for(
-                    &request,
-                    UserAutomationRuntimeError::Unavailable(
-                        "UserAutomation replay ledger lock is poisoned".to_owned(),
-                    ),
-                );
-            };
-            if !seen.insert(request.request_sha256.clone()) {
-                return UserAutomationHostExecutionResponse::failed_for(
-                    &request,
-                    UserAutomationRuntimeError::IdentityConflict,
-                );
-            }
-            if seen.len() > MAX_QUEUE_DEPTH * 4 {
-                let retained = seen.iter().rev().take(MAX_QUEUE_DEPTH * 2).cloned().collect();
-                *seen = retained;
-            }
+            // This endpoint is only the authenticated queue boundary. It is
+            // neither a durable mutation owner nor a replay ledger: an exact
+            // retry after an UnknownOutcome must reach the canonical Store or
+            // Host journal owner, including after this process restarts.
             queue.push_back(HostUserAutomationExecutionEnvelope {
                 request: request.clone(),
                 session,
@@ -412,6 +398,42 @@ impl HostRuntimeControl {
             .receive_frame(limits)
             .await
             .map_err(|error| error.to_string())?;
+        if let Ok(open_id) = decode_user_automation_host_execution_open_frame(&frame) {
+            let owner = self
+                .user_automation_owner
+                .as_ref()
+                .ok_or_else(|| "Host UserAutomation owner is not composed".to_owned())?;
+            let channel = UserAutomationHostChannelBinding::issue_server_authored(
+                server.peer_identity(),
+                owner,
+            )
+            .map_err(|error| error.to_string())?;
+            let open_response = user_automation_host_execution_open_response_frame(
+                &open_id,
+                &channel,
+            )
+            .map_err(|error| error.to_string())?;
+            server
+                .send_frame(&open_response, limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            let request_frame = server
+                .receive_frame(limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            let request = decode_user_automation_host_execution_request_frame(&request_frame)
+                .map_err(|error| error.to_string())?;
+            let response = self
+                .handle_user_automation(request.clone(), &server, channel)
+                .await;
+            let response_frame = user_automation_host_execution_response_frame(&request, &response)
+                .map_err(|error| error.to_string())?;
+            server
+                .send_frame(&response_frame, limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
         let connection_id = frame.connection_id.clone();
         let response_frame = match decode_runtime_control_request_frame(&frame) {
             Ok(request) => {
@@ -421,9 +443,10 @@ impl HostRuntimeControl {
             Err(_) => {
                 let request = decode_user_automation_host_execution_request_frame(&frame)
                     .map_err(|error| error.to_string())?;
-                let response = self
-                    .handle_user_automation(request.clone(), &server, &connection_id)
-                    .await;
+                let response = UserAutomationHostExecutionResponse::failed_for(
+                    &request,
+                    UserAutomationRuntimeError::IdentityConflict,
+                );
                 user_automation_host_execution_response_frame(&request, &response)
                     .map_err(|error| error.to_string())?
             }

@@ -57,6 +57,10 @@ const USER_AUTOMATION_HOST_EXECUTION_TRACE_KEY: &str =
     "eliot.user_automation.host-execution-discriminator";
 const USER_AUTOMATION_HOST_EXECUTION_TRACE_VALUE: &str =
     "eliot-user-automation::host-execution:v1";
+const USER_AUTOMATION_HOST_EXECUTION_OPEN_TRACE_KEY: &str =
+    "eliot.user_automation.host-execution-open-discriminator";
+const USER_AUTOMATION_HOST_EXECUTION_OPEN_TRACE_VALUE: &str =
+    "eliot-user-automation::host-execution-open:v1";
 
 /// Evidence binding supplied by the already authenticated Kernel-to-Host
 /// channel.
@@ -78,6 +82,60 @@ pub struct UserAutomationHostChannelBinding {
 }
 
 impl UserAutomationHostChannelBinding {
+    /// Issues a server-authored binding from the live authenticated peer and
+    /// the retained Host owner anchor. Descriptor and receipt hashes are
+    /// derived here; callers cannot supply shape-valid substitutes.
+    pub fn issue_server_authored(
+        peer: &PeerIdentity,
+        owner: &UserAutomationHostOwnerBinding,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        owner.validate()?;
+        peer.validate()
+            .map_err(|_| rejected("UserAutomation peer is not authenticated"))?;
+        let nonce = USER_AUTOMATION_SESSION_NONCE.fetch_add(1, Ordering::Relaxed);
+        let connection_id = format!(
+            "ua-host-connection:{}:{}",
+            std::process::id(),
+            nonce
+        );
+        Self::for_authenticated_connection(connection_id, peer, owner)
+    }
+
+    fn for_authenticated_connection(
+        connection_id: String,
+        peer: &PeerIdentity,
+        owner: &UserAutomationHostOwnerBinding,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        validate_text(&connection_id, "channel.connection_id")?;
+        owner.validate()?;
+        owner.validate_peer(peer)?;
+        let peer_digest = authenticated_peer_evidence_digest(peer)?;
+        let peer_admission_receipt_sha256 = sha256_hex(
+            &canonical_json_bytes(&(
+                "eliot.user_automation.host-peer-admission.v2",
+                &connection_id,
+                &peer_digest,
+                owner,
+            ))
+            .map_err(|error| rejected(format!("peer admission receipt encoding: {error}")))?,
+        );
+        let descriptor_sha256 = sha256_hex(
+            &canonical_json_bytes(&(
+                "eliot.user_automation.host-channel-descriptor.v2",
+                &connection_id,
+                &peer_admission_receipt_sha256,
+                owner,
+            ))
+            .map_err(|error| rejected(format!("channel descriptor encoding: {error}")))?,
+        );
+        Ok(Self {
+            connection_id,
+            descriptor_sha256,
+            peer_admission_receipt_sha256,
+            state_fence: owner.state_fence.clone(),
+        })
+    }
+
     /// Validates the shape and fence of retained channel evidence.
     pub fn validate(&self) -> Result<(), UserAutomationRuntimeError> {
         validate_text(&self.connection_id, "channel.connection_id")?;
@@ -89,6 +147,21 @@ impl UserAutomationHostChannelBinding {
         self.state_fence
             .validate()
             .map_err(|error| rejected(format!("channel state fence: {error}")))
+    }
+
+    /// Recomputes the complete binding from the retained authenticated peer
+    /// and owner. A caller-provided digest is never treated as authority.
+    pub fn validate_authenticated(
+        &self,
+        peer: &PeerIdentity,
+        owner: &UserAutomationHostOwnerBinding,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        self.validate()?;
+        let expected = Self::for_authenticated_connection(self.connection_id.clone(), peer, owner)?;
+        if self != &expected {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(())
     }
 }
 
@@ -159,6 +232,38 @@ impl UserAutomationHostOwnerBinding {
 
 static USER_AUTOMATION_SESSION_NONCE: AtomicU64 = AtomicU64::new(1);
 
+fn authenticated_peer_evidence_digest(
+    peer: &PeerIdentity,
+) -> Result<String, UserAutomationRuntimeError> {
+    peer.validate()
+        .map_err(|_| rejected("UserAutomation peer is not authenticated"))?;
+    let process = peer
+        .process_binding()
+        .ok_or_else(|| rejected("UserAutomation peer process binding is unavailable"))?;
+    let PeerIdentity::Authenticated {
+        process_id,
+        user_identity,
+        session_identity,
+        ..
+    } = peer
+    else {
+        return Err(rejected("UserAutomation peer is not authenticated"));
+    };
+    Ok(sha256_hex(
+        &canonical_json_bytes(&(
+            "eliot.user_automation.authenticated-peer-evidence.v2",
+            process_id,
+            user_identity,
+            session_identity,
+            process.process_id(),
+            process.start_time_100ns(),
+            process.image_path(),
+            process.executable_file_identity(),
+        ))
+        .map_err(|error| rejected(format!("peer evidence encoding: {error}")))?,
+    ))
+}
+
 /// Opaque server-authored admission context retained beside one queued
 /// carrier. The caller's channel fields remain correlation data; owner calls
 /// require this context and therefore cannot be admitted by copying a carrier
@@ -166,7 +271,7 @@ static USER_AUTOMATION_SESSION_NONCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserAutomationHostExecutionSession {
     server_session_id: String,
-    client_connection_id: String,
+    channel: UserAutomationHostChannelBinding,
     request_sha256: String,
     peer: PeerIdentity,
     owner: UserAutomationHostOwnerBinding,
@@ -177,16 +282,14 @@ impl UserAutomationHostExecutionSession {
     /// the actual connected peer. The owner anchor is retained by Host
     /// composition and cannot be supplied by the wire carrier.
     pub fn issue(
-        client_connection_id: impl Into<String>,
+        channel: UserAutomationHostChannelBinding,
         request_sha256: impl Into<String>,
         peer: PeerIdentity,
         owner: UserAutomationHostOwnerBinding,
     ) -> Result<Self, UserAutomationRuntimeError> {
-        let client_connection_id = client_connection_id.into();
         let request_sha256 = request_sha256.into();
-        validate_text(&client_connection_id, "session.client_connection_id")?;
         validate_sha256(&request_sha256, "session.request_sha256")?;
-        owner.validate_peer(&peer)?;
+        channel.validate_authenticated(&peer, &owner)?;
         let nonce = USER_AUTOMATION_SESSION_NONCE.fetch_add(1, Ordering::Relaxed);
         let peer_process = peer
             .process_binding()
@@ -195,7 +298,7 @@ impl UserAutomationHostExecutionSession {
             &canonical_json_bytes(&(
                 "eliot.user_automation.server-session.v1",
                 nonce,
-                &client_connection_id,
+                &channel,
                 &request_sha256,
                 peer_process.process_id(),
                 peer_process.start_time_100ns(),
@@ -206,7 +309,7 @@ impl UserAutomationHostExecutionSession {
         );
         Ok(Self {
             server_session_id,
-            client_connection_id,
+            channel,
             request_sha256,
             peer,
             owner,
@@ -219,10 +322,7 @@ impl UserAutomationHostExecutionSession {
         request: &UserAutomationHostExecutionRequest,
     ) -> Result<(), UserAutomationRuntimeError> {
         request.validate()?;
-        if request.request_sha256 != self.request_sha256
-            || request.channel.connection_id != self.client_connection_id
-            || request.channel.state_fence != self.owner.state_fence
-        {
+        if request.request_sha256 != self.request_sha256 || request.channel != self.channel {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
         self.owner.validate_peer(&self.peer)?;
@@ -621,6 +721,160 @@ fn validate_frame_trace_context(frame: &Frame) -> Result<(), UserAutomationRunti
     Ok(())
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationHostExecutionOpenRequest {
+    wire_id: String,
+    wire_version: u16,
+    open_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationHostExecutionOpenResponse {
+    wire_id: String,
+    wire_version: u16,
+    open_id: String,
+    channel: UserAutomationHostChannelBinding,
+}
+
+fn open_trace_context() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([(
+        USER_AUTOMATION_HOST_EXECUTION_OPEN_TRACE_KEY.to_owned(),
+        USER_AUTOMATION_HOST_EXECUTION_OPEN_TRACE_VALUE.to_owned(),
+    )])
+}
+
+fn validate_open_trace_context(frame: &Frame) -> Result<(), UserAutomationRuntimeError> {
+    if frame.trace_context.len() != 1
+        || frame
+            .trace_context
+            .get(USER_AUTOMATION_HOST_EXECUTION_OPEN_TRACE_KEY)
+            .map(String::as_str)
+            != Some(USER_AUTOMATION_HOST_EXECUTION_OPEN_TRACE_VALUE)
+    {
+        return Err(rejected("UserAutomation Host open discriminator is invalid"));
+    }
+    Ok(())
+}
+
+/// Builds the first, caller-identified-only open frame. The provisional
+/// `open_id` is correlation data; the Host authoritatively replaces it with a
+/// fresh connection binding after authenticating the pipe peer.
+pub fn user_automation_host_execution_open_frame(
+) -> Result<(String, Frame), UserAutomationRuntimeError> {
+    let nonce = USER_AUTOMATION_SESSION_NONCE.fetch_add(1, Ordering::Relaxed);
+    let open_id = format!("ua-host-open:{}:{}", std::process::id(), nonce);
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: open_id.clone(),
+        request_id: None,
+        kind: FrameKind::Control,
+        message_type: MessageType::Start,
+        request_identity: None,
+        payload: ProtocolPayload::Json(
+            serde_json::to_value(UserAutomationHostExecutionOpenRequest {
+                wire_id: USER_AUTOMATION_HOST_EXECUTION_WIRE_ID.to_owned(),
+                wire_version: USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION,
+                open_id: open_id.clone(),
+            })
+            .map_err(|_| rejected("UserAutomation Host open encoding failed"))?,
+        ),
+        trace_context: open_trace_context(),
+    };
+    frame
+        .validate()
+        .map_err(|_| rejected("UserAutomation Host open frame is invalid"))?;
+    Ok((open_id, frame))
+}
+
+/// Decodes the authenticated Host open request before any owner queue access.
+pub fn decode_user_automation_host_execution_open_frame(
+    frame: &Frame,
+) -> Result<String, UserAutomationRuntimeError> {
+    frame
+        .validate()
+        .map_err(|_| rejected("UserAutomation Host open frame is invalid"))?;
+    validate_open_trace_context(frame)?;
+    if frame.kind != FrameKind::Control || frame.message_type != MessageType::Start {
+        return Err(rejected("UserAutomation Host open frame kind is invalid"));
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err(rejected("UserAutomation Host open payload is invalid"));
+    };
+    let open: UserAutomationHostExecutionOpenRequest = serde_json::from_value(payload.clone())
+        .map_err(|_| rejected("UserAutomation Host open payload is undecodable"))?;
+    if open.wire_id != USER_AUTOMATION_HOST_EXECUTION_WIRE_ID
+        || open.wire_version != USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION
+        || open.open_id != frame.connection_id
+    {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    validate_text(&open.open_id, "open_id")?;
+    Ok(open.open_id)
+}
+
+/// Serializes the server-authored channel returned by the Host open owner.
+pub fn user_automation_host_execution_open_response_frame(
+    open_id: &str,
+    channel: &UserAutomationHostChannelBinding,
+) -> Result<Frame, UserAutomationRuntimeError> {
+    validate_text(open_id, "open_id")?;
+    channel.validate()?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: channel.connection_id.clone(),
+        request_id: None,
+        kind: FrameKind::Control,
+        message_type: MessageType::Ready,
+        request_identity: None,
+        payload: ProtocolPayload::Json(
+            serde_json::to_value(UserAutomationHostExecutionOpenResponse {
+                wire_id: USER_AUTOMATION_HOST_EXECUTION_WIRE_ID.to_owned(),
+                wire_version: USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION,
+                open_id: open_id.to_owned(),
+                channel: channel.clone(),
+            })
+            .map_err(|_| rejected("UserAutomation Host open response encoding failed"))?,
+        ),
+        trace_context: open_trace_context(),
+    };
+    frame
+        .validate()
+        .map_err(|_| rejected("UserAutomation Host open response frame is invalid"))?;
+    Ok(frame)
+}
+
+/// Decodes and validates the server-authored channel from the Host open reply.
+pub fn decode_user_automation_host_execution_open_response_frame(
+    frame: &Frame,
+    open_id: &str,
+) -> Result<UserAutomationHostChannelBinding, UserAutomationRuntimeError> {
+    frame
+        .validate()
+        .map_err(|_| rejected("UserAutomation Host open response is invalid"))?;
+    validate_open_trace_context(frame)?;
+    if frame.kind != FrameKind::Control || frame.message_type != MessageType::Ready {
+        return Err(rejected("UserAutomation Host open response kind is invalid"));
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err(rejected("UserAutomation Host open response payload is invalid"));
+    };
+    let response: UserAutomationHostExecutionOpenResponse = serde_json::from_value(payload.clone())
+        .map_err(|_| rejected("UserAutomation Host open response is undecodable"))?;
+    if response.wire_id != USER_AUTOMATION_HOST_EXECUTION_WIRE_ID
+        || response.wire_version != USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION
+        || response.open_id != open_id
+        || frame.connection_id != response.channel.connection_id
+    {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    response.channel.validate()?;
+    Ok(response.channel)
+}
+
 /// Serializes one typed UserAutomation request into an authenticated EBP
 /// frame. The frame identity is derived from the carrier digest and the
 /// carrier's existing metadata/fence; no authority is minted here.
@@ -786,18 +1040,54 @@ pub struct AuthenticatedUserAutomationHostExecutionTransport {
 #[cfg(windows)]
 impl AuthenticatedUserAutomationHostExecutionTransport {
     /// Connects to the Host runtime-control pipe with the existing
-    /// handle-bound builtin-administrator authentication policy.
+    /// handle-bound builtin-administrator authentication policy. The supplied
+    /// value is only an expected State Fence; descriptor and peer receipt
+    /// digests are replaced by the server-authored open response.
     pub async fn connect(
-        channel: UserAutomationHostChannelBinding,
+        expected_channel: UserAutomationHostChannelBinding,
         timeout: Duration,
     ) -> Result<Self, UserAutomationRuntimeError> {
-        channel.validate()?;
-        let transport = eliot_ipc::NamedPipeTransport::connect_authenticated_builtin_administrators(
-            USER_AUTOMATION_HOST_EXECUTION_PIPE,
-            timeout,
-        )
-        .await
-        .map_err(|error| UserAutomationRuntimeError::Unavailable(error.to_string()))?;
+        expected_channel.validate()?;
+        let transport = Self::connect_server_authored(timeout).await?;
+        if transport.channel.state_fence != expected_channel.state_fence {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(transport)
+    }
+
+    /// Opens the authenticated Host pipe and obtains the complete channel
+    /// binding from the Host owner before any execution carrier is emitted.
+    pub async fn connect_server_authored(
+        timeout: Duration,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        let mut transport =
+            eliot_ipc::NamedPipeTransport::connect_authenticated_builtin_administrators(
+                USER_AUTOMATION_HOST_EXECUTION_PIPE,
+                timeout,
+            )
+            .await
+            .map_err(|error| UserAutomationRuntimeError::Unavailable(error.to_string()))?;
+        let (open_id, open_frame) = user_automation_host_execution_open_frame()?;
+        match transport
+            .send_frame(&open_frame, TransportLimits::default())
+            .await
+            .map_err(|error| UserAutomationRuntimeError::UnknownOutcome(error.to_string()))?
+        {
+            DeliveryOutcome::Delivered => {}
+            DeliveryOutcome::UnknownOutcome => {
+                return Err(UserAutomationRuntimeError::UnknownOutcome(
+                    "UserAutomation Host open delivery crossed an unknown boundary".to_owned(),
+                ));
+            }
+        }
+        let response_frame = transport
+            .receive_frame(TransportLimits::default())
+            .await
+            .map_err(|error| UserAutomationRuntimeError::Unavailable(error.to_string()))?;
+        let channel = decode_user_automation_host_execution_open_response_frame(
+            &response_frame,
+            &open_id,
+        )?;
         Ok(Self {
             channel,
             transport: tokio::sync::Mutex::new(transport),

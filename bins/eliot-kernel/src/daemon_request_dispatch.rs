@@ -17,6 +17,12 @@ mod store_receipt_dispatch;
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, sha256_hex};
+#[cfg(windows)]
+use eliot_kernel_service::{
+    AuthenticatedUserAutomationHostExecutionTransport, UserAutomationDurableJobPort,
+    UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
+    UserAutomationHostExecutionTransport, UserAutomationRuntimeError, UserAutomationWakePort,
+};
 use eliot_kernel_service::AuthenticatedHostSession;
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlOperation, OriginControlPresentation,
@@ -43,6 +49,11 @@ use super::generation_control::{
 /// `EliotdStartupEvidence` carrier remains bin-owned; Kernel consumes its
 /// canonical JSON mechanically and never imports `bins/eliotd`.
 pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evidence";
+/// Authenticated daemon route that drives the typed Host UserAutomation
+/// transport.  The daemon session supplies the outer authority; the Host
+/// open handshake supplies the channel evidence and the Host owner supplies
+/// the Durable Job/Wake effects.
+pub(crate) const USER_AUTOMATION_RUNTIME_OPERATION: &str = "user_automation_runtime";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -342,6 +353,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "origin_control_decide" => "origin_control_decide",
         ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
+        USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
         "store_recovery" => "store_recovery",
         "store_initialize_genesis" => "store_initialize_genesis",
@@ -421,6 +433,14 @@ struct OriginChallengeIssueOperation {
 struct OriginControlDecideOperation {
     operation_id: OperationId,
     presentation: serde_json::Value,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationRuntimeOperation {
+    operation: String,
+    request: UserAutomationHostExecutionOperation,
 }
 
 impl KernelComposition {
@@ -558,6 +578,11 @@ impl KernelComposition {
             }
             DAEMON_STARTUP_EVIDENCE_OPERATION => {
                 self.daemon_startup_evidence_operation(session, &request_id, payload)
+            }
+            #[cfg(windows)]
+            USER_AUTOMATION_RUNTIME_OPERATION => {
+                self.user_automation_runtime_operation(session, payload.clone())
+                    .await
             }
             "health" => self
                 .daemon_health()
@@ -868,6 +893,130 @@ impl KernelComposition {
             "value": { "accepted": true },
             "recovery": null,
         })
+    }
+
+    #[cfg(windows)]
+    /// Drives one real UserAutomation owner operation from the authenticated
+    /// daemon session through the server-authored Host channel.
+    ///
+    /// The daemon payload contains only the closed typed operation.  The
+    /// channel, descriptor digest, peer receipt digest, and connection id are
+    /// obtained from the Host open handshake; a request fence that disagrees
+    /// with the daemon session is rejected before opening the owner channel.
+    /// Runtime owner failures remain typed projections so an uncertain send
+    /// can be reconciled by its original operation identity.
+    async fn user_automation_runtime_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let envelope: UserAutomationRuntimeOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        if envelope.operation != USER_AUTOMATION_RUNTIME_OPERATION {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let request_fence = match &envelope.request {
+            UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.context.state_fence
+            }
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.state_fence
+            }
+        };
+        if request_fence != &session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let transport = match AuthenticatedUserAutomationHostExecutionTransport::connect_server_authored(
+            self.ipc_limits().operation_timeout,
+        )
+        .await
+        {
+            Ok(transport) => transport,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        if transport.channel_binding().state_fence != session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        let client = match UserAutomationHostExecutionClient::new(transport) {
+            Ok(client) => client,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+
+        match envelope.request {
+            UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
+                match client.admit_occurrence(request).await {
+                    Ok(execution) => Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "outcome": "admitted",
+                            "execution": execution,
+                        },
+                        "recovery": null,
+                    })),
+                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                }
+            }
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+                match client.cancel_pending_wakes(request).await {
+                    Ok(wake_ids) => Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "outcome": "cancelled",
+                            "wake_ids": wake_ids,
+                        },
+                        "recovery": null,
+                    })),
+                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn user_automation_runtime_error_response(
+        error: UserAutomationRuntimeError,
+    ) -> serde_json::Value {
+        match error {
+            UserAutomationRuntimeError::Unavailable(reason) => serde_json::json!({
+                "status": "unknown",
+                "value": { "outcome": "unavailable" },
+                "recovery": { "kind": "unavailable", "reason": reason },
+            }),
+            UserAutomationRuntimeError::UnknownOutcome(reason) => serde_json::json!({
+                "status": "unknown",
+                "value": { "outcome": "unknown_outcome" },
+                "recovery": { "kind": "unknown_outcome", "reason": reason },
+            }),
+            UserAutomationRuntimeError::Rejected(reason) => serde_json::json!({
+                "status": "known",
+                "value": {
+                    "accepted": false,
+                    "outcome": "rejected",
+                    "reason": reason,
+                },
+                "recovery": null,
+            }),
+            UserAutomationRuntimeError::IdentityConflict => serde_json::json!({
+                "status": "known",
+                "value": {
+                    "accepted": false,
+                    "outcome": "identity_conflict",
+                },
+                "recovery": null,
+            }),
+        }
     }
 
     async fn origin_challenge_issue_operation(

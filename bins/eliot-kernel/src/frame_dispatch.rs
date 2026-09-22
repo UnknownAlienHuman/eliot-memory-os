@@ -10,7 +10,9 @@
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
-use super::daemon_request_dispatch::DAEMON_STARTUP_EVIDENCE_OPERATION;
+use super::daemon_request_dispatch::{
+    DAEMON_STARTUP_EVIDENCE_OPERATION, USER_AUTOMATION_RUNTIME_OPERATION,
+};
 use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
@@ -844,6 +846,7 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "daemon_ready"
             | ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION
             | DAEMON_STARTUP_EVIDENCE_OPERATION
+            | USER_AUTOMATION_RUNTIME_OPERATION
             | "health"
             | "daemon_degraded"
             | "daemon_fatal"

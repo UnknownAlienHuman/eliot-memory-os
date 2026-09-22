@@ -13,7 +13,7 @@ use eliot_host_state::{
 };
 use eliot_kernel_service::{
     UserAutomationRuntimeError, UserAutomationWakeCancellation,
-    UserAutomationWakeCancellationTarget, UserAutomationWakePort,
+    UserAutomationWakePort,
 };
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::WakeIntentState;
@@ -72,15 +72,15 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
             let current_checksum =
                 record_checksum(&HostStateRecord::Wake(wake.clone())).map_err(map_journal_error)?;
             if current_checksum != target.record_checksum {
-                return Err(UserAutomationRuntimeError::IdentityConflict);
+                if !matches!(wake.intent.state, WakeIntentState::Cancelled) {
+                    return Err(UserAutomationRuntimeError::IdentityConflict);
+                }
             }
 
             match wake.intent.state {
                 WakeIntentState::Pending => {
                     let mut next = wake.clone();
                     next.intent.state = WakeIntentState::Cancelled;
-                    let operation = cancellation_identity(&request, target)?;
-                    next.operation = operation;
                     let expected_record_checksum = PlatformHandle::new(target.record_checksum.clone())
                         .map_err(|_| rejected("wake cancellation checksum identity is invalid"))?;
                     entries.push(WakeCancellationBatchEntry {
@@ -90,10 +90,18 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
                     cancelled.push(target.wake_id.clone());
                 }
                 WakeIntentState::Cancelled => {
-                    // Exact replay is safe only when the target still binds
-                    // to this record.  The target's original checksum guard
-                    // above prevents a caller from substituting a later
-                    // lifecycle state.
+                    // Keep the original operation and expected checksum in
+                    // the batch.  After a committed append whose reply was
+                    // lost, the current record is already Cancelled and its
+                    // checksum has changed; the journal must see the same
+                    // batch identity and return Replayed before applying a
+                    // second lifecycle transition.
+                    let expected_record_checksum = PlatformHandle::new(target.record_checksum.clone())
+                        .map_err(|_| rejected("wake cancellation checksum identity is invalid"))?;
+                    entries.push(WakeCancellationBatchEntry {
+                        expected_record_checksum,
+                        wake: wake.clone(),
+                    });
                     cancelled.push(target.wake_id.clone());
                 }
                 WakeIntentState::Claimed
@@ -157,30 +165,6 @@ fn cancellation_batch_identity(
         .map_err(|_| rejected("wake cancellation batch operation identity is invalid"))?;
     let idempotency_key = PlatformHandle::new(format!("ua-wake-cancel-batch-key:{digest}"))
         .map_err(|_| rejected("wake cancellation batch idempotency identity is invalid"))?;
-    Ok(IdempotencyIdentity {
-        operation_id,
-        idempotency_key,
-    })
-}
-
-fn cancellation_identity(
-    request: &UserAutomationWakeCancellation,
-    target: &UserAutomationWakeCancellationTarget,
-) -> Result<IdempotencyIdentity, UserAutomationRuntimeError> {
-    let bytes = serde_json::to_vec(&(
-        "eliot.user_automation.wake-cancellation.v1",
-        request.identity.operation_id.as_str(),
-        request.identity.idempotency_key.as_str(),
-        target.wake_id.as_str(),
-        target.operation_id.as_str(),
-        target.idempotency_key.as_str(),
-    ))
-    .map_err(|error| rejected(format!("wake cancellation identity: {error}")))?;
-    let digest = sha256_hex(&bytes);
-    let operation_id = PlatformHandle::new(format!("ua-wake-cancel:{digest}"))
-        .map_err(|_| rejected("wake cancellation operation identity is invalid"))?;
-    let idempotency_key = PlatformHandle::new(format!("ua-wake-cancel-key:{digest}"))
-        .map_err(|_| rejected("wake cancellation idempotency identity is invalid"))?;
     Ok(IdempotencyIdentity {
         operation_id,
         idempotency_key,
