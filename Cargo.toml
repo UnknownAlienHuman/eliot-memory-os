@@ -316,7 +316,6 @@ eliot-learning-activation-assessment = { path = "crates/meta/eliot-learning-acti
 eliot-self-quality = { path = "crates/meta/eliot-self-quality", version = "0.1.0" }
 eliot-context-contracts = { path = "crates/smart/eliot-context-contracts", version = "0.1.0" }
 eliot-dreamer-contracts = { path = "crates/smart/eliot-dreamer-contracts", version = "0.1.0" }
-eliot-epistemic-contracts = { path = "crates/smart/eliot-epistemic-contracts", version = "0.1.0" }
 eliot-understanding-assessment = { path = "crates/smart/eliot-understanding-assessment", version = "0.1.0" }
 eliot-experience-projection = { path = "crates/smart/eliot-experience-projection", version = "0.1.0" }
 eliot-dreamer-self-query = { path = "crates/smart/eliot-dreamer-self-query", version = "0.1.0" }
