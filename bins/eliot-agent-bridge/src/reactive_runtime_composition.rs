@@ -520,4 +520,96 @@ mod tests {
         assert_eq!(live_ids(&runner).len(), 1, "ledger restore stands");
         assert_eq!(runner.resource_registry_len(), 1, "only the valid snapshot landed");
     }
+
+    const SERVED_URI: &str = "eliot://evidence/source-9";
+
+    fn served_bytes() -> Vec<u8> {
+        b"snapshot-bytes-9".to_vec()
+    }
+
+    fn served_digest(bytes: &[u8]) -> String {
+        eliot_contracts::sha256_hex(bytes)
+    }
+
+    #[test]
+    fn served_snapshot_publishes_canonically_at_exact_uri() {
+        // Owner-served triple (URI named by the explicit query, exact bytes,
+        // owner digest) lands at the queried URI and expands byte-identically.
+        let mut runner = attached_runner();
+        let bytes = served_bytes();
+        let view = runner
+            .publish_served_snapshot(SERVED_URI, bytes.clone(), &served_digest(&bytes))
+            .expect("owner-served publish lands");
+        assert_eq!(view.handle().uri().as_str(), SERVED_URI);
+        assert_eq!(runner.resource_registry_len(), 1);
+        let expanded = runner
+            .expand_resource(view.handle())
+            .expect("expand resolves the exact URI");
+        assert_eq!(expanded, bytes);
+    }
+
+    #[test]
+    fn served_snapshot_digest_mismatch_withholds_without_publish() {
+        // Bytes that do not match the owner digest are never relabelled at
+        // the named URI: the registry stays untouched.
+        assert!(
+            eliot_agent_bridge_core::ResourceUri::parse("not-a-canonical-uri").is_err(),
+            "non-canonical URI text never reaches publish"
+        );
+        let mut runner = attached_runner();
+        let withheld = runner.publish_served_snapshot(SERVED_URI, served_bytes(), TEST_DIGEST);
+        assert!(withheld.is_err(), "digest mismatch must withhold");
+        assert_eq!(runner.resource_registry_len(), 0);
+    }
+
+    #[test]
+    fn served_snapshot_conflict_keeps_first_bytes() {
+        // An immutable URI keeps its first bytes: a conflicting republish
+        // (even with a self-consistent digest) refuses without masking,
+        // while an identical republish rebinds idempotently.
+        let mut runner = attached_runner();
+        let first = b"first bytes".to_vec();
+        runner
+            .publish_served_snapshot(SERVED_URI, first.clone(), &served_digest(&first))
+            .expect("first publish lands");
+        let second = b"second bytes".to_vec();
+        assert!(
+            runner
+                .publish_served_snapshot(SERVED_URI, second, &served_digest(b"second bytes"))
+                .is_err(),
+            "conflicting republish must not project a masking view"
+        );
+        let again = runner
+            .publish_served_snapshot(SERVED_URI, first.clone(), &served_digest(&first))
+            .expect("identical republish rebinds");
+        assert_eq!(runner.resource_registry_len(), 1);
+        assert_eq!(
+            runner.expand_resource(again.handle()).expect("expand"),
+            first,
+            "first bytes stand"
+        );
+    }
+
+    #[test]
+    fn served_snapshot_oversize_and_detached_withhold() {
+        // The 1MiB ceiling refuses before landing; a detached runner refuses
+        // before anything (attach is the scope authorization on resolution).
+        let mut runner = attached_runner();
+        let big = vec![7u8; eliot_agent_bridge_core::MAX_CONTENT_BYTES + 1];
+        assert!(
+            runner
+                .publish_served_snapshot(SERVED_URI, big.clone(), &served_digest(&big))
+                .is_err(),
+            "oversize served bytes must not land"
+        );
+        assert_eq!(runner.resource_registry_len(), 0);
+        let mut detached = detached_runner();
+        let small = served_bytes();
+        assert!(
+            detached
+                .publish_served_snapshot(SERVED_URI, small.clone(), &served_digest(&small))
+                .is_err(),
+            "detached publish must withhold"
+        );
+    }
 }

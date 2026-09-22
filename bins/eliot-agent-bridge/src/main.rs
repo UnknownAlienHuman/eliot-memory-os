@@ -1480,6 +1480,27 @@ mod tests {
         }
     }"#;
 
+    const QUERY_WITH_EXACT_URI: &str = r#"{
+        "op":"invoke",
+        "request":{
+            "protocol_version":"2026-07-28",
+            "correlation_id":"host-query-1",
+            "client_capabilities":{"tasks":false},
+            "tool":{"name":"eliot.query","arguments":{
+                "intent":{"mode":"current_position","time_scope":"session","branch_environment_scope":"main","freshness_policy":"live","required_assurance":"observation"},
+                "query":"fetch the served snapshot",
+                "exact_resource_uri":"eliot://evidence/source-9"
+            }},
+            "deadline_preference_ms":5000,
+            "observed_context":{
+                "host_session_hint":"host-turn-1",
+                "observed_resource_refs":[],
+                "event_cursors":[],
+                "trace_context":{}
+            }
+        }
+    }"#;
+
     const CANCEL: &str = r#"{
         "op":"cancel",
         "request":{
@@ -2567,6 +2588,26 @@ mod tests {
             serde_json::json!({"evidence": "x".repeat(4096)})
         }
 
+        fn query_request() -> HostInvocationRequest {
+            let decoded =
+                decode_bounded_request(super::QUERY_WITH_EXACT_URI).expect("query must decode");
+            match decoded {
+                super::Request::Invoke { request } => request,
+                _ => panic!("expected invoke"),
+            }
+        }
+
+        fn query_request_with_exact_uri(uri: &str) -> HostInvocationRequest {
+            let base = query_request();
+            let mut value = serde_json::to_value(&base).expect("request must serialize");
+            value["tool"]["arguments"]["exact_resource_uri"] =
+                serde_json::Value::String(uri.to_owned());
+            let request: HostInvocationRequest =
+                serde_json::from_value(value).expect("query request must deserialize");
+            request.validate().expect("query request must validate");
+            request
+        }
+
         #[test]
         fn large_supported_tool_result_populates_registry_and_expands() {
             use eliot_agent_bridge::MAX_PREVIEW_BYTES;
@@ -2643,6 +2684,52 @@ mod tests {
                 status_value["resources"]["entries"],
                 serde_json::Value::from(1)
             );
+        }
+
+        #[test]
+        fn refused_exact_uri_query_records_nothing() {
+            // Production refuses exact-resource-uri queries on the read leg
+            // (exact expansion uses the resource path, not eliot.query), so
+            // the refused outcome must record nothing: no canonical publish
+            // under a caller-asserted URI, no evidence, registry untouched.
+            // The refusing port mirrors production (invoke leg refused);
+            // nothing here bypasses that refusal with a scripted success.
+            let mut runner = attached_runner();
+            let request = query_request();
+            let mut port = super::UnavailableKernelHostRequestPort;
+            let mut response =
+                handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            // The refused leg surfaces a Rejected outcome inside the normal
+            // invocation envelope (not an error envelope); recording must
+            // withhold everything on it.
+            let super::Response::Invocation {
+                result, ..
+            } = &response else {
+                panic!("gateway must answer an invocation envelope even on refusal");
+            };
+            assert!(
+                matches!(
+                    result.outcome(),
+                    eliot_mcp::HostInvocationOutcome::Rejected { .. }
+                ),
+                "refused leg must surface rejection"
+            );
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "rejection projects no handle"
+            );
+            // A refused leg withholds even for a canonical URI: the bridge
+            // never relabels opaque bytes it was never served.
+            let mut runner = attached_runner();
+            let canonical = query_request_with_exact_uri("eliot://evidence/source-9");
+            let mut port = super::UnavailableKernelHostRequestPort;
+            let mut response =
+                handle_invocation(&super::HostRequestGateway, &mut port, &canonical);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
         }
 
         #[test]
