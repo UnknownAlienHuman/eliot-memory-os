@@ -14,6 +14,7 @@ Executes and verifies the documented dependency admission policy:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -26,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
 
 
@@ -61,13 +63,96 @@ _SCANNER_RECORD_TYPES = {"diagnostic", "summary"}
 _DIAGNOSTIC_SEVERITIES = {"error", "warning", "note", "help"}
 _SUMMARY_CHECKS = {"advisories", "bans", "licenses", "sources"}
 _SUMMARY_COUNTERS = {"errors", "warnings", "notes", "helps"}
+_REPARSE_POINT = 0x400
+
+
+def _stable_file_identity(stat_result: os.stat_result) -> tuple[object, ...]:
+    return (
+        getattr(stat_result, "st_dev", None),
+        getattr(stat_result, "st_ino", None),
+        getattr(stat_result, "st_size", None),
+        getattr(stat_result, "st_mtime_ns", None),
+    )
+
+
+def _assert_no_reparse_parents(path: Path) -> None:
+    current = path
+    while True:
+        stat_result = current.lstat()
+        attributes = getattr(stat_result, "st_file_attributes", 0)
+        if current.is_symlink() or attributes & _REPARSE_POINT:
+            raise OSError(f"path contains a symlink or reparse component: {current}")
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+
+def _open_nofollow_read_handle(path: Path) -> int:
+    """Open a resident file while denying replacement during the read."""
+
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80000000,  # GENERIC_READ
+            0x00000001 | 0x00000002,  # FILE_SHARE_READ | FILE_SHARE_WRITE; deny delete/rename
+            None,
+            3,  # OPEN_EXISTING
+            0x00000080 | 0x00200000,  # FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            error = ctypes.get_last_error()
+            raise OSError(error, f"CreateFileW failed for {path}")
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+
+    return os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
+
+
+def _read_stable_file_bytes(path: Path, label: str) -> tuple[bytes, tuple[object, ...]]:
+    """Read and hash one path through a no-follow handle and identity fence."""
+
+    _assert_no_reparse_parents(path)
+    fd: int | None = None
+    try:
+        fd = _open_nofollow_read_handle(path)
+        before = os.fstat(fd)
+        if getattr(before, "st_file_attributes", 0) & _REPARSE_POINT:
+            raise OSError(f"{label} opened as a reparse point: {path}")
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        if getattr(after, "st_file_attributes", 0) & _REPARSE_POINT:
+            raise OSError(f"{label} became a reparse point while being read: {path}")
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if _stable_file_identity(before) != _stable_file_identity(after):
+        raise OSError(f"{label} changed while being read: {path}")
+    _assert_no_reparse_parents(path)
+    return b"".join(chunks), _stable_file_identity(after)
 
 
 def sha256_file(path: Path) -> str:
+    payload, _ = _read_stable_file_bytes(path, "file")
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while chunk := f.read(65536):
-            h.update(chunk)
+    h.update(payload)
     return h.hexdigest()
 
 
@@ -539,7 +624,7 @@ def _open_node_read_handle(path: Path) -> int:
         handle = kernel32.CreateFileW(
             str(path),
             0x80000000,  # GENERIC_READ
-            0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
+            0x00000001 | 0x00000002,  # share read/write; deny delete/rename
             None,
             3,  # OPEN_EXISTING
             0x00000080 | 0x00200000,  # FILE_ATTRIBUTE_NORMAL | OPEN_REPARSE_POINT
@@ -585,6 +670,8 @@ def _read_validated_repo_bytes(
     try:
         fd = _open_node_read_handle(path)
         before = os.fstat(fd)
+        if getattr(before, "st_file_attributes", 0) & _REPARSE_POINT:
+            raise OSError(f"{label} opened as a reparse point: {path}")
         chunks: list[bytes] = []
         while chunk := os.read(fd, 1024 * 1024):
             chunks.append(chunk)
@@ -600,6 +687,10 @@ def _read_validated_repo_bytes(
             except OSError:
                 pass
 
+    if getattr(after, "st_file_attributes", 0) & _REPARSE_POINT:
+        if findings is not None:
+            findings.append(Finding(finding_code, relative, 0, f"{label} became a reparse point while being read"))
+        return path, relative, None, None
     if _node_stat_identity(before) != _node_stat_identity(after):
         if findings is not None:
             findings.append(Finding(finding_code, relative, 0, f"{label} changed while it was being read"))
@@ -913,6 +1004,56 @@ def _read_external_evidence_file(
     if payload is None:
         return path, None
     return path, payload
+
+
+@contextmanager
+def _verified_private_executable(payload: bytes, label: str):
+    """Expose exactly the bytes already verified to an external version probe.
+
+    The probe never reopens the evidence path.  A private, create-new copy is
+    written and read back through the same no-follow identity fence before it
+    is executed; the temporary directory remains private for the lifetime of
+    the child process.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="eliot-verified-executable-") as temporary:
+        private_path = Path(temporary) / "verified.exe"
+        fd: int | None = None
+        try:
+            fd = os.open(
+                private_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                0o700,
+            )
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError(f"{label} private copy made no progress")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+        observed, _ = _read_stable_file_bytes(private_path, f"{label} private copy")
+        if observed != payload:
+            raise OSError(f"{label} private copy changed before execution")
+        if os.name != "nt":
+            private_path.chmod(0o700)
+        yield private_path
+
+
+def _run_verified_executable(payload: bytes, args: list[str], root: Path, label: str) -> subprocess.CompletedProcess:
+    with _verified_private_executable(payload, label) as private_path:
+        return subprocess.run(
+            [str(private_path), *args],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
 
 
 _SURREAL_REPOSITORY = "https://github.com/surrealdb/surrealdb"
@@ -1335,7 +1476,7 @@ def _validate_surreal_binary_evidence(
         "SurrealDB vulnerable-release source archive",
         findings,
     )
-    tag_path, _, tag_ref = _parse_external_json(
+    tag_path, tag_payload, tag_ref = _parse_external_json(
         root, evidence.get("source_tag_ref_path"), "SurrealDB vulnerable-release tag evidence", findings
     )
     if not isinstance(tag_ref, dict):
@@ -1412,7 +1553,7 @@ def _validate_surreal_binary_evidence(
         "source_tag_ref": {
             "status": "verified" if tag_path and tag_object.get("sha") == source_commit else "findings",
             "path": str(tag_path.relative_to(root)).replace("\\", "/") if tag_path else None,
-            "sha256": hashlib.sha256(tag_path.read_bytes()).hexdigest() if tag_path else None,
+            "sha256": hashlib.sha256(tag_payload).hexdigest() if tag_payload is not None else None,
         },
         "advisory_snapshot": advisory_snapshot,
     }
@@ -1522,15 +1663,13 @@ def _validate_patched_candidate(
             )
             if machine != 0x8664:
                 findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate PE machine is not x86_64"))
-        if artifact_path is not None:
+        if artifact_path is not None and artifact_bytes is not None:
             try:
-                proc = subprocess.run(
-                    [str(artifact_path), "version"],
-                    cwd=str(root),
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=False,
+                proc = _run_verified_executable(
+                    artifact_bytes,
+                    ["version"],
+                    root,
+                    "SurrealDB patched candidate artifact",
                 )
                 combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
                 observed_candidate_version = _extract_external_version(combined)
@@ -1557,7 +1696,7 @@ def _validate_patched_candidate(
     ):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "saved release metadata does not bind the candidate URL, size and digest"))
 
-    tag_path, _, tag_data = _parse_external_json(
+    tag_path, tag_payload, tag_data = _parse_external_json(
         root, candidate.get("source_tag_ref_path"), "SurrealDB patched candidate tag evidence", findings
     )
     tag_object = tag_data.get("object", {}) if isinstance(tag_data, dict) else {}
@@ -1612,6 +1751,7 @@ def _validate_patched_candidate(
         "tag_ref": {
             "status": "verified" if tag_path and isinstance(tag_data, dict) and tag_object.get("sha") == candidate.get("source_commit") else "findings",
             "path": str(tag_path.relative_to(root)).replace("\\", "/") if tag_path else None,
+            "sha256": hashlib.sha256(tag_payload).hexdigest() if tag_payload is not None else None,
         },
         "source_archive": candidate_source_archive,
     }
@@ -2183,6 +2323,12 @@ def _scanner_advisory_binding_digest(execution: dict) -> str:
             "advisory_content_digest": execution.get("advisory_content_digest"),
             "scanner_identity": execution.get("scanner_identity"),
             "scanner_identity_after": execution.get("scanner_identity_after"),
+            "parser_status": execution.get("parser_status"),
+            "parser_complete": execution.get("parser_complete"),
+            "summary_consistent": execution.get("summary_consistent"),
+            "parsed_records": execution.get("parsed_records"),
+            "summary_records": execution.get("summary_records"),
+            "scanner_exit_accepted": execution.get("scanner_exit_accepted"),
         }
     )
 
@@ -2201,6 +2347,16 @@ def _scanner_advisory_binding_is_valid(cargo_summary: dict) -> bool:
     if any(not isinstance(execution.get(key), str) or not execution[key] for key in required):
         return False
     if execution.get("input_snapshot_equal") is not True:
+        return False
+    if execution.get("parser_status") != "complete" or execution.get("parser_complete") is not True:
+        return False
+    if execution.get("summary_consistent") is not True:
+        return False
+    if not isinstance(execution.get("parsed_records"), int) or execution["parsed_records"] <= 0:
+        return False
+    if not isinstance(execution.get("summary_records"), int) or execution["summary_records"] <= 0:
+        return False
+    if execution.get("scanner_exit_accepted") is not True:
         return False
     before = execution.get("input_snapshot_before")
     after = execution.get("input_snapshot_after")
@@ -2530,7 +2686,9 @@ def run_cargo_deny(
 
     expected_checks = set(checks)
     actual_checks = set(summary)
+    summary_consistent = True
     if summary_records == 0:
+        summary_consistent = False
         findings.append(
             Finding(
                 SCANNER_OUTPUT_FINDING,
@@ -2540,6 +2698,7 @@ def run_cargo_deny(
             )
         )
     elif actual_checks != expected_checks:
+        summary_consistent = False
         missing_checks = sorted(expected_checks - actual_checks)
         unexpected_checks = sorted(actual_checks - expected_checks)
         findings.append(
@@ -2554,6 +2713,7 @@ def run_cargo_deny(
     summary_errors = _summary_error_count(summary)
     observed_errors = severity_counts.get("error", 0)
     if summary_errors != observed_errors:
+        summary_consistent = False
         findings.append(
             Finding(
                 SCANNER_OUTPUT_FINDING,
@@ -2570,6 +2730,7 @@ def run_cargo_deny(
     )
     observed_warnings = severity_counts.get("warning", 0)
     if summary_warnings != observed_warnings:
+        summary_consistent = False
         findings.append(
             Finding(
                 SCANNER_OUTPUT_FINDING,
@@ -2579,10 +2740,62 @@ def run_cargo_deny(
             )
         )
 
+    summary_notes = sum(
+        int(value.get("notes", 0))
+        for value in summary.values()
+        if isinstance(value, dict) and isinstance(value.get("notes"), int)
+    )
+    observed_notes = severity_counts.get("note", 0)
+    if summary_notes != observed_notes:
+        summary_consistent = False
+        findings.append(
+            Finding(
+                SCANNER_OUTPUT_FINDING,
+                "deny.toml",
+                1,
+                f"cargo-deny summary note count {summary_notes} does not match {observed_notes} parsed note diagnostics",
+            )
+        )
+
+    summary_helps = sum(
+        int(value.get("helps", 0))
+        for value in summary.values()
+        if isinstance(value, dict) and isinstance(value.get("helps"), int)
+    )
+    observed_helps = severity_counts.get("help", 0)
+    if summary_helps != observed_helps:
+        summary_consistent = False
+        findings.append(
+            Finding(
+                SCANNER_OUTPUT_FINDING,
+                "deny.toml",
+                1,
+                f"cargo-deny summary help count {summary_helps} does not match {observed_helps} parsed help diagnostics",
+            )
+        )
+
+    parser_complete = (
+        not parse_errors
+        and not non_json
+        and parsed_records > 0
+        and summary_records > 0
+        and summary_consistent
+    )
+    execution.update(
+        {
+            "summary_consistent": summary_consistent,
+            "parser_complete": parser_complete,
+            "parser_status": "complete" if parser_complete else "incomplete",
+            "parsed_records": parsed_records,
+        }
+    )
+
     combined_output = f"{stdout_text}\n{stderr_text}".lower()
     advisory_policy_finding = any(
         f.code == "DEP-006" and re.search(r"rustsec-\d{4}-\d+", f.detail, re.IGNORECASE) for f in findings
     )
+    execution["scanner_exit_accepted"] = proc.returncode == 0 or advisory_policy_finding
+    execution["advisory_binding_digest"] = _scanner_advisory_binding_digest(execution)
     if profile == "current-advisories" and proc.returncode != 0 and not advisory_policy_finding:
         advisory_unavailable_markers = (
             "advisory database",
@@ -2743,6 +2956,12 @@ def build_receipt(
             "scanner_identity": scanner_execution.get("scanner_identity"),
             "scanner_identity_after": scanner_execution.get("scanner_identity_after"),
             "scanner_identity_stable": scanner_execution.get("scanner_identity_stable"),
+            "parser_status": scanner_execution.get("parser_status"),
+            "parser_complete": scanner_execution.get("parser_complete"),
+            "summary_consistent": scanner_execution.get("summary_consistent"),
+            "parsed_records": scanner_execution.get("parsed_records"),
+            "summary_records": scanner_execution.get("summary_records"),
+            "scanner_exit_accepted": scanner_execution.get("scanner_exit_accepted"),
             "advisory_binding_digest": scanner_execution.get("advisory_binding_digest"),
         },
         "ecosystem_denominator": {
@@ -2798,6 +3017,8 @@ def build_receipt(
     if profile == "current-advisories":
         if effective_status == STATUS_ADVISORY_SOURCE_UNAVAILABLE:
             advisory_status = "unavailable"
+        elif not _scanner_advisory_binding_is_valid(cargo_summary):
+            advisory_status = "not_established"
         elif effective_status in (STATUS_CONFLICTED, STATUS_TOOL_UNAVAILABLE, STATUS_NOT_EXECUTED, STATUS_STALE):
             advisory_status = "not_established"
         elif any(f.code == "DEP-006" for f in findings):
@@ -2811,6 +3032,9 @@ def build_receipt(
             "digest": scanner_execution.get("advisory_content_digest"),
             "input_snapshot_digest": scanner_execution.get("input_snapshot_digest"),
             "binding_digest": scanner_execution.get("advisory_binding_digest"),
+            "parser_status": scanner_execution.get("parser_status"),
+            "parser_complete": scanner_execution.get("parser_complete"),
+            "summary_consistent": scanner_execution.get("summary_consistent"),
             "digest_status": (
                 "bound_to_observed_cargo_deny_output_and_inputs"
                 if _scanner_advisory_binding_is_valid(cargo_summary)

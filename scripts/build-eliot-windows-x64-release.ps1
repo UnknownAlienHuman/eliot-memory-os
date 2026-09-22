@@ -209,6 +209,101 @@ function Assert-PinnedExternalPath([string]$Path, [string]$Purpose) {
     return $file
 }
 
+function Get-Sha256Bytes([byte[]]$Bytes) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Read-VerifiedResidentFile([string]$Path, [string]$Purpose) {
+    $before = Assert-PinnedExternalPath $Path $Purpose
+    $stream = [System.IO.File]::Open(
+        $before.FullName,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        $memory = [System.IO.MemoryStream]::new()
+        try {
+            $stream.CopyTo($memory)
+            $bytes = $memory.ToArray()
+        }
+        finally {
+            $memory.Dispose()
+        }
+        $length = $stream.Length
+    }
+    finally {
+        $stream.Dispose()
+    }
+    $after = Assert-PinnedExternalPath $Path $Purpose
+    if (-not [string]::Equals($before.FullName, $after.FullName, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $after.Length -ne $length) {
+        throw "$Purpose changed during the verified read: $Path"
+    }
+    [pscustomobject]@{
+        path = $after.FullName
+        bytes = $bytes
+        length = $length
+        sha256 = Get-Sha256Bytes $bytes
+    }
+}
+
+function Write-VerifiedResidentFile([string]$Path, [byte[]]$Bytes, [string]$Purpose) {
+    $parent = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    $stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None
+    )
+    try {
+        $stream.Write($Bytes, 0, $Bytes.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    $observed = Read-VerifiedResidentFile $Path $Purpose
+    if ($observed.sha256 -cne (Get-Sha256Bytes $Bytes) -or $observed.length -ne $Bytes.Length) {
+        throw "$Purpose changed after the verified write: $Path"
+    }
+    return $observed
+}
+
+function Get-WindowsPeMachineFromBytes([byte[]]$Bytes, [string]$RelativePath) {
+    if ($Bytes.Length -lt 64 -or $Bytes[0] -ne 0x4d -or $Bytes[1] -ne 0x5a) {
+        throw "release artifact is not a PE executable: $RelativePath"
+    }
+    $peOffset = [System.BitConverter]::ToInt32($Bytes, 0x3c)
+    if ($peOffset -lt 64 -or $peOffset -gt 16MB -or $peOffset + 6 -gt $Bytes.Length -or
+        $Bytes[$peOffset] -ne 0x50 -or $Bytes[$peOffset + 1] -ne 0x45 -or
+        $Bytes[$peOffset + 2] -ne 0 -or $Bytes[$peOffset + 3] -ne 0) {
+        throw "release artifact has an invalid PE header: $RelativePath"
+    }
+    return ('{0:X4}' -f [System.BitConverter]::ToUInt16($Bytes, $peOffset + 4))
+}
+
+function Assert-CanonicalSurrealProvisioningReceipt([object]$Receipt, [string]$Purpose) {
+    $sharedProperty = if ($Receipt) { $Receipt.PSObject.Properties['shared_installation_touched'] } else { $null }
+    if (-not $Receipt -or
+        [string]$Receipt.schema -cne 'eliot.surrealdb-project-local-provisioning.v2' -or
+        [string]$Receipt.repository -cne 'https://github.com/surrealdb/surrealdb' -or
+        -not $sharedProperty -or
+        $sharedProperty.Value -isnot [bool] -or
+        $sharedProperty.Value -ne $false) {
+        throw "$Purpose must bind the official repository and exact Boolean false no-shared-installation boundary"
+    }
+}
+
 function Get-VerifiedSurrealCatalog([string]$Repo, [string]$SourceCommit) {
     $catalogPath = Join-Path $Repo $surrealCatalogRelativePath
     if (-not (Test-Path -LiteralPath $catalogPath -PathType Leaf)) {
@@ -220,7 +315,8 @@ function Get-VerifiedSurrealCatalog([string]$Repo, [string]$SourceCommit) {
     if ($catalogSourceHash -ne $catalogBlob) {
         throw "tracked SurrealDB artifact catalog differs from pinned source commit: $surrealCatalogRelativePath"
     }
-    $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
+    $catalogEvidence = Read-VerifiedResidentFile $catalogPath 'tracked SurrealDB artifact catalog'
+    $catalog = [System.Text.Encoding]::UTF8.GetString($catalogEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
     if ([string]$catalog.schema -ne 'eliot-external-release-artifact-lock-v1' -or
         [string]$catalog.artifact -cne 'surreal.exe' -or
         [string]$catalog.relative_path -cne 'runtime/surreal.exe' -or
@@ -247,7 +343,7 @@ function Get-VerifiedSurrealCatalog([string]$Repo, [string]$SourceCommit) {
         path = $catalogPath
         relative_path = $surrealCatalogRelativePath
         source_commit = $SourceCommit
-        sha256 = (Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        sha256 = $catalogEvidence.sha256
         artifact = [string]$catalog.artifact
         runtime_path = [string]$catalog.relative_path
         version = [string]$catalog.version
@@ -277,13 +373,13 @@ function Get-VerifiedPinnedSurrealArtifact([string]$Path, [string]$ExpectedSha25
         throw "SurrealExe must name the canonical surreal.exe file: $($file.FullName)"
     }
     Assert-NoSecretFile $file 'runtime/surreal.exe'
-    [void](Assert-WindowsX64Pe $file.FullName 'runtime/surreal.exe')
-    $actualSha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $artifactEvidence = Read-VerifiedResidentFile $file.FullName 'SurrealExe'
+    $actualSha256 = $artifactEvidence.sha256
     $pinnedSha256 = $ExpectedSha256.ToLowerInvariant()
     if ($actualSha256 -ne $pinnedSha256) {
         throw "SurrealExe SHA-256 does not match the caller-supplied pin: $($file.FullName)"
     }
-    $machine = Get-WindowsPeMachine $file.FullName 'runtime/surreal.exe'
+    $machine = Get-WindowsPeMachineFromBytes $artifactEvidence.bytes 'runtime/surreal.exe'
     if ($machine -cne [string]$Catalog.pe_machine) {
         throw "SurrealExe PE machine does not match the tracked catalog: expected $($Catalog.pe_machine), actual $machine"
     }
@@ -300,7 +396,7 @@ function Get-VerifiedPinnedSurrealArtifact([string]$Path, [string]$ExpectedSha25
         catalog_source_commit = $Catalog.source_commit
         pe_machine = $Catalog.pe_machine
         sha256 = $actualSha256
-        bytes = $file.Length
+        bytes = $artifactEvidence.length
         signature_policy = 'pre-release-unsigned'
         signature_evidence = 'not-issued'
     }
@@ -335,17 +431,14 @@ function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]
     if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
         throw "project-local SurrealDB provisioning receipt is missing: $receiptPath"
     }
-    $receiptFile = Assert-PinnedExternalPath $receiptPath 'project-local SurrealDB provisioning receipt'
+    $receiptEvidence = Read-VerifiedResidentFile $receiptPath 'project-local SurrealDB provisioning receipt'
     try {
-        $receipt = Get-Content -LiteralPath $receiptFile.FullName -Raw | ConvertFrom-Json
+        $receipt = [System.Text.Encoding]::UTF8.GetString($receiptEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
     }
     catch {
         throw "project-local SurrealDB provisioning receipt is not valid JSON: $receiptPath"
     }
-    if ([string]$receipt.schema -cne 'eliot.surrealdb-project-local-provisioning.v2' -or
-        [bool]$receipt.shared_installation_touched) {
-        throw 'project-local SurrealDB provisioning receipt is missing the no-shared-installation boundary'
-    }
+    Assert-CanonicalSurrealProvisioningReceipt $receipt 'project-local SurrealDB provisioning receipt'
     $candidateSubject = "surrealdb.release-asset.$([string]$candidate.source_tag)"
     $records = @($receipt.records | Where-Object { [string]$_.subject -ceq $candidateSubject })
     if ($records.Count -ne 1) {
@@ -367,13 +460,13 @@ function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]
         throw 'project-local SurrealDB artifact filename does not match the pinned release asset'
     }
     $file = Assert-PinnedExternalPath $candidatePath 'project-local SurrealDB artifact'
-    $actualSha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $artifactEvidence = Read-VerifiedResidentFile $file.FullName 'project-local SurrealDB artifact'
+    $actualSha256 = $artifactEvidence.sha256
     if ($actualSha256 -cne ([string]$candidate.sha256).ToLowerInvariant() -or
-        $file.Length -ne [int64]$candidate.artifact_size) {
+        $artifactEvidence.length -ne [int64]$candidate.artifact_size) {
         throw 'project-local SurrealDB artifact bytes do not match the tracked candidate lock'
     }
-    [void](Assert-WindowsX64Pe $file.FullName 'runtime/surreal.exe')
-    if ((Get-WindowsPeMachine $file.FullName 'runtime/surreal.exe') -cne [string]$candidate.pe_machine) {
+    if ((Get-WindowsPeMachineFromBytes $artifactEvidence.bytes 'runtime/surreal.exe') -cne [string]$candidate.pe_machine) {
         throw "project-local SurrealDB artifact PE machine does not match the candidate lock: expected $($candidate.pe_machine)"
     }
     [ordered]@{
@@ -385,7 +478,7 @@ function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]
         project_local_input_path = $candidateRelative
         provisioner = 'scripts/provision-surrealdb-release.py'
         provisioning_receipt_input_path = $receiptRelative
-        provisioning_receipt_sha256 = (Get-FileHash -LiteralPath $receiptFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        provisioning_receipt_sha256 = $receiptEvidence.sha256
         version = [string]$candidate.version
         architecture = [string]$candidate.architecture
         catalog_path = $Catalog.relative_path
@@ -393,7 +486,7 @@ function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]
         catalog_source_commit = $Catalog.source_commit
         pe_machine = [string]$candidate.pe_machine
         sha256 = $actualSha256
-        bytes = $file.Length
+        bytes = $artifactEvidence.length
         signature_policy = 'pre-release-unsigned'
         signature_evidence = 'not-issued'
     }
@@ -1534,18 +1627,18 @@ function Test-ReleaseBundle([string]$Path) {
         throw 'caller-pinned surrealdb artifact path is duplicated'
     }
     $surrealPath = Join-Path $resolved 'runtime/surreal.exe'
-    $surrealFile = Get-Item -LiteralPath $surrealPath
-    if ((Get-FileHash -LiteralPath $surrealPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne [string]$surrealEntry.sha256 -or
-        $surrealFile.Length -ne [int64]$surrealEntry.bytes -or
-        (Get-WindowsPeMachine $surrealPath 'runtime/surreal.exe') -cne [string]$surrealEntry.pe_machine) {
+    $surrealEvidence = Read-VerifiedResidentFile $surrealPath 'staged SurrealDB artifact'
+    if ($surrealEvidence.sha256 -cne [string]$surrealEntry.sha256 -or
+        $surrealEvidence.length -ne [int64]$surrealEntry.bytes -or
+        (Get-WindowsPeMachineFromBytes $surrealEvidence.bytes 'runtime/surreal.exe') -cne [string]$surrealEntry.pe_machine) {
         throw 'caller-pinned surrealdb artifact readback mismatch'
     }
-    [void](Assert-WindowsX64Pe $surrealPath 'runtime/surreal.exe')
     $catalogPath = Join-Path $resolved $surrealCatalogRelativePath
-    if ((Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne [string]$surrealEntry.catalog_sha256) {
+    $catalogEvidence = Read-VerifiedResidentFile $catalogPath 'bundled SurrealDB artifact catalog'
+    if ($catalogEvidence.sha256 -ne [string]$surrealEntry.catalog_sha256) {
         throw 'bundled SurrealDB artifact catalog digest mismatch'
     }
-    $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
+    $catalog = [System.Text.Encoding]::UTF8.GetString($catalogEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
     $catalogBinding = if ([string]$surrealEntry.source -ceq 'project-local-provisioner') {
         $catalog.patched_candidate
     }
@@ -1573,15 +1666,12 @@ function Test-ReleaseBundle([string]$Path) {
             throw 'project-local SurrealDB runtime metadata is missing its provisioner and receipt binding'
         }
         $stagedReceiptPath = Join-Path $resolved 'runtime/SURREALDB_PROVISIONING_RECEIPT.json'
-        if (-not (Test-Path -LiteralPath $stagedReceiptPath -PathType Leaf) -or
-            (Get-FileHash -LiteralPath $stagedReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne [string]$surrealEntry.provisioning_receipt_sha256) {
+        $stagedReceiptEvidence = Read-VerifiedResidentFile $stagedReceiptPath 'staged SurrealDB provisioning receipt'
+        if ($stagedReceiptEvidence.sha256 -cne [string]$surrealEntry.provisioning_receipt_sha256) {
             throw 'project-local SurrealDB provisioning receipt is missing or changed in the staged bundle'
         }
-        $stagedReceipt = Get-Content -LiteralPath $stagedReceiptPath -Raw | ConvertFrom-Json
-        if ([string]$stagedReceipt.schema -cne 'eliot.surrealdb-project-local-provisioning.v2' -or
-            [bool]$stagedReceipt.shared_installation_touched) {
-            throw 'staged SurrealDB provisioning receipt does not preserve the no-shared-installation boundary'
-        }
+        $stagedReceipt = [System.Text.Encoding]::UTF8.GetString($stagedReceiptEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        Assert-CanonicalSurrealProvisioningReceipt $stagedReceipt 'staged SurrealDB provisioning receipt'
         $candidateRecord = @($stagedReceipt.records | Where-Object {
                 [string]$_.subject -ceq "surrealdb.release-asset.$([string]$catalogBinding.source_tag)" -and
                 [string]$_.relative_path -ceq [string]$surrealEntry.project_local_input_path -and
@@ -1884,13 +1974,20 @@ try {
     foreach ($artifact in $runtimeArtifactPlan) {
         Copy-Item -LiteralPath $artifact.path -Destination (Join-Path $bundle $artifact.relative_path)
     }
-    Copy-Item -LiteralPath $resolvedSurrealExe -Destination (Join-Path $bundle 'runtime/surreal.exe')
+    $surrealBundleEvidence = Read-VerifiedResidentFile $resolvedSurrealExe 'project-local SurrealDB artifact for staging'
+    $stagedSurrealPath = Join-Path $bundle 'runtime/surreal.exe'
+    $writtenSurreal = Write-VerifiedResidentFile $stagedSurrealPath $surrealBundleEvidence.bytes 'staged SurrealDB artifact'
+    if ($writtenSurreal.sha256 -cne [string]$verifiedPinnedSurreal.sha256 -or
+        $writtenSurreal.length -ne [int64]$verifiedPinnedSurreal.bytes) {
+        throw 'staged SurrealDB artifact changed while being copied'
+    }
     if ($verifiedPinnedSurreal.source -ceq 'project-local-provisioner') {
         $stagedProvisioningReceipt = Join-Path $runtimeRoot 'SURREALDB_PROVISIONING_RECEIPT.json'
         $sourceProvisioningReceipt = Join-Path $repo ([string]$verifiedPinnedSurreal.provisioning_receipt_input_path).Replace('/', '\')
-        Copy-Item -LiteralPath $sourceProvisioningReceipt -Destination $stagedProvisioningReceipt
+        $sourceReceiptEvidence = Read-VerifiedResidentFile $sourceProvisioningReceipt 'project-local SurrealDB provisioning receipt for staging'
+        $writtenReceipt = Write-VerifiedResidentFile $stagedProvisioningReceipt $sourceReceiptEvidence.bytes 'staged SurrealDB provisioning receipt'
         Assert-NoSecretFile (Get-Item -LiteralPath $stagedProvisioningReceipt) 'runtime/SURREALDB_PROVISIONING_RECEIPT.json'
-        $stagedReceiptSha256 = (Get-FileHash -LiteralPath $stagedProvisioningReceipt -Algorithm SHA256).Hash.ToLowerInvariant()
+        $stagedReceiptSha256 = $writtenReceipt.sha256
         if ($stagedReceiptSha256 -cne [string]$verifiedPinnedSurreal.provisioning_receipt_sha256) {
             throw 'staged SurrealDB provisioning receipt changed while being copied'
         }

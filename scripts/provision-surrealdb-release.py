@@ -10,11 +10,13 @@ source-tree, tag, and advisory bindings.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
 import os
+import stat
 import tempfile
 import tomllib
 from urllib.request import Request, urlopen
@@ -100,7 +102,7 @@ def _open_nofollow(path: Path) -> int:
         handle = kernel32.CreateFileW(
             str(path),
             0x80000000,
-            0x00000001 | 0x00000002 | 0x00000004,
+            0x00000001 | 0x00000002,
             None,
             3,
             0x00000080 | 0x00200000,
@@ -115,6 +117,54 @@ def _open_nofollow(path: Path) -> int:
     return os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
 
 
+def _open_directory_nofollow(path: Path) -> int:
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80000000,  # GENERIC_READ
+            0x00000001 | 0x00000002,  # share read/write; deny delete/rename
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,  # FILE_FLAG_BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            error = ctypes.get_last_error()
+            raise OSError(error, f"CreateFileW failed for directory {path}")
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    else:
+        fd = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    try:
+        stat_result = os.fstat(fd)
+        if not stat.S_ISDIR(stat_result.st_mode) or getattr(stat_result, "st_file_attributes", 0) & REPARSE_POINT:
+            raise RuntimeError(f"project-local parent is not a resident directory: {path}")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def read_local(root: Path, raw: object) -> tuple[Path, str, bytes]:
     path, relative = safe_local_path(root, raw)
     if not path.is_file():
@@ -123,6 +173,8 @@ def read_local(root: Path, raw: object) -> tuple[Path, str, bytes]:
     try:
         fd = _open_nofollow(path)
         before = os.fstat(fd)
+        if getattr(before, "st_file_attributes", 0) & REPARSE_POINT:
+            raise RuntimeError(f"project-local evidence is a reparse point: {relative}")
         chunks: list[bytes] = []
         while chunk := os.read(fd, 1024 * 1024):
             chunks.append(chunk)
@@ -132,19 +184,38 @@ def read_local(root: Path, raw: object) -> tuple[Path, str, bytes]:
             os.close(fd)
     if _path_identity(before) != _path_identity(after):
         raise RuntimeError(f"project-local evidence changed while being read: {relative}")
+    if getattr(after, "st_file_attributes", 0) & REPARSE_POINT:
+        raise RuntimeError(f"project-local evidence became a reparse point while being read: {relative}")
     revalidated, revalidated_relative = safe_local_path(root, raw)
     if revalidated_relative != relative or _path_identity(after) != _path_identity(revalidated.stat()):
         raise RuntimeError(f"project-local evidence path identity changed during read: {relative}")
     return revalidated, relative, b"".join(chunks)
 
 
-def _ensure_parent(root: Path, relative: Path) -> None:
+@contextmanager
+def _held_parent_directories(root: Path, relative: Path):
+    """Hold every parent directory without delete sharing during a write."""
+
     root_resolved = root.resolve(strict=True)
+    handles: list[int] = []
     current = root_resolved
-    for component in relative.parts[:-1]:
-        current = current / component
-        current.mkdir(exist_ok=True)
-        _validate_components(root, current.relative_to(root_resolved))
+    try:
+        handles.append(_open_directory_nofollow(root_resolved))
+        for component in relative.parts[:-1]:
+            current = current / component
+            try:
+                current.lstat()
+            except FileNotFoundError:
+                current.mkdir()
+            handles.append(_open_directory_nofollow(current))
+        _validate_components(root, relative)
+        yield
+    finally:
+        for fd in reversed(handles):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def materialize(
@@ -155,41 +226,41 @@ def materialize(
     replace_existing: bool = False,
 ) -> dict:
     relative = _relative_path(raw_path)
-    _ensure_parent(root, relative)
-    path, relative_text = safe_local_path(root, raw_path)
     actual = sha256_bytes(payload)
-    reused = False
     if expected_sha256 and actual != expected_sha256.lower():
-        raise RuntimeError(f"downloaded bytes for {path} have SHA-256 {actual}, expected {expected_sha256}")
-    if path.exists():
-        _, _, existing = read_local(root, raw_path)
-        existing_sha = sha256_bytes(existing)
-        if existing_sha != actual and not replace_existing:
-            raise RuntimeError(f"refusing to replace existing project-local evidence {path}: {existing_sha} != {actual}")
-        if existing_sha == actual:
-            payload = existing
-            reused = True
+        raise RuntimeError(f"downloaded bytes for {relative} have SHA-256 {actual}, expected {expected_sha256}")
+
+    with _held_parent_directories(root, relative):
+        path, relative_text = safe_local_path(root, raw_path)
+        reused = False
+        if path.exists():
+            _, _, existing = read_local(root, raw_path)
+            existing_sha = sha256_bytes(existing)
+            if existing_sha != actual and not replace_existing:
+                raise RuntimeError(f"refusing to replace existing project-local evidence {path}: {existing_sha} != {actual}")
+            if existing_sha == actual:
+                payload = existing
+                reused = True
+            else:
+                replace_existing = True
         else:
             replace_existing = True
-    else:
-        replace_existing = True
-    if replace_existing:
-        path, _ = safe_local_path(root, raw_path)
-        fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            _validate_components(root, relative)
-            os.replace(temporary_name, path)
-        finally:
-            if os.path.exists(temporary_name):
-                os.unlink(temporary_name)
-        _, verified_relative, verified_payload = read_local(root, raw_path)
-        if verified_relative != relative_text or sha256_bytes(verified_payload) != actual or len(verified_payload) != len(payload):
-            raise RuntimeError(f"project-local write failed identity or byte revalidation: {relative_text}")
-    return {"path": relative_text, "relative_path": relative_text, "bytes": len(payload), "sha256": actual, "reused": reused}
+        if replace_existing:
+            fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                _validate_components(root, relative)
+                os.replace(temporary_name, path)
+            finally:
+                if os.path.exists(temporary_name):
+                    os.unlink(temporary_name)
+            _, verified_relative, verified_payload = read_local(root, raw_path)
+            if verified_relative != relative_text or sha256_bytes(verified_payload) != actual or len(verified_payload) != len(payload):
+                raise RuntimeError(f"project-local write failed identity or byte revalidation: {relative_text}")
+        return {"path": relative_text, "relative_path": relative_text, "bytes": len(payload), "sha256": actual, "reused": reused}
 
 
 def fetch(url: str, *, data: bytes | None = None, accept: str = "application/octet-stream") -> bytes:
