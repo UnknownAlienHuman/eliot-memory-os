@@ -22,8 +22,6 @@ use crate::composition::GovernorActivationSnapshot;
 use crate::reactive_owner_projection::ReactiveOwnerSource;
 use crate::reactive_projections::{
     GovernorReactiveProjectionSet, ReactiveAcceptedEvidence, ReactiveProjectionError,
-    validate_context_view, validate_critical_attention, validate_delivery_policy,
-    validate_integration_coverage, validate_session_delivery,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -324,117 +322,6 @@ impl GovernorReactiveOwnerSuppliers {
         Ok(())
     }
 
-    pub(crate) fn install_context_view(
-        &self,
-        activation: GovernorActivationSnapshot,
-        evidence: ReactiveAcceptedEvidence,
-        view: ContextPlanningView,
-    ) -> Result<(), ReactiveProjectionError> {
-        validate_context_view(&view, &activation)?;
-        self.install(activation, evidence, |state, binding| {
-            state.context_view = Some(BoundOwnerValue {
-                binding,
-                value: view,
-            });
-        })
-    }
-
-    pub(crate) fn install_cue_activation(
-        &self,
-        activation: GovernorActivationSnapshot,
-        evidence: ReactiveAcceptedEvidence,
-        cue: ReactiveCueActivation,
-    ) -> Result<(), ReactiveProjectionError> {
-        validate_cue_activation_without_view(&cue, &activation)?;
-        self.install(activation, evidence, |state, binding| {
-            state.cue_activation = Some(BoundOwnerValue {
-                binding,
-                value: cue,
-            });
-        })
-    }
-
-    pub(crate) fn install_session_delivery(
-        &self,
-        activation: GovernorActivationSnapshot,
-        evidence: ReactiveAcceptedEvidence,
-        session: SessionDeliverySnapshot,
-    ) -> Result<(), ReactiveProjectionError> {
-        validate_session_delivery(&session, &activation)?;
-        self.install(activation, evidence, |state, binding| {
-            state.session_delivery = Some(BoundOwnerValue {
-                binding,
-                value: session,
-            });
-        })
-    }
-
-    pub(crate) fn install_critical_attention(
-        &self,
-        activation: GovernorActivationSnapshot,
-        evidence: ReactiveAcceptedEvidence,
-        attention: CriticalAttentionProjection,
-    ) -> Result<(), ReactiveProjectionError> {
-        validate_critical_attention(&attention, &activation)?;
-        self.install(activation, evidence, |state, binding| {
-            state.critical_attention = Some(BoundOwnerValue {
-                binding,
-                value: attention,
-            });
-        })
-    }
-
-    pub(crate) fn install_integration_coverage(
-        &self,
-        activation: GovernorActivationSnapshot,
-        evidence: ReactiveAcceptedEvidence,
-        coverage: ReactiveIntegrationCoverageProfile,
-    ) -> Result<(), ReactiveProjectionError> {
-        validate_integration_coverage(&coverage, &activation)?;
-        self.install(activation, evidence, |state, binding| {
-            state.integration_coverage = Some(BoundOwnerValue {
-                binding,
-                value: coverage,
-            });
-        })
-    }
-
-    pub(crate) fn install_delivery_policy(
-        &self,
-        activation: GovernorActivationSnapshot,
-        evidence: ReactiveAcceptedEvidence,
-        policy: ReactiveDeliveryPolicy,
-    ) -> Result<(), ReactiveProjectionError> {
-        validate_delivery_policy(&policy, &activation)?;
-        self.install(activation, evidence, |state, binding| {
-            state.delivery_policy = Some(BoundOwnerValue {
-                binding,
-                value: policy,
-            });
-        })
-    }
-
-    pub(crate) fn install_owner_sources(
-        &self,
-        activation: GovernorActivationSnapshot,
-        evidence: ReactiveAcceptedEvidence,
-        sources: Vec<ReactiveOwnerSource>,
-    ) -> Result<(), ReactiveProjectionError> {
-        if sources.len() > crate::reactive_owner_projection::MAX_REACTIVE_OWNER_RECORDS {
-            return Err(ReactiveProjectionError::OwnerSource(
-                crate::reactive_owner_projection::ReactiveOwnerProjectionError::Bound(
-                    "projection.owner_sources",
-                ),
-            ));
-        }
-        self.install(activation, evidence, |state, binding| {
-            state.owner_sources = Some(BoundOwnerValue {
-                binding,
-                value: sources,
-            });
-        })
-    }
-
     pub(crate) fn reset(&self, state_fence: StateFence) -> Result<(), ReactiveProjectionError> {
         state_fence
             .validate()
@@ -446,35 +333,6 @@ impl GovernorReactiveOwnerSuppliers {
             .write()
             .map_err(|_| ReactiveProjectionError::Poisoned)?;
         *state = ReactiveOwnerSupplierState::empty(state_fence);
-        Ok(())
-    }
-
-    fn install<F>(
-        &self,
-        activation: GovernorActivationSnapshot,
-        evidence: ReactiveAcceptedEvidence,
-        update: F,
-    ) -> Result<(), ReactiveProjectionError>
-    where
-        F: FnOnce(&mut ReactiveOwnerSupplierState, OwnerBinding),
-    {
-        evidence.validate_against(&activation)?;
-        let binding = OwnerBinding {
-            activation,
-            evidence,
-        };
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| ReactiveProjectionError::Poisoned)?;
-        if state.state_fence != binding.activation.state_fence {
-            return Err(ReactiveProjectionError::StaleProjection {
-                projection: "owner_suppliers",
-                field: "state_fence",
-            });
-        }
-        state.ensure_binding(&binding);
-        update(&mut state, binding);
         Ok(())
     }
 
@@ -502,24 +360,6 @@ fn value_for<T: Clone>(
         });
     }
     Ok(value.value.clone())
-}
-
-fn validate_cue_activation_without_view(
-    cue: &ReactiveCueActivation,
-    activation: &GovernorActivationSnapshot,
-) -> Result<(), ReactiveProjectionError> {
-    cue.check_pair()
-        .map_err(|error| ReactiveProjectionError::InvalidProjection {
-            projection: "cue_activation",
-            reason: error.to_string(),
-        })?;
-    if cue.request.state_fence != activation.state_fence {
-        return Err(ReactiveProjectionError::StaleProjection {
-            projection: "cue_activation",
-            field: "request.state_fence",
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]

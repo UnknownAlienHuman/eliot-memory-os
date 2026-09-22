@@ -20,6 +20,7 @@ use crate::controlboard_projection::{
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::reactive_owner_producers::GovernorReactiveOwnerProducers;
 use crate::reactive_owner_projection::ReactiveOwnerSource;
 use crate::reactive_owner_suppliers::GovernorReactiveOwnerSuppliers;
 use crate::reactive_projections::{
@@ -1661,6 +1662,10 @@ pub struct GovernorComposition<P: ?Sized> {
     /// projection owner is separate from the observation journal and owns no
     /// queue, receipt, or canonical write path.
     reactive_suppliers: Arc<GovernorReactiveOwnerSuppliers>,
+    /// Retained semantic-owner outputs staged for the one existing daemon
+    /// cadence. This owner material is reset with the authenticated fence and
+    /// only complete sets reach `reactive_suppliers`.
+    reactive_producers: Arc<GovernorReactiveOwnerProducers>,
     snapshot: KernelGenerationSnapshot,
     recovery: GovernorRecoverySnapshot,
     service_observations: Vec<KernelServiceRecovery>,
@@ -1733,12 +1738,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             GovernorReactiveOwnerSuppliers::new(state_fence.clone())
                 .map_err(|error| CompositionError::Owner(error.to_string()))?,
         );
+        let reactive_producers = Arc::new(
+            GovernorReactiveOwnerProducers::new(state_fence.clone())
+                .map_err(|error| CompositionError::Owner(error.to_string()))?,
+        );
         Ok(Self {
             kernel,
             authority_activation,
             governor,
             owners,
             reactive_suppliers,
+            reactive_producers,
             snapshot,
             recovery,
             service_observations,
@@ -1771,9 +1781,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         view: ContextPlanningView,
     ) -> Result<(), CompositionError> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
-        self.reactive_suppliers
-            .install_context_view(activation, evidence, view)
-            .map_err(|error| CompositionError::Owner(error.to_string()))
+        self.reactive_producers
+            .retain_context_view(activation.clone(), evidence.clone(), view)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reset_and_flush_reactive_producers(&activation, &evidence)
     }
 
     /// Publishes the retained A10 cue request/result pair from its cue owner.
@@ -1783,9 +1794,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         cue: ReactiveCueActivation,
     ) -> Result<(), CompositionError> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
-        self.reactive_suppliers
-            .install_cue_activation(activation, evidence, cue)
-            .map_err(|error| CompositionError::Owner(error.to_string()))
+        self.reactive_producers
+            .retain_cue_activation(activation.clone(), evidence.clone(), cue)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reset_and_flush_reactive_producers(&activation, &evidence)
     }
 
     /// Publishes the session owner's retained delivery history for the live
@@ -1796,9 +1808,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         session: SessionDeliverySnapshot,
     ) -> Result<(), CompositionError> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
-        self.reactive_suppliers
-            .install_session_delivery(activation, evidence, session)
-            .map_err(|error| CompositionError::Owner(error.to_string()))
+        self.reactive_producers
+            .retain_session_delivery(activation.clone(), evidence.clone(), session)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reset_and_flush_reactive_producers(&activation, &evidence)
     }
 
     /// Publishes the attention owner's retained conflict/attention projection.
@@ -1808,9 +1821,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         attention: CriticalAttentionProjection,
     ) -> Result<(), CompositionError> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
-        self.reactive_suppliers
-            .install_critical_attention(activation, evidence, attention)
-            .map_err(|error| CompositionError::Owner(error.to_string()))
+        self.reactive_producers
+            .retain_critical_attention(activation.clone(), evidence.clone(), attention)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reset_and_flush_reactive_producers(&activation, &evidence)
     }
 
     /// Publishes the verified host/runtime/interface coverage and watchdog
@@ -1821,9 +1835,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         coverage: ReactiveIntegrationCoverageProfile,
     ) -> Result<(), CompositionError> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
-        self.reactive_suppliers
-            .install_integration_coverage(activation, evidence, coverage)
-            .map_err(|error| CompositionError::Owner(error.to_string()))
+        self.reactive_producers
+            .retain_integration_coverage(activation.clone(), evidence.clone(), coverage)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reset_and_flush_reactive_producers(&activation, &evidence)
     }
 
     /// Publishes the policy owner's exact delivery policy for the admitted
@@ -1849,9 +1864,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "reactive delivery policy is not bound to the admitted Policy owner".to_owned(),
             ));
         }
-        self.reactive_suppliers
-            .install_delivery_policy(activation, evidence, policy)
-            .map_err(|error| CompositionError::Owner(error.to_string()))
+        self.reactive_producers
+            .retain_delivery_policy(activation.clone(), evidence.clone(), policy)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reset_and_flush_reactive_producers(&activation, &evidence)
     }
 
     /// Publishes one complete owner-produced reactive projection set.
@@ -1888,9 +1904,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &projections.owner_sources,
         )
         .map_err(|error| CompositionError::Owner(error.to_string()))?;
-        self.reactive_suppliers
-            .install_projection_set(activation, evidence, projections)
-            .map_err(|error| CompositionError::Owner(error.to_string()))
+        self.reactive_producers
+            .retain_projection_set(activation.clone(), evidence.clone(), projections)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reset_and_flush_reactive_producers(&activation, &evidence)
     }
 
     /// Publishes the retained cue/index rows supplied by the cue and context
@@ -1903,8 +1920,47 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
         validate_owner_sources(&self.owners.observation, &activation, &sources)
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reactive_producers
+            .retain_owner_sources(activation.clone(), evidence.clone(), sources)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reset_and_flush_reactive_producers(&activation, &evidence)
+    }
+
+    /// Flushes one complete set retained by the semantic owners into the
+    /// read-only supplier consumed by the existing daemon cadence. The
+    /// consumer is reset on every tick so a partial/new binding can never
+    /// reuse a prior slot.
+    fn reset_and_flush_reactive_producers(
+        &self,
+        activation: &GovernorActivationSnapshot,
+        evidence: &crate::reactive_projections::ReactiveAcceptedEvidence,
+    ) -> Result<(), CompositionError> {
         self.reactive_suppliers
-            .install_owner_sources(activation, evidence, sources)
+            .reset(activation.state_fence.clone())
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.flush_reactive_producers(activation, evidence)
+    }
+
+    fn flush_reactive_producers(
+        &self,
+        activation: &GovernorActivationSnapshot,
+        evidence: &crate::reactive_projections::ReactiveAcceptedEvidence,
+    ) -> Result<(), CompositionError> {
+        let Some(projections) = self
+            .reactive_producers
+            .ready_for(activation, evidence)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?
+        else {
+            return Ok(());
+        };
+        validate_owner_sources(
+            &self.owners.observation,
+            activation,
+            &projections.owner_sources,
+        )
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reactive_suppliers
+            .install_projection_set(activation.clone(), evidence.clone(), projections)
             .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
@@ -1937,6 +1993,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             Err(ReactiveProjectionError::EvidenceUnavailable) => return Ok(None),
             Err(error) => return Err(CompositionError::Owner(error.to_string())),
         };
+        self.reactive_suppliers
+            .reset(activation.state_fence.clone())
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.flush_reactive_producers(&activation, &evidence)?;
         self.reactive_suppliers
             .prepare_tick(activation.clone(), evidence)
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
@@ -2483,6 +2543,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &recovery,
         )?;
         self.reactive_suppliers
+            .reset(state_fence.clone())
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reactive_producers
             .reset(state_fence.clone())
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
         self.owners = owners;

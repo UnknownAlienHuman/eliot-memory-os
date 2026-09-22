@@ -55,9 +55,10 @@ mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_projection_refresh;
 mod reactive_admission;
-mod reactive_projections;
+mod reactive_owner_producers;
 mod reactive_owner_projection;
 mod reactive_owner_suppliers;
+mod reactive_projections;
 mod skill_lifecycle;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
@@ -102,15 +103,15 @@ pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_comma
 pub use reactive_admission::{
     ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier, assess_reactive_risk,
 };
-pub use reactive_projections::{
-    GovernorReactiveProjectionOwner, GovernorReactiveProjectionSet, ReactiveProjectionError,
-};
-pub use reactive_owner_suppliers::GovernorReactiveOwnerSuppliers;
 pub use reactive_owner_projection::{
-    MAX_REACTIVE_OWNER_RECORDS, ReactiveCueBindingOwner, ReactiveOwnerProjection,
-    ReactiveOwnerProjectionError, ReactiveObservationCueProjection, ReactiveOwnerSource,
+    MAX_REACTIVE_OWNER_RECORDS, ReactiveCueBindingOwner, ReactiveObservationCueProjection,
+    ReactiveOwnerProjection, ReactiveOwnerProjectionError, ReactiveOwnerSource,
     ReactiveTargetAtomBinding, ReactiveTargetAtomOwner, RetainedReactiveOwnerSources,
     project_reactive_owner, project_reactive_owner_from_sources,
+};
+pub use reactive_owner_suppliers::GovernorReactiveOwnerSuppliers;
+pub use reactive_projections::{
+    GovernorReactiveProjectionOwner, GovernorReactiveProjectionSet, ReactiveProjectionError,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
