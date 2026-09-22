@@ -27,6 +27,7 @@
 pub mod conversion;
 pub mod descriptor;
 pub mod export;
+pub mod guest_gate;
 
 pub use conversion::{
     CallLedger, ConversionError, GuestError, GuestRequest, GuestResponse, INCOMPLETE_CODE,
