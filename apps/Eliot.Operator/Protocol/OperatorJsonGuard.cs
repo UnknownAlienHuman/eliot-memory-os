@@ -64,7 +64,8 @@ public static class OperatorJsonGuard
         var reader = new Utf8JsonReader(bytes, new JsonReaderOptions
         {
             AllowTrailingCommas = false,
-            CommentHandling = JsonCommentHandling.Disallow
+            CommentHandling = JsonCommentHandling.Disallow,
+            MaxDepth = maxDepth
         });
         var objectDepths = new Stack<HashSet<string>>(maxDepth + 1);
         var memberCount = 0;
@@ -78,13 +79,13 @@ public static class OperatorJsonGuard
             {
                 throw new OperatorProtocolException(shapeName, "token_cap");
             }
+            if (reader.CurrentDepth > maxDepth)
+            {
+                throw new OperatorProtocolException(shapeName, "depth_cap");
+            }
             switch (reader.TokenType)
             {
                 case JsonTokenType.StartObject:
-                    if (reader.CurrentDepth > maxDepth)
-                    {
-                        throw new OperatorProtocolException(shapeName, "depth_cap");
-                    }
                     if (reader.CurrentDepth == 0)
                     {
                         sawRootObject = true;

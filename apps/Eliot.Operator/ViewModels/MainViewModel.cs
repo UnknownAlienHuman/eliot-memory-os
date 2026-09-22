@@ -704,20 +704,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         catch (Exception error)
         {
-            // Terminal local or owner-refusal failure: the owner answered (or
-            // nothing was sent), so the pending entry closes as rejected and
-            // no reconciliation handle is retained.
-            if (!RemovePending(pending.OperationId))
-            {
-                RefreshPendingState();
-                SetBanner(
-                    "Command failed — recovery retained",
-                    $"{action}: {error.Message}; the local journal could not be compacted, so the exact operation remains pending.",
-                    OperatorBannerSeverity.Warning);
-                return;
-            }
+            // A local, reconnect, handshake, or decode failure does not prove
+            // that the original owner request was never committed. This also
+            // covers reconciliation attempts: a fresh handshake refusal cannot
+            // compact the older operation. Only the exact owner-bound receipt
+            // branches above may remove a retained operation.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
             RefreshPendingState();
-            SetBanner("Command failed", error.Message, OperatorBannerSeverity.Error);
+            SetBanner(
+                "Command outcome unproven — recovery retained",
+                $"{action}: {error.Message}; use Reconcile before any retry.",
+                OperatorBannerSeverity.Warning);
         }
         finally
         {

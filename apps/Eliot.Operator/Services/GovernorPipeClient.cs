@@ -31,6 +31,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     private OperatorEndpoint? _endpoint;
     private long _requestId;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
+    private readonly StringBuilder _readAhead = new();
 
     public async Task<OperatorSnapshot> SnapshotAsync(string? projectId = null, string? taskId = null, CancellationToken cancellationToken = default)
     {
@@ -123,21 +124,32 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         await _requestGate.WaitAsync(cancellationToken);
         try
         {
+            // Connection establishment and handshake failures happen before
+            // this mutation/read request is written. Once RequestAsync starts,
+            // every parse, correlation, protocol, or cancellation failure is
+            // conservatively an unknown owner outcome.
+            await EnsureConnectedAsync(cancellationToken);
+            var requestId = Interlocked.Increment(ref _requestId);
             try
             {
-                await EnsureConnectedAsync(cancellationToken);
                 var response = await RequestAsync<JsonRpcResponse<McpToolResult>>(new
                 {
                     jsonrpc = "2.0",
-                    id = Interlocked.Increment(ref _requestId),
+                    id = requestId,
                     method = "tools/call",
                     @params = new { name = tool, arguments }
                 }, cancellationToken);
-                if (response.Error is not null || response.Result is null)
+                if (response.Error is not null)
                 {
-                    // The owner explicitly refused: terminal answer, never an
-                    // unknown outcome and never a silent retry.
-                    throw new InvalidOperationException($"Governor rejected operator tool {tool}");
+                    // A JSON-RPC error carries no owner-bound terminal receipt;
+                    // the request may already have reached the mutation owner.
+                    throw new OperatorUnknownOutcomeException(
+                        operationScope, tool, "owner returned an unbound JSON-RPC error");
+                }
+                if (response.Result is null)
+                {
+                    throw new OperatorUnknownOutcomeException(
+                        operationScope, tool, "owner returned no result");
                 }
                 try
                 {
@@ -152,7 +164,38 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                     throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
                 }
             }
+            catch (OperatorUnknownOutcomeException)
+            {
+                await DisconnectAsync();
+                throw;
+            }
+            catch (OperationCanceledException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(
+                    operationScope, tool, $"request cancelled after send: {error.Message}");
+            }
             catch (IOException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (OperatorProtocolException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (JsonException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (NotSupportedException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (InvalidOperationException error)
             {
                 await DisconnectAsync();
                 throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
@@ -291,31 +334,53 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     {
         var reader = _reader ?? throw new IOException("Governor pipe reader is not connected");
         var buffer = new char[4096];
-        var line = new StringBuilder();
         while (true)
         {
+            var newlineIndex = FindNewline(_readAhead);
+            if (newlineIndex >= 0)
+            {
+                if (newlineIndex > OperatorProtocol.MaxLineChars)
+                {
+                    throw new OperatorProtocolException("response", "line_cap");
+                }
+                var line = new StringBuilder(newlineIndex);
+                for (var index = 0; index < newlineIndex; index++)
+                {
+                    var character = _readAhead[index];
+                    if (character != '\r')
+                    {
+                        if (line.Length >= OperatorProtocol.MaxLineChars)
+                        {
+                            throw new OperatorProtocolException("response", "line_cap");
+                        }
+                        line.Append(character);
+                    }
+                }
+                _readAhead.Remove(0, newlineIndex + 1);
+                return line.ToString();
+            }
+            if (_readAhead.Length > OperatorProtocol.MaxLineChars)
+            {
+                throw new OperatorProtocolException("response", "line_cap");
+            }
             var read = await reader.ReadAsync(buffer, cancellationToken);
             if (read == 0)
             {
-                return line.Length == 0 ? null : throw new IOException("Governor closed the pipe mid-line");
+                return _readAhead.Length == 0
+                    ? null
+                    : throw new IOException("Governor closed the pipe mid-line");
             }
-            for (var index = 0; index < read; index++)
-            {
-                var character = buffer[index];
-                if (character == '\n')
-                {
-                    return line.ToString();
-                }
-                if (character != '\r')
-                {
-                    if (line.Length >= OperatorProtocol.MaxLineChars)
-                    {
-                        throw new OperatorProtocolException("response", "line_cap");
-                    }
-                    line.Append(character);
-                }
-            }
+            _readAhead.Append(buffer, 0, read);
         }
+    }
+
+    private static int FindNewline(StringBuilder buffer)
+    {
+        for (var index = 0; index < buffer.Length; index++)
+        {
+            if (buffer[index] == '\n') return index;
+        }
+        return -1;
     }
 
     private async Task DisconnectAsync()
@@ -327,6 +392,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         _reader = null;
         _pipe = null;
         _endpoint = null;
+        _readAhead.Clear();
         try
         {
             if (writer is not null) await writer.DisposeAsync();
