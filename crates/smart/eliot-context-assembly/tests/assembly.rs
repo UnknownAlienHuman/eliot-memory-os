@@ -55,6 +55,7 @@ fn candidate(context: &ContextBinding) -> ContextCandidate {
         binding: context.clone(),
         atom_id: id("atom"),
         provider_role: role(),
+        learning: None,
         source: SourceSnapshot {
             source_id: eliot_contracts::SourceId::new("source").expect("fixture source"),
             owner: ProviderId::new("fixture-provider").expect("fixture owner"),

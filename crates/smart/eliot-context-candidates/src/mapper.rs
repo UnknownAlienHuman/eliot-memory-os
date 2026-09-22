@@ -1472,6 +1472,7 @@ fn build_atom(
         binding: request.binding.clone(),
         atom_id: item.member.member_id.clone(),
         provider_role: slot.clone(),
+        learning: None,
         source: item.member.source.clone(),
         representation: eliot_context_contracts::AtomRepresentation::Whole {
             content: item.member.content.clone(),

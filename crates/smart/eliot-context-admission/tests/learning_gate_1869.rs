@@ -1,21 +1,21 @@
-//! Learning retrieval screen proof for issue #1869 (round 4).
+//! Learning retrieval screen proof for issue #1869 (round 5).
 //!
-//! Genuine issuer-to-consumer path: permits are minted by the real
-//! [`Governor`] owner and verified against live owner state; the governed
-//! retrieval entrypoint [`admit_context_with_learning`] admits covered
-//! learning atoms through the unchanged [`admit_context`] decision and
-//! refuses expired, foreign-task, stale-fence, and unclosed-reusable inputs
-//! before any value surfaces. Plain [`admit_context`] behavior is preserved
-//! bit-for-bit when no learning claims are present.
+//! Genuine issuer-to-consumer path with intrinsic provenance: learning marks
+//! ride on the candidate itself (`ContextCandidate.learning`, digest-covered)
+//! — there is no sidecar to omit. The governed retrieval entrypoint
+//! [`admit_context_with_learning`] admits covered marked atoms through the
+//! unchanged [`admit_context`] decision and refuses expired, foreign-task,
+//! stale-fence, transplanted-digest, and unclosed-reusable inputs before any
+//! value surfaces. Plain [`admit_context`] behavior is preserved bit-for-bit
+//! for unmarked atoms.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use eliot_agent_contracts::AgentAttemptId;
-use eliot_context_admission::admit_context;
-use eliot_context_admission::learning_gate::{LearningAtomClaim, admit_context_with_learning};
+use eliot_context_admission::learning_gate::admit_context_with_learning;
+use eliot_context_admission::{admit_context, screen_admission_input_learning};
 use eliot_context_contracts::*;
 use eliot_contracts::{
     ArtifactId, DecisionId, EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence,
@@ -55,7 +55,7 @@ fn fence_1869() -> StateFence {
         epoch_1869(),
         ResourceGeneration::new(7).expect("generation"),
     );
-    fence.task_revision = Some(eliot_contracts::TaskRevision::new(1).expect("task revision"));
+    fence.task_revision = Some(TaskRevision::new(1).expect("task revision"));
     fence
 }
 
@@ -103,6 +103,7 @@ fn candidate(
     provider_role: ProviderRole,
     loss_policy: LossPolicy,
     protected: bool,
+    learning: Option<LearningProvenance>,
 ) -> ContextCandidate {
     ContextCandidate {
         binding: context.clone(),
@@ -119,6 +120,7 @@ fn candidate(
         representation: AtomRepresentation::Whole {
             content: format!("content-{atom_id}"),
         },
+        learning,
         loss_policy,
         availability: AtomAvailability::PresentCurrent,
         protected,
@@ -135,6 +137,19 @@ fn candidate(
             evidence_id: id(&format!("evidence-{atom_id}")),
             ceiling: ProofCeiling::Observation,
         },
+    }
+}
+
+fn learning_mark(permit_digest: &str, expires: Option<u64>) -> LearningProvenance {
+    LearningProvenance {
+        campaign_id: CAMPAIGN_1869.to_string(),
+        overlay_id: Some(OVERLAY_1869.to_string()),
+        candidate_id: None,
+        closure_ref: None,
+        owner: None,
+        draft: false,
+        expires_at_unix_secs: expires,
+        permit_digest: permit_digest.to_string(),
     }
 }
 
@@ -165,9 +180,9 @@ fn measurement(
     }
 }
 
-/// Minimal valid input: one required floor atom plus one learning-declared
-/// optional atom. The `task` parameter re-binds every identity coherently.
-fn input_with_learning(task: &str) -> AdmissionInput {
+/// Minimal valid input with one required floor atom plus one intrinsically
+/// marked learning atom. The mark cites `permit_digest`.
+fn input_with_learning(task: &str, permit_digest: &str, expires: Option<u64>) -> AdmissionInput {
     let context = binding(task);
     let required_role = role("required-provider", SemanticRole::Goal);
     let learning_role = role("learning-provider", SemanticRole::Optional);
@@ -177,6 +192,7 @@ fn input_with_learning(task: &str) -> AdmissionInput {
         required_role.clone(),
         LossPolicy::NonDroppable,
         true,
+        None,
     );
     let learning = candidate(
         &context,
@@ -184,6 +200,7 @@ fn input_with_learning(task: &str) -> AdmissionInput {
         learning_role.clone(),
         LossPolicy::Summarizable,
         false,
+        Some(learning_mark(permit_digest, expires)),
     );
     let requested = vec![required_role.clone(), learning_role.clone()];
     let denominator = ProviderRoleDenominator {
@@ -342,32 +359,30 @@ fn owner_claim(
     }
 }
 
-fn atom_claim(expires_at_unix_secs: Option<u64>) -> LearningAtomClaim {
-    LearningAtomClaim {
-        campaign_id: CAMPAIGN_1869.to_string(),
-        overlay_id: Some(OVERLAY_1869.to_string()),
-        candidate_id: None,
-        closure_ref: None,
-        owner: None,
-        draft: false,
-        expires_at_unix_secs,
-    }
+/// Issue a live owner permit first so fixtures cite the real digest.
+fn live_permit(
+    governor: &Governor,
+    fence: &StateFence,
+    overlay: Option<&str>,
+    candidate: Option<&str>,
+) -> eliot_governor::LearningAdmissionPermit {
+    issue_learning_admission(&governor, &owner_claim(fence, overlay, candidate))
+        .expect("live owner issues")
 }
 
 #[test]
-fn learning_atom_admitted_with_owner_issued_permit() {
+fn marked_atom_admitted_with_owner_issued_permit() {
     let governor = governor_1869();
     let fence = fence_1869();
-    let input = input_with_learning(TASK_1869);
-    let permit =
-        issue_learning_admission(&governor, &owner_claim(&fence, Some(OVERLAY_1869), None))
-            .expect("live owner issues");
+    let permit = live_permit(&governor, &fence, Some(OVERLAY_1869), None);
     let verified =
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
-    let mut claims = BTreeMap::new();
-    claims.insert(id("learning-1869"), atom_claim(Some(NOW_1869 + 3600)));
-    match admit_context_with_learning(&input, &claims, &verified, NOW_1869)
-        .expect("covered learning atom admits")
+    let input = input_with_learning(TASK_1869, permit.digest(), Some(NOW_1869 + 3600));
+    // Host preflight alone passes on covered input.
+    screen_admission_input_learning(&input, &verified, NOW_1869)
+        .expect("covered input passes preflight");
+    match admit_context_with_learning(&input, &verified, NOW_1869)
+        .expect("covered marked atom admits")
         .outcome
     {
         ContextOutcome::Complete(admitted) => {
@@ -376,7 +391,7 @@ fn learning_atom_admitted_with_owner_issued_permit() {
                     .records
                     .iter()
                     .any(|record| record.candidate.atom_id == id("learning-1869")),
-                "covered learning atom surfaces in the admitted set"
+                "covered marked atom surfaces in the admitted set"
             );
         }
         ContextOutcome::Incomplete(incomplete) => {
@@ -386,25 +401,35 @@ fn learning_atom_admitted_with_owner_issued_permit() {
 }
 
 #[test]
-fn expired_overlay_refuses_whole_retrieval_and_plain_path_survives() {
+fn expired_mark_refuses_whole_retrieval_and_plain_path_survives() {
     let governor = governor_1869();
     let fence = fence_1869();
-    let input = input_with_learning(TASK_1869);
-    let permit =
-        issue_learning_admission(&governor, &owner_claim(&fence, Some(OVERLAY_1869), None))
-            .expect("live owner issues");
+    let permit = live_permit(&governor, &fence, Some(OVERLAY_1869), None);
     let verified =
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
-    let mut claims = BTreeMap::new();
-    claims.insert(id("learning-1869"), atom_claim(Some(NOW_1869 - 1)));
+    let input = input_with_learning(TASK_1869, permit.digest(), Some(NOW_1869 - 1));
     assert_eq!(
-        admit_context_with_learning(&input, &claims, &verified, NOW_1869),
+        admit_context_with_learning(&input, &verified, NOW_1869),
         Err(ContextError::InvalidField("learning.expires_at"))
     );
-    // Historical behavior is untouched: the same input without learning
-    // claims decides exactly as before.
+    // Historical behavior is untouched: unmarked atoms decide as before.
+    // (Stripping the mark changes atom identity, so bound measurements are
+    // rebound exactly as the legitimate producer would emit them.)
+    let mut plain = input;
+    for candidate in &mut plain.candidates.candidates {
+        candidate.learning = None;
+    }
+    for measurement in &mut plain.measurements {
+        let candidate = plain
+            .candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.atom_id == measurement.atom_id)
+            .expect("measured candidate");
+        measurement.binding.subject_digest = canonical_digest(candidate).expect("rebound subject");
+    }
     assert!(matches!(
-        admit_context(&input).expect("plain path survives").outcome,
+        admit_context(&plain).expect("plain path survives").outcome,
         ContextOutcome::Complete(_)
     ));
 }
@@ -413,17 +438,13 @@ fn expired_overlay_refuses_whole_retrieval_and_plain_path_survives() {
 fn foreign_task_permit_refused() {
     let governor = governor_1869();
     let fence = fence_1869();
-    // Compilation serves another task than the permit target.
-    let input = input_with_learning("task-1869-foreign");
-    let permit =
-        issue_learning_admission(&governor, &owner_claim(&fence, Some(OVERLAY_1869), None))
-            .expect("permit targets task-1869-a");
+    let permit = live_permit(&governor, &fence, Some(OVERLAY_1869), None);
     let verified =
-        verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
-    let mut claims = BTreeMap::new();
-    claims.insert(id("learning-1869"), atom_claim(Some(NOW_1869 + 3600)));
+        verify_learning_admission(&governor, &permit, &fence).expect("permit targets task-1869-a");
+    // Compilation serves another task than the permit target.
+    let input = input_with_learning("task-1869-foreign", permit.digest(), Some(NOW_1869 + 3600));
     assert_eq!(
-        admit_context_with_learning(&input, &claims, &verified, NOW_1869),
+        admit_context_with_learning(&input, &verified, NOW_1869),
         Err(ContextError::IdentityConflict)
     );
 }
@@ -432,24 +453,35 @@ fn foreign_task_permit_refused() {
 fn stale_fence_refused() {
     let governor = governor_1869();
     let fence = fence_1869();
-    let mut input = input_with_learning(TASK_1869);
-    // Advance the compilation fence past the admitted one.
-    input.binding.state_fence.task_revision =
-        Some(eliot_contracts::TaskRevision::new(2).expect("task revision"));
-    for candidate in &mut input.candidates.candidates {
-        candidate.binding.state_fence.task_revision =
-            Some(eliot_contracts::TaskRevision::new(2).expect("task revision"));
-    }
-    let permit =
-        issue_learning_admission(&governor, &owner_claim(&fence, Some(OVERLAY_1869), None))
-            .expect("live owner issues");
+    let permit = live_permit(&governor, &fence, Some(OVERLAY_1869), None);
     let verified =
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
-    let mut claims = BTreeMap::new();
-    claims.insert(id("learning-1869"), atom_claim(Some(NOW_1869 + 3600)));
+    let mut input = input_with_learning(TASK_1869, permit.digest(), Some(NOW_1869 + 3600));
+    // Advance the compilation fence past the admitted one.
+    input.binding.state_fence.task_revision = Some(TaskRevision::new(2).expect("task revision"));
+    for candidate in &mut input.candidates.candidates {
+        candidate.binding.state_fence.task_revision =
+            Some(TaskRevision::new(2).expect("task revision"));
+    }
     assert_eq!(
-        admit_context_with_learning(&input, &claims, &verified, NOW_1869),
+        admit_context_with_learning(&input, &verified, NOW_1869),
         Err(ContextError::InvalidFence)
+    );
+}
+
+#[test]
+fn transplanted_permit_digest_refused() {
+    let governor = governor_1869();
+    let fence = fence_1869();
+    // Mark cites a DIFFERENT issuance than the verified permit.
+    let other = live_permit(&governor, &fence, Some("overlay-other"), None);
+    let permit = live_permit(&governor, &fence, Some(OVERLAY_1869), None);
+    let verified =
+        verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
+    let input = input_with_learning(TASK_1869, other.digest(), Some(NOW_1869 + 3600));
+    assert_eq!(
+        admit_context_with_learning(&input, &verified, NOW_1869),
+        Err(ContextError::IdentityConflict)
     );
 }
 
@@ -457,29 +489,40 @@ fn stale_fence_refused() {
 fn unclosed_reusable_refused() {
     let governor = governor_1869();
     let fence = fence_1869();
-    let input = input_with_learning(TASK_1869);
-    let permit = issue_learning_admission(
+    let permit = live_permit(
         &governor,
-        &owner_claim(&fence, Some(OVERLAY_1869), Some("candidate-1869-a")),
-    )
-    .expect("live owner issues candidate-bound permit");
+        &fence,
+        Some(OVERLAY_1869),
+        Some("candidate-1869-a"),
+    );
     let verified =
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
-    let mut claims = BTreeMap::new();
-    claims.insert(
-        id("learning-1869"),
-        LearningAtomClaim {
-            campaign_id: CAMPAIGN_1869.to_string(),
-            overlay_id: Some(OVERLAY_1869.to_string()),
-            candidate_id: Some("candidate-1869-a".to_string()),
-            closure_ref: None,
-            owner: Some("governor-1869".to_string()),
-            draft: false,
-            expires_at_unix_secs: Some(NOW_1869 + 3600),
-        },
-    );
+    let mut input = input_with_learning(TASK_1869, permit.digest(), Some(NOW_1869 + 3600));
+    let learning = input
+        .candidates
+        .candidates
+        .iter_mut()
+        .find(|candidate| candidate.atom_id == id("learning-1869"))
+        .expect("learning atom");
+    learning.learning = Some(LearningProvenance {
+        campaign_id: CAMPAIGN_1869.to_string(),
+        overlay_id: Some(OVERLAY_1869.to_string()),
+        candidate_id: Some("candidate-1869-a".to_string()),
+        closure_ref: None,
+        owner: Some("governor-1869".to_string()),
+        draft: false,
+        expires_at_unix_secs: Some(NOW_1869 + 3600),
+        permit_digest: permit.digest().to_string(),
+    });
+    // Rebind the measurement to the remarked candidate.
+    for measurement in &mut input.measurements {
+        if measurement.atom_id == id("learning-1869") {
+            measurement.binding.subject_digest =
+                canonical_digest(learning).expect("remarked subject");
+        }
+    }
     assert_eq!(
-        admit_context_with_learning(&input, &claims, &verified, NOW_1869),
+        admit_context_with_learning(&input, &verified, NOW_1869),
         Err(ContextError::InvalidField("learning.closure_ref"))
     );
 }
