@@ -62,9 +62,9 @@ pub use backup_restore::{
     KernelBackupRestore, KernelRestoreOutcome, OrsOwnerClient, PurgeOwnerClient, phase_owner,
 };
 pub use backup_restore_ports::{
-    KernelIsolatedDestination, KernelRestoreError, KernelRestoreJournal, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_KEEP_RESOLVED, RESTORE_JOURNAL_OWNER_LABEL,
-    check_kernel_effect_fence,
+    DestinationManifestEvidence, KernelIsolatedDestination, KernelRestoreError, KernelRestoreJournal,
+    RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_KEEP_RESOLVED,
+    RESTORE_JOURNAL_OWNER_LABEL, check_kernel_effect_fence,
 };
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,

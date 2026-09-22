@@ -78,7 +78,8 @@ use eliot_store_api::WriteReceipt;
 use serde::Serialize;
 
 use super::backup_restore_ports::{
-    KernelIsolatedDestination, KernelRestoreError, KernelRestoreJournal, check_kernel_effect_fence,
+    DestinationManifestEvidence, KernelIsolatedDestination, KernelRestoreError, KernelRestoreJournal,
+    check_kernel_effect_fence,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -424,7 +425,12 @@ impl KernelBackupRestore {
     /// the restore is refused with zero target effects. Blob-carrying
     /// archives require exact key coverage plus the destination blob scope;
     /// a fixture-flagged journal admission refuses as not admitted for
-    /// production. Coordinator failures propagate typed in
+    /// production. `manifest_evidence`, when supplied, binds the
+    /// owner-approved destination scope: its shapes validate, its work root
+    /// must canonicalize-equal this Kernel's own work root, and its manifest
+    /// digest must equal the archive's `config` artifact when the archive
+    /// carries one; the values pin at prepare and any drift refuses later
+    /// effects and cutover. Coordinator failures propagate typed in
     /// [`KernelRestoreError::TargetFailed`]; the primary error is preserved,
     /// never flattened into a fabricated success.
     pub fn restore(
@@ -434,6 +440,7 @@ impl KernelBackupRestore {
         kernel_fence: &StateFence,
         keys: Option<&WrappedKeyManifest>,
         blob_scope: Option<&DestinationScope>,
+        manifest_evidence: Option<DestinationManifestEvidence>,
     ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
         bundle
             .validate()
@@ -461,6 +468,31 @@ impl KernelBackupRestore {
                 capability: owners::BLOB_SCOPE_BINDING,
             });
         }
+        if let Some(evidence) = manifest_evidence.as_ref() {
+            evidence.validate()?;
+            let own_root = std::fs::canonicalize(&self.work_root).map_err(|error| {
+                KernelRestoreError::DestinationInvalid(error.to_string())
+            })?;
+            let admitted_root = std::fs::canonicalize(&evidence.kernel_work_root).map_err(
+                |error| KernelRestoreError::DestinationInvalid(error.to_string()),
+            )?;
+            if own_root != admitted_root {
+                return Err(KernelRestoreError::DestinationInvalid(
+                    "admitted work root does not match the Kernel work root".to_owned(),
+                ));
+            }
+            if let Some(config) = bundle
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.kind == "config")
+            {
+                if config.sha256 != evidence.manifest_digest {
+                    return Err(KernelRestoreError::FenceMismatch(
+                        "destination manifest".to_owned(),
+                    ));
+                }
+            }
+        }
         let plan = RestorePlan::compile(bundle, target.clone())
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         self.journal
@@ -481,6 +513,7 @@ impl KernelBackupRestore {
             keys,
             blob_scope,
             receipts,
+            manifest_evidence,
         );
         let receipt = plan
             .execute_with_journal(bundle, &mut target_impl, &mut self.journal)
@@ -511,11 +544,13 @@ impl KernelBackupRestore {
     /// Consumes only authenticated evidence: the accepted owner
     /// authorization (bound to this exact plan and bundle), the completed
     /// restore receipt (bound to this exact plan, bundle, and target), the
-    /// ORS owner's durably held stream binding (destination and transaction
-    /// cross-check — a rotated authority or drifted archive refuses instead
-    /// of continuing), and the freshly re-validated restored fence (lineage
-    /// advance re-proven here with no caller arithmetic on epochs). The
-    /// accepted [`authorize_cutover`](eliot_backup::authorize_cutover)
+    /// pinned destination admission (owner-approved manifest evidence bound
+    /// at prepare — absent without Host admission, and cutover refuses
+    /// without it), the ORS owner's durably held stream binding
+    /// (destination and transaction cross-check — a rotated authority or
+    /// drifted archive refuses instead of continuing), and the freshly
+    /// re-validated restored fence (lineage advance re-proven here with no
+    /// caller arithmetic on epochs). The accepted [`authorize_cutover`](eliot_backup::authorize_cutover)
     /// mints the receipt; a degraded archive keeps its `canonical_only`
     /// marking and is never upgraded. The decision is journaled to the
     /// bound ORS stream with the exact observed predecessor, preserving
@@ -552,6 +587,26 @@ impl KernelBackupRestore {
                 "cutover destination is not the plan-admitted isolated root".to_owned(),
             ));
         }
+        let admission_bytes = std::fs::read(destination.root().join(DESTINATION_ADMISSION_FILE))
+            .map_err(|_| {
+                KernelRestoreError::DestinationInvalid(
+                    "no owner-approved destination admission pinned".to_owned(),
+                )
+            })?;
+        let pinned: PinnedDestinationAdmission =
+            serde_json::from_slice(&admission_bytes).map_err(|_| {
+                KernelRestoreError::DestinationInvalid(
+                    "pinned destination admission is corrupt".to_owned(),
+                )
+            })?;
+        let transaction = plan
+            .transaction()
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        if pinned.transaction_id != transaction.transaction_id
+            || pinned.target_id != plan.target.target_id
+        {
+            return Err(KernelRestoreError::JournalBindingConflict);
+        }
         plan.restored_fence
             .validate()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
@@ -564,9 +619,6 @@ impl KernelBackupRestore {
             .read_durable_binding(stream)
             .map_err(KernelRestoreError::TargetFailed)?
             .ok_or(KernelRestoreError::JournalNotAdmitted)?;
-        let transaction = plan
-            .transaction()
-            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         if durable.transaction_id != transaction.transaction_id
             || durable.destination_ref != plan.target.target_id
             || durable.source_archive_id != bundle.manifest.backup_id
@@ -592,6 +644,9 @@ impl KernelBackupRestore {
             target_id: plan.target.target_id.clone(),
             destination: destination.root().to_string_lossy().into_owned(),
             authorized_by: auth.authorized_by.clone(),
+            manifest_digest: pinned.evidence.manifest_digest.clone(),
+            roots_digest: pinned.evidence.roots_digest.clone(),
+            registry_revision: pinned.evidence.registry_revision,
             new_authority_epoch: cutover.new_authority_epoch.clone(),
             new_resource_generation: cutover.new_resource_generation,
             canonical_only: cutover.canonical_only,
@@ -655,10 +710,27 @@ struct ObservedCutoverDecision {
     target_id: String,
     destination: String,
     authorized_by: String,
+    manifest_digest: String,
+    roots_digest: String,
+    registry_revision: u64,
     new_authority_epoch: EpochId,
     new_resource_generation: ResourceGeneration,
     canonical_only: bool,
 }
+
+/// Pinned destination admission: the owner-approved manifest evidence bound
+/// to one restore transaction and target. Written once at prepare,
+/// re-verified before later effects and at cutover; any drift refuses.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinnedDestinationAdmission {
+    transaction_id: String,
+    target_id: String,
+    evidence: DestinationManifestEvidence,
+}
+
+/// Admission file name inside the isolated destination.
+const DESTINATION_ADMISSION_FILE: &str = "destination-admission.json";
 
 /// Kernel-observed prepare evidence: the exact intent executed, bound to the
 /// compiled plan and the constructed destination. Observation, not authority.
@@ -701,6 +773,7 @@ struct KernelRestoreTarget<'a> {
     keys: Option<&'a WrappedKeyManifest>,
     blob_scope: Option<&'a DestinationScope>,
     receipts: Vec<BlobRestorationReceipt>,
+    manifest_evidence: Option<DestinationManifestEvidence>,
     calls: Vec<String>,
     final_evidence: Option<RestoreEvidence>,
 }
@@ -712,6 +785,7 @@ impl<'a> KernelRestoreTarget<'a> {
         keys: Option<&'a WrappedKeyManifest>,
         blob_scope: Option<&'a DestinationScope>,
         receipts: Vec<BlobRestorationReceipt>,
+        manifest_evidence: Option<DestinationManifestEvidence>,
     ) -> Self {
         Self {
             root: destination.root().to_path_buf(),
@@ -719,6 +793,7 @@ impl<'a> KernelRestoreTarget<'a> {
             keys,
             blob_scope,
             receipts,
+            manifest_evidence,
             calls: Vec::new(),
             final_evidence: None,
         }
@@ -809,6 +884,33 @@ impl<'a> KernelRestoreTarget<'a> {
         Ok(ObservedEffect::Applied(applied))
     }
 
+    /// Re-verifies the pinned destination admission before a post-prepare
+    /// effect. Unadmitted restores skip; admitted ones require the exact
+    /// pinned transaction, target, and manifest evidence — any drift
+    /// refuses the effect instead of continuing under changed authority.
+    fn check_destination_admission(
+        &self,
+        intent: &RestoreIntent,
+        plan_target_id: &str,
+    ) -> Result<(), BackupError> {
+        let Some(expected) = self.manifest_evidence.as_ref() else {
+            return Ok(());
+        };
+        let bytes = std::fs::read(self.root.join(DESTINATION_ADMISSION_FILE))
+            .map_err(|_| BackupError::RestoreJournalCorrupt)?;
+        let pinned: PinnedDestinationAdmission =
+            serde_json::from_slice(&bytes).map_err(|_| BackupError::RestoreJournalCorrupt)?;
+        if pinned.transaction_id != intent.transaction_id
+            || pinned.target_id != plan_target_id
+            || pinned.evidence != *expected
+        {
+            return Err(BackupError::FenceMismatch {
+                subject: "destination admission".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn find_blob<'b>(
         bundle: &'b BackupBundle,
         hash: &str,
@@ -864,6 +966,16 @@ impl<'a> KernelRestoreTarget<'a> {
     ) -> Result<RestoreAppliedEffect, BackupError> {
         self.prepare_isolated(&plan.target, &plan.restored_fence)?;
         self.gate(bundle)?;
+        if let Some(evidence) = self.manifest_evidence.clone() {
+            let pinned = PinnedDestinationAdmission {
+                transaction_id: intent.transaction_id.clone(),
+                target_id: plan.target.target_id.clone(),
+                evidence,
+            };
+            let bytes = canonical_json_bytes(&pinned)
+                .map_err(|error| BackupError::Serialization(error.to_string()))?;
+            self.write_file(DESTINATION_ADMISSION_FILE, &bytes)?;
+        }
         let observed = ObservedPrepare {
             transaction_id: intent.transaction_id.clone(),
             plan_id: plan.plan_id.clone(),
@@ -1402,6 +1514,12 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     ) -> Result<RestoreAppliedEffect, BackupError> {
         if intent.transaction_id.is_empty() {
             return Err(BackupError::RestoreJournalCorrupt);
+        }
+        if !matches!(
+            intent.phase,
+            RestorePhase::Pending | RestorePhase::PrepareIsolatedRoot
+        ) {
+            self.check_destination_admission(intent, plan.target.target_id.as_str())?;
         }
         self.apply_phase(plan, bundle, intent)
     }

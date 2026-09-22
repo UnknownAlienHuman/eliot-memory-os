@@ -74,6 +74,79 @@ pub const RESTORE_JOURNAL_IDENTITY: &str = "kernel-restore-journal-v1";
 /// Kernel-owned operational ORS file; this label names that owner, never a
 /// second database.
 pub const RESTORE_JOURNAL_OWNER_LABEL: &str = "kernel-operational-ors";
+
+/// Kernel-side destination manifest evidence: the digest/path projection of
+/// the Host-issued owner binding every isolated destination must carry.
+///
+/// The issuing owner is the Host-side `ManifestRootsBinding`
+/// (`bins/eliot-host/src/backup_preparation.rs`, manager commit `f3a3d31a`,
+/// read-only reference): `{ roots, manifest_digest, registry_revision }`
+/// produced by `OwnerRegistryEvidence::manifest_roots_against`, where
+/// `manifest_digest` is the active manifest's config digest and
+/// `registry_revision` the registry CAS revision at inspection time. The
+/// Hume `RuntimeStateRoots` inside it stays untouchable here: this struct
+/// carries only the verifiable projection — the two digests, the revision,
+/// and the Kernel work root the destination must live under — and never the
+/// Hume roots type itself. This is not a competing binding struct: it names
+/// the Host binding as its issuer and cannot substitute for it.
+///
+/// Binding rule enforced by the restore owner: digests must be 64-hex; the
+/// admitted work root must canonicalize-equal the Kernel's own work root
+/// (never caller text); when the archive carries a `config` artifact, the
+/// admitted manifest digest must equal that artifact's digest; the admitted
+/// values pin to `destination-admission.json` at prepare and any drift
+/// refuses later effects. Rehearsal without Host admission carries `None`
+/// instead: isolated import still runs, but cutover refuses without a
+/// pinned owner-approved admission.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationManifestEvidence {
+    /// Owner config digest of the active manifest (hex64).
+    pub manifest_digest: String,
+    /// Digest of the manifest-bound runtime roots (hex64).
+    pub roots_digest: String,
+    /// Registry CAS revision observed at inspection time.
+    pub registry_revision: u64,
+    /// Kernel work root the destination must live under.
+    pub kernel_work_root: PathBuf,
+}
+
+impl DestinationManifestEvidence {
+    /// Validates shapes and the admitted root. Cross-checks against the
+    /// Kernel-owned work root and the archive happen at restore entry, not
+    /// here: this validates the evidence itself.
+    pub fn validate(&self) -> Result<(), KernelRestoreError> {
+        if !is_hex64(&self.manifest_digest) {
+            return Err(KernelRestoreError::InvalidInput {
+                field: "restore.manifest_digest",
+                reason: "must be a 64-hex digest",
+            });
+        }
+        if !is_hex64(&self.roots_digest) {
+            return Err(KernelRestoreError::InvalidInput {
+                field: "restore.roots_digest",
+                reason: "must be a 64-hex digest",
+            });
+        }
+        if !self.kernel_work_root.is_absolute() {
+            return Err(KernelRestoreError::InvalidInput {
+                field: "restore.kernel_work_root",
+                reason: "the admitted work root must be absolute",
+            });
+        }
+        if !self.kernel_work_root.is_dir() {
+            return Err(KernelRestoreError::InvalidInput {
+                field: "restore.kernel_work_root",
+                reason: "the admitted work root must be an existing directory",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn is_hex64(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 /// Isolated-restore area below `<work_root>/.eliot`.
 pub const RESTORE_ISOLATED_AREA: &str = "restore-isolated";
 /// Resolved intent/result pairs retained per stream by pruning. The bounded
