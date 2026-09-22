@@ -57,12 +57,14 @@
 //! broker invalidation ....... broker owner (`BrokerOwnerClient::fence`
 //!                              through `fence_user_broker`, Active →
 //!                              Fenced, same retry discipline).
-//! route/runtime ............ no in-tree executors: sessions bind only
-//!                              (no terminate API), routes have no retire
-//!                              mutator (advancement belongs to the I14.14
-//!                              generation machine), generations retire via
-//!                              activation. These legs refuse with their
-//!                              exact owners until their #961 owners land.
+//! route invalidation ........ router owner (`retire_route_scope`:
+//!                              scopes drain so daemon, store-bridge, and
+//!                              registry admissions fail closed with
+//!                              `RouteMismatch`).
+//! runtime .................. no in-tree executor: module generations
+//!                              retire via activation, which belongs to the
+//!                              installer/Hume owner (#961). This leg
+//!                              refuses with its exact owner until then.
 //! ```
 //!
 //! The Host-issued destination authorization gates every effect: `restore`
@@ -91,6 +93,7 @@
 //! Value-based escapes.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use eliot_backup::{
     BackupBlob, BackupBundle, BackupError, BlobRestorationReceipt, CanonicalRecord,
@@ -105,6 +108,7 @@ use eliot_backup::{
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreObligations, RestoreProvenance};
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_kernel_core::GenerationRouter;
 use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseOperation, SupervisionLeasePrepareRequest};
 use eliot_ors::{EpochLineage, OpaqueLabel, OperationalRecordContext, OperationalRecordInput};
 use eliot_ors::{SessionDetach, StateFenceSnapshot, UserBrokerFence};
@@ -252,16 +256,27 @@ struct BrokerInvalidationProof {
     receipts_digest: String,
 }
 
+/// Route-invalidation proof recorded in the cutover decision: every route
+/// scope registered at execution was retired through the router owner.
+/// Count plus digest keeps the decision bounded; the retired route
+/// identities (scope, epoch, generation) hash into the digest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct RouteInvalidationProof {
+    retired_count: u64,
+    receipts_digest: String,
+}
+
 /// Executed invalidation proofs gating cutover. Each leg passes either by
-/// its exact owner in evidence or by the proof recorded here. Route and
-/// runtime have no in-tree executors, so they pass by evidence only —
-/// which finalize never marks satisfied, keeping cutover correctly gated
-/// until their #961 owners land.
+/// its exact owner in evidence or by the proof recorded here. Runtime has
+/// no in-tree executor, so it passes by evidence only — which finalize
+/// never marks satisfied, keeping cutover correctly gated until its #961
+/// owner lands.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExecutedInvalidations {
     lease: Option<LeaseTerminalProof>,
     session: Option<SessionInvalidationProof>,
     broker: Option<BrokerInvalidationProof>,
+    route: Option<RouteInvalidationProof>,
 }
 
 /// Caller-supplied cutover authority bundle: the separate Human/System
@@ -278,6 +293,10 @@ pub struct CutoverAuthority<'a> {
     pub lease_invalidation: CutoverLeaseInvalidation<'a>,
     /// Caller-live authority fence for delivered-generation currency.
     pub live_fence: &'a StateFence,
+    /// Live generation router whose scopes retire at cutover. Absence
+    /// refuses with the exact missing binding: routes cannot be
+    /// invalidated without their owner table.
+    pub router: Option<&'a Mutex<GenerationRouter>>,
 }
 
 /// Lease invalidation bound to one live supervision lease: the authority
@@ -915,6 +934,41 @@ impl KernelBackupRestore {
         Ok((session_proof, broker_proof))
     }
 
+    /// Journals the cutover decision to the bound ORS stream with the exact
+    /// observed predecessor: the durable linearization point of the whole
+    /// prerequisite chain.
+    fn journal_cutover_decision(
+        journal: &mut KernelRestoreJournal,
+        plan: &RestorePlan,
+        transaction_id: &str,
+        authorized_by: &str,
+        decision: &ObservedCutoverDecision,
+    ) -> Result<(), KernelRestoreError> {
+        let payload_bytes = canonical_json_bytes(decision)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let payload = String::from_utf8(payload_bytes.clone()).map_err(|_| {
+            KernelRestoreError::ArchiveInvalid(
+                "cutover decision payload is not UTF-8".to_owned(),
+            )
+        })?;
+        let plan_bytes = canonical_json_bytes(&plan.plan_id)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let request_bytes = canonical_json_bytes(&(
+            transaction_id,
+            plan.plan_id.as_str(),
+            authorized_by,
+        ))
+        .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        journal
+            .append_decision_row(
+                format!("cutover-decision-{}", sha256_hex(&plan_bytes)),
+                sha256_hex(&request_bytes),
+                payload,
+            )
+            .map_err(KernelRestoreError::TargetFailed)?;
+        Ok(())
+    }
+
     /// Proposes and commits one lease terminal ticket through the lease
     /// owner with readback proof: the first cutover prerequisite effect.
     /// Any refusal fails closed before sessions, brokers, or the decision.
@@ -1169,6 +1223,107 @@ impl KernelBackupRestore {
             receipts_digest,
         })
     }
+
+    /// Executes route retirement through the router owner with a journaled
+    /// proof: presence-checked binding, enumerate-then-act drain, and one
+    /// restore journal row. Any refusal fails the cutover closed.
+    fn execute_route_invalidation(
+        router: &Mutex<GenerationRouter>,
+        journal: &mut KernelRestoreJournal,
+        transaction_id: &str,
+        target_id: &str,
+    ) -> Result<RouteInvalidationProof, KernelRestoreError> {
+        let proof = Self::invalidate_routes(router)?;
+        let proof_bytes = canonical_json_bytes(&proof)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        Self::journal_invalidation_row(
+            journal,
+            transaction_id,
+            target_id,
+            "route",
+            &proof_bytes,
+        )?;
+        Ok(proof)
+    }
+
+    /// Retires every registered route scope through the router owner so
+    /// subsequent daemon, store-bridge, and registry admissions fail
+    /// closed with `RouteMismatch`: enumerate-then-act per attempt, so
+    /// retries skip already-retired scopes. A post-loop re-list requires
+    /// the table empty — concurrent registration during invalidation
+    /// refuses instead of cutting over with live routes. Runs under the
+    /// cutover issuer gate structurally (no destination-bound inputs to
+    /// carry); the lock is held only across the synchronous drain, never
+    /// across awaits.
+    fn invalidate_routes(
+        router: &Mutex<GenerationRouter>,
+    ) -> Result<RouteInvalidationProof, KernelRestoreError> {
+        let target_failed =
+            |detail: String| KernelRestoreError::TargetFailed(BackupError::Target(detail));
+        let mut guard = router
+            .lock()
+            .map_err(|_| target_failed("generation lock poisoned".to_owned()))?;
+        let mut retired = Vec::with_capacity(guard.scopes().len());
+        for scope in guard.scopes() {
+            let route = guard.retire_route_scope(&scope).map_err(|error| {
+                match error {
+                    eliot_kernel_core::KernelError::RouteMismatch => {
+                        KernelRestoreError::TargetFailed(BackupError::RestoreJournalCasConflict)
+                    }
+                    other => target_failed(other.to_string()),
+                }
+            })?;
+            retired.push(format!(
+                "{}:{}@{}",
+                scope.as_str(),
+                route.authority_epoch().value(),
+                route.active_generation().value()
+            ));
+        }
+        if !guard.scopes().is_empty() {
+            return Err(KernelRestoreError::FenceMismatch(
+                "routes registered during invalidation".to_owned(),
+            ));
+        }
+        drop(guard);
+        let (retired_count, receipts_digest) = Self::invalidation_proof(&retired)?;
+        Ok(RouteInvalidationProof {
+            retired_count,
+            receipts_digest,
+        })
+    }
+
+    /// Re-verifies post-invalidation quiescence immediately before the
+    /// cutover decision journals: no live sessions, no live broker
+    /// registrations, no registered routes. Any concurrent activation
+    /// between the executors and the decision refuses instead of cutting
+    /// over alongside survivors.
+    fn verify_post_invalidation_quiescence(
+        journal: &KernelRestoreJournal,
+        router: &Mutex<GenerationRouter>,
+    ) -> Result<(), KernelRestoreError> {
+        let projection = journal
+            .read_control_projection()
+            .map_err(KernelRestoreError::TargetFailed)?;
+        if !projection.active_session_refs.is_empty()
+            || !projection.active_user_broker_refs.is_empty()
+        {
+            return Err(KernelRestoreError::FenceMismatch(
+                "authority activated during cutover".to_owned(),
+            ));
+        }
+        let guard = router.lock().map_err(|_| {
+            KernelRestoreError::TargetFailed(BackupError::Target(
+                "generation lock poisoned".to_owned(),
+            ))
+        })?;
+        if !guard.scopes().is_empty() {
+            return Err(KernelRestoreError::FenceMismatch(
+                "routes registered during cutover".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 /// Validates the #961 cutover path for one completed isolated restore:
     /// owner-approved isolated destination, separate cutover authority,
     /// epoch lineage strictly newer than every observed value, and a
@@ -1193,10 +1348,10 @@ impl KernelBackupRestore {
     /// bound ORS stream with the exact observed predecessor, preserving
     /// intent-before-effect ordering for cutover too.
     ///
-    /// This path performs NO activation, retirement, route/process mutation,
-    /// or runtime live-authority invalidation: route/session binding
-    /// mechanics owned elsewhere (front-door sessions, generation routes,
-    /// module generations) plus cutover execution belong to the
+    /// This path performs NO activation, retirement, process mutation,
+    /// or runtime-generation invalidation: generation advancement,
+    /// module generations, and front-door session mechanics owned
+    /// elsewhere, plus cutover execution, belong to the
     /// installer/Hume owner (#961), whose files are untouched here. The
     /// lease, session, and broker legs execute here through their owners
     /// (terminal ticket propose/commit with readback proof; session detach
@@ -1219,6 +1374,7 @@ impl KernelBackupRestore {
             authorization: auth,
             lease_invalidation,
             live_fence,
+            router,
         } = *authority;
         Self::check_cutover_inputs(plan, bundle, receipt, evidence, auth)?;
         let auth = auth.ok_or(KernelRestoreError::CutoverNotAuthorized)?;
@@ -1230,6 +1386,11 @@ impl KernelBackupRestore {
                 capability: "lease-terminal-ticket",
             });
         }
+        // Route retirement needs the live owner table: absence refuses
+        // with the exact missing binding instead of pretending routes died.
+        let router = router.ok_or(KernelRestoreError::CapabilityMissing {
+            capability: "generation-router-binding",
+        })?;
         if destination.label() != plan.target.target_id
             || !destination.root().starts_with(&self.work_root)
         {
@@ -1271,6 +1432,12 @@ impl KernelBackupRestore {
             live_fence,
             &verified,
         )?;
+        let route_proof = Self::execute_route_invalidation(
+            router,
+            &mut self.journal,
+            transaction.transaction_id.as_str(),
+            plan.target.target_id.as_str(),
+        )?;
         let evidence = evidence.ok_or(KernelRestoreError::OwnerEvidenceInvalid(
             "no observed restore evidence".to_owned(),
         ))?;
@@ -1278,9 +1445,14 @@ impl KernelBackupRestore {
             lease: Some(lease_proof.clone()),
             session: Some(session_proof.clone()),
             broker: Some(broker_proof.clone()),
+            route: Some(route_proof.clone()),
         };
         require_cutover_obligations(&evidence.obligations, bundle, &invalidations)
             .map_err(KernelRestoreError::TargetFailed)?;
+        // Post-invalidation quiescence immediately before the decision
+        // journals: no live sessions, brokers, or routes may have appeared
+        // between the executors and this point.
+        Self::verify_post_invalidation_quiescence(&self.journal, router)?;
         let decision = ObservedCutoverDecision {
             plan_id: plan.plan_id.clone(),
             bundle_sha256: plan.bundle_sha256.clone(),
@@ -1298,33 +1470,20 @@ impl KernelBackupRestore {
             session_receipts_digest: session_proof.receipts_digest.clone(),
             broker_fenced_count: broker_proof.fenced_count,
             broker_receipts_digest: broker_proof.receipts_digest.clone(),
+            route_retired_count: route_proof.retired_count,
+            route_receipts_digest: route_proof.receipts_digest.clone(),
             authorization_digest: pinned.authorization_digest.clone(),
             new_authority_epoch: cutover.new_authority_epoch.clone(),
             new_resource_generation: cutover.new_resource_generation,
             canonical_only: cutover.canonical_only,
         };
-        let payload_bytes = canonical_json_bytes(&decision)
-            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
-        let payload = String::from_utf8(payload_bytes.clone()).map_err(|_| {
-            KernelRestoreError::ArchiveInvalid(
-                "cutover decision payload is not UTF-8".to_owned(),
-            )
-        })?;
-        let plan_bytes = canonical_json_bytes(&plan.plan_id)
-            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
-        let request_bytes = canonical_json_bytes(&(
+        Self::journal_cutover_decision(
+            &mut self.journal,
+            plan,
             transaction.transaction_id.as_str(),
-            plan.plan_id.as_str(),
             auth.authorized_by.as_str(),
-        ))
-        .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
-        self.journal
-            .append_decision_row(
-                format!("cutover-decision-{}", sha256_hex(&plan_bytes)),
-                sha256_hex(&request_bytes),
-                payload,
-            )
-            .map_err(KernelRestoreError::TargetFailed)?;
+            &decision,
+        )?;
         Ok(cutover)
     }
 }
@@ -1435,6 +1594,9 @@ fn require_cutover_obligations(
     if invalidations.broker.is_none() {
         require(owners::USER_BROKER, &obligations.user_broker_invalidation, true)?;
     }
+    if invalidations.route.is_none() {
+        require(owners::ROUTE, &obligations.route_invalidation, true)?;
+    }
     Ok(())
 }
 
@@ -1474,6 +1636,8 @@ struct ObservedCutoverDecision {
     session_receipts_digest: String,
     broker_fenced_count: u64,
     broker_receipts_digest: String,
+    route_retired_count: u64,
+    route_receipts_digest: String,
     authorization_digest: String,
     new_authority_epoch: EpochId,
     new_resource_generation: ResourceGeneration,

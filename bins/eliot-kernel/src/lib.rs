@@ -234,9 +234,9 @@ use eliot_ipc::{
     ServerHandshakePolicy, Session, TransportError, TransportLimits,
 };
 use eliot_kernel_core::{
-    AuthoritySnapshotBinding, DispatchSnapshotCodec, GenerationRoute, GenerationRouter,
-    KernelError, ProcessDispatchAuthorityController, RouteScope,
+    AuthoritySnapshotBinding, DispatchSnapshotCodec, KernelError, ProcessDispatchAuthorityController,
 };
+pub use eliot_kernel_core::{GenerationRoute, GenerationRouter, RouteScope};
 #[cfg(windows)]
 pub use eliot_kernel_service::KernelStoreGateway;
 #[cfg(windows)]

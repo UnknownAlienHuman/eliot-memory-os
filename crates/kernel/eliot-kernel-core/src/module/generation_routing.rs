@@ -238,6 +238,31 @@ impl GenerationRouter {
         Ok(())
     }
 
+    /// Retires one route scope, removing it so subsequent admissions fail
+    /// closed with [`KernelError::RouteMismatch`].
+    ///
+    /// Retired scopes never revive through this path: re-admission
+    /// requires a fresh `register` under the current epoch (which refuses
+    /// stale epochs itself). Returns the retired route as evidence.
+    /// An unknown scope refuses — nothing to invalidate — rather than
+    /// succeeding vacuously.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::RouteMismatch`] for an unknown scope.
+    pub fn retire_route_scope(
+        &mut self,
+        scope: &RouteScope,
+    ) -> Result<GenerationRoute, KernelError> {
+        self.routes.remove(scope).ok_or(KernelError::RouteMismatch)
+    }
+
+    /// Lists every currently registered route scope, in scope order.
+    #[must_use]
+    pub fn scopes(&self) -> Vec<RouteScope> {
+        self.routes.keys().cloned().collect()
+    }
+
     /// Resolves the active route for an exact, current fence.
     ///
     /// # Errors
