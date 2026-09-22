@@ -32,15 +32,21 @@ pub use install::{
 /// Canonical package-source types consumed at the installation boundary.
 ///
 /// Re-exported so the composition owner calls
-/// [`install_package`] without taking a second surface dependency; the types
-/// stay canonical (no duplicates, no bridges).
+/// [`install_package`] and drives the accepted-candidate chain without taking
+/// a second surface dependency; the types stay canonical (no duplicates, no
+/// bridges). This includes the governed-procedure projection surface the
+/// daemon rehydrates before install.
 pub use eliot_skills::{
     AdvisoryRuleClaim, Availability, AvailabilityField, CapabilityVersion, ConflictState,
-    DeliveryProjection, DependencyMaterial, DistractorState, FreshnessState, HostLimits,
-    HostProfile, LifecycleProposal, MaterializationInputs, MaterializationScope, PackageDigests,
-    QuarantineState, ReadinessClaims, RegistrationIdentity, SkillBehavior, SkillCounters,
-    SkillInteractionProjection, SkillPackage, SkillState, ToolDefinitionMaterial, UnavailableCode,
-    VersionedObservation, VersionedRequirement,
+    DeliveryProjection, DependencyMaterial, DistractorState, FreshnessState,
+    GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION, GovernedProcedureProjection, HostLimits,
+    HostProfile, InertAsset, LifecycleProposal, MaterializationInputs, MaterializationScope,
+    PackageDigests, PortableSkillPackageCandidate, ProcedureDefinition, ProcedureEvidence,
+    ProcedureState, ProcedureVerifier, QuarantineState, ReadinessClaims, ReceiptClaim,
+    RegistrationIdentity, SafetyPrivacyDisclosure, SkillBehavior, SkillCounters,
+    SkillInteractionProjection, SkillPackage, SkillState, TargetProfile, ToolDefinitionMaterial,
+    UnavailableCode, VersionedObservation, VersionedRequirement,
+    project_governed_procedure_to_portable_skill_candidates,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.skill";

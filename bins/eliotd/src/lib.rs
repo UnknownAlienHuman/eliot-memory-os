@@ -765,22 +765,23 @@ impl DaemonComposition {
     /// catalogue (population caller, issue #1882).
     ///
     /// Composition seam for the runtime population driver: the Governor
-    /// owner hands over a validated package claim, its actual materialization
-    /// inputs, the explicit install context, and the tool-owner view; the
-    /// shared handle records the projected entry. No readiness gate: this
-    /// operates purely on daemon-held catalogue state (validated insert),
-    /// never on Governor recovery owners; promotion keeps the Governor
-    /// canonical gates, and drivers call post-admission. Returns the
-    /// installed Skill identity.
+    /// owner hands over the accepted candidate, a validated package claim,
+    /// its actual materialization inputs, the explicit install context, and
+    /// the tool-owner view; the shared handle records the projected entry
+    /// after the candidate binding. No readiness gate: this operates purely
+    /// on daemon-held catalogue state (validated insert), never on Governor
+    /// recovery owners; promotion keeps the Governor canonical gates, and
+    /// drivers call post-admission. Returns the installed Skill identity.
     pub fn skill_install_package(
         &self,
+        candidate: &eliot_skill::PortableSkillPackageCandidate,
         package: &eliot_skill::SkillPackage,
         inputs: &eliot_skill::MaterializationInputs,
         context: &eliot_skill::CatalogueInstallContext,
         tools: &dyn eliot_skill::KnownTools,
     ) -> Result<String, eliot_skill::SkillError> {
         self.shared_skill_adapter()
-            .install_package(package, inputs, context, tools)
+            .install_package(candidate, package, inputs, context, tools)
     }
 
     /// Issues the Hotset delivery receipt the runtime injector carries
@@ -861,11 +862,13 @@ impl DaemonComposition {
     /// admitted-definition-version gate: the source reports the version it
     /// binds (MCP canonical registry via its `CanonicalToolSource` impl),
     /// the driver states the Governor-admitted version, and drift fails
-    /// closed before the shared handle is touched. The Skill never hardcodes
+    /// closed before the shared handle is touched. The accepted candidate
+    /// binds at the Skill boundary. The Skill never hardcodes
     /// the version; the composition never invents a registry. Drivers call
     /// post-admission with the injector's real inputs.
     pub fn skill_install_package_versioned(
         &self,
+        candidate: &eliot_skill::PortableSkillPackageCandidate,
         package: &eliot_skill::SkillPackage,
         inputs: &eliot_skill::MaterializationInputs,
         context: &eliot_skill::CatalogueInstallContext,
@@ -874,6 +877,7 @@ impl DaemonComposition {
         admitted_definition_version: &str,
     ) -> Result<String, eliot_skill::SkillError> {
         self.shared_skill_adapter().install_package_versioned(
+            candidate,
             package,
             inputs,
             context,
@@ -887,16 +891,18 @@ impl DaemonComposition {
     /// receipt issuance as one runtime delivery act (issue #1882).
     ///
     /// Same seam discipline as [`Self::skill_install_package`]: the driver
-    /// supplies the real package, inputs, context, provider readiness and
-    /// materialization scope, versioned tool source plus alias table and
-    /// admitted version, Hotset identity, and injector approval in one
+    /// supplies the accepted candidate plus the real package, inputs,
+    /// context, provider readiness and materialization scope, versioned tool
+    /// source plus alias table and admitted version, Hotset identity, and
+    /// injector approval in one
     /// [`VersionedDeliveryAct`](skill_lifecycle_adapters::VersionedDeliveryAct);
-    /// the shared handle records the act. The composition observes the live
-    /// admitted Governor fence itself and the act's scope fence must equal
-    /// it: a Governor refresh crossing the drive fails closed before any
-    /// catalogue write or receipt mint. The receipt carries the provisional
-    /// ceiling until evidence promotion; the receiver ack re-enters through
-    /// [`Self::skill_acknowledge_and_display`].
+    /// the shared handle records the act. The candidate rehydrates against
+    /// owner issuance and the live scope/fence before install. The
+    /// composition observes the live admitted Governor fence itself and the
+    /// act's scope fence must equal it: a Governor refresh crossing the
+    /// drive fails closed before any catalogue write or receipt mint. The
+    /// receipt carries the provisional ceiling until evidence promotion; the
+    /// receiver ack re-enters through [`Self::skill_acknowledge_and_display`].
     pub fn skill_run_install_to_receipt(
         &self,
         act: skill_lifecycle_adapters::VersionedDeliveryAct<'_>,
@@ -911,11 +917,11 @@ impl DaemonComposition {
     ///
     /// Production injector entry the Hotset transport lane calls with one
     /// injector-carried [`SkillHotsetRequest`](skill_lifecycle_adapters::SkillHotsetRequest):
-    /// package, inputs, Governor-owned install context, provider readiness,
-    /// scope identities, Hotset identity, and injector approval — no
-    /// literals, no defaults. The composition observes the live terms
-    /// itself: the canonical tool source plus admitted definition version
-    /// from the Governor hook
+    /// accepted candidate, package, inputs, Governor-owned install context,
+    /// provider readiness, scope identities, Hotset identity, and injector
+    /// approval — no literals, no defaults. The composition observes the
+    /// live terms itself: the canonical tool source plus admitted definition
+    /// version from the Governor hook
     /// ([`eliot_governor::canonical_skill_tool_source`]), the default-empty
     /// Skill-owned alias table (the frozen H-A composition call site), and
     /// the live admitted Governor fence. Returns the installed identity

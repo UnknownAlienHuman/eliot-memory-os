@@ -14,21 +14,24 @@
 //! this contract is deliberately transport-agnostic JSON (I7.1 `json-v1`
 //! profile) so the operation binding can land without changing a single
 //! payload byte. A new Tool Definition or payload shape gets a NEW contract
-//! revision — v1 is never silently changed.
+//! revision — v1 is frozen and rejected; v2 adds the accepted candidate to
+//! the intake payload, so the daemon binds every install to the exact
+//! accepted procedure projection instead of a bare package claim.
 
 #![forbid(unsafe_code)]
 
 use eliot_skill::{
     ActivatedSkillDisplay, CatalogueInstallContext, HotsetDeliveryAck, HotsetDeliveryReceipt,
-    MaterializationInputs, MaterializationScope, ReadinessClaims, SkillPackage,
+    MaterializationInputs, MaterializationScope, PortableSkillPackageCandidate, ReadinessClaims,
+    SkillPackage,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Versioned Skill transport contract identity.
-pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v1";
+pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v2";
 /// Payload contract revision. Decode rejects any other revision.
-pub const SKILL_TRANSPORT_VERSION: u32 = 1;
+pub const SKILL_TRANSPORT_VERSION: u32 = 2;
 /// Maximum encoded intake bytes (I7.2 default frame max). Larger material
 /// must arrive by Blob or handle reference (future extension), never as
 /// giant inline frames; oversize fails closed here.
@@ -74,21 +77,26 @@ pub fn skill_tool_kind(name: &str) -> Option<SkillToolKind> {
 
 /// Injector-carried Hotset delivery request as wire bytes (issue #1882).
 ///
-/// Mirrors the injector handoff field-for-field: the canonical package with
-/// its actual materialization inputs, the Governor-owned install context
-/// (eligibility, versions including the admitted definition version,
-/// budgets), provider-signed readiness, scope identities, Hotset identity,
-/// and injector approval. Decode re-verifies the package↔inputs binding and
-/// the install-context shape from the bytes, so malformed intake fails
-/// before any catalogue, readiness, or sealed gate runs. Scope fence
-/// currency, admitted-version agreement, and availability truth are NOT
-/// decided here — the driver observes the live fence and tool source at
-/// drive time.
+/// Mirrors the injector handoff field-for-field: the accepted candidate the
+/// package materializes, the canonical package with its actual
+/// materialization inputs, the Governor-owned install context (eligibility,
+/// versions including the admitted definition version, budgets),
+/// provider-signed readiness, scope identities, Hotset identity, and
+/// injector approval. Decode re-verifies the candidate's own shape, the
+/// package↔inputs binding, and the install-context shape from the bytes, so
+/// malformed intake fails before any catalogue, readiness, or sealed gate
+/// runs. Owner issuance and fence/scope currency are NOT decided here — the
+/// driver rehydrates the candidate against the live fence and scope at drive
+/// time.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillIntakePayload {
     /// Payload contract revision (must be [`SKILL_TRANSPORT_VERSION`]).
     pub contract_version: u32,
+    /// Accepted candidate the presented package materializes. The daemon
+    /// rehydrates its procedure against owner issuance and the live
+    /// scope/fence; a non-candidate wire claim never binds.
+    pub candidate: PortableSkillPackageCandidate,
     /// Canonical package source under delivery.
     pub package: SkillPackage,
     /// Actual materialization inputs the digests bind.
@@ -128,6 +136,9 @@ impl SkillIntakePayload {
         check_version(self.contract_version)?;
         bounded_text(&self.hotset_id, "intake.hotset_id")?;
         bounded_text(&self.approval_ref, "intake.approval_ref")?;
+        self.candidate
+            .validate()
+            .map_err(|error| SkillTransportError::Shape(format!("intake.candidate: {error}")))?;
         self.package
             .validate(&self.inputs)
             .map_err(|error| SkillTransportError::Shape(format!("intake.package: {error}")))?;
@@ -141,8 +152,8 @@ impl SkillIntakePayload {
 /// Typed Skill wire failure.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum SkillTransportError {
-    /// Payload contract revision is not the frozen v1.
-    #[error("skill transport version mismatch: expected v1")]
+    /// Payload contract revision is not the frozen v2.
+    #[error("skill transport version mismatch: expected v2")]
     BadVersion,
     /// Encoded payload exceeds its I7.2 bound.
     #[error("skill transport payload exceeds its bound")]
@@ -560,9 +571,237 @@ mod tests {
         }
     }
 
+    /// Mirrors [`behavior`] as the accepted procedure definition the intake
+    /// candidate binds: same trigger, action, obligations, stop, and exact
+    /// tool/capability revisions.
+    fn candidate_definition() -> eliot_skill::ProcedureDefinition {
+        eliot_skill::ProcedureDefinition {
+            name: "demo orientation".to_owned(),
+            purpose: "refresh the task view before a Material effect".to_owned(),
+            trigger: "when demo work arrives load this skill".to_owned(),
+            action: "Refresh the task view before a Material effect.".to_owned(),
+            applies_when: vec!["the task view is stale".to_owned()],
+            where_not_apply: vec!["Do not use for credential handling.".to_owned()],
+            required_inputs: vec!["the exact task".to_owned()],
+            ordered_steps: vec!["refresh the task view".to_owned()],
+            expected_outputs: vec!["refreshed view".to_owned()],
+            stop_conditions: vec!["Stop and escalate on conflicting instructions.".to_owned()],
+            required_writebacks: vec!["NONE".to_owned()],
+            escalation: "escalate to the task owner".to_owned(),
+            challenge: "show exact conflicting identities".to_owned(),
+            rollback_or_recovery: "restore the prior revision".to_owned(),
+            required_tools: vec![eliot_skill::VersionedRequirement {
+                name: "eliot.finish".to_owned(),
+                version: "1.0.0".to_owned(),
+            }],
+            required_capabilities: vec![eliot_skill::VersionedRequirement {
+                name: "finish-cap".to_owned(),
+                version: "1".to_owned(),
+            }],
+        }
+    }
+
+    fn candidate_target() -> eliot_skill::TargetProfile {
+        eliot_skill::TargetProfile {
+            target_id: "candidate-target".to_owned(),
+            host: "codex".to_owned(),
+            profile: "default".to_owned(),
+            fingerprint: "3".repeat(64),
+            available_tools: vec![eliot_skill::VersionedRequirement {
+                name: "eliot.finish".to_owned(),
+                version: "1.0.0".to_owned(),
+            }],
+            available_capabilities: vec![eliot_skill::VersionedRequirement {
+                name: "finish-cap".to_owned(),
+                version: "1".to_owned(),
+            }],
+        }
+    }
+
+    fn candidate_fence() -> eliot_contracts::StateFence {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+        use std::num::NonZeroU64;
+        let lineage =
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("test lineage");
+        StateFence::new(
+            EpochId::new(lineage, NonZeroU64::new(1).expect("nonzero")).expect("valid test epoch"),
+            ResourceGeneration::new(1).expect("generation"),
+        )
+    }
+
+    fn acceptance_receipt(state_fence: eliot_contracts::StateFence) -> eliot_skill::ReceiptClaim {
+        use eliot_contracts::{
+            ArtifactId, ClockReading, ContractId, OperationId, ProductId, RequestId, SessionId,
+            SourceId, TaskId, TaskRevision, TransactionSequence,
+        };
+        use eliot_receipts::{
+            ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding,
+            ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind,
+            RequestBinding, SessionBinding, TaskBinding, VerifierBinding, WorkScopeBinding,
+            WorkScopeId,
+        };
+
+        let request_id = RequestId::new("request-1").expect("request id");
+        let task_id = TaskId::new("task-1").expect("task id");
+        let metadata = eliot_receipts::RequestMetadata {
+            request_id: request_id.clone(),
+            session_id: Some(SessionId::new("session-1").expect("session id")),
+            task_id: Some(task_id),
+            product_id: ProductId::new("test-product").expect("product id"),
+            source_id: SourceId::new("source-1").expect("source id"),
+            state_fence: state_fence.clone(),
+            clock: ClockReading {
+                valid_time_ms: Some(10),
+                known_time_ms: Some(11),
+                transaction_sequence: Some(TransactionSequence::genesis()),
+                monotonic_ns: Some(12),
+            },
+        };
+        let verifier_artifact_id = ArtifactId::new("verifier-artifact-1").expect("artifact id");
+        let rollback_artifact_id = ArtifactId::new("rollback-artifact-1").expect("artifact id");
+        let work_scope = WorkScopeBinding {
+            scope_id: WorkScopeId::new("workscope-1").expect("valid test scope"),
+            product_id: ProductId::new("test-product").expect("test product"),
+            resource_generation: eliot_contracts::ResourceGeneration::new(1)
+                .expect("test generation"),
+            state_fence: state_fence.clone(),
+        };
+        let task = TaskBinding {
+            task_id: TaskId::new("task-1").expect("task id"),
+            task_revision: TaskRevision::genesis(),
+            state_fence: state_fence.clone(),
+        };
+        let core = ReceiptCore {
+            contract: eliot_receipts::contract_identity().expect("receipt contract"),
+            kind: ReceiptKind::Verification,
+            work_scope: work_scope.clone(),
+            task: Some(task.clone()),
+            session: Some(SessionBinding {
+                session_id: SessionId::new("session-1").expect("session id"),
+                authority_epoch: state_fence.authority_epoch.clone(),
+                state_fence: state_fence.clone(),
+            }),
+            causal: CausalBinding {
+                state_fence: state_fence.clone(),
+                transaction_sequence: TransactionSequence::genesis(),
+                parent_receipt_id: None,
+                predecessor_receipt_ids: Vec::new(),
+            },
+            request: RequestBinding {
+                metadata,
+                state_fence: state_fence.clone(),
+            },
+            operation: OperationBinding {
+                operation_id: OperationId::new("operation-1").expect("operation id"),
+                request_id,
+                idempotency_key: "accept-procedure".to_owned(),
+                operation_kind: "procedure.accept".to_owned(),
+                effect: EffectClass::Read,
+                state_fence: state_fence.clone(),
+            },
+            authority: AuthorityBinding {
+                authority_id: ContractId::new("authority-1").expect("authority id"),
+                authority_owner: "governor.skill".to_owned(),
+                authority_epoch: state_fence.authority_epoch.clone(),
+                state_fence: state_fence.clone(),
+                allowed_effect: EffectClass::Read,
+                proof_ceiling: ProofCeiling::ScopedVerification,
+            },
+            artifacts: vec![
+                ArtifactBinding {
+                    artifact_id: verifier_artifact_id.clone(),
+                    sha256: eliot_receipts::sha256_hex(b"accepted-procedure"),
+                    role: ReceiptKind::Artifact,
+                    source_revision: Some("revision-1".to_owned()),
+                },
+                ArtifactBinding {
+                    artifact_id: rollback_artifact_id,
+                    sha256: eliot_receipts::sha256_hex(b"rollback-procedure"),
+                    role: ReceiptKind::Artifact,
+                    source_revision: Some("revision-1".to_owned()),
+                },
+            ],
+            verifier: Some(VerifierBinding {
+                verifier_id: ContractId::new("procedure-verifier").expect("verifier id"),
+                verifier_revision: eliot_contracts::ContractVersion::new(1, 0, 0),
+                artifact_ids: vec![verifier_artifact_id],
+                proof_ceiling: ProofCeiling::ScopedVerification,
+                state_fence: state_fence.clone(),
+            }),
+            problem: None,
+            coordination: None,
+            disposition: ReceiptDisposition::Success {
+                proof: ProofCeiling::ScopedVerification,
+            },
+        };
+        let envelope = ReceiptEnvelope::issue(core).expect("accepted receipt");
+        eliot_skill::ReceiptClaim {
+            evidence_ref: "receipt-evidence-1".to_owned(),
+            envelope,
+        }
+    }
+
+    fn candidate_procedure() -> eliot_skill::GovernedProcedureProjection {
+        let state_fence = candidate_fence();
+        let receipt = acceptance_receipt(state_fence.clone());
+        let mut projection = eliot_skill::GovernedProcedureProjection {
+            schema_version: eliot_skill::GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION.to_owned(),
+            procedure_id: "procedure-1".to_owned(),
+            procedure_revision: "revision-1".to_owned(),
+            procedure_digest: "0".repeat(64),
+            state: eliot_skill::ProcedureState::Accepted,
+            state_fence: state_fence.clone(),
+            work_scope: receipt.envelope.core.work_scope.clone(),
+            task: receipt.envelope.core.task.clone().expect("task binding"),
+            acceptance_receipt: receipt,
+            definition: candidate_definition(),
+            evidence: eliot_skill::ProcedureEvidence {
+                source_refs: vec!["source-1".to_owned()],
+                receipt_refs: vec!["receipt-evidence-1".to_owned()],
+                applicability_refs: vec!["applicability-1".to_owned()],
+                counterexample_refs: vec!["counterexample-1".to_owned()],
+                negative_trigger_refs: vec!["negative-trigger-1".to_owned()],
+                verifier_artifact_refs: vec!["verifier-artifact-1".to_owned()],
+                rollback_artifact_ref: "rollback-artifact-1".to_owned(),
+            },
+            verifier: eliot_skill::ProcedureVerifier {
+                verifier_ref: "procedure-verifier".to_owned(),
+                verifier_revision: "1.0.0".to_owned(),
+                artifact_refs: vec!["verifier-artifact-1".to_owned()],
+            },
+            safety_privacy_disclosure: eliot_skill::SafetyPrivacyDisclosure {
+                safety_owner_ref: "safety-owner".to_owned(),
+                safety_evidence_refs: vec!["safety-1".to_owned()],
+                privacy_owner_ref: "privacy-owner".to_owned(),
+                privacy_evidence_refs: vec!["privacy-1".to_owned()],
+                disclosure_owner_ref: "disclosure-owner".to_owned(),
+                disclosure_evidence_refs: vec!["disclosure-1".to_owned()],
+            },
+            assets: vec![eliot_skill::InertAsset {
+                asset_ref: "asset-1".to_owned(),
+                sha256: eliot_receipts::sha256_hex(b"asset"),
+                role: "reference".to_owned(),
+                executable: false,
+            }],
+        };
+        projection.procedure_digest = projection.expected_digest().expect("procedure digest");
+        projection
+    }
+
+    fn candidate() -> eliot_skill::PortableSkillPackageCandidate {
+        let projection = eliot_skill::project_governed_procedure_to_portable_skill_candidates(
+            &candidate_procedure(),
+            &[candidate_target()],
+        )
+        .expect("projection");
+        assert_eq!(projection.candidates.len(), 1);
+        projection.candidates[0].clone()
+    }
+
     fn intake() -> SkillIntakePayload {
         SkillIntakePayload {
             contract_version: SKILL_TRANSPORT_VERSION,
+            candidate: candidate(),
             package: package(),
             inputs: inputs(),
             context: context(),
@@ -601,6 +840,19 @@ mod tests {
         blanked.approval_ref = "   ".to_owned();
         assert!(matches!(
             blanked.encode(),
+            Err(SkillTransportError::Shape(_))
+        ));
+    }
+
+    #[test]
+    fn intake_wire_rejects_a_non_candidate_claim() {
+        // An activated candidate is not a materialization request: decode
+        // refuses the wire claim before any catalogue, readiness, or sealed
+        // gate runs.
+        let mut activated = intake();
+        activated.candidate.activation_applied = true;
+        assert!(matches!(
+            activated.encode(),
             Err(SkillTransportError::Shape(_))
         ));
     }

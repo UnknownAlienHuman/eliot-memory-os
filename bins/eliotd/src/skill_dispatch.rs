@@ -138,6 +138,7 @@ fn build_inject_request(
     payload: &eliot_agent_bridge_core::SkillIntakePayload,
 ) -> crate::SkillHotsetRequest<'_> {
     crate::SkillHotsetRequest {
+        candidate: &payload.candidate,
         package: &payload.package,
         inputs: &payload.inputs,
         context: &payload.context,
@@ -273,7 +274,7 @@ mod tests {
                 session_id: Some("kernel-session-1".to_owned()),
                 task_id: None,
                 work_scope_id: None,
-                payload_schema_id: "eliot.skill.transport/v1".to_owned(),
+                payload_schema_id: "eliot.skill.transport/v2".to_owned(),
                 payload_sha256: "d".repeat(64),
             },
             state_fence: fence(),
