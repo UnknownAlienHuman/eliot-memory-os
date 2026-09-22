@@ -1130,6 +1130,41 @@ impl ServiceRegistrationRuntimeInspection {
     }
 }
 
+/// Complete read-only runtime capsule for a canonical service registration.
+///
+/// This is the owner-bound adapter surface for consumers that need both the
+/// typed two-sample SCM/process observation and the installer control-grant
+/// evidence read from the same service handle.  The legacy
+/// [`ServiceRegistrationRuntimeInspection`] remains available as a
+/// compatibility projection that intentionally drops the grant and absence
+/// proof; callers that make installation decisions must use this capsule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceRegistrationRuntimeReadback {
+    /// Exact configuration, stable runtime state, process identity and the
+    /// service-object grant were observed together.
+    Matching {
+        /// Stable SCM/process observation bound to the validated request.
+        observation: ServiceRuntimeObservation,
+        /// DACL/owner/group readback for the installer-controlled service
+        /// object.  It is absent only for a request that does not require the
+        /// canonical Host/Watchdog grant.
+        control_grant: Option<ServiceControlGrantReadback>,
+    },
+    /// The exact canonical service name was observed absent by SCM.
+    Absent {
+        /// Proof bound to the live absent query and expected configuration.
+        proof: ServiceAbsentProof,
+    },
+    /// The registration or live image/grant differs from the validated
+    /// request.
+    Mismatched,
+    /// SCM or the live process could not be observed authoritatively.
+    Unknown {
+        /// Typed diagnostics for the failing stage.
+        detail: ServiceInspectionUnknownDetail,
+    },
+}
+
 /// Result of one exact-registration-bound SCM start attempt.
 ///
 /// The operation is deliberately separate from the provider-neutral

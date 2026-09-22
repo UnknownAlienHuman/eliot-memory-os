@@ -270,8 +270,9 @@ pub use service_registration::{
     SERVICE_OWNER_READ_SECURITY_INFORMATION, ServiceAbsentProof, ServiceAccount,
     ServiceBootstrapArguments, ServiceControlGrantReadback, ServiceInspectionUnknownDetail,
     ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
-    ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection, ServiceRuntimeObservation,
-    ServiceSidType, ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
+    ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
+    ServiceRegistrationRuntimeReadback, ServiceRuntimeObservation, ServiceSidType,
+    ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
 };
 pub use supervision_authority_key::{
     SealedSupervisionAuthorityKey, SupervisionAuthorityKeyError,
@@ -2390,6 +2391,23 @@ impl WindowsPlatform {
         request: &ServiceRegistrationRequest,
     ) -> ServiceRegistrationRuntimeInspection {
         inspect_service_registration_runtime(request)
+    }
+
+    /// Reads back the complete canonical registration and its current SCM
+    /// process state without mutating the service, retaining the exact
+    /// installer control-grant readback from that same observation.
+    ///
+    /// Unlike [`Self::inspect_service_registration_runtime`], this capsule
+    /// also carries a live absence proof. Installation consumers use this
+    /// surface so a legacy `Partial` status sample cannot be promoted into a
+    /// matching registration decision and so DACL/owner/group evidence cannot
+    /// be detached from the runtime observation that admitted it.
+    #[must_use]
+    pub fn inspect_service_registration_runtime_with_control_grant(
+        &self,
+        request: &ServiceRegistrationRequest,
+    ) -> ServiceRegistrationRuntimeReadback {
+        inspect_service_registration_runtime_readback(request)
     }
 
     /// Starts one exact canonical service at most once.
@@ -5197,9 +5215,9 @@ const fn service_runtime_sample_is_stable(
     clippy::too_many_lines,
     reason = "the two-sample SCM/config/process identity contour must remain one ordered fail-closed observation"
 )]
-fn inspect_service_registration_runtime(
+fn inspect_service_registration_runtime_readback(
     request: &ServiceRegistrationRequest,
-) -> ServiceRegistrationRuntimeInspection {
+) -> ServiceRegistrationRuntimeReadback {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
     use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
@@ -5216,7 +5234,11 @@ fn inspect_service_registration_runtime(
     // SAFETY: null machine/database selects the local SCM; access is query-only.
     let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
-        return ServiceRegistrationRuntimeInspection::unknown(last_win32_code(), "open-scm");
+        return runtime_readback_from_inspection(
+            request,
+            ServiceRegistrationRuntimeInspection::unknown(last_win32_code(), "open-scm"),
+            None,
+        );
     }
     // SAFETY: name is NUL-terminated and manager is a live query handle.
     let service = unsafe {
@@ -5237,12 +5259,21 @@ fn inspect_service_registration_runtime(
         // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         return if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST.cast_signed()) {
-            ServiceRegistrationRuntimeInspection::Absent
+            runtime_readback_from_inspection(
+                request,
+                ServiceRegistrationRuntimeInspection::Absent,
+                None,
+            )
         } else {
-            ServiceRegistrationRuntimeInspection::unknown(code, "open-service")
+            runtime_readback_from_inspection(
+                request,
+                ServiceRegistrationRuntimeInspection::unknown(code, "open-service"),
+                None,
+            )
         };
     }
 
+    let mut control_grant = None;
     let result = (|| {
         let configuration = match query_service_configuration(service) {
             Ok(configuration) => configuration,
@@ -5254,7 +5285,7 @@ fn inspect_service_registration_runtime(
             return ServiceRegistrationRuntimeInspection::Mismatched;
         }
         match read_watchdog_host_control_grant(service, request) {
-            Ok(_) => {}
+            Ok(value) => control_grant = value,
             Err(error)
                 if matches!(
                     error.kind,
@@ -5373,14 +5404,75 @@ fn inspect_service_registration_runtime(
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
     }
-    result
+    runtime_readback_from_inspection(request, result, control_grant)
 }
 
 #[cfg(not(windows))]
-fn inspect_service_registration_runtime(
+fn inspect_service_registration_runtime_readback(
     _request: &ServiceRegistrationRequest,
+) -> ServiceRegistrationRuntimeReadback {
+    runtime_readback_from_inspection(
+        _request,
+        ServiceRegistrationRuntimeInspection::unknown(50, "unsupported-platform"),
+        None,
+    )
+}
+
+fn inspect_service_registration_runtime(
+    request: &ServiceRegistrationRequest,
 ) -> ServiceRegistrationRuntimeInspection {
-    ServiceRegistrationRuntimeInspection::unknown(50, "unsupported-platform")
+    runtime_readback_into_inspection(inspect_service_registration_runtime_readback(request))
+}
+
+fn runtime_readback_from_inspection(
+    request: &ServiceRegistrationRequest,
+    inspection: ServiceRegistrationRuntimeInspection,
+    control_grant: Option<ServiceControlGrantReadback>,
+) -> ServiceRegistrationRuntimeReadback {
+    match inspection {
+        ServiceRegistrationRuntimeInspection::Matching { observation } => {
+            ServiceRegistrationRuntimeReadback::Matching {
+                observation,
+                control_grant,
+            }
+        }
+        ServiceRegistrationRuntimeInspection::Absent => {
+            match ServiceAbsentProof::new(
+                request.service_name(),
+                request.expected_configuration_digest(),
+            ) {
+                Ok(proof) => ServiceRegistrationRuntimeReadback::Absent { proof },
+                Err(_) => ServiceRegistrationRuntimeReadback::Unknown {
+                    detail: ServiceInspectionUnknownDetail::new(87, "absent-proof"),
+                },
+            }
+        }
+        ServiceRegistrationRuntimeInspection::Mismatched => {
+            ServiceRegistrationRuntimeReadback::Mismatched
+        }
+        ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+            ServiceRegistrationRuntimeReadback::Unknown { detail }
+        }
+    }
+}
+
+fn runtime_readback_into_inspection(
+    readback: ServiceRegistrationRuntimeReadback,
+) -> ServiceRegistrationRuntimeInspection {
+    match readback {
+        ServiceRegistrationRuntimeReadback::Matching { observation, .. } => {
+            ServiceRegistrationRuntimeInspection::Matching { observation }
+        }
+        ServiceRegistrationRuntimeReadback::Absent { .. } => {
+            ServiceRegistrationRuntimeInspection::Absent
+        }
+        ServiceRegistrationRuntimeReadback::Mismatched => {
+            ServiceRegistrationRuntimeInspection::Mismatched
+        }
+        ServiceRegistrationRuntimeReadback::Unknown { detail } => {
+            ServiceRegistrationRuntimeInspection::Unknown { detail }
+        }
+    }
 }
 
 fn runtime_identity_digest_from_configuration(

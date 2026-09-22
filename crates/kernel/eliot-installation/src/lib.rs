@@ -44,14 +44,14 @@ use eliot_platform_windows::{
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
     InstallerSecretObservation, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
     ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
-    ServiceRegistrationInspection, ServiceRegistrationOutcome, ServiceRegistrationRequest,
-    ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStartOutcome,
-    ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
-    SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease, WindowsInstallerRootPrimitive,
-    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
-    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
-    fresh_service_registration_nonce, observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
+    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
+    ServiceRegistrationRuntimeReadback, ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
+    StagingReceipt, SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
+    UserOwnedPathLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
+    WindowsPlatform, WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
+    current_user_local_app_data_root, fresh_service_registration_nonce,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
 use eliot_platform_windows::{
@@ -4476,8 +4476,8 @@ impl WindowsInstallationEffectPort {
     ) -> Result<InstallationEffectObservation, PortError> {
         let (platform, registration, spec) = Self::service_context(request)?;
         let service_name = registration.service_name().to_owned();
-        match platform.inspect_service_registration(&registration) {
-            ServiceRegistrationInspection::Absent { proof } => {
+        match platform.inspect_service_registration_runtime_with_control_grant(&registration) {
+            ServiceRegistrationRuntimeReadback::Absent { proof } => {
                 if std::fs::symlink_metadata(service_marker_path(request)).is_ok() {
                     return Ok(root_mismatch("service-marker-before-intent"));
                 }
@@ -4489,7 +4489,7 @@ impl WindowsInstallationEffectPort {
                     &spec,
                 )
             }
-            ServiceRegistrationInspection::Matching { control_grant, .. } => {
+            ServiceRegistrationRuntimeReadback::Matching { control_grant, .. } => {
                 let digest = registration.expected_configuration_digest();
                 let control_grant = control_grant
                     .as_ref()
@@ -4531,8 +4531,10 @@ impl WindowsInstallationEffectPort {
                     ),
                 }
             }
-            ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
+            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
+                Ok(root_mismatch("service-readback"))
+            }
         }
     }
 
@@ -4543,15 +4545,17 @@ impl WindowsInstallationEffectPort {
         let (platform, registration, spec) = Self::service_context(request)?;
         let service_name = registration.service_name().to_owned();
         let digest = registration.expected_configuration_digest();
-        match platform.inspect_service_registration(&registration) {
-            ServiceRegistrationInspection::Absent { proof } => service_absent_from_live_inspection(
-                request,
-                &registration,
-                &proof,
-                &self.primitive,
-                &spec,
-            ),
-            ServiceRegistrationInspection::Matching { control_grant, .. } => {
+        match platform.inspect_service_registration_runtime_with_control_grant(&registration) {
+            ServiceRegistrationRuntimeReadback::Absent { proof } => {
+                service_absent_from_live_inspection(
+                    request,
+                    &registration,
+                    &proof,
+                    &self.primitive,
+                    &spec,
+                )
+            }
+            ServiceRegistrationRuntimeReadback::Matching { control_grant, .. } => {
                 let control_grant = control_grant
                     .as_ref()
                     .map(InstallerServiceControlGrantReceipt::from_readback)
@@ -4617,8 +4621,10 @@ impl WindowsInstallationEffectPort {
                     control_grant,
                 )
             }
-            ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
+            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
+                Ok(root_mismatch("service-readback"))
+            }
         }
     }
 
