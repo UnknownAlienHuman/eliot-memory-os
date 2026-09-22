@@ -76,6 +76,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::input::ReactiveCueActivation;
+use crate::settled_plan_feed::{
+    LiveActivationBindings, SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
+    drive_live_feed,
+};
 
 /// One cue hit mapped to its live owner atom.
 ///
@@ -251,4 +255,65 @@ fn project_hit(
         derived,
     });
     Ok(())
+}
+
+/// One served cue mapping plus its settled plan outcome, produced in a
+/// single causal call so the mapping and the plan cannot diverge.
+///
+/// The caller (daemon central export, B2-owned) assembles
+/// [`SettledPlanFeedInputs`] from the owner projections — the assembled A15
+/// view, the cue pair the Governor binder
+/// (`eliot_governor::bind_cue_pair_to_roles`) proved current for the live
+/// seven-role closure, the session/attention/coverage projections, and the
+/// delivery policy — and drives this feed. Caller data is never owner proof:
+/// both the serving gate and the feed gate re-verify every binding before
+/// anything plans.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServedViewFeed {
+    /// Live view cues served under the bindings fence.
+    pub served: ServedViewCues,
+    /// Settled plan outcome over the same inputs.
+    pub outcome: SettledPlanFeedOutcome,
+}
+
+/// Fail-closed feed errors. A serving rejection and a planning/producer
+/// defect surface distinctly; neither downgrades into the other.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServedViewFeedError {
+    /// The live view cues failed the serving gate (rotated fence, forged
+    /// pair, or unmapped binding).
+    Serve(ReactiveInputError),
+    /// The settled-plan feed rejected the inputs or its producer defected.
+    Feed(SettledPlanFeedError),
+}
+
+impl std::fmt::Display for ServedViewFeedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Serve(error) => write!(formatter, "served-view feed serving: {error}"),
+            Self::Feed(error) => write!(formatter, "served-view feed planning: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ServedViewFeedError {}
+
+/// Drive one served-view feed evaluation over the coherent fence readset.
+///
+/// Serves the live view cues under `bindings.state_fence` (the single fence
+/// every projection must be evaluated under), then drives the settled-plan
+/// feed over the same inputs and bindings. The serving mapping runs first so
+/// a stale or foreign view fails closed before the planner — which only
+/// checks the projections against each other — can ever observe it; the
+/// feed's own live-activation gate then re-verifies the readset before
+/// producing. Holds no state; replay protection stays with the A1 transport
+/// window and the bridge ledger, never here.
+pub fn drive_served_view_feed(
+    bindings: &LiveActivationBindings,
+    inputs: SettledPlanFeedInputs<'_>,
+) -> Result<ServedViewFeed, ServedViewFeedError> {
+    let served = serve_view_cues_under_fence(&bindings.state_fence, inputs.view, inputs.cue_activation)
+        .map_err(ServedViewFeedError::Serve)?;
+    let outcome = drive_live_feed(bindings, inputs).map_err(ServedViewFeedError::Feed)?;
+    Ok(ServedViewFeed { served, outcome })
 }

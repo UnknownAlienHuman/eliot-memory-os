@@ -40,9 +40,10 @@ mod context_inputs;
 mod cue_composition;
 mod epistemic_composition;
 pub use context_inputs::{
-    ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
-    ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
-    ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME, RoleAcquisition, SevenRoleInputs,
+    BoundCuePair, ContextInputsError, ContextReconstructionRequest, CuePairBindError,
+    GovernorContextInputs, ROLE_AFFORDANCES, ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION,
+    ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME,
+    RoleAcquisition, SevenRoleInputs, bind_cue_pair_to_roles,
 };
 pub use cue_composition::{
     CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,

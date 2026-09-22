@@ -41,14 +41,13 @@
 //! `Ok`-empty, never canned, never a facade-synthesized `Unavailable`
 //! standing in for the store's own answer.
 //!
-//! Downstream handoff (no new import here): once the manager registers the
-//! `eliot-reactive-context-plan` dependency, the integrator feeds the
-//! reconstructed owner view + cue pair into
-//! `eliot_reactive_context_plan::serve_view_cues_under_fence` under the same
-//! admitted fence, then into `drive_live_feed`. That call lives with the
-//! integrator (daemon central export, B2-owned), not in this hook, per
-//! `bins/AGENTS.md` (no task/memory/policy semantics in the composition
-//! binary).
+//! Downstream handoff (no new import here): the integrator feeds the
+//! reconstructed owner view + cue pair into the plan crate's
+//! `drive_served_view_feed` (serve under the admitted fence, then the
+//! settled-plan feed in one causal call) under the same admitted fence.
+//! That call lives with the integrator (daemon central export, B2-owned),
+//! not in this hook, per `bins/AGENTS.md` (no task/memory/policy semantics
+//! in the composition binary).
 //!
 //! Registration (lane D1, this copy): `bins/eliotd/src/lib.rs` declares
 //! `mod reactive_view_cue_feed;` plus a `pub use` of
