@@ -35,10 +35,11 @@
 //! reconstruction composition
 //! (`GovernorContextInputs::reconstruct`,
 //! `crates/governor/eliot-governor/src/context_inputs.rs:288`); delivery
-//! receipts, stickiness, and session dedup stay with the bridge owner. At
-//! base the store leg is `Unavailable` (MGR04/#19 owns the catalogue row,
-//! parameter schema, and adapter handlers), so the hook surfaces that
-//! `Unavailable` distinctly — never `Ok`-empty, never canned.
+//! receipts, stickiness, and session dedup stay with the bridge owner. A
+//! genuine gateway failure (including a store generation without the
+//! activated handler) surfaces with its exact typed identity — never
+//! `Ok`-empty, never canned, never a facade-synthesized `Unavailable`
+//! standing in for the store's own answer.
 //!
 //! Downstream handoff (no new import here): once the manager registers the
 //! `eliot-reactive-context-plan` dependency, the integrator feeds the
@@ -49,18 +50,19 @@
 //! `bins/AGENTS.md` (no task/memory/policy semantics in the composition
 //! binary).
 //!
-//! Registration (manager-owned, not this file): `bins/eliotd/src/lib.rs`
-//! needs `mod reactive_view_cue_feed;` plus a `pub use` of
+//! Registration (lane D1, this copy): `bins/eliotd/src/lib.rs` declares
+//! `mod reactive_view_cue_feed;` plus a `pub use` of
 //! [`serve_projection_inputs_under_fence`]. No manifest change: this module
 //! uses only the crate's existing dependencies. Do NOT register it in
 //! `main.rs` (`daemon_runtime` is binary-private; this hook consumes the
 //! lib-side serving function).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_read::{QueryResult, ReadError};
-use eliot_store_api::ScopeId;
+use eliot_store_api::{RevisionKey, ScopeId};
 
 use super::DaemonComposition;
 use super::DaemonKernelClient;
@@ -71,7 +73,8 @@ use super::governor_local_read::answer_projection_inputs;
 /// Verifies `ctx.state_fence` equals `admitted_fence`, then consumes the
 /// serving function
 /// [`answer_projection_inputs`](super::governor_local_read::answer_projection_inputs)
-/// with the validated `packet_ref` / `material_refs` shape and returns its
+/// with the closed `selector` / `max_records` selectors and the caller
+/// `ExactFence` dependency revisions, and returns its
 /// owner outcome unchanged: the exact record/provenance on success, or the
 /// typed fail-closed error (`Unavailable` until the MGR04/#19 store slice
 /// activates the operation). Holds no state; the composition retains no
@@ -83,8 +86,9 @@ pub async fn serve_projection_inputs_under_fence(
     admitted_fence: &StateFence,
     ctx: &RequestMetadata,
     scope: ScopeId,
-    packet_ref: Option<String>,
-    material_refs: Vec<String>,
+    selector: String,
+    max_records: u32,
+    dependency_revisions: BTreeMap<RevisionKey, u64>,
 ) -> Result<QueryResult, ReadError> {
     if ctx.state_fence != *admitted_fence {
         return Err(ReadError::InvalidField {
@@ -94,5 +98,14 @@ pub async fn serve_projection_inputs_under_fence(
                 .to_owned(),
         });
     }
-    answer_projection_inputs(composition, kernel, ctx, scope, packet_ref, material_refs).await
+    answer_projection_inputs(
+        composition,
+        kernel,
+        ctx,
+        scope,
+        selector,
+        max_records,
+        dependency_revisions,
+    )
+    .await
 }

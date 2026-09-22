@@ -13,6 +13,7 @@ mod input;
 mod plan;
 mod result;
 mod settled_plan_feed;
+mod view_cue_owner_serve;
 
 pub use bridge_admission::{
     BridgeAdmissionBatch, BridgeAdmissionDelivery, BridgeAdmissionError,
@@ -33,4 +34,7 @@ pub use result::{
 pub use settled_plan_feed::{
     LiveActivationBindings, SettledPlanFeed, SettledPlanFeedError, SettledPlanFeedInputs,
     SettledPlanFeedOutcome, drive_live_feed, produce_settled_plan_feed,
+};
+pub use view_cue_owner_serve::{
+    MappedCueTarget, ServedViewCues, UnmappedCueTarget, serve_view_cues_under_fence,
 };

@@ -113,10 +113,11 @@ pub enum ContextInputsError {
 /// (`task_id`+`max_records` for `GetTaskState`, optional
 /// `problem_id`+`max_records` for `GetAttentionAndProblems`,
 /// `selector`+`max_records` for `GetUnderstandingProjectionInputs`,
-/// `skill_id`+`max_records` for `GetCapabilityEvidenceState`); this
-/// reconstruction currently acquires those roles with no parameters, so
-/// against the real catalogue they resolve to per-role `Unavailable`
-/// (fail-closed) until a follow-up threads the closed selectors. Cue and
+/// `skill_id`+`max_records` for `GetCapabilityEvidenceState`); the
+/// understanding-projection roles (`GetUnderstandingProjectionInputs`) use
+/// the optional [`Self::understanding_selector`] plus
+/// [`Self::understanding_max_records`] closed selectors when present and no
+/// parameters otherwise. Cue and
 /// negative-memory roles share the one understanding-projection acquisition;
 /// only the candidate-stage interpretation differs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -132,6 +133,19 @@ pub struct ContextReconstructionRequest {
     pub evidence_subject: String,
     /// Explicit evidence bound (`1..=EVIDENCE_PACK_MAX_RECORDS`).
     pub evidence_max_records: u32,
+    /// Exact understanding-projection selector for the cue-activation and
+    /// negative-memory roles (`GetUnderstandingProjectionInputs`).
+    ///
+    /// `None` preserves the parameter-free acquisition (per-role
+    /// `Unavailable` against the real catalogue); `Some` threads the closed
+    /// selectors and requires [`Self::understanding_max_records`].
+    pub understanding_selector: Option<String>,
+    /// Explicit understanding-projection bound
+    /// (`1..=EVIDENCE_PACK_MAX_RECORDS`, the ceiling both production
+    /// adapters enforce for this operation).
+    ///
+    /// Required exactly when [`Self::understanding_selector`] is present.
+    pub understanding_max_records: Option<u32>,
 }
 
 impl ContextReconstructionRequest {
@@ -162,6 +176,27 @@ impl ContextReconstructionRequest {
             return Err(ContextInputsError::RequestInvalid(format!(
                 "evidence_max_records must be within 1..={EVIDENCE_PACK_MAX_RECORDS}"
             )));
+        }
+        match (&self.understanding_selector, self.understanding_max_records) {
+            (None, None) => {}
+            (Some(selector), Some(max_records)) => {
+                if selector.trim().is_empty() || selector.chars().any(char::is_control) {
+                    return Err(ContextInputsError::RequestInvalid(
+                        "understanding_selector must be non-blank text".to_owned(),
+                    ));
+                }
+                if max_records == 0 || max_records > EVIDENCE_PACK_MAX_RECORDS {
+                    return Err(ContextInputsError::RequestInvalid(format!(
+                        "understanding_max_records must be within 1..={EVIDENCE_PACK_MAX_RECORDS}"
+                    )));
+                }
+            }
+            _ => {
+                return Err(ContextInputsError::RequestInvalid(
+                    "understanding_selector and understanding_max_records must be supplied together"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -419,6 +454,33 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         request: &ContextReconstructionRequest,
     ) -> Result<RoleAcquisition, ContextInputsError> {
         let operation = NamedReadOperation::GetUnderstandingProjectionInputs;
+        let parameters = match (
+            request.understanding_selector.clone(),
+            request.understanding_max_records,
+        ) {
+            (Some(selector), Some(max_records)) => NamedParameters::from_map(BTreeMap::from([
+                ("selector".to_owned(), Value::String(selector)),
+                (
+                    "max_records".to_owned(),
+                    Value::String(max_records.to_string()),
+                ),
+            ]))
+            .map_err(|error| {
+                ContextInputsError::RequestRejected(bounded_reason(
+                    "invalid understanding selectors",
+                    error,
+                ))
+            })?,
+            // Selector-less acquisition keeps the established parameter-free
+            // shape: the catalogue resolves it to per-role `Unavailable`,
+            // never to an inferred selector.
+            (None, None) => NamedParameters::new(),
+            _ => {
+                return Err(ContextInputsError::RequestRejected(
+                    "understanding selectors must be supplied together".to_owned(),
+                ));
+            }
+        };
         match self
             .reads
             .query(
@@ -429,7 +491,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
-                    parameters: NamedParameters::new(),
+                    parameters,
                     provenance_handles: Vec::new(),
                 },
             )
@@ -914,6 +976,8 @@ mod reconstruction_tests {
             epistemic_position: "position-a".to_owned(),
             evidence_subject: "subject-a".to_owned(),
             evidence_max_records: 8,
+            understanding_selector: None,
+            understanding_max_records: None,
         })
     }
 

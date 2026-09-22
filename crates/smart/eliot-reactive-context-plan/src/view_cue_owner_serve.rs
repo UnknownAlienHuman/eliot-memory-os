@@ -54,13 +54,16 @@
 //! [`drive_live_feed`](crate::drive_live_feed)).
 //!
 //! Store-leg status: the live payload leg (`GetUnderstandingProjectionInputs`
-//! store handler) is MGR04/#19-owned and `Unavailable` at base, so this
-//! function serves owner-constructed views through the in-tree validated
-//! constructors and fails closed on any mismatch. It never synthesizes
-//! projection data, never returns `Ok`-empty, and mints no receipts: delivery
-//! receipts and stickiness stay with the bridge owner.
+//! through the closed `selector` + `max_records` catalogue selectors, served
+//! by the memory/Surreal adapters from committed named-operation rows and
+//! threaded by the Governor reconstruction and the daemon hook under the
+//! exact fence) feeds the owner view assembly upstream of this function. This
+//! function serves the assembled owner view and fails closed on any
+//! fence/admission/binding mismatch. It never synthesizes projection data,
+//! never returns `Ok`-empty, and mints no receipts: delivery receipts and
+//! stickiness stay with the bridge owner.
 //!
-//! Registration (manager-owned, not this file): `src/lib.rs` needs
+//! Registration (lane D1, this copy): `src/lib.rs` declares
 //! `mod view_cue_owner_serve;` plus a `pub use` of
 //! [`serve_view_cues_under_fence`], [`ServedViewCues`],
 //! [`MappedCueTarget`], and [`UnmappedCueTarget`]. No manifest change: this
