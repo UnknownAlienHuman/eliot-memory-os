@@ -725,6 +725,16 @@ impl KernelComposition {
         let testd_artifact_sha256 = config.testd_artifact_sha256.clone();
         let native_worker_artifact_sha256 = config.native_worker_artifact_sha256.clone();
         let eliotd_receipt_binding = config.eliotd_receipt_binding.clone();
+        let notification_client = config
+            .notify_executable_path
+            .map(super::automation_notification_client::KernelNotificationClient::new)
+            .transpose()
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "Notify client construction rejected the installer binding: {error}"
+                ))
+            })?
+            .map(Arc::new);
         if let Some(binding) = &eliotd_receipt_binding {
             binding.validate().map_err(|error| {
                 observe_entrypoint_with_detail(
@@ -1128,6 +1138,7 @@ impl KernelComposition {
             approved_config_hash,
             canonical_store_claimed: AtomicBool::new(false),
             blob_store: Mutex::new(blob_store),
+            notification_client,
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]

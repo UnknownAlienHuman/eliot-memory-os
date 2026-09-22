@@ -476,6 +476,10 @@ pub struct KernelComposition {
     /// while no approved blob manifest was injected; `Some` validates the
     /// manifest at startup without starting the generation.
     blob_store: Mutex<Option<BlobStoreController>>,
+    /// One optional, explicitly installer-bound Notify client retained by
+    /// Kernel composition. The client is supplied to the UserAutomation
+    /// runtime owner; this field owns no notification state or policy.
+    notification_client: Option<Arc<automation_notification_client::KernelNotificationClient>>,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
@@ -1200,6 +1204,18 @@ impl KernelComposition {
             .map_err(|_| "bridge connection lock poisoned".to_owned())?
             .values()
             .any(|state| state.session.is_some() || state.activation_completed))
+    }
+
+    /// Returns the single Kernel-owned Notify delivery client, when Host/B2
+    /// supplied an explicit installed binding during composition.
+    ///
+    /// The returned client is a transport port only. UserAutomation remains
+    /// the owner of failure semantics, while Notify remains the owner of
+    /// notification state and delivery policy.
+    pub fn user_automation_notification_client(
+        &self,
+    ) -> Option<Arc<automation_notification_client::KernelNotificationClient>> {
+        self.notification_client.clone()
     }
 
     #[cfg(windows)]
