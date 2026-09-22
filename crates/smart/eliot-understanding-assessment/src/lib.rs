@@ -25,9 +25,21 @@
 //! bank/feedback cites by handle plus revision cursor plus content digest,
 //! and journal/outcome/verifier cites by record handle inside a passed
 //! journal envelope (record identity plus envelope digest plus source
-//! revision). Cite-family labels record the caller's claimed role; binding
-//! proves owner-record existence, never role correctness — which is why
-//! verdicts stay candidates.
+//! revision). Outcome and discriminator legs additionally require
+//! owner-verified semantics: an outcome-kind journal event
+//! (`ProductOutcome`, `TaskProgress`, `FailureOrRepair`, `UserCorrection`,
+//! `LoopOrNoProgress`) or a view atom with an outcome role (`Evidence`,
+//! `Acceptance`) — and the `Verifier` role for verifier receipts — and an
+//! action-kind journal event (`ToolOrRoute`, `TaskProgress`) or an
+//! `Instruction`-role view atom for discriminative probes. Cite-family
+//! labels record the caller's claimed role; binding proves owner-record
+//! existence with the required role, never role correctness beyond that —
+//! which is why verdicts stay candidates. Rival, prediction, revision, and
+//! material-unknown cites carry exact existence binding only: no
+//! role-typed owner records exist for them in intake (`ObservationKind`
+//! and `SemanticRole` name no model, prediction, or revision kinds), so
+//! their roles stay caller-claimed and they cannot establish adequacy
+//! alone — the role-gated legs must also bind.
 //!
 //! Authority boundary: `validate()` is a shape and tamper check only, never
 //! authority — a shape hash is not provenance. The consumer authority path
@@ -62,13 +74,14 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::{ArtifactId, ContractVersion, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_context_contracts::{ActiveUnderstandingView, ContextError};
+use eliot_context_contracts::{ActiveUnderstandingView, ContextError, SemanticRole};
 use eliot_dreamer_contracts::self_query::{
     AcceptedSourceProjection, AcceptedSourceRef, SelfQueryContractError,
 };
 use eliot_epistemic_contracts::{ContractError as EpistemicError, ProviderContribution};
 use eliot_observation_contracts::{
     BankProjection, ExperienceRecordRef, FeedbackProjection, JournalProjection, ObservationError,
+    ObservationKind,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -87,6 +100,24 @@ pub const MAX_EVIDENCE_CITES: usize = 256;
 pub const MAX_SCOPE_TEXT: usize = 256;
 /// Maximum missing-input names carried by one scope.
 pub const MAX_MISSING_INPUTS: usize = 32;
+/// Journal event kinds carrying outcome semantics (`ObservationKind`, owner
+/// vocabulary): only these qualify a journal record as outcome evidence.
+const OUTCOME_KINDS: [ObservationKind; 5] = [
+    ObservationKind::ProductOutcome,
+    ObservationKind::TaskProgress,
+    ObservationKind::FailureOrRepair,
+    ObservationKind::UserCorrection,
+    ObservationKind::LoopOrNoProgress,
+];
+/// Journal event kinds carrying executed probe/action semantics: only these
+/// qualify a journal record as a discriminative probe or action.
+const ACTION_KINDS: [ObservationKind; 2] = [
+    ObservationKind::ToolOrRoute,
+    ObservationKind::TaskProgress,
+];
+/// View semantic roles carrying outcome semantics (`SemanticRole`, owner
+/// vocabulary): only these qualify a compiled atom as outcome evidence.
+const OUTCOME_ROLES: [SemanticRole; 2] = [SemanticRole::Evidence, SemanticRole::Acceptance];
 
 /// Assessment failure: every case fails closed with its reason.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -520,10 +551,118 @@ fn match_contribution(
         && cite.handle.as_str() == contribution.claim.as_str()
 }
 
-/// Match a journal/outcome/verifier cite by record handle inside a passed
-/// journal envelope, pinned by envelope digest plus source revision.
+/// Match a cite pin against a journal envelope: digest plus source revision.
 fn match_journal_record(cite: &EvidenceCite, envelope_digest: &str, source_revision: &str) -> bool {
     cite.digest == envelope_digest && cite.revision == source_revision
+}
+
+/// Match a journal/outcome/verifier cite to a journal record: exact record
+/// handle inside a passed envelope pinned by envelope digest plus source
+/// revision. Returns the owner event kind when the record carries an event.
+fn journal_record_kind(
+    cite: &EvidenceCite,
+    owner: &OwnerContext<'_>,
+) -> Option<ObservationKind> {
+    for evidence in owner.experience {
+        if let ExperienceEvidence::Journal(projection) = evidence {
+            if let Some(record) = projection
+                .records
+                .iter()
+                .find(|record| record.record_id == cite.handle.as_str())
+            {
+                if match_journal_record(cite, &projection.digest, &projection.source_revision) {
+                    return record.event.as_ref().map(|event| event.kind);
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Match an outcome/verifier cite to a compiled view atom: exact atom
+/// handle plus source revision plus source digest. Returns the owner
+/// semantic role assigned at admission.
+fn view_atom_role(cite: &EvidenceCite, view: &ActiveUnderstandingView) -> Option<SemanticRole> {
+    view.rendered
+        .iter()
+        .find(|atom| {
+            atom.atom_id == cite.handle
+                && atom.source_revision == cite.revision
+                && atom.source_digest == cite.digest
+        })
+        .map(|atom| atom.role)
+}
+
+/// Which adequacy leg a cite fills: only outcome and discriminator legs
+/// carry owner-role requirements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CiteLeg {
+    /// No role requirement beyond owner-record existence.
+    Neutral,
+    /// Applicable outcome evidence: owner outcome kind or outcome role.
+    Outcome,
+    /// Discriminative probe/action: owner action kind or instruction role.
+    Discriminator,
+}
+
+/// Enforce the owner-role requirement for outcome and discriminator legs.
+///
+/// Accepted-source, contribution, bank, and feedback cites resolve into
+/// typed owner envelopes whose membership already constrains semantics, so
+/// existence binding suffices there. Journal/outcome/verifier cites must
+/// additionally carry owner-verified semantics: an outcome-kind journal
+/// event, or a view atom with an outcome role (`Evidence`/`Acceptance`) for
+/// outcome evidence and the `Verifier` role for verifier receipts;
+/// discriminator cites require an action-kind journal event or an
+/// `Instruction`-role view atom. No role-typed owner records exist in
+/// intake for rival, prediction, revision, or material-unknown cites, so
+/// those legs stay on exact existence binding (documented residual: their
+/// roles stay caller-claimed, and they cannot establish adequacy alone
+/// because the role-gated legs must also bind).
+fn leg_role_ok(cite: &EvidenceCite, owner: &OwnerContext<'_>, leg: CiteLeg) -> bool {
+    match leg {
+        CiteLeg::Neutral => true,
+        CiteLeg::Outcome => match cite.family {
+            CitedFamily::AcceptedSource
+            | CitedFamily::EpistemicContribution
+            | CitedFamily::BankRecord
+            | CitedFamily::FeedbackRecord => true,
+            CitedFamily::JournalRecord => journal_record_kind(cite, owner)
+                .map(|kind| OUTCOME_KINDS.contains(&kind))
+                .unwrap_or(false),
+            CitedFamily::OutcomeRecord => {
+                journal_record_kind(cite, owner)
+                    .map(|kind| OUTCOME_KINDS.contains(&kind))
+                    .unwrap_or(false)
+                    || view_atom_role(cite, owner.view)
+                        .map(|role| OUTCOME_ROLES.contains(&role))
+                        .unwrap_or(false)
+            }
+            CitedFamily::VerifierReceipt => {
+                journal_record_kind(cite, owner)
+                    .map(|kind| OUTCOME_KINDS.contains(&kind))
+                    .unwrap_or(false)
+                    || view_atom_role(cite, owner.view)
+                        .map(|role| role == SemanticRole::Verifier)
+                        .unwrap_or(false)
+            }
+        },
+        CiteLeg::Discriminator => match cite.family {
+            CitedFamily::AcceptedSource
+            | CitedFamily::EpistemicContribution
+            | CitedFamily::BankRecord
+            | CitedFamily::FeedbackRecord => true,
+            CitedFamily::JournalRecord | CitedFamily::OutcomeRecord | CitedFamily::VerifierReceipt => {
+                journal_record_kind(cite, owner)
+                    .map(|kind| ACTION_KINDS.contains(&kind))
+                    .unwrap_or(false)
+                    || view_atom_role(cite, owner.view)
+                        .map(|role| role == SemanticRole::Instruction)
+                        .unwrap_or(false)
+            }
+        },
+    }
 }
 
 /// Match a bank/feedback cite by handle plus revision cursor plus content
@@ -564,21 +703,14 @@ fn classify_cite(
             Some(contribution) if match_contribution(cite, contribution) => CiteBinding::Bound,
             _ => CiteBinding::Unbound,
         }),
-        CitedFamily::JournalRecord | CitedFamily::OutcomeRecord | CitedFamily::VerifierReceipt => {
-            let mut bound = false;
-            for evidence in owner.experience {
-                if let ExperienceEvidence::Journal(projection) = evidence {
-                    if projection
-                        .records
-                        .iter()
-                        .any(|record| record.record_id == cite.handle.as_str())
-                        && match_journal_record(cite, &projection.digest, &projection.source_revision)
-                    {
-                        bound = true;
-                        break;
-                    }
-                }
-            }
+        CitedFamily::JournalRecord => Ok(if journal_record_kind(cite, owner).is_some() {
+            CiteBinding::Bound
+        } else {
+            CiteBinding::Unbound
+        }),
+        CitedFamily::OutcomeRecord | CitedFamily::VerifierReceipt => {
+            let bound = journal_record_kind(cite, owner).is_some()
+                || view_atom_role(cite, owner.view).is_some();
             Ok(if bound { CiteBinding::Bound } else { CiteBinding::Unbound })
         }
         CitedFamily::BankRecord | CitedFamily::FeedbackRecord => {
@@ -607,25 +739,28 @@ fn classify_cite(
 }
 
 /// Binding rollup over every carried cite list: stale accepted-source
-/// triples fail closed; every other unbound cite caps adequacy.
+/// triples fail closed; unbound cites and owner-role mismatches cap adequacy.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct BindingRollup {
     /// Accepted-source cites contradicting their projection.
     stale: Vec<String>,
     /// Well-formed cites matching no passed owner object.
     unbound: Vec<String>,
+    /// Bound cites whose owner record carries the wrong role for the leg.
+    role_mismatch: Vec<String>,
 }
 
 impl BindingRollup {
     fn classify_slots(
         &mut self,
-        slots: &[(&[EvidenceCite], &str)],
+        slots: &[(&[EvidenceCite], &str, CiteLeg)],
         owner: &OwnerContext<'_>,
     ) -> Result<(), AssessmentError> {
-        for (slot, name) in slots {
+        for (slot, name, leg) in slots {
             for cite in slot.iter() {
                 match classify_cite(cite, owner)? {
-                    CiteBinding::Bound => {}
+                    CiteBinding::Bound if leg_role_ok(cite, owner, *leg) => {}
+                    CiteBinding::Bound => self.role_mismatch.push((*name).to_string()),
                     CiteBinding::Stale => self.stale.push((*name).to_string()),
                     CiteBinding::Unbound => self.unbound.push((*name).to_string()),
                 }
@@ -634,10 +769,11 @@ impl BindingRollup {
         Ok(())
     }
 
-    /// True only when every carried cite resolved into an owner object.
+    /// True only when every carried cite resolved into an owner object with
+    /// the role its leg requires.
     #[must_use]
     fn fully_bound(&self) -> bool {
-        self.stale.is_empty() && self.unbound.is_empty()
+        self.stale.is_empty() && self.unbound.is_empty() && self.role_mismatch.is_empty()
     }
 }
 
@@ -819,12 +955,12 @@ impl CommonGroundAssessment {
         let mut rollup = BindingRollup::default();
         rollup.classify_slots(
             &[
-                (&self.common_ground_terminology_compatibility[..], "common_ground_terminology_compatibility"),
-                (&self.common_ground_reference_compatibility[..], "common_ground_reference_compatibility"),
-                (&self.common_ground_commitment_compatibility[..], "common_ground_commitment_compatibility"),
-                (&self.common_ground_action_consequence_compatibility[..], "common_ground_action_consequence_compatibility"),
-                (&self.common_ground_goals_decisions_invariants_rivals_unknowns_survival_after_model_harness_change[..], "common_ground_goals_decisions_invariants_rivals_unknowns_survival_after_model_harness_change"),
-                (&self.common_ground_public_inheritance_transfer_refs[..], "common_ground_public_inheritance_transfer_refs"),
+                (&self.common_ground_terminology_compatibility[..], "common_ground_terminology_compatibility", CiteLeg::Neutral),
+                (&self.common_ground_reference_compatibility[..], "common_ground_reference_compatibility", CiteLeg::Neutral),
+                (&self.common_ground_commitment_compatibility[..], "common_ground_commitment_compatibility", CiteLeg::Neutral),
+                (&self.common_ground_action_consequence_compatibility[..], "common_ground_action_consequence_compatibility", CiteLeg::Neutral),
+                (&self.common_ground_goals_decisions_invariants_rivals_unknowns_survival_after_model_harness_change[..], "common_ground_goals_decisions_invariants_rivals_unknowns_survival_after_model_harness_change", CiteLeg::Neutral),
+                (&self.common_ground_public_inheritance_transfer_refs[..], "common_ground_public_inheritance_transfer_refs", CiteLeg::Neutral),
             ],
             owner,
         )?;
@@ -845,6 +981,7 @@ impl CommonGroundAssessment {
         }
         let mut drifted = rollup.stale;
         drifted.extend(rollup.unbound);
+        drifted.extend(rollup.role_mismatch);
         if self.digest != self.compute_digest()? {
             drifted.push("assessment.digest".to_string());
         }
@@ -909,18 +1046,18 @@ pub fn assess_common_ground(input: CommonGroundInput<'_>) -> Result<CommonGround
     let mut rollup = BindingRollup::default();
     rollup.classify_slots(
         &[
-            (&slots[0][..], "assessment.terminology"),
-            (&slots[1][..], "assessment.reference"),
-            (&slots[2][..], "assessment.commitment"),
-            (&slots[3][..], "assessment.action_consequence"),
-            (&slots[4][..], "assessment.survival"),
-            (&slots[5][..], "assessment.transfer_refs"),
-            (&input.closure.rival_model[..], "closure.rival_model"),
-            (&input.closure.pre_probe_prediction[..], "closure.pre_probe_prediction"),
-            (&input.closure.discriminator[..], "closure.discriminator"),
-            (&input.closure.outcome_verifier[..], "closure.outcome_verifier"),
-            (&input.closure.revision[..], "closure.revision"),
-            (&input.closure.held_out[..], "closure.held_out"),
+            (&slots[0][..], "assessment.terminology", CiteLeg::Neutral),
+            (&slots[1][..], "assessment.reference", CiteLeg::Neutral),
+            (&slots[2][..], "assessment.commitment", CiteLeg::Neutral),
+            (&slots[3][..], "assessment.action_consequence", CiteLeg::Neutral),
+            (&slots[4][..], "assessment.survival", CiteLeg::Neutral),
+            (&slots[5][..], "assessment.transfer_refs", CiteLeg::Neutral),
+            (&input.closure.rival_model[..], "closure.rival_model", CiteLeg::Neutral),
+            (&input.closure.pre_probe_prediction[..], "closure.pre_probe_prediction", CiteLeg::Neutral),
+            (&input.closure.discriminator[..], "closure.discriminator", CiteLeg::Discriminator),
+            (&input.closure.outcome_verifier[..], "closure.outcome_verifier", CiteLeg::Outcome),
+            (&input.closure.revision[..], "closure.revision", CiteLeg::Neutral),
+            (&input.closure.held_out[..], "closure.held_out", CiteLeg::Neutral),
         ],
         &input.owner,
     )?;
@@ -1133,17 +1270,17 @@ impl ScopedUnderstandingAssessment {
         let mut rollup = BindingRollup::default();
         rollup.classify_slots(
             &[
-                (&self.scoped_current_model_and_rivals[..], "scoped_current_model_and_rivals"),
-                (&self.scoped_material_unknowns[..], "scoped_material_unknowns"),
-                (&self.scoped_pre_probe_predictions_fixed_before_observation[..], "scoped_pre_probe_predictions_fixed_before_observation"),
-                (&self.scoped_selected_discriminator_or_action[..], "scoped_selected_discriminator_or_action"),
-                (&self.scoped_observed_outcome_and_verifier[..], "scoped_observed_outcome_and_verifier"),
-                (&self.scoped_model_revision_after_outcome[..], "scoped_model_revision_after_outcome"),
-                (&self.scoped_counterfactual_or_held_out_evidence[..], "scoped_counterfactual_or_held_out_evidence"),
-                (&self.scoped_unanswerable_stale_case_where_applicable[..], "scoped_unanswerable_stale_case_where_applicable"),
-                (&self.scoped_counterfactual_intervention_or_state_update_case_where_applicable[..], "scoped_counterfactual_intervention_or_state_update_case_where_applicable"),
-                (&self.scoped_held_out_compositional_transfer_where_applicable[..], "scoped_held_out_compositional_transfer_where_applicable"),
-                (&self.scoped_abstention_precision_coverage_where_applicable[..], "scoped_abstention_precision_coverage_where_applicable"),
+                (&self.scoped_current_model_and_rivals[..], "scoped_current_model_and_rivals", CiteLeg::Neutral),
+                (&self.scoped_material_unknowns[..], "scoped_material_unknowns", CiteLeg::Neutral),
+                (&self.scoped_pre_probe_predictions_fixed_before_observation[..], "scoped_pre_probe_predictions_fixed_before_observation", CiteLeg::Neutral),
+                (&self.scoped_selected_discriminator_or_action[..], "scoped_selected_discriminator_or_action", CiteLeg::Discriminator),
+                (&self.scoped_observed_outcome_and_verifier[..], "scoped_observed_outcome_and_verifier", CiteLeg::Outcome),
+                (&self.scoped_model_revision_after_outcome[..], "scoped_model_revision_after_outcome", CiteLeg::Neutral),
+                (&self.scoped_counterfactual_or_held_out_evidence[..], "scoped_counterfactual_or_held_out_evidence", CiteLeg::Neutral),
+                (&self.scoped_unanswerable_stale_case_where_applicable[..], "scoped_unanswerable_stale_case_where_applicable", CiteLeg::Neutral),
+                (&self.scoped_counterfactual_intervention_or_state_update_case_where_applicable[..], "scoped_counterfactual_intervention_or_state_update_case_where_applicable", CiteLeg::Neutral),
+                (&self.scoped_held_out_compositional_transfer_where_applicable[..], "scoped_held_out_compositional_transfer_where_applicable", CiteLeg::Neutral),
+                (&self.scoped_abstention_precision_coverage_where_applicable[..], "scoped_abstention_precision_coverage_where_applicable", CiteLeg::Neutral),
             ],
             owner,
         )?;
@@ -1171,6 +1308,7 @@ impl ScopedUnderstandingAssessment {
         }
         let mut drifted = rollup.stale;
         drifted.extend(rollup.unbound);
+        drifted.extend(rollup.role_mismatch);
         if self.digest != self.compute_digest()? {
             drifted.push("assessment.digest".to_string());
         }
@@ -1229,16 +1367,16 @@ pub fn assess_scoped(input: ScopedInput<'_>) -> Result<ScopedUnderstandingAssess
     let mut rollup = BindingRollup::default();
     rollup.classify_slots(
         &[
-            (&input.closure.rival_model[..], "closure.rival_model"),
-            (&input.closure.pre_probe_prediction[..], "closure.pre_probe_prediction"),
-            (&input.closure.discriminator[..], "closure.discriminator"),
-            (&input.closure.outcome_verifier[..], "closure.outcome_verifier"),
-            (&input.closure.revision[..], "closure.revision"),
-            (&input.closure.held_out[..], "closure.held_out"),
-            (&input.material_unknowns[..], "assessment.material_unknowns"),
-            (&input.abstention[..], "assessment.abstention"),
-            (&input.unanswerable[..], "assessment.unanswerable"),
-            (&input.counterfactual[..], "assessment.counterfactual"),
+            (&input.closure.rival_model[..], "closure.rival_model", CiteLeg::Neutral),
+            (&input.closure.pre_probe_prediction[..], "closure.pre_probe_prediction", CiteLeg::Neutral),
+            (&input.closure.discriminator[..], "closure.discriminator", CiteLeg::Discriminator),
+            (&input.closure.outcome_verifier[..], "closure.outcome_verifier", CiteLeg::Outcome),
+            (&input.closure.revision[..], "closure.revision", CiteLeg::Neutral),
+            (&input.closure.held_out[..], "closure.held_out", CiteLeg::Neutral),
+            (&input.material_unknowns[..], "assessment.material_unknowns", CiteLeg::Neutral),
+            (&input.abstention[..], "assessment.abstention", CiteLeg::Neutral),
+            (&input.unanswerable[..], "assessment.unanswerable", CiteLeg::Neutral),
+            (&input.counterfactual[..], "assessment.counterfactual", CiteLeg::Neutral),
         ],
         &input.owner,
     )?;
