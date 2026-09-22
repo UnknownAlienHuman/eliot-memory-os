@@ -182,22 +182,30 @@ impl KernelComposition {
 
     #[cfg(windows)]
     fn revoke_all_agent_bridges(&self) -> Result<(), TransportError> {
+        // Keep the Kernel owner lock order identical to activation result
+        // admission: pending state is the cross-representation CAS owner and
+        // the connection map is acquired only after it. This prevents profile
+        // promotion from waiting on connections while a submitter waits on
+        // pending state.
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         let mut connections = self
             .agent_bridge_connections
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        for (_, mut state) in std::mem::take(&mut *connections) {
+        let revoked = std::mem::take(&mut *connections);
+        pending.fifo.clear();
+        pending.entries.clear();
+        drop(connections);
+        drop(pending);
+        for (_, mut state) in revoked {
             state.exchange.abort();
             if let Some(mut session) = state.session {
                 session.fence();
             }
             state.accepted_transport = None;
-        }
-        if let Ok(mut pending) = self.agent_activation_pending.lock() {
-            pending.fifo.clear();
-            pending.entries.clear();
-        } else {
-            return Err(TransportError::SessionFenced);
         }
         self.fence_all_host_requests();
         self.agent_activation_changed.notify_waiters();
@@ -657,8 +665,9 @@ impl KernelComposition {
     /// by the trusted resolver read per I1.8; Kernel rechecks only what it
     /// owns and never invents semantic identity.
     ///
-    /// Must be called without holding the pending lock; it takes the
-    /// connection, profile, and service locks in that order.
+    /// The helper itself does not acquire pending state. Callers that hold the
+    /// pending lock acquire it before this connection/profile/service sequence;
+    /// bridge revocation uses the same order.
     #[cfg(windows)]
     fn validate_result_bridge_leg(
         &self,
@@ -2056,16 +2065,16 @@ impl KernelComposition {
     #[cfg(windows)]
     pub fn revoke_agent_bridge(&self, connection_id: &str) {
         observe_bridge("kernel.bridge_cleanup", "attempt");
-        if let Ok(mut connections) = self.agent_bridge_connections.lock()
-            && let Some(mut state) = connections.remove(connection_id)
-        {
-            state.exchange.abort();
-            if let Some(mut session) = state.session.take() {
-                session.fence();
-            }
-            state.accepted_transport = None;
-        }
-        if let Ok(mut pending) = self.agent_activation_pending.lock() {
+        // This is the same pending-then-connections order used by result
+        // admission. Removing both records while both guards are held keeps a
+        // submitter from validating a live connection and then committing
+        // against a ticket that profile/disconnect revocation has removed.
+        let revoked = if let Ok(mut pending) = self.agent_activation_pending.lock() {
+            let revoked = self
+                .agent_bridge_connections
+                .lock()
+                .ok()
+                .and_then(|mut connections| connections.remove(connection_id));
             let removed = pending
                 .entries
                 .iter()
@@ -2079,6 +2088,16 @@ impl KernelComposition {
             pending
                 .fifo
                 .retain(|ticket_id| live_ticket_ids.contains(ticket_id));
+            revoked
+        } else {
+            None
+        };
+        if let Some(mut state) = revoked {
+            state.exchange.abort();
+            if let Some(mut session) = state.session.take() {
+                session.fence();
+            }
+            state.accepted_transport = None;
         }
         self.fence_host_requests_for_connection(connection_id);
         self.agent_activation_changed.notify_waiters();
