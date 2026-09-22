@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionResult, AtomAvailability, ContextCandidate,
-    ContextError, OmissionRecord,
+    ContextError, ContextOutcome, OmissionRecord,
 };
 use eliot_contracts::{ArtifactId, DecisionId, StateFence, fences_match_exact};
 use serde::{Deserialize, Serialize};
@@ -301,6 +301,11 @@ pub struct MaterialRankTrace {
     pub invalidation: Option<ArtifactId>,
     /// Decision anchor locating this material in its packet compilation.
     pub decision_id: DecisionId,
+    /// Owner-backed capacity signal: true when this material was admitted
+    /// while the admission economy reported zero remaining headroom. Read
+    /// directly from the admission economy receipt; it classifies nothing by
+    /// itself and never remaps the outcome.
+    pub capacity_constrained: bool,
     /// Content-addressed handle (`material-trace:<sha256>`) resolving to
     /// exactly this record; swapping any bound fact invalidates the handle.
     pub trace_handle: String,
@@ -354,6 +359,13 @@ pub fn trace_material(
         .iter()
         .map(|member| member.atom_id.clone())
         .collect();
+    // Owner-backed capacity fact: the admitted economy reports zero remaining
+    // headroom. Read once from the receipt that owns it; per-material use
+    // below only records the signal, never reinterprets it.
+    let headroom_exhausted = matches!(
+        &result.outcome,
+        ContextOutcome::Complete(set) if set.economy.allocations.remaining_headroom == 0
+    );
     let omissions: BTreeMap<&ArtifactId, &OmissionRecord> = result
         .evidence
         .omissions
@@ -383,6 +395,11 @@ pub fn trace_material(
             dependencies: candidate.dependencies.clone(),
             invalidation: omission.and_then(|item| item.invalidation.clone()),
             decision_id: input.binding.decision_id.clone(),
+            capacity_constrained: headroom_exhausted
+                && matches!(
+                    decision.disposition,
+                    AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
+                ),
             trace_handle: String::new(),
         };
         trace.trace_handle = material_trace_handle(&trace)?;

@@ -27,7 +27,7 @@ use eliot_protocol::{
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
     LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME, forward_admitted_local_read,
-    terminal_for_invalid_ticket,
+    poll_retrieval_drive, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -656,6 +656,16 @@ async fn run_loop(
                 // gate: it must start even while an activation is in flight,
                 // so its gate is checked before the activation early-continue.
                 maybe_start_local_read_poll(&kernel, &composition, &mut local_read_flight);
+                // Retrieval/admission drive rides the same tick under its own
+                // gate (Implements #1947): supplier-pending idles with a
+                // typed outcome, while a resolved owner bundle drives plan
+                // validation and traced admission synchronously. The outcome
+                // is accounted by family below; no arm is a silent drop.
+                let retrieval_outcome = poll_retrieval_drive(&composition);
+                tracing::debug!(
+                    outcome = retrieval_outcome.kind(),
+                    "eliotd retrieval drive settled"
+                );
                 if decide_activation_tick(&flight) == ActivationTickDecision::StartClaim {
                     flight = ActivationFlight::InFlight(ActivationFlightState {
                         future: start_activation_claim(&kernel),

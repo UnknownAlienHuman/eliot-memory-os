@@ -21,6 +21,8 @@ eliot-agent-coordinator.workspace = true
 eliot-authority.workspace = true
 eliot-contracts.workspace = true
 eliot-config.workspace = true
+eliot-context-admission = { path = "../../crates/smart/eliot-context-admission", version = "0.1.0" }
+eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts", version = "0.1.0" }
 eliot-controlboard.workspace = true
 eliot-doctor-core.workspace = true
 eliot-dreamer-bundle = { path = "../../crates/smart/eliot-dreamer-bundle", version = "0.1.0" }
@@ -39,6 +41,7 @@ eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 eliot-protocol.workspace = true
+eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan", version = "0.1.0" }
 eliot-read = { path = "../../crates/governor/eliot-read", version = "0.1.0" }
 eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
