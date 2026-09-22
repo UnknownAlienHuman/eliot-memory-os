@@ -58,7 +58,11 @@ use eliot_agent_coordinator::{
     StaffingPlanRequest, VerifiedSessionBinding, produce_session_bound_attempts,
     verify_session_binding,
 };
-use eliot_contracts::{SessionId, StateFence, TaskId, WorkLeaseId, fences_match_exact};
+use eliot_contracts::{
+    ClockReading, ProductId, RequestMetadata, SessionId, SourceId, StateFence, TaskId, WorkLeaseId,
+    fences_match_exact,
+};
+use eliot_governor::TaskRecord;
 use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_process::ProcessRequest;
 use eliot_protocol::{AgentActivationResolutionDisposition, AgentActivationResolutionResult};
@@ -124,6 +128,10 @@ pub struct DispatchedExecution {
 /// Fail-closed execution-chain errors.
 #[derive(Debug, Error)]
 pub enum ExecutionChainError {
+    /// The live task record is terminal; a closed task never dispatches
+    /// execution, so a resolution naming one fails closed here.
+    #[error("live task record is terminal; closed tasks never dispatch")]
+    TaskTerminal,
     /// The live attach receipt disagrees with the freshly read live triple:
     /// the attach is stale or belongs to another session/task.
     #[error("live attach receipt disagrees with the live triple at {field}")]
@@ -661,6 +669,53 @@ pub fn supply_coordinator_config() -> Result<CoordinatorConfig, ExecutionChainEr
     })
 }
 
+/// Read the live Governor task record for one admitted task.
+///
+/// Owner: Governor task lifecycle (`DaemonComposition::task_lifecycle`
+/// forwarding to the Governor owner). The request metadata binds the live
+/// session, the admitted task, and the live fence exactly like the
+/// fence-bound read contexts elsewhere in this binary; the record itself is
+/// never minted here. Fails closed when the composition is not ready, the
+/// metadata is invalid, or the Governor owner holds no such task.
+pub fn supply_live_task_record(
+    composition: &DaemonComposition,
+    session: &SessionId,
+    task: &TaskId,
+    fence: &StateFence,
+) -> Result<TaskRecord, ExecutionChainError> {
+    let refused = |reason: String| ExecutionChainError::SupplierReadRejected {
+        owner: "Governor task lifecycle",
+        reason,
+    };
+    let context = RequestMetadata {
+        request_id: RequestId::new("eliotd:execution:task-view")
+            .map_err(|error| refused(error.to_string()))?,
+        session_id: Some(session.clone()),
+        task_id: Some(task.clone()),
+        product_id: ProductId::new(crate::SERVICE_NAME)
+            .map_err(|error| refused(error.to_string()))?,
+        source_id: SourceId::new(crate::SERVICE_NAME)
+            .map_err(|error| refused(error.to_string()))?,
+        state_fence: fence.clone(),
+        clock: ClockReading {
+            valid_time_ms: None,
+            known_time_ms: None,
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    context
+        .validate()
+        .map_err(|error| refused(error.to_string()))?;
+    let lifecycle = composition
+        .task_lifecycle()
+        .map_err(|error| refused(error.to_string()))?;
+    lifecycle
+        .view(&context, task)
+        .map_err(|error| refused(error.to_string()))?
+        .ok_or_else(|| refused("task unknown to Governor owner".to_owned()))
+}
+
 /// Attempt the Task-Controller staffing request.
 /// Absent: the Task Controller issues staffing requests through a channel
 /// with no daemon intake read — the only consumer,
@@ -780,14 +835,71 @@ pub enum GovernedDispatchOutcome {
     Failed(ExecutionChainError),
 }
 
+/// Validate one retained Governor resolution against live owners: admitted
+/// session/task text into canonical types, session agreement with the live
+/// Kernel session (the daemon serves a single live owner session), then live
+/// Governor task-record currency (fence agreement plus owner-defined
+/// non-terminality). Task, principal, scope, and plan are observed and
+/// traced — no independent live task/principal read exists in daemon scope,
+/// so they are never asserted, only recorded. The owner's revision counter
+/// is observed only: it has no canonical text rendering in-tree, so it is
+/// never compared against owner-minted revision text. Non-Resolved
+/// dispositions are checked by the caller before invoking this helper.
+fn check_activation_admission(
+    composition: &DaemonComposition,
+    activation: Option<&AgentActivationResolutionResult>,
+    live_session: Option<&SessionId>,
+    live_fence: &StateFence,
+) -> Result<(), ExecutionChainError> {
+    let Some(result) = activation else {
+        return Ok(());
+    };
+    let AgentActivationResolutionDisposition::Resolved { binding } = &result.disposition else {
+        return Ok(());
+    };
+    let admitted_session =
+        SessionId::new(binding.session_id.clone()).map_err(ExecutionChainError::OwnerIdentity)?;
+    let admitted_task =
+        TaskId::new(binding.task_id.clone()).map_err(ExecutionChainError::OwnerIdentity)?;
+    match live_session {
+        Some(live) if live == &admitted_session => {
+            tracing::debug!(
+                session = %crate::diagnostics::sanitize_identity(admitted_session.as_str()),
+                task = %crate::diagnostics::sanitize_identity(admitted_task.as_str()),
+                principal = %crate::diagnostics::sanitize_identity(&binding.principal_id),
+                "activation-resolved triple agrees with the live owner session",
+            );
+        }
+        _ => {
+            return Err(ExecutionChainError::Match(
+                SessionMatchError::SessionMismatch,
+            ));
+        }
+    }
+    let record = supply_live_task_record(composition, &admitted_session, &admitted_task, live_fence)?;
+    if !fences_match_exact(&record.state_fence, live_fence) {
+        return Err(ExecutionChainError::StaleAdmissionFence);
+    }
+    if !record.state.is_active() {
+        return Err(ExecutionChainError::TaskTerminal);
+    }
+    tracing::debug!(
+        task_revision = record.revision,
+        fence_generation = live_fence.resource_generation.value(),
+        "live task record agrees with the live fence and is executable",
+    );
+    Ok(())
+}
+
 /// Poll one governed execution dispatch from live owners.
 ///
 /// Evaluated in the daemon binary flow (see the run-loop dispatch arm):
 /// reads the live Kernel fence, owner session, and Governor fence; requires
 /// Kernel/Governor fence agreement under the normative
 /// [`fences_match_exact`]; validates a retained Governor resolution's
-/// admitted session/task triple against the live Kernel session when one
-/// was consumed for this dispatch; and either dispatches through
+/// admitted session/task triple against the live Kernel session and the
+/// live Governor task record (fence agreement plus owner-defined
+/// non-terminality); and either dispatches through
 /// [`launch_closed_execution`] with a presented bundle or declines with the
 /// exact live missing-owner inventory. Absence of dispatchable work is a
 /// normal idle outcome, never an error, and execution-plane failures must
@@ -824,36 +936,17 @@ pub fn poll_governed_dispatch(
     // live task/principal read exists in daemon scope, so they are never
     // asserted, only recorded. Disagreement fails closed with the exact
     // field; non-Resolved dispositions carry no admission signal.
-    if let Some(result) = activation
-        && let AgentActivationResolutionDisposition::Resolved { binding } = &result.disposition
-    {
-        let admitted_session = match SessionId::new(binding.session_id.clone()) {
-            Ok(session) => session,
-            Err(error) => {
-                return GovernedDispatchOutcome::Failed(ExecutionChainError::OwnerIdentity(error));
-            }
-        };
-        let admitted_task = match TaskId::new(binding.task_id.clone()) {
-            Ok(task) => task,
-            Err(error) => {
-                return GovernedDispatchOutcome::Failed(ExecutionChainError::OwnerIdentity(error));
-            }
-        };
-        match &live_session {
-            Some(live) if *live == admitted_session => {
-                tracing::debug!(
-                    session = %crate::diagnostics::sanitize_identity(admitted_session.as_str()),
-                    task = %crate::diagnostics::sanitize_identity(admitted_task.as_str()),
-                    principal = %crate::diagnostics::sanitize_identity(&binding.principal_id),
-                    "activation-resolved triple agrees with the live owner session",
-                );
-            }
-            _ => {
-                return GovernedDispatchOutcome::Failed(ExecutionChainError::Match(
-                    SessionMatchError::SessionMismatch,
-                ));
-            }
-        }
+    // Activation-resolved admission: when the loop retained a Governor
+    // resolution for this dispatch, validate its admitted triple and task
+    // record against live owners. Non-Resolved dispositions carry no
+    // admission signal and pass through untouched.
+    if let Err(error) = check_activation_admission(
+        composition,
+        activation,
+        live_session.as_ref(),
+        &live_fence,
+    ) {
+        return GovernedDispatchOutcome::Failed(error);
     }
     let Some(bundle) = bundle else {
         // No presented bundle: report the live missing-owner inventory. A
