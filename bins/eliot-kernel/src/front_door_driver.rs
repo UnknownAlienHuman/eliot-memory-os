@@ -384,7 +384,6 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
-            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 session.fence();
