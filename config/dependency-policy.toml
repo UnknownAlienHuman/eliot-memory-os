@@ -39,6 +39,15 @@ trust_model = "local-loopback-service-only"
 removal_boundary = "pluggable-storage-facade"
 owner = "crates/storage/eliot-store-surreal"
 
+[direct_dependencies.aes-gcm]
+ecosystem = "rust"
+consumer = "eliot-backup"
+owner = "crates/storage/eliot-backup"
+reason = "vetted AES-256-GCM for portable backup envelope open and re-seal (#1873)"
+features = ["aes", "alloc"]
+public_exposure = "none (sealed bytes and digests only; no key or plaintext types cross the API)"
+removal_plan = "installation-bound DPAPI path remains; portable restore degrades to refused"
+
 [direct_dependencies.anyhow]
 ecosystem = "rust"
 consumer = "workspace error reporting"
@@ -92,6 +101,15 @@ reason = "Sink/Stream utility combinators"
 features = ["sink"]
 public_exposure = "internal async conduits"
 removal_plan = "hand-rolled poll loop"
+
+[direct_dependencies.getrandom]
+ecosystem = "rust"
+consumer = "eliot-backup"
+owner = "crates/storage/eliot-backup"
+reason = "OS randomness for portable envelope nonces (#1873)"
+features = []
+public_exposure = "none"
+removal_plan = "installation-bound DPAPI path remains; portable sealing refused without nonces"
 
 [direct_dependencies.wasmtime]
 ecosystem = "rust"
