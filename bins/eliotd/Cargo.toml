@@ -39,6 +39,7 @@ eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 eliot-protocol.workspace = true
+eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan" }
 eliot-read = { path = "../../crates/governor/eliot-read" }
 eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true

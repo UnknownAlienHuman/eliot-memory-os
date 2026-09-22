@@ -489,3 +489,39 @@ pub fn canonical_planning_digest<T: Serialize>(value: &T) -> Result<String, Reac
     }
     Ok(sha256_hex(&bytes))
 }
+
+/// Owner-issued parts for one immutable planning view closure (#1942 lane D).
+///
+/// Assembled by the context-assembly owner from the live A15 closure. Digests
+/// are computed by [`produce_context_planning_view`], never supplied by
+/// callers: a caller cannot smuggle a mismatched digest past the producer.
+pub struct ContextPlanningViewParts {
+    /// Owner-issued view identity.
+    pub view_id: ArtifactId,
+    /// Assembled live view.
+    pub view: ActiveUnderstandingView,
+    /// Admitted set the view was assembled from.
+    pub admitted: AdmittedContextSet,
+    /// Canonical bytes of the rendered view payload.
+    pub canonical_bytes: Vec<u8>,
+    /// Canonical bytes of the admitted payload used to assemble the view.
+    pub admitted_canonical_bytes: Vec<u8>,
+}
+
+/// Produce (retain + intrinsically validate) one immutable planning view.
+///
+/// Authority boundary: the context-assembly owner owns view content; this
+/// producer only retains the supplied closure through the existing validated
+/// constructor. It mints no view, admits nothing, and delivers nothing.
+/// Fail-closed: any intrinsic violation is returned, never defaulted.
+pub fn produce_context_planning_view(
+    parts: ContextPlanningViewParts,
+) -> Result<ContextPlanningView, ReactiveInputError> {
+    ContextPlanningView::new(
+        parts.view_id,
+        parts.view,
+        parts.admitted,
+        parts.canonical_bytes,
+        parts.admitted_canonical_bytes,
+    )
+}

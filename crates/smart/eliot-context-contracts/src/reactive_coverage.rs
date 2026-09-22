@@ -506,3 +506,86 @@ impl IntegrationCoverageProfile {
         Ok(())
     }
 }
+
+/// Owner-issued parts for one immutable integration coverage profile (#1942 lane D).
+///
+/// Issued by the host/coverage owner from live capability observations. The
+/// profile digest is computed by [`produce_integration_coverage_profile`],
+/// never supplied by callers. An advisory hook that disappeared stays an
+/// explicit gap here; the producer never marks unavailable coverage as
+/// enforced or observed.
+pub struct IntegrationCoverageProfileParts {
+    /// Host identity the observations were taken on.
+    pub host_id: String,
+    /// Runtime identity the observations were taken on.
+    pub runtime_id: String,
+    /// Interface identity the observations were taken on.
+    pub interface_id: String,
+    /// Contract identity the observations were taken under.
+    pub contract: ContractIdentity,
+    /// Delivery recipient the profile qualifies modes for.
+    pub recipient_id: String,
+    /// Host generation of the observations.
+    pub host_generation: ResourceGeneration,
+    /// Runtime generation of the observations.
+    pub runtime_generation: ResourceGeneration,
+    /// Recipient generation of the observations.
+    pub recipient_generation: ResourceGeneration,
+    /// Owner revision of this profile.
+    pub profile_revision: String,
+    /// Explicit completeness of the event evidence.
+    pub completeness: SnapshotCompleteness,
+    /// Delivery modes the observed host supports.
+    pub supported_modes: Vec<ReactiveDeliveryMode>,
+    /// Privacy ceiling of the observed host.
+    pub privacy_ceiling: ReactiveContextPrivacy,
+    /// Effect ceiling of the observed host.
+    pub effect_ceiling: EffectClass,
+    /// Proof ceiling of the observed host.
+    pub proof_ceiling: ProofCeiling,
+    /// State fence the observations were evaluated under.
+    pub state_fence: StateFence,
+    /// Per-event coverage evidence.
+    pub events: Vec<CoverageEvidence>,
+    /// Explicit gaps; required unless the profile is complete.
+    pub gaps: Vec<String>,
+}
+
+/// Produce (assemble + digest + validate) one integration coverage profile.
+///
+/// Authority boundary: the host/coverage owner owns capability observations;
+/// this producer only assembles the supplied event evidence, computes the
+/// canonical digest, and runs the existing intrinsic validation. It derives
+/// no coverage, infers no enforcement, and qualifies no mode beyond what the
+/// retained evidence states. Fail-closed: any identity, evidence, gap, or
+/// digest violation is returned, never defaulted.
+pub fn produce_integration_coverage_profile(
+    parts: IntegrationCoverageProfileParts,
+) -> Result<IntegrationCoverageProfile, ReactiveInputError> {
+    let mut profile = IntegrationCoverageProfile {
+        host_id: parts.host_id,
+        runtime_id: parts.runtime_id,
+        interface_id: parts.interface_id,
+        contract: parts.contract,
+        recipient_id: parts.recipient_id,
+        host_generation: parts.host_generation,
+        runtime_generation: parts.runtime_generation,
+        recipient_generation: parts.recipient_generation,
+        profile_revision: parts.profile_revision,
+        completeness: parts.completeness,
+        supported_modes: parts.supported_modes,
+        privacy_ceiling: parts.privacy_ceiling,
+        effect_ceiling: parts.effect_ceiling,
+        proof_ceiling: parts.proof_ceiling,
+        state_fence: parts.state_fence,
+        events: parts.events,
+        gaps: parts.gaps,
+        profile_digest: String::new(),
+    };
+    // `profile_digest` is not part of the canonical digest input, so it is
+    // computed over the assembled fields before validation binds it.
+    let digest = profile.canonical_digest()?;
+    digest.clone_into(&mut profile.profile_digest);
+    profile.validate()?;
+    Ok(profile)
+}
