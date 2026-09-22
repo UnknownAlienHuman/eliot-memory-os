@@ -43,6 +43,9 @@ STATUS_STALE = "STALE"
 STATUS_CONFLICTED = "CONFLICTED"
 STATUS_NOT_EXECUTED = "NOT_EXECUTED"
 
+SCANNER_IDENTITY_FINDING = "DEP-011"
+SCANNER_OUTPUT_FINDING = "DEP-012"
+
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -70,8 +73,44 @@ def check_policy_manifest(root: Path) -> tuple[list[Finding], dict]:
     if data.get("schema") != "eliot.dependency-policy.v1":
         findings.append(Finding("DEP-002", rel_path, 1, "schema must be 'eliot.dependency-policy.v1'"))
 
-    if not data.get("scanner", {}).get("tool"):
-        findings.append(Finding("DEP-002", rel_path, 1, "missing [scanner] tool declaration"))
+    scanner = data.get("scanner", {})
+    if not isinstance(scanner, dict):
+        findings.append(Finding("DEP-002", rel_path, 1, "[scanner] must be a table"))
+        scanner = {}
+
+    for field in ("tool", "version", "executable", "sha256", "advisory_owner", "checks"):
+        if field not in scanner or scanner[field] in (None, "", []):
+            findings.append(Finding("DEP-002", rel_path, 1, f"missing [scanner] {field} declaration"))
+
+    if scanner.get("tool") != "cargo-deny":
+        findings.append(Finding("DEP-002", rel_path, 1, "[scanner].tool must be 'cargo-deny'"))
+
+    scanner_digest = scanner.get("sha256", "")
+    if scanner_digest and not re.fullmatch(r"[0-9a-fA-F]{64}", str(scanner_digest)):
+        findings.append(Finding("DEP-002", rel_path, 1, "[scanner].sha256 must be a 64-character hexadecimal digest"))
+
+    scanner_checks = scanner.get("checks", [])
+    if not isinstance(scanner_checks, list) or not {"advisories", "bans", "licenses", "sources"}.issubset(scanner_checks):
+        findings.append(
+            Finding(
+                "DEP-002",
+                rel_path,
+                1,
+                "[scanner].checks must include advisories, bans, licenses and sources",
+            )
+        )
+
+    ecosystems = data.get("ecosystems", {})
+    if not isinstance(ecosystems, dict):
+        findings.append(Finding("DEP-002", rel_path, 1, "[ecosystems] must be a table"))
+        ecosystems = {}
+    rust_policy = ecosystems.get("rust", {})
+    if not isinstance(rust_policy, dict):
+        findings.append(Finding("DEP-002", rel_path, 1, "[ecosystems.rust] must be a table"))
+        rust_policy = {}
+    for field in ("manifest", "lockfile", "policy_file", "targets", "features"):
+        if field not in rust_policy or rust_policy[field] in (None, "", []):
+            findings.append(Finding("DEP-002", rel_path, 1, f"missing [ecosystems.rust] {field} declaration"))
 
     deny_path = root / "deny.toml"
     if not deny_path.is_file():
@@ -322,20 +361,241 @@ def check_external_executables(manifest_data: dict) -> list[Finding]:
     return findings
 
 
-def run_cargo_deny(root: Path, profile: str, scanner_info: dict) -> tuple[list[Finding], str, dict]:
+def _scanner_version(raw_output: str) -> str | None:
+    match = re.search(r"\bcargo-deny(?:\.exe)?\s+(\d+\.\d+\.\d+)\b", raw_output, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _rust_policy_options(root: Path, rust_policy: dict | None) -> tuple[list[str], dict]:
+    config = rust_policy if isinstance(rust_policy, dict) else {}
+    manifest = str(config.get("manifest", "Cargo.toml"))
+    lockfile = str(config.get("lockfile", "Cargo.lock"))
+    policy_file = str(config.get("policy_file", "deny.toml"))
+    targets = config.get("targets", [])
+    if isinstance(targets, str):
+        targets = [targets]
+    targets = [str(target) for target in targets]
+
+    features = config.get("features", "all")
+    options = [
+        "--manifest-path",
+        manifest,
+        "--config",
+        policy_file,
+        "--workspace",
+        "--locked",
+    ]
+    if features == "all":
+        options.append("--all-features")
+    elif isinstance(features, list) and features:
+        options.extend(["--features", ",".join(str(feature) for feature in features)])
+    for target in targets:
+        options.extend(["--target", target])
+
+    return options, {
+        "manifest": manifest,
+        "lockfile": lockfile,
+        "policy_file": policy_file,
+        "targets": targets,
+        "features": features,
+        "workspace": True,
+        "locked": True,
+    }
+
+
+def _finding_code_for_scanner_diagnostic(code: str, message: str) -> str:
+    lower_code = code.lower()
+    lower_message = message.lower()
+    if "source" in lower_code or "registry" in lower_code or "registry" in lower_message:
+        return "DEP-005"
+    if "advisory" in lower_code or "rustsec" in lower_code or "rustsec" in lower_message:
+        return "DEP-006"
+    return "DEP-004"
+
+
+def _parse_scanner_stream(
+    stream: str,
+    stream_name: str,
+    findings: list[Finding],
+    summary: dict,
+    seen_findings: set[tuple[str, str]],
+) -> tuple[int, int, list[str]]:
+    json_records = 0
+    diagnostic_records = 0
+    non_json: list[str] = []
+
+    for line_no, raw_line in enumerate(stream.splitlines(), 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            non_json.append(line)
+            continue
+
+        if not isinstance(entry, dict):
+            non_json.append(line)
+            continue
+        json_records += 1
+        entry_type = entry.get("type")
+        fields = entry.get("fields", {})
+        if not isinstance(fields, dict):
+            fields = {}
+
+        if entry_type == "summary":
+            for check_name, check_summary in fields.items():
+                summary[check_name] = check_summary
+            continue
+
+        if entry_type != "diagnostic":
+            continue
+
+        diagnostic_records += 1
+        severity = str(fields.get("severity", "")).lower()
+        if severity != "error":
+            continue
+        code = str(fields.get("code", ""))
+        message = str(fields.get("message", "")).strip()
+        finding_key = (code, message)
+        if finding_key in seen_findings:
+            continue
+        seen_findings.add(finding_key)
+        finding_code = _finding_code_for_scanner_diagnostic(code, message)
+        findings.append(
+            Finding(
+                finding_code,
+                "deny.toml",
+                1,
+                f"cargo-deny error ({stream_name}:{line_no}): [{code}] {message}",
+            )
+        )
+
+    return json_records, diagnostic_records, non_json
+
+
+def _summary_error_count(summary: dict) -> int:
+    total = 0
+    for value in summary.values():
+        if isinstance(value, dict):
+            try:
+                total += int(value.get("errors", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def run_cargo_deny(
+    root: Path,
+    profile: str,
+    scanner_info: dict,
+    rust_policy: dict | None = None,
+) -> tuple[list[Finding], str, dict]:
+    """Run the configured cargo-deny identity and return findings plus evidence.
+
+    cargo-deny emits JSON diagnostics on stderr for this version. Both output
+    streams are parsed so a policy failure cannot be mistaken for an unusable
+    scanner merely because stdout is empty.
+    """
+
     findings: list[Finding] = []
-    executable_name = scanner_info.get("executable", "cargo-deny")
+    executable_name = str(scanner_info.get("executable", "cargo-deny"))
     exec_path = shutil.which(executable_name)
+    execution: dict = {
+        "configured_executable": executable_name,
+        "configured_version": scanner_info.get("version"),
+        "configured_sha256": scanner_info.get("sha256"),
+        "profile": profile,
+        "identity_verified": False,
+    }
 
     if not exec_path:
         findings.append(Finding("DEP-001", "deny.toml", 1, f"scanner tool '{executable_name}' not found on PATH"))
-        return findings, STATUS_TOOL_UNAVAILABLE, {}
+        execution["status"] = STATUS_TOOL_UNAVAILABLE
+        return findings, STATUS_TOOL_UNAVAILABLE, {"_execution": execution}
 
+    try:
+        observed_digest = sha256_file(Path(exec_path)).lower()
+    except OSError as exc:
+        findings.append(Finding("DEP-001", "deny.toml", 1, f"cannot read scanner executable '{exec_path}': {exc}"))
+        execution["status"] = STATUS_TOOL_UNAVAILABLE
+        return findings, STATUS_TOOL_UNAVAILABLE, {"_execution": execution}
+
+    try:
+        version_proc = subprocess.run(
+            [exec_path, "--version"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        findings.append(Finding("DEP-001", "deny.toml", 1, f"cannot execute scanner identity probe: {exc}"))
+        execution["observed_sha256"] = observed_digest
+        execution["status"] = STATUS_TOOL_UNAVAILABLE
+        return findings, STATUS_TOOL_UNAVAILABLE, {"_execution": execution}
+
+    version_output = "\n".join(part for part in (version_proc.stdout, version_proc.stderr) if part)
+    observed_version = _scanner_version(version_output)
+    execution.update(
+        {
+            "executable": str(Path(exec_path).resolve()),
+            "observed_version": observed_version,
+            "observed_sha256": observed_digest,
+            "version_probe_exit_code": version_proc.returncode,
+        }
+    )
+
+    expected_version = str(scanner_info.get("version", ""))
+    expected_digest = str(scanner_info.get("sha256", "")).lower()
+    if version_proc.returncode != 0 or not observed_version:
+        findings.append(
+            Finding(
+                SCANNER_IDENTITY_FINDING,
+                "config/dependency-policy.toml",
+                1,
+                f"scanner identity probe did not report cargo-deny version (exit={version_proc.returncode})",
+            )
+        )
+    elif expected_version and observed_version != expected_version:
+        findings.append(
+            Finding(
+                SCANNER_IDENTITY_FINDING,
+                "config/dependency-policy.toml",
+                1,
+                f"scanner version mismatch: configured {expected_version}, observed {observed_version}",
+            )
+        )
+
+    if expected_digest and observed_digest != expected_digest:
+        findings.append(
+            Finding(
+                SCANNER_IDENTITY_FINDING,
+                "config/dependency-policy.toml",
+                1,
+                f"scanner executable SHA-256 mismatch: configured {expected_digest}, observed {observed_digest}",
+            )
+        )
+
+    if findings:
+        execution["status"] = STATUS_CONFLICTED
+        return findings, STATUS_CONFLICTED, {"_execution": execution}
+
+    execution["identity_verified"] = True
+    option_args, option_evidence = _rust_policy_options(root, rust_policy)
     checks = ["bans", "licenses", "sources"]
     if profile == "current-advisories":
         checks.insert(0, "advisories")
+    if profile == "offline-source":
+        option_args.append("--offline")
 
-    cmd = [exec_path, "--format", "json", "check"] + checks
+    cmd = [exec_path, "--format", "json", "--color", "never"] + option_args + ["check"] + checks
+    execution.update(option_evidence)
+    execution["checks"] = checks
+    execution["offline"] = profile == "offline-source"
+    execution["command"] = [str(arg) for arg in cmd]
+
     try:
         proc = subprocess.run(
             cmd,
@@ -347,42 +607,109 @@ def run_cargo_deny(root: Path, profile: str, scanner_info: dict) -> tuple[list[F
         )
     except subprocess.TimeoutExpired:
         findings.append(Finding("DEP-001", "deny.toml", 1, "cargo-deny execution timed out after 180s"))
-        return findings, STATUS_TOOL_UNAVAILABLE, {}
-    except Exception as exc:
+        execution["status"] = STATUS_TOOL_UNAVAILABLE
+        return findings, STATUS_TOOL_UNAVAILABLE, {"_execution": execution}
+    except OSError as exc:
         findings.append(Finding("DEP-001", "deny.toml", 1, f"cargo-deny execution error: {exc}"))
-        return findings, STATUS_TOOL_UNAVAILABLE, {}
+        execution["status"] = STATUS_TOOL_UNAVAILABLE
+        return findings, STATUS_TOOL_UNAVAILABLE, {"_execution": execution}
 
-    summary = {}
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-            if entry.get("type") == "summary":
-                summary = entry.get("fields", {})
-            elif entry.get("type") == "diagnostic":
-                fields = entry.get("fields", {})
-                severity = fields.get("severity")
-                message = fields.get("message", "")
-                code = fields.get("code", "")
-                if severity == "error":
-                    fcode = "DEP-004"
-                    if "source" in code.lower() or "registry" in message.lower():
-                        fcode = "DEP-005"
-                    elif "advisory" in code.lower() or "RUSTSEC" in message:
-                        fcode = "DEP-006"
-                    findings.append(Finding(fcode, "deny.toml", 1, f"cargo-deny error: [{code}] {message}"))
-        except Exception:
-            continue
+    execution["exit_code"] = proc.returncode
+    summary: dict = {}
+    seen_findings: set[tuple[str, str]] = set()
+    stdout_json, stdout_diagnostics, stdout_non_json = _parse_scanner_stream(
+        proc.stdout, "stdout", findings, summary, seen_findings
+    )
+    stderr_json, stderr_diagnostics, stderr_non_json = _parse_scanner_stream(
+        proc.stderr, "stderr", findings, summary, seen_findings
+    )
+    execution.update(
+        {
+            "stdout_json_records": stdout_json,
+            "stderr_json_records": stderr_json,
+            "stdout_diagnostic_records": stdout_diagnostics,
+            "stderr_diagnostic_records": stderr_diagnostics,
+            "non_json_output_lines": len(stdout_non_json) + len(stderr_non_json),
+        }
+    )
+
+    summary_errors = _summary_error_count(summary)
+    if summary_errors and not findings:
+        findings.append(
+            Finding(
+                "DEP-004",
+                "deny.toml",
+                1,
+                f"cargo-deny summary reports {summary_errors} policy error(s) without diagnostic records",
+            )
+        )
+
+    parsed_records = stdout_json + stderr_json
+    combined_output = f"{proc.stdout}\n{proc.stderr}".lower()
+    advisory_policy_finding = any(
+        f.code == "DEP-006" and re.search(r"rustsec-\d{4}-\d+", f.detail, re.IGNORECASE) for f in findings
+    )
+    if profile == "current-advisories" and proc.returncode != 0 and not advisory_policy_finding:
+        advisory_unavailable_markers = (
+            "advisory database",
+            "failed to fetch",
+            "could not fetch",
+            "unable to fetch",
+            "network",
+        )
+        if any(marker in combined_output for marker in advisory_unavailable_markers):
+            if not any(f.code == "DEP-006" for f in findings):
+                findings.append(
+                    Finding(
+                        "DEP-006",
+                        "deny.toml",
+                        1,
+                        "cargo-deny could not establish the current advisory database evidence",
+                    )
+                )
+            execution["status"] = STATUS_ADVISORY_SOURCE_UNAVAILABLE
+            return findings, STATUS_ADVISORY_SOURCE_UNAVAILABLE, {**summary, "_execution": execution}
+
+        stale_markers = ("stale", "out of date", "older than")
+        if any(marker in combined_output for marker in stale_markers):
+            if not any(f.code == "DEP-006" for f in findings):
+                findings.append(
+                    Finding(
+                        "DEP-006",
+                        "deny.toml",
+                        1,
+                        "cargo-deny advisory evidence is stale and cannot support current-advisory proof",
+                    )
+                )
+            execution["status"] = STATUS_STALE
+            return findings, STATUS_STALE, {**summary, "_execution": execution}
 
     if proc.returncode != 0 and not findings:
+        detail = (proc.stderr or proc.stdout).strip().replace("\n", " ")
+        if len(detail) > 400:
+            detail = detail[:400] + "..."
         findings.append(
-            Finding("DEP-001", "deny.toml", 1, f"cargo-deny exited nonzero ({proc.returncode}): {proc.stderr[:200]}")
+            Finding(
+                SCANNER_OUTPUT_FINDING,
+                "deny.toml",
+                1,
+                f"cargo-deny exited nonzero ({proc.returncode}) without a parsed policy diagnostic: {detail}",
+            )
+        )
+
+    if proc.returncode == 0 and parsed_records == 0:
+        findings.append(
+            Finding(
+                SCANNER_OUTPUT_FINDING,
+                "deny.toml",
+                1,
+                "cargo-deny returned success without machine-readable JSON evidence",
+            )
         )
 
     status = STATUS_PASS if not findings else STATUS_FINDINGS
-    return findings, status, summary
+    execution["status"] = status
+    return findings, status, {**summary, "_execution": execution}
 
 
 def build_receipt(
@@ -414,6 +741,18 @@ def build_receipt(
             digests[f] = sha256_file(fp)
 
     scanner = manifest_data.get("scanner", {})
+    if not isinstance(scanner, dict):
+        scanner = {}
+    scanner_execution = cargo_summary.get("_execution", {}) if isinstance(cargo_summary, dict) else {}
+    scanner_summary = (
+        {key: value for key, value in cargo_summary.items() if key != "_execution"}
+        if isinstance(cargo_summary, dict)
+        else {}
+    )
+    ecosystems = manifest_data.get("ecosystems", {})
+    rust_policy = ecosystems.get("rust", {}) if isinstance(ecosystems, dict) else {}
+    if not isinstance(rust_policy, dict):
+        rust_policy = {}
     ceiling = (
         "DEPENDENCY_ADMISSION_AND_ADVISORY_EVIDENCE_CANDIDATE"
         if profile == "current-advisories"
@@ -432,12 +771,20 @@ def build_receipt(
             "version": scanner.get("version", "0.20.2"),
             "executable_sha256": scanner.get("sha256", ""),
             "advisory_owner": scanner.get("advisory_owner", "cargo-deny"),
+            "observed_version": scanner_execution.get("observed_version"),
+            "observed_executable_sha256": scanner_execution.get("observed_sha256"),
+            "identity_verified": scanner_execution.get("identity_verified", False),
         },
         "ecosystem_denominator": {
             "rust": {
                 "direct_dependencies_count": direct_deps_count,
-                "targets": manifest_data.get("ecosystems", {}).get("rust", {}).get("targets", []),
-                "features": manifest_data.get("ecosystems", {}).get("rust", {}).get("features", "all"),
+                "manifest": rust_policy.get("manifest", "Cargo.toml"),
+                "lockfile": rust_policy.get("lockfile", "Cargo.lock"),
+                "policy_file": rust_policy.get("policy_file", "deny.toml"),
+                "workspace": True,
+                "locked": True,
+                "targets": rust_policy.get("targets", []),
+                "features": rust_policy.get("features", "all"),
             },
             "nuget": {
                 "project": "apps/Eliot.Operator/Eliot.Operator.csproj",
@@ -450,7 +797,8 @@ def build_receipt(
             "external_executables": list(manifest_data.get("external_executables", {}).keys()),
         },
         "input_digests": digests,
-        "scanner_summary": cargo_summary,
+        "scanner_summary": scanner_summary,
+        "scanner_execution": scanner_execution,
         "findings_count": len(findings),
         "findings": [
             {"code": f.code, "path": f.path, "line": f.line, "detail": f.detail} for f in findings
@@ -458,10 +806,18 @@ def build_receipt(
     }
 
     if profile == "current-advisories":
+        if status == STATUS_ADVISORY_SOURCE_UNAVAILABLE:
+            advisory_status = "unavailable"
+        elif status in (STATUS_CONFLICTED, STATUS_TOOL_UNAVAILABLE, STATUS_NOT_EXECUTED, STATUS_STALE):
+            advisory_status = "not_established"
+        elif any(f.code == "DEP-006" for f in findings):
+            advisory_status = "findings"
+        else:
+            advisory_status = "ok"
         receipt["advisory_snapshot"] = {
             "source": "https://github.com/rustsec/advisory-db",
             "evaluated_at_utc": receipt["timestamp_utc"],
-            "status": "ok" if not any(f.code == "DEP-006" for f in findings) else "findings",
+            "status": advisory_status,
         }
 
     return receipt
@@ -497,13 +853,27 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
     all_findings.extend(ext_findings)
 
     # 7. Run cargo deny scanner
-    scanner_findings, scanner_status, cargo_summary = run_cargo_deny(root, profile, manifest_data.get("scanner", {}))
+    ecosystems = manifest_data.get("ecosystems", {})
+    rust_policy = ecosystems.get("rust", {}) if isinstance(ecosystems, dict) else {}
+    scanner_info = manifest_data.get("scanner", {})
+    if not isinstance(scanner_info, dict):
+        scanner_info = {}
+    scanner_findings, scanner_status, cargo_summary = run_cargo_deny(
+        root,
+        profile,
+        scanner_info,
+        rust_policy if isinstance(rust_policy, dict) else {},
+    )
     all_findings.extend(scanner_findings)
 
     # Derive overall status
-    if any(f.code == "DEP-001" for f in all_findings):
+    if scanner_status == STATUS_TOOL_UNAVAILABLE or any(f.code == "DEP-001" for f in all_findings):
         overall_status = STATUS_TOOL_UNAVAILABLE
-    elif any(f.code == "DEP-003" for f in all_findings):
+    elif scanner_status == STATUS_ADVISORY_SOURCE_UNAVAILABLE:
+        overall_status = STATUS_ADVISORY_SOURCE_UNAVAILABLE
+    elif scanner_status in (STATUS_STALE, STATUS_CONFLICTED, STATUS_NOT_EXECUTED):
+        overall_status = scanner_status
+    elif any(f.code in ("DEP-002", "DEP-003") for f in all_findings):
         overall_status = STATUS_INCOMPLETE
     elif any(f.code == "DEP-006" for f in all_findings):
         overall_status = STATUS_FINDINGS
