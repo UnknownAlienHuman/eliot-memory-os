@@ -30,6 +30,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 eliot-agent-contracts.workspace = true
+eliot-store-api.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

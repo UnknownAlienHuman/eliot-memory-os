@@ -49,6 +49,7 @@ mod store_write_reservation_tests;
 mod testd_front_door;
 mod user_automation;
 mod user_automation_execution;
+mod user_automation_execution_client;
 mod user_automation_failure_history;
 #[cfg(test)]
 mod user_automation_failure_history_tests;
@@ -80,6 +81,7 @@ pub use doctor_front_door::{
     is_doctor_diagnosis_only_envelope, reconcile_doctor_repair_delivery,
 };
 pub use eliot_process::ProcessExecutionAdmissionRequest;
+pub use eliot_kernel_core::user_automation::AutomationExecutionReference;
 pub use eliot_protocol::{
     AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
     AgentBridgeClientDeclaration,
@@ -187,7 +189,14 @@ pub use user_automation_execution::{
     UserAutomationFailureHistoryPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
     UserAutomationNotificationDelivery, UserAutomationNotificationPort, UserAutomationRemovalResult,
     UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition, UserAutomationRuntimeError,
-    UserAutomationRuntimePort, UserAutomationWakeCancellation, UserAutomationWakePort,
+    UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationWakeCancellationTarget, UserAutomationWakePort,
+};
+pub use user_automation_execution_client::{
+    USER_AUTOMATION_HOST_EXECUTION_WIRE_ID, USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION,
+    UserAutomationHostChannelBinding, UserAutomationHostExecutionClient,
+    UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest,
+    UserAutomationHostExecutionResponse, UserAutomationHostExecutionTransport,
 };
 pub use user_automation_failure_history::{
     StoreUserAutomationFailureHistory, build_failure_transition,

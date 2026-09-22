@@ -1,0 +1,56 @@
+{
+  "schema": "eliot.cues.legacy-facade.v1",
+  "denominator": "30 cases, exactly 1..30 (issue #833)",
+  "kinds": [
+    {"legacy": "file_path", "owner": "FilePath"},
+    {"legacy": "dir_path", "owner": "DirPath"},
+    {"legacy": "symbol", "owner": "Symbol"},
+    {"legacy": "error_signature", "owner": "ErrorSignature"},
+    {"legacy": "command_pattern", "owner": "CommandPattern"},
+    {"legacy": "dependency", "owner": "Dependency"},
+    {"legacy": "api_surface", "owner": "ApiSurface"},
+    {"legacy": "task_class", "owner": "TaskClass"},
+    {"legacy": "subsystem", "owner": "Subsystem"},
+    {"legacy": "concept", "owner": "Concept"}
+  ],
+  "unsupported_kinds": [
+    "",
+    "unknown",
+    "FilePath",
+    "FILE_PATH",
+    "file-path",
+    "file path",
+    "cue",
+    "null",
+    "relation_edge",
+    "binding_candidate",
+    "comparison_key",
+    "none"
+  ],
+  "modes": [
+    {"legacy": "exact", "owner": "Exact"},
+    {"legacy": "prefix", "owner": "Prefix"},
+    {"legacy": "signature", "owner": "Signature"}
+  ],
+  "unsupported_modes": ["", "contains", "regex", "EXACT", "Prefix"],
+  "malformed_envelopes": [
+    {"scope": "", "kind": "symbol", "value": "x", "target": "t", "revision": 1},
+    {"scope": "s", "kind": "", "value": "x", "target": "t", "revision": 1},
+    {"scope": "s", "kind": "symbol", "value": "", "target": "t", "revision": 1},
+    {"scope": "s", "kind": "symbol", "value": "x", "target": "", "revision": 1},
+    {"scope": "s\twith-tab", "kind": "symbol", "value": "x", "target": "t", "revision": 1},
+    {"scope": "s", "kind": "sym\tbol", "value": "x", "target": "t", "revision": 1},
+    {"scope": "s", "kind": "symbol", "value": "x\u0000null", "target": "t", "revision": 1},
+    {"scope": "s", "kind": "symbol", "value": "x", "target": "t\nnewline", "revision": 1}
+  ],
+  "delivery": {
+    "scope": "scope",
+    "kind": "symbol",
+    "value": "Foo::Bar",
+    "target": "artifact:delivery-1",
+    "revision": 3,
+    "owner": "B-RCTX/Host",
+    "issue": 612
+  },
+  "replay_rows": ["cue:0123456789abcdef0123456789abcdef", "cue:fedcba9876543210fedcba9876543210"]
+}
