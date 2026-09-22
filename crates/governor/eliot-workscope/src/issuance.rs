@@ -77,20 +77,7 @@ pub fn issue_resolution_receipt(
     let snapshot = owner
         .read_current(fence)
         .map_err(|_| WorkScopeError::StateFenceMismatch)?;
-    let bound = &snapshot.binding.scope;
-    if bound.scope_ref != descriptor.scope_ref
-        || bound.kind != descriptor.kind
-        || bound.lineage_ref
-            != descriptor
-                .lineage
-                .as_ref()
-                .map(|lineage| lineage.lineage_ref.clone())
-        || bound.generation != descriptor.generation.resource_generation.value()
-        || !descriptor.instances.iter().any(|instance| {
-            instance.instance_ref == bound.instance_ref
-                && instance.root_identity == bound.root_identity
-        })
-    {
+    if !super::binding_matches_descriptor(&snapshot.binding, descriptor) {
         return Err(WorkScopeError::BindingReceiptMismatch);
     }
     if snapshot.guard_receipt.disposition != ScopeBindingDisposition::Matched {

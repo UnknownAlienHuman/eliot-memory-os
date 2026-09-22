@@ -31,10 +31,11 @@
 //! seams rather than re-implementing them.
 
 use super::{
-    GenerationEvidence, IdentityEvidence, PrivacyProfile, ProposalSource,
+    GenerationEvidence, GuardTrigger, IdentityEvidence, PrivacyProfile, ProposalSource,
     RepositoryLineageIdentity, ResolutionAuthentication, ResourceExecutionIdentity, ScopeFingerprint,
-    ScopeKind, ScopeLifecycle, WorkScopeDescriptor, WorkScopeError, WorkScopeProposal,
-    WorkScopeResolutionReceipt, WorkspaceInstanceIdentity, counter, text, unique,
+    ScopeKind, ScopeLifecycle, WorkScopeBindingOwner, WorkScopeDescriptor, WorkScopeError,
+    WorkScopeProposal, WorkScopeResolutionReceipt, WorkspaceInstanceIdentity, binding_matches_descriptor,
+    counter, text, unique,
 };
 use eliot_contracts::{StateFence, fences_match_exact};
 use schemars::JsonSchema;
@@ -351,4 +352,81 @@ pub fn verify_receipt_for_admission(
         return Ok(ReceiptAdmission::Withheld(WithholdReason::FenceMismatch));
     }
     Ok(ReceiptAdmission::Admitted)
+}
+
+/// Admission decision bound to the trigger that requested it.
+///
+/// Records which mandatory point ran admission and what it decided. The
+/// decision itself is a [`ReceiptAdmission`]: `Admitted` only, or the exact
+/// [`WithholdReason`] otherwise. Withheld operations keep their reason so the
+/// caller asks the cheapest discriminative question instead of retrying
+/// against another candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TriggerAdmission {
+    pub trigger: GuardTrigger,
+    pub scope_ref: String,
+    pub decision: ReceiptAdmission,
+}
+
+impl TriggerAdmission {
+    /// Validates the admission record without re-running admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bound scope reference is blank.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        text(&self.scope_ref, "admission.scope_ref")
+    }
+}
+
+/// Admits one trigger-gated operation against live owner authority.
+///
+/// This is the in-crate admission caller: it reads the live
+/// [`WorkScopeBindingOwner`] at `fence` (fail-closed on a stale fence),
+/// requires the retained binding to describe `descriptor`, requires the
+/// receipt to select exactly that live binding on every identity field, and
+/// only then runs [`verify_receipt_for_admission`] against the currently
+/// observed generation evidence. Authority comes from the live owner read and
+/// the retained descriptor — never from self-asserted receipt fields alone.
+///
+/// # Errors
+///
+/// Returns an error when the owner read, descriptor, receipt shape, or
+/// generation evidence is malformed, or when live records disagree about
+/// which scope is bound.
+pub fn admit_at_trigger(
+    owner: &WorkScopeBindingOwner,
+    descriptor: &WorkScopeDescriptor,
+    receipt: &WorkScopeResolutionReceipt,
+    observed_generation: &GenerationEvidence,
+    fence: &StateFence,
+    trigger: GuardTrigger,
+) -> Result<TriggerAdmission, WorkScopeError> {
+    text(&receipt.receipt_ref, "receipt.receipt_ref")?;
+    descriptor.validate()?;
+    observed_generation.validate()?;
+    let snapshot = owner
+        .read_current(fence)
+        .map_err(|_| WorkScopeError::StateFenceMismatch)?;
+    let bound = &snapshot.binding.scope;
+    if !binding_matches_descriptor(&snapshot.binding, descriptor) {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    let selected = &receipt.selected;
+    if selected.scope_ref != bound.scope_ref
+        || selected.kind != bound.kind
+        || selected.lineage_ref != bound.lineage_ref
+        || selected.instance_ref != bound.instance_ref
+        || selected.root_identity != bound.root_identity
+        || selected.generation != bound.generation
+    {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    let decision = verify_receipt_for_admission(receipt, descriptor, observed_generation, fence)?;
+    Ok(TriggerAdmission {
+        trigger,
+        scope_ref: bound.scope_ref.clone(),
+        decision,
+    })
 }
