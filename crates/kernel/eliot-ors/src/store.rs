@@ -23,6 +23,9 @@ use persistence_models::{
     ScopeReservationHead,
 };
 
+#[path = "store/restore_journal.rs"]
+mod restore_journal;
+
 mod recovery_projection;
 
 use crate::cutover_ownership::{
