@@ -164,6 +164,60 @@ pub struct DispatchDriveResponse {
     pub table_elements: u64,
     /// Child-observed epoch ticks.
     pub epoch_ticks: u64,
+    /// Lifecycle outcome verdicts evaluated from retained evidence.
+    pub verdicts: LifecycleVerdicts,
+}
+
+/// Lifecycle outcome verdicts (A13.3 promotion path) evaluated from the
+/// retained execution evidence of exactly one admitted operation. Shadow
+/// is the only phase single-execution evidence can close: a completed,
+/// effect-free, differential-agreeing run is the shadow observation
+/// itself. Canary, rollback, and cutover are progression phases requiring
+/// multi-evidence Governor decisions; they stay unevaluated (matching the
+/// codebase convention that unevaluated verdicts read false), never
+/// minted as verified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LifecycleVerdicts {
+    /// Effect-free completed differential-agreeing execution observed.
+    pub shadow: eliot_wasm_runtime::VerificationVerdict,
+    /// Bounded-canary progression evidence (never single-execution).
+    pub canary: eliot_wasm_runtime::VerificationVerdict,
+    /// Rollback execution evidence (none observed here).
+    pub rollback: eliot_wasm_runtime::VerificationVerdict,
+    /// Active-generation cutover evidence (none observed here).
+    pub cutover: eliot_wasm_runtime::VerificationVerdict,
+}
+
+impl LifecycleVerdicts {
+    /// All phases unevaluated: the closed value before any execution.
+    #[must_use]
+    pub const fn unevaluated() -> Self {
+        use eliot_wasm_runtime::VerificationVerdict::Rejected;
+        Self {
+            shadow: Rejected,
+            canary: Rejected,
+            rollback: Rejected,
+            cutover: Rejected,
+        }
+    }
+}
+
+/// Evaluates lifecycle verdicts from the retained Succeeded evidence.
+/// The differential already matched (the runtime enforced it for
+/// success), so shadow closes exactly when the completed run proposed no
+/// effects and left a measured-empty state delta. Absent measurements
+/// never manufacture verification: a missing delta reports Rejected.
+/// Progression phases stay unevaluated.
+fn evaluate_lifecycle_verdicts(result: &eliot_wasm_runtime::InvocationResult) -> LifecycleVerdicts {
+    use eliot_wasm_runtime::VerificationVerdict::{Rejected, Verified};
+    let shadow = match result.observed_state_delta.as_deref() {
+        Some(delta) if delta.is_empty() && result.proposed_effects.is_empty() => Verified,
+        _ => Rejected,
+    };
+    LifecycleVerdicts {
+        shadow,
+        ..LifecycleVerdicts::unevaluated()
+    }
 }
 
 /// Bounded production evidence sink: retains evidence up to the cap, then
@@ -973,6 +1027,7 @@ fn map_invocation_result(
         peak_memory_bytes: peak,
         table_elements: u64::from(tables),
         epoch_ticks: ticks,
+        verdicts: evaluate_lifecycle_verdicts(result),
     })
 }
 
@@ -1438,6 +1493,82 @@ mod tests {
             eliot_wasm_runtime::GovernorResolutionPort::resolve(&mut admission, &request),
             Err(eliot_wasm_runtime::PortError::Denied)
         ));
+    }
+
+    /// Lifecycle verdicts evaluate from retained Succeeded evidence:
+    /// effect-free empty-delta success closes shadow; proposed effects
+    /// deny it; progression phases stay unevaluated (never minted).
+    #[test]
+    fn lifecycle_verdicts_evaluate_from_evidence() {
+        use eliot_wasm_runtime::{
+            CancellationPolicy, EpochPolicy, InvocationDisposition, InvocationId,
+            VerificationVerdict,
+        };
+        let material = admission_material(b"intent-artifact", b"intent-input");
+        let host_digest = Sha256Digest::of_bytes(b"intent-host-image");
+        let usage = || eliot_wasm_runtime::EngineUsage {
+            attempted_output_bytes: 14,
+            output_bytes: 14,
+            host_calls: 0,
+            fuel_consumed: 13,
+            peak_memory_bytes: Some(65536),
+            table_elements: Some(0),
+            instances: 1,
+            stack_bytes: None,
+            enforced_stack_limit_bytes: Some(8192),
+            elapsed_ms: 3,
+            effective_epoch_policy: EpochPolicy {
+                deadline_ticks: 100,
+                cancellation: CancellationPolicy::EpochAndFuel,
+            },
+            epoch_ticks: Some(1),
+            artifact_reads: 0,
+            artifact_bytes: 0,
+            accessed_artifact_digests: Vec::new(),
+        };
+        let succeeded = |effects: Vec<eliot_wasm_runtime::EffectProposal>,
+                         delta: Option<Vec<u8>>| {
+            eliot_wasm_runtime::InvocationResult {
+                receipt: eliot_wasm_runtime::InvocationReceipt {
+                    invocation_id: InvocationId::new("operation-verdict-001").expect("invocation"),
+                    request_digest: Sha256Digest::of_bytes(b"verdict-request"),
+                    disposition: InvocationDisposition::Succeeded,
+                    error: None,
+                    output_digest: None,
+                    effect_digest: None,
+                    state_delta_digest: None,
+                    engine_binding: None,
+                    usage: Some(usage()),
+                    reconciliation_required: false,
+                },
+                output: Some(b"verdict-output".to_vec()),
+                proposed_effects: effects,
+                observed_state_delta: delta,
+            }
+        };
+        let clean = map_invocation_result(
+            &succeeded(Vec::new(), Some(Vec::new())),
+            &material,
+            &host_digest,
+        )
+        .expect("clean success responds");
+        assert_eq!(clean.verdicts.shadow, VerificationVerdict::Verified);
+        assert_eq!(clean.verdicts.canary, VerificationVerdict::Rejected);
+        assert_eq!(clean.verdicts.rollback, VerificationVerdict::Rejected);
+        assert_eq!(clean.verdicts.cutover, VerificationVerdict::Rejected);
+        assert_eq!(
+            clean.output_digest.as_str(),
+            Sha256Digest::of_bytes(b"verdict-output").as_str()
+        );
+        let noisy = map_invocation_result(&succeeded(Vec::new(), None), &material, &host_digest)
+            .expect("unmeasured delta still responds");
+        // Unmeasured delta never manufactures verification: the response
+        // carries output, but shadow stays rejected.
+        assert_eq!(noisy.verdicts.shadow, VerificationVerdict::Rejected);
+        assert_eq!(
+            noisy.output_digest.as_str(),
+            Sha256Digest::of_bytes(b"verdict-output").as_str()
+        );
     }
 
     /// Result mapping denies without fabricating output: differential and

@@ -46,6 +46,14 @@ fn emit_stderr_receipt(fields: &[(&str, &str)]) {
     let _ = writeln!(stderr, "}}");
 }
 
+/// Renders one lifecycle verdict as its stable receipt token.
+const fn verdict_text(verdict: eliot_wasm_runtime::VerificationVerdict) -> &'static str {
+    match verdict {
+        eliot_wasm_runtime::VerificationVerdict::Verified => "verified",
+        eliot_wasm_runtime::VerificationVerdict::Rejected => "rejected",
+    }
+}
+
 /// Runs the owner-dispatched parent drive branch: exactly one admitted
 /// operation to the canonical response. Returns true when a dispatch file
 /// was staged (success emitted, raw guest bytes on stdout, receipt on
@@ -61,6 +69,10 @@ fn run_dispatch_drive_branch() -> bool {
             let peak = response.peak_memory_bytes.to_string();
             let tables = response.table_elements.to_string();
             let ticks = response.epoch_ticks.to_string();
+            let shadow = verdict_text(response.verdicts.shadow);
+            let canary = verdict_text(response.verdicts.canary);
+            let rollback = verdict_text(response.verdicts.rollback);
+            let cutover = verdict_text(response.verdicts.cutover);
             emit_stderr_receipt(&[
                 ("status", "dispatch-drive-complete"),
                 ("operation", &response.operation_id),
@@ -74,6 +86,10 @@ fn run_dispatch_drive_branch() -> bool {
                 ("peak_memory_bytes", &peak),
                 ("table_elements", &tables),
                 ("epoch_ticks", &ticks),
+                ("verdict_shadow", shadow),
+                ("verdict_canary", canary),
+                ("verdict_rollback", rollback),
+                ("verdict_cutover", cutover),
             ]);
             true
         }

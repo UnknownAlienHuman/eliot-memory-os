@@ -241,6 +241,7 @@ fn request_accepted_grant(
     artifact_bytes: &[u8],
     wit_bytes: &[u8],
     channel: &GrantChannel,
+    channel_fence: &eliot_contracts::StateFence,
 ) -> Result<crate::grant_client::AcceptedGrant, GrantLaunchError> {
     let bundle = build_grant_bundle(
         &args.component_id,
@@ -259,7 +260,7 @@ fn request_accepted_grant(
             field: "bundle",
         },
     })?;
-    request_grant_via_transport(&bundle, channel).map_err(|error| match error {
+    request_grant_via_transport(&bundle, channel, channel_fence).map_err(|error| match error {
         GrantClientError::Denied { field } | GrantClientError::InvalidField { field } => {
             GrantLaunchError {
                 stage: "transport",
@@ -345,7 +346,13 @@ pub fn run_grant_launch(args: &GrantLaunchArgs) -> Result<GrantLaunchReceipt, Gr
     let now = now_unix_ms()?;
     check_launch_policy(args, now)?;
     let (descriptor, artifact_bytes, wit_bytes) = read_launch_inputs(args)?;
-    let accepted = request_accepted_grant(args, &artifact_bytes, &wit_bytes, &channel)?;
+    let accepted = request_accepted_grant(
+        args,
+        &artifact_bytes,
+        &wit_bytes,
+        &channel,
+        &descriptor.authority_state_fence,
+    )?;
     let (authorized, installed) =
         authorize_and_resolve(args, &accepted, &descriptor, &artifact_bytes, &wit_bytes)?;
     let engine = grant_engine_binding(&installed);
