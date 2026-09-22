@@ -20,10 +20,10 @@ runtime_bundle = "eliot-dreamer"
 agent_order = 34
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
-eliot-learning-contracts = { path = "../eliot-learning-contracts" }
-eliot-instrument-api = { path = "../../instrument/eliot-instrument-api" }
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-learning-contracts = { path = "../eliot-learning-contracts", version = "0.1.0" }
+eliot-instrument-api = { path = "../../instrument/eliot-instrument-api", version = "0.1.0" }
 schemars = { version = "1.2.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
