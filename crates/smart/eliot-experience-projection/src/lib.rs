@@ -21,6 +21,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cursor;
+
 use eliot_contracts::StateFence;
 use eliot_observation_contracts::{
     ExperienceRecordRef, ExperienceSourceFamily, ObservationError, ObservationScope,
@@ -28,6 +30,8 @@ use eliot_observation_contracts::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+pub use cursor::{JournalCoverage, JournalCursor, entries_since, journal_coverage, journal_cursor};
 
 /// Freeze identity this package builds against.
 ///
