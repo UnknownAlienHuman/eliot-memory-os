@@ -42,6 +42,7 @@ pub(super) enum MigrationPreflight {
     Empty,
     ExactReplay,
     V1ToV2,
+    BackupTables,
 }
 
 pub(super) fn v1_identity() -> SchemaMigrationIdentity {
@@ -107,6 +108,18 @@ pub(super) fn schema_meta_record_for_v1_to_v2(
         migration_checksum_sha256: migration.checksum_sha256.clone(),
         updated_at: updated_at.to_owned(),
     }
+}
+
+/// Builds the schema-meta record for the additive backup-tables delta: the
+/// backup migration identity is appended to the migration chain while the
+/// generation stays at v2, so later preflight observes an applied v2
+/// baseline plus the backup delta instead of a generation change.
+pub(super) fn schema_meta_record_for_backup_tables(
+    existing: &SchemaMetaRecord,
+    migration: &CompiledMigration,
+    updated_at: &str,
+) -> SchemaMetaRecord {
+    schema_meta_record_for_v1_to_v2(existing, migration, updated_at)
 }
 
 pub(super) fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(), AdapterError> {

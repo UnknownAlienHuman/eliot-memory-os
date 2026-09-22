@@ -309,10 +309,10 @@ impl RpcTransport {
     }
 
     /// Executes one protected health/admin operation on the isolated admin
-    /// lane, outside normal read/write admission. Backup coordination
-    /// writes (issues #951/#952) run here: bounded, fenced, and isolated
-    /// from the normal-write lane so an export never consumes a canonical
-    /// write slot or waits behind normal workload.
+    /// lane, outside normal read/write admission. Staged for future
+    /// wire children; test-only until a sliced consumer arrives through
+    /// its own exclusive scope.
+    #[cfg(test)]
     pub(crate) async fn query_admin(
         &self,
         operation: &'static str,

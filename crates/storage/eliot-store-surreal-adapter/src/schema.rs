@@ -579,6 +579,24 @@ pub(crate) fn erasure_forward_migration_sql() -> String {
     )
 }
 
+/// Forward migration from a v2 baseline to the v2-plus-backup schema:
+/// creates only the three backup coordination tables under exactly the
+/// same fence plus predecessor (`migrations[0]`) guards as the v1-to-v2
+/// forward migration above, without changing the generation. The caller
+/// supplies the v2 predecessor bindings through the same
+/// `forward_migration_expected_bindings` shape.
+pub(crate) fn backup_forward_migration_sql() -> String {
+    format!(
+        "{} {} {} {} {} {}",
+        TX_BEGIN,
+        TX_GUARD_FENCE,
+        BACKUP_TABLES_DDL.trim(),
+        TX_GUARD_SCHEMA_PREDECESSOR,
+        TX_UPDATE_SCHEMA_META_CAS,
+        TX_COMMIT
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn forward_migration_expected_bindings() -> Vec<&'static str> {
     vec![

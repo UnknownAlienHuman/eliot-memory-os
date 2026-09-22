@@ -73,12 +73,25 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
                     .apply_initial_schema_migration(&clock)
                     .await
                     .map_err(|error| error.to_string())?;
+                // Deployment provisioning for the backup edge (issues
+                // #951/#952): the explicit init mode also applies the
+                // admitted backup-tables delta on a v2 baseline, so a
+                // freshly initialized database serves backup operations
+                // without a second provisioning step. The delta is
+                // idempotent: re-running init replays instead of
+                // duplicating tables.
+                let backup_receipt = composition
+                    .apply_backup_tables_migration(&clock)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 let output = serde_json::json!({
                     "service": SERVICE_NAME,
                     "operation": "initialize_schema_only",
                     "migration_id": receipt.migration_id,
                     "checksum_sha256": receipt.checksum_sha256,
                     "generation_after": receipt.generation_after.as_str(),
+                    "backup_migration_id": backup_receipt.migration_id,
+                    "backup_checksum_sha256": backup_receipt.checksum_sha256,
                 });
                 println!(
                     "{}",

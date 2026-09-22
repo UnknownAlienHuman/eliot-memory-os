@@ -52,11 +52,20 @@ pub(super) const STATUS_EXPIRED: &str = "expired";
 /// enumeration order with its deterministic ordering and stable residency
 /// domain. Equal content under different tables stays distinct: the member
 /// digest always binds the table name.
+///
+/// `core` marks the v2-baseline tables that exist on every migrated
+/// database: a missing core table contradicts the schema meta the
+/// readiness gate already verified, so the freeze fails closed instead of
+/// completing over a hollow denominator. Feature tables (`core: false`)
+/// tolerate absence as documented empty dispositions: they can only
+/// under-capture content that was never provisioned, never resurrect, and
+/// the live purge ledger still applies at restore time.
 pub(super) struct CaptureTable {
     pub(super) table: &'static str,
     pub(super) order_by: &'static str,
     pub(super) domain: &'static str,
     pub(super) id_kind: TableIdKind,
+    pub(super) core: bool,
 }
 
 /// How the restore replay re-derives a table's deterministic record key
@@ -85,114 +94,133 @@ pub(super) const CAPTURE_TABLES: &[CaptureTable] = &[
         order_by: "revision_key",
         domain: "canonical.revision_head",
         id_kind: TableIdKind::Field("revision_key"),
+        core: true,
     },
     CaptureTable {
         table: schema::table::ORDERING_HEAD,
         order_by: "ordering_scope",
         domain: "canonical.ordering_head",
         id_kind: TableIdKind::Field("ordering_scope"),
+        core: true,
     },
     CaptureTable {
         table: schema::table::CANONICAL_EVENT,
         order_by: "event_id",
         domain: "canonical.event",
         id_kind: TableIdKind::Field("event_id"),
+        core: true,
     },
     CaptureTable {
         table: schema::table::PROJECTION_RECORD,
         order_by: "publication_id",
         domain: "canonical.projection",
         id_kind: TableIdKind::Field("publication_id"),
+        core: true,
     },
     CaptureTable {
         table: schema::table::RELATION_RECORD,
         order_by: "relation_id",
         domain: "canonical.relation",
         id_kind: TableIdKind::Field("relation_id"),
+        core: true,
     },
     CaptureTable {
         table: schema::table::OUTBOX_EVENT,
         order_by: "outbox_id",
         domain: "canonical.outbox",
         id_kind: TableIdKind::Field("outbox_id"),
+        core: true,
     },
     CaptureTable {
         table: schema::table::WRITE_RECEIPT,
         order_by: "operation_id",
         domain: "canonical.receipt",
         id_kind: TableIdKind::Field("operation_id"),
+        core: true,
     },
     CaptureTable {
         table: schema::table::RECOVERY_OWNER,
         order_by: "namespace, key",
         domain: "canonical.recovery_owner",
         id_kind: TableIdKind::NamespaceKey,
+        core: true,
     },
     CaptureTable {
         table: schema::table::RECOVERY_JOB,
         order_by: "namespace, key",
         domain: "canonical.recovery_job",
         id_kind: TableIdKind::NamespaceKey,
+        core: true,
     },
     CaptureTable {
         table: schema::table::NOTIFICATION_RECORD,
         order_by: "dedup_key",
         domain: "canonical.notification",
         id_kind: TableIdKind::Field("dedup_key"),
+        core: false,
     },
     CaptureTable {
         table: schema::table::REACTIVE_SESSION,
         order_by: "session_id",
         domain: "canonical.reactive_session",
         id_kind: TableIdKind::Field("session_id"),
+        core: false,
     },
     CaptureTable {
         table: schema::table::RESOURCE_SNAPSHOT,
         order_by: "uri",
         domain: "canonical.resource_snapshot",
         id_kind: TableIdKind::Field("uri"),
+        core: false,
     },
     CaptureTable {
         table: schema::table::AUTOMATION_REVISION,
         order_by: "automation_id, revision",
         domain: "canonical.automation_revision",
         id_kind: TableIdKind::AutomationRevision,
+        core: false,
     },
     CaptureTable {
         table: schema::table::AUTOMATION_CURRENT,
         order_by: "automation_id",
         domain: "canonical.automation_current",
         id_kind: TableIdKind::Field("automation_id"),
+        core: false,
     },
     CaptureTable {
         table: schema::table::AUTOMATION_INVOCATION,
         order_by: "occurrence_id",
         domain: "canonical.automation_invocation",
         id_kind: TableIdKind::Field("occurrence_id"),
+        core: false,
     },
     CaptureTable {
         table: schema::table::AUTOMATION_FAILURE,
         order_by: "automation_id, revision, occurrence_id, fingerprint",
         domain: "canonical.automation_failure",
         id_kind: TableIdKind::AutomationFailure,
+        core: false,
     },
     CaptureTable {
         table: schema::table::AUTOMATION_LAST_FAILURE,
         order_by: "automation_id",
         domain: "canonical.automation_pointer",
         id_kind: TableIdKind::Field("automation_id"),
+        core: false,
     },
     CaptureTable {
         table: schema::table::ERASURE_INTENT,
         order_by: "operation_id",
         domain: "canonical.erasure_intent",
         id_kind: TableIdKind::Field("operation_id"),
+        core: false,
     },
     CaptureTable {
         table: schema::table::ERASURE_OUTCOME,
         order_by: "operation_id",
         domain: "canonical.erasure_outcome",
         id_kind: TableIdKind::Field("operation_id"),
+        core: false,
     },
 ];
 
@@ -244,6 +272,31 @@ pub(super) struct BackupResidencyRow {
     pub(super) content_digest: String,
 }
 
+/// Reports whether the proved live provider version pins the English-prose
+/// error matchers below. Prose shapes are proven only against the pinned
+/// provider major; an unproved version (never connected, cleared after
+/// connection loss, or a different major) disables prose matching so every
+/// ambiguity fails closed instead of misclassifying provider prose it was
+/// never proven against.
+pub(super) fn provider_prose_pinned(adapter: &crate::SurrealStoreAdapter) -> bool {
+    adapter
+        .authenticated_provider_identity()
+        .is_some_and(|identity| identity.version_major == crate::PINNED_SURREALDB_MAJOR)
+}
+
+/// Reports whether a provider statement error observes an absent table
+/// under the pinned provider contract. The table name must appear in the
+/// prose so one table's absence is never attributed to another.
+pub(super) fn is_absent_table_pinned(error: &str, table: &str, prose_pinned: bool) -> bool {
+    if !prose_pinned {
+        return false;
+    }
+    let folded = error.to_ascii_lowercase();
+    folded.contains("does not exist")
+        && folded.contains("table")
+        && folded.contains(&table.to_ascii_lowercase())
+}
+
 /// Derives the stable residency digest for one capture domain. The digest
 /// binds the domain label only; member content never collapses domains.
 pub(super) fn residency_digest_for(domain: &str) -> String {
@@ -287,15 +340,17 @@ pub(super) fn derive_consistency_point(
     Ok(sha256_hex(&material))
 }
 
-/// Loads one backup-operation row by exact operation identity. Absent backup
-/// tables observe absent-table, which maps to `MigrationRequired`: an
-/// unprovisioned backend refuses without effects instead of inventing
-/// coordination state.
+/// Loads one backup-operation row by exact operation identity. Absent
+/// backup tables observe absent-table under the pinned provider contract,
+/// which maps to `MigrationRequired`: an unprovisioned backend refuses
+/// without effects instead of inventing coordination state. Unproven
+/// prose, or any other error class, keeps the reconciling disposition.
 pub(super) async fn load_operation_row(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
     operation: &'static str,
     operation_id: &OperationId,
+    prose_pinned: bool,
 ) -> Result<Option<BackupOperationRow>, AdapterError> {
     let mut bindings = Map::new();
     bindings.insert(
@@ -315,7 +370,11 @@ pub(super) async fn load_operation_row(
     .await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
-        if errors.iter().all(|error| client::is_absent_table(error)) {
+        if prose_pinned
+            && errors.iter().all(|error| {
+                is_absent_table_pinned(error, schema::table::BACKUP_OPERATION, prose_pinned)
+            })
+        {
             return Err(AdapterError::MigrationRequired);
         }
         return Err(AdapterError::PartialOutcome);
@@ -339,13 +398,16 @@ pub(crate) async fn backup_begin(
     request.validate().map_err(AdapterError::Store)?;
     let db = super::client(adapter).await?;
     super::ensure_ready(adapter, db).await?;
+    let prose_pinned = provider_prose_pinned(adapter);
     if request.scope.schema_generation != adapter.config.expected_schema_generation.as_str() {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     }
-    if request.scope.installation_id != adapter.config.installation_id {
+    if request.scope.installation_id != adapter.config.installation_id
+        || request.scope.store_id != adapter.config.database
+    {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "backup.installation_id",
-            reason: "capture source is not this installation",
+            reason: "capture source is not this store",
         }));
     }
     if request.scope.residency_denominator_digest != expected_denominator_digest() {
@@ -355,8 +417,14 @@ pub(crate) async fn backup_begin(
         }));
     }
     let operation_id = request.identity.operation_id.clone();
-    if let Some(existing) =
-        load_operation_row(db, &adapter.config, "backup.begin", &operation_id).await?
+    if let Some(existing) = load_operation_row(
+        db,
+        &adapter.config,
+        "backup.begin",
+        &operation_id,
+        prose_pinned,
+    )
+    .await?
     {
         return replay_or_conflict_begin(&request, &existing);
     }
@@ -368,7 +436,7 @@ pub(crate) async fn backup_begin(
     )?;
     let admitted_product =
         u64::from(request.max_pages).saturating_mul(u64::from(request.max_members_per_page));
-    let frozen = freeze_denominator(db, &adapter.config, admitted_product).await?;
+    let frozen = freeze_denominator(db, &adapter.config, admitted_product, prose_pinned).await?;
     if frozen.fence.state_fence != request.scope.state_fence
         || frozen.fence.next_commit_sequence != fence.next_commit_sequence
         || frozen.fence.next_outbox_sequence != fence.next_outbox_sequence
@@ -394,6 +462,7 @@ pub(crate) async fn backup_begin(
         &members,
         &residencies,
         total_bytes,
+        prose_pinned,
     )
     .await?;
     Ok(StoreBackupConsistency {
@@ -453,8 +522,11 @@ async fn freeze_denominator(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
     admitted_product: u64,
+    prose_pinned: bool,
 ) -> Result<FrozenDenominator, AdapterError> {
-    let per_table_limit = admitted_product.saturating_add(1).min(i64::MAX as u64);
+    let per_table_limit = admitted_product
+        .saturating_add(1)
+        .min(u64::try_from(i64::MAX).unwrap_or(u64::MAX));
     let mut sql = String::from(schema::TX_BEGIN);
     sql.push_str(schema::READ_FENCE);
     sql.push_str(schema::READ_ALL_REVISION_HEADS);
@@ -469,7 +541,12 @@ async fn freeze_denominator(
     sql.push_str(schema::TX_COMMIT);
     let mut response = client::query(db, config, "backup.begin", &sql, Map::new()).await?;
     let errors = response.take_errors();
-    if !errors.is_empty() {
+    // Errors are attributed per statement below, never blanket-bailed:
+    // every consumed index classifies its own value, so a missing
+    // optional table reads as empty while a missing core table (or any
+    // other error class) keeps the reconciling disposition. The gate
+    // here only fast-fails errors no per-index classifier can own.
+    if !errors.is_empty() && !is_tolerable_absence(&errors, prose_pinned) {
         return Err(AdapterError::PartialOutcome);
     }
     let fence = response
@@ -482,7 +559,10 @@ async fn freeze_denominator(
     plan::validate_ordering_heads(&ordering_heads)?;
     let mut rows = Vec::with_capacity(CAPTURE_TABLES.len());
     for (index, table) in CAPTURE_TABLES.iter().enumerate() {
-        rows.push((index, take_capture_table(&mut response, 4 + index, table)?));
+        rows.push((
+            index,
+            take_capture_table(&mut response, 4 + index, table, prose_pinned)?,
+        ));
     }
     Ok(FrozenDenominator {
         fence,
@@ -492,13 +572,31 @@ async fn freeze_denominator(
     })
 }
 
+/// Reports whether every provider error is a pinned absent-table
+/// observation naming an OPTIONAL capture table. Core tables and every
+/// other error class stay outside this tolerance: they fail closed at the
+/// gate above or inside `take_capture_table`.
+fn is_tolerable_absence(errors: &[String], prose_pinned: bool) -> bool {
+    if !prose_pinned || errors.is_empty() {
+        return false;
+    }
+    errors.iter().all(|error| {
+        CAPTURE_TABLES
+            .iter()
+            .any(|table| !table.core && is_absent_table_pinned(error, table.table, prose_pinned))
+    })
+}
+
 /// Takes one frozen table scan, tolerating exactly one case: a missing
-/// feature table on an otherwise healthy database reads as empty. Any other
-/// error, or a missing core table, keeps the reconciling disposition.
+/// OPTIONAL table under the pinned provider contract reads as empty. A
+/// missing core table contradicts the schema meta the readiness gate
+/// already verified, so it fails closed; any other error, or any
+/// unproven prose, keeps the reconciling disposition.
 fn take_capture_table(
     response: &mut client::RpcResults,
     index: usize,
     table: &CaptureTable,
+    prose_pinned: bool,
 ) -> Result<Vec<Value>, AdapterError> {
     let value = response.take::<Value>(index)?;
     match value {
@@ -513,11 +611,7 @@ fn take_capture_table(
             Ok(rows)
         }
         Value::String(prose) => {
-            let folded = prose.to_ascii_lowercase();
-            if folded.contains("does not exist")
-                && folded.contains("table")
-                && folded.contains(&table.table.to_ascii_lowercase())
-            {
+            if !table.core && is_absent_table_pinned(&prose, table.table, prose_pinned) {
                 Ok(Vec::new())
             } else {
                 Err(AdapterError::PartialOutcome)
@@ -669,6 +763,7 @@ async fn persist_frozen_capture(
     members: &[BackupMemberRow],
     residencies: &[BackupResidencyRow],
     total_bytes: u64,
+    prose_pinned: bool,
 ) -> Result<(), AdapterError> {
     let operation_id = request.identity.operation_id.to_string();
     let scope_json = serde_json::to_string(&request.scope)
@@ -726,17 +821,27 @@ async fn persist_frozen_capture(
         );
     }
     sql.push_str(schema::TX_COMMIT);
-    let mut response = db.query_admin("backup.begin", &sql, bindings).await?;
+    let mut response = db.query_write("backup.begin", &sql, bindings).await?;
     let errors = response.take_errors();
     if errors.is_empty() {
         return Ok(());
     }
-    if errors.iter().all(|error| client::is_absent_table(error)) {
+    if prose_pinned
+        && errors.iter().all(|error| {
+            is_absent_table_pinned(error, schema::table::BACKUP_OPERATION, prose_pinned)
+        })
+    {
         return Err(AdapterError::MigrationRequired);
     }
-    if is_duplicate_operation(&errors) {
-        let Some(existing) =
-            load_operation_row(db, config, "backup.begin", &request.identity.operation_id).await?
+    if is_duplicate_operation(&errors, prose_pinned) {
+        let Some(existing) = load_operation_row(
+            db,
+            config,
+            "backup.begin",
+            &request.identity.operation_id,
+            prose_pinned,
+        )
+        .await?
         else {
             return Err(AdapterError::UnknownOutcome {
                 operation_id: operation_id.clone(),
@@ -749,9 +854,14 @@ async fn persist_frozen_capture(
 }
 
 /// Reports whether provider statement errors observe a duplicate operation
-/// row: a concurrent winner committed first, so the loser re-reads and
-/// classifies replay versus conflict instead of retrying blindly.
-pub(super) fn is_duplicate_operation(errors: &[String]) -> bool {
+/// row under the pinned provider contract: a concurrent winner committed
+/// first, so the loser re-reads and classifies replay versus conflict
+/// instead of retrying blindly. Unproven prose never counts as a
+/// duplicate; it keeps the reconciling disposition.
+pub(super) fn is_duplicate_operation(errors: &[String], prose_pinned: bool) -> bool {
+    if !prose_pinned {
+        return false;
+    }
     errors.iter().any(|error| {
         let folded = error.to_ascii_lowercase();
         folded.contains("backup_operation_id")
@@ -773,9 +883,16 @@ pub(crate) async fn backup_page(
     request.validate().map_err(AdapterError::Store)?;
     let db = super::client(adapter).await?;
     super::ensure_ready(adapter, db).await?;
-    let operation = load_operation_row(db, &adapter.config, "backup.page", &request.operation_id)
-        .await?
-        .ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
+    let prose_pinned = provider_prose_pinned(adapter);
+    let operation = load_operation_row(
+        db,
+        &adapter.config,
+        "backup.page",
+        &request.operation_id,
+        prose_pinned,
+    )
+    .await?
+    .ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
     if operation.operation_kind != KIND_CAPTURE {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "backup.operation",
@@ -795,6 +912,7 @@ pub(crate) async fn backup_page(
         &request.operation_id.to_string(),
         request.cursor,
         request.max_members,
+        prose_pinned,
     )
     .await?;
     let total_members = u64::try_from(operation.member_count.max(0)).unwrap_or(0);
@@ -868,7 +986,7 @@ pub(super) async fn mark_expired(
     let mut bindings = Map::new();
     bindings.insert("backup_operation_id".to_owned(), json!(operation_id));
     let _ = db
-        .query_admin(
+        .query_write(
             "backup.page",
             &format!(
                 "UPDATE {} SET status = 'expired' WHERE operation_id = $backup_operation_id AND status = 'capturing';",
@@ -888,6 +1006,7 @@ async fn read_member_window(
     operation_id: &str,
     cursor: u64,
     max_members: u32,
+    prose_pinned: bool,
 ) -> Result<Vec<BackupMemberRow>, AdapterError> {
     let limit = i64::from(max_members);
     let cursor_value =
@@ -908,7 +1027,11 @@ async fn read_member_window(
     .await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
-        if errors.iter().all(|error| client::is_absent_table(error)) {
+        if prose_pinned
+            && errors.iter().all(|error| {
+                is_absent_table_pinned(error, schema::table::BACKUP_MEMBER, prose_pinned)
+            })
+        {
             return Err(AdapterError::MigrationRequired);
         }
         return Err(AdapterError::PartialOutcome);
@@ -927,9 +1050,16 @@ pub(crate) async fn backup_end(
     request.validate().map_err(AdapterError::Store)?;
     let db = super::client(adapter).await?;
     super::ensure_ready(adapter, db).await?;
-    let operation = load_operation_row(db, &adapter.config, "backup.end", &request.operation_id)
-        .await?
-        .ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
+    let prose_pinned = provider_prose_pinned(adapter);
+    let operation = load_operation_row(
+        db,
+        &adapter.config,
+        "backup.end",
+        &request.operation_id,
+        prose_pinned,
+    )
+    .await?
+    .ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
     if operation.operation_kind != KIND_CAPTURE {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "backup.operation",
@@ -949,7 +1079,9 @@ pub(crate) async fn backup_end(
         }));
     }
     check_frozen_fence(db, &adapter.config, &operation).await?;
-    let (members, residencies) = load_frozen_denominator(db, &adapter.config, &operation).await?;
+    let (members, residencies) =
+        load_frozen_denominator(db, &adapter.config, &operation, "backup.end", prose_pinned)
+            .await?;
     let (live_revisions, live_orderings) = read_live_heads(db, &adapter.config).await?;
     if heads_digest(&live_revisions, &live_orderings)? != operation.frozen_heads_digest {
         mark_expired(db, &adapter.config, &operation.operation_id).await;
@@ -960,7 +1092,7 @@ pub(crate) async fn backup_end(
     receipt.revision_heads = live_revisions;
     receipt.ordering_heads = live_orderings;
     receipt.validate().map_err(AdapterError::Store)?;
-    commit_completion(db, &adapter.config, &operation, &receipt).await?;
+    commit_completion(db, &adapter.config, &operation, &receipt, prose_pinned).await?;
     Ok(receipt)
 }
 
@@ -983,10 +1115,16 @@ pub(super) fn completed_receipt(
 
 /// Loads all frozen members and residency dispositions for one operation,
 /// verifying the frozen population matches the operation row.
-async fn load_frozen_denominator(
+/// Loads all frozen members and residency dispositions for one operation,
+/// verifying the frozen population matches the operation row. Coordination
+/// tables proved present by the operation-row load above; any error here
+/// keeps the reconciling disposition.
+pub(super) async fn load_frozen_denominator(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
     operation: &BackupOperationRow,
+    pool_operation: &'static str,
+    prose_pinned: bool,
 ) -> Result<(Vec<BackupMemberRow>, Vec<BackupResidencyRow>), AdapterError> {
     let mut bindings = Map::new();
     bindings.insert(
@@ -997,7 +1135,7 @@ async fn load_frozen_denominator(
     let mut response = client::query(
         db,
         config,
-        "backup.end",
+        pool_operation,
         &format!(
             "SELECT * FROM {} WHERE operation_id = $backup_operation_id ORDER BY page_cursor LIMIT {limit}; SELECT * FROM {} WHERE operation_id = $backup_operation_id ORDER BY residency_digest LIMIT 65;",
             schema::table::BACKUP_MEMBER,
@@ -1008,7 +1146,12 @@ async fn load_frozen_denominator(
     .await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
-        if errors.iter().all(|error| client::is_absent_table(error)) {
+        if prose_pinned
+            && errors.iter().all(|error| {
+                is_absent_table_pinned(error, schema::table::BACKUP_MEMBER, prose_pinned)
+                    || is_absent_table_pinned(error, schema::table::BACKUP_RESIDENCY, prose_pinned)
+            })
+        {
             return Err(AdapterError::MigrationRequired);
         }
         return Err(AdapterError::PartialOutcome);
@@ -1030,52 +1173,7 @@ fn build_completion_receipt(
     members: &[BackupMemberRow],
     residencies: &[BackupResidencyRow],
 ) -> Result<StoreBackupCompletionReceipt, AdapterError> {
-    let mut ordered_digests: Vec<&str> = members
-        .iter()
-        .map(|member| member.member_digest.as_str())
-        .collect();
-    ordered_digests.sort_unstable();
-    let snapshot_digest = sha256_hex(ordered_digests.join("\n").as_bytes());
-    let mut computed = std::collections::BTreeMap::new();
-    for member in members {
-        let entry = computed
-            .entry(member.residency_digest.clone())
-            .or_insert((0_u64, 0_u64));
-        entry.0 += 1;
-        entry.1 = entry
-            .1
-            .saturating_add(u64::try_from(member.member_bytes.max(0)).unwrap_or(0));
-    }
-    let mut receipt_residencies = Vec::with_capacity(residencies.len());
-    for stored in residencies {
-        let (count, bytes) = computed.remove(&stored.residency_digest).ok_or({
-            AdapterError::Store(StoreError::InvalidField {
-                field: "backup.denominator",
-                reason: "stored disposition has no frozen members",
-            })
-        })?;
-        if count != u64::try_from(stored.member_count.max(0)).unwrap_or(u64::MAX)
-            || bytes != u64::try_from(stored.member_bytes.max(0)).unwrap_or(u64::MAX)
-        {
-            return Err(AdapterError::Store(StoreError::InvalidField {
-                field: "backup.denominator",
-                reason: "stored disposition diverges from frozen members",
-            }));
-        }
-        receipt_residencies.push(ResidencyDisposition {
-            residency_digest: stored.residency_digest.clone(),
-            domain: stored.domain.clone(),
-            member_count: count,
-            member_bytes: bytes,
-            content_digest: stored.content_digest.clone(),
-        });
-    }
-    if !computed.is_empty() {
-        return Err(AdapterError::Store(StoreError::InvalidField {
-            field: "backup.denominator",
-            reason: "frozen members lack a stored disposition",
-        }));
-    }
+    let (snapshot_digest, receipt_residencies) = recompute_denominator(members, residencies)?;
     let total_bytes: u64 = receipt_residencies
         .iter()
         .map(|entry| entry.member_bytes)
@@ -1099,6 +1197,64 @@ fn build_completion_receipt(
     Ok(receipt)
 }
 
+/// Recomputes the snapshot digest and cross-footed per-residency
+/// dispositions over frozen rows. Shared by completion and validation so
+/// both prove the same denominator over the same frozen evidence instead
+/// of validation trusting a weaker projection.
+pub(super) fn recompute_denominator(
+    members: &[BackupMemberRow],
+    stored: &[BackupResidencyRow],
+) -> Result<(String, Vec<ResidencyDisposition>), AdapterError> {
+    let mut ordered_digests: Vec<&str> = members
+        .iter()
+        .map(|member| member.member_digest.as_str())
+        .collect();
+    ordered_digests.sort_unstable();
+    let snapshot_digest = sha256_hex(ordered_digests.join("\n").as_bytes());
+    let mut computed = std::collections::BTreeMap::new();
+    for member in members {
+        let entry = computed
+            .entry(member.residency_digest.clone())
+            .or_insert((0_u64, 0_u64));
+        entry.0 += 1;
+        entry.1 = entry
+            .1
+            .saturating_add(u64::try_from(member.member_bytes.max(0)).unwrap_or(0));
+    }
+    let mut receipt_residencies = Vec::with_capacity(stored.len());
+    for disposition in stored {
+        let (count, bytes) =
+            computed
+                .remove(&disposition.residency_digest)
+                .ok_or(AdapterError::Store(StoreError::InvalidField {
+                    field: "backup.denominator",
+                    reason: "stored disposition has no frozen members",
+                }))?;
+        if count != u64::try_from(disposition.member_count.max(0)).unwrap_or(u64::MAX)
+            || bytes != u64::try_from(disposition.member_bytes.max(0)).unwrap_or(u64::MAX)
+        {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "backup.denominator",
+                reason: "stored disposition diverges from frozen members",
+            }));
+        }
+        receipt_residencies.push(ResidencyDisposition {
+            residency_digest: disposition.residency_digest.clone(),
+            domain: disposition.domain.clone(),
+            member_count: count,
+            member_bytes: bytes,
+            content_digest: disposition.content_digest.clone(),
+        });
+    }
+    if !computed.is_empty() {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "backup.denominator",
+            reason: "frozen members lack a stored disposition",
+        }));
+    }
+    Ok((snapshot_digest, receipt_residencies))
+}
+
 /// Commits the completion receipt atomically: the status flip plus receipt
 /// payload land in one conditional update. A concurrent winner's identical
 /// receipt replays; anything else stays a conflict.
@@ -1107,6 +1263,7 @@ async fn commit_completion(
     config: &SurrealAdapterConfig,
     operation: &BackupOperationRow,
     receipt: &StoreBackupCompletionReceipt,
+    prose_pinned: bool,
 ) -> Result<(), AdapterError> {
     let receipt_json = serde_json::to_string(receipt)
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
@@ -1121,7 +1278,7 @@ async fn commit_completion(
         json!(receipt.snapshot_digest),
     );
     let mut response = db
-        .query_admin(
+        .query_write(
             "backup.end",
             &format!(
                 "LET $backup_complete = (UPDATE {} SET status = 'completed', snapshot_digest = $backup_snapshot_digest, receipt_json = $backup_receipt_json WHERE operation_id = $backup_operation_id AND status = 'capturing' RETURN AFTER); IF array::len($backup_complete ?? []) != 1 {{ THROW 'backup_completion_conflict'; }};",
@@ -1134,7 +1291,11 @@ async fn commit_completion(
     if errors.is_empty() {
         return Ok(());
     }
-    if errors.iter().all(|error| client::is_absent_table(error)) {
+    if prose_pinned
+        && errors.iter().all(|error| {
+            is_absent_table_pinned(error, schema::table::BACKUP_OPERATION, prose_pinned)
+        })
+    {
         return Err(AdapterError::MigrationRequired);
     }
     let current = load_operation_row(
@@ -1144,6 +1305,7 @@ async fn commit_completion(
         &OperationId::new(&operation.operation_id)
             .map_err(StoreError::Foundation)
             .map_err(AdapterError::Store)?,
+        prose_pinned,
     )
     .await?
     .ok_or(AdapterError::PartialOutcome)?;

@@ -16,7 +16,6 @@
 //! Unknown stays unknown: transport loss or a moved fence during replay
 //! reports `UnknownOutcome` for exact readback instead of success.
 
-use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::fmt::Write as _;
 
@@ -25,16 +24,17 @@ use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use crate::schema;
 use eliot_store_api::{
-    ResidencyDisposition, StateFence, StoreBackupCompletionReceipt, StoreBackupPhase,
-    StoreBackupReconcileRequest, StoreBackupReconciliation, StoreBackupStatusReport,
-    StoreBackupStatusRequest, StoreBackupValidationOutcome, StoreBackupValidationReceipt,
-    StoreBackupValidationRequest, StoreError, StoreIsolatedRestoreRequest, sha256_hex,
+    OutboxIntent, ProjectionPublicationRecord, ResidencyDisposition, StateFence,
+    StoreBackupCompletionReceipt, StoreBackupPhase, StoreBackupReconcileRequest,
+    StoreBackupReconciliation, StoreBackupStatusReport, StoreBackupStatusRequest,
+    StoreBackupValidationOutcome, StoreBackupValidationReceipt, StoreBackupValidationRequest,
+    StoreError, StoreIsolatedRestoreRequest, sha256_hex,
 };
 
 use super::backup_snapshot::{
-    BackupMemberRow, BackupOperationRow, CAPTURE_TABLES, STATUS_COMPLETED, TableIdKind,
-    completed_receipt, expected_denominator_digest, is_duplicate_operation, load_operation_row,
-    operation_scope,
+    BackupMemberRow, BackupOperationRow, BackupResidencyRow, CAPTURE_TABLES, STATUS_COMPLETED,
+    TableIdKind, completed_receipt, expected_denominator_digest, is_duplicate_operation,
+    load_operation_row, operation_scope,
 };
 use super::receipt_reconciliation::read_fence;
 use super::take_vec;
@@ -59,13 +59,21 @@ pub(crate) async fn backup_isolated_restore(
     request.validate().map_err(AdapterError::Store)?;
     let db = super::client(adapter).await?;
     super::ensure_ready(adapter, db).await?;
+    let prose_pinned = super::backup_snapshot::provider_prose_pinned(adapter);
     if request.scope.schema_generation != adapter.config.expected_schema_generation.as_str() {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     }
-    if request.scope.dest_installation_id != adapter.config.installation_id {
+    // Owner-approved isolated destination proof: the admitted scope must
+    // name this exact installation and store database, the composition
+    // pins the Host-approved fence, and the session admits the backup
+    // capability. Identity match alone never authorizes; all three legs
+    // are required before any write.
+    if request.scope.dest_installation_id != adapter.config.installation_id
+        || request.scope.dest_store_id != adapter.config.database
+    {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "backup.destination",
-            reason: "restore destination is not this installation",
+            reason: "restore destination is not this store",
         }));
     }
     if request.scope.residency_denominator_digest != expected_denominator_digest() {
@@ -76,8 +84,14 @@ pub(crate) async fn backup_isolated_restore(
     }
     let fence = current_live_fence(db, &adapter.config, &request.scope.state_fence).await?;
     let restore_id = request.identity.operation_id.clone();
-    if let Some(existing) =
-        load_operation_row(db, &adapter.config, "backup.restore", &restore_id).await?
+    if let Some(existing) = load_operation_row(
+        db,
+        &adapter.config,
+        "backup.restore",
+        &restore_id,
+        prose_pinned,
+    )
+    .await?
     {
         return replay_or_conflict_restore(&request, &existing);
     }
@@ -86,6 +100,7 @@ pub(crate) async fn backup_isolated_restore(
         &adapter.config,
         "backup.restore",
         &request.source_operation_id,
+        prose_pinned,
     )
     .await?
     .ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
@@ -98,17 +113,20 @@ pub(crate) async fn backup_isolated_restore(
     }
     let source_members =
         load_source_members(db, &adapter.config, &source, request.expected_member_count).await?;
-    let suppressions = load_purge_subjects(db, &adapter.config).await?;
+    let suppressions = load_purge_subjects(db, &adapter.config, prose_pinned).await?;
     let candidates: Vec<&BackupMemberRow> = source_members
         .iter()
         .filter(|member| !is_suppressed(&suppressions, member))
+        .filter(|member| !is_outbox_suppressed(member))
         .collect();
+    validate_derived_members(&candidates)?;
     let plan = classify_replay_slots(
         db,
         &adapter.config,
         &fence,
         &candidates,
         &restore_id.to_string(),
+        prose_pinned,
     )
     .await?;
     apply_replay(
@@ -120,13 +138,20 @@ pub(crate) async fn backup_isolated_restore(
         &restore_id.to_string(),
     )
     .await?;
+    let source_commit_sequence = u64::try_from(source.frozen_commit_sequence.max(0)).unwrap_or(0);
+    let source_outbox_sequence = u64::try_from(source.frozen_outbox_sequence.max(0)).unwrap_or(0);
     commit_restore(
         db,
         &adapter.config,
-        &request,
-        &source_receipt,
-        &plan,
-        &candidates,
+        RestoreCommit {
+            request: &request,
+            source_receipt: &source_receipt,
+            plan: &plan,
+            candidates: &candidates,
+            source_commit_sequence,
+            source_outbox_sequence,
+            prose_pinned,
+        },
     )
     .await
 }
@@ -171,12 +196,10 @@ fn completed_source_receipt(
             reason: "restore source must be a capture operation",
         }));
     }
-    completed_receipt(source)?.ok_or({
-        AdapterError::Store(StoreError::InvalidField {
-            field: "backup.source",
-            reason: "restore source capture is not completed",
-        })
-    })
+    completed_receipt(source)?.ok_or(AdapterError::Store(StoreError::InvalidField {
+        field: "backup.source",
+        reason: "restore source capture is not completed",
+    }))
 }
 
 /// Loads all frozen source members, verifying the frozen population.
@@ -205,9 +228,10 @@ async fn load_source_members(
     .await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
-        if errors.iter().all(|error| client::is_absent_table(error)) {
-            return Err(AdapterError::MigrationRequired);
-        }
+        // Source members live in the backup coordination tables the
+        // restore path already proved present by loading the source
+        // operation row; any error here keeps the reconciling
+        // disposition.
         return Err(AdapterError::PartialOutcome);
     }
     let members = take_vec::<BackupMemberRow>(&mut response, 0)?;
@@ -217,24 +241,39 @@ async fn load_source_members(
     Ok(members)
 }
 
-/// Loads current purge-suppression subjects. An absent erasure table reads
-/// as no suppressions; any other error keeps the reconciling disposition.
+/// Loads current purge-suppression subjects. A missing purge ledger can
+/// never mean "no suppressions": the backend is not provisioned for safe
+/// restore, so it refuses with `MigrationRequired` instead of resurrecting
+/// purged records. Any other error class keeps the reconciling
+/// disposition.
 async fn load_purge_subjects(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
+    prose_pinned: bool,
 ) -> Result<Vec<String>, AdapterError> {
     let mut response = client::query(
         db,
         config,
         "backup.restore",
-        "SELECT VALUE subject FROM erasure_intent;",
+        &format!(
+            "SELECT VALUE subject FROM {};",
+            schema::table::ERASURE_INTENT
+        ),
         Map::new(),
     )
     .await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
-        if errors.iter().all(|error| client::is_absent_table(error)) {
-            return Ok(Vec::new());
+        if prose_pinned
+            && errors.iter().all(|error| {
+                super::backup_snapshot::is_absent_table_pinned(
+                    error,
+                    schema::table::ERASURE_INTENT,
+                    prose_pinned,
+                )
+            })
+        {
+            return Err(AdapterError::MigrationRequired);
         }
         return Err(AdapterError::PartialOutcome);
     }
@@ -249,6 +288,61 @@ fn is_suppressed(subjects: &[String], member: &BackupMemberRow) -> bool {
     subjects.iter().any(|subject| {
         subject == &qualified || subject == &member.member_id || subject == &member.member_table
     })
+}
+
+/// Reports whether a frozen outbox member must stay suppressed under the
+/// normative outbox suppression/re-emission contract: only pending
+/// (`ARRIVED`) effects re-emit from the isolated destination. Claimed,
+/// applied, confirmed, rejected, ambiguous, or irreconcilable effect
+/// evidence stays historical — resurrecting it would revive completed or
+/// uncertain effects as live work. Unparseable bodies cannot prove pending
+/// status, so they suppress rather than re-emit. Suppressed members are
+/// excluded from replay and receipt denominators; the delta against the
+/// source receipt is the exact suppression evidence.
+fn is_outbox_suppressed(member: &BackupMemberRow) -> bool {
+    if member.member_table != schema::table::OUTBOX_EVENT {
+        return false;
+    }
+    let Ok(row) = serde_json::from_str::<Value>(&member.member_json) else {
+        return true;
+    };
+    row.get("body")
+        .and_then(|body| body.get("state"))
+        .and_then(Value::as_str)
+        != Some("ARRIVED")
+}
+
+/// Validates restored derived data through the accepted owner types
+/// before any write: projection publications validate as
+/// `ProjectionPublicationRecord` and outbox intents as `OutboxIntent`.
+/// Derived bytes are replayed verbatim, never re-derived here; a member
+/// that no longer validates as owner-built refuses the restore with
+/// `InvalidProjection` instead of importing unverified derived data.
+fn validate_derived_members(candidates: &[&BackupMemberRow]) -> Result<(), AdapterError> {
+    for member in candidates {
+        let row: Value = serde_json::from_str(&member.member_json)
+            .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+        if member.member_table == schema::table::PROJECTION_RECORD {
+            let Some(body) = row.get("body") else {
+                return Err(AdapterError::Store(StoreError::InvalidProjection));
+            };
+            let record: ProjectionPublicationRecord = serde_json::from_value(body.clone())
+                .map_err(|_| AdapterError::Store(StoreError::InvalidProjection))?;
+            if record.validate().is_err() {
+                return Err(AdapterError::Store(StoreError::InvalidProjection));
+            }
+        } else if member.member_table == schema::table::OUTBOX_EVENT {
+            let Some(body) = row.get("body") else {
+                return Err(AdapterError::Store(StoreError::InvalidProjection));
+            };
+            let intent: OutboxIntent = serde_json::from_value(body.clone())
+                .map_err(|_| AdapterError::Store(StoreError::InvalidProjection))?;
+            if intent.validate().is_err() {
+                return Err(AdapterError::Store(StoreError::InvalidProjection));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Replay classification for one restore: slots to create, slots already
@@ -266,6 +360,7 @@ async fn classify_replay_slots(
     fence: &crate::apply::schema_contract::FenceRecord,
     candidates: &[&BackupMemberRow],
     operation_id: &str,
+    prose_pinned: bool,
 ) -> Result<ReplayPlan, AdapterError> {
     let mut sql = String::from(schema::TX_BEGIN);
     sql.push_str(schema::READ_FENCE);
@@ -301,14 +396,32 @@ async fn classify_replay_slots(
     }
     let mut create_indexes = Vec::new();
     for (position, member) in candidates.iter().enumerate() {
-        let live = response.take::<Option<Value>>(2 + position)?;
-        match live {
-            None => create_indexes.push(position),
-            Some(value) => {
-                if row_content_digest(&value)? != member.content_digest {
+        // Shape-explicit slot read: null means absent (create below), an
+        // object converges by content digest, and a provider error string
+        // classifies by table — a missing destination table is
+        // unprovisioned, anything else stays reconciling. Error prose is
+        // never trusted on an unpinned provider version.
+        let live = response.take::<Value>(2 + position)?;
+        match &live {
+            Value::Null => create_indexes.push(position),
+            Value::Object(_) => {
+                if row_content_digest(&live)? != member.content_digest {
                     return Err(AdapterError::Store(StoreError::IdentityConflict));
                 }
             }
+            Value::String(prose) => {
+                if prose_pinned
+                    && super::backup_snapshot::is_absent_table_pinned(
+                        prose,
+                        &member.member_table,
+                        prose_pinned,
+                    )
+                {
+                    return Err(AdapterError::MigrationRequired);
+                }
+                return Err(AdapterError::PartialOutcome);
+            }
+            _ => return Err(AdapterError::PartialOutcome),
         }
     }
     Ok(ReplayPlan {
@@ -324,12 +437,10 @@ fn restore_record_key(member: &BackupMemberRow) -> Result<(String, String), Adap
     let table = CAPTURE_TABLES
         .iter()
         .find(|entry| entry.table == member.member_table)
-        .ok_or({
-            AdapterError::Store(StoreError::InvalidField {
-                field: "backup.member_table",
-                reason: "frozen member names an unknown canonical table",
-            })
-        })?;
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "backup.member_table",
+            reason: "frozen member names an unknown canonical table",
+        }))?;
     let row: Value = serde_json::from_str(&member.member_json)
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
     let key =
@@ -338,16 +449,19 @@ fn restore_record_key(member: &BackupMemberRow) -> Result<(String, String), Adap
                 .get(field)
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .ok_or({
-                    AdapterError::Serialization("frozen member lost its logical key".to_owned())
-                })?,
+                .ok_or(AdapterError::Serialization(
+                    "frozen member lost its logical key".to_owned(),
+                ))?,
             TableIdKind::NamespaceKey => {
-                let namespace = row.get("namespace").and_then(Value::as_str).ok_or({
-                    AdapterError::Serialization("frozen member lost its namespace".to_owned())
-                })?;
-                let key = row.get("key").and_then(Value::as_str).ok_or({
-                    AdapterError::Serialization("frozen member lost its key".to_owned())
-                })?;
+                let namespace = row.get("namespace").and_then(Value::as_str).ok_or(
+                    AdapterError::Serialization("frozen member lost its namespace".to_owned()),
+                )?;
+                let key =
+                    row.get("key")
+                        .and_then(Value::as_str)
+                        .ok_or(AdapterError::Serialization(
+                            "frozen member lost its key".to_owned(),
+                        ))?;
                 let bytes = eliot_store_api::canonical_json_bytes(&json!({
                     "namespace": namespace,
                     "key": key,
@@ -356,24 +470,24 @@ fn restore_record_key(member: &BackupMemberRow) -> Result<(String, String), Adap
                 sha256_hex(&bytes)
             }
             TableIdKind::AutomationRevision => {
-                let automation_id = row.get("automation_id").and_then(Value::as_str).ok_or({
-                    AdapterError::Serialization("frozen member lost its id".to_owned())
-                })?;
-                let revision = row.get("revision").and_then(Value::as_str).ok_or({
-                    AdapterError::Serialization("frozen member lost its revision".to_owned())
-                })?;
+                let automation_id = row.get("automation_id").and_then(Value::as_str).ok_or(
+                    AdapterError::Serialization("frozen member lost its id".to_owned()),
+                )?;
+                let revision = row.get("revision").and_then(Value::as_str).ok_or(
+                    AdapterError::Serialization("frozen member lost its revision".to_owned()),
+                )?;
                 format!("{automation_id}\u{1f}{revision}")
             }
             TableIdKind::AutomationFailure => {
-                let automation_id = row.get("automation_id").and_then(Value::as_str).ok_or({
-                    AdapterError::Serialization("frozen member lost its id".to_owned())
-                })?;
-                let revision = row.get("revision").and_then(Value::as_str).ok_or({
-                    AdapterError::Serialization("frozen member lost its revision".to_owned())
-                })?;
-                let fingerprint = row.get("fingerprint").and_then(Value::as_str).ok_or({
-                    AdapterError::Serialization("frozen member lost its fingerprint".to_owned())
-                })?;
+                let automation_id = row.get("automation_id").and_then(Value::as_str).ok_or(
+                    AdapterError::Serialization("frozen member lost its id".to_owned()),
+                )?;
+                let revision = row.get("revision").and_then(Value::as_str).ok_or(
+                    AdapterError::Serialization("frozen member lost its revision".to_owned()),
+                )?;
+                let fingerprint = row.get("fingerprint").and_then(Value::as_str).ok_or(
+                    AdapterError::Serialization("frozen member lost its fingerprint".to_owned()),
+                )?;
                 eliot_store_api::automation_failure_key(automation_id, revision, fingerprint)
             }
         };
@@ -418,22 +532,15 @@ async fn apply_replay(
     let mut bindings = Map::new();
     apply_replay_statements(&mut sql, &mut bindings, plan, candidates, fence)?;
     sql.push_str(schema::TX_COMMIT);
-    let mut response = db.query_admin("backup.restore", &sql, bindings).await?;
+    let mut response = db.query_write("backup.restore", &sql, bindings).await?;
     let errors = response.take_errors();
     if errors.is_empty() {
         return Ok(());
     }
-    if errors
-        .iter()
-        .any(|error| error.contains(FENCE_DRIFT_MARKER))
-    {
-        return Err(AdapterError::UnknownOutcome {
-            operation_id: operation_id.to_owned(),
-        });
-    }
-    if errors.iter().all(|error| client::is_absent_table(error)) {
-        return Err(AdapterError::MigrationRequired);
-    }
+    // Any statement error resolves by re-reading the actual slot state
+    // below: converged slots pass, divergent slots conflict, and a moved
+    // fence stays unknown. Nothing is inferred from prose here, so no
+    // error shape can smuggle a success claim.
     verify_replay_slots(db, config, plan, candidates, operation_id).await
 }
 
@@ -516,48 +623,60 @@ async fn verify_replay_slots(
     }
     for (slot, position) in plan.create_indexes.iter().enumerate() {
         let member = candidates[*position];
-        let live = response
-            .take::<Option<Value>>(2 + slot)?
-            .ok_or(AdapterError::PartialOutcome)?;
-        if row_content_digest(&live)? != member.content_digest {
-            return Err(AdapterError::Store(StoreError::IdentityConflict));
+        // Shape-explicit like classification: only a live object can
+        // converge; error prose or anything else keeps the reconciling
+        // disposition instead of a false convergence claim.
+        let live = response.take::<Value>(2 + slot)?;
+        match &live {
+            Value::Object(_) => {
+                if row_content_digest(&live)? != member.content_digest {
+                    return Err(AdapterError::Store(StoreError::IdentityConflict));
+                }
+            }
+            _ => return Err(AdapterError::PartialOutcome),
         }
     }
     Ok(())
 }
 
-/// Commits the restore atomically: fence compare-and-set bump, then the
-/// restore operation row with its receipt. A concurrent winner's identical
-/// receipt replays; anything else stays a conflict.
-async fn commit_restore(
-    db: &RpcTransport,
-    config: &SurrealAdapterConfig,
-    request: &StoreIsolatedRestoreRequest,
-    source_receipt: &StoreBackupCompletionReceipt,
-    plan: &ReplayPlan,
-    candidates: &[&BackupMemberRow],
-) -> Result<StoreBackupCompletionReceipt, AdapterError> {
-    let receipt = build_restore_receipt(request, source_receipt, candidates)?;
-    let receipt_json = serde_json::to_string(&receipt)
-        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-    let scope_json = serde_json::to_string(&request.scope)
-        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-    let mut sql = String::from(schema::TX_BEGIN);
-    sql.push_str(FENCE_BUMP_STATEMENT);
-    let _ = write!(
-        sql,
-        "CREATE {} CONTENT $backup_operation_record;",
-        schema::table::BACKUP_OPERATION
-    );
-    sql.push_str(schema::TX_COMMIT);
+/// Inputs for the atomic restore commit: admitted request, source
+/// evidence, replay plan, frozen members, and watermarks. Bundled so the
+/// commit signature stays reviewable without an argument-count escape.
+struct RestoreCommit<'a> {
+    request: &'a StoreIsolatedRestoreRequest,
+    source_receipt: &'a StoreBackupCompletionReceipt,
+    plan: &'a ReplayPlan,
+    candidates: &'a [&'a BackupMemberRow],
+    source_commit_sequence: u64,
+    source_outbox_sequence: u64,
+    prose_pinned: bool,
+}
+
+/// Builds the bindings for the atomic restore commit: advanced fence
+/// sequences, the expected (pre-advance) guard values, and the restore
+/// operation row with its receipt.
+fn restore_commit_bindings(
+    commit: &RestoreCommit<'_>,
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+    receipt_json: &str,
+    scope_json: &str,
+) -> Map<String, Value> {
+    let RestoreCommit {
+        request,
+        source_receipt,
+        plan,
+        candidates,
+        ..
+    } = commit;
     let mut bindings = Map::new();
     bindings.insert(
         "backup_next_commit_sequence".to_owned(),
-        json!(plan.fence_commit_sequence.saturating_add(1)),
+        json!(next_commit_sequence),
     );
     bindings.insert(
         "backup_next_outbox_sequence".to_owned(),
-        json!(plan.fence_outbox_sequence.saturating_add(1)),
+        json!(next_outbox_sequence),
     );
     bindings.insert(
         "backup_expected_commit_sequence".to_owned(),
@@ -593,7 +712,53 @@ async fn commit_restore(
             "frozen_heads_digest": "",
         }),
     );
-    let mut response = db.query_admin("backup.restore", &sql, bindings).await?;
+    bindings
+}
+
+/// Commits the restore atomically: fence compare-and-set advancement, then
+/// the restore operation row with its receipt. The fence sequences advance
+/// to cover the maximum of the live watermark and the source watermark,
+/// plus the restore itself: restored commit/outbox evidence is never left
+/// above the fence sequences, so later captures and drift checks observe
+/// the restored state instead of silently predating it. Sequences never
+/// rewind. A concurrent winner's identical receipt replays; anything else
+/// stays a conflict.
+async fn commit_restore(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    commit: RestoreCommit<'_>,
+) -> Result<StoreBackupCompletionReceipt, AdapterError> {
+    let receipt = build_restore_receipt(commit.request, commit.source_receipt, commit.candidates)?;
+    let receipt_json = serde_json::to_string(&receipt)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    let scope_json = serde_json::to_string(&commit.request.scope)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    let next_commit_sequence = commit
+        .plan
+        .fence_commit_sequence
+        .max(commit.source_commit_sequence)
+        .saturating_add(1);
+    let next_outbox_sequence = commit
+        .plan
+        .fence_outbox_sequence
+        .max(commit.source_outbox_sequence)
+        .saturating_add(1);
+    let mut sql = String::from(schema::TX_BEGIN);
+    sql.push_str(FENCE_BUMP_STATEMENT);
+    let _ = write!(
+        sql,
+        "CREATE {} CONTENT $backup_operation_record;",
+        schema::table::BACKUP_OPERATION
+    );
+    sql.push_str(schema::TX_COMMIT);
+    let bindings = restore_commit_bindings(
+        &commit,
+        next_commit_sequence,
+        next_outbox_sequence,
+        &receipt_json,
+        &scope_json,
+    );
+    let mut response = db.query_write("backup.restore", &sql, bindings).await?;
     let errors = response.take_errors();
     if errors.is_empty() {
         return Ok(receipt);
@@ -603,18 +768,22 @@ async fn commit_restore(
         .any(|error| error.contains(FENCE_DRIFT_MARKER))
     {
         return Err(AdapterError::UnknownOutcome {
-            operation_id: request.identity.operation_id.to_string(),
+            operation_id: commit.request.identity.operation_id.to_string(),
         });
     }
-    if errors.iter().all(|error| client::is_absent_table(error)) {
-        return Err(AdapterError::MigrationRequired);
-    }
-    if is_duplicate_operation(&errors) {
-        let existing =
-            load_operation_row(db, config, "backup.restore", &request.identity.operation_id)
-                .await?
-                .ok_or(AdapterError::PartialOutcome)?;
-        return replay_or_conflict_restore(request, &existing);
+    // Coordination tables proved present by the source load above; any
+    // error here keeps the reconciling disposition.
+    if is_duplicate_operation(&errors, commit.prose_pinned) {
+        let existing = load_operation_row(
+            db,
+            config,
+            "backup.restore",
+            &commit.request.identity.operation_id,
+            commit.prose_pinned,
+        )
+        .await?
+        .ok_or(AdapterError::PartialOutcome)?;
+        return replay_or_conflict_restore(commit.request, &existing);
     }
     Err(AdapterError::PartialOutcome)
 }
@@ -633,12 +802,10 @@ fn build_restore_receipt(
         let table = CAPTURE_TABLES
             .iter()
             .find(|entry| entry.table == member.member_table)
-            .ok_or({
-                AdapterError::Store(StoreError::InvalidField {
-                    field: "backup.member_table",
-                    reason: "frozen member names an unknown canonical table",
-                })
-            })?;
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "backup.member_table",
+                reason: "frozen member names an unknown canonical table",
+            }))?;
         let entry = domains
             .entry(member.residency_digest.clone())
             .or_insert_with(|| (table.domain.to_owned(), Vec::new(), 0, 0));
@@ -669,16 +836,18 @@ fn build_restore_receipt(
         member_count: candidates.len() as u64,
         total_bytes,
         residencies,
-        revision_heads: Vec::new(),
-        ordering_heads: Vec::new(),
+        revision_heads: source_receipt.revision_heads.clone(),
+        ordering_heads: source_receipt.ordering_heads.clone(),
         partial: false,
     };
     receipt.validate().map_err(AdapterError::Store)?;
     Ok(receipt)
 }
 
-/// Validates one captured snapshot without restoring it. The frozen set is
-/// recomputed and compared field by field: complete, known-empty,
+/// Validates one captured snapshot without restoring it. The full frozen
+/// denominator is recomputed exactly like completion — snapshot digest
+/// plus cross-footed per-residency dispositions over the same frozen
+/// evidence — and compared field by field: complete, known-empty,
 /// unsupported, and conflict stay distinct, and unavailable validation
 /// never returns success.
 pub(crate) async fn backup_validate(
@@ -688,16 +857,26 @@ pub(crate) async fn backup_validate(
     request.validate().map_err(AdapterError::Store)?;
     let db = super::client(adapter).await?;
     super::ensure_ready(adapter, db).await?;
+    let prose_pinned = super::backup_snapshot::provider_prose_pinned(adapter);
     let operation = load_operation_row(
         db,
         &adapter.config,
         "backup.validate",
         &request.operation_id,
+        prose_pinned,
     )
     .await?
     .ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
-    let members = load_validation_members(db, &adapter.config, &operation).await?;
-    let (checked, unresolved, outcome) = verify_frozen_set(&operation, &members, &request)?;
+    let (members, residencies) = super::backup_snapshot::load_frozen_denominator(
+        db,
+        &adapter.config,
+        &operation,
+        "backup.validate",
+        prose_pinned,
+    )
+    .await?;
+    let (checked, unresolved, outcome) =
+        verify_frozen_set(&operation, &members, &residencies, &request)?;
     let receipt = StoreBackupValidationReceipt {
         operation_id: request.operation_id.clone(),
         state_fence: operation.state_fence.clone(),
@@ -710,112 +889,38 @@ pub(crate) async fn backup_validate(
     Ok(receipt)
 }
 
-/// Frozen member digest projection for validation. Field names mirror the
-/// provider columns exactly so the projection decodes without renaming.
-#[derive(Deserialize)]
-#[allow(clippy::struct_field_names, reason = "fields mirror provider columns")]
-struct MemberDigestRow {
-    member_digest: String,
-    content_digest: String,
-    residency_digest: String,
-}
-
-/// Loads frozen members for validation, verifying the frozen population.
-async fn load_validation_members(
-    db: &RpcTransport,
-    config: &SurrealAdapterConfig,
-    operation: &BackupOperationRow,
-) -> Result<Vec<BackupMemberRow>, AdapterError> {
-    let mut bindings = Map::new();
-    bindings.insert(
-        "backup_operation_id".to_owned(),
-        json!(operation.operation_id),
-    );
-    let limit = operation.member_count.max(0).saturating_add(1);
-    let mut response = client::query(
-        db,
-        config,
-        "backup.validate",
-        &format!(
-            "SELECT member_digest, content_digest, residency_digest FROM {} WHERE operation_id = $backup_operation_id ORDER BY page_cursor LIMIT {limit};",
-            schema::table::BACKUP_MEMBER
-        ),
-        bindings,
-    )
-    .await?;
-    let errors = response.take_errors();
-    if !errors.is_empty() {
-        if errors.iter().all(|error| client::is_absent_table(error)) {
-            return Err(AdapterError::MigrationRequired);
-        }
-        return Err(AdapterError::PartialOutcome);
-    }
-    let rows = response.take::<Vec<MemberDigestRow>>(0)?;
-    if i64::try_from(rows.len()).unwrap_or(i64::MAX) != operation.member_count {
-        return Err(AdapterError::PartialOutcome);
-    }
-    Ok(rows
-        .into_iter()
-        .map(|row| BackupMemberRow {
-            operation_id: operation.operation_id.clone(),
-            member_digest: row.member_digest,
-            content_digest: row.content_digest,
-            residency_digest: row.residency_digest,
-            member_bytes: 0,
-            page_cursor: 0,
-            member_table: String::new(),
-            member_id: String::new(),
-            member_json: String::new(),
-        })
-        .collect())
-}
-
-/// Verifies the frozen set against the validation request: snapshot digest
-/// recomputed over ordered member digests, scope denominator pinned to the
-/// operation row, zero unresolved on any complete claim.
+/// Verifies the frozen set against the validation request with the same
+/// recompute completion uses: snapshot digest over ordered member
+/// digests, per-residency cross-foot against the stored dispositions, and
+/// scope denominator pinned to the operation row. Zero unresolved on any
+/// complete or known-empty claim.
 fn verify_frozen_set(
     operation: &BackupOperationRow,
     members: &[BackupMemberRow],
+    residencies: &[BackupResidencyRow],
     request: &StoreBackupValidationRequest,
 ) -> Result<(u64, u64, StoreBackupValidationOutcome), AdapterError> {
-    let mut ordered: Vec<&str> = members
-        .iter()
-        .map(|member| member.member_digest.as_str())
-        .collect();
-    ordered.sort_unstable();
-    let recomputed = sha256_hex(ordered.join("\n").as_bytes());
+    let total = members.len() as u64;
     let scope = operation_scope(operation)?;
     if scope.residency_denominator_digest != expected_denominator_digest() {
-        return Ok((
-            0,
-            members.len() as u64,
-            StoreBackupValidationOutcome::Conflict,
-        ));
+        return Ok((0, total, StoreBackupValidationOutcome::Conflict));
     }
+    let Ok((recomputed, _)) = super::backup_snapshot::recompute_denominator(members, residencies)
+    else {
+        return Ok((0, total, StoreBackupValidationOutcome::Conflict));
+    };
     if recomputed != request.snapshot_digest {
-        return Ok((
-            0,
-            members.len() as u64,
-            StoreBackupValidationOutcome::Conflict,
-        ));
+        return Ok((0, total, StoreBackupValidationOutcome::Conflict));
     }
     if let Some(stored) = operation.snapshot_digest.as_deref()
         && stored != request.snapshot_digest
     {
-        return Ok((
-            0,
-            members.len() as u64,
-            StoreBackupValidationOutcome::Conflict,
-        ));
+        return Ok((0, total, StoreBackupValidationOutcome::Conflict));
     }
     if members.is_empty() {
         return Ok((0, 0, StoreBackupValidationOutcome::KnownEmpty));
     }
-    Ok((
-        members.len() as u64,
-        0,
-        StoreBackupValidationOutcome::Complete,
-    ))
+    Ok((total, 0, StoreBackupValidationOutcome::Complete))
 }
 
 /// Observes the status of one backup operation. Absent operations report
@@ -828,8 +933,15 @@ pub(crate) async fn backup_status(
     request.validate().map_err(AdapterError::Store)?;
     let db = super::client(adapter).await?;
     super::ensure_ready(adapter, db).await?;
-    let operation =
-        load_operation_row(db, &adapter.config, "backup.status", &request.operation_id).await?;
+    let prose_pinned = super::backup_snapshot::provider_prose_pinned(adapter);
+    let operation = load_operation_row(
+        db,
+        &adapter.config,
+        "backup.status",
+        &request.operation_id,
+        prose_pinned,
+    )
+    .await?;
     let report = match operation {
         None => StoreBackupStatusReport {
             operation_id: request.operation_id.clone(),
@@ -883,11 +995,13 @@ pub(crate) async fn backup_reconcile(
     request.validate().map_err(AdapterError::Store)?;
     let db = super::client(adapter).await?;
     super::ensure_ready(adapter, db).await?;
+    let prose_pinned = super::backup_snapshot::provider_prose_pinned(adapter);
     let operation = load_operation_row(
         db,
         &adapter.config,
         "backup.reconcile",
         &request.operation_id,
+        prose_pinned,
     )
     .await?;
     let Some(operation) = operation else {

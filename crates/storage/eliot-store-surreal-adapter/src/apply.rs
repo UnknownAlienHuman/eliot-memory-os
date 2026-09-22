@@ -95,8 +95,9 @@ use schema_contract::SchemaMigrationIdentity;
 #[cfg(test)]
 use schema_contract::schema_meta_record;
 use schema_contract::{
-    FenceRecord, MigrationPreflight, SchemaMetaRecord, schema_meta_record_for_v1_to_v2,
-    v1_identity, validate_fence_record, validate_schema_meta_record, validate_v1_pin,
+    FenceRecord, MigrationPreflight, SchemaMetaRecord, schema_meta_record_for_backup_tables,
+    schema_meta_record_for_v1_to_v2, v1_identity, validate_fence_record,
+    validate_schema_meta_record, validate_v1_pin,
 };
 
 fn is_admitted_migration(migration: &CompiledMigration) -> bool {
@@ -252,6 +253,17 @@ fn migration_preflight(
             return Err(AdapterError::PartialOutcome);
         }
         return Ok(MigrationPreflight::V1ToV2);
+    }
+    // Additive backup-tables delta on an applied v2 baseline: the
+    // generation stays v2 and only the three backup tables are created.
+    // A v1 database must travel v1-to-v2 first; an already-provisioned
+    // database replays exactly through the branch above.
+    if record.generation == schema::GENERATION_V2
+        && record.migration_state == "APPLIED"
+        && migration.migration_id == schema::MIGRATION_ID_BACKUP_TABLES
+        && migration.generation_after.as_str() == schema::GENERATION_V2
+    {
+        return Ok(MigrationPreflight::BackupTables);
     }
     Err(AdapterError::Config(
         "schema migration identity does not match the admitted plan".to_owned(),
@@ -509,6 +521,71 @@ async fn handle_forward_migration(
     }
 }
 
+/// Applies the additive backup-tables delta on an applied v2 baseline:
+/// creates only the three backup coordination tables under the live fence
+/// guard, then records the appended migration identity without changing
+/// the generation. Destructive statements are refused before any provider
+/// I/O; guard conflicts stay deterministic instead of unknown.
+async fn handle_backup_tables_migration(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    migration: &CompiledMigration,
+    existing: SchemaMetaRecord,
+    fence: FenceRecord,
+    state_fence: &StateFence,
+    updated_at: &str,
+) -> Result<MigrationReceipt, AdapterError> {
+    if migration
+        .statements
+        .trim()
+        .to_ascii_lowercase()
+        .contains("drop ")
+        || migration
+            .statements
+            .trim()
+            .to_ascii_lowercase()
+            .contains("delete ")
+        || migration
+            .statements
+            .trim()
+            .to_ascii_lowercase()
+            .contains("remove ")
+    {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let record = schema_meta_record_for_backup_tables(&existing, migration, updated_at);
+    let sql = schema::backup_forward_migration_sql();
+    let bindings = build_forward_bindings(&existing, &fence, &record);
+    let mut response = client::query(db, config, "migration.apply", &sql, bindings).await?;
+    let errors = response.take_errors();
+    if errors.iter().any(|e| is_guard_conflict(e)) {
+        return Err(AdapterError::Config("forward guard conflict".to_owned()));
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::UnknownMigrationOutcome {
+            migration_id: migration.migration_id.clone(),
+        });
+    }
+    let observed = read_schema_meta(db, config).await?;
+    match migration_preflight(observed, migration) {
+        Ok(MigrationPreflight::ExactReplay) => {
+            let after = read_fence(db, config).await?;
+            let Some(after) = after else {
+                return Err(AdapterError::PartialOutcome);
+            };
+            validate_fence_record(&after)?;
+            if after.state_fence != *state_fence
+                || after.next_commit_sequence != fence.next_commit_sequence
+                || after.next_outbox_sequence != fence.next_outbox_sequence
+            {
+                return Err(AdapterError::PartialOutcome);
+            }
+            Ok(migration_receipt(migration))
+        }
+        _ => Err(AdapterError::PartialOutcome),
+    }
+}
+
 /// Applies one explicit migration and records the new schema generation.
 ///
 /// When a write-execution generation is installed, the migration runs
@@ -598,6 +675,29 @@ async fn apply_migration_direct(
                 return Err(AdapterError::PartialOutcome);
             };
             handle_forward_migration(
+                db,
+                &adapter.config,
+                migration,
+                existing,
+                fence,
+                state_fence,
+                &updated_at,
+            )
+            .await
+        }
+        MigrationPreflight::BackupTables => {
+            let fence = read_fence(db, &adapter.config).await?;
+            let Some(fence) = fence else {
+                return Err(AdapterError::PartialOutcome);
+            };
+            validate_fence_record(&fence)?;
+            if fence.state_fence != *state_fence {
+                return Err(AdapterError::PartialOutcome);
+            }
+            let Some(existing) = existing else {
+                return Err(AdapterError::PartialOutcome);
+            };
+            handle_backup_tables_migration(
                 db,
                 &adapter.config,
                 migration,

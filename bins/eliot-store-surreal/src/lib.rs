@@ -484,6 +484,28 @@ impl StoreComposition {
             .map_err(map_adapter_error)
     }
 
+    /// Applies exactly the adapter's additive backup-tables migration
+    /// (issues #951/#952). This is the deployment caller that provisions
+    /// the backup coordination tables: normal Store startup never calls
+    /// this method; portable development opts into the separate
+    /// schema-initialization CLI mode, and production deployment invokes
+    /// the admitted migration explicitly through this same composition
+    /// seam. The delta is idempotent: an already-provisioned database
+    /// replays exactly instead of duplicating tables.
+    pub async fn apply_backup_tables_migration(
+        &self,
+        observed_clock: &ClockObservation,
+    ) -> Result<MigrationReceipt, StoreCompositionError> {
+        if self.schema_bootstrap_binding.profile != InstallationProfile::PortableDev {
+            return Err(StoreCompositionError::Store(StoreError::Unavailable));
+        }
+        let migration = SurrealStoreAdapter::backup_tables_migration();
+        self.store
+            .apply_migration(&migration, observed_clock, &self.state_fence)
+            .await
+            .map_err(map_adapter_error)
+    }
+
     /// Executes one explicitly bound `SystemService` schema bootstrap command.
     ///
     /// This is intentionally a Store-local seam for the future transaction-
@@ -720,8 +742,9 @@ impl StoreComposition {
     ///
     /// Same live-backend contract as [`Self::backup_begin`]: validated
     /// and destination-pinned here, delegated exactly once to the #952
-    /// restore backend. This method can never activate the installation,
-    /// unblock effects, or retire the source.
+    /// restore backend, then verified connected through the canonical
+    /// head owner route below. This method can never activate the
+    /// installation, unblock effects, or retire the source.
     pub async fn backup_isolated_restore(
         &self,
         request: StoreIsolatedRestoreRequest,
@@ -730,7 +753,9 @@ impl StoreComposition {
         if request.scope.state_fence != self.state_fence {
             return Err(StoreError::FenceMismatch);
         }
-        CanonicalBackupPorts::backup_isolated_restore(&self.store, request).await
+        let receipt = CanonicalBackupPorts::backup_isolated_restore(&self.store, request).await?;
+        self.verify_restore_heads(&receipt).await?;
+        Ok(receipt)
     }
 
     /// Validates one captured snapshot without restoring it (issue #975).
@@ -773,6 +798,45 @@ impl StoreComposition {
     ) -> Result<StoreBackupReconciliation, StoreError> {
         request.validate()?;
         CanonicalBackupPorts::backup_reconcile(&self.store, request).await
+    }
+
+    /// Verifies restored records stayed connected to the canonical heads
+    /// (issue #952).
+    ///
+    /// This is the composition-side half of the derived-projection
+    /// transition owner route: after the adapter replays validated rows,
+    /// every revision scope and ordering scope named by the restore
+    /// receipt must read back covered by the live heads under the receipt
+    /// fence. A scope behind its restored revision, a foreign fence, or a
+    /// missing head refuses with `InvalidProjection` instead of reporting
+    /// a ready restore over disconnected records. Unverified derived data
+    /// can never grant completion; the failure preserves the durable
+    /// restore evidence for exact reconciliation.
+    async fn verify_restore_heads(
+        &self,
+        receipt: &StoreBackupCompletionReceipt,
+    ) -> Result<(), StoreError> {
+        for head in &receipt.revision_heads {
+            let live =
+                CanonicalStoreClient::revision_heads(&self.store, vec![head.key.clone()]).await?;
+            let Some(current) = live.first() else {
+                return Err(StoreError::InvalidProjection);
+            };
+            if current.state_fence != receipt.state_fence || current.revision < head.revision {
+                return Err(StoreError::InvalidProjection);
+            }
+        }
+        for head in &receipt.ordering_heads {
+            let live =
+                CanonicalStoreClient::ordering_heads(&self.store, vec![head.scope.clone()]).await?;
+            let Some(current) = live.first() else {
+                return Err(StoreError::InvalidProjection);
+            };
+            if current.state_fence != receipt.state_fence || current.sequence < head.sequence {
+                return Err(StoreError::InvalidProjection);
+            }
+        }
+        Ok(())
     }
 
     /// Reconciles a possibly ambiguous write by exact operation identity.
