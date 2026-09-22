@@ -25,6 +25,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod isolated_restore;
+mod owner_adapters;
 mod portable_recovery;
 mod product_command;
 mod product_run;
@@ -33,6 +34,10 @@ mod restore_runner;
 pub use isolated_restore::{
     CutoverAuthorization, CutoverReceipt, IsolatedRestorePlan, IsolatedRoot, authorize_cutover,
     plan_isolated_restore,
+};
+pub use owner_adapters::{
+    DestinationRestoreAdapter, DestinationScope, RESTORE_ENVELOPE_ALGORITHM,
+    RESTORE_ENVELOPE_VERSION, RestoredSealedBlob, SealedEnvelope,
 };
 pub use portable_recovery::{
     BlobRestorationReceipt, FullRecoveryPackage, MAX_WRAPPED_KEY_BYTES, WrappedKeyEntry,
