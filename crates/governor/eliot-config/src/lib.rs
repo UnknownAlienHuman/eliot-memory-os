@@ -13,6 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod delivery_policy_projection;
 pub mod first_run;
 pub mod quiet_hours;
 
