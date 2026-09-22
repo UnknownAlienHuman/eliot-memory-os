@@ -601,6 +601,10 @@ impl AgentCoordinator {
                 mutation_scope: lane.mutation_scope.clone(),
                 state: CoordinatedAttemptState::Admitted,
                 superseded_by: None,
+                // T1/T5 session admission: no session exists at admission.
+                // The first provider-execution bind records the session from
+                // the authenticated binding; see `bind_provider_execution`.
+                session: None,
                 provider_binding: None,
                 admitted_route: lane.admitted_route.clone(),
             };
@@ -656,6 +660,19 @@ impl AgentCoordinator {
 
     pub fn attempt(&self, attempt_id: &AttemptId) -> Option<&AttemptRecord> {
         self.attempts.get(attempt_id)
+    }
+
+    /// Read-only projection of every attempt record held by this
+    /// coordinator, in deterministic attempt-identity order.
+    ///
+    /// Owner-read for session-envelope producers (issue #1942, lane O1):
+    /// producers filter this live registry with a deterministic rule and
+    /// never accept caller-supplied attempt identity. The registry carries
+    /// no session; the caller receives each candidate's fence so the session
+    /// assembly can verify the binding against the live attach fence that
+    /// the bridge owns.
+    pub fn attempt_records(&self) -> Vec<AttemptRecord> {
+        self.attempts.values().cloned().collect()
     }
 
     pub fn events(&self) -> &[CoordinatorEvent] {
@@ -718,9 +735,9 @@ impl AgentCoordinator {
     ///   process-generation bridging): a live generation feed distinct from
     ///   the fence has no entry point in `ExecutionContext` or
     ///   `ProviderAdmissionReceipt` and stays T1/T5-owned. The coordinator
-    ///   likewise admits no session, so the projected attempt session is
-    ///   `None` and a sessionful binding fails closed here until T1/T5 supply
-    ///   session admission;
+    ///   admits the attempt session at the first bind from the authenticated
+    ///   binding (T1/T5 session admission, see below); a later bind naming
+    ///   another session fails closed here as a silent rebind;
     /// - a physical unit already bound to another attempt under the same
     ///   authenticated provider scope and generation is a
     ///   `DuplicateIdentity("execution_unit")` (a new turn, including
@@ -767,6 +784,18 @@ impl AgentCoordinator {
             return Err(CoordinatorError::IdentityConflict("execution_binding"));
         }
         let admitted = self.binding_subject(&attempt_id)?;
+        // T1/T5 session admission: the coordinator holds no independent
+        // session source, so the first authenticated binding for an attempt
+        // admits its session. The S1 validator then checks agreement: a
+        // first bind always agrees (admission moment), while a later bind
+        // naming another session fails closed as a silent rebind — a thread
+        // still cannot create a session, because only this authenticated
+        // bind path (sealed verifier plus fence/lease/route agreement) can
+        // record one, and observations never create bindings.
+        let mut admitted = admitted;
+        if admitted.session.is_none() {
+            admitted.session.clone_from(&submission.binding.session_id);
+        }
         validate_execution_binding(
             &submission.binding,
             &admitted,
@@ -791,10 +820,15 @@ impl AgentCoordinator {
                 receipt: binding.clone(),
             },
         );
-        self.attempts
+        // The S1 check above admitted this exact session (first bind records
+        // it, later binds agreed with the recorded one), so this write is a
+        // no-op on replays and never a silent rebind.
+        let record = self
+            .attempts
             .get_mut(&attempt_id)
-            .ok_or(CoordinatorError::UnknownAttempt)?
-            .provider_binding = Some(binding.clone());
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        record.session.clone_from(&binding.session_id);
+        record.provider_binding = Some(binding.clone());
         self.events.push(CoordinatorEvent::ProviderExecutionBound {
             context,
             submission: Box::new(submission),
@@ -840,10 +874,12 @@ impl AgentCoordinator {
             task_id: attempt.task_id.clone(),
             parent_attempt: attempt.parent_attempt_id.clone(),
             work_unit: work_unit.clone(),
-            // The coordinator admits no session: the projected session is
-            // `None`, so a sessionful binding fails closed in S1 until T1/T5
-            // supply session admission.
-            session: None,
+            // T1/T5 session admission: the projected session is the session
+            // admitted at the first provider-execution bind (`None` until
+            // bound). The S1 validator compares the presented binding
+            // against exactly this value, so a sessionful binding agrees
+            // once admitted and any other session fails closed.
+            session: attempt.session.clone(),
             lease: attempt.lease_id.clone(),
             state,
             // Inert for binding validation: the coordinator tracks lineage
@@ -1137,6 +1173,12 @@ impl AgentCoordinator {
             mutation_scope: old.mutation_scope.clone(),
             state: CoordinatedAttemptState::Admitted,
             superseded_by: None,
+            // A reassigned attempt carries a new attempt identity, so no
+            // binding tied to the old identity transfers: session,
+            // provider binding, and admitted route all restart unresolved.
+            // The new identity admits its session at its own first
+            // provider-execution bind; intake fails closed meanwhile.
+            session: None,
             provider_binding: None,
             // S5: a reassigned attempt carries a new attempt identity, so the
             // old lane's admitted decision (bound to the old attempt_id)

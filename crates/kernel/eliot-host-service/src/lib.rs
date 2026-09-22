@@ -15,6 +15,7 @@
 
 pub mod reactive_context_delivery;
 pub mod runtime_control;
+pub mod session_envelope;
 pub mod user_automation_durable_job;
 pub mod user_automation_execution;
 pub mod user_automation_wake;
