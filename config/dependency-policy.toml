@@ -192,6 +192,15 @@ features = []
 public_exposure = "error type definitions"
 removal_plan = "manual Error impl"
 
+[direct_dependencies.tiktoken-rs]
+ecosystem = "rust"
+consumer = "crates/agent/eliot-agent-codex"
+owner = "crates/agent/eliot-agent-codex"
+reason = "owner-published OpenAI BPE tokenizers with model-to-encoding registry for C6 route render-time measurement"
+features = []
+public_exposure = "none"
+removal_plan = "drop codex render-time measurement; bridge withholds as unmeasured"
+
 [direct_dependencies.time]
 ecosystem = "rust"
 consumer = "workspace timestamps"

@@ -38,6 +38,7 @@ use thiserror::Error;
 
 pub mod catalogue;
 pub mod preflight;
+pub mod route_tokenizer;
 
 pub const CODEX_ADAPTER_ID: &str = "eliot-agent-codex";
 pub const CODEX_HOST_FAMILY: &str = "codex";
@@ -102,6 +103,12 @@ pub enum CodexAdapterError {
     ModelNotInCatalogue,
     #[error("Codex host-event normalization input is invalid: {0}")]
     InvalidInput(&'static str),
+    #[error("Codex model has no owner-published tokenizer mapping: {model_id}")]
+    UnknownTokenizerModel { model_id: String },
+    #[error("Codex result bytes are not countable text for the route tokenizer")]
+    UncountableBytes,
+    #[error("Codex tokenizer unavailable: {0}")]
+    TokenizerUnavailable(&'static str),
 }
 
 /// Exact route constructor.  The resulting value is still the A-01 route
@@ -1096,7 +1103,9 @@ fn classify_codex_payload(
 /// Validate that a recorded binding belongs to this adapter family before use:
 /// shape, exact Codex route, and the Codex turn namespace. A foreign-family
 /// binding quarantines as a binding mismatch, never as attributed output.
-fn validate_binding_for_codex(binding: &ProviderExecutionBinding) -> Result<(), CodexAdapterError> {
+pub(crate) fn validate_binding_for_codex(
+    binding: &ProviderExecutionBinding,
+) -> Result<(), CodexAdapterError> {
     binding.validate_internal()?;
     validate_codex_route(&binding.route)?;
     if binding.execution_unit.namespace != CODEX_EXECUTION_UNIT_NAMESPACE {
@@ -1543,7 +1552,7 @@ fn is_terminal_observation(payload: &NormalizedHostEventPayload) -> bool {
 /// and must be terminal (observed completed/failed, never a quarantined,
 /// usage, or session observation). Provider-effect/attempt linkage beyond this
 /// stays with S5 (`AgentResult::validate_for_binding`).
-fn validate_terminal_observation(
+pub(crate) fn validate_terminal_observation(
     terminal: &NormalizedHostEventEnvelope,
     binding: &ProviderExecutionBinding,
     admission: &AdmittedRouteReceipt,
@@ -3207,6 +3216,163 @@ mod tests {
             turn_interrupt_bound("req-interrupt-1", &sessionless),
             Err(CodexAdapterError::SessionMismatch)
         ));
+        Ok(())
+    }
+
+    fn bound_binding_with_model(model: &str) -> TestResult<ProviderExecutionBinding> {
+        let mut binding = bound_binding()?;
+        binding.route.model = model.to_owned();
+        Ok(binding)
+    }
+
+    fn terminal_for(
+        binding: &ProviderExecutionBinding,
+        observed_at: ClockReading,
+    ) -> TestResult<NormalizedHostEventEnvelope> {
+        let admission = admission_for(binding)?;
+        let message = CodexWireMessage::notification(
+            "turn/completed",
+            Some(completed_params("thread-1", "turn-1", "completed")),
+        );
+        let raw_source_bytes = serde_json::to_vec(&message)?;
+        Ok(normalize_bound_with_bytes(
+            message,
+            raw_source_bytes,
+            binding,
+            &admission,
+            1,
+            None,
+            observed_at,
+        )?
+        .0)
+    }
+
+    #[test]
+    fn measured_tool_result_emits_matched_bound_carrier() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let terminal = terminal_for(&binding, clock_at(Some(1_786_000_000_000)))?;
+        let carrier =
+            observe_measured_tool_result(b"hello world", &terminal, &binding, &admission)?;
+        // Observed route is the wire-attributed binding's route, in full
+        // triangle agreement with requested and admitted-selected.
+        assert_eq!(carrier.observation.route_state, RouteObservationState::Matched);
+        assert_eq!(
+            carrier.observation.observed_route,
+            Some(binding.route.clone())
+        );
+        assert_eq!(carrier.observation.requested_route, binding.route);
+        assert_eq!(
+            carrier.observation.admitted_route_digest,
+            admission.self_digest
+        );
+        // Real tokenizer count and digest for the exact bytes.
+        assert_eq!(carrier.tokens, 2);
+        assert_eq!(
+            carrier.result_digest,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_eq!(carrier.result_bytes, b"hello world");
+        // Turn-level usage never enters; unknown stays unknown, never zero.
+        assert_eq!(carrier.observation.usage.input_tokens, None);
+        assert_eq!(carrier.observation.usage.output_tokens, None);
+        assert_eq!(
+            carrier.observation.usage.quota,
+            QuotaKnowledge::Unknown
+        );
+        // Terminal time is the wire fact's own observation time.
+        assert_eq!(
+            carrier.observation.terminal.valid_time_ms,
+            Some(1_786_000_000_000)
+        );
+        carrier
+            .observation
+            .validate_against(&binding, &admission)
+            .expect("emitted observation links");
+        Ok(())
+    }
+
+    #[test]
+    fn community_only_model_withholds_at_producer() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        let binding = bound_binding_with_model("codex-mini-latest")?;
+        let admission = admission_for(&binding)?;
+        let terminal = terminal_for(&binding, clock_at(Some(1_786_000_000_000)))?;
+        match observe_measured_tool_result(b"hello world", &terminal, &binding, &admission) {
+            Err(CodexAdapterError::UnknownTokenizerModel { model_id }) => {
+                assert_eq!(model_id, "codex-mini-latest");
+                Ok(())
+            }
+            other => panic!("community-only model must withhold: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_utf8_tool_bytes_withhold_at_producer() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let terminal = terminal_for(&binding, clock_at(Some(1_786_000_000_000)))?;
+        assert!(matches!(
+            observe_measured_tool_result(b"\xff\xfe\x00binary", &terminal, &binding, &admission),
+            Err(CodexAdapterError::UncountableBytes)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_terminal_time_withholds_at_producer() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let terminal = terminal_for(&binding, clock_at(None))?;
+        assert!(matches!(
+            observe_measured_tool_result(b"hello world", &terminal, &binding, &admission),
+            Err(CodexAdapterError::InvalidInput(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_terminal_never_binds_measured_result() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        let mut foreign_binding = binding.clone();
+        foreign_binding.execution_unit = ExecutionUnit::new("codex", "turn-2")?;
+        let foreign_terminal = translate_bound(
+            "turn/completed",
+            completed_params("thread-1", "turn-2", "completed"),
+            &foreign_binding,
+            1,
+            None,
+        )?;
+        assert!(is_binding_mismatch(&observe_measured_tool_result(
+            b"hello world",
+            &foreign_terminal,
+            &binding,
+            &admission,
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn cross_admission_never_matches_measured_result() -> TestResult {
+        use super::route_tokenizer::observe_measured_tool_result;
+        use eliot_contracts::DecisionId;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let terminal = terminal_for(&binding, clock_at(Some(1_786_000_000_000)))?;
+        let mut other_admission = admission_for(&binding)?;
+        other_admission.decision_id = DecisionId::new("decision-2")?;
+        other_admission.self_digest = other_admission.compute_digest()?;
+        other_admission.validate()?;
+        assert!(is_binding_mismatch(&observe_measured_tool_result(
+            b"hello world",
+            &terminal,
+            &binding,
+            &other_admission,
+        )));
         Ok(())
     }
 

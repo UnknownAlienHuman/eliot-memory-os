@@ -49,6 +49,7 @@ mod kernel_host_request_client;
 pub mod memory_handle_join;
 pub mod reactive_injection_receipts;
 pub mod reactive_runtime_composition;
+pub mod result_flow;
 pub mod settled_plan_transport;
 mod understanding_bootstrap;
 pub(crate) use cli_contract::validate_client_declaration_path;
@@ -66,6 +67,7 @@ pub use reactive_injection_receipts::{
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
 };
+pub use result_flow::{LiveToolResult, project_measured_tool_result};
 pub use settled_plan_transport::{
     AdmittedPlanItem, FeedAdmissionOutcome, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS,
     PlanAdmissionError, PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem,
@@ -717,6 +719,22 @@ impl BridgeRunner {
             ));
         }
         self.publish_canonical_resource(&uri, content)
+    }
+    /// Projects one route-owner measured attestation into its byte-bound
+    /// delivery receipt (issue #1941 result flow): the holder joins the
+    /// attested count/digest with the physical observation, current
+    /// admission plus execution binding, admissible source handle, and
+    /// owner-observed delivery; see [`project_measured_tool_result`].
+    /// The bridge runs no tokenizer — the attested count passes through
+    /// intake verification unaltered. Typed withhold and contract errors
+    /// propagate for the attaching caller; this runner entry only supplies
+    /// the live core.
+    pub fn project_measured_tool_result(
+        &self,
+        result_bytes: &[u8],
+        flow: &LiveToolResult<'_>,
+    ) -> Result<ToolResultReceipt, BridgeError> {
+        project_measured_tool_result(&self.core, result_bytes, flow)
     }
     /// Notes the owner-supplied bootstrap context for this session.
     ///
