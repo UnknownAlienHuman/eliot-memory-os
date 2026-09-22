@@ -1,0 +1,33 @@
+[package]
+name = "eliot-experience-projection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Immutable experience read-aid view over owner projection vocabulary (#223)"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "IMPLEMENTED_PROTOTYPE"
+workspace_admission = "admitted to workspace membership for integration candidate; package/edge proof pending"
+functional_cell = "smart.experience.projection"
+freeze_ref = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+source_layer = "C1"
+agent_order = 48
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts", version = "0.1.0" }
+schemars.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+eliot-receipts.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

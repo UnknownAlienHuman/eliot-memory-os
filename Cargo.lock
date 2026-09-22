@@ -1018,6 +1018,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-cognitive-quality"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-learning-contracts",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-config"
 version = "0.1.0"
 dependencies = [
@@ -1645,6 +1660,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-self-query"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eliot-dreamer-structure-repair"
 version = "0.1.0"
 dependencies = [
@@ -1714,6 +1740,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-epistemic-context-provider"
+version = "0.1.0"
+dependencies = [
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-epistemic-contracts"
 version = "0.1.0"
 dependencies = [
@@ -1761,6 +1800,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-experience-projection"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2339,6 +2390,36 @@ dependencies = [
  "eliot-memory-curation-contracts",
  "eliot-receipts",
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-memory-projection-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-memory-quality"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-learning-contracts",
+ "eliot-memory-projection-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
