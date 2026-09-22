@@ -18,6 +18,7 @@ use eliot_protocol::dreamer_job::DurableJobResponse;
 use eliot_store_api::CanonicalStoreClient;
 use eliot_store_api::MAX_STORE_FAILURE_REFERENCE_LEN;
 use eliot_store_api::RequestMeta;
+use eliot_store_api::StoreBackupEnvelope;
 use eliot_store_api::StoreError;
 use eliot_store_api::StoreFailure;
 use eliot_store_api::StoreFailureIdentityContext;
@@ -88,7 +89,7 @@ fn internal_defect_fallback(context: &StoreFailureIdentityContext) -> Response {
     );
 }
 
-fn map_store_error(error: StoreError, context: StoreFailureIdentityContext) -> Response {
+pub(crate) fn map_store_error(error: StoreError, context: StoreFailureIdentityContext) -> Response {
     // Sanitize the admitted identity first so the contract mapping preserves
     // the original disposition (Unavailable/Conflict/etc.) whenever the
     // context carries poisoned refs/fence. Only genuinely unmappable cases
@@ -152,6 +153,24 @@ fn failure_context_for_operation(
         operation_id: Some(operation_id),
         idempotency_key_ref_or_digest: Some(idempotency_key),
         state_fence_ref_or_exact_safe_projection: Some(context.state_fence.clone()),
+        ..StoreFailureIdentityContext::default()
+    }
+}
+
+/// Builds the typed-failure identity context for one admitted backup
+/// envelope (issue #975).
+///
+/// Backup envelopes carry no caller `RequestMeta`: fresh transport
+/// correlation lives only in the frame, so `request_id` stays `None` here
+/// while the stable mutation identity, transport idempotency key, and fence
+/// come from the admitted envelope itself.
+pub(crate) fn failure_context_for_backup(
+    request: &StoreBackupEnvelope,
+) -> StoreFailureIdentityContext {
+    StoreFailureIdentityContext {
+        operation_id: Some(request.operation.operation_id().clone()),
+        idempotency_key_ref_or_digest: Some(request.identity.idempotency_key.clone()),
+        state_fence_ref_or_exact_safe_projection: Some(request.state_fence.clone()),
         ..StoreFailureIdentityContext::default()
     }
 }
@@ -392,6 +411,17 @@ impl StoreDispatchBackend for StoreComposition {
                 // Boxed: the ledger request/response futures hold
                 // multi-kilobyte canonical payloads across provider awaits.
                 Box::pin(dispatch_dreamer_job(&self.store, &context, request.clone())).await
+            }
+            // Issue #975: one authenticated backup arm. The closed envelope
+            // is delegated once through the composition's backup operation;
+            // an unimplemented port refuses with a typed failure before any
+            // provider I/O and never falls back to another operation.
+            Request::Backup { request } => {
+                Box::pin(crate::backup_dispatch::dispatch_backup(
+                    self,
+                    request.clone(),
+                ))
+                .await
             }
         }
     }

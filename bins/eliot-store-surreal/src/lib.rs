@@ -33,9 +33,13 @@ use eliot_store_api::{
     CAPABILITIES, CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
     ExactJsonBytes, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, StoreError,
-    StoreHealth, WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
-    genesis_manifest, verify_canonical_request_hash,
+    ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
+    StoreBackupBeginRequest, StoreBackupCompletionReceipt, StoreBackupConsistency,
+    StoreBackupEndRequest, StoreBackupPage, StoreBackupPageRequest, StoreBackupReconcileRequest,
+    StoreBackupReconciliation, StoreBackupStatusReport, StoreBackupStatusRequest,
+    StoreBackupValidationReceipt, StoreBackupValidationRequest, StoreError, StoreHealth,
+    StoreIsolatedRestoreRequest, WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests, genesis_manifest,
+    verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -82,6 +86,7 @@ pub use schema_bootstrap_contract::{
 mod request_dispatch;
 pub use request_dispatch::StoreDispatchBackend;
 pub use request_dispatch::dispatch;
+mod backup_dispatch;
 pub mod task_binding_gate;
 #[cfg(test)]
 use request_dispatch::map_recovery_dispatch_result;
@@ -639,6 +644,114 @@ impl StoreComposition {
         outcome
     }
 
+    /// Opens one bounded coherent canonical snapshot (issue #975).
+    ///
+    /// Thin composition delegation: the closed #950 begin request is
+    /// validated and the fence is pinned to this composition before the
+    /// canonical adapter port runs. Until the #951 capture backend lands,
+    /// the unimplemented port refuses with [`StoreError::UnknownOperation`]
+    /// without effects; support is advertised only from the accepted
+    /// concrete backend, never from this delegation.
+    pub async fn backup_begin(
+        &self,
+        request: StoreBackupBeginRequest,
+    ) -> Result<StoreBackupConsistency, StoreError> {
+        request.validate()?;
+        if request.scope.state_fence != self.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        Err(StoreError::UnknownOperation)
+    }
+
+    /// Reads one page of an open capture under its consistency point
+    /// (issue #975).
+    ///
+    /// Same unbound-port contract as [`Self::backup_begin`]: validated
+    /// here and refused without effects until the #951 backend lands. The
+    /// page request carries no separate fence field; the fence stays bound
+    /// by the session admission and the wire envelope around it.
+    pub async fn backup_page(
+        &self,
+        request: StoreBackupPageRequest,
+    ) -> Result<StoreBackupPage, StoreError> {
+        request.validate()?;
+        Err(StoreError::UnknownOperation)
+    }
+
+    /// Closes one capture and issues its completion receipt (issue #975).
+    ///
+    /// Same unbound-port contract as [`Self::backup_begin`]: validated
+    /// here, refused without effects until the #951 backend lands.
+    pub async fn backup_end(
+        &self,
+        request: StoreBackupEndRequest,
+    ) -> Result<StoreBackupCompletionReceipt, StoreError> {
+        request.validate()?;
+        Err(StoreError::UnknownOperation)
+    }
+
+    /// Restores validated canonical records into the admitted isolated
+    /// destination only (issue #975).
+    ///
+    /// Same unbound-port contract as [`Self::backup_begin`]: validated and
+    /// destination-pinned here, refused without effects until the #952
+    /// backend lands. This method can never activate the installation,
+    /// unblock effects, or retire the source.
+    pub async fn backup_isolated_restore(
+        &self,
+        request: StoreIsolatedRestoreRequest,
+    ) -> Result<StoreBackupCompletionReceipt, StoreError> {
+        request.validate()?;
+        if request.scope.state_fence != self.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        Err(StoreError::UnknownOperation)
+    }
+
+    /// Validates one captured snapshot without restoring it (issue #975).
+    ///
+    /// Same unbound-port contract as [`Self::backup_begin`]: validated
+    /// here and refused without effects until the #952 backend lands.
+    /// The fence stays bound by the session admission and the wire
+    /// envelope. Validation can never import.
+    pub async fn backup_validate(
+        &self,
+        request: StoreBackupValidationRequest,
+    ) -> Result<StoreBackupValidationReceipt, StoreError> {
+        request.validate()?;
+        Err(StoreError::UnknownOperation)
+    }
+
+    /// Observes the status of one backup operation (issue #975).
+    ///
+    /// Same unbound-port contract as [`Self::backup_begin`]: validated
+    /// here and refused without effects until the #951/#952 backends land.
+    /// The fence stays bound by the session admission and the wire
+    /// envelope.
+    pub async fn backup_status(
+        &self,
+        request: StoreBackupStatusRequest,
+    ) -> Result<StoreBackupStatusReport, StoreError> {
+        request.validate()?;
+        Err(StoreError::UnknownOperation)
+    }
+
+    /// Reconciles one uncertain backup mutation by exact identity
+    /// (issue #975).
+    ///
+    /// Same unbound-port contract as [`Self::backup_begin`]: validated
+    /// here and refused without effects until the #951/#952 backends land.
+    /// The fence stays bound by the session admission and the wire
+    /// envelope. Unknown stays unknown; reconciliation never mints a new
+    /// operation.
+    pub async fn backup_reconcile(
+        &self,
+        request: StoreBackupReconcileRequest,
+    ) -> Result<StoreBackupReconciliation, StoreError> {
+        request.validate()?;
+        Err(StoreError::UnknownOperation)
+    }
+
     /// Reconciles a possibly ambiguous write by exact operation identity.
     pub async fn receipt(
         &self,
@@ -1052,6 +1165,12 @@ fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
                 .validate_for_context(context)
                 .map_err(|error| error.to_string())
         }
+        // Store backup edge (issue #975): the wire decode already ran the
+        // closed backup shape plus transport identity binding, and
+        // `validate_request_frame` already enforced the exact backup
+        // session capability. Backup operations live outside the generated
+        // named/apply catalogue, like Dreamer ledger requests.
+        Request::Backup { request } => request.validate().map_err(|error| error.to_string()),
         // Health, readiness, head, snapshot, recovery, and receipt requests
         // keep their own bounded validation and perform no canonical
         // mutation. Dreamer ledger requests join them here: the wire decode

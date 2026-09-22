@@ -31,6 +31,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod dreamer_job;
+pub mod backup_io;
 pub mod epistemic_revision;
 pub mod erasure_admission;
 mod notification_state;
@@ -116,6 +117,17 @@ pub use user_automation_state::{
     validate_automation_mutation_params, validate_automation_read_params,
 };
 
+pub use backup_io::{
+    MAX_STORE_BACKUP_DOMAIN_BYTES, MAX_STORE_BACKUP_EVIDENCE_BINDINGS,
+    MAX_STORE_BACKUP_PAGE_MEMBERS, MAX_STORE_BACKUP_RESIDENCIES, STORE_BACKUP_CONTRACT_VERSION,
+    CanonicalBackupPorts, ResidencyDisposition, RestoreBinding, StoreBackupBeginRequest,
+    StoreBackupCompletionReceipt, StoreBackupConsistency, StoreBackupEndRequest,
+    StoreBackupPage, StoreBackupPageRequest, StoreBackupPhase, StoreBackupReconcileRequest,
+    StoreBackupReconciliation, StoreBackupScope, StoreBackupStatusReport, StoreBackupStatusRequest,
+    StoreBackupValidationOutcome, StoreBackupValidationReceipt, StoreBackupValidationRequest,
+    StoreEvidencePack, StoreIsolatedRestoreRequest, StoreBackupMember,
+};
+
 pub use request_hash::{
     CanonicalRequestView, MAX_DIGEST_DETAIL_CHARS, canonical_request_bytes, canonical_request_hash,
     verify_canonical_request_hash,
@@ -141,10 +153,11 @@ pub use wire::{
     CAPABILITY_ERASURE_INTENT, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
     CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
     CAPABILITY_RECOVERY, CAPABILITY_RESERVED_WRITE, CAPABILITY_REVISION_HEADS,
-    CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ErasureSurfaceRequest, ReadinessReceipt,
-    ReadinessStatus, StoreRequest, StoreResponse, StoreWireError, decode_request_frame,
-    decode_request_frame_with_authority, decode_response_frame, dreamer_job_capability,
-    request_frame, request_frame_with_payload_authority, response_frame,
+    CAPABILITY_STORE_BACKUP, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ErasureSurfaceRequest,
+    ReadinessReceipt, ReadinessStatus, StoreBackupEnvelope, StoreBackupEnvelopeResponse,
+    StoreBackupOperation, StoreBackupOutcome, StoreRequest, StoreResponse, StoreWireError,
+    decode_request_frame, decode_request_frame_with_authority, decode_response_frame,
+    dreamer_job_capability, request_frame, request_frame_with_payload_authority, response_frame,
 };
 
 mod operation_catalogue;
