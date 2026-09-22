@@ -244,6 +244,13 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
+        self.admit_host_request_envelope_under_transition(envelope)
+    }
+
+    fn admit_host_request_envelope_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         envelope
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -408,13 +415,16 @@ impl KernelComposition {
         }
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
-        let (receipt, record) = self.admit_host_request_envelope(envelope)?;
+        let _transition = self.agent_bridge_transition_read()?;
+        let (receipt, record) = self.admit_host_request_envelope_under_transition(envelope)?;
         // Queue admitted `eliot.query` pairs for the outbound-only eliotd
         // poller (`local_read_claim`, Implements #18). Packet admissions and
         // malformed selectors never queue; enqueue is best-effort and never
         // fails admission (the ORS record is already staged above).
-        if matches!(check_local_read_admission(envelope, tool), Ok(Some(_))) {
-            let _ = self.enqueue_local_read_pair(envelope, tool);
+        if record.result_digest.is_none()
+            && matches!(check_local_read_admission(envelope, tool), Ok(Some(_)))
+        {
+            let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
         }
         // Coherence gate before serving: a resulted record must carry a
         // digest-bound body, otherwise the row is never served as an answer.
@@ -506,20 +516,33 @@ impl KernelComposition {
     /// is fenced to `Unknown` under the same owner-continuation rules as the
     /// per-connection fence. Like revocation, this never fails.
     pub(super) fn fence_all_host_requests(&self) -> Result<(), TransportError> {
-        let outstanding = self
-            .host_request_connection_index
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)
-            .map(|mut index| {
+        let (outstanding, poisoned) = match self.host_request_connection_index.lock() {
+            Ok(mut index) => (
                 std::mem::take(&mut *index)
                     .into_values()
                     .flatten()
-                    .collect::<Vec<_>>()
-            })?;
+                    .collect::<Vec<_>>(),
+                false,
+            ),
+            Err(poisoned) => {
+                let mut index = poisoned.into_inner();
+                (
+                    std::mem::take(&mut *index)
+                        .into_values()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                    true,
+                )
+            }
+        };
         for operation_ref in &outstanding {
             fence_one_host_request(self, operation_ref);
         }
-        Ok(())
+        if poisoned {
+            Err(TransportError::SessionFenced)
+        } else {
+            Ok(())
+        }
     }
 
     /// Fences the presenting connection's still-uncertain host requests.
@@ -534,7 +557,10 @@ impl KernelComposition {
     pub(super) fn fence_host_requests_for_connection(&self, connection_id: &str) {
         let outstanding = match self.host_request_connection_index.lock() {
             Ok(mut index) => index.remove(connection_id).unwrap_or_default(),
-            Err(_) => return,
+            Err(poisoned) => {
+                let mut index = poisoned.into_inner();
+                index.remove(connection_id).unwrap_or_default()
+            }
         };
         for operation_ref in &outstanding {
             fence_one_host_request(self, operation_ref);
@@ -898,16 +924,32 @@ impl KernelComposition {
             .host_request_connection_index
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        index
-            .entry(envelope.connection_id.clone())
-            .or_default()
-            .push(HostRequestOperationRef {
-                operation_id: host_request_operation_id(envelope),
+        let operation_id = host_request_operation_id(envelope);
+        if let Some(existing_connection) = index.iter().find_map(|(connection_id, refs)| {
+            refs.iter()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                })
+                .map(|_| connection_id.as_str())
+        }) {
+            if existing_connection != envelope.connection_id {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
+        let refs = index.entry(envelope.connection_id.clone()).or_default();
+        if !refs.iter().any(|candidate| {
+            candidate.operation_id == operation_id
+                && candidate.request_digest == envelope.envelope_sha256
+        }) {
+            refs.push(HostRequestOperationRef {
+                operation_id,
                 request_digest: envelope.envelope_sha256.clone(),
                 local_read_envelope: None,
                 local_read_tool: None,
                 local_read_attempt: LocalReadAttemptState::default(),
             });
+        }
         Ok(())
     }
 }
@@ -943,19 +985,39 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
     ) -> Result<(), TransportError> {
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.host_request_connection_gate_under_transition(envelope)?;
         let mut index = self
             .host_request_connection_index
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         let operation_id = host_request_operation_id(envelope);
-        for refs in index.values() {
-            for candidate in refs {
-                if candidate.operation_id == operation_id
-                    && candidate.request_digest == envelope.envelope_sha256
-                    && candidate.local_read_envelope.is_some()
-                {
-                    return Ok(());
-                }
+        let existing_connection = index.iter().find_map(|(connection_id, refs)| {
+            refs.iter()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                })
+                .map(|_| connection_id.clone())
+        });
+        if let Some(existing_connection) = existing_connection.as_deref() {
+            if existing_connection != envelope.connection_id {
+                return Err(TransportError::IdentityConflict);
+            }
+            if index
+                .get(existing_connection)
+                .into_iter()
+                .flatten()
+                .any(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                        && candidate.local_read_envelope.is_some()
+                })
+            {
+                return Ok(());
             }
         }
         let queued = index
@@ -974,25 +1036,32 @@ impl KernelComposition {
                 }
             }
         }
-        index
-            .entry(envelope.connection_id.clone())
-            .or_default()
-            .push(HostRequestOperationRef {
+        let refs = index.entry(envelope.connection_id.clone()).or_default();
+        let local_read_attempt = LocalReadAttemptState {
+            // The durable claim record is written at enqueue, before any
+            // poll: unclaimed (`generation == 0`) until the first claim
+            // mints fencing generation 1. The salt makes this lifecycle's
+            // identities unique even if the pair is re-enqueued later. No
+            // time lease is involved.
+            enqueue_salt: LOCAL_READ_ENQUEUE_SALT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            ..LocalReadAttemptState::default()
+        };
+        if let Some(candidate) = refs.iter_mut().find(|candidate| {
+            candidate.operation_id == operation_id
+                && candidate.request_digest == envelope.envelope_sha256
+        }) {
+            candidate.local_read_envelope = Some(envelope.clone());
+            candidate.local_read_tool = Some(tool.clone());
+            candidate.local_read_attempt = local_read_attempt;
+        } else {
+            refs.push(HostRequestOperationRef {
                 operation_id,
                 request_digest: envelope.envelope_sha256.clone(),
                 local_read_envelope: Some(envelope.clone()),
                 local_read_tool: Some(tool.clone()),
-                // The durable claim record is written at enqueue, before any
-                // poll: unclaimed (`generation == 0`) until the first claim
-                // mints fencing generation 1. The salt makes this lifecycle's
-                // identities unique even if the pair is re-enqueued later. No
-                // time lease is involved.
-                local_read_attempt: LocalReadAttemptState {
-                    enqueue_salt: LOCAL_READ_ENQUEUE_SALT
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-                    ..LocalReadAttemptState::default()
-                },
+                local_read_attempt,
             });
+        }
         Ok(())
     }
 
@@ -1021,6 +1090,10 @@ impl KernelComposition {
         TransportError,
     > {
         let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         let mut index = self
             .host_request_connection_index
             .lock()
@@ -1163,6 +1236,10 @@ impl KernelComposition {
         request_digest: &str,
     ) -> Result<Option<LocalReadAttemptState>, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         self.live_local_read_attempt_under_transition(operation_id, request_digest)
     }
 
@@ -1195,6 +1272,9 @@ impl KernelComposition {
     /// the store is unavailable.
     pub(crate) fn retire_local_read_pair(&self, operation_id: &str, request_digest: &str) {
         let Ok(_transition) = self.agent_bridge_transition_read() else {
+            return;
+        };
+        let Ok(_admission_owner) = self.agent_activation_pending.lock() else {
             return;
         };
         self.retire_local_read_pair_under_transition(operation_id, request_digest);
@@ -1245,6 +1325,10 @@ impl KernelComposition {
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         let operation_id = OperationIdentity::new(body.operation_id.clone())
             .map_err(|_| TransportError::SessionFenced)?;
         let stored = self

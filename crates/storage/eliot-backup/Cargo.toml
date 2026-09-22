@@ -24,7 +24,7 @@ thiserror.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
-eliot-store-memory = { path = "../eliot-store-memory" }
+eliot-store-memory = { path = "../eliot-store-memory", version = "0.1.0" }
 toml.workspace = true
 
 [lints]
