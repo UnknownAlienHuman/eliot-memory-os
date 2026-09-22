@@ -5651,9 +5651,9 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
-    fn pending_watchdog_start_inputs(
+    fn watchdog_start_inputs_for_manifest(
         &self,
-        pending: &eliot_installation::PendingActivation,
+        manifest: &CandidateManifest,
     ) -> Result<
         Option<(
             ServiceRegistrationRequest,
@@ -5664,11 +5664,11 @@ impl HostComposition {
     > {
         let Some(approval) = select_watchdog_approval_for_inspection(
             &self.registry,
-            &pending.manifest,
+            manifest,
         )? else {
             return Ok(None);
         };
-        let launch = &pending.manifest.runtime_launch;
+        let launch = &manifest.runtime_launch;
         let registration = approved_service_registration_request(
             launch,
             &approval,
@@ -5682,23 +5682,28 @@ impl HostComposition {
         )))
     }
 
-    /// Reconciles every Watchdog effect before the first-install registry
-    /// abort.  A service stop is admitted only when this Host's carrier proves
-    /// that the approved registration was initially stopped, the current SCM
-    /// process is the exact bound heartbeat peer, and the stop primitive
-    /// confirms the post-call state.  Restarted Hosts have no operation-bound
-    /// carrier and therefore accept only an exact stopped SCM service with no
-    /// heartbeat artifacts; all other states remain recovery-required.
     #[cfg(windows)]
-    pub(crate) fn reconcile_watchdog_start_for_abort(
-        &mut self,
+    fn pending_watchdog_start_inputs(
+        &self,
         pending: &eliot_installation::PendingActivation,
+    ) -> Result<
+        Option<(
+            ServiceRegistrationRequest,
+            PathBuf,
+            PathBuf,
+        )>,
+        HostError,
+    > {
+        self.watchdog_start_inputs_for_manifest(&pending.manifest)
+    }
+
+    #[cfg(windows)]
+    fn reconcile_watchdog_start_bound(
+        &mut self,
+        registration: ServiceRegistrationRequest,
+        platform_root: PathBuf,
+        heartbeat_state_root: PathBuf,
     ) -> Result<(), HostError> {
-        let Some((registration, platform_root, heartbeat_state_root)) =
-            self.pending_watchdog_start_inputs(pending)?
-        else {
-            return Ok(());
-        };
         let carrier = self.watchdog_start_recovery.clone();
         if let Some(carrier) = carrier.as_ref() {
             if carrier.registration != registration
@@ -5841,6 +5846,26 @@ impl HostComposition {
             watchdog_heartbeat::require_no_start_artifacts(&heartbeat_state_root)?;
         }
         Ok(())
+    }
+
+    /// Reconciles every Watchdog effect before the first-install registry
+    /// abort.  A service stop is admitted only when this Host's carrier proves
+    /// that the approved registration was initially stopped, the current SCM
+    /// process is the exact bound heartbeat peer, and the stop primitive
+    /// confirms the post-call state.  Restarted Hosts have no operation-bound
+    /// carrier and therefore accept only an exact stopped SCM service with no
+    /// heartbeat artifacts; all other states remain recovery-required.
+    #[cfg(windows)]
+    pub(crate) fn reconcile_watchdog_start_for_abort(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+    ) -> Result<(), HostError> {
+        let Some((registration, platform_root, heartbeat_state_root)) =
+            self.pending_watchdog_start_inputs(pending)?
+        else {
+            return Ok(());
+        };
+        self.reconcile_watchdog_start_bound(registration, platform_root, heartbeat_state_root)
     }
 
     #[cfg(windows)]
@@ -6131,30 +6156,39 @@ impl HostComposition {
             .push(phase_b_activation_binding(&phase_b)?);
         self.append_record(HostStateRecord::Activation(next))?;
         if let Some(watchdog_approval) = watchdog_approval.as_ref() {
-            self.start_watchdog(
+            if let Err(error) = self.start_watchdog(
                 &phase_b,
                 &manifest.runtime_launch,
                 watchdog_approval,
                 lifecycle_context(&self.host, "watchdog-start")?,
-            )?;
+            ) {
+                return self.cleanup_launched_contour(error);
+            }
         }
-        let (kernel_artifact, approved_store_artifact) = manifest
-            .host_child_artifact_digests()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let (kernel_artifact, approved_store_artifact) = match manifest.host_child_artifact_digests()
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return self.cleanup_launched_contour(HostError::ProcessContour(error.to_string()));
+            }
+        };
         if approved_store_artifact != store_artifact {
-            return Err(HostError::ProcessContour(
+            return self.cleanup_launched_contour(HostError::ProcessContour(
                 "Store bridge artifact digest is not the approved manifest digest".to_owned(),
             ));
         }
         let (approved_kernel_path, approved_store_path, approved_config_path) =
             manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
-        let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
+        let (prior_kernel, kernel_generation, kernel_authority_epoch) = match self
             .next_kernel_activation_context(
                 phase_b.launch.authority_state_fence.authority_epoch.clone(),
                 None,
-            )?;
-        self.jobs.start_approved(
+            ) {
+                Ok(value) => value,
+                Err(error) => return self.cleanup_launched_contour(error),
+            };
+        if let Err(error) = self.jobs.start_approved(
             kernel_executable,
             store_executable,
             &manifest.generation,
@@ -6167,7 +6201,9 @@ impl HostComposition {
             store_artifact,
             &self.host,
             &phase_b.launch,
-        )?;
+        ) {
+            return self.cleanup_launched_contour(error);
+        }
         let agent_bridge_admission = match (phase_b.agent_bridge(), phase_b.final_agent_bridge()) {
             (Some(_prepared), None) => Err(HostError::RecoveryRequired(
                 "Agent Bridge admission requires the final provider binding".to_owned(),
@@ -7194,18 +7230,37 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    fn reconcile_watchdog_start_for_cleanup(&mut self) -> Result<(), HostError> {
+        let Some((registration, platform_root, heartbeat_state_root)) = self
+            .watchdog_start_recovery
+            .as_ref()
+            .map(|carrier| {
+                (
+                    carrier.registration.clone(),
+                    carrier.platform_root.clone(),
+                    carrier.heartbeat_state_root.clone(),
+                )
+            })
+        else {
+            return Ok(());
+        };
+        self.reconcile_watchdog_start_bound(registration, platform_root, heartbeat_state_root)
+    }
+
+    #[cfg(windows)]
     fn cleanup_launched_contour(&mut self, error: HostError) -> Result<(), HostError> {
         // F-LOG-HOST-1: cleanup phase only; outer owns the terminal.
         host_lifecycle_observe_drain("host.cleanup-launched requested");
+        let watchdog = self.reconcile_watchdog_start_for_cleanup();
         let store = self.jobs.terminate_store();
         let kernel = self.jobs.terminate_kernel();
-        match (kernel, store) {
-            (Ok(()), Ok(())) => {
+        match (watchdog, kernel, store) {
+            (Ok(()), Ok(()), Ok(())) => {
                 self.jobs.clear_recorded_contour();
                 Err(error)
             }
-            (kernel, store) => Err(HostError::RecoveryRequired(format!(
-                "persistence failed ({error}); launched contour cleanup requires recovery: kernel={kernel:?}, store={store:?}"
+            (watchdog, kernel, store) => Err(HostError::RecoveryRequired(format!(
+                "persistence failed ({error}); launched contour cleanup requires recovery: watchdog={watchdog:?}, kernel={kernel:?}, store={store:?}"
             ))),
         }
     }
