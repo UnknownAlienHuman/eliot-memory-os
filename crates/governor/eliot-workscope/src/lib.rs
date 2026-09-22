@@ -14,6 +14,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod identity;
+
+pub use identity::{
+    EvidenceStanding, GenerationEvidence, IdentityEvidence, MemoryApplicability, ProposalSource,
+    ResolutionAuthentication, ResourceExecutionIdentity, ScopeFingerprint, ScopeLifecycle,
+    ScopeRelocationKind, ScopeRelocationOrAttachReceipt, SupportingEvidenceClass,
+    WorkScopeDescriptor, WorkScopeProposal, WorkScopeResolutionReceipt,
+};
+
 /// The bounded kind of a `WorkScope`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
