@@ -184,30 +184,24 @@ impl KernelComposition {
         // the bridge generation.  Keep it held across the no-profile fence,
         // ownership drain, and replacement publication so no old snapshot can
         // become reachable between revocation and the profile swap.
-        let mut pending = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        {
-            let mut profile = match self.agent_bridge_profile.lock() {
-                Ok(profile) => profile,
-                Err(poisoned) => {
-                    let mut profile = poisoned.into_inner();
-                    *profile = None;
-                    return Err(TransportError::SessionFenced);
-                }
-            };
-            // Publish the outgoing generation's fence before detaching any
-            // owned state.  A poisoned profile lock stays fail-closed.
-            *profile = None;
-        }
-        self.revoke_all_agent_bridges(&mut pending)?;
-        *self
-            .agent_bridge_profile
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)? = next;
+        let (mut pending, pending_poisoned) = match self.agent_activation_pending.lock() {
+            Ok(pending) => (pending, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        let (mut profile, profile_poisoned) = match self.agent_bridge_profile.lock() {
+            Ok(profile) => (profile, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        // Publish the outgoing generation's fence before detaching any owned
+        // state. A poisoned inner lock is cleaned through its recovered guard,
+        // but it never permits replacement publication.
+        *profile = None;
+        let revocation = self.revoke_all_agent_bridges(&mut pending);
         self.note_agent_bridge_peer_set_change();
-        drop(pending);
+        if pending_poisoned || profile_poisoned || revocation.is_err() {
+            return Err(TransportError::SessionFenced);
+        }
+        *profile = next;
         Ok(())
     }
 
@@ -221,10 +215,10 @@ impl KernelComposition {
         // the connection map is acquired only after it. This prevents profile
         // promotion from waiting on connections while a submitter waits on
         // pending state.
-        let mut connections = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
+        let (mut connections, connections_poisoned) = match self.agent_bridge_connections.lock() {
+            Ok(connections) => (connections, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
         let revoked = std::mem::take(&mut *connections);
         pending.fifo.clear();
         pending.entries.clear();
@@ -239,9 +233,13 @@ impl KernelComposition {
         // The index is drained while the same admission owner is held.  Its
         // detached store fencing may continue after the map ownership is gone,
         // but a poisoned index must prevent replacement publication.
-        self.fence_all_host_requests()?;
+        let index_fenced = self.fence_all_host_requests();
         self.agent_activation_changed.notify_waiters();
-        Ok(())
+        if connections_poisoned || index_fenced.is_err() {
+            Err(TransportError::SessionFenced)
+        } else {
+            Ok(())
+        }
     }
 
     #[cfg(windows)]
@@ -545,6 +543,19 @@ impl KernelComposition {
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
+        // The pending owner serializes ticket publication with disconnect
+        // revocation.  Within that owner, retain the same profile ->
+        // connection order used by host-request admission.  The connection
+        // guard is only needed for the immutable receipt snapshot; service
+        // validation and frame parsing happen after it is released, so no
+        // inner lock is held across a second owner lookup.
+        let profile = self
+            .agent_bridge_profile
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        self.validate_active_bridge_profile(&profile.admission)?;
         let (request, receipt) = {
             let connections = self
                 .agent_bridge_connections
@@ -560,20 +571,13 @@ impl KernelComposition {
                 .accepted_transport
                 .as_ref()
                 .ok_or(TransportError::SessionFenced)?;
-            let receipt = accepted.admission_receipt();
-            let profile = self
-                .agent_bridge_profile
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?
-                .clone()
-                .ok_or(TransportError::SessionFenced)?;
+            let receipt = accepted.admission_receipt().clone();
             if receipt.descriptor_sha256 != profile.admission.descriptor_sha256
                 || receipt.profile_id != profile.admission.profile_id.as_str()
                 || receipt.state_fence != profile.admission.state_fence
             {
                 return Err(TransportError::SessionFenced);
             }
-            self.validate_active_bridge_profile(&profile.admission)?;
             if activation_deadline_expired(unix_ms(), receipt.activation_deadline_unix_ms) {
                 return Err(TransportError::Timeout);
             }
@@ -601,9 +605,9 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
             request
-                .validate_admission(receipt)
+                .validate_admission(&receipt)
                 .map_err(|_| TransportError::SessionFenced)?;
-            (request, receipt.clone())
+            (request, receipt)
         };
         let request_id = request
             .request_identity
@@ -728,13 +732,22 @@ impl KernelComposition {
     /// owns and never invents semantic identity.
     ///
     /// The helper itself does not acquire pending state. Callers that hold the
-    /// pending lock acquire it before this connection/profile/service sequence;
-    /// bridge revocation uses the same order.
+    /// pending lock acquire it before this profile/connection/service
+    /// sequence; bridge revocation uses the same order.
     #[cfg(windows)]
     fn validate_result_bridge_leg(
         &self,
         ticket: &AgentActivationResolutionTicket,
     ) -> Result<(), TransportError> {
+        // The pending owner is held by every caller. Read the profile before
+        // the connection map so host-request admission (profile ->
+        // connection) and result publication cannot form an inner-lock ABBA.
+        let profile = self
+            .agent_bridge_profile
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
         let receipt = {
             let connections = self
                 .agent_bridge_connections
@@ -758,12 +771,6 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let profile = self
-            .agent_bridge_profile
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .clone()
-            .ok_or(TransportError::SessionFenced)?;
         if receipt.descriptor_sha256 != profile.admission.descriptor_sha256
             || receipt.profile_id != profile.admission.profile_id.as_str()
             || receipt.state_fence != profile.admission.state_fence
@@ -1298,20 +1305,21 @@ impl KernelComposition {
         let session_nonce = fresh_activation_nonce_material()
             .map_err(|_| TransportError::SessionFenced)?
             .to_string();
-        let accepted = {
-            let connections = self
-                .agent_bridge_connections
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let state = connections
-                .get(connection_id)
-                .ok_or(TransportError::SessionFenced)?;
-            state
-                .accepted_transport
-                .as_ref()
-                .ok_or(TransportError::SessionFenced)?
-                .clone()
-        };
+        // Keep the connection owner guard through Session construction and
+        // publication. A detached connection or a poisoned map therefore
+        // cannot leave a locally-created Session without an atomic owner
+        // update; projection either commits both fields or returns fenced.
+        let mut connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let accepted = connections
+            .get(connection_id)
+            .ok_or(TransportError::SessionFenced)?
+            .accepted_transport
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?
+            .clone();
         let session = Session::establish_agent_bridge(
             connection_id,
             accepted.peer().clone(),
@@ -1369,10 +1377,6 @@ impl KernelComposition {
             trace_context: original.trace_context.clone(),
         };
         reply.validate()?;
-        let mut connections = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
         let state = connections
             .get_mut(connection_id)
             .ok_or(TransportError::SessionFenced)?;
@@ -1625,20 +1629,21 @@ impl KernelComposition {
         let session_nonce = fresh_activation_nonce_material()
             .map_err(|_| TransportError::SessionFenced)?
             .to_string();
-        let accepted = {
-            let connections = self
-                .agent_bridge_connections
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let state = connections
-                .get(connection_id)
-                .ok_or(TransportError::SessionFenced)?;
-            state
-                .accepted_transport
-                .as_ref()
-                .ok_or(TransportError::SessionFenced)?
-                .clone()
-        };
+        // Keep the connection owner guard through Session construction and
+        // publication. A detached connection or a poisoned map therefore
+        // cannot leave a locally-created Session without an atomic owner
+        // update; projection either commits both fields or returns fenced.
+        let mut connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let accepted = connections
+            .get(connection_id)
+            .ok_or(TransportError::SessionFenced)?
+            .accepted_transport
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?
+            .clone();
         let session = Session::establish_agent_bridge(
             connection_id,
             accepted.peer().clone(),
@@ -1696,10 +1701,6 @@ impl KernelComposition {
             trace_context: original.trace_context.clone(),
         };
         reply.validate()?;
-        let mut connections = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
         let state = connections
             .get_mut(connection_id)
             .ok_or(TransportError::SessionFenced)?;
@@ -2036,95 +2037,116 @@ impl KernelComposition {
     ) -> Result<Frame, TransportError> {
         observe_bridge("kernel.bridge_activation_request", "attempt");
         let _transition = self.agent_bridge_transition_read()?;
-        let Ok(mut connections) = self.agent_bridge_connections.lock() else {
-            let err = TransportError::SessionFenced;
-            observe_bridge("kernel.bridge_activation_request", "fenced");
-            super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(&err));
-            return Err(err);
+        let (mut pending, pending_poisoned) = match self.agent_activation_pending.lock() {
+            Ok(pending) => (pending, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
         };
-        let result = (|| {
-            let state = connections
-                .get_mut(connection_id)
-                .ok_or(TransportError::SessionFenced)?;
-            let accepted = state
-                .accepted_transport
-                .as_ref()
-                .ok_or(TransportError::SessionFenced)?;
-            let receipt = accepted.admission_receipt();
-            let profile = self
-                .agent_bridge_profile
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?
-                .clone()
-                .ok_or(TransportError::SessionFenced)?;
-            if receipt.descriptor_sha256 != profile.admission.descriptor_sha256
-                || receipt.profile_id != profile.admission.profile_id.as_str()
-                || receipt.state_fence != profile.admission.state_fence
-            {
-                return Err(TransportError::SessionFenced);
-            }
-            self.validate_active_bridge_profile(&profile.admission)?;
-            if activation_deadline_expired(unix_ms(), receipt.activation_deadline_unix_ms) {
-                return Err(TransportError::SessionFenced);
-            }
-            frame.validate()?;
-            if frame.connection_id != connection_id
-                || frame.kind != FrameKind::Request
-                || frame.message_type != MessageType::Execute
-                || frame.request_identity.is_none()
-            {
-                return Err(TransportError::SessionFenced);
-            }
-            let request_id = frame
-                .request_id
-                .clone()
-                .ok_or(TransportError::SessionFenced)?;
-            let ProtocolPayload::Json(payload) = &frame.payload else {
-                return Err(TransportError::SessionFenced);
-            };
-            let request: AgentBridgeActivationRequest = serde_json::from_value(payload.clone())
+        let result = if pending_poisoned {
+            Err(TransportError::SessionFenced)
+        } else {
+            (|| {
+                let profile = match self.agent_bridge_profile.lock() {
+                    Ok(profile) => profile.clone().ok_or(TransportError::SessionFenced)?,
+                    Err(poisoned) => {
+                        let mut profile = poisoned.into_inner();
+                        *profile = None;
+                        return Err(TransportError::SessionFenced);
+                    }
+                };
+                self.validate_active_bridge_profile(&profile.admission)?;
+                let receipt = {
+                    let connections = match self.agent_bridge_connections.lock() {
+                        Ok(connections) => connections,
+                        Err(poisoned) => {
+                            drop(poisoned.into_inner());
+                            return Err(TransportError::SessionFenced);
+                        }
+                    };
+                    let state = connections
+                        .get(connection_id)
+                        .ok_or(TransportError::SessionFenced)?;
+                    if state.activation_completed || state.session.is_some() {
+                        return Err(TransportError::IdentityConflict);
+                    }
+                    state
+                        .accepted_transport
+                        .as_ref()
+                        .ok_or(TransportError::SessionFenced)?
+                        .admission_receipt()
+                        .clone()
+                };
+                if receipt.descriptor_sha256 != profile.admission.descriptor_sha256
+                    || receipt.profile_id != profile.admission.profile_id.as_str()
+                    || receipt.state_fence != profile.admission.state_fence
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                if activation_deadline_expired(unix_ms(), receipt.activation_deadline_unix_ms) {
+                    return Err(TransportError::SessionFenced);
+                }
+                frame.validate()?;
+                if frame.connection_id != connection_id
+                    || frame.kind != FrameKind::Request
+                    || frame.message_type != MessageType::Execute
+                    || frame.request_identity.is_none()
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let request_id = frame
+                    .request_id
+                    .clone()
+                    .ok_or(TransportError::SessionFenced)?;
+                let ProtocolPayload::Json(payload) = &frame.payload else {
+                    return Err(TransportError::SessionFenced);
+                };
+                let request: AgentBridgeActivationRequest = serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if frame.request_identity.as_ref() != Some(&request.request_identity)
+                    || request.request_identity.request.metadata.request_id != request_id
+                    || request.operation != AGENT_BRIDGE_ACTIVATION_OPERATION
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                request
+                    .validate_admission(&receipt)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let response = AgentBridgeActivationResponse::denied(
+                    &request,
+                    AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+                )
                 .map_err(|_| TransportError::SessionFenced)?;
-            if frame.request_identity.as_ref() != Some(&request.request_identity)
-                || request.request_identity.request.metadata.request_id != request_id
-                || request.operation != AGENT_BRIDGE_ACTIVATION_OPERATION
-            {
-                return Err(TransportError::SessionFenced);
-            }
-            request
-                .validate_admission(receipt)
-                .map_err(|_| TransportError::SessionFenced)?;
-            let response = AgentBridgeActivationResponse::denied(
-                &request,
-                AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
-            )
-            .map_err(|_| TransportError::SessionFenced)?;
-            response
-                .validate_request(&request)
-                .map_err(|_| TransportError::SessionFenced)?;
-            let reply = Frame {
-                protocol_version: frame.protocol_version,
-                encoding_profile: frame.encoding_profile,
-                connection_id: connection_id.to_owned(),
-                request_id: Some(response.request_id.clone()),
-                kind: FrameKind::Response,
-                message_type: MessageType::Result,
-                request_identity: None,
-                payload: ProtocolPayload::Json(
-                    serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?,
-                ),
-                trace_context: frame.trace_context.clone(),
-            };
-            reply.validate()?;
-            Ok(reply)
-        })();
-        if let Some(mut state) = connections.remove(connection_id) {
-            if result.is_ok() {
-                state.exchange.abort();
-            } else {
-                state.exchange.fence();
-            }
-            state.accepted_transport = None;
-        }
+                response
+                    .validate_request(&request)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let reply = Frame {
+                    protocol_version: frame.protocol_version,
+                    encoding_profile: frame.encoding_profile,
+                    connection_id: connection_id.to_owned(),
+                    request_id: Some(response.request_id.clone()),
+                    kind: FrameKind::Response,
+                    message_type: MessageType::Result,
+                    request_identity: None,
+                    payload: ProtocolPayload::Json(
+                        serde_json::to_value(response)
+                            .map_err(|_| TransportError::SessionFenced)?,
+                    ),
+                    trace_context: frame.trace_context.clone(),
+                };
+                reply.validate()?;
+                Ok(reply)
+            })()
+        };
+        let cleanup = self.cleanup_agent_bridge_activation_response_under_transition(
+            connection_id,
+            &mut pending,
+            result.is_ok(),
+        );
+        let result = match (result, cleanup, pending_poisoned) {
+            (Ok(reply), Ok(()), false) => Ok(reply),
+            (Err(error), _, _) => Err(error),
+            (Ok(_), Err(error), _) => Err(error),
+            (Ok(_), Ok(()), true) => Err(TransportError::SessionFenced),
+        };
         match &result {
             Ok(_) => observe_bridge("kernel.bridge_activation_request", "success"),
             Err(error) => {
@@ -2133,6 +2155,58 @@ impl KernelComposition {
             }
         }
         result
+    }
+
+    #[cfg(windows)]
+    fn cleanup_agent_bridge_activation_response_under_transition(
+        &self,
+        connection_id: &str,
+        pending: &mut AgentActivationPendingState,
+        response_valid: bool,
+    ) -> Result<(), TransportError> {
+        // This cleanup is part of the legacy denial linearization point. It
+        // must still detach the bridge when validation failed because an
+        // inner lock was poisoned; otherwise the caller could retry against
+        // a half-validated connection. Recovering a poisoned guard permits
+        // removal and fencing, but the caller still receives SessionFenced.
+        let (mut connections, connections_poisoned) = match self.agent_bridge_connections.lock() {
+            Ok(connections) => (connections, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        let revoked = connections.remove(connection_id);
+        let removed = pending
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.ticket.connection_id == connection_id)
+            .map(|(ticket_id, _)| ticket_id.clone())
+            .collect::<Vec<_>>();
+        for ticket_id in &removed {
+            pending.entries.remove(ticket_id);
+        }
+        let live_ticket_ids = pending.entries.keys().cloned().collect::<BTreeSet<_>>();
+        pending
+            .fifo
+            .retain(|ticket_id| live_ticket_ids.contains(ticket_id));
+        drop(connections);
+        if let Some(mut state) = revoked {
+            if response_valid {
+                state.exchange.abort();
+            } else {
+                state.exchange.fence();
+            }
+            if let Some(mut session) = state.session.take() {
+                session.fence();
+            }
+            state.accepted_transport = None;
+        }
+        self.fence_host_requests_for_connection(connection_id);
+        self.note_agent_bridge_peer_set_change();
+        self.agent_activation_changed.notify_waiters();
+        if connections_poisoned {
+            Err(TransportError::SessionFenced)
+        } else {
+            Ok(())
+        }
     }
 
     /// Revokes all retained bridge authority for one disconnected connection.
@@ -2154,20 +2228,16 @@ impl KernelComposition {
             observe_bridge("kernel.bridge_cleanup", "fenced");
             return;
         };
-        let Ok(mut pending) = self.agent_activation_pending.lock() else {
-            self.fence_host_requests_for_connection(connection_id);
-            self.agent_activation_changed.notify_waiters();
-            observe_bridge("kernel.bridge_cleanup", "fenced");
-            return;
+        let (mut pending, pending_poisoned) = match self.agent_activation_pending.lock() {
+            Ok(pending) => (pending, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
         };
-        if self
-            .revoke_agent_bridge_under_transition(connection_id, &mut pending)
-            .is_err()
-        {
-            self.fence_host_requests_for_connection(connection_id);
+        let revocation = self.revoke_agent_bridge_under_transition(connection_id, &mut pending);
+        if pending_poisoned || revocation.is_err() {
             observe_bridge("kernel.bridge_cleanup", "fenced");
+        } else {
+            observe_bridge("kernel.bridge_cleanup", "complete");
         }
-        observe_bridge("kernel.bridge_cleanup", "complete");
     }
 
     #[cfg(windows)]
@@ -2180,11 +2250,11 @@ impl KernelComposition {
         // admission. Removing both records while both guards are held keeps a
         // submitter from validating a live connection and then committing
         // against a ticket that profile/disconnect revocation has removed.
-        let revoked = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .remove(connection_id);
+        let (mut connections, connections_poisoned) = match self.agent_bridge_connections.lock() {
+            Ok(connections) => (connections, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        let revoked = connections.remove(connection_id);
         let removed = pending
             .entries
             .iter()
@@ -2198,6 +2268,7 @@ impl KernelComposition {
         pending
             .fifo
             .retain(|ticket_id| live_ticket_ids.contains(ticket_id));
+        drop(connections);
         if let Some(mut state) = revoked {
             state.exchange.abort();
             if let Some(mut session) = state.session.take() {
@@ -2206,7 +2277,12 @@ impl KernelComposition {
             state.accepted_transport = None;
         }
         self.fence_host_requests_for_connection(connection_id);
+        self.note_agent_bridge_peer_set_change();
         self.agent_activation_changed.notify_waiters();
-        Ok(())
+        if connections_poisoned {
+            Err(TransportError::SessionFenced)
+        } else {
+            Ok(())
+        }
     }
 }
