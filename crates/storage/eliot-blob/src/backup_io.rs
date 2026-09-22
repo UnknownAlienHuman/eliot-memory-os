@@ -12,13 +12,21 @@
 //! stay attested by the envelope/key owners — ciphertext presence here is
 //! never plaintext authentication or key possession.
 
+use std::task::{Context, Poll, Waker};
+
 use eliot_blob_api::{
     BlobBackupCompletionReceipt, BlobBackupFence, BlobBackupPage, BlobBackupPartial,
-    BlobBackupScope, BlobError, BlobId, BlobLocator, BlobRootLease, CryptoDescriptor,
+    BlobBackupScope, BlobError, BlobFuture, BlobId, BlobLocator, BlobReadChunk, BlobReadRequest,
+    BlobReceiptContext, BlobRootLease, BlobStoreClient, CryptoDescriptor, FencedBlobMember,
     ObjectResidencyKey, PageCompletion, SealedBlobCaptureRecord, BLOB_BACKUP_GENESIS,
 };
+use eliot_platform::WorkScopePath;
+use eliot_receipts::EffectClass;
 
-use super::{AeadOpenRequest, AeadSealRequest, BlobAeadPort, BlobKeyPort, BlobKeySelection};
+use super::{
+    AeadOpenRequest, AeadSealRequest, BlobAeadPort, BlobKeyPort, BlobKeySelection, BlobPlatformPort,
+    BlobRootOwner,
+};
 use sha2::{Digest, Sha256};
 
 /// Verifies an admitted destination scope against live owner state.
@@ -411,7 +419,7 @@ pub fn export_page(
     let mut sealed_running = page.cumulative_bytes_before();
     for (position, index) in page.member_indexes().iter().enumerate() {
         let member_position = page.start_index() + position;
-        let Some(locator) = fence.member(*index) else {
+        let Some(fenced) = fence.member(*index) else {
             return Err(interrupt(
                 members,
                 member_position,
@@ -421,6 +429,7 @@ pub fn export_page(
                 },
             ));
         };
+        let locator = fenced.locator();
         let plaintext = fetch(locator).map_err(|cause| {
             interrupt(std::mem::take(&mut members), member_position, cause)
         })?;
@@ -615,6 +624,21 @@ pub fn bind_restore_set(
 /// backend response: operation id, per-residency dispositions
 /// (bytes/digest/domain), completion receipt, and scope binding travel in
 /// the wire; the wire adds transport identity and never re-derives a digest.
+///
+/// Wire handoff (read-only reference, wire branch `work/950-975-store-wire`,
+/// tip `5b6877b4`, files not edited here): the store channel carries its own
+/// `StoreEvidencePack` (`eliot-store-api/src/backup_io.rs`) mirroring this
+/// pack's shape in store-neutral vocabulary — receipt, bindings,
+/// destination installation/store ids, scope residency digest — over
+/// store-canonical members, while this pack serves the sealed-blob channel
+/// over envelope members. The two channels share no code dependency
+/// (`eliot-store-api` does not depend on `eliot-blob-api`) and meet only at
+/// the Kernel capture coordinator: the blob pack's `blob_hash`,
+/// `sealed_sha256`, `plaintext_sha256`, lineage-bound `crypto`, and
+/// `scope_residency_digest` correspond to the store pack's member digest,
+/// content digest, and residency digest slots with envelope semantics
+/// preserved, and destination installation/store identity stays with the
+/// wire/coordinator owners on both sides.
 #[derive(Clone, Debug)]
 pub struct ConsumerEvidencePack {
     receipt: BlobBackupCompletionReceipt,
@@ -717,6 +741,17 @@ pub enum CaptureOutcome {
         failed_fence_index: usize,
         cause: BlobError,
     },
+}
+
+fn mint_run_trust(
+    ports: &mut CapturePorts<'_>,
+    fence: &BlobBackupFence,
+    scope: &BlobBackupScope,
+    lease: &BlobRootLease,
+    owner: Option<&BlobRootOwner>,
+) -> Result<CaptureTrustRoot, BlobError> {
+    let selection = ports.key_port.current()?;
+    CaptureTrustRoot::mint(fence.operation_id(), &selection, owner, lease, scope)
 }
 
 fn interrupt_outcome(
@@ -859,6 +894,413 @@ fn finalize_capture(
     Ok((receipt, evidence))
 }
 
+/// Drives one owner future to completion on the calling task.
+///
+/// The current owner futures (`BlobStoreService` stage/read/reachability)
+/// wrap synchronous core transitions and never yield, so they complete on
+/// immediate polls. The loop still bounds polls with cooperative yields: a
+/// future that ever stays `Pending` refuses with a typed provider error
+/// instead of parking the task or inventing readiness. No executor, no
+/// thread blocking, no second completion story.
+///
+/// # Errors
+///
+/// Returns the owner's own failure, or [`BlobError::Provider`] when the
+/// future yields and therefore requires the composition executor.
+pub fn drive_owner<T>(future: BlobFuture<'_, T>) -> Result<T, BlobError> {
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut future = future;
+    for _ in 0..16 {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+    Err(BlobError::Provider(
+        "owner future yielded; composition executor required".to_owned(),
+    ))
+}
+
+/// Production plaintext fetch owner: reads fenced members through the real
+/// source `BlobStore` client.
+///
+/// Holds the admitted run-scoped read context and source root lease
+/// (composition-minted, caller-held; validated here before any byte moves)
+/// plus the live client handle. Each fetch builds the exact validated owner
+/// read request from the fenced member's durable metadata binding, drives it
+/// through the real client, and verifies the returned chunk through the
+/// owner contract — including the chunk's receipt/byte integrity proof.
+/// A replaced or drifted payload refuses at the service binding, never
+/// seals under the stale fenced identity.
+pub struct ServiceFetch<'c> {
+    client: &'c dyn BlobStoreClient,
+    context: BlobReceiptContext,
+    lease: BlobRootLease,
+    max_bytes: u64,
+}
+
+impl<'c> ServiceFetch<'c> {
+    /// Binds the fetch owner. Admission is checked now: the context must
+    /// authorize reads, the lease must validate, and the byte bound must be
+    /// non-zero — before any member is touched.
+    pub fn bind(
+        client: &'c dyn BlobStoreClient,
+        context: BlobReceiptContext,
+        lease: BlobRootLease,
+        max_bytes: u64,
+    ) -> Result<Self, BlobError> {
+        context.validate_for(EffectClass::Read)?;
+        lease.validate_context(&context)?;
+        lease.validate()?;
+        if max_bytes == 0 {
+            return Err(BlobError::InvalidField {
+                field: "capture_fetch.max_bytes",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(Self {
+            client,
+            context,
+            lease,
+            max_bytes,
+        })
+    }
+
+    /// Reads one fenced member's plaintext through the real source client.
+    /// The returned bytes are caller-owned plaintext for the seal step and
+    /// are retained nowhere here.
+    pub fn fetch(&self, member: &FencedBlobMember) -> Result<Vec<u8>, BlobError> {
+        let request = BlobReadRequest {
+            context: self.context.clone(),
+            root_lease: self.lease.clone(),
+            locator: member.locator().clone(),
+            expected_metadata_sha256: member.expected_metadata_sha256().to_owned(),
+            expected_ready_receipt_id: member.expected_ready_receipt_id().to_owned(),
+            max_bytes: self.max_bytes,
+        };
+        request.validate()?;
+        let chunk: BlobReadChunk = drive_owner(self.client.read(request))?;
+        chunk.validate()?;
+        if !chunk.is_complete() {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok(chunk.bytes().to_vec())
+    }
+}
+
+/// Production isolated-destination stager: persists verified sealed members
+/// through the real destination platform port.
+///
+/// Holds the admitted destination root lease (caller-held; validated here)
+/// plus the live platform handle and a backup-operation namespace. Each
+/// store re-proves the sealed digest over the actual bytes, derives the
+/// owner-contained path from the member hash, proves containment against
+/// the admitted lease, creates the envelope with the no-replace durable
+/// primitive (a replayed member refuses instead of overwriting — the caller
+/// reconciles by read-back), and verifies by reading the bytes back and
+/// re-proving the digest. Plaintext never reaches this owner: only sealed
+/// envelopes plus their digests.
+pub struct SubstrateStage<'p, P: BlobPlatformPort + ?Sized> {
+    platform: &'p mut P,
+    lease: BlobRootLease,
+    namespace: String,
+    max_bytes: u64,
+}
+
+impl<'p, P: BlobPlatformPort + ?Sized> SubstrateStage<'p, P> {
+    /// Binds the stager. The lease validates now and the namespace must be
+    /// non-blank path-safe text; the platform handle stays borrowed from
+    /// the composition owner for the run.
+    pub fn bind(
+        platform: &'p mut P,
+        lease: BlobRootLease,
+        namespace: String,
+        max_bytes: u64,
+    ) -> Result<Self, BlobError> {
+        lease.validate()?;
+        if namespace.trim().is_empty()
+            || namespace.chars().any(char::is_control)
+            || namespace.contains(['/', '\\', '.'])
+        {
+            return Err(BlobError::InvalidField {
+                field: "capture_stage.namespace",
+                reason: "must be non-blank and free of separators",
+            });
+        }
+        if max_bytes == 0 {
+            return Err(BlobError::InvalidField {
+                field: "capture_stage.max_bytes",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(Self {
+            platform,
+            lease,
+            namespace,
+            max_bytes,
+        })
+    }
+
+    fn envelope_path(&self, binding: &RestoreBinding) -> Result<WorkScopePath, BlobError> {
+        let path = WorkScopePath::new(format!(
+            "backup-export/{}/{}.sealed",
+            self.namespace,
+            binding.blob_hash()
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        self.platform.prove_contained(&self.lease, &path)?;
+        Ok(path)
+    }
+
+    /// Stages one verified sealed member to the isolated destination and
+    /// proves the write by read-back. Refusals leave prior members intact
+    /// and report the exact member; a replayed path refuses at the
+    /// no-replace primitive for caller reconciliation.
+    pub fn store(
+        &mut self,
+        binding: &RestoreBinding,
+        sealed_bytes: &[u8],
+    ) -> Result<(), BlobError> {
+        if sealed_bytes.is_empty() {
+            return Err(BlobError::InvalidField {
+                field: "capture.sealed_bytes",
+                reason: "sealed envelope cannot be empty",
+            });
+        }
+        if sealed_bytes.len() as u64 > self.max_bytes {
+            return Err(BlobError::InvalidField {
+                field: "capture.sealed_bytes",
+                reason: "member exceeds the stager byte bound",
+            });
+        }
+        if sha256_hex(sealed_bytes) != binding.sealed_sha256() {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        let path = self.envelope_path(binding)?;
+        self.platform.write_new_durable(&path, sealed_bytes)?;
+        let stored = self.platform.read_bounded(&path, self.max_bytes)?;
+        if sha256_hex(&stored) != binding.sealed_sha256() {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// First-mint trust root for one capture run (P3a/P3b binding).
+///
+/// Pins, at run start and from live owner readback only: the operation id,
+/// the admitted scope digest, the lease root/lease identities and
+/// generation, the CURRENT key selection (fresh `current()` read — never
+/// caller text, never invented crypto), and the OS root claim identity read
+/// from the live `BlobRootOwner` when one is held. Every later page
+/// re-checks currency against the pinned root through the same live
+/// handles: a key-lineage rotation, lease drift, heartbeat failure, or root
+/// identity change refuses with fence/owner errors instead of mixing
+/// generations into one receipt. Same-lineage generation advance stays
+/// admissible, and historical envelopes keep resolving through `resolve` —
+/// historical key possession is honored for opens while only the pinned
+/// current lineage admits new seals.
+#[derive(Clone, Debug)]
+pub struct CaptureTrustRoot {
+    operation_id: String,
+    scope_digest: String,
+    lease_root_id: String,
+    lease_id: String,
+    lease_generation: u64,
+    key_lineage: BlobId,
+    key_generation: u64,
+    root_id: Option<String>,
+}
+
+impl CaptureTrustRoot {
+    /// Mints the trust root from live readback. The key selection must come
+    /// from a fresh `current()` call on the run's key port; the owner, when
+    /// held, must show no heartbeat failure and must own the presented
+    /// lease root. Without a held owner, root-liveness readback is
+    /// unavailable and the run carries that ceiling explicitly
+    /// (`root_id` stays `None`): composition proof, not a silent pass.
+    pub fn mint(
+        operation_id: &str,
+        selection: &BlobKeySelection,
+        owner: Option<&BlobRootOwner>,
+        lease: &BlobRootLease,
+        scope: &BlobBackupScope,
+    ) -> Result<Self, BlobError> {
+        valid_operation_text(operation_id, "capture_trust.operation_id")?;
+        lease.validate()?;
+        selection.crypto.validate()?;
+        let root_id = if let Some(owner) = owner {
+            if let Some(failure) = owner.heartbeat_failure() {
+                return Err(failure);
+            }
+            if !owner.owns_service_root(lease.root_id.as_str()) {
+                return Err(BlobError::OwnerConflict);
+            }
+            Some(owner.root_id().to_owned())
+        } else {
+            None
+        };
+        Ok(Self {
+            operation_id: operation_id.to_owned(),
+            scope_digest: scope.residency_digest().to_owned(),
+            lease_root_id: lease.root_id.as_str().to_owned(),
+            lease_id: lease.lease_id.as_str().to_owned(),
+            lease_generation: lease.root_generation,
+            key_lineage: selection.crypto.key_lineage.clone(),
+            key_generation: selection.crypto.key_generation,
+            root_id,
+        })
+    }
+
+    /// Re-checks currency against the pinned root through the live handles.
+    /// Lineage rotation, lease drift, heartbeat failure, or a changed root
+    /// identity refuses; same-lineage generation advance passes.
+    pub fn recheck(
+        &self,
+        key_port: &mut dyn BlobKeyPort,
+        owner: Option<&BlobRootOwner>,
+        lease: &BlobRootLease,
+    ) -> Result<(), BlobError> {
+        lease.validate()?;
+        if lease.root_id.as_str() != self.lease_root_id
+            || lease.lease_id.as_str() != self.lease_id
+            || lease.root_generation != self.lease_generation
+        {
+            return Err(BlobError::StaleFence);
+        }
+        if let Some(owner) = owner {
+            if let Some(failure) = owner.heartbeat_failure() {
+                return Err(failure);
+            }
+            if !owner.owns_service_root(lease.root_id.as_str()) {
+                return Err(BlobError::OwnerConflict);
+            }
+            if self.root_id.as_deref() != Some(owner.root_id()) {
+                return Err(BlobError::StaleFence);
+            }
+        }
+        let current = key_port.current()?;
+        if current.crypto.key_lineage != self.key_lineage {
+            return Err(BlobError::StaleFence);
+        }
+        Ok(())
+    }
+
+    /// Operation this trust root pins.
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// Admitted scope digest pinned at mint.
+    #[must_use]
+    pub fn scope_digest(&self) -> &str {
+        &self.scope_digest
+    }
+
+    /// Key lineage pinned at mint; rotations refuse.
+    #[must_use]
+    pub fn key_lineage(&self) -> &BlobId {
+        &self.key_lineage
+    }
+
+    /// Key generation observed at mint; advance stays admissible.
+    #[must_use]
+    pub fn key_generation(&self) -> u64 {
+        self.key_generation
+    }
+}
+
+fn valid_operation_text(value: &str, field: &'static str) -> Result<(), BlobError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        Err(BlobError::InvalidField {
+            field,
+            reason: "must be non-blank and free of control characters",
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Production capture caller: binds the real owner handles once and runs
+/// the bounded driver with first-mint trust.
+///
+/// This is the in-copy caller side of the backup flow: composition claims
+/// the OS root owner, constructs the real key/AEAD ports, admits the
+/// lease/crypto/residency bindings, and calls [`ProductionCapture::run`]
+/// with the real [`ServiceFetch`]/[`SubstrateStage`] owners behind the
+/// fetch/stage seams. The Kernel coordinator (#959) drives this caller;
+/// this struct never mints admission itself — every binding validates here
+/// before any byte moves.
+pub struct ProductionCapture<'a> {
+    ports: CapturePorts<'a>,
+    owner: Option<&'a BlobRootOwner>,
+    lease: BlobRootLease,
+    crypto: CryptoDescriptor,
+    residency: ObjectResidencyKey,
+}
+
+impl<'a> ProductionCapture<'a> {
+    /// Binds the production caller. The lease, destination crypto, and
+    /// residency validate now; the held OS owner, when present, must show
+    /// no heartbeat failure and must own the presented lease root — a
+    /// second owner fails fast with `OwnerConflict` before any byte moves.
+    /// The lease stays caller-held and prevalidated: this validates, never
+    /// mints.
+    pub fn bind(
+        ports: CapturePorts<'a>,
+        owner: Option<&'a BlobRootOwner>,
+        lease: BlobRootLease,
+        crypto: CryptoDescriptor,
+        residency: ObjectResidencyKey,
+    ) -> Result<Self, BlobError> {
+        lease.validate()?;
+        crypto.validate()?;
+        residency.validate()?;
+        if let Some(owner) = owner {
+            if let Some(failure) = owner.heartbeat_failure() {
+                return Err(failure);
+            }
+            if !owner.owns_service_root(lease.root_id.as_str()) {
+                return Err(BlobError::OwnerConflict);
+            }
+        }
+        Ok(Self {
+            ports,
+            owner,
+            lease,
+            crypto,
+            residency,
+        })
+    }
+
+    /// Runs one bounded capture over the fenced denominator under the
+    /// admitted scope, reading through `fetch` and staging through `stage`.
+    /// Production callers back those seams with [`ServiceFetch::fetch`] and
+    /// [`SubstrateStage::store`]; the trust root mints from a fresh key-port
+    /// readback at start and re-checks currency every page.
+    pub fn run(
+        &mut self,
+        fence: &BlobBackupFence,
+        scope: &BlobBackupScope,
+        fetch: &mut PlaintextFetch,
+        stage: &mut SealedStage,
+    ) -> CaptureOutcome {
+        run_capture(
+            &mut self.ports,
+            fence,
+            scope,
+            &self.lease,
+            &self.crypto,
+            &self.residency,
+            self.owner,
+            fetch,
+            stage,
+        )
+    }
+}
+
 /// Bounded capture driver: walks the fenced denominator page by page through
 /// export, import-verification, and destination staging.
 ///
@@ -876,9 +1318,12 @@ fn finalize_capture(
 ///
 /// `fetch` is the production plaintext read half owned by the caller;
 /// `stage` is the isolated-destination stager owned by the caller (the F
-/// lane stages re-sealed bytes into its isolated substrate). This driver
-/// owns the denominator walk, the seal/verify round-trip, and the evidence —
-/// never the live store and never cutover.
+/// lane stages re-sealed bytes into its isolated substrate). `owner`, when
+/// held, supplies live root readback: the trust root mints from a fresh
+/// key-port selection at start and re-checks lineage, lease, heartbeat, and
+/// root identity every page. This driver owns the denominator walk, the
+/// seal/verify round-trip, and the evidence — never the live store and
+/// never cutover.
 #[allow(clippy::too_many_arguments)]
 pub fn run_capture(
     ports: &mut CapturePorts<'_>,
@@ -887,18 +1332,34 @@ pub fn run_capture(
     lease: &BlobRootLease,
     crypto: &CryptoDescriptor,
     residency: &ObjectResidencyKey,
+    owner: Option<&BlobRootOwner>,
     fetch: &mut PlaintextFetch,
     stage: &mut SealedStage,
 ) -> CaptureOutcome {
     if let Err(cause) = scope.verify_against(lease, crypto, residency) {
         return interrupt_outcome(fence, &[], 0, 0, 0, 0, cause);
     }
+    let trust = match mint_run_trust(ports, fence, scope, lease, owner) {
+        Ok(trust) => trust,
+        Err(cause) => return interrupt_outcome(fence, &[], 0, 0, 0, 0, cause),
+    };
     let mut done: Vec<ExportedPage> = Vec::new();
     let mut staged_members: u64 = 0;
     let mut staged_bytes: u64 = 0;
     let mut start = 0usize;
     let mut page_index = 0u32;
     while start < fence.member_count() {
+        if let Err(cause) = trust.recheck(&mut *ports.key_port, owner, lease) {
+            return interrupt_outcome(
+                fence,
+                &done,
+                staged_members,
+                staged_bytes,
+                page_index,
+                start,
+                cause,
+            );
+        }
         let remaining = fence.member_count() - start;
         let window = usize::try_from(fence.max_members_per_page())
             .unwrap_or(usize::MAX)

@@ -309,6 +309,93 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
+/// One fenced denominator member: the exact locator plus the durable
+/// metadata binding the service read path requires.
+///
+/// The locator alone never authorizes a read: `expected_metadata_sha256` and
+/// `expected_ready_receipt_id` pin the exact durable metadata the member was
+/// fenced against, so a replaced or drifted payload refuses instead of
+/// sealing under a stale identity. Both bindings come from canonical capture
+/// with the locator, never from a later scan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FencedBlobMember {
+    locator: BlobLocator,
+    expected_metadata_sha256: String,
+    expected_ready_receipt_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FencedBlobMemberWire {
+    locator: BlobLocator,
+    expected_metadata_sha256: String,
+    expected_ready_receipt_id: String,
+}
+
+impl FencedBlobMember {
+    /// Fixes one denominator member from the externally fenced capture
+    /// denominator. The locator validates through the owner contract; both
+    /// metadata bindings validate as shapes here and are re-proved by the
+    /// service read itself.
+    pub fn member(
+        locator: BlobLocator,
+        expected_metadata_sha256: String,
+        expected_ready_receipt_id: String,
+    ) -> Result<Self, BlobError> {
+        let member = Self {
+            locator,
+            expected_metadata_sha256,
+            expected_ready_receipt_id,
+        };
+        member.validate()?;
+        Ok(member)
+    }
+
+    fn validate(&self) -> Result<(), BlobError> {
+        self.locator.validate()?;
+        validate_hex_field(
+            &self.expected_metadata_sha256,
+            "backup_fence.expected_metadata_sha256",
+        )?;
+        valid_operation_id(
+            &self.expected_ready_receipt_id,
+            "backup_fence.expected_ready_receipt_id",
+        )?;
+        Ok(())
+    }
+
+    /// Exact locator captured.
+    #[must_use]
+    pub fn locator(&self) -> &BlobLocator {
+        &self.locator
+    }
+
+    /// Durable metadata digest the service read must match.
+    #[must_use]
+    pub fn expected_metadata_sha256(&self) -> &str {
+        &self.expected_metadata_sha256
+    }
+
+    /// Ready receipt identity the service read must match.
+    #[must_use]
+    pub fn expected_ready_receipt_id(&self) -> &str {
+        &self.expected_ready_receipt_id
+    }
+}
+
+impl<'de> Deserialize<'de> for FencedBlobMember {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = FencedBlobMemberWire::deserialize(deserializer)?;
+        let value = Self {
+            locator: wire.locator,
+            expected_metadata_sha256: wire.expected_metadata_sha256,
+            expected_ready_receipt_id: wire.expected_ready_receipt_id,
+        };
+        value.validate().map_err(de::Error::custom)?;
+        Ok(value)
+    }
+}
+
 /// Fenced export denominator: the exact finite member set one backup
 /// operation must account for.
 ///
@@ -322,7 +409,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 pub struct BlobBackupFence {
     operation_id: String,
     source_root_generation: u64,
-    members: Vec<BlobLocator>,
+    members: Vec<FencedBlobMember>,
     max_members_per_page: u32,
     max_bytes_per_member: u64,
     max_total_sealed_bytes: u64,
@@ -333,19 +420,19 @@ pub struct BlobBackupFence {
 struct BlobBackupFenceWire {
     operation_id: String,
     source_root_generation: u64,
-    members: Vec<BlobLocator>,
+    members: Vec<FencedBlobMember>,
     max_members_per_page: u32,
     max_bytes_per_member: u64,
     max_total_sealed_bytes: u64,
 }
 
 impl BlobBackupFence {
-    /// Fixes the denominator for one backup operation. Every member locator
+    /// Fixes the denominator for one backup operation. Every member
     /// validates through the owner contract here, before any byte is read.
     pub fn fence(
         operation_id: String,
         source_root_generation: u64,
-        members: Vec<BlobLocator>,
+        members: Vec<FencedBlobMember>,
         max_members_per_page: u32,
         max_bytes_per_member: u64,
         max_total_sealed_bytes: u64,
@@ -383,7 +470,10 @@ impl BlobBackupFence {
             member.validate()?;
         }
         for (index, member) in self.members.iter().enumerate() {
-            if self.members[..index].contains(member) {
+            if self.members[..index]
+                .iter()
+                .any(|seen| seen.locator() == member.locator())
+            {
                 return Err(BlobError::DuplicateIdentity("backup_fence"));
             }
         }
@@ -404,7 +494,7 @@ impl BlobBackupFence {
 
     /// Exact finite member set.
     #[must_use]
-    pub fn members(&self) -> &[BlobLocator] {
+    pub fn members(&self) -> &[FencedBlobMember] {
         &self.members
     }
 
@@ -417,8 +507,17 @@ impl BlobBackupFence {
 
     /// Member at `index`, or `None` past the fence end.
     #[must_use]
-    pub fn member(&self, index: usize) -> Option<&BlobLocator> {
+    pub fn member(&self, index: usize) -> Option<&FencedBlobMember> {
         self.members.get(index)
+    }
+
+    /// Locates the fenced member for an exact locator, or `None` when the
+    /// locator is outside the fenced denominator.
+    #[must_use]
+    pub fn find_member(&self, locator: &BlobLocator) -> Option<&FencedBlobMember> {
+        self.members
+            .iter()
+            .find(|member| member.locator() == locator)
     }
 
     /// Page-size ceiling for this fence.
@@ -622,7 +721,7 @@ impl BlobBackupPage {
             .member_indexes()
             .iter()
             .map(|index| {
-                let locator = &fence.members[*index];
+                let locator = fence.members[*index].locator();
                 Ok((
                     locator.hash.as_str(),
                     locator.residency_key_digest()?,
@@ -899,7 +998,7 @@ impl BlobBackupCompletionReceipt {
         for member in fence.members() {
             let matches = records
                 .iter()
-                .filter(|record| record.locator() == member)
+                .filter(|record| record.locator() == member.locator())
                 .count();
             if matches != 1 {
                 return Err(BlobError::PlanGap(
@@ -933,7 +1032,7 @@ impl BlobBackupCompletionReceipt {
         for member in fence.members() {
             let record = records
                 .iter()
-                .find(|record| record.locator() == member)
+                .find(|record| record.locator() == member.locator())
                 .ok_or_else(|| {
                     BlobError::PlanGap(
                         "backup export must hold exactly one record per fenced member".to_owned(),
