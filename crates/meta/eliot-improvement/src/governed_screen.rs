@@ -61,6 +61,7 @@ pub struct CarriageMark<'a> {
 /// callers always pass the production [`BoundedBacklog`]. `overlay` and
 /// `cross_task_admission` are required exactly when the permit binds an
 /// overlay subject or the requesting task leaves the admitted target.
+#[derive(Clone, Copy, Debug)]
 pub struct PresentedLearning<'a> {
     pub governor: &'a Governor,
     pub verified: &'a VerifiedLearningAdmission<'a>,
@@ -230,8 +231,18 @@ pub fn check_governed_carriage(
     Ok(())
 }
 
-/// Map a carriage refusal onto the contract error space for screens.
+/// Convert a unix-seconds clock into owner time for registry gates.
 ///
+/// Fail-closed: out-of-range stamps refuse with `InvalidProduction`
+/// instead of wrapping or clamping.
+pub fn datetime_from_unix(now_unix_secs: u64) -> Result<OffsetDateTime, BoundsError> {
+    i64::try_from(now_unix_secs)
+        .ok()
+        .and_then(|secs| OffsetDateTime::from_unix_timestamp(secs).ok())
+        .ok_or(BoundsError::InvalidProduction("learning.now"))
+}
+
+/// Map a carriage refusal onto the contract error space for screens.///
 /// Variants reachable from [`check_governed_carriage`] map precisely;
 /// backlog-policy/archive/closure-assembly variants cannot occur on this
 /// path and collapse to `IdentityConflict` rather than inventing semantics.
