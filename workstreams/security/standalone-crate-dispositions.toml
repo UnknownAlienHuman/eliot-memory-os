@@ -56,26 +56,8 @@ base_sha = "f74c20e5652b12beabe60dc19f57ed197646a781"
 discovery = "python scripts/verify-standalone-crates.py --root . --list"
 gate = "python scripts/verify-excluded-dispositions-1811.py --root ."
 root_exclude_at_base = []
-standalone_package_count = 11
+standalone_package_count = 10
 allowed_dispositions = ["KEEP", "WRAP", "EXTRACT", "REWORK", "REPLACE", "RETIRE", "UNKNOWN"]
-
-[[crate]]
-path = "crates/foundation/eliot-memory-projection-contracts"
-package = "eliot-memory-projection-contracts"
-disposition = "REWORK"
-owner = "foundation.memory.projection-contracts"
-standalone = "own [workspace] table; absent from root members and root exclude"
-prototype = true
-source_status = "IMPLEMENTED_PROTOTYPE"
-workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "foundation.memory.projection-contracts"
-agent_order = 44
-lifecycle_owner = "foundation.memory.projection-contracts"
-lifecycle_owner_source = "crates/foundation/eliot-memory-projection-contracts/module.toml"
-integration_owner = "cognitive-wave-integrator"
-integration_owner_source = "crates/foundation/eliot-memory-projection-contracts/module.toml"
-production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
-remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
 
 [[crate]]
 path = "crates/governor/eliot-memory-projection-provider"
