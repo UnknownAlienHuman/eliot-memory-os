@@ -7,6 +7,11 @@ license = "MIT"
 
 [dependencies]
 blake3 = "1.8.5"
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-context-contracts = { path = "../../smart/eliot-context-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-governor = { path = "../../governor/eliot-governor" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
 time = { version = "0.3.44", features = ["serde", "formatting", "parsing"] }

@@ -50,6 +50,7 @@ pub use cue_composition::{
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 mod controlboard_projection;
+mod learning_admission;
 mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_projection_refresh;
@@ -85,6 +86,12 @@ pub use eliot_canonical::CanonicalWriteEnvelope;
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
 pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
+pub use learning_admission::{
+    LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
+    LearningAdmissionError, LearningAdmissionPermit, VerifiedLearningAdmission,
+    issue_learning_admission, issue_learning_ticket, verify_learning_admission,
+    verify_learning_ticket,
+};
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
     WatchdogEntryKind,
