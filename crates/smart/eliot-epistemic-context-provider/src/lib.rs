@@ -171,4 +171,21 @@ impl EpistemicContextContribution {
         }
         Ok(())
     }
+
+    /// Track one position across two owner reads: contribute from the
+    /// initial position, then revalidate against the live one.
+    ///
+    /// This is the production-consumer orchestration for epistemic
+    /// liveness: a single call chains contribution and readback. Both
+    /// positions arrive through the admission owner (no store I/O here);
+    /// canonical store readback stays owner-side. Any advance between the
+    /// reads fails closed with the exact drifted aspect.
+    pub fn track_position(
+        initial: &CurrentEpistemicPosition,
+        live: &CurrentEpistemicPosition,
+    ) -> Result<Self, ContributionError> {
+        let contributed = Self::from_position(initial)?;
+        contributed.revalidate_against_live(live)?;
+        Ok(contributed)
+    }
 }

@@ -143,6 +143,46 @@ impl ExperienceView {
     }
 }
 
+/// Track view refs against the live Governor journal: the canonical owner
+/// read in this lane.
+///
+/// Reads the journal snapshot through the owner API and presence-checks
+/// every carried ref handle against admitted record ids. Journal-family
+/// views only; other families fail closed. This is the production-consumer
+/// chain for journal reads: owner read first, revalidation second, no
+/// bodies traveling. Revision staleness beyond presence stays a
+/// live-owner capability, exactly as in [`revalidate_journal_presence`].
+pub fn track_journal_presence(
+    view: &ExperienceView,
+    journal: &eliot_observation::ObservationJournal,
+) -> Result<(), ObservationError> {
+    use eliot_observation::{ObservationAdmissionResult, ObservationJournalEntry};
+    use std::collections::BTreeSet;
+    view.validate()?;
+    if view.family != ExperienceSourceFamily::SystemObservationJournal {
+        return Err(ObservationError::InvalidField {
+            field: "track.family",
+            reason: "view family is not the journal family",
+        });
+    }
+    let snapshot: Vec<ObservationJournalEntry> = journal.snapshot();
+    let mut admitted: BTreeSet<&str> = BTreeSet::new();
+    for entry in &snapshot {
+        if let ObservationAdmissionResult::Accepted { receipt } = &entry.result {
+            admitted.insert(receipt.record_id.as_str());
+        }
+    }
+    for reference in &view.refs {
+        if !admitted.contains(reference.handle.as_str()) {
+            return Err(ObservationError::InvalidField {
+                field: "track.ref",
+                reason: "live owner state advanced",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Revalidate view refs against a live bank projection.
 ///
 /// Every carried ref must still resolve to a projected ref with identical

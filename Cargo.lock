@@ -1792,6 +1792,7 @@ name = "eliot-experience-projection"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-observation",
  "eliot-observation-contracts",
  "eliot-receipts",
  "schemars",
