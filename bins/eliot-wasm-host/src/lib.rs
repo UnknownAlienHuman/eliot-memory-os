@@ -25,6 +25,7 @@ mod artifact_preflight;
 mod child_engine;
 mod cli_contract;
 mod contour;
+mod grant_authorization;
 mod grant_client;
 mod guest_exec;
 mod installed_binary;
@@ -46,6 +47,9 @@ pub use contour::{
     STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
     authorize_host_call, check_activation_imports, check_admitted_request,
 };
+pub use grant_authorization::{
+    AuthorizedGrant, authorize_grant, authorize_grant_against_descriptor,
+};
 pub use grant_client::{
     AcceptedGrant, GrantChannel, GrantClientBundle, GrantClientError, accept_grant,
     build_grant_bundle, request_grant,
@@ -58,7 +62,8 @@ pub use guest_exec::{
     validate_request,
 };
 pub use installed_binary::{
-    InstalledBinary, InstalledBinaryError, WasmHostBinaryBinding, resolve_installed_binary,
+    InstalledBinary, InstalledBinaryError, WasmHostBinaryBinding,
+    binding_from_installation_records, binding_from_launch_descriptor, resolve_installed_binary,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{

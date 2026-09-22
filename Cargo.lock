@@ -3042,6 +3042,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-governor",
+ "eliot-installation",
  "eliot-ipc",
  "eliot-observation-contracts",
  "eliot-platform",
