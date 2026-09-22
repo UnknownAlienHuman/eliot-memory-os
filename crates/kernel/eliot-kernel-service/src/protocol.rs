@@ -1991,9 +1991,11 @@ pub fn semantic_store_config_hash_from_json(
         doctor_artifact_digest: serde_json::Value,
         testd_artifact_digest: serde_json::Value,
         native_worker_artifact_digest: serde_json::Value,
+        wasm_host_artifact_digest: serde_json::Value,
         doctor_executable_path: serde_json::Value,
         testd_executable_path: serde_json::Value,
         native_worker_executable_path: serde_json::Value,
+        wasm_host_executable_path: serde_json::Value,
         descriptor_digest: serde_json::Value,
     }
 
@@ -2045,9 +2047,11 @@ pub fn semantic_store_config_hash_from_json(
                 "doctor_artifact_digest",
                 "testd_artifact_digest",
                 "native_worker_artifact_digest",
+                "wasm_host_artifact_digest",
                 "doctor_executable_path",
                 "testd_executable_path",
                 "native_worker_executable_path",
+                "wasm_host_executable_path",
                 "descriptor_digest",
             ],
         )?;
@@ -2149,9 +2153,11 @@ pub fn semantic_store_config_hash_from_json(
             doctor_artifact_digest: field(value, "doctor_artifact_digest")?,
             testd_artifact_digest: field(value, "testd_artifact_digest")?,
             native_worker_artifact_digest: field(value, "native_worker_artifact_digest")?,
+            wasm_host_artifact_digest: field(value, "wasm_host_artifact_digest")?,
             doctor_executable_path: field(value, "doctor_executable_path")?,
             testd_executable_path: field(value, "testd_executable_path")?,
             native_worker_executable_path: field(value, "native_worker_executable_path")?,
+            wasm_host_executable_path: field(value, "wasm_host_executable_path")?,
             descriptor_digest: field(value, "descriptor_digest")?,
         })
     }
@@ -3699,9 +3705,11 @@ mod tests {
                 "doctor_artifact_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "testd_artifact_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "native_worker_artifact_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "wasm_host_artifact_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                 "doctor_executable_path": "C:/eliot/eliot-doctor.exe",
                 "testd_executable_path": "C:/eliot/eliot-testd.exe",
                 "native_worker_executable_path": "C:/eliot/eliot-native-worker.exe",
+                "wasm_host_executable_path": "C:/eliot/eliot-wasm-host.exe",
                 "descriptor_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }
         }"#,
