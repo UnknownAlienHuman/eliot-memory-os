@@ -48,8 +48,9 @@ pub use contour::{
     authorize_host_call, check_activation_imports, check_admitted_request,
 };
 pub use dispatch_drive::{
-    DispatchDriveResponse, DriveError, GUEST_EXEC_ARGV0_HINT, LifecycleVerdicts, SeatedVerdicts,
-    drive_admission, evaluate_lifecycle_verdicts, evaluate_seated_verdicts, guest_exec_argv,
+    DispatchDriveResponse, DriveAdmission, DriveError, GUEST_EXEC_ARGV0_HINT, LifecycleVerdicts,
+    OwnerRecords, SeatedVerdicts, assemble_owner_records, drive_admission, drive_dispatch,
+    evaluate_lifecycle_verdicts, evaluate_seated_verdicts, guest_exec_argv,
 };
 pub use dispatch_material::{
     DISPATCH_MATERIAL_MAX_BYTES, WASM_DISPATCH_MATERIAL_WIRE_ID,
@@ -60,7 +61,7 @@ pub use dispatch_material::{
     ValidatedManifestRecord, ValidatedPromotionInput, ValidatedPromotionRecord,
     ValidatedSnapshotInput, ValidatedSnapshotRecord, ValidatedWorkInput, ValidatedWorkRecord,
     ValidatedAssuranceRecord, admitted_material_path, bind_dispatch_material, consume_staged,
-    read_staged_bytes,
+    read_dispatch_material, read_dispatch_material_from, read_staged_bytes,
 };
 pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,

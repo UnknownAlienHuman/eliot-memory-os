@@ -10,17 +10,19 @@
 //! wasm_dispatch`) stages the material envelope JSON plus the colocated
 //! guest artifact/input files next to the installed image under the file
 //! names below. The envelope field names and closed spelling sets are the
-//! contract with that publisher; this module binds already-typed values
-//! and enforces the same shapes the publisher enforces, so a mixed or
-//! tampered envelope fails here before any authority, permit, or child
+//! contract with that publisher; this module parses the staged envelope
+//! bytes and enforces the same shapes the publisher enforces, so a mixed
+//! or tampered envelope fails here before any authority, permit, or child
 //! exists.
 //!
-//! Thin-host note: this crate carries no JSON dependency, so envelope-byte
-//! parsing stays with the execution join (A3 authority lane), which owns
-//! the reader plus the `dispatch_authority` grant rebuild this validation
-//! feeds. What this module implements now — the pure typed binding — is
-//! the non-dependent seam: every record shape, digest, ceiling, spelling,
-//! and byte binding the drive needs once the bytes are parsed.
+//! Learning-ticket note: guest/input bytes cross this module opaquely.
+//! Ticket screening is single-owned by the learning lane's guest gate
+//! (`check_guest_tickets` over `AdmissionInput` in
+//! `work/2376-guest-gate-ticket`); this module binds input digests and
+//! never screens tickets, so no second admission surface is invented
+//! here. Where the seated path must screen, the drive invokes the
+//! caller-provided screen hook (see `dispatch_drive`), which the
+//! integration owner wires to that exact screen call.
 
 use eliot_wasm_runtime::Sha256Digest;
 
@@ -53,6 +55,8 @@ pub enum MaterialError {
     TooLarge,
     /// A staged file could not be read (kind string only).
     Unreadable(String),
+    /// The material bytes are not a valid envelope.
+    Malformed,
     /// An observed file digest does not match the bound record.
     DigestMismatch,
     /// A record failed shape checks.
@@ -70,6 +74,7 @@ impl MaterialError {
             Self::Missing => "DISPATCH_MATERIAL_MISSING",
             Self::TooLarge => "DISPATCH_MATERIAL_TOO_LARGE",
             Self::Unreadable(_) => "DISPATCH_MATERIAL_UNREADABLE",
+            Self::Malformed => "DISPATCH_MATERIAL_MALFORMED",
             Self::DigestMismatch => "DISPATCH_MATERIAL_DIGEST_MISMATCH",
             Self::InvalidRecord { .. } => "DISPATCH_MATERIAL_INVALID_RECORD",
         }
@@ -586,6 +591,329 @@ pub fn read_staged_bytes(path: &std::path::Path) -> Result<Vec<u8>, MaterialErro
 /// never silent reuse.
 pub fn consume_staged(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
+}
+
+/// Wire mirror of the owner-published grant record, field-for-field with
+/// the publisher. The authority epoch travels as canonical JSON and is
+/// carried verbatim: fence construction from it belongs to the authority
+/// join, never to this reader.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaterialGrantMirror {
+    grant_digest: String,
+    authority_epoch: serde_json::Value,
+    fence_generation: u64,
+    fence_nonce: String,
+    idempotency_key: String,
+    expires_at: u64,
+    host_artifact_digest: String,
+}
+
+/// Wire mirror of the guest invocation ceilings record.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestCeilingsMirror {
+    artifact_digest: String,
+    input_digest: String,
+    max_output_bytes: u64,
+    max_fuel: u64,
+    max_memory_bytes: u64,
+    wall_deadline_ms: u64,
+    epoch_deadline_ticks: u64,
+    table_elements: u64,
+    max_instances: u64,
+    artifact_access_reads: u64,
+    artifact_access_bytes: u64,
+    component_id: String,
+}
+
+/// Wire mirror of the owner-authored manifest record.
+///
+/// Closed-world declaration lists (`allowed_imports`, `allowed_exports`,
+/// `capability_grants`) are parsed and carried for envelope closure but
+/// enforced by contour admission, not read here — hence the dead-code
+/// allowance on the mirror.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct ManifestRecordMirror {
+    component_id: String,
+    world: String,
+    target: String,
+    source_digest: String,
+    state_contract_digest: String,
+    required_verifier: String,
+    privacy_classes: Vec<String>,
+    allowed_imports: Vec<String>,
+    allowed_exports: Vec<String>,
+    capability_grants: Vec<String>,
+    state_class: String,
+    migration_contract: String,
+    privacy_policy: String,
+    comparator: String,
+    rollback_generation: Option<String>,
+}
+
+/// Wire mirror of the owner-authored work identity record.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkRecordMirror {
+    owner: String,
+    work_unit: String,
+    work_scope: String,
+    task_ref: Option<String>,
+    lease_id: String,
+    lease_scope_ref: String,
+    lease_state: String,
+    generation_state: String,
+    authority_revision: u64,
+    lifecycle_revision: u64,
+    verification_revision: u64,
+    deterministic_seed: u64,
+    contour: String,
+    generation_health: Vec<String>,
+}
+
+/// Wire mirror of the owner-authored assurance record. Enum spellings are
+/// carried verbatim and mapped strictly by the binder; unknown spellings
+/// fail closed there.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssuranceRecordMirror {
+    source_ref: String,
+    provenance_ref: String,
+    integrity: String,
+    freshness: String,
+    competence: String,
+    independence: String,
+    privacy_class: String,
+    instruction_taint: String,
+    epistemic_use: Vec<String>,
+    effect_ceilings: Vec<String>,
+    required_verifier: String,
+    quarantine: String,
+}
+
+/// Wire mirror of the owner-authored promotion oracle record.
+///
+/// Field names mirror the publisher envelope exactly (hence the shared
+/// `digest` postfix); renaming any of them breaks the closed envelope.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
+struct PromotionRecordMirror {
+    corpus_digest: String,
+    expected_result_digest: String,
+    expected_effect_digest: String,
+    expected_state_delta_digest: String,
+}
+
+/// Wire mirror of the owner-attested snapshot record.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotRecordMirror {
+    service: String,
+    protocol: String,
+    generation: u64,
+    authority_epoch: serde_json::Value,
+    artifact_digest: String,
+    protected_snapshot_digest: String,
+    principal: String,
+}
+
+/// Wire mirror of the dispatch material envelope, field-for-field with the
+/// owner publisher (`WasmDispatchMaterial`).
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaterialEnvelopeMirror {
+    wire_id: String,
+    wire_version: u16,
+    claim_id: String,
+    operation_id: String,
+    generation: u64,
+    authority_epoch: serde_json::Value,
+    launch_nonce: String,
+    admitted_at_unix_ms: u64,
+    grant: MaterialGrantMirror,
+    guest: GuestCeilingsMirror,
+    profile: String,
+    prior_conformance_artifact: Option<String>,
+    manifest: ManifestRecordMirror,
+    work: WorkRecordMirror,
+    assurance: AssuranceRecordMirror,
+    promotion: PromotionRecordMirror,
+    snapshot: SnapshotRecordMirror,
+}
+
+/// Canonical epoch JSON carried verbatim. The publisher serializes the
+/// canonical `EpochId` shape (`lineage_id` then `sequence`, sorted keys),
+/// and this reader re-serializes the parsed value the same way, so the
+/// derivation input is byte-stable across the round trip. Never
+/// interpreted here: fence construction belongs to the authority join.
+fn epoch_json_string(value: &serde_json::Value) -> Result<String, MaterialError> {
+    if !value.is_object() {
+        return Err(MaterialError::Malformed);
+    }
+    serde_json::to_string(value).map_err(|_| MaterialError::Malformed)
+}
+
+/// Parses staged envelope bytes into a typed material input. The wire
+/// identity and version must match exactly; every record then flows
+/// through the same typed binder the direct path uses, so a malformed
+/// envelope and a malformed record fail with the same typed refusal —
+/// never a panic, never a partial bind.
+///
+/// The body is one straight field mapping by design: envelope order
+/// follows publisher order so reviewers can diff them side by side.
+#[allow(clippy::too_many_lines)]
+fn parse_envelope(bytes: &[u8]) -> Result<DispatchMaterialInput, MaterialError> {
+    let envelope: MaterialEnvelopeMirror =
+        serde_json::from_slice(bytes).map_err(|_| MaterialError::Malformed)?;
+    if envelope.wire_id != WASM_DISPATCH_MATERIAL_WIRE_ID
+        || envelope.wire_version != WASM_DISPATCH_MATERIAL_WIRE_VERSION
+    {
+        return Err(MaterialError::Malformed);
+    }
+    let authority_epoch_json = epoch_json_string(&envelope.authority_epoch)?;
+    let snapshot_epoch_json = epoch_json_string(&envelope.snapshot.authority_epoch)?;
+    let grant_epoch_json = epoch_json_string(&envelope.grant.authority_epoch)?;
+    if grant_epoch_json != authority_epoch_json || snapshot_epoch_json != authority_epoch_json {
+        return Err(invalid("epoch-agreement"));
+    }
+    Ok(DispatchMaterialInput {
+        claim_id: envelope.claim_id,
+        operation_id: envelope.operation_id,
+        generation: envelope.generation,
+        authority_epoch_json,
+        launch_nonce: envelope.launch_nonce,
+        admitted_at_unix_ms: envelope.admitted_at_unix_ms,
+        grant_digest: envelope.grant.grant_digest,
+        grant_fence_generation: envelope.grant.fence_generation,
+        grant_fence_nonce: envelope.grant.fence_nonce,
+        grant_idempotency_key: envelope.grant.idempotency_key,
+        grant_expires_at: envelope.grant.expires_at,
+        host_artifact_digest: envelope.grant.host_artifact_digest,
+        profile: envelope.profile,
+        prior_conformance_artifact: envelope.prior_conformance_artifact,
+        ceilings: ValidatedGuestCeilingsInput {
+            component_id: envelope.guest.component_id,
+            artifact_digest: envelope.guest.artifact_digest,
+            input_digest: envelope.guest.input_digest,
+            max_output_bytes: envelope.guest.max_output_bytes,
+            max_fuel: envelope.guest.max_fuel,
+            max_memory_bytes: envelope.guest.max_memory_bytes,
+            wall_deadline_ms: envelope.guest.wall_deadline_ms,
+            epoch_deadline_ticks: envelope.guest.epoch_deadline_ticks,
+            table_elements: envelope.guest.table_elements,
+            max_instances: envelope.guest.max_instances,
+            artifact_access_reads: envelope.guest.artifact_access_reads,
+            artifact_access_bytes: envelope.guest.artifact_access_bytes,
+        },
+        manifest: ValidatedManifestInput {
+            component_id: envelope.manifest.component_id,
+            world: envelope.manifest.world,
+            target: envelope.manifest.target,
+            source_digest: envelope.manifest.source_digest,
+            state_contract_digest: envelope.manifest.state_contract_digest,
+            required_verifier: envelope.manifest.required_verifier,
+            privacy_classes: envelope.manifest.privacy_classes,
+            state_class: envelope.manifest.state_class,
+            migration_contract: envelope.manifest.migration_contract,
+            privacy_policy: envelope.manifest.privacy_policy,
+            comparator: envelope.manifest.comparator,
+            rollback_generation: envelope.manifest.rollback_generation,
+        },
+        work: ValidatedWorkInput {
+            owner: envelope.work.owner,
+            work_unit: envelope.work.work_unit,
+            work_scope: envelope.work.work_scope,
+            task_ref: envelope.work.task_ref,
+            lease_id: envelope.work.lease_id,
+            lease_scope_ref: envelope.work.lease_scope_ref,
+            lease_state: envelope.work.lease_state,
+            generation_state: envelope.work.generation_state,
+            authority_revision: envelope.work.authority_revision,
+            lifecycle_revision: envelope.work.lifecycle_revision,
+            verification_revision: envelope.work.verification_revision,
+            deterministic_seed: envelope.work.deterministic_seed,
+            contour: envelope.work.contour,
+            generation_health: envelope.work.generation_health,
+        },
+        assurance: ValidatedAssuranceInput {
+            source_ref: envelope.assurance.source_ref,
+            provenance_ref: envelope.assurance.provenance_ref,
+            integrity: envelope.assurance.integrity,
+            freshness: envelope.assurance.freshness,
+            competence: envelope.assurance.competence,
+            independence: envelope.assurance.independence,
+            privacy_class: envelope.assurance.privacy_class,
+            instruction_taint: envelope.assurance.instruction_taint,
+            epistemic_use: envelope.assurance.epistemic_use,
+            effect_ceilings: envelope.assurance.effect_ceilings,
+            required_verifier: envelope.assurance.required_verifier,
+            quarantine: envelope.assurance.quarantine,
+        },
+        promotion: ValidatedPromotionInput {
+            corpus_digest: envelope.promotion.corpus_digest,
+            expected_result_digest: envelope.promotion.expected_result_digest,
+            expected_effect_digest: envelope.promotion.expected_effect_digest,
+            expected_state_delta_digest: envelope.promotion.expected_state_delta_digest,
+        },
+        snapshot: ValidatedSnapshotInput {
+            service: envelope.snapshot.service,
+            protocol: envelope.snapshot.protocol,
+            generation: envelope.snapshot.generation,
+            authority_epoch_json: snapshot_epoch_json,
+            artifact_digest: envelope.snapshot.artifact_digest,
+            protected_snapshot_digest: envelope.snapshot.protected_snapshot_digest,
+            principal: envelope.snapshot.principal,
+        },
+        artifact_bytes: Vec::new(),
+        input_bytes: Vec::new(),
+    })
+}
+
+/// Reads and validates one staged dispatch material set from the install
+/// directory: the envelope file parses and binds, then the colocated
+/// guest artifact/input files read bounded and re-hash against the bound
+/// digests. A missing envelope is `Ok(None)` — the caller keeps its
+/// fail-closed path; anything present but invalid fails closed.
+///
+/// # Errors
+///
+/// Returns [`MaterialError`] when any staged file is oversized,
+/// unreadable, malformed, or fails shape and byte binding.
+pub fn read_dispatch_material_from(
+    install_dir: &std::path::Path,
+) -> Result<Option<ValidatedDispatchMaterial>, MaterialError> {
+    let material_path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
+    let envelope_bytes = match read_staged_bytes(&material_path) {
+        Err(MaterialError::Missing) => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(bytes) => bytes,
+    };
+    let mut input = parse_envelope(&envelope_bytes)?;
+    input.artifact_bytes =
+        read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))?;
+    input.input_bytes = read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME))?;
+    bind_dispatch_material(input).map(Some)
+}
+
+/// Reads staged dispatch material from the executable directory
+/// (`current_exe`, never argv/stdin/env). `None` when no material was
+/// delivered or the loader path is unavailable.
+///
+/// # Errors
+///
+/// Returns [`MaterialError`] when staged files are present but invalid.
+pub fn read_dispatch_material() -> Result<Option<ValidatedDispatchMaterial>, MaterialError> {
+    let Some(path) = admitted_material_path() else {
+        return Ok(None);
+    };
+    let Some(directory) = path.parent() else {
+        return Ok(None);
+    };
+    read_dispatch_material_from(directory)
 }
 
 /// Binds one typed material input into validated dispatch material.
@@ -1121,5 +1449,196 @@ mod tests {
             .expect("oversize fixture writable");
         assert_eq!(read_staged_bytes(&path), Err(MaterialError::TooLarge));
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn test_envelope_json(input: &DispatchMaterialInput) -> Vec<u8> {
+        let epoch: serde_json::Value =
+            serde_json::from_str(&input.authority_epoch_json).expect("epoch parses");
+        serde_json::to_vec(&serde_json::json!({
+            "wire_id": WASM_DISPATCH_MATERIAL_WIRE_ID,
+            "wire_version": WASM_DISPATCH_MATERIAL_WIRE_VERSION,
+            "claim_id": input.claim_id,
+            "operation_id": input.operation_id,
+            "generation": input.generation,
+            "authority_epoch": epoch,
+            "launch_nonce": input.launch_nonce,
+            "admitted_at_unix_ms": input.admitted_at_unix_ms,
+            "grant": {
+                "grant_digest": input.grant_digest,
+                "authority_epoch": epoch,
+                "fence_generation": input.grant_fence_generation,
+                "fence_nonce": input.grant_fence_nonce,
+                "idempotency_key": input.grant_idempotency_key,
+                "expires_at": input.grant_expires_at,
+                "host_artifact_digest": input.host_artifact_digest,
+            },
+            "guest": {
+                "artifact_digest": input.ceilings.artifact_digest,
+                "input_digest": input.ceilings.input_digest,
+                "max_output_bytes": input.ceilings.max_output_bytes,
+                "max_fuel": input.ceilings.max_fuel,
+                "max_memory_bytes": input.ceilings.max_memory_bytes,
+                "wall_deadline_ms": input.ceilings.wall_deadline_ms,
+                "epoch_deadline_ticks": input.ceilings.epoch_deadline_ticks,
+                "table_elements": input.ceilings.table_elements,
+                "max_instances": input.ceilings.max_instances,
+                "artifact_access_reads": input.ceilings.artifact_access_reads,
+                "artifact_access_bytes": input.ceilings.artifact_access_bytes,
+                "component_id": input.ceilings.component_id,
+            },
+            "profile": input.profile,
+            "prior_conformance_artifact": input.prior_conformance_artifact,
+            "manifest": {
+                "component_id": input.manifest.component_id,
+                "world": input.manifest.world,
+                "target": input.manifest.target,
+                "source_digest": input.manifest.source_digest,
+                "state_contract_digest": input.manifest.state_contract_digest,
+                "required_verifier": input.manifest.required_verifier,
+                "privacy_classes": input.manifest.privacy_classes,
+                "allowed_imports": [],
+                "allowed_exports": ["run"],
+                "capability_grants": [],
+                "state_class": input.manifest.state_class,
+                "migration_contract": input.manifest.migration_contract,
+                "privacy_policy": input.manifest.privacy_policy,
+                "comparator": input.manifest.comparator,
+                "rollback_generation": input.manifest.rollback_generation,
+            },
+            "work": {
+                "owner": input.work.owner,
+                "work_unit": input.work.work_unit,
+                "work_scope": input.work.work_scope,
+                "task_ref": input.work.task_ref,
+                "lease_id": input.work.lease_id,
+                "lease_scope_ref": input.work.lease_scope_ref,
+                "lease_state": input.work.lease_state,
+                "generation_state": input.work.generation_state,
+                "authority_revision": input.work.authority_revision,
+                "lifecycle_revision": input.work.lifecycle_revision,
+                "verification_revision": input.work.verification_revision,
+                "deterministic_seed": input.work.deterministic_seed,
+                "contour": input.work.contour,
+                "generation_health": input.work.generation_health,
+            },
+            "assurance": {
+                "source_ref": input.assurance.source_ref,
+                "provenance_ref": input.assurance.provenance_ref,
+                "integrity": input.assurance.integrity,
+                "freshness": input.assurance.freshness,
+                "competence": input.assurance.competence,
+                "independence": input.assurance.independence,
+                "privacy_class": input.assurance.privacy_class,
+                "instruction_taint": input.assurance.instruction_taint,
+                "epistemic_use": input.assurance.epistemic_use,
+                "effect_ceilings": input.assurance.effect_ceilings,
+                "required_verifier": input.assurance.required_verifier,
+                "quarantine": input.assurance.quarantine,
+            },
+            "promotion": {
+                "corpus_digest": input.promotion.corpus_digest,
+                "expected_result_digest": input.promotion.expected_result_digest,
+                "expected_effect_digest": input.promotion.expected_effect_digest,
+                "expected_state_delta_digest": input.promotion.expected_state_delta_digest,
+            },
+            "snapshot": {
+                "service": input.snapshot.service,
+                "protocol": input.snapshot.protocol,
+                "generation": input.snapshot.generation,
+                "authority_epoch": epoch,
+                "artifact_digest": input.snapshot.artifact_digest,
+                "protected_snapshot_digest": input.snapshot.protected_snapshot_digest,
+                "principal": input.snapshot.principal,
+            },
+        }))
+        .expect("envelope serializes")
+    }
+
+    fn stage_envelope(name: &str, input: &DispatchMaterialInput) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&dir).expect("stage dir writable");
+        std::fs::write(
+            dir.join(WASM_HOST_MATERIAL_FILE_NAME),
+            test_envelope_json(input),
+        )
+        .expect("envelope writable");
+        std::fs::write(
+            dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME),
+            &input.artifact_bytes,
+        )
+        .expect("artifact writable");
+        std::fs::write(dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME), &input.input_bytes)
+            .expect("input writable");
+        dir
+    }
+
+    /// Staged envelope end-to-end: the publisher-shaped JSON parses,
+    /// binds, and re-hashes the colocated bytes; absence stays `None`.
+    #[test]
+    fn staged_envelope_parses_and_binds() {
+        let input = test_input();
+        let dir = stage_envelope("eliot-2377-envelope-ok", &input);
+        let material = read_dispatch_material_from(&dir)
+            .expect("envelope reads")
+            .expect("material present");
+        assert_eq!(material.claim_id, "claim-material-001");
+        assert_eq!(material.profile, Profile::D2Operational);
+        assert_eq!(
+            material.authority_epoch_json, input.authority_epoch_json,
+            "epoch JSON survives the envelope round trip verbatim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let absent = std::env::temp_dir().join("eliot-2377-envelope-absent");
+        std::fs::create_dir_all(&absent).expect("absent dir writable");
+        assert_eq!(read_dispatch_material_from(&absent), Ok(None));
+        let _ = std::fs::remove_dir_all(&absent);
+    }
+
+    /// Envelope refusals are typed and fail closed: malformed JSON, a
+    /// foreign wire identity, an unknown field, and epoch disagreement
+    /// never bind.
+    #[test]
+    fn staged_envelope_refusals_fail_closed() {
+        let input = test_input();
+        // Malformed JSON.
+        assert_eq!(
+            parse_envelope(b"{not json").map(|_| ()),
+            Err(MaterialError::Malformed)
+        );
+        // Foreign wire identity.
+        let mut foreign = test_envelope_json(&input);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&foreign).expect("envelope parses");
+        value["wire_id"] = serde_json::Value::String("foreign.envelope".to_owned());
+        foreign = serde_json::to_vec(&value).expect("foreign serializes");
+        assert_eq!(
+            parse_envelope(&foreign).map(|_| ()),
+            Err(MaterialError::Malformed)
+        );
+        // Unknown field denied by the closed envelope.
+        let mut unknown = test_envelope_json(&input);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&unknown).expect("envelope parses");
+        value["second_admission"] = serde_json::Value::Bool(true);
+        unknown = serde_json::to_vec(&value).expect("unknown serializes");
+        assert_eq!(
+            parse_envelope(&unknown).map(|_| ()),
+            Err(MaterialError::Malformed)
+        );
+        // Epoch disagreement between envelope and grant.
+        let mut drifted = test_envelope_json(&input);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&drifted).expect("envelope parses");
+        value["grant"]["authority_epoch"] = serde_json::json!({
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440001",
+            "sequence": 3
+        });
+        drifted = serde_json::to_vec(&value).expect("drifted serializes");
+        assert_eq!(
+            parse_envelope(&drifted).map(|_| ()),
+            Err(MaterialError::InvalidRecord {
+                field: "epoch-agreement"
+            })
+        );
     }
 }

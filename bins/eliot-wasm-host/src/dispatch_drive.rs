@@ -34,10 +34,13 @@
 
 use std::path::Path;
 
+use eliot_runtime_contracts::{HealthDimension, HealthVector};
+use eliot_security_contracts::PrivacyClass;
 use eliot_wasm_runtime::{
-    ArtifactAccessLimits, CancellationPolicy, EpochPolicy, ExecutionContour,
-    InvocationDisposition, InvocationLimits, InvocationRequest, InvocationResult, RuntimeError,
-    Sha256Digest, TrapClass, VerificationVerdict,
+    ArtifactAccessLimits, CancellationPolicy, CapabilityId, EpochPolicy, ExecutionContour,
+    InvocationDisposition, InvocationId, InvocationLimits, InvocationRequest, InvocationResult,
+    OwnerId, Revision, RuntimeError, Sha256Digest, TrapClass, VerificationVerdict, WasmRuntime,
+    WorkScopeRef, WorkUnitId,
 };
 use eliot_wasm_runtime::lifecycle::InFlightDisposition;
 
@@ -288,7 +291,6 @@ fn check_contour_prior(
 /// guest bytes, and the seed is owner-set. Cancellation is never
 /// requested by the drive; it arrives through the cancel path.
 fn assemble_request(material: &ValidatedDispatchMaterial) -> Result<InvocationRequest, DriveError> {
-    use eliot_wasm_runtime::{CapabilityId, InvocationId, WorkScopeRef, WorkUnitId};
     let invoked = |field: &'static str| DriveError::Admission { field };
     let contour = match material.work.contour.as_str() {
         "SHADOW" => ExecutionContour::Shadow,
@@ -426,14 +428,19 @@ pub fn guest_exec_argv(
     ]
 }
 
+/// Pre-seating admission: the assembled invocation request plus the
+/// admitted generation the authority/permit join consumes.
+pub type DriveAdmission = (
+    InvocationRequest,
+    crate::contour::AdmittedGeneration,
+);
+
 /// Runs the pre-seating drive pipeline over validated material: invocation
 /// assembly, the contour-prior progression gate, and contour admission
 /// over real bytes. Returns the assembled request plus the admitted
 /// generation the authority/permit join consumes. Pure over admitted
 /// values — no authority, permit, filesystem, or spawn.
-pub fn drive_admission(
-    material: &ValidatedDispatchMaterial,
-) -> Result<(InvocationRequest, crate::contour::AdmittedGeneration), DriveError> {
+pub fn drive_admission(material: &ValidatedDispatchMaterial) -> Result<DriveAdmission, DriveError> {
     let request = assemble_request(material)?;
     // Progression gate: Shadow operations must prove a prior
     // conformance-verified run for the exact current artifact (A13.3
@@ -454,6 +461,258 @@ pub fn drive_admission(
     // denied before any authority, permit, or child exists.
     let (_, admitted) = contour_admission(material, &request)?;
     Ok((request, admitted))
+}
+
+/// Governor-facing owner records assembled from validated material: the
+/// exact typed inputs the resolution ports and the authority join consume
+/// (owner/scope/work identities, limit envelope, privacy grants, verifier,
+/// revisions, determinism seed, promotion oracle, generation health, the
+/// opaque epoch JSON, and the grant window). Strictly mechanical mapping
+/// over admitted values — unknown spellings fail closed; no policy is
+/// decided here, and no resolution is minted: the Governor and authority
+/// owners still produce their own `GovernorResolution` /
+/// `AuthorityResolution` from the seated request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerRecords {
+    /// Admitted owner identity.
+    pub owner: OwnerId,
+    /// Admitted work-unit identity.
+    pub work_unit: WorkUnitId,
+    /// Admitted work-scope identity.
+    pub work_scope: WorkScopeRef,
+    /// Pinned component identity.
+    pub component: CapabilityId,
+    /// Requested contour marker.
+    pub contour: ExecutionContour,
+    /// Owner-set determinism seed.
+    pub deterministic_seed: u64,
+    /// Per-invocation limit envelope.
+    pub limits: InvocationLimits,
+    /// Admitted privacy grants.
+    pub privacy: Vec<PrivacyClass>,
+    /// Owner-recorded required verifier.
+    pub required_verifier: String,
+    /// Authority revision bound at admission.
+    pub authority_revision: Revision,
+    /// Lifecycle revision bound at admission.
+    pub lifecycle_revision: Revision,
+    /// Verification revision bound at admission.
+    pub verification_revision: Revision,
+    /// Owner-attested generation health vector.
+    pub generation_health: HealthVector,
+    /// Promotion corpus digest.
+    pub corpus_digest: Sha256Digest,
+    /// Oracle result digest.
+    pub expected_result_digest: Sha256Digest,
+    /// Oracle effect digest.
+    pub expected_effect_digest: Sha256Digest,
+    /// Oracle state-delta digest.
+    pub expected_state_delta_digest: Sha256Digest,
+    /// Canonical live-authority-epoch JSON (derivation input, never
+    /// interpreted here).
+    pub authority_epoch_json: String,
+    /// Owner-issued grant digest.
+    pub grant_digest: Sha256Digest,
+    /// Grant fence generation.
+    pub grant_fence_generation: u64,
+    /// Grant fence nonce.
+    pub grant_fence_nonce: String,
+    /// Grant lease identity.
+    pub grant_idempotency_key: String,
+    /// Grant window: durable admission time opens, expiry closes.
+    pub grant_window: (u64, u64),
+}
+
+/// Maps one owner spelling to its health dimension; unknown spellings fail
+/// closed so owner and child can never disagree silently.
+fn map_health_dimension(value: &str) -> Result<HealthDimension, DriveError> {
+    match value {
+        "UNKNOWN" => Ok(HealthDimension::Unknown),
+        "HEALTHY" => Ok(HealthDimension::Healthy),
+        "DEGRADED" => Ok(HealthDimension::Degraded),
+        "FAILED" => Ok(HealthDimension::Failed),
+        _ => Err(DriveError::Admission {
+            field: "health-dimension",
+        }),
+    }
+}
+
+/// Assembles the owner records for the Governor factory and the authority
+/// join: snapshot-bound identities, generation, lease selection, owner,
+/// scope, assurance-derived privacy, limits, revisions, and promotion
+/// oracle. Every enum spelling maps strictly; unknown spellings fail
+/// closed.
+///
+/// # Errors
+///
+/// Returns [`DriveError::Admission`] when any identity, spelling,
+/// revision, or health vector fails shape checks.
+pub fn assemble_owner_records(material: &ValidatedDispatchMaterial) -> Result<OwnerRecords, DriveError> {
+    let owned = |field: &'static str| DriveError::Admission { field };
+    let contour = match material.work.contour.as_str() {
+        "SHADOW" => ExecutionContour::Shadow,
+        "CONFORMANCE" => ExecutionContour::Conformance,
+        _ => return Err(owned("contour")),
+    };
+    let privacy = material
+        .manifest
+        .privacy_classes
+        .iter()
+        .map(|class| match class.as_str() {
+            "Public" => Ok(PrivacyClass::Public),
+            "Internal" => Ok(PrivacyClass::Internal),
+            "Private" => Ok(PrivacyClass::Private),
+            "Secret" => Ok(PrivacyClass::Secret),
+            "Licensed" => Ok(PrivacyClass::Licensed),
+            _ => Err(owned("privacy-class")),
+        })
+        .collect::<Result<Vec<PrivacyClass>, DriveError>>()?;
+    let health = material
+        .work
+        .generation_health
+        .iter()
+        .map(|dimension| map_health_dimension(dimension))
+        .collect::<Result<Vec<HealthDimension>, DriveError>>()?;
+    let [liveness, readiness, freshness, compatibility, integrity, capacity] =
+        health.try_into().map_err(|_| owned("health-vector"))?;
+    Ok(OwnerRecords {
+        owner: OwnerId::new(material.work.owner.clone()).map_err(|_| owned("owner"))?,
+        work_unit: WorkUnitId::new(material.work.work_unit.clone())
+            .map_err(|_| owned("work-unit"))?,
+        work_scope: WorkScopeRef::new(material.work.work_scope.clone())
+            .map_err(|_| owned("work-scope"))?,
+        component: CapabilityId::new(material.ceilings.component_id.clone())
+            .map_err(|_| owned("component-id"))?,
+        contour,
+        deterministic_seed: material.work.deterministic_seed,
+        limits: assemble_limits(material)?,
+        privacy,
+        required_verifier: material.manifest.required_verifier.clone(),
+        authority_revision: Revision::new(material.work.authority_revision)
+            .map_err(|_| owned("work-revisions"))?,
+        lifecycle_revision: Revision::new(material.work.lifecycle_revision)
+            .map_err(|_| owned("work-revisions"))?,
+        verification_revision: Revision::new(material.work.verification_revision)
+            .map_err(|_| owned("work-revisions"))?,
+        generation_health: HealthVector {
+            liveness,
+            readiness,
+            freshness,
+            compatibility,
+            integrity,
+            capacity,
+        },
+        corpus_digest: material.promotion.corpus_digest.clone(),
+        expected_result_digest: material.promotion.expected_result_digest.clone(),
+        expected_effect_digest: material.promotion.expected_effect_digest.clone(),
+        expected_state_delta_digest: material.promotion.expected_state_delta_digest.clone(),
+        authority_epoch_json: material.authority_epoch_json.clone(),
+        grant_digest: material.grant.grant_digest.clone(),
+        grant_fence_generation: material.grant.fence_generation,
+        grant_fence_nonce: material.grant.fence_nonce.clone(),
+        grant_idempotency_key: material.grant.idempotency_key.clone(),
+        grant_window: (
+            material.grant.admitted_at_unix_ms,
+            material.grant.expires_at,
+        ),
+    })
+}
+
+/// Maps a classified invocation result to the canonical drive response:
+/// success carries the real guest output with recomputed digests and
+/// measured metering; differential and promotion denials surface as
+/// admission taxonomy (owner-data mismatch, never fabricated output);
+/// every other verdict fails closed with unknown outcome preserved.
+/// Lifecycle and seated verdicts evaluate over the same retained result.
+///
+/// # Errors
+///
+/// Returns [`DriveError`] when the result is not a measured success.
+fn map_invocation_result(
+    result: &InvocationResult,
+    material: &ValidatedDispatchMaterial,
+) -> Result<DispatchDriveResponse, DriveError> {
+    match (&result.receipt.disposition, &result.receipt.error) {
+        (InvocationDisposition::Succeeded, _) => {}
+        (InvocationDisposition::Rejected, Some(RuntimeError::DifferentialMismatch)) => {
+            return Err(DriveError::Admission {
+                field: "differential",
+            });
+        }
+        (InvocationDisposition::Rejected, Some(RuntimeError::PromotionDenied)) => {
+            return Err(DriveError::Admission { field: "promotion" });
+        }
+        (InvocationDisposition::Rejected, _) => {
+            return Err(DriveError::Execution { stage: "rejected" });
+        }
+        (InvocationDisposition::Unavailable, _) => {
+            return Err(DriveError::Execution {
+                stage: "unavailable",
+            });
+        }
+        (InvocationDisposition::Unknown, _) => {
+            return Err(DriveError::Execution { stage: "unknown" });
+        }
+    }
+    let output = result
+        .output
+        .clone()
+        .ok_or(DriveError::Execution { stage: "response" })?;
+    let usage = result
+        .receipt
+        .usage
+        .clone()
+        .ok_or(DriveError::Execution { stage: "response" })?;
+    let peak = usage
+        .peak_memory_bytes
+        .ok_or(DriveError::Execution { stage: "metering" })?;
+    let tables = usage
+        .table_elements
+        .ok_or(DriveError::Execution { stage: "metering" })?;
+    let ticks = usage
+        .epoch_ticks
+        .ok_or(DriveError::Execution { stage: "metering" })?;
+    Ok(DispatchDriveResponse {
+        operation_id: material.operation_id.clone(),
+        component_id: material.ceilings.component_id.clone(),
+        artifact_digest: material.ceilings.artifact_digest.as_str().to_owned(),
+        input_digest: material.ceilings.input_digest.as_str().to_owned(),
+        host_artifact_digest: material.host_artifact_digest.as_str().to_owned(),
+        output_digest: Sha256Digest::of_bytes(&output).as_str().to_owned(),
+        output,
+        fuel_consumed: usage.fuel_consumed,
+        peak_memory_bytes: peak,
+        table_elements: u64::from(tables),
+        epoch_ticks: ticks,
+        verdicts: evaluate_lifecycle_verdicts(result),
+        seated: evaluate_seated_verdicts(result),
+    })
+}
+
+/// Learning-ticket screening hook: invoked pre-seating over the exact
+/// admitted input bytes. Screening stays single-owned by the learning
+/// lane — this drive never screens tickets itself and invents no ticket
+/// assertions. The integration owner wires this hook to that lane's exact
+/// screen call
+/// (`eliot_context_compiler_wasm::guest_gate::check_guest_tickets` over
+/// the parsed `AdmissionInput`), mapping refusal to
+/// `DriveError::Admission { field: "learning-screen" }`. `None` keeps the
+/// opaque-bytes path for non-learning flows.
+///
+/// # Errors
+///
+/// Returns the hook's refusal unchanged when screening denies.
+pub fn drive_dispatch(
+    material: &ValidatedDispatchMaterial,
+    wasm_runtime: &mut WasmRuntime,
+    screen: Option<&dyn Fn(&[u8]) -> Result<(), DriveError>>,
+) -> Result<DispatchDriveResponse, DriveError> {
+    let (request, _admitted) = drive_admission(material)?;
+    if let Some(screen) = screen {
+        screen(&material.input_bytes)?;
+    }
+    let result = wasm_runtime.execute(request);
+    map_invocation_result(&result, material)
 }
 
 #[cfg(test)]
@@ -687,6 +946,165 @@ mod tests {
         }
     }
 
+    /// Owner records assemble strictly: identities, contour, limits,
+    /// privacy grants, revisions, health vector, oracle digests, epoch
+    /// JSON, and the grant window bind; unknown spellings refuse.
+    #[test]
+    fn owner_records_assemble_against_live_types() {
+        use eliot_runtime_contracts::HealthDimension;
+        use eliot_security_contracts::PrivacyClass;
+        let material = test_material();
+        let records = assemble_owner_records(&material).expect("records assemble");
+        assert_eq!(records.owner.as_str(), "owner-drive");
+        assert_eq!(records.work_unit.as_str(), "work-drive");
+        assert_eq!(records.work_scope.as_str(), "scope-drive");
+        assert_eq!(records.component.as_str(), "component-drive");
+        assert_eq!(records.contour, ExecutionContour::Conformance);
+        assert_eq!(records.deterministic_seed, 7);
+        assert_eq!(records.limits.max_fuel, 100_000);
+        assert_eq!(records.privacy, vec![PrivacyClass::Internal]);
+        assert_eq!(records.required_verifier, "verifier:a12");
+        assert_eq!(records.authority_revision.get(), 1);
+        assert!(records.generation_health.is_fully_healthy());
+        assert_eq!(
+            records.corpus_digest.as_str(),
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(records.grant_window, (4_000_000_000_000, 4_000_000_060_000));
+        assert_eq!(records.grant_fence_generation, 7);
+        // Unknown privacy spelling refuses.
+        let mut foreign = test_material();
+        foreign.manifest.privacy_classes = vec!["TopSecret".to_owned()];
+        assert_eq!(
+            assemble_owner_records(&foreign).map(|_| ()),
+            Err(DriveError::Admission {
+                field: "privacy-class"
+            })
+        );
+        // Unknown contour spelling refuses.
+        let mut contour = test_material();
+        contour.work.contour = "ACTIVE".to_owned();
+        assert_eq!(
+            assemble_owner_records(&contour).map(|_| ()),
+            Err(DriveError::Admission { field: "contour" })
+        );
+        let _ = HealthDimension::Unknown;
+    }
+
+    /// Full drive through the live runtime owner with no ports bound:
+    /// the typed plan gap surfaces end-to-end and the drive fails closed
+    /// without fabricating output.
+    #[test]
+    fn drive_dispatch_fails_closed_on_plan_gap() {
+        use eliot_wasm_runtime::WasmRuntime;
+        let material = test_material();
+        let mut runtime = WasmRuntime::new(None);
+        assert_eq!(
+            drive_dispatch(&material, &mut runtime, None).map(|_| ()),
+            Err(DriveError::Execution {
+                stage: "unavailable"
+            })
+        );
+    }
+
+    /// Screening hook: a refusing hook denies pre-seating with its exact
+    /// refusal, and the runtime is never contacted.
+    #[test]
+    fn drive_dispatch_applies_screen_hook() {
+        use eliot_wasm_runtime::WasmRuntime;
+        use std::cell::Cell;
+        let material = test_material();
+        let mut runtime = WasmRuntime::new(None);
+        let seen = Cell::new(0_usize);
+        let screen = |bytes: &[u8]| -> Result<(), DriveError> {
+            seen.set(seen.get() + 1);
+            assert_eq!(bytes, b"drive-input-bytes");
+            Err(DriveError::Admission {
+                field: "learning-screen",
+            })
+        };
+        assert_eq!(
+            drive_dispatch(&material, &mut runtime, Some(&screen)).map(|_| ()),
+            Err(DriveError::Admission {
+                field: "learning-screen"
+            })
+        );
+        assert_eq!(seen.get(), 1);
+    }
+
+    /// Result mapping: a measured success projects the canonical response
+    /// with recomputed digests, metering, and both verdict sets.
+    #[test]
+    fn result_mapping_projects_measured_success() {
+        use eliot_wasm_runtime::{
+            CancellationPolicy, EngineUsage, EpochPolicy, InvocationReceipt,
+        };
+        use VerificationVerdict::Verified;
+        let material = test_material();
+        let request = assemble_request(&material).expect("request assembles");
+        let result = InvocationResult {
+            receipt: InvocationReceipt {
+                invocation_id: request.invocation_id.clone(),
+                request_digest: request.request_digest().clone(),
+                disposition: InvocationDisposition::Succeeded,
+                error: None,
+                output_digest: Some(Sha256Digest::of_bytes(b"drive-output")),
+                effect_digest: None,
+                state_delta_digest: Some(Sha256Digest::of_bytes(b"")),
+                engine_binding: None,
+                usage: Some(EngineUsage {
+                    attempted_output_bytes: 12,
+                    output_bytes: 12,
+                    host_calls: 0,
+                    fuel_consumed: 678,
+                    peak_memory_bytes: Some(12_340),
+                    table_elements: Some(2),
+                    instances: 1,
+                    stack_bytes: None,
+                    enforced_stack_limit_bytes: Some(8_192),
+                    elapsed_ms: 45,
+                    effective_epoch_policy: EpochPolicy {
+                        deadline_ticks: 100,
+                        cancellation: CancellationPolicy::EpochAndFuel,
+                    },
+                    epoch_ticks: Some(45),
+                    artifact_reads: 1,
+                    artifact_bytes: 20,
+                    accessed_artifact_digests: vec![Sha256Digest::of_bytes(
+                        b"drive-artifact-bytes",
+                    )],
+                }),
+                reconciliation_required: false,
+            },
+            output: Some(b"drive-output".to_vec()),
+            proposed_effects: Vec::new(),
+            observed_state_delta: Some(Vec::new()),
+        };
+        let response = map_invocation_result(&result, &material).expect("response maps");
+        assert_eq!(response.operation_id, "operation-drive-001");
+        assert_eq!(response.component_id, "component-drive");
+        assert_eq!(response.output, b"drive-output");
+        assert_eq!(
+            response.output_digest,
+            Sha256Digest::of_bytes(b"drive-output").as_str()
+        );
+        assert_eq!(response.fuel_consumed, 678);
+        assert_eq!(response.peak_memory_bytes, 12_340);
+        assert_eq!(response.table_elements, 2);
+        assert_eq!(response.epoch_ticks, 45);
+        assert_eq!(response.verdicts.shadow, Verified);
+        assert_eq!(response.seated.drain, Some(InFlightDisposition::DrainRead));
+        // Differential denial surfaces as admission taxonomy.
+        let mut denied = result.clone();
+        denied.receipt.disposition = InvocationDisposition::Rejected;
+        denied.receipt.error = Some(RuntimeError::DifferentialMismatch);
+        assert_eq!(
+            map_invocation_result(&denied, &material).map(|_| ()),
+            Err(DriveError::Admission {
+                field: "differential"
+            })
+        );
+    }
     /// Verdict evaluation: an effect-free succeeded shadow run closes the
     /// shadow verdict and drains reads; traps, cancels, and unknown
     /// outcomes classify without minting progression.
