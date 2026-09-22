@@ -18,6 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
+use eliot_installation::{InstallationProfile, InstallationRoots};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -687,4 +688,41 @@ pub fn cleanup_preparations<J: PreparationJournal>(
         }
     }
     Ok(report)
+}
+
+/// Resolves the source installation root from owner-issued installation
+/// roots: validates the root set for the Host profile, then returns the
+/// canonical durable-data root that preparation must treat as the active
+/// source. The source is observed read-only for comparison and never
+/// modified.
+///
+/// Fail-closed with static reasons: a root-set violation yields
+/// [`PreparationError::InvalidRequest`], a non-directory yields
+/// [`PreparationError::ArbitraryPath`], and an unresolvable root yields
+/// [`PreparationError::FilesystemEffect`]. Owner error internals are never
+/// echoed. Staging admission, generation/lease authority, and journal
+/// binding stay with [`prepare_isolated_destination`] and HostComposition
+/// delegation.
+pub fn resolve_source_root(
+    roots: &InstallationRoots,
+    profile: InstallationProfile,
+) -> Result<PathBuf, PreparationError> {
+    roots
+        .validate(profile)
+        .map_err(|_| PreparationError::InvalidRequest {
+            field: "source_roots",
+            reason: "owner installation roots violate the Host profile".to_owned(),
+        })?;
+    let canonical = std::fs::canonicalize(&roots.durable_data).map_err(|error| {
+        PreparationError::FilesystemEffect {
+            path: roots.durable_data.clone(),
+            reason: format!("cannot canonicalize owner durable-data root: {error}"),
+        }
+    })?;
+    if !canonical.is_dir() {
+        return Err(PreparationError::ArbitraryPath {
+            reason: "owner durable-data root is not a directory".to_owned(),
+        });
+    }
+    Ok(canonical)
 }

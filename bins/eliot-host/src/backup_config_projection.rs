@@ -12,6 +12,7 @@
 //! grant, or current-state assertion.
 
 use eliot_contracts::StateFence;
+use eliot_installation::ApprovedGeneration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -225,6 +226,143 @@ pub fn project_backup_config(
         owner_lease_ref: request.owner_lease_ref.clone(),
         generation: request.generation,
         manifest_digest: request.manifest_digest.clone(),
+        build_digests: request.build_digests.clone(),
+        purge_ledger_revision: request.purge_ledger_revision,
+        state_fence: fence.clone(),
+        projection_digest,
+    })
+}
+
+/// Owner-verified build/config facts extracted from one validated
+/// [`ApprovedGeneration`] installation record.
+///
+/// Every digest below is owner-issued: the configuration digest is the
+/// candidate configuration digest and the build digests are the eight
+/// approved artifact digests in manifest order, all shape-enforced by
+/// [`ApprovedGeneration::validate`] before extraction. The generation handle
+/// is the owner-issued generation identity text, never a caller-chosen
+/// number: numeric generation, lease, purge, and target build/profile
+/// evidence stays caller-presented until #954 control contracts and
+/// HostComposition delegation land, and is documented as such at
+/// [`project_backup_config_owner_bound`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovedBuildBinding {
+    /// Owner-issued generation identity handle text.
+    pub generation_handle: String,
+    /// Owner-issued candidate configuration digest (lowercase hex 64).
+    pub config_digest: String,
+    /// Owner-issued approved artifact digests in manifest order.
+    pub artifact_digests: Vec<String>,
+}
+
+/// Binds presented evidence to the exact active approved generation.
+///
+/// Fails closed with [`ProjectionError::StaleEvidence`] naming
+/// `approved_generation` when the record is not active or its owner
+/// validation rejects it. Owner error internals are never echoed: a record
+/// that fails owner validation cannot be treated as current authority.
+pub fn bind_approved_build(
+    approved: &ApprovedGeneration,
+) -> Result<ApprovedBuildBinding, ProjectionError> {
+    if !approved.active {
+        return Err(ProjectionError::StaleEvidence {
+            field: "approved_generation",
+        });
+    }
+    approved
+        .validate()
+        .map_err(|_| ProjectionError::StaleEvidence {
+            field: "approved_generation",
+        })?;
+    let manifest = &approved.manifest;
+    Ok(ApprovedBuildBinding {
+        generation_handle: manifest.generation.as_str().to_owned(),
+        config_digest: manifest.config_digest.as_str().to_owned(),
+        artifact_digests: vec![
+            manifest.kernel_artifact_digest.as_str().to_owned(),
+            manifest.store_bridge_artifact_digest.as_str().to_owned(),
+            manifest.canonical_store_artifact_digest.as_str().to_owned(),
+            manifest.host_artifact_digest.as_str().to_owned(),
+            manifest.doctor_artifact_digest.as_str().to_owned(),
+            manifest.testd_artifact_digest.as_str().to_owned(),
+            manifest.native_worker_artifact_digest.as_str().to_owned(),
+            manifest.wasm_host_artifact_digest.as_str().to_owned(),
+        ],
+    })
+}
+
+/// Projects backup configuration evidence against the owner-bound build
+/// (issue #958, cases 958/1-2, 958/4, 958/16 with owner binding).
+///
+/// Shapes and bounds are checked exactly as in [`project_backup_config`].
+/// The presented manifest digest must equal the owner-issued configuration
+/// digest and every presented build digest must be one of the owner-issued
+/// artifact digests; anything else fails with
+/// [`ProjectionError::StaleEvidence`] naming the field. The projection
+/// digest additionally binds the owner-issued generation handle, so a
+/// receipt can never migrate across generations.
+///
+/// Owner binding covers manifest and builds only. Installation identity,
+/// lease reference, numeric generation, purge-ledger revision, and target
+/// build/profile stay caller-presented: lease issuance and purge-ledger
+/// authority belong to #954 control contracts and HostComposition
+/// delegation, which are open. No secret-typed field exists here.
+pub fn project_backup_config_owner_bound(
+    request: &BackupConfigRequest,
+    binding: &ApprovedBuildBinding,
+    fence: &StateFence,
+) -> Result<BackupConfigProjection, ProjectionError> {
+    check_identity(&request.installation_id, "installation_id")?;
+    check_identity(&request.owner_lease_ref, "owner_lease_ref")?;
+    check_digest(&request.manifest_digest, "manifest_digest")?;
+    check_bounded_list(&request.build_digests, "build_digests")?;
+    for digest in &request.build_digests {
+        check_digest(digest, "build_digests[]")?;
+    }
+    if let Some(audit) = &request.audit {
+        check_digest(&audit.note_digest, "audit.note_digest")?;
+        check_bounded_list(&audit.observed_dispositions, "audit.observed_dispositions")?;
+        for disposition in &audit.observed_dispositions {
+            check_identity(disposition, "audit.observed_dispositions[]")?;
+        }
+    }
+    if request.manifest_digest != binding.config_digest {
+        return Err(ProjectionError::StaleEvidence {
+            field: "manifest_digest",
+        });
+    }
+    for digest in &request.build_digests {
+        if !binding
+            .artifact_digests
+            .iter()
+            .any(|artifact| artifact == digest)
+        {
+            return Err(ProjectionError::StaleEvidence {
+                field: "build_digests",
+            });
+        }
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"eliot.backup.config-projection.v1\0");
+    hasher.update(CONFIG_PROJECTION_VERSION.to_le_bytes());
+    hasher.update(request.installation_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(request.owner_lease_ref.as_bytes());
+    hasher.update([0]);
+    hasher.update(request.generation.to_le_bytes());
+    hasher.update(binding.generation_handle.as_bytes());
+    hasher.update(binding.config_digest.as_bytes());
+    for digest in &request.build_digests {
+        hasher.update(digest.as_bytes());
+    }
+    hasher.update(request.purge_ledger_revision.to_le_bytes());
+    let projection_digest = format!("{:x}", hasher.finalize());
+    Ok(BackupConfigProjection {
+        version: CONFIG_PROJECTION_VERSION,
+        installation_id: request.installation_id.clone(),
+        owner_lease_ref: request.owner_lease_ref.clone(),
+        generation: request.generation,
+        manifest_digest: binding.config_digest.clone(),
         build_digests: request.build_digests.clone(),
         purge_ledger_revision: request.purge_ledger_revision,
         state_fence: fence.clone(),
