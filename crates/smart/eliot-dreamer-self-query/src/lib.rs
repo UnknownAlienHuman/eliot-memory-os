@@ -1,26 +1,31 @@
-//! Bounded Dreamer self-query pose over the existing owner contract
-//! (#223, review repair).
+//! Bounded Dreamer self-query pose over existing owner contracts
+//! (#223, review repair, unit #3).
 //!
 //! [`pose_self_query`] accepts the existing
 //! `eliot_dreamer_contracts::self_query::SelfQueryInput` (A-03 owner,
 //! merged PR #1060), runs the owner's `validate()`, and freezes the owner's
-//! `input_digest()` into a [`SelfQueryPoseReceipt`]. That validate-then-
-//! digest prefix is exactly the shared entry of both A-08 brief projectors
-//! (`project_architecture_brief`, `project_implementation_brief`); this
-//! adapter performs no selection, authoring, or model work of its own.
+//! `input_digest()` into a [`SelfQueryPoseReceipt`]. [`pose_with_sources`]
+//! additionally cites an owner [`AcceptedSourceProjection`]: every source
+//! triple the input cites (embedded snapshot plus anchors) must resolve to
+//! a current projected ref, otherwise the pose fails closed as stale. That
+//! validate-then-digest prefix mirrors the shared entry of both A-08 brief
+//! projectors (`project_architecture_brief`, `project_implementation_brief`);
+//! this adapter performs no selection, authoring, or model work of its own.
 //!
 //! There are no parallel subject/request/candidate types here: the request
 //! surface, job/admission/attempt bindings, denominator, policy,
-//! preservation, and accepted-source snapshot stay with the A-03 owner, and
-//! brief projection stays with the A-08 owners. The accepted-source
-//! projection as a standalone owner contract stays `NOT_FROZEN` in
-//! `crates/smart/cognitive-rev12-contract-schema-freeze.toml` (CC-006):
-//! source material travels inside the owner's `ArchitectureSourceSnapshot`,
-//! never as invented local fields. This package is not a W9 unblock.
+//! preservation, source snapshot, anchors, and accepted-source projection
+//! stay with the A-03 owner, and brief projection stays with the A-08
+//! owners. Source material travels inside owner types; the opaque
+//! `source_bundle_handle` is not a typed citation and is never verified
+//! here. This package is not a W9 unblock.
 
 #![forbid(unsafe_code)]
 
-use eliot_dreamer_contracts::self_query::{SelfQueryContractError, SelfQueryInput};
+use eliot_contracts::ArtifactId;
+use eliot_dreamer_contracts::self_query::{
+    AcceptedSourceProjection, SelfQueryContractError, SelfQueryInput,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +68,87 @@ impl SelfQueryPoseReceipt {
     }
 }
 
+/// One cited source triple: handle plus the revision cursor and digest the
+/// input claims for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CitedSource {
+    /// Cited source handle.
+    pub handle: ArtifactId,
+    /// Cited revision cursor.
+    pub revision: String,
+    /// Cited content digest at the cursor.
+    pub digest: String,
+}
+
+impl CitedSource {
+    /// Validate the cited triple shape.
+    pub fn validate(&self) -> Result<(), SelfQueryContractError> {
+        if self.revision.trim().is_empty() {
+            return Err(SelfQueryContractError::Missing {
+                field: "cited.revision",
+            });
+        }
+        if self.revision.len() > 256 {
+            return Err(SelfQueryContractError::Bound {
+                field: "cited.revision",
+                maximum: 256,
+                actual: self.revision.len(),
+            });
+        }
+        if self.digest.len() != 64
+            || !self
+                .digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(SelfQueryContractError::InvalidDigest {
+                field: "cited.digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Extract the source triples an owner input cites: its embedded snapshot,
+/// when present, plus every anchor's source lineage.
+#[must_use]
+pub fn cited_sources(input: &SelfQueryInput) -> Vec<CitedSource> {
+    let mut cited = Vec::new();
+    if let Some(source) = &input.source {
+        cited.push(CitedSource {
+            handle: source.source_handle.clone(),
+            revision: source.revision.clone(),
+            digest: source.digest.clone(),
+        });
+    }
+    for anchor in &input.anchors {
+        cited.push(CitedSource {
+            handle: anchor.source_handle.clone(),
+            revision: anchor.revision.clone(),
+            digest: anchor.source_digest.clone(),
+        });
+    }
+    cited
+}
+
+/// Check cited triples against an accepted-source projection.
+///
+/// The projection itself is validated first; every triple must then match
+/// a projected ref exactly (handle, revision, digest), otherwise the
+/// citation is stale or uncited and the check fails closed.
+pub fn check_citations(
+    cited: &[CitedSource],
+    sources: &AcceptedSourceProjection,
+) -> Result<(), SelfQueryContractError> {
+    sources.validate()?;
+    for citation in cited {
+        citation.validate()?;
+        sources.check_cited(&citation.handle, &citation.revision, &citation.digest)?;
+    }
+    Ok(())
+}
+
 /// Pose a self-query over the existing owner input.
 ///
 /// Runs the owner's `validate()` (job class, bundle/job/receipt/grounded
@@ -77,4 +163,17 @@ pub fn pose_self_query(
         input_digest: input.input_digest()?,
         schema_version: input.schema_version,
     })
+}
+
+/// Pose a self-query with source citation.
+///
+/// Every source triple the input cites must resolve to a current projected
+/// ref first; only then does the owner pose run. Stale or uncited sources
+/// fail closed before any digest freezes.
+pub fn pose_with_sources(
+    input: &SelfQueryInput,
+    sources: &AcceptedSourceProjection,
+) -> Result<SelfQueryPoseReceipt, SelfQueryContractError> {
+    check_citations(&cited_sources(input), sources)?;
+    pose_self_query(input)
 }

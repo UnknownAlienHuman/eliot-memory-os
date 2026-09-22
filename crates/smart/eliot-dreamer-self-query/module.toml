@@ -14,22 +14,22 @@ hot_path = false
 lifecycle_owner = "smart.dreamer.self_query"
 loc_soft_ceiling = 10000
 loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
-product_objective = "A Dreamer self-query over the existing A-03 owner input freezes the owner digest the A-08 brief projectors consume, with no parallel request surface."
-causal_property = "bounded Dreamer self-query pose over the owner contract"
-old_failure_or_missing_capability = "Self-queries recompile context, rerun admission, or invent a parallel request type instead of using the existing SelfQueryInput owner contract (CC-006)."
-discriminator = "posing runs the owner validate() and freezes the owner input_digest(); no local subject/request/candidate types exist and no compilation, admission, briefing, or model work occurs"
-primary_responsibility = "Pose one validated SelfQueryInput and freeze its owner digest into a SelfQueryPoseReceipt for the brief projectors."
+product_objective = "A Dreamer self-query over the existing A-03 owner input freezes the owner digest the A-08 brief projectors consume, with source citations checked against the owner accepted-source projection."
+causal_property = "bounded Dreamer self-query pose with source citation"
+old_failure_or_missing_capability = "Self-queries recompile context, rerun admission, invent a parallel request type, or cite sources without a currency check instead of using the existing SelfQueryInput and accepted-source owner contracts (CC-006)."
+discriminator = "posing runs the owner validate() and freezes the owner input_digest(); cited triples must match projected refs exactly before any digest freezes; no local subject/request/candidate types exist"
+primary_responsibility = "Pose one validated SelfQueryInput with source citation into a SelfQueryPoseReceipt for the brief projectors."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["eliot_dreamer_contracts::self_query::SelfQueryInput by reference (A-03 owner, PR #1060)"]
+inputs = ["eliot_dreamer_contracts::self_query::SelfQueryInput by reference (A-03 owner, PR #1060)", "AcceptedSourceProjection by reference (same owner)"]
 outputs = ["SelfQueryPoseReceipt"]
-depends_on = ["eliot-dreamer-contracts"]
-providers = ["A-03 self-query contract owner (input supply only)"]
+depends_on = ["eliot-dreamer-contracts", "eliot-contracts"]
+providers = ["A-03 self-query contract owner (input and projection supply only)"]
 consumers = ["eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief"]
-non_goals = ["second ContextCompiler invocation", "second admission pass", "mutable UnderstandingState", "ArchitectureBrief/ImplementationBrief authorship", "parallel request/candidate types", "model route calls", "support/truth promotion", "standalone accepted-source projection schema"]
-invariants = ["no local request types: the owner input is the only request surface", "owner validate() runs before any digest freezes", "digest is the owner's input_digest(), never a local hash of local fields", "no compilation, admission, briefing, or model work"]
-failure_behavior = "Return the owner's own rejection for invalid input; reject malformed receipt digests explicitly. Pose acceptance with an owner-valid fixture executes at package proof."
-proof_surface = ["owner rejection passthrough", "receipt digest shape", "wire roundtrip"]
+non_goals = ["second ContextCompiler invocation", "second admission pass", "mutable UnderstandingState", "ArchitectureBrief/ImplementationBrief authorship", "parallel request/candidate types", "model route calls", "support/truth promotion", "opaque bundle-handle verification"]
+invariants = ["no local request types: the owner input and projection are the only surfaces", "owner validate() runs before any digest freezes", "every cited triple matches a projected ref exactly or the pose fails closed", "opaque bundle handles are never treated as typed citations", "no compilation, admission, briefing, or model work"]
+failure_behavior = "Return the owner's own rejection for invalid input or stale/uncited sources; reject malformed receipt digests explicitly. Pose acceptance with an owner-valid fixture executes at package proof."
+proof_surface = ["owner rejection passthrough", "citation currency and staleness", "receipt digest shape", "wire roundtrip"]
 proof_ceiling = "PACKAGE_PROOF_ONLY"
 product_pulse = "D3A_SELF_QUERY_EDGE_01"
 replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
@@ -43,6 +43,10 @@ disposition = "wave authority: accepted-source projection recorded NOT_FROZEN (C
 [[donor]]
 path = "crates/smart/eliot-dreamer-contracts/src/self_query/input.rs"
 disposition = "owner contract reused: SelfQueryInput validate() plus input_digest(); A-03 owner per merged PR #1060"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-contracts/src/self_query/accepted.rs"
+disposition = "owner contract reused: AcceptedSourceProjection project()/validate()/check_cited() with frozen digest and exact-triple currency; adapter only cites it"
 
 [[donor]]
 path = "crates/smart/eliot-dreamer-architecture-brief/src/projection.rs"
