@@ -30,6 +30,9 @@
 //!   plus the four D2 values, with liveness checks against the live attach
 //!   before delegating to the plan-crate binder. Deterministic by
 //!   construction; runnable end-to-end once all four values are live.
+//! - [`serve_live_six_slot`]: one production serving call through the four
+//!   D2 resolvers into the assembly (resolver order session → attention →
+//!   coverage → policy → assembly; first missing inventory fails the call).
 //!
 //! # What fails closed, and on exactly which missing owner facts
 //!
@@ -38,18 +41,24 @@
 //! and fail closed with [`OwnerPublicationError::MissingOwnerFacts`] naming
 //! the exact unowned fields. No field is fabricated to satisfy a validator:
 //!
-//! - session snapshot: `runtime_id`, `host_id`, `runtime_generation`,
+//! - session snapshot (9): `runtime_id`, `host_id`, `runtime_generation`,
 //!   `host_generation`, `recipient_id`, `attempt_id` (no runtime/host/
 //!   recipient/attempt owner in the bridge; see [`resolve_runtime_envelope`]),
 //!   plus per-record `operation_id`, `request_id`, `idempotency_key`
-//!   (bridge hook/response deliveries are piggybacks, never operations) and
-//!   per-record `source_revision` (see [`resolve_record_envelope`]).
-//! - contract coverage: the host/runtime/interface/recipient identity
-//!   envelope, generations, contract, modes, ceilings, and owner-claim
-//!   events (I7.16 discovery/owner state; see [`resolve_coverage_envelope`]).
-//! - delivery policy: the policy-owner envelope (see
+//!   (bridge hook/response deliveries are piggybacks, never operations; see
+//!   [`resolve_record_envelope`]). Per-record `source_revision` already
+//!   resolves through the [`BridgeRunner::reactive_item_cue`] probe.
+//! - contract coverage (14 + candidate state): the host/runtime/interface/
+//!   recipient identity envelope, generations, contract, modes, ceilings,
+//!   owner-claim events, and owner gaps (I7.16 discovery/owner state; see
+//!   [`resolve_coverage_envelope`]). The verified governor candidate binds
+//!   by fingerprint and contributes live gap evidence; unverified or foreign
+//!   candidates fail closed with their exact cause.
+//! - delivery policy (22): the policy-owner envelope (see
 //!   [`resolve_policy_envelope`]). The live frame carries only plan
-//!   identity and the (empty) observation clock.
+//!   identity and the (empty) observation clock; `tie_break_revision = 1`,
+//!   no deadline, and `cancelled = false` are contract-fixed or observed
+//!   bridge facts.
 //!
 //! # Authority separation
 //!
@@ -111,10 +120,15 @@
 //!   (`reactive_injection_receipts.rs`).
 //! - per-delivered-row use facts: `BridgeRunner::reactive_receipt`
 //!   (`lib.rs`) ← `ReactiveInjectionLedger::receipt`.
+//! - per-row cue facts: `BridgeRunner::reactive_item_cue` (`lib.rs`) ←
+//!   `ReactiveInjectionLedger::item_cue` (`reactive_injection_receipts.rs`,
+//!   mirroring the `item_session` probe).
 //! - task/scope/plan/principal: `binding.task_binding()` (`TaskId`,
 //!   work-scope string, plan identity) and `binding.principal_id()`.
 //! - governor posture: `GovernorCoverageDerivation::current` / `revision`
-//!   (`crates/governor/eliot-integration-coverage/src/lib.rs`).
+//!   (`crates/governor/eliot-integration-coverage/src/lib.rs`); candidate
+//!   gaps/fingerprint from the integrator-held verified governor candidate
+//!   profile (same crate, candidate vocabulary).
 
 use eliot_agent_bridge_core::BridgeError;
 use eliot_agent_contracts::AgentAttemptId;
@@ -165,10 +179,10 @@ const LEDGER_SOURCE_ID: &str = "eliot.agent-bridge.reactive-ledger";
 const LEDGER_SOURCE_REVISION: &str = "ledger-delivery-records-v1";
 
 /// Member/projection source revision when the per-item source revision is
-/// not exposed on the allowed `BridgeRunner` surface. The value declares its
-/// own limitation in-band; it never impersonates a source revision. Owner
-/// request: one read-only item-cue probe on the ledger (see
-/// [`resolve_record_envelope`]).
+/// not available. Members now carry their exact ledger source revision via
+/// the [`BridgeRunner::reactive_item_cue`] probe; the projection-level
+/// revision stays coarse (members may span sources) and declares that
+/// in-band.
 const SOURCE_REVISION_UNEXPOSED: &str = "unknown:bridge-ledger-item-cue-unexposed";
 
 /// Resolution condition carried by every bridge-published open member: the
@@ -178,6 +192,10 @@ const RESOLUTION_CONDITION_OPEN: &str = "ledger-open-no-terminal-disposition";
 /// Freshness gap declared by the coverage posture: the bridge retains no
 /// owner claim receipts, so the adapted profile can never be `Fresh`.
 const COVERAGE_FRESHNESS_GAP: &str = "bridge-retains-no-owner-claim-receipts";
+
+/// Coverage gap declared by the attention projection: the bridge tracks no
+/// coverage state, so it declares the gap instead of claiming completeness.
+const ATTENTION_COVERAGE_GAP: &str = "bridge-tracks-no-coverage-state";
 
 /// Fail-closed publication errors. The ledger/owners own the reason detail;
 /// this module owns only the transport-facing classification, mirroring
@@ -410,9 +428,9 @@ fn ledger_influence(update: &UseOutcome) -> AttentionInfluence {
 /// - `claim_digest`: computed with `CriticalAttentionMember::
 ///   canonical_resolution_claim_digest` after the member is assembled.
 /// - `kind`: `CRITICAL` / `NORMAL` from `AttentionItem::severity`.
-/// - `source_revision`: [`SOURCE_REVISION_UNEXPOSED`] — the per-item source
-///   revision is not exposed on the allowed surface (owner request in
-///   [`resolve_record_envelope`]). The constant declares the gap in-band.
+/// - `source_revision`: the item's exact ledger source revision, resolved
+///   through the [`BridgeRunner::reactive_item_cue`] probe (which mirrors
+///   the `item_session` probe on the ledger).
 /// - `source` / `evidence`: empty — the bridge retains no owner evidence;
 ///   empty vectors validate and claim nothing.
 /// - `task_id`: the live attach task binding (same `TaskId` type, shared
@@ -439,6 +457,7 @@ fn ledger_influence(update: &UseOutcome) -> AttentionInfluence {
 fn attention_member_from_row(
     item: &AttentionItem,
     influence: AttentionInfluence,
+    source_revision: String,
     task_id: eliot_contracts::TaskId,
     scope_id: WorkScopeId,
     fence: StateFence,
@@ -458,7 +477,7 @@ fn attention_member_from_row(
         claim_artifact_id: attention_id.clone(),
         claim_digest: String::new(),
         kind,
-        source_revision: SOURCE_REVISION_UNEXPOSED.to_owned(),
+        source_revision: source_revision.clone(),
         source: Vec::new(),
         evidence: Vec::new(),
         task_id: task_id.clone(),
@@ -479,7 +498,7 @@ fn attention_member_from_row(
         state_fence: fence.clone(),
         owner_closure: AttentionOwnerClosure {
             owner_id: BRIDGE_OBSERVATION_OWNER.to_owned(),
-            source_revision: SOURCE_REVISION_UNEXPOSED.to_owned(),
+            source_revision,
             attention_id,
             task_id,
             scope_id,
@@ -538,9 +557,16 @@ pub fn publish_live_attention_projection(
                 .unwrap_or(AttentionInfluence::Unknown),
             _ => AttentionInfluence::Unknown,
         };
+        let source_revision = runner
+            .reactive_item_cue(&row.item_id)
+            .map(|(cue, _)| cue.source_revision)
+            .ok_or(OwnerPublicationError::InvalidBinding {
+                field: "ledger.item_cue",
+            })?;
         members.push(attention_member_from_row(
             row,
             influence,
+            source_revision,
             task_id.clone(),
             scope_id.clone(),
             fence.clone(),
@@ -554,7 +580,7 @@ pub fn publish_live_attention_projection(
         scope_id,
         state_fence: fence,
         members,
-        missing_coverage: Vec::new(),
+        missing_coverage: vec![ATTENTION_COVERAGE_GAP.to_owned()],
         projection_digest: String::new(),
     };
     projection.projection_digest = projection
@@ -610,15 +636,12 @@ fn resolve_runtime_envelope() -> Result<RuntimeEnvelope, Vec<&'static str>> {
 ///
 /// Bridge hook/response deliveries are piggybacks, never operations, so the
 /// operation envelope (`operation_id`, `request_id`, `idempotency_key`) must
-/// come from the owner that performed the original operation; the
-/// per-record `source_revision` needs the item-cue probe requested below.
-/// Until then the session-snapshot assembly fails closed with their exact
-/// names. Owner request: one read-only `item_cue(item_id)` probe on the
-/// ledger returning the item's cue source, source revision, and cue digest,
-/// mirroring the existing `item_session` probe in
-/// `bins/eliot-agent-bridge/src/reactive_injection_receipts.rs`; with it,
-/// `source_revision` resolves from a ledger fact and leaves only the
-/// operation envelope outstanding.
+/// come from the owner that performed the original operation; until then
+/// the session-snapshot assembly fails closed with their exact names. The
+/// per-record `source_revision` already resolves from a ledger fact: the
+/// caller supplies the item's cue source revision read through the
+/// [`BridgeRunner::reactive_item_cue`] probe (which mirrors the
+/// `item_session` probe on the ledger).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordEnvelope {
     /// Canonical operation identity from the operating owner.
@@ -627,25 +650,26 @@ pub struct RecordEnvelope {
     pub request_id: RequestId,
     /// Caller idempotency key from the operating owner.
     pub idempotency_key: String,
-    /// Source revision of the delivered content.
+    /// Source revision of the delivered content (ledger fact).
     pub source_revision: String,
 }
 
 /// Resolve the per-record owner envelope for one delivered row.
 ///
-/// Returns `Err` with the four exact missing facts today (see
-/// [`RecordEnvelope`]). The `row`/`receipt` parameters name the live facts
-/// the envelope binds to once the owning lanes resolve them.
+/// The `source_revision` arrives as a ledger fact (item cue via the probe);
+/// the operation envelope has no live source and fails closed with its
+/// three exact names. The `row`/`receipt_id` parameters name the live facts
+/// the envelope binds to once the operating owner resolves them.
 fn resolve_record_envelope(
     row: &AttentionItem,
     receipt_id: &str,
+    source_revision: String,
 ) -> Result<RecordEnvelope, Vec<&'static str>> {
-    let _ = (row, receipt_id);
+    let _ = (row, receipt_id, source_revision);
     Err(vec![
         "record.operation_id",
         "record.request_id",
         "record.idempotency_key",
-        "record.source_revision",
     ])
 }
 
@@ -769,9 +793,10 @@ fn session_record_from_row(
 ///
 /// Fails closed with `MissingOwnerFacts` today: [`resolve_runtime_envelope`]
 /// contributes the six envelope facts and [`resolve_record_envelope`]
-/// contributes the four per-record facts on the first delivered row. The
-/// inventory is deterministic (envelope first, then record facts) and every
-/// other derivation above already runs against live state.
+/// contributes the three per-record operation facts on the first delivered
+/// row (its `source_revision` already resolves through the item-cue probe).
+/// The inventory is deterministic (envelope first, then record facts) and
+/// every other derivation above already runs against live state.
 pub fn publish_live_session_snapshot(
     runner: &BridgeRunner,
 ) -> Result<SessionDeliverySnapshot, OwnerPublicationError> {
@@ -816,7 +841,13 @@ pub fn publish_live_session_snapshot(
         let Some(receipt) = runner.reactive_receipt(&receipt_id) else {
             continue;
         };
-        let record = resolve_record_envelope(row, &receipt_id)
+        let source_revision = runner
+            .reactive_item_cue(&row.item_id)
+            .map(|(cue, _)| cue.source_revision)
+            .ok_or(OwnerPublicationError::InvalidBinding {
+                field: "ledger.item_cue",
+            })?;
+        let record = resolve_record_envelope(row, &receipt_id, source_revision)
             .map_err(|facts| OwnerPublicationError::MissingOwnerFacts { facts })?;
         records.push(session_record_from_row(
             row,
@@ -986,6 +1017,7 @@ fn resolve_coverage_envelope() -> Result<CoverageEnvelope, Vec<&'static str>> {
         "coverage.effect_ceiling",
         "coverage.proof_ceiling",
         "coverage.events/owner-claims",
+        "coverage.owner_gaps",
     ])
 }
 
@@ -994,22 +1026,37 @@ fn resolve_coverage_envelope() -> Result<CoverageEnvelope, Vec<&'static str>> {
 ///
 /// Consumes [`governor_coverage_posture`] (revision → `profile_revision`,
 /// mapped completeness, verified posture, fingerprint) for the scalar
-/// posture and [`resolve_coverage_envelope`] for the I7.16 identity
-/// envelope; the profile digest is computed over the assembly and
-/// revalidated before return. Freshness is `ExplicitlyUnavailable` with
-/// the posture gap plus owner gaps (never `Fresh`: no owner claim
-/// receipts are retained bridge-side).
+/// posture, the verified governor `candidate` for its live gap evidence
+/// (bound to the derivation by exact fingerprint equality), and
+/// [`resolve_coverage_envelope`] for the I7.16 identity envelope; the
+/// profile digest is computed over the assembly and revalidated before
+/// return. Freshness is `ExplicitlyUnavailable` with the posture gap plus
+/// candidate and owner gaps (never `Fresh`: no owner claim receipts are
+/// retained bridge-side).
 ///
 /// Fails closed with `MissingOwnerFacts` today (see
-/// [`resolve_coverage_envelope`]).
+/// [`resolve_coverage_envelope`]; an unverified or foreign candidate also
+/// fails closed with its exact cause).
 pub fn adapt_contract_coverage(
     derivation: &GovernorCoverageDerivation,
+    candidate: &eliot_integration_coverage::IntegrationCoverageProfile,
     fence: &StateFence,
 ) -> Result<IntegrationCoverageProfile, OwnerPublicationError> {
     let posture = governor_coverage_posture(derivation)?;
+    if !candidate.verified {
+        return Err(OwnerPublicationError::MissingOwnerFacts {
+            facts: vec!["coverage.candidate-unverified"],
+        });
+    }
+    if candidate.fingerprint != posture.derivation_fingerprint {
+        return Err(OwnerPublicationError::InvalidBinding {
+            field: "coverage.candidate_fingerprint",
+        });
+    }
     let envelope = resolve_coverage_envelope()
         .map_err(|facts| OwnerPublicationError::MissingOwnerFacts { facts })?;
     let mut gaps = vec![posture.freshness_gap.clone()];
+    gaps.extend(candidate.gaps.clone());
     gaps.extend(envelope.owner_gaps.clone());
     let mut profile = IntegrationCoverageProfile {
         host_id: envelope.host_id,
@@ -1149,6 +1196,7 @@ fn resolve_policy_envelope() -> Result<PolicyEnvelope, Vec<&'static str>> {
         "policy.request_id",
         "policy.operation_id",
         "policy.idempotency_key",
+        "policy.target_event_id",
         "policy.target_event",
         "policy.delivery_profile",
         "policy.delivery_contract",
@@ -1157,6 +1205,7 @@ fn resolve_policy_envelope() -> Result<PolicyEnvelope, Vec<&'static str>> {
         "policy.max_references",
         "policy.max_work",
         "policy.max_delivery_bytes",
+        "policy.max_delivery_stu",
         "policy.fixed_reserve",
         "policy.protocol_reserve",
         "policy.output_reserve",
@@ -1283,4 +1332,36 @@ pub fn assemble_live_six_slot(
         policy,
     })
     .map_err(OwnerPublicationError::Bind)
+}
+
+/// Serve one production six-slot publication from live owner state.
+///
+/// One causal call through the four D2 resolvers into
+/// [`assemble_live_six_slot`]: the live session snapshot, the live
+/// attention projection, the adapted contract coverage (over the live
+/// governor `derivation` plus its verified `candidate`), and the adapted
+/// delivery policy — joined with D1-served view/cue from the plan-crate
+/// port shape (`feed`). First missing owner inventory fails the whole
+/// call in resolver order (session → attention → coverage → policy →
+/// assembly); nothing partial is ever published. Deterministic: repeated
+/// calls over unchanged live state yield the same publication digest.
+pub fn serve_live_six_slot(
+    runner: &BridgeRunner,
+    feed: SettledPlanFeedInputs<'_>,
+    derivation: &GovernorCoverageDerivation,
+    candidate: &eliot_integration_coverage::IntegrationCoverageProfile,
+) -> Result<OwnerBoundPublication, OwnerPublicationError> {
+    let (_, fence) = live_state_fence(runner)?;
+    let session_snapshot = publish_live_session_snapshot(runner)?;
+    let critical_attention = publish_live_attention_projection(runner)?;
+    let integration_coverage = adapt_contract_coverage(derivation, candidate, &fence)?;
+    let policy = adapt_delivery_policy(runner)?;
+    assemble_live_six_slot(
+        runner,
+        feed,
+        &session_snapshot,
+        &critical_attention,
+        &integration_coverage,
+        &policy,
+    )
 }

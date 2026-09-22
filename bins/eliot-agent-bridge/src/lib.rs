@@ -529,6 +529,18 @@ impl BridgeRunner {
     pub fn reactive_receipt(&self, receipt_id: &str) -> Option<InjectionReceipt> {
         self.reactive_ledger.receipt(receipt_id).cloned()
     }
+    /// Looks up the normalized cue and exact firing evidence bound to one
+    /// ledger item identity. Read-only owner-publication probe: resolution
+    /// succeeds only for exact ledger identities.
+    #[must_use]
+    pub fn reactive_item_cue(
+        &self,
+        item_id: &str,
+    ) -> Option<(NormalizedCue, FiringEvidence)> {
+        self.reactive_ledger
+            .item_cue(item_id)
+            .map(|(cue, firing)| (cue.clone(), firing.clone()))
+    }
     /// Records a later observable use, influence, or outcome update for a
     /// delivered item (I7.6 `influence_ack` side: delivery, acknowledgement,
     /// use, and causal benefit stay separate; absence stays unknown).

@@ -676,6 +676,21 @@ impl ReactiveInjectionLedger {
             .map(|item| item.session_id.as_str())
     }
 
+    /// Returns the normalized cue and exact firing evidence bound to one
+    /// item identity, if the item exists.
+    ///
+    /// Read-only probe for the owner publication join: resolution succeeds
+    /// only for exact ledger identities, never by pattern or inference.
+    /// Covers every retained item regardless of attention visibility, so a
+    /// published projection can name the per-item source revision and cue
+    /// digest the ledger actually admitted.
+    #[must_use]
+    pub fn item_cue(&self, item_id: &str) -> Option<(&NormalizedCue, &FiringEvidence)> {
+        self.items
+            .get(item_id)
+            .map(|item| (&item.cue, &item.firing))
+    }
+
     /// Bounded identities of pending (undelivered) injections for one
     /// session in ledger order.
     ///
