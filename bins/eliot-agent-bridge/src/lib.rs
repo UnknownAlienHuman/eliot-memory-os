@@ -35,8 +35,8 @@ pub use eliot_agent_bridge_core::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
-use eliot_contracts::sha256_hex;
-use eliot_mcp::{HostInvocationOutcome, KernelHostRequestPort, ResponseKind};
+use eliot_contracts::{ResourceGeneration, StateFence, sha256_hex};
+use eliot_mcp::{HostInvocationOutcome, KernelHostRequestPort, ResponseKind, ToolRequest};
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
     AgentBridgePeerChallenge, EventEnvelope,
@@ -422,6 +422,28 @@ impl BridgeRunner {
             .map(|view| view.binding().session_id().as_str().to_owned())
             .ok_or(BridgeError::NotAttached)
     }
+    /// Live attach scope for invocation binding: the activation-sealed
+    /// session identity plus the canonical [`StateFence`] the Store
+    /// projections are keyed by (epoch clone + generation value, revisions
+    /// `None` exactly like the frame fence the pipe already carries).
+    /// Authority stays with the binding and the serving owners; this echo
+    /// mints none. Detached callers fail closed.
+    fn live_invocation_scope(&self) -> Result<(String, StateFence), BridgeError> {
+        let view = self.attach_view().ok_or(BridgeError::NotAttached)?;
+        let session = view.binding().session_id().as_str().to_owned();
+        let generation = ResourceGeneration::new(view.binding().state_fence().generation().get())
+            .map_err(|_| BridgeError::InvalidContract {
+                field: "attach.state_fence.generation",
+                reason: "generation must be non-zero",
+            })?;
+        Ok((
+            session,
+            StateFence::new(
+                view.binding().state_fence().authority_epoch().clone(),
+                generation,
+            ),
+        ))
+    }
     /// Admits one caller-supplied reactive-context injection as pending for
     /// the live session (I7.19 admit step).
     ///
@@ -719,6 +741,57 @@ impl BridgeRunner {
             ));
         }
         self.publish_canonical_resource(&uri, content)
+    }
+    /// Records one owner-attested exact-resource delivery into the
+    /// attach-scoped evidence projection, at the normal Invoke callsite
+    /// after the gateway returns with the exact authenticated outcome.
+    ///
+    /// Only an `eliot.query` tool naming an `exact_resource_uri` whose
+    /// outcome carries the serving owner's attestation in
+    /// `response.resource` publishes: the handle URI must equal the queried
+    /// URI exactly (never relabelled), the canonical content bytes must
+    /// digest to the handle's artifact digest with exact byte size, and the
+    /// handle's session/fence scope must echo the live attach binding.
+    /// Anything else — non-query tools, absent URIs, unattested responses,
+    /// gaps, rejections, session/fence divergence — yields `None` and
+    /// publishes nothing, so opaque bytes are never relabelled at a
+    /// caller-named URI. A `None` leaves the gateway-shaped response
+    /// exactly as produced; the dispatch falls through to the existing
+    /// overflow-evidence path untouched.
+    pub fn record_exact_resource_delivery(
+        &mut self,
+        tool: &ToolRequest,
+        outcome: &HostInvocationOutcome,
+    ) -> Option<HotResourceView> {
+        let ToolRequest::Query(input) = tool else {
+            return None;
+        };
+        let uri_text = input.exact_resource_uri.as_deref()?;
+        let HostInvocationOutcome::Responded { response, .. } = outcome else {
+            return None;
+        };
+        match response.kind {
+            ResponseKind::Candidate | ResponseKind::Projection => {}
+            ResponseKind::PlanGap | ResponseKind::Unsupported => return None,
+        }
+        let handle = response.resource.as_ref()?;
+        if handle.uri != uri_text {
+            return None;
+        }
+        let bytes = serde_json::to_vec(&response.content).ok()?;
+        if handle.artifact.sha256 != sha256_hex(&bytes)
+            || handle.size_bytes != bytes.len() as u64
+        {
+            return None;
+        }
+        let (live_session, live_fence) = self.live_invocation_scope().ok()?;
+        if handle.session.session_id.as_str() != live_session
+            || handle.session.state_fence != live_fence
+        {
+            return None;
+        }
+        self.publish_served_snapshot(uri_text, bytes, &handle.artifact.sha256)
+            .ok()
     }
     /// Projects one route-owner measured attestation into its byte-bound
     /// delivery receipt (issue #1941 result flow): the holder joins the
