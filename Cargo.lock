@@ -3141,6 +3141,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-understanding-assessment"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-context-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-observation-contracts",
+ "schemars",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-user-broker"
 version = "0.1.0"
 dependencies = [
