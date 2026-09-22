@@ -459,28 +459,51 @@ def collect_locked_dependency_identity(
     return findings, identities
 
 
+def _validated_node_input(
+    root: Path, raw_value: object, label: str
+) -> tuple[Path | None, str | None]:
+    path, _ = _configured_repo_path(root, raw_value, label, NODE_ECOSYSTEM_FINDING)
+    if path is None:
+        return None, None
+    try:
+        resolved_path = path.resolve()
+        relative_path = resolved_path.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None, None
+    relative = str(relative_path).replace("\\", "/")
+    if not relative or relative == ".":
+        return None, None
+    return resolved_path, relative
+
+
 def _node_input_paths(root: Path, node_policy: dict | None) -> list[str]:
     policy = node_policy if isinstance(node_policy, dict) else {}
     paths: list[str] = []
-    for key in ("contract", "manifest"):
-        value = policy.get(key)
-        if isinstance(value, str) and value.strip():
-            paths.append(value.replace("\\", "/"))
 
-    contract_raw = policy.get("contract")
-    if isinstance(contract_raw, str):
-        contract_path = root / contract_raw
+    contract_path, contract_relative = _validated_node_input(
+        root, policy.get("contract"), "[ecosystems.node].contract"
+    )
+    if contract_relative:
+        paths.append(contract_relative)
+
+    if contract_path is not None:
         try:
             contract = json.loads(contract_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             contract = {}
         surface = contract.get("surface") if isinstance(contract, dict) else None
         if isinstance(surface, str) and surface.strip():
-            paths.append(surface.replace("\\", "/"))
+            _, surface_relative = _validated_node_input(root, surface, "Node contract surface")
+            if surface_relative:
+                paths.append(surface_relative)
 
-    manifest_raw = policy.get("manifest")
-    if isinstance(manifest_raw, str):
-        manifest_path = root / manifest_raw
+    manifest_path, manifest_relative = _validated_node_input(
+        root, policy.get("manifest"), "[ecosystems.node].manifest"
+    )
+    if manifest_relative:
+        paths.append(manifest_relative)
+
+    if manifest_path is not None:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -491,10 +514,14 @@ def _node_input_paths(root: Path, node_policy: dict | None) -> list[str]:
                 if isinstance(instruction, str) and instruction.strip():
                     instruction_path = (manifest_path.parent / instruction).resolve()
                     try:
-                        rel = instruction_path.relative_to(root.resolve())
+                        relative_instruction = instruction_path.relative_to(root.resolve())
                     except ValueError:
                         continue
-                    paths.append(str(rel).replace("\\", "/"))
+                    _, instruction_relative = _validated_node_input(
+                        root, str(relative_instruction), "Node manifest instruction"
+                    )
+                    if instruction_relative:
+                        paths.append(instruction_relative)
     return list(dict.fromkeys(paths))
 
 
