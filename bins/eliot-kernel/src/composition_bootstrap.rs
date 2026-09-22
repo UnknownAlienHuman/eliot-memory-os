@@ -19,8 +19,9 @@ use super::{
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
     AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, ContractId,
     DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
-    GenerationRoute, GenerationRouter, HealthVector, IpcImplementation, KernelBuildError,
-    KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
+    GenerationRoute, GenerationRouter, HealthVector, IpcImplementation, KernelBackupRestore,
+    KernelBuildError, KernelComposition, KernelConfig, KernelDispatchKey, KernelError,
+    KernelPathAdmission, KernelRestoreJournal,
     KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
     ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
     OrsGenerationCoordinator, PROTOCOL_VERSION, PreparedAuthorityMaterial,
@@ -1081,6 +1082,26 @@ impl KernelComposition {
                 })?
                 .note_blob_degraded();
         }
+        // Issue #960: bind the Kernel-owned production restore adapter to the
+        // actual existing ORS owner handle. No second database is opened:
+        // restore streams live in the operational ORS file through the
+        // E-owned journal logic. An unbindable owner degrades only the
+        // restore capability (effects refuse while unbound); unrelated
+        // Kernel work is unaffected, mirroring the manifest-absent path
+        // above.
+        let backup_restore = KernelRestoreJournal::bind_owner(Arc::clone(&ors))
+            .map(|journal| KernelBackupRestore::bind(journal, work_root.clone()))
+            .map_or_else(
+                |_| {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.restore_owner_unavailable",
+                    );
+                    observe_terminal_error("RESTORE_OWNER_UNAVAILABLE");
+                    None
+                },
+                Some,
+            );
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.
@@ -1128,6 +1149,7 @@ impl KernelComposition {
             approved_config_hash,
             canonical_store_claimed: AtomicBool::new(false),
             blob_store: Mutex::new(blob_store),
+            backup_restore: Mutex::new(backup_restore),
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]
