@@ -10,7 +10,8 @@
 pub mod learning_gate;
 
 pub use learning_gate::{
-    LearningAtomClaim, LearningSubject, admit_context_with_learning, screen_learning_subjects,
+    LearningSubject, admit_context_with_learning, screen_admission_input_learning,
+    screen_learning_subjects,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

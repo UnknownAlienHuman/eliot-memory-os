@@ -1,23 +1,24 @@
-//! Learning delivery screen proof for issue #1869 (round 4).
+//! Learning delivery screen proof for issue #1869 (round 5).
 //!
-//! Genuine issuer-to-consumer path at compile/delivery: the governed
-//! assembly entrypoint [`assemble_active_view_with_learning`] re-verifies
-//! declared learning atoms against an owner-issued Governor permit minted by
-//! the real [`Governor`] owner, and requires the admitted compilation fence
-//! to exactly match the admitted fence. Drifted fences, unadmitted-but-
-//! claimed atoms, and expired overlays refuse before anything renders;
-//! plain [`assemble_active_view`] behavior is preserved.
+//! Genuine issuer-to-consumer path at compile/delivery with intrinsic
+//! provenance: the governed assembly entrypoint
+//! [`assemble_active_view_with_learning`] re-verifies learning-marked
+//! admitted atoms (`ContextCandidate.learning`, digest-covered — no sidecar
+//! to omit) against an owner-issued Governor permit minted by the real
+//! [`Governor`] owner, and requires the admitted compilation fence to
+//! exactly match the admitted fence. Drifted fences, transplanted digests,
+//! and expired marks refuse before anything renders; plain
+//! [`assemble_active_view`] behavior is preserved.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use eliot_agent_contracts::AgentAttemptId;
-use eliot_context_admission::learning_gate::LearningAtomClaim;
 use eliot_context_assembly::{
-    AdmittedContextSet, AssemblyError, AssemblyPolicy, QualityScorecard,
-    SerializedContextMeasurement, assemble_active_view, assemble_active_view_with_learning,
+    ActiveUnderstandingViewResult, AdmittedContextSet, AssemblyError, AssemblyPolicy,
+    QualityScorecard, SerializedContextMeasurement, assemble_active_view,
+    assemble_active_view_with_learning,
 };
 use eliot_context_contracts::*;
 use eliot_contracts::{
@@ -27,7 +28,7 @@ use eliot_contracts::{
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_governor::{
     Governor, GovernorConfig, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
-    QueueLimits, issue_learning_admission, verify_learning_admission,
+    QueueLimits, VerifiedLearningAdmission, issue_learning_admission, verify_learning_admission,
 };
 use eliot_receipts::{ProofCeiling, WorkScopeId};
 
@@ -83,26 +84,22 @@ fn binding() -> ContextBinding {
     }
 }
 
-fn role(provider: &str, semantic: SemanticRole) -> ProviderRole {
+fn role() -> ProviderRole {
     ProviderRole {
-        provider: ProviderId::new(provider).expect("fixture provider"),
-        role: semantic,
+        provider: ProviderId::new("fixture-provider").expect("fixture provider"),
+        role: SemanticRole::Goal,
     }
 }
 
-fn candidate(
-    context: &ContextBinding,
-    atom: &str,
-    provider_role: ProviderRole,
-) -> ContextCandidate {
+fn candidate(context: &ContextBinding, atom: &str) -> ContextCandidate {
     ContextCandidate {
         binding: context.clone(),
         atom_id: id(atom),
-        provider_role,
+        provider_role: role(),
         source: SourceSnapshot {
             source_id: eliot_contracts::SourceId::new(format!("source-{atom}"))
                 .expect("fixture source"),
-            owner: ProviderId::new(format!("owner-{atom}")).expect("fixture owner"),
+            owner: ProviderId::new("fixture-provider").expect("fixture owner"),
             snapshot_id: id(&format!("snapshot-{atom}")),
             revision: "revision-1".to_owned(),
             content_sha256: digest(),
@@ -111,6 +108,7 @@ fn candidate(
         representation: AtomRepresentation::Whole {
             content: format!("whole {atom}"),
         },
+        learning: None,
         loss_policy: LossPolicy::NonDroppable,
         availability: AtomAvailability::PresentCurrent,
         protected: true,
@@ -130,26 +128,24 @@ fn candidate(
     }
 }
 
-fn refresh_economy_receipt(value: &mut AdmittedContextSet) {
-    let mut unsigned = value.economy.clone();
-    unsigned.receipt_digest = "0".repeat(64);
-    value.economy.receipt_digest =
-        eliot_context_contracts::canonical_digest(&unsigned).expect("economy receipt");
-}
-
-/// Admitted set with one ordinary atom plus one learning-declared atom.
-///
-/// Both atoms share the admitted denominator role (the established two-atom
-/// pattern); learning provenance travels only in the explicit sidecar claims
-/// map, never in reinterpreted role fields.
-fn admitted_with_learning() -> AdmittedContextSet {
+/// Admitted set with one ordinary atom plus one intrinsically marked
+/// learning atom citing `permit_digest`. Both atoms share the admitted
+/// denominator role (the established two-atom pattern); learning provenance
+/// travels only in the intrinsic mark, never in reinterpreted role fields.
+fn admitted_with_learning(permit_digest: &str, expires: Option<u64>) -> AdmittedContextSet {
     let context = binding();
-    let first = candidate(
-        &context,
-        "atom-1869",
-        role("fixture-provider", SemanticRole::Goal),
-    );
-    let second = candidate(&context, "learning-1869", first.provider_role.clone());
+    let first = candidate(&context, "atom-1869");
+    let mut second = candidate(&context, "learning-1869");
+    second.learning = Some(LearningProvenance {
+        campaign_id: CAMPAIGN_1869.to_string(),
+        overlay_id: Some(OVERLAY_1869.to_string()),
+        candidate_id: None,
+        closure_ref: None,
+        owner: None,
+        draft: false,
+        expires_at_unix_secs: expires,
+        permit_digest: permit_digest.to_string(),
+    });
     let atom_id = first.atom_id.clone();
     let provider = first.provider_role.clone();
     let floor = DecisionSafetyFloor {
@@ -246,6 +242,13 @@ fn admitted_with_learning() -> AdmittedContextSet {
     value
 }
 
+fn refresh_economy_receipt(value: &mut AdmittedContextSet) {
+    let mut unsigned = value.economy.clone();
+    unsigned.receipt_digest = "0".repeat(64);
+    value.economy.receipt_digest =
+        eliot_context_contracts::canonical_digest(&unsigned).expect("economy receipt");
+}
+
 fn quality(context: &ContextBinding) -> QualityScorecard {
     let dimensions = [
         QualityDimension::AcceptanceDecisionCoverage,
@@ -319,7 +322,7 @@ fn policy_for(context: &ContextBinding, max_serialized_bytes: u64) -> AssemblyPo
 }
 
 fn recipe(context: &ContextBinding) -> ContextRecipe {
-    let provider = role("fixture-provider", SemanticRole::Goal);
+    let provider = role();
     let mut recipe = ContextRecipe {
         schema_version: CONTEXT_CONTRACT_VERSION,
         binding: context.clone(),
@@ -380,44 +383,32 @@ fn owner_permit(
     .expect("live owner issues")
 }
 
-fn learning_claims(expires: Option<u64>) -> BTreeMap<ArtifactId, LearningAtomClaim> {
-    use eliot_context_admission::learning_gate::LearningAtomClaim;
-    let mut claims = BTreeMap::new();
-    claims.insert(
-        id("learning-1869"),
-        LearningAtomClaim {
-            campaign_id: CAMPAIGN_1869.to_string(),
-            overlay_id: Some(OVERLAY_1869.to_string()),
-            candidate_id: None,
-            closure_ref: None,
-            owner: None,
-            draft: false,
-            expires_at_unix_secs: expires,
-        },
-    );
-    claims
-}
-
-#[test]
-fn learning_atom_projects_with_owner_issued_permit() {
-    let governor = governor_1869();
-    let fence = fence_1869();
-    let value = admitted_with_learning();
+fn assemble_marked(
+    value: &AdmittedContextSet,
+    verified: &VerifiedLearningAdmission<'_>,
+    now: u64,
+) -> Result<ActiveUnderstandingViewResult, AssemblyError> {
     let context = value.binding.clone();
-    let permit = owner_permit(&governor, &fence);
-    let verified =
-        verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
-    let view = assemble_active_view_with_learning(
-        &value,
+    assemble_active_view_with_learning(
+        value,
         &recipe(&context),
         quality(&context),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
-        &learning_claims(Some(NOW_1869 + 3600)),
-        &verified,
-        NOW_1869,
+        verified,
+        now,
     )
-    .expect("covered learning atom projects");
+}
+
+#[test]
+fn marked_atom_projects_with_owner_issued_permit() {
+    let governor = governor_1869();
+    let fence = fence_1869();
+    let permit = owner_permit(&governor, &fence);
+    let verified =
+        verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
+    let value = admitted_with_learning(permit.digest(), Some(NOW_1869 + 3600));
+    let view = assemble_marked(&value, &verified, NOW_1869).expect("covered marked atom projects");
     assert_eq!(view.view.rendered.len(), 2);
     assert!(view.view.admitted_ids.contains(&id("learning-1869")));
 }
@@ -426,14 +417,14 @@ fn learning_atom_projects_with_owner_issued_permit() {
 fn drifted_fence_refuses_before_render() {
     let governor = governor_1869();
     let fence = fence_1869();
-    let mut value = admitted_with_learning();
+    let permit = owner_permit(&governor, &fence);
+    let verified =
+        verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
+    let mut value = admitted_with_learning(permit.digest(), Some(NOW_1869 + 3600));
     // Drift the compilation fence past the admitted one. The wrapper
     // refuses before rendering (and before measurement runs).
     value.binding.state_fence.task_revision = Some(TaskRevision::new(2).expect("task revision"));
     let context = value.binding.clone();
-    let permit = owner_permit(&governor, &fence);
-    let verified =
-        verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
     let mut calls = 0;
     let result = assemble_active_view_with_learning(
         &value,
@@ -444,7 +435,6 @@ fn drifted_fence_refuses_before_render() {
             calls += 1;
             Ok(measurement(&context, bytes))
         },
-        &learning_claims(Some(NOW_1869 + 3600)),
         &verified,
         NOW_1869,
     );
@@ -456,59 +446,55 @@ fn drifted_fence_refuses_before_render() {
 }
 
 #[test]
-fn claimed_but_unadmitted_atom_refused() {
+fn transplanted_permit_digest_refused_at_delivery() {
     let governor = governor_1869();
     let fence = fence_1869();
-    let value = admitted_with_learning();
-    let context = value.binding.clone();
-    let permit = owner_permit(&governor, &fence);
+    let other = owner_permit(&governor, &fence);
+    // Same owner, second issuance for another overlay: a different digest.
+    let permit = issue_learning_admission(
+        &governor,
+        &LearningAdmissionClaim {
+            schema_version: LEARNING_ADMISSION_SCHEMA_VERSION,
+            source_campaign_id: CAMPAIGN_1869.to_string(),
+            target_task_id: TASK_1869.to_string(),
+            fence: fence.clone(),
+            overlay_id: Some("overlay-other".to_string()),
+            candidate_id: None,
+            scope_ref: "scope-1869".to_string(),
+            authority_ref: "governor-1869".to_string(),
+            retention_ref: "retention-1869".to_string(),
+            evaluator_ref: "evaluator-1869-a".to_string(),
+            rollback_ref: "rollback-1869".to_string(),
+        },
+    )
+    .expect("live owner issues");
+    assert_ne!(other.digest(), permit.digest());
     let verified =
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
-    let mut claims = learning_claims(Some(NOW_1869 + 3600));
-    claims.insert(
-        id("ghost-1869"),
-        eliot_context_admission::learning_gate::LearningAtomClaim {
-            campaign_id: CAMPAIGN_1869.to_string(),
-            overlay_id: Some(OVERLAY_1869.to_string()),
-            candidate_id: None,
-            closure_ref: None,
-            owner: None,
-            draft: false,
-            expires_at_unix_secs: Some(NOW_1869 + 3600),
-        },
-    );
-    let result = assemble_active_view_with_learning(
-        &value,
-        &recipe(&context),
-        quality(&context),
-        &policy_for(&context, 100_000),
-        |bytes| Ok(measurement(&context, bytes)),
-        &claims,
-        &verified,
-        NOW_1869,
-    );
+    // Atom cites the other issuance: refused even though both are genuine.
+    let value = admitted_with_learning(other.digest(), Some(NOW_1869 + 3600));
+    let result = assemble_marked(&value, &verified, NOW_1869);
     assert_eq!(
         result,
-        Err(AssemblyError::Contract(ContextError::DenominatorMismatch))
+        Err(AssemblyError::Contract(ContextError::IdentityConflict))
     );
 }
 
 #[test]
-fn expired_overlay_refuses_delivery_and_plain_projection_survives() {
+fn expired_mark_refuses_delivery_and_plain_projection_survives() {
     let governor = governor_1869();
     let fence = fence_1869();
-    let value = admitted_with_learning();
-    let context = value.binding.clone();
     let permit = owner_permit(&governor, &fence);
     let verified =
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
+    let value = admitted_with_learning(permit.digest(), Some(NOW_1869 - 1));
+    let context = value.binding.clone();
     let result = assemble_active_view_with_learning(
         &value,
         &recipe(&context),
         quality(&context),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
-        &learning_claims(Some(NOW_1869 - 1)),
         &verified,
         NOW_1869,
     );
@@ -518,17 +504,30 @@ fn expired_overlay_refuses_delivery_and_plain_projection_survives() {
             "learning.expires_at"
         )))
     );
-    // Historical behavior is untouched: the same set without learning
-    // claims projects exactly as before.
-    let plain = assemble_active_view(
-        &value,
+    // Historical behavior is untouched: unmarked atoms project as before.
+    // (Stripping the mark changes atom identity, so the economy digests are
+    // recomputed exactly as the legitimate producer would emit them.)
+    let mut plain = value;
+    for record in &mut plain.records {
+        record.candidate.learning = None;
+    }
+    refresh_economy_receipt(&mut plain);
+    let payload_bytes = plain
+        .canonical_payload_utf8_bytes()
+        .expect("admitted payload");
+    plain.economy.allocations.admitted_required = payload_bytes;
+    plain.economy.allocations.remaining_headroom = 100_000 - 9 - payload_bytes;
+    refresh_economy_receipt(&mut plain);
+    plain.economy.measurement.digest = plain.canonical_payload_digest().expect("admitted digest");
+    refresh_economy_receipt(&mut plain);
+    let context = plain.binding.clone();
+    let view = assemble_active_view(
+        &plain,
         &recipe(&context),
         quality(&context),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
-    );
-    match plain {
-        Ok(view) => assert_eq!(view.view.rendered.len(), 2),
-        Err(error) => panic!("plain fixture error: {error:?}"),
-    }
+    )
+    .expect("plain projection survives");
+    assert_eq!(view.view.rendered.len(), 2);
 }

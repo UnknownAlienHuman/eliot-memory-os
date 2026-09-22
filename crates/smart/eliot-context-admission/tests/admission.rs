@@ -74,6 +74,7 @@ fn candidate(
         binding: context.clone(),
         atom_id: id(atom_id),
         provider_role,
+        learning: None,
         source: SourceSnapshot {
             source_id: SourceId::new(format!("source-{atom_id}")).expect("source"),
             owner: ProviderId::new(format!("owner-{atom_id}")).expect("owner"),
