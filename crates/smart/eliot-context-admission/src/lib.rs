@@ -121,6 +121,23 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
     validate_selection_contract(input)
 }
 
+/// Admit one immutable candidate set and return the per-material rank traces.
+///
+/// This is the live runtime entrypoint combining [`admit_context`] with
+/// [`trace_material`]: the caller receives the admission result together
+/// with exactly one handle-bound [`MaterialRankTrace`] per evaluated
+/// candidate, carrying the typed six-outcome slot, the freshness signal,
+/// and the explicit suppression evidence. The traces re-validate the result
+/// against the input closure fail-closed, so the pair always corresponds;
+/// no separate join by the caller can drift.
+pub fn admit_context_traced(
+    input: &AdmissionInput,
+) -> Result<(AdmissionResult, Vec<MaterialRankTrace>), ContextError> {
+    let result = admit_context(input)?;
+    let traces = trace_material(input, &result)?;
+    Ok((result, traces))
+}
+
 fn build_omissions(
     input: &AdmissionInput,
     candidates: &BTreeMap<eliot_contracts::ArtifactId, &eliot_context_contracts::ContextCandidate>,
