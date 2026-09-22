@@ -343,7 +343,11 @@ impl InvalidationOwnerClient {
 
     /// Requests the invalidation. Cutover-gated, channel-absent: always
     /// refuses here, naming either the missing cutover authority or the
-    /// missing wire channel.
+    /// missing wire channel. Lease revocation belongs to the
+    /// supervision-lease authority (`commit_terminal` in
+    /// `supervision_lease_authority.rs`, which needs a live commit ticket,
+    /// predecessor proof, trust anchor, and signer) under #961 sequencing;
+    /// the other kinds have no execution API in-tree at all.
     pub fn request(&self, cutover: Option<&CutoverReceipt>) -> Result<(), BackupError> {
         match cutover {
             None => Err(BackupError::CutoverNotAuthorized),
@@ -538,12 +542,17 @@ impl KernelBackupRestore {
     }
 
     /// Validates the #961 cutover path for one completed isolated restore:
-    /// owner-approved isolated destination, separate cutover authority, and
-    /// epoch lineage strictly newer than every observed value.
+    /// owner-approved isolated destination, separate cutover authority,
+    /// epoch lineage strictly newer than every observed value, and a
+    /// complete validation denominator in the observed evidence.
     ///
     /// Consumes only authenticated evidence: the accepted owner
     /// authorization (bound to this exact plan and bundle), the completed
     /// restore receipt (bound to this exact plan, bundle, and target), the
+    /// observed restore evidence (validated, plan-bound, and obligation
+    /// complete — any applicable unresolved effect, missing receipt, or
+    /// unknown reconciliation without its complete current denominator
+    /// refuses cutover qualification; suspension is not resolution), the
     /// pinned destination admission (owner-approved manifest evidence bound
     /// at prepare — absent without Host admission, and cutover refuses
     /// without it), the ORS owner's durably held stream binding
@@ -566,6 +575,7 @@ impl KernelBackupRestore {
         plan: &RestorePlan,
         bundle: &BackupBundle,
         receipt: &RestoreReceipt,
+        evidence: Option<&RestoreEvidence>,
         destination: &KernelIsolatedDestination,
         auth: Option<&CutoverAuthorization>,
     ) -> Result<CutoverReceipt, KernelRestoreError> {
@@ -580,6 +590,15 @@ impl KernelBackupRestore {
                 "restore receipt does not bind this plan and target".to_owned(),
             ));
         }
+        let evidence = evidence.ok_or(KernelRestoreError::OwnerEvidenceInvalid(
+            "no observed restore evidence".to_owned(),
+        ))?;
+        evidence.validate().map_err(KernelRestoreError::TargetFailed)?;
+        evidence
+            .validate_against_plan(plan, bundle)
+            .map_err(KernelRestoreError::TargetFailed)?;
+        require_cutover_obligations(&evidence.obligations, bundle)
+            .map_err(KernelRestoreError::TargetFailed)?;
         if destination.label() != plan.target.target_id
             || !destination.root().starts_with(&self.work_root)
         {
@@ -685,6 +704,85 @@ fn suspended_entries(
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string())),
         None => Ok(Vec::new()),
     }
+}
+
+/// Requires the validation denominator for cutover qualification: every
+/// applicable owner obligation satisfied by its exact owner, with
+/// blob/ORS suspension excused exactly when the archive carries no blobs
+/// or ORS snapshot to suspend.
+///
+/// A `MissingCapability` or `Unknown` anywhere — unresolved effects, stale
+/// authority, unverifiable keys, incomplete closure, absent denominator —
+/// refuses with the exact obligation slot: suspension is not resolution
+/// and a `FullRecovery` class is not operational readiness. An applicable
+/// obligation left `NotAttempted` contradicts the archive the evidence was
+/// built from and fails as corruption rather than qualifying. Known-zero
+/// unresolved work passes only through a satisfied reconciliation
+/// obligation backed by its complete current denominator, which only the
+/// exact reconciliation owner can issue.
+fn require_cutover_obligations(
+    obligations: &RestoreObligations,
+    bundle: &BackupBundle,
+) -> Result<(), BackupError> {
+    fn require(
+        capability: &'static str,
+        obligation: &RestoreOwnerObligation,
+        applicable: bool,
+    ) -> Result<(), BackupError> {
+        match obligation.state {
+            RestoreObligationState::Satisfied => Ok(()),
+            RestoreObligationState::NotAttempted if !applicable => Ok(()),
+            RestoreObligationState::NotAttempted => Err(BackupError::RestoreJournalCorrupt),
+            _ => Err(BackupError::RestoreCapabilityUnsupported { capability }),
+        }
+    }
+    let list: [(&RestoreOwnerObligation, &'static str, bool); 13] = [
+        (&obligations.purge, owners::PURGE, true),
+        (
+            &obligations.canonical_validation,
+            owners::CANONICAL,
+            true,
+        ),
+        (
+            &obligations.reference_validation,
+            owners::REFERENCE,
+            true,
+        ),
+        (
+            &obligations.blob_validation,
+            owners::BLOB,
+            !bundle.blobs.is_empty(),
+        ),
+        (
+            &obligations.ors_suspension,
+            owners::ORS,
+            bundle.ors_snapshot.is_some(),
+        ),
+        (
+            &obligations.unresolved_effect_reconciliation,
+            owners::RECONCILIATION,
+            true,
+        ),
+        (&obligations.watchdog_signals, owners::WATCHDOG, true),
+        (
+            &obligations.external_source_revalidation,
+            owners::EXTERNAL_SOURCE,
+            true,
+        ),
+        (&obligations.runtime_invalidation, owners::RUNTIME, true),
+        (&obligations.session_invalidation, owners::SESSION, true),
+        (&obligations.lease_invalidation, owners::LEASE, true),
+        (&obligations.route_invalidation, owners::ROUTE, true),
+        (
+            &obligations.user_broker_invalidation,
+            owners::USER_BROKER,
+            true,
+        ),
+    ];
+    for (obligation, capability, applicable) in list {
+        require(capability, obligation, applicable)?;
+    }
+    Ok(())
 }
 
 /// Re-reads the evidence file of a resumed run whose finalize executed in a
