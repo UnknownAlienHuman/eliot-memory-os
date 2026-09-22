@@ -802,6 +802,29 @@ impl DaemonKernelClient {
         Self::blocking(async move { client.transact_async(operation, payload).await })
     }
 
+    /// Executes one closed named read on the calling thread through the
+    /// authenticated Kernel route. Mirrors [`Self::store_named_async`]
+    /// for synchronous owners (Governor history acquisition) that cannot
+    /// hold the async runtime across the call.
+    pub(super) fn store_named_blocking(
+        &self,
+        request: NamedReadRequest,
+    ) -> Result<NamedReadResponse, KernelPortError> {
+        let client = self.clone_for_future();
+        Self::blocking(async move {
+            client
+                .store_named_future(request)
+                .await
+                .map_err(|error| match error {
+                    KernelPortError::Contract(reason) => KernelClientError::Contract(reason),
+                    KernelPortError::Unknown(reason) => KernelClientError::Unknown(reason),
+                    KernelPortError::NotAdmitted(reason) => {
+                        KernelClientError::Transport(reason)
+                    }
+                })
+        })
+    }
+
     pub(super) fn request_blocking_with_identity(
         &self,
         operation: &'static str,
@@ -834,6 +857,13 @@ impl DaemonKernelClient {
     /// substitutes the operation or fence; `NotAdmitted` / `Unknown` for
     /// transport outcomes via [`kernel_port_error`].
     pub(super) async fn store_named_async(
+        &self,
+        request: NamedReadRequest,
+    ) -> Result<NamedReadResponse, KernelPortError> {
+        self.store_named_future(request).await
+    }
+
+    async fn store_named_future(
         &self,
         request: NamedReadRequest,
     ) -> Result<NamedReadResponse, KernelPortError> {

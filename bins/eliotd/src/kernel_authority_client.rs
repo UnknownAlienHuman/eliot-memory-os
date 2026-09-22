@@ -47,6 +47,9 @@ const REVOKE_INTRODUCTION_OPERATION: &str = "revoke_introduction";
 /// front-door owner route; until it lands the Kernel rejects the operation
 /// and publishing fails closed through the typed mapping below.
 const PUBLISH_OWNER_BUNDLE_OPERATION: &str = "publish_owner_bundle";
+/// Owner readback query route for publish reconcile: reports whether the
+/// Kernel holds a bound owner plus its exact revision and bundle digest.
+const QUERY_OWNER_BUNDLE_OPERATION: &str = "query_owner_bundle";
 
 const ACTIVATION_RECEIPT_KIND: &str = "authority_activation_receipt";
 const REVOCATION_RECEIPT_KIND: &str = "authority_revocation_receipt";
@@ -88,16 +91,80 @@ impl KernelAuthorityClient {
     /// and acknowledges the bound revision. Until the Kernel serves the
     /// route the call fails closed through the typed transport mapping —
     /// honest diagnosed degradation, never invented rights.
+    /// Publishes one canonical Governor closure restore toward the Kernel
+    /// owner route and returns the exact publish disposition.
+    ///
+    /// The bundle travels the existing daemon→Kernel transport as one JSON
+    /// operation carrying the bundle plus the exact expected revision; the
+    /// Kernel binds it through its composition owner step. An unproven
+    /// outcome preserves the exact published identity
+    /// (`expected_revision` plus `bundle_digest`) for reconcile readback
+    /// instead of collapsing to ordinary unavailable: the caller reconciles
+    /// the Kernel readback before reattempting or claiming the bind.
     pub(crate) fn publish_owner_bundle(
         &self,
         bundle: &eliot_kernel_core::GovernorClosureRestore,
-    ) -> Result<u64, P07PortError> {
+        expected_revision: u64,
+        bundle_digest: &str,
+    ) -> super::owner_bundle_feed::OwnerPublishDisposition {
+        use super::owner_bundle_feed::OwnerPublishDisposition;
         let payload = serde_json::json!({
             "bundle": bundle,
+            "expected_revision": expected_revision,
         });
-        let value = self
+        let value = match self
             .kernel
             .request_blocking(PUBLISH_OWNER_BUNDLE_OPERATION, payload)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return match error {
+                    KernelPortError::NotAdmitted(reason)
+                        if reason == PRE_ADMISSION_RECEIPT_PENDING =>
+                    {
+                        OwnerPublishDisposition::Unavailable
+                    }
+                    KernelPortError::NotAdmitted(_) => OwnerPublishDisposition::NotAdmitted,
+                    KernelPortError::Contract(_) => OwnerPublishDisposition::RefusedBinding,
+                    // Unproven delivery: the bind may have committed before
+                    // the acknowledgement was lost. The exact published
+                    // identity travels with the disposition so the caller
+                    // reconciles the Kernel owner readback before any
+                    // reattempt or claim.
+                    KernelPortError::Unknown(_) => OwnerPublishDisposition::UnknownOutcome {
+                        expected_revision,
+                        bundle_digest: bundle_digest.to_owned(),
+                    },
+                };
+            }
+        };
+        let Ok(value) = kind_value(&value, "owner_bundle_receipt") else {
+            return OwnerPublishDisposition::RefusedBinding;
+        };
+        match value.get("revision").and_then(serde_json::Value::as_u64) {
+            Some(revision) if revision == expected_revision => {
+                OwnerPublishDisposition::Bound { revision }
+            }
+            // The Kernel bound something else (rotation race or a foreign
+            // publisher): never claim this bundle. The caller re-serves
+            // fresh state instead of retrying blindly.
+            Some(_) => OwnerPublishDisposition::RefusedStale,
+            None => OwnerPublishDisposition::RefusedBinding,
+        }
+    }
+
+    /// Queries the Kernel owner readback for reconcile: whether an owner is
+    /// bound and, when bound, its exact revision and bundle digest.
+    ///
+    /// The read carries no effects, so an unproven outcome degrades to
+    /// retryable unavailable; every other failure keeps its typed refusal.
+    pub(crate) fn query_owner_readback(
+        &self,
+    ) -> Result<super::owner_bundle_feed::OwnerReadback, P07PortError> {
+        use super::owner_bundle_feed::OwnerReadback;
+        let value = self
+            .kernel
+            .request_blocking(QUERY_OWNER_BUNDLE_OPERATION, serde_json::json!({}))
             .map_err(|error| match error {
                 KernelPortError::NotAdmitted(reason)
                     if reason == PRE_ADMISSION_RECEIPT_PENDING =>
@@ -106,19 +173,22 @@ impl KernelAuthorityClient {
                 }
                 KernelPortError::NotAdmitted(_) => P07PortError::NotAdmitted,
                 KernelPortError::Contract(_) => P07PortError::InvalidBinding,
-                // An unproven publish outcome is retryable: rebinding the
-                // same bundle is idempotent at the Kernel owner step (same
-                // revision, same watermark, same admitted bytes), so no
-                // reconciliation identity is lost by reporting unavailable.
                 KernelPortError::Unknown(_) => P07PortError::Unavailable,
             })?;
-        let value = kind_value(&value, "owner_bundle_receipt")
-            .map_err(|_| P07PortError::InvalidBinding)?;
-        value
-            .get("revision")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|revision| *revision > 0)
-            .ok_or(P07PortError::InvalidBinding)
+        let value =
+            kind_value(&value, "owner_bundle_readback").map_err(|_| P07PortError::InvalidBinding)?;
+        let bound = value
+            .get("bound")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(P07PortError::InvalidBinding)?;
+        Ok(OwnerReadback {
+            bound,
+            revision: value.get("revision").and_then(serde_json::Value::as_u64),
+            digest: value
+                .get("digest")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        })
     }
 }
 

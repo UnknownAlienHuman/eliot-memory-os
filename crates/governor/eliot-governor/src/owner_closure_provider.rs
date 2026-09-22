@@ -238,6 +238,12 @@ impl OwnerClosureProvider {
         &self.state_fence
     }
 
+    /// Returns the validated owner snapshot this provider restored from.
+    #[must_use]
+    pub const fn owner_snapshot(&self) -> &AuthorityOwnerSnapshot {
+        &self.snapshot
+    }
+
     /// Returns the distinct lineage roots in the restored snapshot, sorted.
     #[must_use]
     pub fn authority_roots(&self) -> Vec<String> {

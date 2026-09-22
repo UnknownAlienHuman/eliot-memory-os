@@ -29,7 +29,7 @@ use super::{
     RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
     StartupCoordinator, StateFence, UserOwnedPathLease, UserOwnedRootLease,
     WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
-    sha256_hex, sha256_json, unix_ms,
+    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -362,6 +362,8 @@ impl KernelComposition {
             EntrypointStage::Composition,
             "kernel.composition.p07_owner_bind_started",
         );
+        let digest = owner_bundle_digest(&restore)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         let store: Arc<dyn OperationalRecoveryStore> =
             Arc::clone(&self.p07_ors) as Arc<dyn OperationalRecoveryStore>;
         let bound = bind_canonical_owner(restore, expected_revision, store).inspect_err(|_| {
@@ -378,6 +380,12 @@ impl KernelComposition {
                 KernelBuildError::Service("P-07 owner lock poisoned".to_owned())
             })?
             .replace(bound);
+        self.p07_owner_digest
+            .lock()
+            .map_err(|_| {
+                KernelBuildError::Service("P-07 owner lock poisoned".to_owned())
+            })?
+            .replace(digest);
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
             "kernel.composition.p07_owner_bound",
@@ -406,10 +414,17 @@ impl KernelComposition {
                 "P-07 owner refresh requires a bound owner".to_owned(),
             ));
         };
+        let digest = owner_bundle_digest(&restore)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         bound
             .refresh(restore, expected_revision, &store)
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
-        Ok(bound.bound_revision())
+        let revision = bound.bound_revision();
+        self.p07_owner_digest
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+            .replace(digest);
+        Ok(revision)
     }
 
     /// Rebinds the P-07 owner after a restart: binds when no owner is
@@ -440,6 +455,24 @@ impl KernelComposition {
             .lock()
             .ok()
             .and_then(|guard| guard.as_ref().map(BoundCanonicalOwner::bound_revision))
+    }
+
+    /// Returns the owner readback triple for reconcile queries: whether an
+    /// owner is bound, its exact revision, and the canonical digest of the
+    /// bound bundle bytes. The Governor feed compares all three against
+    /// what it served before claiming a publish committed.
+    #[must_use]
+    pub fn p07_owner_readback(&self) -> (bool, Option<u64>, Option<String>) {
+        let owner = self.p07_owner.lock().ok();
+        let digest = self.p07_owner_digest.lock().ok();
+        match (owner, digest) {
+            (Some(owner), Some(digest)) => {
+                let record = owner.as_ref().map(BoundCanonicalOwner::bound_revision);
+                let proof = digest.as_ref().cloned();
+                (record.is_some(), record, proof)
+            }
+            _ => (false, None, None),
+        }
     }
 
     fn assemble_with_process_authority(
@@ -1251,6 +1284,7 @@ impl KernelComposition {
         observe_entrypoint(EntrypointStage::Composition);
         Ok(Self {
             p07_owner: Mutex::new(None),
+            p07_owner_digest: Mutex::new(None),
             p07_ors: Arc::clone(&ors),
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,

@@ -38,8 +38,7 @@ use eliot_authority::{
     GrantGraph, GrantGraphRecoverySnapshot, GrantId, RevocationHistoryEvidence,
 };
 
-use crate::error::{KernelError, validate_id};
-use crate::grant_activation_port::{
+use crate::error::{KernelError, validate_id};use crate::grant_activation_port::{
     GrantClosureEnumeration, GrantClosureMember, GrantClosureSurvivor, RootGrantHydration,
     RootGrantHydrationSource,
 };

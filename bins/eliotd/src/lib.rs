@@ -154,7 +154,9 @@ pub use governor_local_read::{
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use owner_bundle_feed::{
-    OwnerBundleFeed, build_owner_feed, persist_owner_feed, publish_owner_bundle,
+    OwnerBundleFeed, OwnerFeedAttach, OwnerFeedMaintenance, OwnerPublishDisposition, OwnerReadback,
+    PublishReconcile, attach_owner_feed, build_owner_feed, maintain_owner_feed,
+    maintain_owner_feed_slot, persist_owner_feed, publish_owner_bundle, reconcile_owner_publish,
 };
 pub use process_origin::{
     CapabilityEvidenceSource, Generation, OperationDisposition,

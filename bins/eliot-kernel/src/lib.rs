@@ -218,7 +218,7 @@ use eliot_ipc::{
 use eliot_kernel_core::{
     AuthoritySnapshotBinding, BoundCanonicalOwner, DispatchSnapshotCodec, GenerationRoute,
     GenerationRouter, GovernorClosureRestore, KernelError, ProcessDispatchAuthorityController,
-    RouteScope, bind_canonical_owner,
+    RouteScope, bind_canonical_owner, owner_bundle_digest,
 };
 #[cfg(windows)]
 pub use eliot_kernel_service::KernelStoreGateway;
@@ -540,6 +540,10 @@ pub struct KernelComposition {
     /// admitted revision. Refresh and recovery rebind through the same
     /// retained ORS handle below, never through a second store.
     p07_owner: Mutex<Option<BoundCanonicalOwner>>,
+    /// Canonical content digest of the bound owner bundle, computed by the
+    /// one shared definition both sides call. The owner readback serves it
+    /// so the Governor feed can prove the Kernel bound its exact bytes.
+    p07_owner_digest: Mutex<Option<String>>,
     /// ORS handle retained for P-07 owner bind/refresh/recovery. Cloned
     /// from the assembly store so later owner operations never reopen the
     /// database file or invent a second recovery store.

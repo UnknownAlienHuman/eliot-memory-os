@@ -344,6 +344,32 @@ pub(super) fn run() -> Result<(), String> {
             .emit();
         }
     }
+    // #2100: attach the canonical Governor P-07 owner feed at the same
+    // site. The feed builds from live Governor state, serves the restore
+    // bundle, publishes it toward the Kernel owner route (reconciling
+    // unproven delivery against the exact published identity), and persists
+    // the admitted registry. A degraded attach never fails readiness: the
+    // owner feed is not readiness-gating, and the loop maintenance below
+    // retries it. No thread, no run-loop change at this site.
+    let owner_feed = match eliotd::attach_owner_feed(&composition, &kernel) {
+        (slot, eliotd::OwnerFeedAttach::Ready { revision }) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.owner_feed_attached",
+                revision = revision,
+            );
+            slot
+        }
+        (slot, eliotd::OwnerFeedAttach::Unavailable { reason }) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "owner-feed",
+                &reason,
+            )
+            .emit();
+            slot
+        }
+    };
     kernel.report_ready().map_err(|error| error.to_string())?;
     // The local-read poller below drives Skill pairs through the composition
     // inside its flight future: share it here so the future owns its handle.
@@ -377,7 +403,11 @@ pub(super) fn run() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    let loop_result = runtime.block_on(run_loop(Arc::clone(&kernel), Arc::clone(&composition)));
+    let loop_result = runtime.block_on(run_loop(
+        Arc::clone(&kernel),
+        Arc::clone(&composition),
+        Arc::clone(&owner_feed),
+    ));
     // The loop dropped its handle on return, so this unwrap is deterministic;
     // the error arm documents the invariant instead of panicking on it.
     let shutdown_result = Arc::try_unwrap(composition)
@@ -632,6 +662,7 @@ impl LoopCadence {
 async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
     composition: Arc<DaemonComposition>,
+    owner_feed: Arc<std::sync::Mutex<Option<eliotd::OwnerBundleFeed>>>,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
     // Sole owner of activation state. No second owner and no second
@@ -643,6 +674,10 @@ async fn run_loop(
     // off until the next tick, while a claimed pair forwards through the
     // Kernel `local_read` leg and submits its result body before idling.
     let mut local_read_flight = LocalReadFlight::Idle;
+    // Owner-feed maintenance counter: the feed pass runs on every twelfth
+    // heartbeat (~60s), detached on the blocking pool so the loop never
+    // stalls on transport round trips.
+    let mut owner_feed_ticks: u64 = 0;
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
@@ -726,7 +761,62 @@ async fn run_loop(
                 KernelTransitionPort::health(&*kernel)
                     .await
                     .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
+                // #2100: owner-feed maintenance on every twelfth heartbeat.
+                // Detached onto the blocking pool: the pass performs
+                // blocking transport round trips that must never stall the
+                // loop. Outcomes are traced inside the pass; degradation
+                // retries on a later pass and never fails the daemon.
+                owner_feed_ticks = owner_feed_ticks.wrapping_add(1);
+                if owner_feed_ticks % 12 == 0 {
+                    let feed = Arc::clone(&owner_feed);
+                    let kernel = Arc::clone(&kernel);
+                    // Weak composition handle: a mid-flight pass must never
+                    // pin the composition past loop exit and fail the
+                    // shutdown unwrap. A gone composition skips the pass.
+                    let composition = Arc::downgrade(&composition);
+                    tokio::task::spawn_blocking(move || {
+                        if let Some(composition) = composition.upgrade() {
+                            maintain_owner_feed_pass(&feed, &composition, &kernel);
+                        }
+                    });
+                }
             }
+        }
+    }
+}
+
+/// Runs one detached owner-feed maintenance pass, tracing its outcome.
+/// Degradation is diagnostic-only: the daemon continues and a later pass
+/// retries. No partial publish is ever claimed.
+fn maintain_owner_feed_pass(
+    feed: &Arc<std::sync::Mutex<Option<eliotd::OwnerBundleFeed>>>,
+    composition: &Arc<DaemonComposition>,
+    kernel: &Arc<DaemonKernelClient>,
+) {
+    match eliotd::maintain_owner_feed_slot(feed, composition, kernel) {
+        eliotd::OwnerFeedMaintenance::NoFeed => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.owner_feed_maintenance",
+                outcome = "no_feed",
+            );
+        }
+        eliotd::OwnerFeedMaintenance::Unchanged => {}
+        eliotd::OwnerFeedMaintenance::Published { revision } => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.owner_feed_maintenance",
+                outcome = "published",
+                revision = revision,
+            );
+        }
+        eliotd::OwnerFeedMaintenance::Degraded { reason } => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "owner-feed",
+                &reason,
+            )
+            .emit();
         }
     }
 }

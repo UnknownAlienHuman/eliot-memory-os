@@ -50,7 +50,7 @@ pub use authority_controller::{
     SealedAuthoritySnapshot, process_admission_digest,
 };
 pub use error::{KernelError, KernelResult};
-pub use durable_owner_bootstrap::{BoundCanonicalOwner, bind_canonical_owner};
+pub use durable_owner_bootstrap::{BoundCanonicalOwner, bind_canonical_owner, owner_bundle_digest};
 pub use grant_activation_port::{
     CommittedReceipt, GrantActivationIntent, GrantActivationPort, GrantClosureActivationIntent,
     GrantClosureEnumeration, GrantClosureMember, GrantClosureReceipt, GrantClosureRevocationIntent,

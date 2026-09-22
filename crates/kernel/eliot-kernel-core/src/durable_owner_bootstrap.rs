@@ -158,6 +158,27 @@ impl BoundCanonicalOwner {
     }
 }
 
+/// Computes the canonical content digest of one owner bundle.
+///
+/// The Kernel composition records this digest beside the binding and the
+/// daemon feed computes it before publishing; a readback digest comparison
+/// then proves the Kernel bound the exact bundle the Governor served —
+/// never merely the same revision. Both sides call this one definition
+/// over the same bytes, so the digests agree by construction.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] when the bundle cannot be
+/// rendered into canonical bytes.
+pub fn owner_bundle_digest(restore: &GovernorClosureRestore) -> Result<String, KernelError> {
+    let bytes =
+        eliot_contracts::canonical_json_bytes(restore).map_err(|_| KernelError::InvalidField {
+            field: "restore",
+            reason: "owner bundle digest serialization failed",
+        })?;
+    Ok(eliot_contracts::sha256_hex(&bytes))
+}
+
 impl std::fmt::Debug for BoundCanonicalOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
