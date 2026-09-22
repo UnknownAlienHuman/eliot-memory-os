@@ -35,6 +35,7 @@ pub use eliot_agent_bridge_core::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
+use eliot_contracts::sha256_hex;
 use eliot_mcp::{HostInvocationOutcome, KernelHostRequestPort, ResponseKind};
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
@@ -682,6 +683,40 @@ impl BridgeRunner {
             return None;
         }
         self.core.publish_evidence(bytes).ok()
+    }
+    /// Publishes one owner-served snapshot at its exact canonical URI and
+    /// returns its bounded hot-response projection.
+    ///
+    /// `uri_text` is the exact resource identity the serving owner attested,
+    /// `content` the exact bytes served, and `content_sha256` the owner-side
+    /// digest over those bytes (lowercase SHA-256 hex). Canonical grammar is
+    /// enforced by [`ResourceUri::parse`]; the digest is re-verified here
+    /// before anything lands, so a mismatch withholds with
+    /// [`BridgeError::ProviderContract`] and publishes nothing — opaque
+    /// bytes are never relabelled at a caller-named URI. The 1MiB ceiling
+    /// and the immutable-conflict rule are enforced inside
+    /// [`Self::publish_canonical_resource`]. Requires the live attach, which
+    /// is the scope authorization on resolution.
+    ///
+    /// The caller (result-flow composition) owns the remaining invocation
+    /// binding: it passes only the URI named by the explicitly queried tool,
+    /// only bytes and a digest carried by the same digest-bound authenticated
+    /// outcome, and only when the served session/fence echo the live attach
+    /// binding. This function mints no addressability beyond what the owner
+    /// served.
+    pub fn publish_served_snapshot(
+        &mut self,
+        uri_text: &str,
+        content: Vec<u8>,
+        content_sha256: &str,
+    ) -> Result<HotResourceView, BridgeError> {
+        let uri = ResourceUri::parse(uri_text)?;
+        if sha256_hex(&content) != content_sha256 {
+            return Err(BridgeError::ProviderContract(
+                "served snapshot digest does not bind the exact bytes".to_owned(),
+            ));
+        }
+        self.publish_canonical_resource(&uri, content)
     }
     /// Notes the owner-supplied bootstrap context for this session.
     ///

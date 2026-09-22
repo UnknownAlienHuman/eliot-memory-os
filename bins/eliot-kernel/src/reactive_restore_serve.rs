@@ -14,11 +14,17 @@
 //! `agent_host_request_reactive_restore` arm admits the envelope, decodes
 //! the query, and calls [`serve_reactive_restore`] with the retained store
 //! gateway client, the live service, and the envelope-admitted session.
-//! This file declares no `mod`, op constant, or dispatch arm.
+//! The invoke-read arm branches explicitly queried URIs to
+//! [`serve_exact_resource_snapshot`] instead of the named-query route,
+//! pairs the served bytes/digest with the admitted URI, and answers through
+//! the existing digest-bound result body. This file declares no `mod`, op
+//! constant, or dispatch arm.
 
+use eliot_contracts::StateFence;
 use eliot_kernel_service::{
     AuthenticatedReactiveSession, KernelService, ReactiveLedgerReadRequest, ReactiveServiceError,
-    ResourceSnapshotReadRequest, handle_reactive_ledger_read, handle_resource_snapshot_read,
+    ResourceSnapshotReadRequest, ResourceSnapshotReadResponse, handle_reactive_ledger_read,
+    handle_resource_snapshot_read,
 };
 use eliot_protocol::{ReactiveRestoreQuery, ReactiveRestoreReply, RestoredSnapshot};
 use eliot_store_api::{CanonicalStoreClient, RequestMetadata};
@@ -89,6 +95,57 @@ pub async fn serve_reactive_restore(
         snapshots,
         revision,
     })
+}
+
+/// Serve one explicitly queried resource URI against the canonical snapshot
+/// projection, preserving the invocation binding.
+///
+/// `session` is the live-service-bound reactive session, `context` the
+/// route-bound request metadata the arm derives from the admitted envelope,
+/// `fence` the envelope-admitted fence, and `uri` the exact
+/// `exact_resource_uri` text from the linkage-checked tool (never a caller
+/// copy re-typed by the arm). URI shape is validated here with a stable
+/// field path; session/fence authority is enforced inside
+/// [`handle_resource_snapshot_read`] (live-service liveness, context/fence
+/// equality, same-fence `ExactFence` projection). Absence projects explicit
+/// absence (`content == None`, never fabricated); any Store failure aborts
+/// with the runner-bound state untouched upstream.
+pub async fn serve_exact_resource_snapshot(
+    client: &impl CanonicalStoreClient,
+    service: &KernelService,
+    session: &AuthenticatedReactiveSession,
+    context: &RequestMetadata,
+    fence: &StateFence,
+    uri: &str,
+) -> Result<ResourceSnapshotReadResponse, ReactiveServiceError> {
+    bounded_exact_uri(uri)?;
+    handle_resource_snapshot_read(
+        client,
+        service,
+        session,
+        &ResourceSnapshotReadRequest {
+            context: context.clone(),
+            state_fence: fence.clone(),
+            uri: uri.to_owned(),
+        },
+    )
+    .await
+}
+
+/// Validates one explicitly queried resource URI: bounded non-blank wire
+/// text for this path (mirrors the restore carrier text ceiling); canonical
+/// `eliot://` grammar stays with the bridge publish gate, never here.
+fn bounded_exact_uri(uri: &str) -> Result<(), ReactiveServiceError> {
+    if uri.trim().is_empty()
+        || uri.chars().any(char::is_control)
+        || uri.len() > eliot_protocol::MAX_RESTORE_TEXT_BYTES
+    {
+        return Err(ReactiveServiceError::InvalidField {
+            field: "restore.uri",
+            reason: "uri must be bounded non-blank wire text",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -497,6 +554,158 @@ mod tests {
             "snapshot serves byte-identically to the admitted bytes"
         );
         assert_eq!(reply.revision, 1);
+    }
+
+    const EXACT_URI: &str = "eliot://evidence/source-9";
+
+    #[tokio::test]
+    async fn exact_uri_serve_round_trips_bytes_with_owner_digest() {
+        // Invoke-shaped exact-URI seam: bytes admitted through the real
+        // Store snapshot builder serve back byte-identically with the
+        // owner digest the bridge publish gate re-verifies.
+        use eliot_store_memory::MemoryStore;
+
+        let store = MemoryStore::new();
+        let snapshot_bytes = b"snapshot-bytes-9".to_vec();
+        let mutation =
+            resource_snapshot_mutation_request(EXACT_URI.to_owned(), &snapshot_bytes)
+                .expect("snapshot builds");
+        let (ctx, transition) =
+            memory_transition("seed-exact-1", mutation.operation, mutation.parameters);
+        store
+            .apply_transaction(&ctx, transition, &[], &[])
+            .expect("snapshot commits");
+
+        let service = ready_service();
+        let session = live_session(&service);
+        let served = serve_exact_resource_snapshot(
+            &store,
+            &service,
+            &session,
+            &context(),
+            &test_fence(),
+            EXACT_URI,
+        )
+        .await
+        .expect("serve over the reference contour");
+        assert_eq!(
+            served.content.as_deref(),
+            Some(snapshot_bytes.as_slice()),
+            "snapshot serves byte-identically to the admitted bytes"
+        );
+        assert_eq!(
+            served.content_sha256.as_deref(),
+            Some(eliot_contracts::sha256_hex(&snapshot_bytes).as_str()),
+            "served digest binds the exact bytes"
+        );
+        assert_eq!(served.state_fence, test_fence());
+    }
+
+    #[tokio::test]
+    async fn exact_uri_serve_rejects_malformed_uri_shape() {
+        // Shape refusal precedes any Store read: the scripted store below is
+        // never reached for a malformed URI.
+        let service = ready_service();
+        let session = live_session(&service);
+        let store = FakeStore::new(ledger_payload(), snapshot_payload());
+        let oversize = "e".repeat(eliot_protocol::MAX_RESTORE_TEXT_BYTES + 1);
+        for bad in ["   ", "eliot://evidence/so\nurce-9", oversize.as_str()] {
+            let result = serve_exact_resource_snapshot(
+                &store,
+                &service,
+                &session,
+                &context(),
+                &test_fence(),
+                bad,
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(ReactiveServiceError::InvalidField {
+                        field: "restore.uri",
+                        ..
+                    })
+                ),
+                "malformed URI shape must refuse, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_uri_serve_fence_mismatch_refuses_at_live_authority() {
+        let service = ready_service();
+        let session = live_session(&service);
+        let store = FakeStore::new(ledger_payload(), snapshot_payload());
+        let rotated = StateFence::new(
+            test_epoch(9),
+            ResourceGeneration::new(7).expect("generation"),
+        );
+        let result = serve_exact_resource_snapshot(
+            &store,
+            &service,
+            &session,
+            &context(),
+            &rotated,
+            EXACT_URI,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ReactiveServiceError::FenceMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_uri_serve_context_fence_divergence_refuses() {
+        // The route-bound context must carry the admitted fence: a context
+        // minted under another fence is not the invocation it claims.
+        let service = ready_service();
+        let session = live_session(&service);
+        let store = FakeStore::new(ledger_payload(), snapshot_payload());
+        let mut diverged = context();
+        diverged.state_fence = StateFence::new(
+            test_epoch(9),
+            ResourceGeneration::new(7).expect("generation"),
+        );
+        let result = serve_exact_resource_snapshot(
+            &store,
+            &service,
+            &session,
+            &diverged,
+            &test_fence(),
+            EXACT_URI,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ReactiveServiceError::FenceMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_uri_absent_projects_explicit_absence() {
+        // No durable snapshot for the URI serves explicit absence through
+        // the production path: no bytes, no digest, never fabricated.
+        let service = ready_service();
+        let session = live_session(&service);
+        let store = FakeStore::new(
+            ledger_payload(),
+            serde_json::json!({"revision": 6}),
+        );
+        let served = serve_exact_resource_snapshot(
+            &store,
+            &service,
+            &session,
+            &context(),
+            &test_fence(),
+            EXACT_URI,
+        )
+        .await
+        .expect("absence serves");
+        assert!(served.content.is_none());
+        assert!(served.content_sha256.is_none());
+        assert_eq!(served.revision, 6);
     }
 
     #[tokio::test]
