@@ -155,12 +155,11 @@ pub use governor_local_read::{
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use process_origin::{
-    CapabilityEvidenceSource, Generation, OperationDisposition,
-    OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant,
-    OriginControlOperation, OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY,
-    PhysicalProcessBinding, ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError,
-    ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
-    request_origin_control,
+    CapabilityEvidenceSource, Generation, OperationDisposition, OriginChallenge,
+    OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
+    OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY, PhysicalProcessBinding,
+    ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError, ProcessOriginEvidence,
+    ProcessStatusReceipt, canonical_origin_digest, gate_process_control, request_origin_control,
 };
 pub use reactive_feed::{
     BorrowedReactiveFeedOwner, ReactiveFeedOwnerSnapshot, ReactiveFeedOwnerSource,
@@ -378,6 +377,9 @@ impl DaemonComposition {
             &config.launch().kernel,
             QueueLimits::default(),
         )?;
+        let reactive_feed_source = Arc::new(reactive_feed::GovernorReactiveFeedSource::new(
+            governor.reactive_owner_suppliers(),
+        ));
         Ok(Self {
             governor,
             config_lease,
@@ -393,7 +395,7 @@ impl DaemonComposition {
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
-            reactive_feed_source: None,
+            reactive_feed_source: Some(reactive_feed_source),
         })
     }
 
@@ -489,6 +491,84 @@ impl DaemonComposition {
         Ok(())
     }
 
+    /// Publishes the owner-issued A15 context view through the Governor's
+    /// authenticated projection boundary.
+    pub fn publish_reactive_context_view(
+        &self,
+        now: u64,
+        view: eliot_context_contracts::ContextPlanningView,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_context_view(now, view)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes the owner-issued A10 cue activation through the Governor.
+    pub fn publish_reactive_cue_activation(
+        &self,
+        now: u64,
+        cue: eliot_reactive_context_plan::ReactiveCueActivation,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_cue_activation(now, cue)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes the session owner's retained delivery snapshot.
+    pub fn publish_reactive_session_delivery(
+        &self,
+        now: u64,
+        session: eliot_context_contracts::SessionDeliverySnapshot,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_session_delivery(now, session)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes the attention owner's retained critical-attention projection.
+    pub fn publish_reactive_critical_attention(
+        &self,
+        now: u64,
+        attention: eliot_context_contracts::CriticalAttentionProjection,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_critical_attention(now, attention)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes the verified coverage/watchdog/trace projection.
+    pub fn publish_reactive_integration_coverage(
+        &self,
+        now: u64,
+        coverage: eliot_context_contracts::IntegrationCoverageProfile,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_integration_coverage(now, coverage)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes the policy owner's exact delivery policy.
+    pub fn publish_reactive_delivery_policy(
+        &self,
+        now: u64,
+        policy: eliot_reactive_context_plan::ReactiveDeliveryPolicy,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_delivery_policy(now, policy)
+            .map_err(DaemonError::Composition)
+    }
+
+    /// Publishes retained cue/index rows from the cue and context owners.
+    pub fn publish_reactive_owner_sources(
+        &self,
+        now: u64,
+        sources: Vec<eliot_governor::ReactiveOwnerSource>,
+    ) -> Result<(), DaemonError> {
+        self.governor
+            .publish_reactive_owner_sources(now, sources)
+            .map_err(DaemonError::Composition)
+    }
+
     /// Drives the registered owner source from the existing activation-poll
     /// cadence. `None` means no A4 source has been registered yet; it is an
     /// explicit unconfigured state and never a fabricated empty feed.
@@ -502,17 +582,30 @@ impl DaemonComposition {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
-        let snapshot = self
+        let Some(snapshot) = self
             .governor
-            .read_unique_agent_activation(now)
-            .map_err(DaemonError::Composition)?;
-        reactive_feed::drive_daemon_feed_from_source(
+            .prepare_reactive_feed_tick(now)
+            .map_err(DaemonError::Composition)?
+        else {
+            return Ok(None);
+        };
+        match reactive_feed::drive_daemon_feed_from_source(
             &snapshot,
             &self.governor.owners().observation,
             source.as_ref(),
-        )
-        .map(Some)
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+        ) {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(reactive_feed::ReactiveFeedSupplyError::OwnerWithheld { projection, reason }) => {
+                tracing::debug!(
+                    target: "eliotd::reactive_feed",
+                    projection,
+                    reason = %reason,
+                    event = "eliotd.reactive_feed_withheld",
+                );
+                Ok(None)
+            }
+            Err(error) => Err(DaemonError::Lifecycle(error.to_string())),
+        }
     }
 
     /// Drives one reactive Context feed from the live daemon composition.

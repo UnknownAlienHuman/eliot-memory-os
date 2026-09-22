@@ -25,14 +25,15 @@
 //! ```
 //!
 //! The runtime source is deliberately owner-shaped: each six-input method is
-//! called for the fresh authenticated activation, and the returned values are
-//! validated before the planner runs. Current main has no registered source
-//! for those typed projections yet; the scheduler therefore reports an
-//! explicit unconfigured state and never fills the gap with an empty view,
-//! policy, receipt, or queue. A3's Kernel/resource expansion and the A4
-//! owning lanes can register their concrete source through the public seam.
+//! read for the fresh authenticated activation, and the returned values are
+//! validated before the planner runs. Governor registers one supplier set at
+//! composition startup; until the owning lanes install all six typed values,
+//! the scheduler reports an explicit withheld state and never fills the gap
+//! with an empty view, policy, receipt, or queue.
 
 #![allow(clippy::result_large_err)]
+
+use std::sync::Arc;
 
 use eliot_context_contracts::{
     ContextPlanningView, CriticalAttentionProjection, IntegrationCoverageProfile,
@@ -40,8 +41,9 @@ use eliot_context_contracts::{
 };
 use eliot_contracts::{ArtifactId, SessionId};
 use eliot_governor::{
-    GovernorActivationSnapshot, ReactiveObservationCueProjection, ReactiveOwnerProjection,
-    ReactiveOwnerProjectionError, ReactiveOwnerSource, project_reactive_owner_from_sources,
+    GovernorActivationSnapshot, GovernorReactiveOwnerSuppliers, ReactiveObservationCueProjection,
+    ReactiveOwnerProjection, ReactiveOwnerProjectionError, ReactiveOwnerSource,
+    project_reactive_owner_from_sources,
 };
 use eliot_observation::ObservationJournal;
 use eliot_reactive_context_plan::{
@@ -67,6 +69,13 @@ pub enum ReactiveFeedSupplyError {
     OwnerFeedBindingMismatch { field: &'static str },
     /// A named owner could not supply one of the six typed feed projections.
     OwnerRead {
+        projection: &'static str,
+        reason: String,
+    },
+    /// The one registered Governor owner has not received all six real
+    /// projections for this activation. The scheduler withholds the tick;
+    /// it does not manufacture an empty plan or treat the source as absent.
+    OwnerWithheld {
         projection: &'static str,
         reason: String,
     },
@@ -102,6 +111,10 @@ impl std::fmt::Display for ReactiveFeedSupplyError {
                     "reactive feed owner read {projection} failed: {reason}"
                 )
             }
+            Self::OwnerWithheld { projection, reason } => write!(
+                formatter,
+                "reactive feed owner {projection} is withheld: {reason}"
+            ),
             Self::OwnerInputInvalid { projection, reason } => write!(
                 formatter,
                 "reactive feed owner projection {projection} is invalid: {reason}"
@@ -122,6 +135,15 @@ impl std::error::Error for ReactiveFeedSupplyError {}
 /// lane; this boundary does not construct a projection, seal a digest, or
 /// substitute an empty value.
 pub trait ReactiveFeedOwnerSource: Send + Sync {
+    /// Reports a truthful absence before individual projection reads. Existing
+    /// external sources default to `Ready`; the Governor adapter uses this to
+    /// distinguish an unpublished owner set from malformed/stale state.
+    fn availability(
+        &self,
+        _activation: &GovernorActivationSnapshot,
+    ) -> ReactiveFeedOwnerAvailability {
+        ReactiveFeedOwnerAvailability::Ready
+    }
     /// Read the assembled A15 context view for the exact activation.
     fn read_context_view(
         &self,
@@ -161,6 +183,114 @@ pub trait ReactiveFeedOwnerSource: Send + Sync {
     ) -> Result<Vec<ReactiveOwnerSource>, String>;
 }
 
+/// Read status of the one registered owner source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReactiveFeedOwnerAvailability {
+    /// A read may proceed. A later read can still fail closed for stale data.
+    Ready,
+    /// The owner has no current six-projection publication yet.
+    Withheld {
+        projection: &'static str,
+        reason: String,
+    },
+}
+
+/// Concrete daemon adapter over the Governor's retained six-projection owner.
+///
+/// It reads one clone of the owner publication for each typed method; the
+/// owner validates the same activation on every read. This adapter retains no
+/// queue, source history, planner state, or receipt authority.
+pub struct GovernorReactiveFeedSource {
+    owner: Arc<GovernorReactiveOwnerSuppliers>,
+}
+
+impl GovernorReactiveFeedSource {
+    /// Installs the read-only adapter over the Governor owner.
+    #[must_use]
+    pub fn new(owner: Arc<GovernorReactiveOwnerSuppliers>) -> Self {
+        Self { owner }
+    }
+}
+
+impl ReactiveFeedOwnerSource for GovernorReactiveFeedSource {
+    fn availability(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> ReactiveFeedOwnerAvailability {
+        match self.owner.is_ready_for(activation) {
+            Ok(true) => ReactiveFeedOwnerAvailability::Ready,
+            Ok(false) => ReactiveFeedOwnerAvailability::Withheld {
+                projection: "six_owner_projections",
+                reason: "no current owner publication".to_owned(),
+            },
+            Err(_error) => ReactiveFeedOwnerAvailability::Ready,
+        }
+    }
+
+    fn read_context_view(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<ContextPlanningView, String> {
+        self.owner
+            .read_context_view(activation)
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_cue_activation(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<eliot_reactive_context_plan::ReactiveCueActivation, String> {
+        self.owner
+            .read_cue_activation(activation)
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_session_snapshot(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<SessionDeliverySnapshot, String> {
+        self.owner
+            .read_session_delivery(activation)
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_critical_attention(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<CriticalAttentionProjection, String> {
+        self.owner
+            .read_critical_attention(activation)
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_integration_coverage(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<IntegrationCoverageProfile, String> {
+        self.owner
+            .read_integration_coverage(activation)
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_policy(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<eliot_reactive_context_plan::ReactiveDeliveryPolicy, String> {
+        self.owner
+            .read_delivery_policy(activation)
+            .map_err(|error| error.to_string())
+    }
+
+    fn read_owner_sources(
+        &self,
+        activation: &GovernorActivationSnapshot,
+    ) -> Result<Vec<ReactiveOwnerSource>, String> {
+        self.owner
+            .read_owner_sources(activation)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// One immutable set of owner outputs captured for one authenticated tick.
 ///
 /// The snapshot is a transport-free composition value. It is not retained by
@@ -191,6 +321,11 @@ impl ReactiveFeedOwnerSnapshot {
         activation: &GovernorActivationSnapshot,
         source: &dyn ReactiveFeedOwnerSource,
     ) -> Result<Self, ReactiveFeedSupplyError> {
+        if let ReactiveFeedOwnerAvailability::Withheld { projection, reason } =
+            source.availability(activation)
+        {
+            return Err(ReactiveFeedSupplyError::OwnerWithheld { projection, reason });
+        }
         let snapshot = Self {
             owner_sources: source.read_owner_sources(activation).map_err(|reason| {
                 ReactiveFeedSupplyError::OwnerRead {

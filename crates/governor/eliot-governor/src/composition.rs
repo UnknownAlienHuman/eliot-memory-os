@@ -20,6 +20,11 @@ use crate::controlboard_projection::{
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::reactive_owner_projection::ReactiveOwnerSource;
+use crate::reactive_owner_suppliers::GovernorReactiveOwnerSuppliers;
+use crate::reactive_projections::{
+    ReactiveProjectionError, accepted_evidence_for, validate_owner_sources,
+};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
@@ -35,6 +40,10 @@ use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
+use eliot_context_contracts::{
+    ContextPlanningView, CriticalAttentionProjection,
+    IntegrationCoverageProfile as ReactiveIntegrationCoverageProfile, SessionDeliverySnapshot,
+};
 use eliot_contracts::{
     EpochId, OperationId, ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes,
     sha256_hex,
@@ -48,6 +57,7 @@ use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_protocol::RequestIdentity;
+use eliot_reactive_context_plan::{ReactiveCueActivation, ReactiveDeliveryPolicy};
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
@@ -1646,6 +1656,10 @@ pub struct GovernorComposition<P: ?Sized> {
     authority_activation: Option<Arc<dyn P07AuthorityPort>>,
     governor: Governor,
     owners: GovernorOwners<P>,
+    /// Fence-keyed read projection for the reactive planning inputs. The
+    /// projection owner is separate from the observation journal and owns no
+    /// queue, receipt, or canonical write path.
+    reactive_suppliers: Arc<GovernorReactiveOwnerSuppliers>,
     snapshot: KernelGenerationSnapshot,
     recovery: GovernorRecoverySnapshot,
     service_observations: Vec<KernelServiceRecovery>,
@@ -1714,11 +1728,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             snapshot.protected_snapshot_digest.clone(),
             &recovery,
         )?;
+        let reactive_suppliers = Arc::new(
+            GovernorReactiveOwnerSuppliers::new(state_fence.clone())
+                .map_err(|error| CompositionError::Owner(error.to_string()))?,
+        );
         Ok(Self {
             kernel,
             authority_activation,
             governor,
             owners,
+            reactive_suppliers,
             snapshot,
             recovery,
             service_observations,
@@ -1731,6 +1750,157 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    /// Returns the one read-only reactive supplier set used by the daemon
+    /// scheduler. The handle carries no mutable authority outside Governor.
+    #[must_use]
+    pub fn reactive_owner_suppliers(&self) -> Arc<GovernorReactiveOwnerSuppliers> {
+        Arc::clone(&self.reactive_suppliers)
+    }
+
+    /// Publishes the retained A15 context view from its semantic owner.
+    ///
+    /// Governor obtains the activation and accepted-evidence binding itself;
+    /// the caller supplies only the already-owned, fully typed view. Missing
+    /// sibling projections remain an explicit withheld scheduler state.
+    pub fn publish_reactive_context_view(
+        &self,
+        now: u64,
+        view: ContextPlanningView,
+    ) -> Result<(), CompositionError> {
+        let (activation, evidence) = self.reactive_publication_binding(now)?;
+        self.reactive_suppliers
+            .install_context_view(activation, evidence, view)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Publishes the retained A10 cue request/result pair from its cue owner.
+    pub fn publish_reactive_cue_activation(
+        &self,
+        now: u64,
+        cue: ReactiveCueActivation,
+    ) -> Result<(), CompositionError> {
+        let (activation, evidence) = self.reactive_publication_binding(now)?;
+        self.reactive_suppliers
+            .install_cue_activation(activation, evidence, cue)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Publishes the session owner's retained delivery history for the live
+    /// task/session/fence.
+    pub fn publish_reactive_session_delivery(
+        &self,
+        now: u64,
+        session: SessionDeliverySnapshot,
+    ) -> Result<(), CompositionError> {
+        let (activation, evidence) = self.reactive_publication_binding(now)?;
+        self.reactive_suppliers
+            .install_session_delivery(activation, evidence, session)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Publishes the attention owner's retained conflict/attention projection.
+    pub fn publish_reactive_critical_attention(
+        &self,
+        now: u64,
+        attention: CriticalAttentionProjection,
+    ) -> Result<(), CompositionError> {
+        let (activation, evidence) = self.reactive_publication_binding(now)?;
+        self.reactive_suppliers
+            .install_critical_attention(activation, evidence, attention)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Publishes the verified host/runtime/interface coverage and watchdog
+    /// trace projection from its coverage owner.
+    pub fn publish_reactive_integration_coverage(
+        &self,
+        now: u64,
+        coverage: ReactiveIntegrationCoverageProfile,
+    ) -> Result<(), CompositionError> {
+        let (activation, evidence) = self.reactive_publication_binding(now)?;
+        self.reactive_suppliers
+            .install_integration_coverage(activation, evidence, coverage)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Publishes the policy owner's exact delivery policy for the admitted
+    /// plan. The policy snapshot identity is checked against the retained
+    /// Policy owner before it can enter the reactive source.
+    pub fn publish_reactive_delivery_policy(
+        &self,
+        now: u64,
+        policy: ReactiveDeliveryPolicy,
+    ) -> Result<(), CompositionError> {
+        let (activation, evidence) = self.reactive_publication_binding(now)?;
+        let policy_owner = self.owners.policy.as_ref().ok_or_else(|| {
+            CompositionError::Owner(
+                "reactive delivery policy owner is unavailable; projection withheld".to_owned(),
+            )
+        })?;
+        if policy_owner.state_fence() != &activation.state_fence
+            || policy_owner.snapshot().state_fence != activation.state_fence
+            || policy_owner.snapshot().scope_id != activation.work_scope_id
+            || policy.policy_id.as_str() != policy_owner.snapshot().snapshot_id
+        {
+            return Err(CompositionError::Owner(
+                "reactive delivery policy is not bound to the admitted Policy owner".to_owned(),
+            ));
+        }
+        self.reactive_suppliers
+            .install_delivery_policy(activation, evidence, policy)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Publishes the retained cue/index rows supplied by the cue and context
+    /// owners. The Governor journal remains the sole admitted-record source.
+    pub fn publish_reactive_owner_sources(
+        &self,
+        now: u64,
+        sources: Vec<ReactiveOwnerSource>,
+    ) -> Result<(), CompositionError> {
+        let (activation, evidence) = self.reactive_publication_binding(now)?;
+        validate_owner_sources(&self.owners.observation, &activation, &sources)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        self.reactive_suppliers
+            .install_owner_sources(activation, evidence, sources)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    fn reactive_publication_binding(
+        &self,
+        now: u64,
+    ) -> Result<
+        (
+            GovernorActivationSnapshot,
+            crate::reactive_projections::ReactiveAcceptedEvidence,
+        ),
+        CompositionError,
+    > {
+        let activation = self.read_unique_agent_activation(now)?;
+        let evidence = accepted_evidence_for(&self.owners.observation, &activation)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        Ok((activation, evidence))
+    }
+
+    /// Prepares the one reactive scheduler tick against the current
+    /// activation and accepted observation evidence. Missing accepted evidence
+    /// withholds the tick; it never creates a synthetic owner binding.
+    pub fn prepare_reactive_feed_tick(
+        &self,
+        now: u64,
+    ) -> Result<Option<GovernorActivationSnapshot>, CompositionError> {
+        let activation = self.read_unique_agent_activation(now)?;
+        let evidence = match accepted_evidence_for(&self.owners.observation, &activation) {
+            Ok(evidence) => evidence,
+            Err(ReactiveProjectionError::EvidenceUnavailable) => return Ok(None),
+            Err(error) => return Err(CompositionError::Owner(error.to_string())),
+        };
+        self.reactive_suppliers
+            .prepare_tick(activation.clone(), evidence)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        Ok(Some(activation))
     }
 
     /// Returns the authenticated Kernel snapshot admitted at construction.
@@ -2272,6 +2442,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             protected_snapshot_digest.clone(),
             &recovery,
         )?;
+        self.reactive_suppliers
+            .reset(state_fence.clone())
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
         self.owners = owners;
         self.recovery = recovery;
         self.service_observations = service_observations;
@@ -3775,9 +3948,13 @@ mod tests {
     fn policy_owner_recovers_with_fence_revision_digest_correlation() {
         let observed = snapshot();
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
-        let composition =
-            GovernorComposition::new(Arc::new(fake_kernel(observed.clone())), None, &expected, QueueLimits::default())
-                .expect("composition");
+        let composition = GovernorComposition::new(
+            Arc::new(fake_kernel(observed.clone())),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("composition");
         let policy = composition.owners().policy.as_ref().expect("policy owner");
         assert_eq!(policy.state_fence(), &observed.state_fence());
         assert_eq!(policy.revision(), 1);
@@ -5499,8 +5676,7 @@ mod tests {
         // `PreparedTransition` via `commit_canonical` correlated by
         // `operation_id` / `canonical_request_hash` / `state_fence`.
         let observed = snapshot();
-        let expected =
-            KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let composition = GovernorComposition::new(
             Arc::new(activation_fake(&observed)),
             None,

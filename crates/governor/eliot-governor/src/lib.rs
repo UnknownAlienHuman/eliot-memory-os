@@ -55,7 +55,9 @@ mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_projection_refresh;
 mod reactive_admission;
+mod reactive_projections;
 mod reactive_owner_projection;
+mod reactive_owner_suppliers;
 mod skill_lifecycle;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
@@ -100,6 +102,10 @@ pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_comma
 pub use reactive_admission::{
     ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier, assess_reactive_risk,
 };
+pub use reactive_projections::{
+    GovernorReactiveProjectionOwner, GovernorReactiveProjectionSet, ReactiveProjectionError,
+};
+pub use reactive_owner_suppliers::GovernorReactiveOwnerSuppliers;
 pub use reactive_owner_projection::{
     MAX_REACTIVE_OWNER_RECORDS, ReactiveCueBindingOwner, ReactiveOwnerProjection,
     ReactiveOwnerProjectionError, ReactiveObservationCueProjection, ReactiveOwnerSource,

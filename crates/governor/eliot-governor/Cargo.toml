@@ -13,6 +13,7 @@ eliot-canonical.workspace = true
 eliot-change-monitor.workspace = true
 eliot-config.workspace = true
 eliot-context-candidates = { path = "../../smart/eliot-context-candidates" }
+eliot-context-contracts = { path = "../../smart/eliot-context-contracts" }
 eliot-coordination.workspace = true
 eliot-contracts.workspace = true
 eliot-cue-binding = { path = "../../smart/eliot-cue-binding" }
@@ -32,6 +33,7 @@ eliot-observation-contracts.workspace = true
 eliot-problem.workspace = true
 eliot-protocol.workspace = true
 eliot-read = { path = "../eliot-read" }
+eliot-reactive-context-plan = { path = "../../smart/eliot-reactive-context-plan" }
 eliot-receipts.workspace = true
 eliot-session.workspace = true
 eliot-skill.workspace = true
