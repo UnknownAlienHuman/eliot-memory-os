@@ -316,15 +316,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         foreach (var pending in unknown)
         {
+            // Resend the retained operation: same identity, same expected
+            // revision, same command bytes. No new identity is minted here.
             using var document = JsonDocument.Parse(pending.EnvelopeJson);
-            var envelope = OperatorIntentEnvelope.Create(
+            var reconciling = new OperatorIntentEnvelope(
                 document.RootElement.GetProperty("project_id").GetString()!,
                 document.RootElement.GetProperty("task_id").GetString()!,
                 document.RootElement.GetProperty("expected_revision").GetUInt64(),
+                pending.OperationId,
                 document.RootElement.GetProperty("command").Clone());
-            // Preserve the original identity: reconciliation resends the same
-            // operation, so the minted key is replaced with the retained one.
-            var reconciling = envelope with { OperationId = pending.OperationId };
+            reconciling.Validate();
             await SubmitIntentAsync(reconciling, pending.CommandName, isReconcile: true);
         }
     }
