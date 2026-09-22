@@ -61,6 +61,15 @@ pub(crate) mod table {
     /// row per `occurrence_id` carrying the verbatim invocation document.
     /// Create-only; divergent rewrites fail closed.
     pub(crate) const AUTOMATION_INVOCATION: &str = "automation_invocation";
+    /// Immutable automation failure row per automation + revision +
+    /// fingerprint (issue #1779). One row per canonical failure key
+    /// carrying the verbatim failure document with first-writer
+    /// provenance. Create-or-converge; divergent rewrites fail closed.
+    pub(crate) const AUTOMATION_FAILURE: &str = "automation_failure";
+    /// Last automation failure pointer per automation (issue #1779). One
+    /// row per `automation_id` naming the most recently committed
+    /// failure key. Last write wins; no compare-and-set.
+    pub(crate) const AUTOMATION_LAST_FAILURE: &str = "automation_last_failure";
 }
 
 /// Record key of the single canonical fence/sequence row.

@@ -13,6 +13,7 @@ use std::{cmp::Ordering, collections::BTreeSet};
 use eliot_contracts::{
     ArtifactId, ContractVersion, DecisionId, StateFence, TaskRevision, fences_match_exact,
 };
+use eliot_cue_contracts::CueKind;
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceFreshness};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -556,14 +557,20 @@ impl CriticalAttention {
     }
 }
 
-/// Cue kind used by deterministic push orientation.
+/// Historical cue-kind spellings retained only for explicit legacy decoding.
 ///
-/// Declaration order is the stable ordering used by [`CueIndex`].
+/// The local current `CueKind` duplicate (issue #832 reservation) is removed:
+/// the single current owner is A-10 `eliot_cue_contracts::CueKind`. These
+/// eight spellings preserve the exact historical wire identities
+/// (`SCREAMING_SNAKE_CASE`) so frozen external records stay readable. They
+/// never masquerade as current types: only [`decode_legacy_cue_kind`]
+/// interprets them, and it converts exactly the three evidence-backed
+/// one-to-one kinds.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
 )]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CueKind {
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum LegacyContextCueKind {
     Path,
     Symbol,
     Error,
@@ -572,6 +579,74 @@ pub enum CueKind {
     TaskClass,
     Concept,
     Problem,
+}
+
+/// Bounded failure of historical cue-kind decoding.
+///
+/// Every rejection names its exact disposition: unknown text outside the
+/// eight historical spellings, the ambiguous `Path` split (file versus
+/// directory needs path context this decoder does not have), or an
+/// unsupported legacy kind with no evidence-backed current counterpart.
+/// No caller text is retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyCueKindError {
+    /// Input is outside the eight historical spellings, missing, or empty.
+    UnknownSpelling,
+    /// `Path` cannot split into `FilePath`/`DirPath` without path context.
+    AmbiguousSplit { kind: LegacyContextCueKind },
+    /// Historical kind with no exact current counterpart.
+    UnsupportedLegacy { kind: LegacyContextCueKind },
+}
+
+impl std::fmt::Display for LegacyCueKindError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownSpelling => write!(formatter, "unknown historical cue-kind spelling"),
+            Self::AmbiguousSplit { kind } => write!(
+                formatter,
+                "historical cue kind {kind:?} is ambiguous without path context"
+            ),
+            Self::UnsupportedLegacy { kind } => write!(
+                formatter,
+                "historical cue kind {kind:?} has no exact current counterpart"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LegacyCueKindError {}
+
+/// Decode one historical cue-kind spelling to the current A-10 kind.
+///
+/// Converts exactly `SYMBOL`, `TASK_CLASS`, and `CONCEPT` one-to-one.
+/// `PATH` fails as [`LegacyCueKindError::AmbiguousSplit`];
+/// `ERROR`, `COMMAND`, `SERVICE`, and `PROBLEM` fail as
+/// [`LegacyCueKindError::UnsupportedLegacy`]; anything else (including
+/// empty or differently-cased text) fails as
+/// [`LegacyCueKindError::UnknownSpelling`]. Ambiguous input stays
+/// rejected rather than guessing context.
+pub fn decode_legacy_cue_kind(value: &str) -> Result<CueKind, LegacyCueKindError> {
+    match value {
+        "SYMBOL" => Ok(CueKind::Symbol),
+        "TASK_CLASS" => Ok(CueKind::TaskClass),
+        "CONCEPT" => Ok(CueKind::Concept),
+        "PATH" => Err(LegacyCueKindError::AmbiguousSplit {
+            kind: LegacyContextCueKind::Path,
+        }),
+        "ERROR" => Err(LegacyCueKindError::UnsupportedLegacy {
+            kind: LegacyContextCueKind::Error,
+        }),
+        "COMMAND" => Err(LegacyCueKindError::UnsupportedLegacy {
+            kind: LegacyContextCueKind::Command,
+        }),
+        "SERVICE" => Err(LegacyCueKindError::UnsupportedLegacy {
+            kind: LegacyContextCueKind::Service,
+        }),
+        "PROBLEM" => Err(LegacyCueKindError::UnsupportedLegacy {
+            kind: LegacyContextCueKind::Problem,
+        }),
+        _ => Err(LegacyCueKindError::UnknownSpelling),
+    }
 }
 
 /// Observable event that can activate exact memory handles.
@@ -590,11 +665,16 @@ pub struct ActivationCue {
 
 impl ActivationCue {
     /// Normalize without changing canonical path spelling.
+    ///
+    /// Trim-only applies to path-like and symbol kinds
+    /// (`FilePath`, `DirPath`, `Symbol`), preserving the historical
+    /// `Path`/`Symbol` behavior; every other current kind collapses
+    /// whitespace exactly as before.
     pub fn normalized_value(&self) -> Result<String, ContextError> {
         text(self.scope.as_str(), "cue.scope")?;
         text(self.value.as_str(), "cue.value")?;
         let normalized = match self.kind {
-            CueKind::Path | CueKind::Symbol => self.value.trim().to_owned(),
+            CueKind::FilePath | CueKind::DirPath | CueKind::Symbol => self.value.trim().to_owned(),
             _ => self
                 .value
                 .split_whitespace()
@@ -622,6 +702,10 @@ pub struct CueActivation {
 }
 
 /// Deterministic, model-free cue index projection.
+///
+/// Declaration order follows the single A-10 owner
+/// (`eliot_cue_contracts::CueKind`); this crate defines no kind ordering
+/// of its own.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CueIndex {
     entries: Vec<(String, CueKind, String, Vec<ArtifactId>)>,
@@ -658,7 +742,7 @@ impl CueIndex {
         text(scope, "cue.scope")?;
         text(value, "cue.value")?;
         let normalized = match kind {
-            CueKind::Path | CueKind::Symbol => value.trim().to_owned(),
+            CueKind::FilePath | CueKind::DirPath | CueKind::Symbol => value.trim().to_owned(),
             _ => value
                 .split_whitespace()
                 .collect::<Vec<_>>()
@@ -754,24 +838,38 @@ impl OrientationRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::CueKind;
+    use super::{LegacyContextCueKind, LegacyCueKindError, decode_legacy_cue_kind};
+    use eliot_cue_contracts::CueKind;
 
     #[test]
-    fn cue_kind_order_matches_deterministic_index_contract() {
-        let expected = [
-            CueKind::Path,
-            CueKind::Symbol,
-            CueKind::Error,
-            CueKind::Command,
-            CueKind::Service,
-            CueKind::TaskClass,
-            CueKind::Concept,
-            CueKind::Problem,
-        ];
-        let mut actual = expected;
-        actual.reverse();
-        actual.sort();
-
-        assert_eq!(actual, expected);
+    fn legacy_decoder_covers_all_historical_spellings_explicitly() {
+        assert_eq!(decode_legacy_cue_kind("SYMBOL"), Ok(CueKind::Symbol));
+        assert_eq!(decode_legacy_cue_kind("TASK_CLASS"), Ok(CueKind::TaskClass));
+        assert_eq!(decode_legacy_cue_kind("CONCEPT"), Ok(CueKind::Concept));
+        assert_eq!(
+            decode_legacy_cue_kind("PATH"),
+            Err(LegacyCueKindError::AmbiguousSplit {
+                kind: LegacyContextCueKind::Path
+            })
+        );
+        for (spelling, kind) in [
+            ("ERROR", LegacyContextCueKind::Error),
+            ("COMMAND", LegacyContextCueKind::Command),
+            ("SERVICE", LegacyContextCueKind::Service),
+            ("PROBLEM", LegacyContextCueKind::Problem),
+        ] {
+            assert_eq!(
+                decode_legacy_cue_kind(spelling),
+                Err(LegacyCueKindError::UnsupportedLegacy { kind }),
+                "{spelling} must carry its explicit legacy disposition"
+            );
+        }
+        for unknown in ["", "PATHS", "symbol", "Symbol", "TASK-CLASS", "CONCEPT "] {
+            assert_eq!(
+                decode_legacy_cue_kind(unknown),
+                Err(LegacyCueKindError::UnknownSpelling),
+                "{unknown:?} must stay rejected, never guessed"
+            );
+        }
     }
 }

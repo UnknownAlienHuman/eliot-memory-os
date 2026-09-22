@@ -281,6 +281,7 @@ fn activate_response_uncertainty_reconciles_but_exact_rejection_does_not() -> Te
         request_digest: digest.clone(),
         state: KernelServiceState::Activating,
         receipt: None,
+        runtime_health: None,
         activation_receipt: None,
         store_rebind_receipt: None,
         supervision_lease: None,

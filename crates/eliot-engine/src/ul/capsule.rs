@@ -1,6 +1,6 @@
 use crate::EngineError;
 use eliot_types::{
-    CapsuleBuild, CapsuleFreshness, CoChangeEdge, ConceptNode, CueBinding, CueKind, CueMatchMode,
+    CapsuleBuild, CapsuleFreshness, CoChangeEdge, ConceptNode, CueBinding, LegacyCueKindV1, CueMatchMode,
     CueStrength, DependencyManifest, FileDependency, HotspotScore, ModuleCard, ProjectCharter,
     ProjectId, PyramidBuildStatus, PyramidTargetKind, SubsystemCapsule, SystemFlow, SystemMap,
     inspect_text_encoding, normalize_bindings, path_matches_boundary, ul_token_estimate,
@@ -975,7 +975,7 @@ fn first_non_heading_sentence(content: &str) -> Option<(String, usize, usize)> {
 fn target_cues(value: &str) -> Result<Vec<CueBinding>, EngineError> {
     normalize_bindings(
         vec![CueBinding {
-            cue_kind: CueKind::Concept,
+            cue_kind: LegacyCueKindV1::Concept,
             cue_value: value.to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,

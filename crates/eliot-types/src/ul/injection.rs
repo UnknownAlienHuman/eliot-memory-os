@@ -1,11 +1,11 @@
-use crate::{CueKind, MemoryInfluenceClass, SessionId, TaskId};
+use crate::{LegacyCueKindV1, MemoryInfluenceClass, SessionId, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct ObservedCue {
-    pub kind: CueKind,
+    pub kind: LegacyCueKindV1,
     pub value: String,
 }
 

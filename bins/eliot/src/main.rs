@@ -252,7 +252,7 @@ enum InstallationCommand {
         #[arg(long)]
         transaction_id: Option<String>,
     },
-    /// Materialize an exact twelve-role Phase-A source bundle and feed it through
+    /// Materialize an exact thirteen-role Phase-A source bundle and feed it through
     /// the publication-bound generation planner. `--store` is required because
     /// the durable transaction store is the sole authority for a generated plan.
     MaterializeSourceBundle {
@@ -274,6 +274,8 @@ enum InstallationCommand {
         eliot_testd: PathBuf,
         #[arg(long, value_parser = absolute_path)]
         eliot_native_worker: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_wasm_host: PathBuf,
         /// Optional explicit external agent-bridge executable source. Must be
         /// supplied together with `--agent-bridge-account`.
         #[arg(long, value_parser = absolute_path)]
@@ -1556,6 +1558,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_doctor,
             eliot_testd,
             eliot_native_worker,
+            eliot_wasm_host,
             agent_bridge_exe,
             agent_bridge_account,
             output_bundle,
@@ -1582,6 +1585,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_doctor,
             eliot_testd,
             eliot_native_worker,
+            eliot_wasm_host,
             output_bundle,
             output,
             store,
@@ -1961,6 +1965,7 @@ fn run_installation_materialize_source_bundle(
     eliot_doctor: PathBuf,
     eliot_testd: PathBuf,
     eliot_native_worker: PathBuf,
+    eliot_wasm_host: PathBuf,
     output_bundle: PathBuf,
     output: PathBuf,
     store: PathBuf,
@@ -1988,6 +1993,7 @@ fn run_installation_materialize_source_bundle(
         eliot_doctor_exe: eliot_doctor,
         eliot_testd_exe: eliot_testd,
         eliot_native_worker_exe: eliot_native_worker,
+        eliot_wasm_host_exe: eliot_wasm_host,
         agent_bridge_exe,
         agent_bridge_account,
         output_bundle: output_bundle.clone(),

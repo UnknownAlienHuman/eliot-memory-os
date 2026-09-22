@@ -5,7 +5,7 @@ mod request_input;
 use eliot_agent_bridge::{
     BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError, CurrentAssessment,
     HotResourceView, InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap,
-    kernel_ports_with_declaration, parse_args,
+    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
@@ -547,7 +547,20 @@ fn main() {
         total_records = next_total;
         let mut response = match decode_bounded_request(text) {
             Ok(Request::Attach { request }) => match runner.attach(request) {
-                Ok(_) => Response::Attached { bootstrap: None },
+                Ok(_) => {
+                    // Best-effort durable restore for the fresh attach: a
+                    // refused or absent restore keeps the current empty-ledger
+                    // behavior and is reported on stderr without failing the
+                    // attach that already succeeded.
+                    if let Err(error) = reactive_runtime_composition::restore_reactive_runtime(
+                        &mut runner,
+                        &mut *host_request_port,
+                        &[],
+                    ) {
+                        emit_error("REACTIVE_RESTORE_REFUSED", &error.to_string());
+                    }
+                    Response::Attached { bootstrap: None }
+                }
                 Err(error) => {
                     provider_failure |= matches!(error, BridgeError::PlanGap(_));
                     bridge_error(&error)
@@ -903,7 +916,9 @@ fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'sta
         | ToolRequest::Verify(_)
         | ToolRequest::Coordinate(_)
         | ToolRequest::Finish(_)
-        | ToolRequest::UserAutomation(_) => (
+        | ToolRequest::UserAutomation(_)
+        | ToolRequest::SkillInject(_)
+        | ToolRequest::SkillDisplay(_) => (
             "effectful",
             DRY_RUN_ROUTE_WITHHELD,
             DRY_RUN_UNSUPPORTED_DISPOSITION,
@@ -1533,6 +1548,23 @@ mod tests {
         }
     }"#;
 
+    const DRY_RUN_SKILL: &str = r#"{
+        "op":"dry_run_invoke",
+        "request":{
+            "protocol_version":"2026-07-28",
+            "correlation_id":"host-dryrun-skill-1",
+            "client_capabilities":{"tasks":false},
+            "tool":{"name":"skill.inject","arguments":{"contract_version":1}},
+            "deadline_preference_ms":5000,
+            "observed_context":{
+                "host_session_hint":"host-turn-1",
+                "observed_resource_refs":[],
+                "event_cursors":[],
+                "trace_context":{}
+            }
+        }
+    }"#;
+
     fn dry_run_test_runner() -> BridgeRunner {
         BridgeRunner::new(
             Profile::SpineFunctional,
@@ -1694,6 +1726,36 @@ mod tests {
                 && !evidence.statement.contains("admitted"),
             "unsupported preview must not assert external validation occurred"
         );
+    }
+
+    #[test]
+    fn dry_run_skill_carrier_returns_unsupported_without_dispatch() {
+        // Skill carriers are effectful (install/issue) with no bridge-owned
+        // simulator: the dry run stays a static preview naming the skill
+        // route, dispatching nothing.
+        let Request::DryRunInvoke { request } =
+            serde_json::from_str::<Request>(DRY_RUN_SKILL).expect("dry-run must deserialize")
+        else {
+            panic!("expected dry-run invoke");
+        };
+        assert_eq!(request.tool.canonical_name(), "skill.inject");
+        let runner = dry_run_test_runner();
+        let response = dry_run_invocation(&runner, &request);
+        let Response::DryRun {
+            disposition,
+            preview,
+            evidence,
+            ..
+        } = response
+        else {
+            panic!("skill dry run must stay a dry-run envelope");
+        };
+        assert_eq!(disposition, "DRY_RUN_UNSUPPORTED");
+        assert_eq!(preview.canonical_tool_name.as_deref(), Some("skill.inject"));
+        assert_eq!(preview.effect_class, "effectful");
+        assert_eq!(preview.route, "withheld-no-simulator");
+        assert!(!preview.simulated);
+        assert!(evidence.statement.contains("DRY_RUN_UNSUPPORTED"));
     }
 
     #[test]

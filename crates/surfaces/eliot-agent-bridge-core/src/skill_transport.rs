@@ -19,8 +19,8 @@
 #![forbid(unsafe_code)]
 
 use eliot_skill::{
-    CatalogueInstallContext, HotsetDeliveryAck, HotsetDeliveryReceipt, MaterializationInputs,
-    MaterializationScope, ReadinessClaims, SkillPackage,
+    ActivatedSkillDisplay, CatalogueInstallContext, HotsetDeliveryAck, HotsetDeliveryReceipt,
+    MaterializationInputs, MaterializationScope, ReadinessClaims, SkillPackage,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -36,6 +36,41 @@ pub const MAX_INTAKE_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum encoded ack/display bytes (I7.2 hot-response profile: receipts,
 /// acks, and displays are small bounded projections).
 pub const MAX_CARRY_BYTES: usize = 64 * 1024;
+
+/// Host-request capability and tool name carrying Skill intake.
+///
+/// NOT an MCP hot tool: no semantic profile, never advertised on the MCP
+/// surface, always rejected by profile-driven dispatch. It names the
+/// session-admitted capability for Hotset intake on the host-request
+/// invoke-read leg, where the Kernel linkage rule (tool name equals envelope
+/// capability, digest-bound bytes) applies unchanged.
+pub const SKILL_INJECT_TOOL: &str = "skill.inject";
+/// Host-request capability and tool name carrying Skill display requests.
+/// Same non-MCP status as [`SKILL_INJECT_TOOL`].
+pub const SKILL_DISPLAY_TOOL: &str = "skill.display";
+
+/// Skill tool kinds routable on the host-request channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SkillToolKind {
+    /// Hotset intake (`skill.inject`).
+    Inject,
+    /// Display request (`skill.display`).
+    Display,
+}
+
+/// Routes one tool name to its Skill kind, if any.
+///
+/// Pure name match owned here so every lane (bridge submit path, daemon
+/// dispatch, Kernel admission) resolves the same two names from one
+/// definition. Unknown names yield `None` and stay on their existing path.
+#[must_use]
+pub fn skill_tool_kind(name: &str) -> Option<SkillToolKind> {
+    match name {
+        SKILL_INJECT_TOOL => Some(SkillToolKind::Inject),
+        SKILL_DISPLAY_TOOL => Some(SkillToolKind::Display),
+        _ => None,
+    }
+}
 
 /// Injector-carried Hotset delivery request as wire bytes (issue #1882).
 ///
@@ -246,6 +281,111 @@ impl SkillDisplayPayload {
             ));
         }
         Ok(())
+    }
+}
+
+/// Typed Skill result envelope carried back on the submit leg (issue #1882).
+///
+/// The daemon serves a claimed skill pair locally and persists exactly one
+/// of these outcomes; the bridge polls it like any other result body. Every
+/// claimed pair settles through this envelope — including refusals — so no
+/// skill pair can poison the poller into a crash loop. Success carries the
+/// digest-bound receipt or display verbatim; refusal carries a stable code
+/// plus bounded detail and never fabricates delivery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillResultEnvelope {
+    /// Payload contract revision (must be [`SKILL_TRANSPORT_VERSION`]).
+    pub contract_version: u32,
+    /// Settled outcome for the claimed pair.
+    pub outcome: SkillResultOutcome,
+}
+
+/// Settled outcome for one claimed skill pair.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum SkillResultOutcome {
+    /// Hotset intake installed and issued: the injector's receipt.
+    Receipt(HotsetDeliveryReceipt),
+    /// Display request bound and rendered: the activated view.
+    Display(ActivatedSkillDisplay),
+    /// The pair was understood but refused: stable code plus detail.
+    Refused {
+        /// Stable refusal code (`FENCE_MISMATCH`, `INVALID_FIELD:<field>`,
+        /// `NOT_FOUND`, `IDENTITY_MISMATCH`, `SURFACE`, `STORE`).
+        code: String,
+        /// Bounded human detail naming the refusal.
+        detail: String,
+    },
+}
+
+impl SkillResultEnvelope {
+    /// Builds a receipt outcome.
+    pub fn receipt(receipt: HotsetDeliveryReceipt) -> Self {
+        Self {
+            contract_version: SKILL_TRANSPORT_VERSION,
+            outcome: SkillResultOutcome::Receipt(receipt),
+        }
+    }
+
+    /// Builds a display outcome.
+    pub fn display(display: ActivatedSkillDisplay) -> Self {
+        Self {
+            contract_version: SKILL_TRANSPORT_VERSION,
+            outcome: SkillResultOutcome::Display(display),
+        }
+    }
+
+    /// Builds a refusal outcome from a driver error. Every [`SkillError`]
+    /// maps to a stable code; the detail carries the owner's message.
+    /// Nothing about delivery is claimed: a refusal proves only that the
+    /// pair was understood and declined with a reason.
+    pub fn refused(error: &eliot_skill::SkillError) -> Self {
+        use eliot_skill::SkillError;
+        let (code, detail) = match error {
+            SkillError::FenceMismatch => (
+                "FENCE_MISMATCH".to_owned(),
+                "scope fence does not match the admitted fence".to_owned(),
+            ),
+            SkillError::InvalidField { field, reason } => {
+                (format!("INVALID_FIELD:{field}"), (*reason).to_owned())
+            }
+            SkillError::RevisionConflict => (
+                "REVISION_CONFLICT".to_owned(),
+                "base revision changed under the act".to_owned(),
+            ),
+            SkillError::NotFound => (
+                "NOT_FOUND".to_owned(),
+                "named Skill has no catalogue entry".to_owned(),
+            ),
+            SkillError::IdentityMismatch => (
+                "IDENTITY_MISMATCH".to_owned(),
+                "receipt, ack, or digest binding does not match".to_owned(),
+            ),
+            SkillError::IndependentEvidenceRequired => (
+                "EVIDENCE_REQUIRED".to_owned(),
+                "promotion needs independent evidence".to_owned(),
+            ),
+            SkillError::NonReversiblePromotion => (
+                "NON_REVERSIBLE".to_owned(),
+                "promotion is not reversible".to_owned(),
+            ),
+            SkillError::Serialization(error) | SkillError::Surface(error) => {
+                ("SURFACE".to_owned(), error.clone())
+            }
+            SkillError::Store(_) => (
+                "STORE".to_owned(),
+                "canonical store failure; see store receipt".to_owned(),
+            ),
+            SkillError::Duplicate { field } => (
+                format!("INVALID_FIELD:{field}"),
+                "duplicate field".to_owned(),
+            ),
+        };
+        Self {
+            contract_version: SKILL_TRANSPORT_VERSION,
+            outcome: SkillResultOutcome::Refused { code, detail },
+        }
     }
 }
 
@@ -513,6 +653,31 @@ mod tests {
             .encode(),
             Err(SkillTransportError::Shape(_))
         ));
+    }
+
+    #[test]
+    fn skill_tool_names_route_exactly_two_kinds() {
+        assert_eq!(skill_tool_kind("skill.inject"), Some(SkillToolKind::Inject));
+        assert_eq!(
+            skill_tool_kind("skill.display"),
+            Some(SkillToolKind::Display)
+        );
+        assert_eq!(skill_tool_kind("eliot.query"), None);
+        assert_eq!(skill_tool_kind(""), None);
+        assert_eq!(skill_tool_kind("skill.inject "), None);
+    }
+
+    #[test]
+    fn refusal_envelope_codes_driver_errors_without_claiming_delivery() {
+        use eliot_skill::SkillError;
+        let refused = SkillResultEnvelope::refused(&SkillError::FenceMismatch);
+        assert!(matches!(
+            &refused.outcome,
+            SkillResultOutcome::Refused { code, .. } if code == "FENCE_MISMATCH"
+        ));
+        let bytes = serde_json::to_vec(&refused).expect("refusal encodes");
+        let decoded: SkillResultEnvelope = serde_json::from_slice(&bytes).expect("refusal decodes");
+        assert_eq!(decoded, refused);
     }
 
     struct CarryTools;

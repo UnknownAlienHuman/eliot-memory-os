@@ -11,7 +11,7 @@ use crate::{
     NotificationEnvelope, NotifyError, ProviderId, Recipient, RecipientRole,
     UserAutomationFailureIdentity,
 };
-use eliot_contracts::RequestMetadata;
+use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_kernel_core::{
     AutomationFailureNotificationProjection, AutomationRecipientRole, UserAutomationError,
     UserAutomationFailureProjection, UserAutomationPreflightContext,
@@ -83,7 +83,7 @@ pub fn preflight_user_automation(
                 &projection.source_receipt,
                 &projection.automation_id,
                 &projection.automation_revision,
-                request,
+                &request.context.state_fence,
             )
             .map_err(|error| UserAutomationPreflightError::Notification(error.to_string()))?;
             Ok(UserAutomationPreflightDecision::BlockedConfig { receipt, failure })
@@ -136,7 +136,7 @@ impl UserAutomationFailureRequest {
         source_receipt: &ReceiptEnvelope,
         automation_id: &str,
         automation_revision: &str,
-        request: &NotificationRequest,
+        state_fence: &StateFence,
     ) -> Result<Self, NotifyError> {
         let notification = bind_failure_notification(
             &failure.notification,
@@ -144,7 +144,37 @@ impl UserAutomationFailureRequest {
             automation_id,
             automation_revision,
             &failure.failure_fingerprint,
-            request,
+            state_fence,
+        )?;
+        Ok(Self {
+            automation_id: automation_id.to_owned(),
+            automation_revision: automation_revision.to_owned(),
+            failure_fingerprint: failure.failure_fingerprint.clone(),
+            notification,
+        })
+    }
+
+    /// Binds owner identity to an existing notification request without
+    /// changing its authenticated context, audience or effect ceiling.
+    ///
+    /// Owner-projection constructor for runtime port adapters: assembles the
+    /// same envelope `from_kernel_projection` builds, with the fence passed
+    /// explicitly instead of inside a parent request (the binding reads only
+    /// the fence from it).
+    pub fn from_owner_failure(
+        failure: &UserAutomationFailureProjection,
+        source_receipt: &ReceiptEnvelope,
+        automation_id: &str,
+        automation_revision: &str,
+        state_fence: &StateFence,
+    ) -> Result<Self, NotifyError> {
+        let notification = bind_failure_notification(
+            &failure.notification,
+            source_receipt,
+            automation_id,
+            automation_revision,
+            &failure.failure_fingerprint,
+            state_fence,
         )?;
         Ok(Self {
             automation_id: automation_id.to_owned(),
@@ -216,14 +246,14 @@ fn bind_failure_notification(
     automation_id: &str,
     automation_revision: &str,
     failure_fingerprint: &str,
-    request: &NotificationRequest,
+    state_fence: &StateFence,
 ) -> Result<NotificationEnvelope, NotifyError> {
     let identity = UserAutomationFailureIdentity::new(
         automation_id,
         automation_revision,
         failure_fingerprint,
     )?;
-    if projection.canonical.state_fence != request.context.state_fence
+    if projection.canonical.state_fence != *state_fence
         || projection.canonical.subject != projection.subject
         || projection.canonical.summary != projection.summary
         || projection.recipients.is_empty()

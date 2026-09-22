@@ -32,9 +32,9 @@ use eliot_store_api::{
     CanonicalRequestView, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, OperationIdentity, OrderingScopeId, PreparedTransition, RequestMeta,
     ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceipt, automation_create_params,
-    automation_edit_params, automation_mutation_request, automation_read_request,
-    automation_run_now_params, automation_state_transition_params, canonical_request_hash,
-    operation_manifest_set_digest,
+    automation_edit_params, automation_failure_params, automation_mutation_request,
+    automation_read_request, automation_run_now_params, automation_state_transition_params,
+    canonical_request_hash, operation_manifest_set_digest,
 };
 use serde_json::Value;
 
@@ -493,5 +493,117 @@ fn automation_operations_reject_a_foreign_transition_class() {
     assert_eq!(
         store.apply_transaction(&ctx, transition, &[], &[]),
         Err(StoreError::TransitionClassExceeded)
+    );
+}
+
+/// Canonical failure document for one failure class.
+fn failure_json(fingerprint: &str, dedup_key: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "fingerprint": fingerprint,
+        "reason": "{\"CanonicalBlockedConfig\":{\"class\":\"provider-fingerprint\"}}",
+        "notification_dedup_key": dedup_key,
+    }))
+    .expect("failure document serializes")
+}
+
+fn failure_params(
+    automation_id: &str,
+    revision: &str,
+    occurrence_id: &str,
+    fingerprint: &str,
+) -> BTreeMap<String, Value> {
+    automation_failure_params(
+        automation_id.to_owned(),
+        revision.to_owned(),
+        occurrence_id.to_owned(),
+        failure_json(fingerprint, "caller-key"),
+    )
+}
+
+#[test]
+fn failure_leg_records_converges_and_projects_last() {
+    let store = MemoryStore::new();
+    let fingerprint = "a".repeat(64);
+    // Absence stays explicit before any failure write.
+    let payload = read(&store, "failure", Some("auto-1"), false);
+    assert!(payload.get("failure").is_some_and(Value::is_null));
+    // Unknown revisions fail closed.
+    let request =
+        automation_mutation_request(failure_params("auto-absent", "r-1", "occ-1", &fingerprint));
+    assert!(
+        apply(
+            &store,
+            "failure-absent",
+            request.operation,
+            request.parameters
+        )
+        .is_err(),
+        "unknown revision failures fail closed"
+    );
+    // Create the owning revision, then record the failure.
+    let first = valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active);
+    let request = automation_mutation_request(automation_create_params(
+        "auto-1".to_owned(),
+        "r-1".to_owned(),
+        AUTOMATION_STATE_ACTIVE.to_owned(),
+        revision_json(&first),
+    ));
+    apply(&store, "create-1", request.operation, request.parameters).expect("create commits");
+    let request =
+        automation_mutation_request(failure_params("auto-1", "r-1", "occ-1", &fingerprint));
+    apply(&store, "failure-1", request.operation, request.parameters).expect("failure commits");
+    let payload = read(&store, "failure", Some("auto-1"), false);
+    let row = payload.get("failure").expect("failure row projects");
+    assert_eq!(
+        row.get("fingerprint").and_then(Value::as_str),
+        Some(fingerprint.as_str())
+    );
+    assert_eq!(
+        row.get("history_ref").and_then(Value::as_str),
+        Some(format!("automation-failure:auto-1:r-1:{fingerprint}").as_str()),
+    );
+    assert_eq!(
+        row.get("source_operation_id").and_then(Value::as_str),
+        Some("op-automation-failure-1")
+    );
+    // A repeat of one failure class from another operation converges on
+    // the existing row: same reference, first-writer provenance kept.
+    let request =
+        automation_mutation_request(failure_params("auto-1", "r-1", "occ-2", &fingerprint));
+    apply(&store, "failure-2", request.operation, request.parameters).expect("repeat converges");
+    let repeat = read(&store, "failure", Some("auto-1"), false);
+    assert_eq!(repeat.get("failure"), payload.get("failure"));
+    // A divergent document under one failure key fails closed: same
+    // fingerprint, different reason wire value.
+    let divergent_json = serde_json::to_string(&serde_json::json!({
+        "fingerprint": fingerprint,
+        "reason": "{\"DeterministicModelAccess\":null}",
+        "notification_dedup_key": "caller-key",
+    }))
+    .expect("divergent document serializes");
+    let mut divergent = failure_params("auto-1", "r-1", "occ-3", &fingerprint);
+    divergent.insert("failure_json".to_owned(), Value::String(divergent_json));
+    let request = automation_mutation_request(divergent);
+    assert_eq!(
+        apply(
+            &store,
+            "failure-divergent",
+            request.operation,
+            request.parameters
+        ),
+        Err(StoreError::IdentityConflict),
+        "divergent failure documents fail closed"
+    );
+    // A second failure class moves the last-failure pointer.
+    let other = "b".repeat(64);
+    let request = automation_mutation_request(failure_params("auto-1", "r-1", "occ-4", &other));
+    apply(&store, "failure-3", request.operation, request.parameters).expect("second commits");
+    let payload = read(&store, "failure", Some("auto-1"), false);
+    assert_eq!(
+        payload
+            .get("failure")
+            .and_then(|row| row.get("fingerprint"))
+            .and_then(Value::as_str),
+        Some(other.as_str())
     );
 }

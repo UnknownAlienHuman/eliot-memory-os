@@ -30,6 +30,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -77,6 +78,10 @@ pub const AUTOMATION_PARAM_CONFIGURATION_STATE: &str = "configuration_state";
 pub const AUTOMATION_PARAM_OCCURRENCE_ID: &str = "occurrence_id";
 /// Opaque canonical invocation document (run-now leg).
 pub const AUTOMATION_PARAM_INVOCATION_JSON: &str = "invocation_json";
+/// Opaque canonical failure document (failure leg): JSON object with the
+/// class `fingerprint`, the typed `reason` wire value, and the
+/// `notification_dedup_key` echoed from the failure projection.
+pub const AUTOMATION_PARAM_FAILURE_JSON: &str = "failure_json";
 /// Read query discriminator parameter.
 pub const AUTOMATION_PARAM_QUERY: &str = "query";
 /// `"true"`/`"false"` retired-row inclusion (list query, required).
@@ -97,6 +102,8 @@ pub const AUTOMATION_OPERATION_RESUME: &str = "resume";
 pub const AUTOMATION_OPERATION_REMOVE: &str = "remove";
 /// Mutation leg discriminator values.
 pub const AUTOMATION_OPERATION_RUN_NOW: &str = "run-now";
+/// Mutation leg discriminator values (failure-history writer leg).
+pub const AUTOMATION_OPERATION_FAILURE: &str = "failure";
 
 /// Read query discriminator values (mirror the domain query kinds minus
 /// `Preflight`, which is B-owned).
@@ -107,8 +114,8 @@ pub const AUTOMATION_QUERY_CURRENT: &str = "current";
 pub const AUTOMATION_QUERY_HISTORY: &str = "history";
 /// Read query discriminator values.
 pub const AUTOMATION_QUERY_INVOCATIONS: &str = "invocations";
-/// Read query discriminator values (explicit absence until a failure
-/// writer path exists; never a fabricated failure).
+/// Read query discriminator values (the failure writer leg records the
+/// last failure row; absence stays explicit, never fabricated).
 pub const AUTOMATION_QUERY_FAILURE: &str = "failure";
 
 /// Closed admission-state wire values (mirror the domain
@@ -218,6 +225,21 @@ pub enum DecodedAutomationMutation {
         occurrence_id: String,
         /// Verbatim canonical invocation document.
         invocation_json: String,
+    },
+    /// Record one revision-bound configuration failure as immutable
+    /// history. The named revision must exist; repeats of one failure
+    /// class converge on the existing row.
+    Failure {
+        /// Stable automation identity.
+        automation_id: String,
+        /// Immutable revision that owns the failure class (must exist).
+        revision: String,
+        /// Stable occurrence identity retained as history context.
+        occurrence_id: String,
+        /// Verbatim canonical failure document.
+        failure_json: String,
+        /// Parsed canonical failure document.
+        failure: AutomationFailureDocument,
     },
 }
 
@@ -354,6 +376,37 @@ pub fn automation_run_now_params(
     ])
 }
 
+/// Builds a failure-leg parameter map.
+pub fn automation_failure_params(
+    automation_id: String,
+    revision: String,
+    occurrence_id: String,
+    failure_json: String,
+) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            AUTOMATION_PARAM_OPERATION.to_owned(),
+            Value::String(AUTOMATION_OPERATION_FAILURE.to_owned()),
+        ),
+        (
+            AUTOMATION_PARAM_AUTOMATION_ID.to_owned(),
+            Value::String(automation_id),
+        ),
+        (
+            AUTOMATION_PARAM_REVISION.to_owned(),
+            Value::String(revision),
+        ),
+        (
+            AUTOMATION_PARAM_OCCURRENCE_ID.to_owned(),
+            Value::String(occurrence_id),
+        ),
+        (
+            AUTOMATION_PARAM_FAILURE_JSON.to_owned(),
+            Value::String(failure_json),
+        ),
+    ])
+}
+
 /// Builds the closed `GetUserAutomationState` read request.
 pub fn automation_read_request(
     query: String,
@@ -448,6 +501,15 @@ pub fn validate_automation_mutation_params(
             )?;
             Ok(())
         }
+        AUTOMATION_OPERATION_FAILURE => {
+            validate_revision_id(text_param(parameters, AUTOMATION_PARAM_REVISION)?)?;
+            validate_occurrence_id(text_param(parameters, AUTOMATION_PARAM_OCCURRENCE_ID)?)?;
+            parse_automation_failure_document(text_param(
+                parameters,
+                AUTOMATION_PARAM_FAILURE_JSON,
+            )?)?;
+            Ok(())
+        }
         _ => Err(StoreError::UnknownOperation),
     }
 }
@@ -497,6 +559,16 @@ pub fn decode_automation_mutation(
             occurrence_id: text_of(AUTOMATION_PARAM_OCCURRENCE_ID)?,
             invocation_json: text_of(AUTOMATION_PARAM_INVOCATION_JSON)?,
         }),
+        AUTOMATION_OPERATION_FAILURE => {
+            let failure_json = text_of(AUTOMATION_PARAM_FAILURE_JSON)?;
+            Ok(DecodedAutomationMutation::Failure {
+                automation_id: text_of(AUTOMATION_PARAM_AUTOMATION_ID)?,
+                revision: text_of(AUTOMATION_PARAM_REVISION)?,
+                occurrence_id: text_of(AUTOMATION_PARAM_OCCURRENCE_ID)?,
+                failure: parse_automation_failure_document(&failure_json)?,
+                failure_json,
+            })
+        }
         _ => Err(StoreError::UnknownOperation),
     }
 }
@@ -653,6 +725,94 @@ pub fn validate_automation_doc(document: &str, field: &'static str) -> Result<()
         });
     }
     Ok(())
+}
+
+/// Canonical failure document persisted verbatim by the failure leg
+/// (issue #1779). The fingerprint is the deterministic class digest
+/// minted by the Kernel-owned revision; the reason wire value and the
+/// notification dedup key travel opaque so the Store never interprets
+/// failure semantics. Failure content validity (fingerprint derivation,
+/// notification shape) stays Kernel-owned.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationFailureDocument {
+    /// Deterministic failure-class fingerprint (lowercase SHA-256 hex).
+    pub fingerprint: String,
+    /// Typed failure-reason wire value (canonical JSON).
+    pub reason: String,
+    /// Notification dedup key echoed from the failure projection.
+    pub notification_dedup_key: String,
+}
+
+/// Validates one failure document structurally plus its closed fields.
+pub fn validate_automation_failure_document(
+    document: &AutomationFailureDocument,
+) -> Result<(), StoreError> {
+    if document.fingerprint.len() != 64
+        || !document
+            .fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(StoreError::InvalidField {
+            field: "automation.fingerprint",
+            reason: "failure fingerprint must be SHA-256 hex",
+        });
+    }
+    validate_failure_text(&document.reason, "automation.reason")?;
+    validate_failure_text(
+        &document.notification_dedup_key,
+        "automation.notification_dedup_key",
+    )?;
+    Ok(())
+}
+
+fn validate_failure_text(value: &str, field: &'static str) -> Result<(), StoreError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field,
+            reason: "failure text must be non-blank wire text",
+        });
+    }
+    if value.len() > MAX_AUTOMATION_DOC_BYTES {
+        return Err(StoreError::InvalidField {
+            field,
+            reason: "failure text exceeds the document bound",
+        });
+    }
+    Ok(())
+}
+
+/// Parses and validates the `failure_json` leg parameter into its
+/// canonical document.
+pub fn parse_automation_failure_document(
+    failure_json: &str,
+) -> Result<AutomationFailureDocument, StoreError> {
+    validate_automation_doc(failure_json, AUTOMATION_PARAM_FAILURE_JSON)?;
+    let document: AutomationFailureDocument = serde_json::from_str(failure_json)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    validate_automation_failure_document(&document)?;
+    Ok(document)
+}
+
+/// Storage key for one failure row: automation, revision, fingerprint.
+/// Repeats of one failure class converge on this key; the first writer
+/// wins and later repeats keep the existing row.
+#[must_use]
+pub fn automation_failure_key(automation_id: &str, revision: &str, fingerprint: &str) -> String {
+    format!("{automation_id}\x1f{revision}\x1f{fingerprint}")
+}
+
+/// Canonical failure-history record reference for one failure row.
+/// Deterministic over the row key, so replays and converged repeats
+/// resolve the identical reference.
+#[must_use]
+pub fn automation_failure_history_ref(
+    automation_id: &str,
+    revision: &str,
+    fingerprint: &str,
+) -> String {
+    format!("automation-failure:{automation_id}:{revision}:{fingerprint}")
 }
 
 /// Returns whether the value names a closed admission state (mirror of

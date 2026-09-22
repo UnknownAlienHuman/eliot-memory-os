@@ -47,6 +47,66 @@ pub const EXIT_NOT_COMPLETED: i32 = 2;
 /// Exit status when the engine itself could not be built.
 pub const EXIT_ENGINE_FAILED: i32 = 3;
 
+/// Metering schema (single stderr line, ASCII, documented here — the only
+/// place that formats it; the parent parses it strictly):
+/// `GUEST_EXEC_METERING v=1 peak=<u64> table=<u32> ticks=<u64> fuel=<u64>`.
+/// Values are the child Store's own observations for the completed run.
+/// The parent requires this line to accept a report: unmeasured success
+/// is reported as unknown, never manufactured.
+pub const METERING_PREFIX: &str = "GUEST_EXEC_METERING";
+
+/// Child-observed Store measurements for one completed run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildMetering {
+    /// Observed peak linear-memory bytes.
+    pub peak_memory_bytes: u64,
+    /// Observed table elements.
+    pub table_elements: u32,
+    /// Observed epoch ticks.
+    pub epoch_ticks: u64,
+    /// Consumed fuel units.
+    pub fuel_consumed: u64,
+}
+
+/// Formats one metering line for stderr.
+#[must_use]
+pub fn metering_line(metering: ChildMetering) -> String {
+    format!(
+        "{METERING_PREFIX} v=1 peak={peak} table={table} ticks={ticks} fuel={fuel}",
+        peak = metering.peak_memory_bytes,
+        table = metering.table_elements,
+        ticks = metering.epoch_ticks,
+        fuel = metering.fuel_consumed,
+    )
+}
+
+/// Strictly parses one metering line: exact prefix, version, keys, order,
+/// and integer shapes; anything else is rejected (never defaulted).
+#[must_use]
+pub fn parse_metering_line(line: &str) -> Option<ChildMetering> {
+    let body = line.trim().strip_prefix(METERING_PREFIX)?.trim_start();
+    let mut parts = body.split_whitespace();
+    if parts.next()? != "v=1" {
+        return None;
+    }
+    let number = |part: Option<&str>, key: &str| -> Option<u64> {
+        part?.strip_prefix(key)?.parse::<u64>().ok()
+    };
+    let peak = number(parts.next(), "peak=")?;
+    let table = u32::try_from(number(parts.next(), "table=")?).ok()?;
+    let ticks = number(parts.next(), "ticks=")?;
+    let fuel = number(parts.next(), "fuel=")?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(ChildMetering {
+        peak_memory_bytes: peak,
+        table_elements: table,
+        epoch_ticks: ticks,
+        fuel_consumed: fuel,
+    })
+}
+
 /// Validation failures, all pre-invoke. Codes only — no paths or payloads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GuestExecRejection {
@@ -194,6 +254,30 @@ pub fn run_guest_exec(args: &GuestExecArgs) -> i32 {
             EXIT_NOT_COMPLETED,
         );
     }
+    // Measurements first: a completed run without fully observed metering
+    // is unreportable — exit without stdout rather than emit output the
+    // parent cannot contract-check. The metering line also precedes stdout
+    // on the wire, so a lost line can never accompany accepted bytes.
+    let metering = ChildMetering {
+        peak_memory_bytes: match report.usage.peak_memory_bytes {
+            Some(peak) => peak,
+            None => return fail("GUEST_EXEC_METERING_UNOBSERVED", EXIT_NOT_COMPLETED),
+        },
+        table_elements: match report.usage.table_elements {
+            Some(table) => table,
+            None => return fail("GUEST_EXEC_METERING_UNOBSERVED", EXIT_NOT_COMPLETED),
+        },
+        epoch_ticks: match report.usage.epoch_ticks {
+            Some(ticks) => ticks,
+            None => return fail("GUEST_EXEC_METERING_UNOBSERVED", EXIT_NOT_COMPLETED),
+        },
+        fuel_consumed: report.usage.fuel_consumed,
+    };
+    let mut stderr = std::io::stderr().lock();
+    if writeln!(stderr, "{}", metering_line(metering)).is_err() || stderr.flush().is_err() {
+        return fail("GUEST_EXEC_METERING_FAILED", EXIT_NOT_COMPLETED);
+    }
+    drop(stderr);
     let mut stdout = std::io::stdout().lock();
     if stdout.write_all(&report.output).is_err() || stdout.flush().is_err() {
         return fail("GUEST_EXEC_OUTPUT_FAILED", EXIT_NOT_COMPLETED);
@@ -244,6 +328,40 @@ mod tests {
                 .allowed_digests
                 .contains(&Sha256Digest::of_bytes(b"artifact-bytes"))
         );
+    }
+
+    #[test]
+    fn metering_line_round_trips_strictly() {
+        let metering = ChildMetering {
+            peak_memory_bytes: 12_340,
+            table_elements: 2,
+            epoch_ticks: 45,
+            fuel_consumed: 678,
+        };
+        let line = metering_line(metering);
+        assert_eq!(
+            line,
+            "GUEST_EXEC_METERING v=1 peak=12340 table=2 ticks=45 fuel=678"
+        );
+        assert_eq!(parse_metering_line(&line), Some(metering));
+        assert_eq!(parse_metering_line(&format!("{line}\n")), Some(metering));
+        assert_eq!(
+            parse_metering_line("GUEST_EXEC_METERING v=2 peak=1 table=0 ticks=0 fuel=0"),
+            None
+        );
+        assert_eq!(
+            parse_metering_line("GUEST_EXEC_METERING v=1 peak=1 table=0 ticks=0"),
+            None
+        );
+        assert_eq!(
+            parse_metering_line("GUEST_EXEC_METERING v=1 peak=1 table=0 ticks=0 fuel=0 extra=1"),
+            None
+        );
+        assert_eq!(
+            parse_metering_line("GUEST_EXEC_TERMINATION:Completed"),
+            None
+        );
+        assert_eq!(parse_metering_line(""), None);
     }
 
     #[test]

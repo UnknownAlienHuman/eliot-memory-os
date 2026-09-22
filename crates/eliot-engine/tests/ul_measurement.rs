@@ -4,7 +4,7 @@ use eliot_engine::{
     summarize_field_evidence,
 };
 use eliot_types::{
-    ConceptKind, ConceptNode, CoverageClass, CueBinding, CueKind, CueMatchMode, CueRecordSource,
+    ConceptKind, ConceptNode, CoverageClass, CueBinding, LegacyCueKindV1, CueMatchMode, CueRecordSource,
     CueStrength, DependencyManifest, InjectionReceipt, ModuleCard, ProjectId, SessionId,
     SubsystemCapsule, TaskId, UL_FIELD_VALIDATION_BASELINE_COMMIT,
     UL_FIELD_VALIDATION_SCHEMA_VERSION, UlExperimentArm, UlFieldTaskAnnotation,
@@ -512,7 +512,7 @@ fn source(
         preview_text: record_ref.to_owned(),
         payload: None,
         cue_bindings: vec![CueBinding {
-            cue_kind: CueKind::FilePath,
+            cue_kind: LegacyCueKindV1::FilePath,
             cue_value: path.to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,

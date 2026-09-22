@@ -1,7 +1,7 @@
 use crate::EngineError;
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CognitiveProjectionReadState, CueIndexRow, CueKind, CueRecordSource, CueStrength,
+    CognitiveProjectionReadState, CueIndexRow, LegacyCueKindV1, CueRecordSource, CueStrength,
     CurrentStateRequest, MemoryRevision, ObservedCue, ProjectId, ReadConsistencyMode, cue_row_id,
     normalize_binding, normalize_path, normalize_symbol, ul_token_estimate,
 };
@@ -35,7 +35,7 @@ pub struct FiringResult {
 
 struct ProjectCueShard {
     memory_revision: MemoryRevision,
-    exact: BTreeMap<(CueKind, String), Vec<CueIndexRow>>,
+    exact: BTreeMap<(LegacyCueKindV1, String), Vec<CueIndexRow>>,
     dir_prefix: Vec<CueIndexRow>,
 }
 
@@ -134,7 +134,7 @@ impl CueIndexService {
         };
         for mut row in rows {
             row.cue_value_norm = normalize_cue_value(row.cue_kind, &row.cue_value_norm);
-            if row.cue_kind == CueKind::DirPath {
+            if row.cue_kind == LegacyCueKindV1::DirPath {
                 shard.dir_prefix.push(row);
             } else {
                 shard
@@ -344,7 +344,7 @@ fn matching_rows(shard: &ProjectCueShard, cues: &[ObservedCue]) -> Vec<(CueIndex
         if let Some(rows) = shard.exact.get(&(cue.kind, cue.value.clone())) {
             hits.extend(rows.iter().cloned().map(|row| (row, cue.clone())));
         }
-        if matches!(cue.kind, CueKind::FilePath | CueKind::DirPath) {
+        if matches!(cue.kind, LegacyCueKindV1::FilePath | LegacyCueKindV1::DirPath) {
             hits.extend(
                 shard
                     .dir_prefix
@@ -393,17 +393,17 @@ fn rows_for_source(
         .collect()
 }
 
-fn normalize_cue_value(kind: CueKind, value: &str) -> String {
+fn normalize_cue_value(kind: LegacyCueKindV1, value: &str) -> String {
     match kind {
-        CueKind::FilePath | CueKind::DirPath => normalize_path(value, None),
-        CueKind::Symbol => normalize_symbol(value),
-        CueKind::ErrorSignature
-        | CueKind::CommandPattern
-        | CueKind::Dependency
-        | CueKind::ApiSurface
-        | CueKind::TaskClass
-        | CueKind::Subsystem
-        | CueKind::Concept => value.trim().chars().flat_map(char::to_lowercase).collect(),
+        LegacyCueKindV1::FilePath | LegacyCueKindV1::DirPath => normalize_path(value, None),
+        LegacyCueKindV1::Symbol => normalize_symbol(value),
+        LegacyCueKindV1::ErrorSignature
+        | LegacyCueKindV1::CommandPattern
+        | LegacyCueKindV1::Dependency
+        | LegacyCueKindV1::ApiSurface
+        | LegacyCueKindV1::TaskClass
+        | LegacyCueKindV1::Subsystem
+        | LegacyCueKindV1::Concept => value.trim().chars().flat_map(char::to_lowercase).collect(),
     }
 }
 

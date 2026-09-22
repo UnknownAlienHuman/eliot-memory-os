@@ -976,6 +976,53 @@ fn dispatch_apply_automation_state(
                 serde_json::to_value(&invocation_json)
                     .map_err(|error| StoreError::Serialization(error.to_string()))?
             }
+            DecodedAutomationMutation::Failure {
+                automation_id,
+                revision,
+                occurrence_id,
+                failure,
+                failure_json,
+            } => {
+                let key = automation_revision_key(&automation_id, &revision);
+                if !state.automation_revisions.contains_key(&key) {
+                    return Err(StoreError::InvalidField {
+                        field: "automation.revision",
+                        reason: "unknown automation revision",
+                    });
+                }
+                let failure_key = eliot_store_api::automation_failure_key(
+                    &automation_id,
+                    &revision,
+                    &failure.fingerprint,
+                );
+                match state.automation_failures.get(&failure_key) {
+                    Some(existing) if existing.failure_json != failure_json => {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.automation_failures.insert(
+                            failure_key.clone(),
+                            AutomationFailureRow {
+                                automation_id: automation_id.clone(),
+                                revision: revision.clone(),
+                                occurrence_id: occurrence_id.clone(),
+                                fingerprint: failure.fingerprint.clone(),
+                                failure_json: failure_json.clone(),
+                                source_operation_id: operation_key.clone(),
+                                state_fence: transition.state_fence.clone(),
+                                scope_id: transition.scope_id.to_string(),
+                                task_id: transition.task_id.clone(),
+                            },
+                        );
+                    }
+                }
+                state
+                    .automation_last_failure
+                    .insert(automation_id.clone(), failure_key);
+                serde_json::to_value(&failure_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            }
         };
         let payload_digest = sha256_hex(
             &canonical_json_bytes(&row_json)
@@ -1360,8 +1407,8 @@ fn resource_snapshot_payload(
 /// same-fence current pointers in automation-id order (retired excluded
 /// unless requested); `current` projects one pointer or explicit absence;
 /// `history` projects the bounded verbatim revision set; `invocations`
-/// projects the bounded verbatim invocation set; `failure` projects
-/// explicit absence (no failure writer path exists yet).
+/// projects the bounded verbatim invocation set; `failure` projects the
+/// last same-fence failure row or explicit absence.
 fn automation_state_payload(
     state: &MemoryState,
     query: &NamedReadRequest,
@@ -1444,33 +1491,82 @@ fn automation_state_payload(
             let id = decoded.automation_id.clone().ok_or_else(|| {
                 serde_json::Error::custom("exact automation selector is required")
             })?;
-            let mut invocations = Vec::new();
-            for row in state.automation_invocations.values() {
-                if row.automation_id != id || row.state_fence != *fence {
-                    continue;
-                }
-                if invocations.len() >= limit {
-                    break;
-                }
-                invocations.push(json!({
-                    "occurrence_id": row.occurrence_id,
-                    "automation_id": row.automation_id,
-                    "invocation_json": row.invocation_json,
-                }));
-            }
-            serde_json::to_value(json!({
-                "invocations": invocations,
-                "revision": invocations.len(),
-                "state_fence": fence,
-            }))
+            automation_invocations_payload(state, fence, &id, limit)
         }
-        AUTOMATION_QUERY_FAILURE => serde_json::to_value(json!({
-            "failure": Value::Null,
-            "revision": 0,
-            "state_fence": fence,
-        })),
+        AUTOMATION_QUERY_FAILURE => {
+            let id = decoded.automation_id.clone().ok_or_else(|| {
+                serde_json::Error::custom("exact automation selector is required")
+            })?;
+            automation_failure_payload(state, fence, &id)
+        }
         _ => Err(serde_json::Error::custom("unknown automation query")),
     }
+}
+
+/// Projects the bounded same-fence invocation set for one automation.
+fn automation_invocations_payload(
+    state: &MemoryState,
+    fence: &StateFence,
+    automation_id: &str,
+    limit: usize,
+) -> Result<Value, serde_json::Error> {
+    let mut invocations = Vec::new();
+    for row in state.automation_invocations.values() {
+        if row.automation_id != automation_id || row.state_fence != *fence {
+            continue;
+        }
+        if invocations.len() >= limit {
+            break;
+        }
+        invocations.push(json!({
+            "occurrence_id": row.occurrence_id,
+            "automation_id": row.automation_id,
+            "invocation_json": row.invocation_json,
+        }));
+    }
+    serde_json::to_value(json!({
+        "invocations": invocations,
+        "revision": invocations.len(),
+        "state_fence": fence,
+    }))
+}
+
+/// Projects the last same-fence failure row for one automation, or
+/// explicit absence when no row exists under this fence.
+fn automation_failure_payload(
+    state: &MemoryState,
+    fence: &StateFence,
+    automation_id: &str,
+) -> Result<Value, serde_json::Error> {
+    let row = state
+        .automation_last_failure
+        .get(automation_id)
+        .and_then(|key| state.automation_failures.get(key))
+        .filter(|row| row.state_fence == *fence);
+    let (failure, revision) = match row {
+        Some(row) => (
+            json!({
+                "automation_id": row.automation_id,
+                "revision": row.revision,
+                "occurrence_id": row.occurrence_id,
+                "fingerprint": row.fingerprint,
+                "failure_json": row.failure_json,
+                "history_ref": eliot_store_api::automation_failure_history_ref(
+                    &row.automation_id,
+                    &row.revision,
+                    &row.fingerprint,
+                ),
+                "source_operation_id": row.source_operation_id,
+            }),
+            1,
+        ),
+        None => (Value::Null, 0),
+    };
+    serde_json::to_value(json!({
+        "failure": failure,
+        "revision": revision,
+        "state_fence": fence,
+    }))
 }
 
 fn validate_transaction(
@@ -2930,6 +3026,24 @@ struct AutomationInvocationRow {
     task_id: Option<String>,
 }
 
+/// One immutable automation failure row keyed by
+/// `(automation_id, revision, fingerprint)` (issue #1779). Verbatim
+/// failure document plus the first-writer operation identity, driven
+/// only through the closed failure leg under the held transaction lock.
+/// Repeats of one failure class converge on the existing row.
+#[derive(Clone, Debug, PartialEq)]
+struct AutomationFailureRow {
+    automation_id: String,
+    revision: String,
+    occurrence_id: String,
+    fingerprint: String,
+    failure_json: String,
+    source_operation_id: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct MemoryState {
     epistemic_positions: BTreeMap<String, (EpistemicCommit, WriteReceipt)>,
@@ -2978,6 +3092,17 @@ struct MemoryState {
     /// Verbatim invocation documents, driven only through the closed
     /// automation legs under the held transaction lock.
     automation_invocations: BTreeMap<String, AutomationInvocationRow>,
+    /// Immutable automation failure rows keyed by the canonical failure
+    /// key `(automation_id, revision, fingerprint)` (issue #1779).
+    /// Verbatim failure documents with first-writer provenance, driven
+    /// only through the closed failure leg under the held transaction
+    /// lock; repeats converge on the existing row.
+    automation_failures: BTreeMap<String, AutomationFailureRow>,
+    /// Last-failure pointers keyed by automation (issue #1779): the
+    /// failure key of the most recently committed failure row. Driven
+    /// only through the closed failure leg under the held transaction
+    /// lock; latest write wins.
+    automation_last_failure: BTreeMap<String, String>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -3009,6 +3134,8 @@ impl PartialEq for MemoryState {
             && self.automation_revisions == other.automation_revisions
             && self.automation_currents == other.automation_currents
             && self.automation_invocations == other.automation_invocations
+            && self.automation_failures == other.automation_failures
+            && self.automation_last_failure == other.automation_last_failure
             && self.next_commit_sequence == other.next_commit_sequence
             && self.next_outbox_sequence == other.next_outbox_sequence
             && self.notifications.iter().collect::<Vec<_>>()
@@ -3040,6 +3167,8 @@ impl Default for MemoryState {
             automation_revisions: BTreeMap::new(),
             automation_currents: BTreeMap::new(),
             automation_invocations: BTreeMap::new(),
+            automation_failures: BTreeMap::new(),
+            automation_last_failure: BTreeMap::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
