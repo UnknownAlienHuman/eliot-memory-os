@@ -59,6 +59,7 @@ pub mod notification_board_attach;
 mod observation_adapters;
 mod process_origin;
 mod reactive_projection_feed;
+mod reactive_view_cue_feed;
 mod route_receipts;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -165,6 +166,7 @@ pub use reactive_projection_feed::{
     DaemonReactiveFeedError, DaemonReactiveFeedInputs, DaemonReactiveFeedOutcome,
     drive_daemon_reactive_feed, drive_daemon_retained_feed, drive_daemon_supplied_feed,
 };
+pub use reactive_view_cue_feed::serve_projection_inputs_under_fence;
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,

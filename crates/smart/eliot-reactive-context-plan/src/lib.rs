@@ -9,17 +9,22 @@
 #![allow(clippy::result_large_err, clippy::large_enum_variant)]
 
 mod bridge_admission;
+mod coverage_policy_owner_bind;
 mod input;
 mod owner_retention;
 mod owner_supply;
 mod plan;
 mod result;
 mod settled_plan_feed;
+mod view_cue_owner_serve;
 
 pub use bridge_admission::{
     BridgeAdmissionBatch, BridgeAdmissionDelivery, BridgeAdmissionError,
     BridgeAdmissionInstruction, BridgeAdmissionSeverity, MAX_BRIDGE_RELATIONS,
     plan_bridge_admissions,
+};
+pub use coverage_policy_owner_bind::{
+    OwnerBindError, OwnerBoundPublication, OwnerBoundSixSlot, bind_owner_publication,
 };
 
 pub use input::{
@@ -49,4 +54,7 @@ pub use result::{
 pub use settled_plan_feed::{
     LiveActivationBindings, SettledPlanFeed, SettledPlanFeedError, SettledPlanFeedInputs,
     SettledPlanFeedOutcome, drive_live_feed, produce_settled_plan_feed,
+};
+pub use view_cue_owner_serve::{
+    MappedCueTarget, ServedViewCues, UnmappedCueTarget, serve_view_cues_under_fence,
 };
