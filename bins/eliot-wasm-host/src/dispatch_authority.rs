@@ -603,6 +603,103 @@ mod tests {
         ));
     }
 
+    /// R1 join mirror: the identical forward issuance the owner runs in
+    /// `eliot-kernel-service::wasm_dispatch::wasm_join_gate` over the same
+    /// admitted values must produce the identical invocation digest. The
+    /// owner test pins the same literal; agreement is the join interop
+    /// proof — the owner-published join closes if and only if this
+    /// derivation matches. Pure crypto, no filesystem, no spawn.
+    #[test]
+    fn join_issuance_matches_owner_vector() {
+        use eliot_process::{
+            EnvironmentInheritance, EnvironmentProjection, ImageId, JobId, OperationId,
+            ProcessTreeId, ResourceLimits, SessionId,
+        };
+        use std::collections::BTreeMap;
+
+        let nonce = "launch-nonce-wasm-join-0001";
+        let authority = WasmDispatchAuthority::new(
+            "claim-wasm-join-001",
+            "operation-wasm-join-001",
+            7,
+            &epoch_json_for_join(),
+            nonce,
+        )
+        .expect("join authority derives");
+        let epoch: eliot_contracts::EpochId =
+            serde_json::from_value(epoch_json_for_join()).expect("join epoch parses");
+        let fence = FencingToken::new(
+            epoch,
+            Generation::new(7).expect("generation"),
+            "wasm-host-launch-fence-aaaaaaaaaaaaaaaa".to_owned(),
+        )
+        .expect("join fence builds");
+        let grant = ValidatedDispatchGrant::new(
+            fence,
+            ActionLeaseRef::new("wasm-host-launch-lease-aaaaaaaaaaaaaaaa".to_owned())
+                .expect("lease"),
+            "e".repeat(64),
+            4_000_000_000_000,
+            4_000_000_060_000,
+        )
+        .expect("join grant validates");
+        let artifact_digest = Sha256Digest::of_bytes(b"join-artifact-bytes");
+        let environment =
+            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
+                .expect("environment");
+        let limits =
+            ResourceLimits::new(30_000, None, Some(536_870_912), 4096, 4096, 1).expect("limits");
+        let intent = ProcessIntent::new(
+            OperationId::new("operation-wasm-join-001").expect("operation"),
+            ProcessTreeId::new("scope-1955").expect("tree"),
+            JobId::new("operation-wasm-join-001").expect("job"),
+            ImageId::new("wasm-host-image-dddddddddddddddd").expect("image"),
+            SessionId::new("claim-wasm-join-001").expect("session"),
+            Generation::new(7).expect("generation"),
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            "d".repeat(64),
+            vec![
+                "--profile".to_owned(),
+                "D2_OPERATIONAL".to_owned(),
+                "--guest-exec".to_owned(),
+                "--guest-exec-artifact".to_owned(),
+                "C:\\Kernel\\eliot-wasm-host.guest-artifact.bin".to_owned(),
+                "--guest-exec-input".to_owned(),
+                "C:\\Kernel\\eliot-wasm-host.guest-input.bin".to_owned(),
+                "--guest-exec-artifact-digest".to_owned(),
+                artifact_digest.as_str().to_owned(),
+                "--guest-exec-max-output".to_owned(),
+                "4096".to_owned(),
+                "--guest-exec-max-fuel".to_owned(),
+                "100000".to_owned(),
+                "--guest-exec-max-memory".to_owned(),
+                "536870912".to_owned(),
+                "--guest-exec-wall-ms".to_owned(),
+                "30000".to_owned(),
+                "--guest-exec-epoch-ticks".to_owned(),
+                "100".to_owned(),
+            ],
+            "C:\\Kernel",
+            environment,
+            limits,
+        )
+        .expect("join intent builds");
+        let issued = authority
+            .issue(&intent, &grant, nonce, 4_000_000_030_000)
+            .expect("join issuance");
+        assert_eq!(
+            issued.invocation_digest(),
+            "5ac10e759c80ae9256faf09b1cf420635c3b917593f5f1f57e57fe95000914eb"
+        );
+    }
+
+    fn epoch_json_for_join() -> serde_json::Value {
+        serde_json::json!({
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 3
+        })
+    }
+
     #[test]
     fn tagged_hash_matches_byte_identity() {
         // The hex decode/encode round-trips the trusted primitive exactly:

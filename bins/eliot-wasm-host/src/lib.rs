@@ -58,7 +58,7 @@ pub use dispatch_authority::{
     WASM_DISPATCH_DERIVATION_DOMAIN, WASM_LAUNCH_GRANT_HEAD, WASM_VALIDATION_REVISION,
     WasmDispatchAuthority,
 };
-pub use dispatch_drive::{DispatchDriveResponse, DriveError, drive_dispatch};
+pub use dispatch_drive::{DispatchDriveResponse, DriveError, LifecycleVerdicts, drive_dispatch};
 pub use dispatch_material::{
     DISPATCH_MATERIAL_MAX_BYTES, MaterialError, ValidatedAssuranceRecord,
     ValidatedDispatchMaterial, ValidatedGuestCeilings, ValidatedManifestRecord,

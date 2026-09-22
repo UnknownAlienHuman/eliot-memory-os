@@ -741,6 +741,195 @@ fn validate_snapshot_record(record: &WasmSnapshotRecord) -> Result<(), WasmDispa
     Ok(())
 }
 
+/// Published join gate record: the owner-side forward issuance digest
+/// the Kernel join table binds against the child's admitted request. The
+/// child re-derives the identical digest from the same admitted material
+/// (R1 interop vectors assert both literals); any drift fails the join
+/// gate, never silently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmJoinGate {
+    /// Admitted claim identity.
+    pub claim_id: String,
+    /// Admitted operation identity.
+    pub operation_id: String,
+    /// Child-identical authority identity string.
+    pub authority_id: String,
+    /// Opaque grant digest carried for correlation.
+    pub grant_digest: String,
+    /// Forward-issued invocation digest for the join table.
+    pub invocation_digest: String,
+}
+
+/// Computes the owner-side join gate for one admitted claim: the identical
+/// forward issuance the child performs in-process (deterministic key from
+/// pre-binding admitted material, fence/lease from the grant window,
+/// canonical intent, one-shot permit). The owner never issues a live
+/// permit here — this pure computation publishes the digest the live
+/// join gate closes over. Inputs mirror the child derivation exactly:
+/// `executable_path` and `host_artifact_digest` are the registry values
+/// Beauvoir passes from the descriptor, `install_dir` their parent.
+///
+/// # Errors
+///
+/// Returns [`WasmDispatchError`] when any identity, digest, ceiling, or
+/// issuance input fails closed.
+#[allow(clippy::too_many_arguments)]
+pub fn wasm_join_gate(
+    claim: &WasmOwnerClaim,
+    executable_path: &str,
+    host_artifact_digest: &str,
+    install_dir: &std::path::Path,
+) -> Result<WasmJoinGate, WasmDispatchError> {
+    use eliot_process::{
+        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
+        EnvironmentProjection, FencingToken, Generation, ImageId, JobId, KernelDispatchKey,
+        OperationId, PermitIssuance, ProcessIntent, ProcessRequest, ProcessTreeId, ResourceLimits,
+        SessionId,
+    };
+    use sha2::{Digest as _, Sha256};
+
+    if claim.claim_id.trim().is_empty()
+        || claim.operation_id.trim().is_empty()
+        || claim.launch_nonce.trim().is_empty()
+        || executable_path.trim().is_empty()
+    {
+        return Err(invalid("join-identities"));
+    }
+    if claim.generation == 0 || claim.admitted_at_unix_ms == 0 {
+        return Err(invalid("join-window"));
+    }
+    require_digest(&claim.identity_digest, "join-identity-digest")?;
+    require_digest(host_artifact_digest, "join-host-digest")?;
+    // Derivation base identical to the child
+    // (`bins/eliot-wasm-host/src/dispatch_authority.rs`): the owner
+    // publisher runs the identical forward computation so both sides
+    // derive the same key, authority identity, and invocation digest.
+    let epoch_json =
+        serde_json::to_value(&claim.authority_epoch).map_err(|_| WasmDispatchError::Gate)?;
+    let derived = wasm_dispatch_derivation_from_epoch_json(
+        &claim.claim_id,
+        &claim.operation_id,
+        claim.generation,
+        &epoch_json,
+        &claim.launch_nonce,
+    )?;
+    let key_material = format!("key:{}", derived.base_json);
+    let key_digest = Sha256::digest(key_material.as_bytes());
+    let mut key_bytes = [0_u8; 32];
+    key_bytes.copy_from_slice(&key_digest);
+    let key =
+        KernelDispatchKey::from_secret_bytes(key_bytes).map_err(|_| WasmDispatchError::Gate)?;
+    let authority_id = DispatchAuthorityId::new(derived.authority_id.clone())
+        .map_err(|_| WasmDispatchError::Gate)?;
+    // Grant identical to the bundle publisher: the join test fixes the
+    // same fence/lease derivation the child rebuilds.
+    let generation =
+        Generation::new(claim.generation).map_err(|_| invalid("join-generation"))?;
+    let grant = wasm_dispatch_grant_for(
+        &claim.identity_digest,
+        &claim.authority_epoch,
+        generation,
+        claim.admitted_at_unix_ms,
+        host_artifact_digest,
+    )?;
+    let fence = FencingToken::new(
+        claim.authority_epoch.clone(),
+        Generation::new(claim.generation).map_err(|_| invalid("join-generation"))?,
+        grant.fence_nonce.clone(),
+    )
+    .map_err(|_| WasmDispatchError::Gate)?;
+    let lease = ActionLeaseRef::new(grant.idempotency_key.clone())
+        .map_err(|_| WasmDispatchError::Gate)?;
+    // Canonical intent identical to the child rule: operation/tree/job/
+    // image/session/generation/exe/argv/workdir/env/limits, with the tree
+    // bound to the work scope exactly like the child derivation.
+    let short_host = host_artifact_digest
+        .get(..16)
+        .ok_or_else(|| invalid("join-host-digest"))?;
+    let artifact_path = install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME);
+    let input_path = install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME);
+    let artifact_text = artifact_path
+        .to_str()
+        .ok_or_else(|| invalid("join-paths"))?;
+    let input_text = input_path.to_str().ok_or_else(|| invalid("join-paths"))?;
+    let working_text = install_dir
+        .to_str()
+        .ok_or_else(|| invalid("join-paths"))?;
+    let environment =
+        EnvironmentProjection::new(std::collections::BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
+            .map_err(|_| WasmDispatchError::Gate)?;
+    let limits = ResourceLimits::new(
+        claim.guest.wall_deadline_ms,
+        None,
+        Some(claim.guest.max_memory_bytes),
+        claim.guest.max_output_bytes,
+        claim.guest.max_output_bytes,
+        1,
+    )
+    .map_err(|_| WasmDispatchError::Gate)?;
+    let intent = ProcessIntent::new(
+        OperationId::new(claim.operation_id.clone()).map_err(|_| invalid("join-operation"))?,
+        ProcessTreeId::new(claim.work.work_scope.clone()).map_err(|_| invalid("join-tree"))?,
+        JobId::new(claim.operation_id.clone()).map_err(|_| invalid("join-job"))?,
+        ImageId::new(format!("wasm-host-image-{short_host}"))
+            .map_err(|_| invalid("join-image"))?,
+        SessionId::new(claim.claim_id.clone()).map_err(|_| invalid("join-session"))?,
+        Generation::new(claim.generation).map_err(|_| invalid("join-generation"))?,
+        executable_path.to_owned(),
+        host_artifact_digest.to_owned(),
+        vec![
+            "--profile".to_owned(),
+            claim.profile.clone(),
+            "--guest-exec".to_owned(),
+            "--guest-exec-artifact".to_owned(),
+            artifact_text.to_owned(),
+            "--guest-exec-input".to_owned(),
+            input_text.to_owned(),
+            "--guest-exec-artifact-digest".to_owned(),
+            claim.guest.artifact_digest.clone(),
+            "--guest-exec-max-output".to_owned(),
+            claim.guest.max_output_bytes.to_string(),
+            "--guest-exec-max-fuel".to_owned(),
+            claim.guest.max_fuel.to_string(),
+            "--guest-exec-max-memory".to_owned(),
+            claim.guest.max_memory_bytes.to_string(),
+            "--guest-exec-wall-ms".to_owned(),
+            claim.guest.wall_deadline_ms.to_string(),
+            "--guest-exec-epoch-ticks".to_owned(),
+            claim.guest.epoch_deadline_ticks.to_string(),
+        ],
+        working_text.to_owned(),
+        environment,
+        limits,
+    )
+    .map_err(|_| WasmDispatchError::Gate)?;
+    let issuance = PermitIssuance::new(
+        lease,
+        fence,
+        std::collections::BTreeMap::from([(
+            WASM_DISPATCH_LAUNCH_GRANT_HEAD.to_owned(),
+            derived.head_digest.clone(),
+        )]),
+        claim.admitted_at_unix_ms,
+        grant.expires_at,
+        claim.launch_nonce.clone(),
+    )
+    .map_err(|_| WasmDispatchError::Gate)?;
+    let mut authority = DispatchPermitAuthority::activate(authority_id, key);
+    let permit = authority
+        .issue(&intent, issuance)
+        .map_err(|_| WasmDispatchError::Gate)?;
+    let request =
+        ProcessRequest::new(intent, permit).map_err(|_| WasmDispatchError::Gate)?;
+    Ok(WasmJoinGate {
+        claim_id: claim.claim_id.clone(),
+        operation_id: claim.operation_id.clone(),
+        authority_id: derived.authority_id,
+        grant_digest: grant.grant_digest,
+        invocation_digest: request.invocation_digest().to_owned(),
+    })
+}
+
 /// Canonical material bytes for delivery: exact JSON the child parses.
 pub fn material_bytes(material: &WasmDispatchMaterial) -> Result<Vec<u8>, WasmDispatchError> {
     serde_json::to_vec(material).map_err(|_| WasmDispatchError::Gate)
@@ -792,6 +981,8 @@ pub struct WasmOwnerClaim {
 pub struct WasmPublishedBundle {
     /// Validated envelope as published.
     pub material: WasmDispatchMaterial,
+    /// Owner-side join gate for the live join table.
+    pub join: WasmJoinGate,
     /// Staged material file path.
     pub material_path: std::path::PathBuf,
     /// Staged artifact file path.
@@ -853,12 +1044,19 @@ pub fn publish_wasm_dispatch_bundle(
     let material_path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
     let artifact_path = install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME);
     let input_path = install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME);
+    let join = wasm_join_gate(
+        claim,
+        host_path.as_str(),
+        host_digest.as_str(),
+        &install_dir,
+    )?;
     let io_denied = |_| invalid("delivery-io");
     std::fs::write(&material_path, material_bytes(&material)?).map_err(io_denied)?;
     std::fs::write(&artifact_path, &claim.artifact_bytes).map_err(io_denied)?;
     std::fs::write(&input_path, &claim.input_bytes).map_err(io_denied)?;
     Ok(WasmPublishedBundle {
         material,
+        join,
         material_path,
         artifact_path,
         input_path,
@@ -1193,6 +1391,79 @@ mod tests {
             publish_wasm_dispatch_bundle(&garbage_descriptor(), &empty),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));
+    }
+
+    /// R1 join vector: fixed claim + registry values produce the pinned
+    /// invocation digest below. The child asserts the identical literal
+    /// (`bins/eliot-wasm-host/src/dispatch_drive.rs`, join issuance pin);
+    /// agreement is the join interop proof — the owner-published join
+    /// closes if and only if the child re-derives these values.
+    #[test]
+    fn join_gate_matches_child_vector() {
+        fn join_claim() -> WasmOwnerClaim {
+            WasmOwnerClaim {
+                claim_id: "claim-wasm-join-001".to_owned(),
+                operation_id: "operation-wasm-join-001".to_owned(),
+                generation: 7,
+                authority_epoch: serde_json::from_value(serde_json::json!({
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 3
+                }))
+                .expect("test epoch parses"),
+                launch_nonce: "launch-nonce-wasm-join-0001".to_owned(),
+                admitted_at_unix_ms: 4_000_000_000_000,
+                identity_digest: "a".repeat(64),
+                guest: WasmGuestCeilings {
+                    artifact_digest: sha256_hex(b"join-artifact-bytes"),
+                    input_digest: sha256_hex(b"join-input-bytes"),
+                    max_output_bytes: 4096,
+                    max_fuel: 100_000,
+                    max_memory_bytes: 536_870_912,
+                    wall_deadline_ms: 30_000,
+                    epoch_deadline_ticks: 100,
+                    table_elements: 64,
+                    max_instances: 2,
+                    artifact_access_reads: 2,
+                    artifact_access_bytes: 131_072,
+                    component_id: "component-join".to_owned(),
+                },
+                profile: "D2_OPERATIONAL".to_owned(),
+                manifest: test_manifest(),
+                work: test_work(),
+                assurance: test_assurance(),
+                promotion: test_promotion(),
+                snapshot: test_snapshot(),
+                artifact_bytes: b"join-artifact-bytes".to_vec(),
+                input_bytes: b"join-input-bytes".to_vec(),
+            }
+        }
+        let join = wasm_join_gate(
+            &join_claim(),
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            std::path::Path::new("C:\\Kernel"),
+        )
+        .expect("join gate computes");
+        assert_eq!(join.claim_id, "claim-wasm-join-001");
+        assert_eq!(join.operation_id, "operation-wasm-join-001");
+        assert!(
+            join.authority_id
+                .starts_with(WASM_DISPATCH_AUTHORITY_PREFIX)
+        );
+        assert_eq!(join.invocation_digest.len(), 64);
+        // Replay-stable: identical inputs rebuild the identical digest.
+        let replay = wasm_join_gate(
+            &join_claim(),
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            std::path::Path::new("C:\\Kernel"),
+        )
+        .expect("join gate recomputes");
+        assert_eq!(join, replay);
+        assert_eq!(
+            join.invocation_digest,
+            "5ac10e759c80ae9256faf09b1cf420635c3b917593f5f1f57e57fe95000914eb"
+        );
     }
 
     #[test]
