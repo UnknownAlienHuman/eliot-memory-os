@@ -33,7 +33,8 @@ use crate::{
     ActivePhaseBRebindReceipt, ActivePhaseBRebindRecovery, AgentBridgeStagePrepared,
     HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
-    InstallationError, PendingActivation, WindowsPathIdentity, activation_terminal_digest,
+    InstallationError, PendingActivation, PendingActivationAbortReceipt, WindowsPathIdentity,
+    activation_terminal_digest,
     candidate_manifest_digest, valid_installation_key,
 };
 
@@ -219,6 +220,77 @@ impl RedbInstallationRegistry {
                 _file: file,
             },
         }))
+    }
+
+    fn validate_host_owner_binding_for_identity(
+        &self,
+        host: &HostOwnerEpochCapability,
+        installation_id: &PlatformHandle,
+        host_state_root: &PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        if !host.is_for_installation(installation_id) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let expected_root = WindowsPathIdentity::parse_root(
+            host_state_root.as_str(),
+            "installation_registry.owner.host_state_root",
+        )?;
+        let actual_root = match &self._path_lease {
+            RegistryPathLease::InstallationHost { _root, .. } => {
+                _root
+                    .verify_stable_identity()
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+                let canonical_root = _root
+                    .canonical_path()
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+                WindowsPathIdentity::parse_root(
+                    &canonical_root.to_string_lossy(),
+                    "installation_registry.owner.retained_host_state_root",
+                )?
+            }
+            _ => {
+                return Err(InstallationError::Platform(
+                    "owner-bound abort requires the retained protected Host registry root"
+                        .to_owned(),
+                ));
+            }
+        };
+        if actual_root != expected_root {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_host_owner_binding(
+        &self,
+        host: &HostOwnerEpochCapability,
+        pending: &PendingActivation,
+    ) -> Result<(), InstallationError> {
+        self.validate_host_owner_binding_for_identity(
+            host,
+            &pending
+                .manifest
+                .runtime_launch
+                .installation_epoch
+                .installation,
+            &pending
+                .manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root,
+        )
+    }
+
+    fn validate_host_owner_binding_for_abort_receipt(
+        &self,
+        host: &HostOwnerEpochCapability,
+        receipt: &PendingActivationAbortReceipt,
+    ) -> Result<(), InstallationError> {
+        self.validate_host_owner_binding_for_identity(
+            host,
+            &receipt.installation_id,
+            &receipt.host_state_root,
+        )
     }
 
     /// Seeds one physically persisted active generation for a production-bound
@@ -467,6 +539,7 @@ impl RedbInstallationRegistry {
             let pending = registry.pending_activation.as_ref().ok_or_else(|| {
                 InstallationError::IncompleteObservation("no pending activation exists".to_owned())
             })?;
+            self.validate_host_owner_binding(host, pending)?;
             if pending.approval != approval {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -499,6 +572,7 @@ impl RedbInstallationRegistry {
             let pending = registry.pending_activation.as_ref().ok_or_else(|| {
                 InstallationError::IncompleteObservation("no pending activation exists".to_owned())
             })?;
+            self.validate_host_owner_binding(host, pending)?;
             if pending.approval != approval
                 || receipt.transaction_id != pending.transaction_id
                 || receipt.candidate_manifest_digest != pending.manifest_digest
@@ -530,6 +604,7 @@ impl RedbInstallationRegistry {
             let pending = registry.pending_activation.as_ref().ok_or_else(|| {
                 InstallationError::IncompleteObservation("no pending activation exists".to_owned())
             })?;
+            self.validate_host_owner_binding(host, pending)?;
             if pending.approval != approval
                 || receipt.transaction_id != pending.transaction_id
                 || receipt.candidate_manifest_digest != pending.manifest_digest
@@ -563,6 +638,7 @@ impl RedbInstallationRegistry {
             let pending = registry.pending_activation.as_ref().ok_or_else(|| {
                 InstallationError::IncompleteObservation("no pending activation exists".to_owned())
             })?;
+            self.validate_host_owner_binding(host, pending)?;
             if pending.approval != approval
                 || intent.transaction_id != pending.transaction_id
                 || intent.installation_plan_digest != pending.plan_digest
@@ -595,6 +671,7 @@ impl RedbInstallationRegistry {
             let pending = registry.pending_activation.as_ref().ok_or_else(|| {
                 InstallationError::IncompleteObservation("no pending activation exists".to_owned())
             })?;
+            self.validate_host_owner_binding(host, pending)?;
             if pending.approval != approval
                 || pending.phase_b_intent.as_ref() != Some(&intent)
                 || pending.phase_b_receipt.is_some()
@@ -626,6 +703,7 @@ impl RedbInstallationRegistry {
             let pending = registry.pending_activation.as_ref().ok_or_else(|| {
                 InstallationError::IncompleteObservation("no pending activation exists".to_owned())
             })?;
+            self.validate_host_owner_binding(host, pending)?;
             if pending.approval != approval
                 || pending.phase_b_intent.as_ref().is_none_or(|intent| {
                     intent.effect_id != prepared.effect_id
@@ -664,6 +742,7 @@ impl RedbInstallationRegistry {
             let pending = registry.pending_activation.as_ref().ok_or_else(|| {
                 InstallationError::IncompleteObservation("no pending activation exists".to_owned())
             })?;
+            self.validate_host_owner_binding(host, pending)?;
             if pending.approval != approval {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -697,6 +776,7 @@ impl RedbInstallationRegistry {
             let pending = registry.pending_activation.as_ref().ok_or_else(|| {
                 InstallationError::IncompleteObservation("no pending activation exists".to_owned())
             })?;
+            self.validate_host_owner_binding(host, pending)?;
             if pending.approval != approval {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -830,6 +910,7 @@ impl RedbInstallationRegistry {
             let pending = registry.pending_activation.as_ref().ok_or_else(|| {
                 InstallationError::IncompleteObservation("no pending activation exists".to_owned())
             })?;
+            self.validate_host_owner_binding(host, pending)?;
             if pending.approval != approval {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -857,10 +938,11 @@ impl RedbInstallationRegistry {
         let approval = approval.clone();
         let commit_fence = commit_fence.clone();
         self.mutate_atomic(expected_revision, |registry| {
-            if let Some(pending) = registry.pending_activation.as_ref()
-                && pending.approval != approval
-            {
-                return Err(InstallationError::IdentityConflict);
+            if let Some(pending) = registry.pending_activation.as_ref() {
+                self.validate_host_owner_binding(host, pending)?;
+                if pending.approval != approval {
+                    return Err(InstallationError::IdentityConflict);
+                }
             }
             registry.commit_pending_activation_unchecked(
                 &approval.transaction_id,
@@ -893,6 +975,7 @@ impl RedbInstallationRegistry {
                 "exact pending activation is absent before abort".to_owned(),
             )
         })?;
+        self.validate_host_owner_binding(host, pending)?;
         if pending.transaction_id != *transaction_id
             || pending.plan_digest != *plan_digest
             || pending.approval != *approval
@@ -913,36 +996,63 @@ impl RedbInstallationRegistry {
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
+        approval: &InstallationActivationApproval,
+        activation_intent_digest: &PlatformHandle,
     ) -> Result<Option<PlatformHandle>, InstallationError> {
         let _guard = host
             .live_guard()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        approval.validate()?;
+        crate::sha256_handle(
+            activation_intent_digest,
+            "activation_projection.intent_digest",
+        )?;
         let registry = self.load()?;
-        if registry.pending_activation().is_some() {
-            return Ok(None);
-        }
-        let Some(terminal) = registry.last_terminal_activation.as_ref() else {
+        let receipt = registry
+            .aborted_activation_receipts
+            .iter()
+            .find(|receipt| {
+                receipt.transaction_id == *transaction_id
+                    && receipt.plan_digest == *plan_digest
+                    && receipt.generation == *generation
+            })
+            .or_else(|| {
+                registry
+                    .last_terminal_activation
+                    .as_ref()
+                    .and_then(|terminal| terminal.abort_receipt.as_ref())
+                    .filter(|receipt| {
+                        receipt.transaction_id == *transaction_id
+                            && receipt.plan_digest == *plan_digest
+                            && receipt.generation == *generation
+                    })
+            });
+        let Some(receipt) = receipt else {
             return Ok(None);
         };
-        let same_transaction_and_plan =
-            terminal.transaction_id == *transaction_id && terminal.plan_digest == *plan_digest;
-        if terminal.disposition == PendingActivationTerminalDisposition::Aborted
-            && same_transaction_and_plan
-            && terminal.generation == *generation
-            && terminal.commit_fence.is_none()
+        receipt.validate()?;
+        self.validate_host_owner_binding_for_abort_receipt(host, receipt)?;
+        if registry.active_generation.is_some() || registry.last_known_good_generation.is_some() {
+            return Err(InstallationError::IncompleteObservation(
+                "aborted first-install terminal coexists with active registry state".to_owned(),
+            ));
+        }
+        if !receipt.approval.matches_approval(approval)
+            || receipt.activation_intent_digest != *activation_intent_digest
         {
-            if registry.active_generation.is_some() || registry.last_known_good_generation.is_some()
-            {
-                return Err(InstallationError::IncompleteObservation(
-                    "aborted first-install terminal coexists with active registry state".to_owned(),
-                ));
-            }
-            let terminal_digest = activation_terminal_digest(terminal)?;
+            return Err(InstallationError::IdentityConflict);
+        }
+        if receipt.transaction_id == *transaction_id
+            && receipt.plan_digest == *plan_digest
+            && receipt.generation == *generation
+        {
+            let receipt_digest = crate::activation_abort_receipt_digest(receipt)?;
             let evidence = PlatformHandle::new(format!(
-                "activation-abort-ack-v1:{}:{}:{}",
-                registry.revision(),
-                terminal.generation.as_str(),
-                terminal_digest,
+                "activation-abort-ack-v2:{}:{}:{}:{}",
+                receipt.registry_revision_after,
+                receipt.generation.as_str(),
+                receipt.registry_snapshot_identity,
+                receipt_digest,
             ))
             .map_err(|error| InstallationError::InvalidField {
                 field: "activation_projection.abort_evidence".to_owned(),
@@ -950,10 +1060,7 @@ impl RedbInstallationRegistry {
             })?;
             return Ok(Some(evidence));
         }
-        if same_transaction_and_plan {
-            return Err(InstallationError::IdentityConflict);
-        }
-        Ok(None)
+        Err(InstallationError::IdentityConflict)
     }
     /// Atomically aborts one exact first-install pending approval.
     pub fn abort_pending_activation(
@@ -968,14 +1075,26 @@ impl RedbInstallationRegistry {
         approval.validate()?;
         let approval = approval.clone();
         self.mutate_atomic(expected_revision, |registry| {
-            if let Some(pending) = registry.pending_activation.as_ref()
-                && pending.approval != approval
-            {
-                return Err(InstallationError::IdentityConflict);
+            if let Some(pending) = registry.pending_activation.as_ref() {
+                self.validate_host_owner_binding(host, pending)?;
+                if pending.approval != approval {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            } else if let Some(receipt) = registry.aborted_activation_receipts.iter().find(|receipt| {
+                receipt.transaction_id == approval.transaction_id
+                    && receipt.plan_digest == approval.installer_plan_digest
+                    && receipt.generation == approval.generation
+            }) {
+                receipt.validate()?;
+                self.validate_host_owner_binding_for_abort_receipt(host, receipt)?;
+                if !receipt.approval.matches_approval(&approval) {
+                    return Err(InstallationError::IdentityConflict);
+                }
             }
             registry.abort_pending_activation_unchecked(
                 &approval.transaction_id,
                 &approval.installer_plan_digest,
+                &approval.generation,
             )
         })
     }

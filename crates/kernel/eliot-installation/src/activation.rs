@@ -295,7 +295,7 @@ impl InstallationActivationApprovalBinding {
         self == &Self::from_approval(approval)
     }
 
-    fn validate(&self) -> Result<(), InstallationError> {
+    pub(crate) fn validate(&self) -> Result<(), InstallationError> {
         let approval = InstallationActivationApproval {
             approval_ref: self.approval_ref.clone(),
             transaction_id: self.transaction_id.clone(),

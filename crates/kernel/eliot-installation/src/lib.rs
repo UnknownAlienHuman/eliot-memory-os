@@ -150,8 +150,10 @@ pub use approved_generation_registry::{
     phase_b_digest_state, phase_b_scm_selector,
 };
 use approved_generation_registry::{
-    ActiveVerifiedReceiptBinding, PendingActivationTerminal, PendingActivationTerminalDisposition,
+    ActiveVerifiedReceiptBinding, PendingActivationAbortReceipt, PendingActivationTerminal,
+    PendingActivationTerminalDisposition, activation_abort_receipt_digest,
     activation_terminal_digest, candidate_manifest_digest, phase_b_scm_digest,
+    activation_projection_intent_digest,
     registry_projection_identity, validate_phase_b_scm_digest,
 };
 #[cfg(test)]
@@ -9309,12 +9311,15 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         // Phase-B effects are still pending and carry no runtime receipt.
         transaction.require_signed_pending_activation_effects()?;
         let approval = intent.derive_verified_approval(&transaction)?;
+        let activation_intent_digest = activation_projection_intent_digest(&intent)?;
         let expected_transaction = TransactionVersion::of(&transaction)?;
         let abort_evidence = match registry.read_exact_aborted_activation_ack(
             host,
             transaction_id,
             &transaction.installer_plan_digest,
             &transaction.candidate_manifest.generation,
+            &approval,
+            &activation_intent_digest,
         )? {
             Some(evidence) => evidence,
             None => {
@@ -9331,6 +9336,8 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
                         transaction_id,
                         &transaction.installer_plan_digest,
                         &transaction.candidate_manifest.generation,
+                        &approval,
+                        &activation_intent_digest,
                     )?
                     .ok_or_else(|| {
                         InstallationError::IncompleteObservation(
