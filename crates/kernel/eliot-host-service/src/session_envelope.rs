@@ -34,13 +34,20 @@
 //! vocabulary (`ReactiveContextRecipient`: session, opaque runtime identity,
 //! runtime generation, route) carries no standalone `recipient_id` string,
 //! so the contract derivation reads the authoritative disclosure vocabulary:
-//! I5.26 names disclosure recipients as `recipient_principal_or_route`, and
-//! the admitted recipient carries no principal. The route
+//! I5.26 names disclosure recipients as `recipient_principal_or_route`,
+//! I10.15 addresses recipients as recipient principals/routes, and I10.18
+//! owns sender/recipient principal identity on envelopes — while the
+//! admitted reactive recipient carries no principal field at all. The route
 //! fingerprint-or-identity is therefore the recipient identity text
 //! (`AdmittedDeliveryFacts.recipient_id`), cloned from the admitted struct —
-//! never parsed, hashed, or composed from other fields. Principal and
-//! recipient stay un-conflated: the snapshot carries the bridge-owned
-//! `principal_id` separately.
+//! never parsed, hashed, or composed from other fields. Excluded with
+//! reason: `session_id` would collapse recipient into session (the snapshot
+//! carries `session.session_id` separately and binds records on it);
+//! `runtime_id` would collapse recipient into runtime (the snapshot carries
+//! a separate `runtime_id` sourced from the runtime owner — the Kernel
+//! activation receipt authoritatively, this retained producer observation
+//! only as evidence). Principal and recipient stay un-conflated: the
+//! snapshot carries the bridge-owned `principal_id` separately.
 //!
 //! Fence note: `entry_fence` is the Host journal `RecordFence`, not the
 //! bridge `StateFence` — distinct fenced domains, carried side by side, never

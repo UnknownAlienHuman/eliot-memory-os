@@ -43,16 +43,23 @@
 //! triple — no other runtime join may invoke the supplier path, and no
 //! speculative loop is wired here.
 
-use eliot_agent_api::{ExecutionUnit, NativeSession, ProviderExecutionBinding, RequestId};
+use eliot_agent_api::{
+    AgentLaunchRequest, AuthorityEnvelope, ExecutionUnit, NativeSession, ProviderExecutionBinding,
+    RequestId, RouteFingerprint,
+};
 use eliot_agent_codex::{
-    CodexAdapterError, CodexAttachReceipt, CodexBindExecutionInput, bind_execution_unit,
+    CodexAdapterError, CodexAttachInput, CodexAttachReceipt, CodexBindExecutionInput,
+    CodexSessionBinding, attach, bind_execution_unit,
 };
 use eliot_agent_coordinator::{
-    AgentCoordinator, CoordinatorError, ExecutionContext, ProviderExecutionBindingSubmission,
-    ProviderIdentity, SessionAttemptError, SessionMatchError, VerifiedSessionBinding,
-    produce_session_bound_attempts, verify_session_binding,
+    AgentCoordinator, CoordinatedAttemptState, CoordinatorError, ExecutionContext,
+    ProviderAdmissionReceipt, ProviderExecutionBindingSubmission, ProviderIdentity,
+    SessionAttemptError, SessionMatchError, VerifiedSessionBinding, produce_session_bound_attempts,
+    verify_session_binding,
 };
 use eliot_contracts::{SessionId, StateFence, TaskId, WorkLeaseId, fences_match_exact};
+use eliot_process::ProcessRequest;
+use eliot_source_assurance::{AdmissionExpectation, SourceAssurance};
 use thiserror::Error;
 
 /// Typed inputs for dispatching one execution unit through the chain.
@@ -137,6 +144,14 @@ pub enum ExecutionChainError {
     /// one.
     #[error("recorded attestation names another attempt than dispatched")]
     AttemptMismatch,
+    /// No admitted lane carries the attach route, or several do: the launch
+    /// cannot select a single lane without a caller choice.
+    #[error("admitted lanes do not select exactly one lane for the attach route")]
+    LaneSelection,
+    /// The admitted attempt is not in a dispatchable state (neither
+    /// `Admitted` nor `Running`).
+    #[error("admitted attempt is not in a dispatchable state")]
+    AttemptNotDispatchable,
 }
 
 /// Dispatch one execution unit through the full production chain.
@@ -204,5 +219,138 @@ pub fn dispatch_execution_unit(
     Ok(DispatchedExecution {
         binding: bound,
         verified,
+    })
+}
+
+/// Typed inputs for launching one execution unit through the full chain.
+///
+/// Owner artifacts only, grouped by the owner that issued them: the Task
+/// Controller frozen launch, the Governor grant envelope and provider
+/// admission receipt, the Q-01 source admission, the P-03 process binding,
+/// the daemon-held live attach session binding and live triple, and the
+/// execution-observed facts plus provider-start correlation. No identity,
+/// fence, task, or receipt text appears anywhere here; every field is a
+/// validated owner type.
+pub struct LaunchExecutionInput<'a> {
+    /// Frozen Task-Controller launch request.
+    pub launch: AgentLaunchRequest,
+    /// Governor grant envelope bounding the launch.
+    pub authority: AuthorityEnvelope,
+    /// Admitted route this launch serves.
+    pub route: RouteFingerprint,
+    /// Daemon-held live attach session binding.
+    pub session: CodexSessionBinding,
+    /// P-03 process-request binding for the execution.
+    pub process_request: ProcessRequest,
+    /// Q-01 source assurance for the launch source.
+    pub source_assurance: SourceAssurance,
+    /// Q-01 admission expectation for the launch source.
+    pub source_expectation: AdmissionExpectation,
+    /// Coordinator holding the admission.
+    pub coordinator: &'a mut AgentCoordinator,
+    /// Governor/provider admission receipt for the staffed candidate.
+    pub admission: ProviderAdmissionReceipt,
+    /// Freshly read live attach session the launch serves.
+    pub live_session: &'a SessionId,
+    /// Freshly read live attach fence the launch serves under.
+    pub live_fence: &'a StateFence,
+    /// Freshly read live attach task the launch serves.
+    pub live_task: &'a TaskId,
+    /// Authenticated provider scope the execution runs under.
+    pub provider_scope_ref: String,
+    /// Observed native thread locator (execution evidence only).
+    pub native_session: NativeSession,
+    /// Execution-unit identity for this turn.
+    pub execution_unit: ExecutionUnit,
+    /// Start-request identity.
+    pub start_request_id: RequestId,
+    /// Canonical start-request bytes (digest computed inside the supplier).
+    pub start_request_bytes: &'a [u8],
+    /// Provider identity for the start correlation.
+    pub provider_identity: ProviderIdentity,
+    /// Provider start-receipt reference for the start correlation.
+    pub provider_start_receipt_ref: String,
+}
+
+/// Launch one execution unit through the complete production chain.
+///
+/// Order with attach-first validation: the adapter `attach` runs before any
+/// coordinator mutation, so a rejected launch/authority/route/session,
+/// process request, or source admission fails here and no admission, start,
+/// or bind authority ever flows. The coordinator `admit` then stages the
+/// Governor/provider receipt; exactly one admitted lane may carry the attach
+/// route; the attempt starts unless already running; and the remainder runs
+/// through [`dispatch_execution_unit`], which re-checks the live triple
+/// before authoritative use. Deterministic; the coordinator bind stays
+/// idempotent under its canonical-input replay.
+pub fn launch_execution_unit(
+    input: LaunchExecutionInput,
+) -> Result<DispatchedExecution, ExecutionChainError> {
+    // 1. Attach first: validates launch, authority, route, session, process
+    //    request, and source admission together. Nothing below runs unless
+    //    the daemon admission accepts all of them.
+    let attached = attach(CodexAttachInput {
+        launch: input.launch,
+        authority: input.authority,
+        route: input.route.clone(),
+        session: input.session,
+        process_request: input.process_request,
+        source_assurance: input.source_assurance,
+        source_expectation: input.source_expectation,
+    })?;
+    // 2. Stage the Governor/provider admission receipt (sealed verifier).
+    let receipt = input.coordinator.admit(input.admission)?;
+    // 3. The admission must serve the attached launch task.
+    if receipt.task_id != attached.launch().task_id {
+        return Err(ExecutionChainError::LiveAttachMismatch {
+            field: "admission.task",
+        });
+    }
+    // 4. Select exactly one admitted lane by the attach route (exact typed
+    //    equality; lanes arrive sorted from `admit`, so selection is
+    //    deterministic).
+    let mut lanes = receipt
+        .admitted_lanes
+        .iter()
+        .filter(|lane| lane.route == input.route);
+    let lane = lanes.next().ok_or(ExecutionChainError::LaneSelection)?;
+    if lanes.next().is_some() {
+        return Err(ExecutionChainError::LaneSelection);
+    }
+    let context = ExecutionContext::from(&receipt);
+    // 5. Start unless already running; anything else is not dispatchable.
+    //    Owner state is read first — a cached state assumption never starts
+    //    or skips here.
+    let record = input
+        .coordinator
+        .attempt(&lane.attempt_id)
+        .ok_or(ExecutionChainError::AttemptMismatch)?;
+    match record.state {
+        CoordinatedAttemptState::Admitted => {
+            input
+                .coordinator
+                .start_attempt(context.clone(), lane.attempt_id.clone())?;
+        }
+        CoordinatedAttemptState::Running => {}
+        _ => return Err(ExecutionChainError::AttemptNotDispatchable),
+    }
+    // 6. Remainder runs through the verified dispatch chain, which re-checks
+    //    the live triple before authoritative use.
+    dispatch_execution_unit(ExecutionDispatchInput {
+        attached: &attached,
+        coordinator: input.coordinator,
+        context,
+        attempt_id: lane.attempt_id.clone(),
+        lease_id: lane.lease_id.clone(),
+        live_session: input.live_session,
+        live_fence: input.live_fence,
+        live_task: input.live_task,
+        provider_scope_ref: input.provider_scope_ref,
+        native_session: input.native_session,
+        execution_unit: input.execution_unit,
+        start_request_id: input.start_request_id,
+        start_request_bytes: input.start_request_bytes,
+        provider_identity: input.provider_identity,
+        provider_start_receipt_ref: input.provider_start_receipt_ref,
     })
 }

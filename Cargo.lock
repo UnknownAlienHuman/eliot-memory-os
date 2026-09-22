@@ -3230,6 +3230,7 @@ dependencies = [
  "eliot-runtime-contracts",
  "eliot-security-contracts",
  "eliot-skill",
+ "eliot-source-assurance",
  "eliot-store-api",
  "eliot-watchdog-core",
  "serde",
