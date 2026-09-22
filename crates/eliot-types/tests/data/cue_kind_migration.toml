@@ -418,23 +418,23 @@ matched_digest = "bb13ce5a7ba203f62fd0c78b9f6ae400be9b221ada0e20df9366d7a18b6a31
 variants = []
 
 [type_row."crates/smart/eliot-cues/src/lib.rs"]
-role = "duplicate"
+role = "internal"
 owner = "#833"
 migration = 833
 expiry = "facade-disposition-under-#833; invalid-on-definition-change"
-risk = "duplicate-definition"
-match_count = 34
-matched_digest = "6434f2969478f134681902e318f4e2217af6df1830f9eb8a55b73ab3f8068826"
-variants = ["FilePath", "DirPath", "Symbol", "ErrorSignature", "CommandPattern", "Dependency", "ApiSurface", "TaskClass", "Subsystem", "Concept"]
+risk = "none"
+match_count = 5
+matched_digest = "52fe5b71c80f39045b257fc409bba3a960b2e443fe7df7ba4db8cda83714aea7"
+variants = []
 
 [type_row."crates/smart/eliot-cues/tests/integrity.rs"]
 role = "duplicate-test"
 owner = "#833"
 migration = 833
 expiry = "facade-disposition-under-#833; invalid-on-definition-change"
-risk = "duplicate-definition"
-match_count = 44
-matched_digest = "cd735a997136a737d47a42e22e6854a6694d441f0fd7f882918281faf05d1416"
+risk = "none"
+match_count = 5
+matched_digest = "188333ab1a99b1cdaa9c2f93b769a26215a45ca96fb30a709d428b0a7d226ad1"
 variants = []
 
 [type_row."crates/smart/eliot-cue-contracts/src/normalization.rs"]

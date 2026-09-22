@@ -1488,10 +1488,7 @@ fn case_28_new_duplicate_fails() -> TestResult {
         &["crates/smart", "crates/foundation", "crates/eliot-types"],
         "CueKind",
     )?;
-    let mut expected = vec![
-        "crates/smart/eliot-cue-contracts/src/normalization.rs".to_owned(),
-        "crates/smart/eliot-cues/src/lib.rs".to_owned(),
-    ];
+    let mut expected = vec!["crates/smart/eliot-cue-contracts/src/normalization.rs".to_owned()];
     expected.sort();
     assert_eq!(live, expected, "new duplicate definition or lost row");
     Ok(())
