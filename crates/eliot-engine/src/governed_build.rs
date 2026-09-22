@@ -24,15 +24,16 @@ use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation};
 use eliot_instrument_runner::registry::RegistryFreshness;
 use eliot_instrument_runner::{
     CacheLaneAttestations, InstrumentBinding, InstrumentObservation, InstrumentRequestPort,
-    InstrumentRunner, ProviderRegistry, RegistryEntry, ResolvedExecutableIdentity, RunnerError,
+    InstrumentRunner, KernelInstrumentAdmission, KernelInstrumentRequestPort, ProviderRegistry,
+    RegistryEntry, ResolvedExecutableIdentity, RunnerError,
 };
 use eliot_process::{OperationId, ProcessEvidenceSink, ProcessExecutor};
 use thiserror::Error;
 
+use crate::EngineError;
 use crate::cached_derivation::{
     CachedDerivation, CachedDerivationService, GovernedDerivationRequest,
 };
-use crate::EngineError;
 
 /// Default maximum time allowed for one admitted build to reach a terminal
 /// process observation.
@@ -77,6 +78,34 @@ pub struct GovernedBuildRequest<'a> {
     pub invocation: InstrumentInvocation,
     /// Kernel-owned port that returns the sealed process request.
     pub request_port: &'a dyn InstrumentRequestPort,
+    /// Current provider registry used for admission and identity binding.
+    pub registry: &'a ProviderRegistry,
+    /// Freshness inputs for the registry resolution.
+    pub freshness: RegistryFreshness<'a>,
+    /// Machine-derived executable identity, if the registry entry requires it.
+    pub executable: Option<&'a ResolvedExecutableIdentity>,
+    /// Caller-owned dependency closure, producer, root, schema, and optional
+    /// expected content digest.
+    pub attestations: CacheLaneAttestations,
+    /// Exact output path named by the admitted build contract.
+    pub artifact_path: PathBuf,
+    /// Evidence sink supplied by the process composition root.
+    pub sink: Arc<dyn ProcessEvidenceSink>,
+    /// Bounded wait and cache-union policy.
+    pub options: GovernedBuildOptions,
+}
+
+/// Application-facing BUILD request whose process admission is supplied by
+/// the active Kernel owner.
+///
+/// The public low-level [`GovernedBuildRequest`] remains available for callers
+/// that already own an explicit `InstrumentRequestPort`.  Normal production
+/// callers should use this shape with [`GovernedBuildRuntime::run_admitted`],
+/// which installs the concrete Kernel-backed port and keeps request issuance
+/// out of the engine.
+pub struct GovernedBuildApplicationRequest<'a> {
+    /// Provider-neutral BUILD invocation.
+    pub invocation: InstrumentInvocation,
     /// Current provider registry used for admission and identity binding.
     pub registry: &'a ProviderRegistry,
     /// Freshness inputs for the registry resolution.
@@ -193,6 +222,33 @@ impl<E> GovernedBuildRuntime<E> {
 }
 
 impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
+    /// Runs a BUILD through the active Kernel admission owner and the existing
+    /// InstrumentRunner/ProcessExecutor composition.
+    ///
+    /// This is the production application entrypoint for the cache-aware BUILD
+    /// lane.  A valid cache hit returns before admission, while every miss
+    /// obtains a fresh sealed `ProcessRequest` from `admission`; the engine
+    /// never constructs or deserializes one itself.
+    pub async fn run_admitted(
+        &mut self,
+        request: GovernedBuildApplicationRequest<'_>,
+        admission: &dyn KernelInstrumentAdmission,
+    ) -> Result<GovernedBuildOutcome, GovernedBuildError> {
+        let port = KernelInstrumentRequestPort::new(admission);
+        self.run(GovernedBuildRequest {
+            invocation: request.invocation,
+            request_port: &port,
+            registry: request.registry,
+            freshness: request.freshness,
+            executable: request.executable,
+            attestations: request.attestations,
+            artifact_path: request.artifact_path,
+            sink: request.sink,
+            options: request.options,
+        })
+        .await
+    }
+
     /// Runs one admitted BUILD through cache lookup, real process execution,
     /// artifact readback, and observed-content publication.
     ///
