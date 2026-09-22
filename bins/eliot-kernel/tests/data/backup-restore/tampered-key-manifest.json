@@ -1,0 +1,1 @@
+{"manifest_id":"key-manifest-960","backup_id":"bundle-960-full","entries":[{"key_lineage":"key-lineage-1","wrapping_key_id":"wrap-1","algorithm":"wrap-alg","wrapped_key_bytes":[119,114,97,112,112,101,100,45,57,54,48],"wrapped_key_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
