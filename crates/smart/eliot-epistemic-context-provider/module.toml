@@ -14,22 +14,22 @@ hot_path = false
 lifecycle_owner = "smart.epistemic.context_provider"
 loc_soft_ceiling = 10000
 loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
-product_objective = "The admitted Current Epistemic Position reaches context candidates as a typed envelope-bound contribution without a parallel contribution schema."
-causal_property = "envelope-bound epistemic Context provider contribution"
+product_objective = "The owner-neutral ProviderContribution reaches context candidates framed by this package's provider identity, with no parallel contribution schema."
+causal_property = "thin adapter over the owner contribution envelope"
 old_failure_or_missing_capability = "Context candidates either link the epistemic resolver algorithm or invent a provider contribution type instead of consuming the admitted position contract (CC-PROVIDER-CONTRIBUTION-SCHEMA)."
-discriminator = "the contribution echoes the admitted position digest, claim, envelope scope/fence/revision, and coverage digest exactly; provider identity is enforced; superseded positions are rejected; no caller-supplied scope/fence and no synthetic construction path exist"
-primary_responsibility = "Contribute one EpistemicContextContribution read from an admitted CurrentEpistemicPosition with envelope-bound scope/fence/revision/coverage."
+discriminator = "the adapter carries a validated owner ProviderContribution plus the enforced provider label; scope/fence/revision/coverage arrive only through the owner envelope; no caller-supplied envelope fields and no synthetic construction path exist"
+primary_responsibility = "Frame one validated owner ProviderContribution with this package's provider identity for context candidates."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["admitted CurrentEpistemicPosition by reference (frozen contract)"]
+inputs = ["validated owner ProviderContribution (frozen owner contract)"]
 outputs = ["EpistemicContextContribution"]
-depends_on = ["eliot-epistemic-contracts", "eliot-context-contracts", "eliot-contracts"]
-providers = ["eliot-epistemic position owner (admission supply only)"]
+depends_on = ["eliot-epistemic-contracts", "eliot-context-contracts"]
+providers = ["eliot-epistemic position owner (contribution supply only)"]
 consumers = ["eliot-context-candidates"]
-non_goals = ["epistemic resolution", "second admission pass", "owner-neutral ProviderContribution schema", "support/truth promotion", "fence compatibility inference", "caller-supplied scope/fence", "synthetic contribution construction"]
-invariants = ["position digest, claim, envelope scope/fence/revision, and coverage digest echoed exactly, never reinterpreted or independently supplied", "provider identity enforced at validation", "superseded positions rejected, never contributed", "fence is carried, not gated: the consumer edge gates compatibility", "no resolver, acquisition, ranking, storage, or application behavior"]
-failure_behavior = "Reject superseded positions, version drift, provider mismatch, and malformed envelope echoes explicitly."
-proof_surface = ["envelope echo", "superseded rejection", "provider enforcement", "version drift", "wire roundtrip"]
+non_goals = ["epistemic resolution", "second admission pass", "parallel contribution schema", "support/truth promotion", "fence compatibility inference", "caller-supplied envelope fields", "synthetic contribution construction"]
+invariants = ["owner envelope validated on entry and re-validated on every validate call", "provider identity enforced at validation", "envelope fields echoed only through the owner type, never reinterpreted or independently supplied", "fence is carried, not gated: the consumer edge gates compatibility", "no resolver, acquisition, ranking, storage, or application behavior"]
+failure_behavior = "Return the owner's own rejection for invalid or superseded positions; reject provider mismatch explicitly."
+proof_surface = ["owner envelope passthrough", "superseded rejection", "provider enforcement", "wire roundtrip"]
 proof_ceiling = "PACKAGE_PROOF_ONLY"
 product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
 replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
@@ -37,8 +37,12 @@ merge_rejoin_condition = "merge back when no independent consumer, proof, depend
 split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
 
 [[donor]]
+path = "crates/smart/eliot-epistemic-contracts/src/contribution.rs"
+disposition = "owner contract reused: ProviderContribution contribute()/validate() with closed validation and envelope binding; this package only frames it"
+
+[[donor]]
 path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
-disposition = "frozen upstream surface: CurrentEpistemicPosition, AdmittedKind, Currentness, ProviderId, StateFence bindings; owner-neutral ProviderContribution recorded NOT_FROZEN"
+disposition = "wave authority: contribution envelope bound to the admitted position; no parallel contribution schema; not a W9 unblock"
 
 [agent_task]
 objective = "Contribute the admitted epistemic position to context candidates as a typed read-only envelope."

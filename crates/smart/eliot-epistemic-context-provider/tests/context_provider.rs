@@ -1,8 +1,9 @@
-//! Package fixtures for the envelope-bound epistemic Context contribution.
+//! Package fixtures for the thin owner-contribution adapter.
 //!
-//! The contribution under test takes only the admitted position. Every
-//! negative case derives from one valid contribution by tampering exactly
-//! one echoed field.
+//! The adapter takes an admitted position or a whole owner contribution.
+//! Every negative case derives from one valid adapted contribution by
+//! tampering exactly one field. Pose acceptance with execution belongs to
+//! package proof; these fixtures pin the adapter contract shape.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -11,13 +12,12 @@ use std::num::NonZeroU64;
 
 use eliot_context_contracts::ProviderId;
 use eliot_contracts::{
-    ArtifactId, ContractVersion, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId,
-    StateFence,
+    ArtifactId, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
 };
 use eliot_epistemic_context_provider::{ContributionError, EpistemicContextContribution};
 use eliot_epistemic_contracts::{
-    AdmittedReceipt, AdmittedReceiptParams, CONTRACT_VERSION, ClaimId, CurrentEpistemicPosition,
-    Currentness, PositionId, PositionRevision,
+    AdmittedReceipt, AdmittedReceiptParams, ClaimId, CurrentEpistemicPosition, Currentness,
+    PositionId, PositionRevision, ProviderContribution,
 };
 
 fn hex64() -> String {
@@ -69,27 +69,40 @@ fn position(currentness: Currentness) -> CurrentEpistemicPosition {
         .expect("fixture position")
 }
 
+fn owner_contribution() -> ProviderContribution {
+    ProviderContribution::contribute(&position(Currentness::Current))
+        .expect("fixture owner contribution")
+}
+
 fn contribution() -> EpistemicContextContribution {
     EpistemicContextContribution::from_position(&position(Currentness::Current))
         .expect("fixture contribution")
 }
 
 #[test]
-fn from_position_echoes_the_admission_envelope() {
+fn from_position_frames_the_owner_envelope() {
     let admitted = position(Currentness::Current);
     let made = EpistemicContextContribution::from_position(&admitted).expect("valid contribution");
-    assert_eq!(made.position_digest, admitted.digest);
-    assert_eq!(made.claim, admitted.claim);
-    assert_eq!(made.admission_scope, admitted.admission.scope);
-    assert_eq!(made.admission_fence, admitted.admission.fence);
-    assert_eq!(made.admission_revision, admitted.admission.revision);
-    assert_eq!(made.coverage_digest, admitted.admission.coverage_digest);
+    assert_eq!(made.contribution.position_digest, admitted.digest);
+    assert_eq!(made.contribution.claim, admitted.claim);
+    assert_eq!(made.contribution.scope, admitted.admission.scope);
+    assert_eq!(made.contribution.fence, admitted.admission.fence);
     assert_eq!(
         made.provider.as_str(),
         eliot_epistemic_context_provider::PROVIDER_LABEL
     );
-    assert_eq!(made.contract_version, CONTRACT_VERSION);
     made.validate().expect("contribution validates");
+}
+
+#[test]
+fn from_contribution_attaches_the_provider() {
+    let made = EpistemicContextContribution::from_contribution(owner_contribution())
+        .expect("valid adaptation");
+    assert_eq!(
+        made.provider.as_str(),
+        eliot_epistemic_context_provider::PROVIDER_LABEL
+    );
+    made.validate().expect("adapted contribution validates");
 }
 
 #[test]
@@ -97,7 +110,7 @@ fn superseded_position_contributes_nothing() {
     let admitted = position(Currentness::Superseded);
     let error = EpistemicContextContribution::from_position(&admitted)
         .expect_err("superseded must fail");
-    assert!(matches!(error, ContributionError::SupersededPosition));
+    assert!(matches!(error, ContributionError::Upstream(_)));
 }
 
 #[test]
@@ -109,57 +122,38 @@ fn foreign_provider_identity_is_rejected() {
 }
 
 #[test]
-fn version_drift_is_rejected() {
+fn tampered_owner_digest_is_rejected_upstream() {
     let mut made = contribution();
-    made.contract_version = ContractVersion::new(9, 9, 9);
-    let error = made.validate().expect_err("drift must fail");
-    assert!(matches!(error, ContributionError::VersionMismatch));
-}
-
-#[test]
-fn tampered_digest_is_rejected() {
-    let mut made = contribution();
-    made.position_digest = "not-a-digest".to_owned();
+    made.contribution.position_digest = "not-a-digest".to_owned();
     let error = made.validate().expect_err("tampered digest must fail");
-    assert!(matches!(error, ContributionError::InvalidField { .. }));
-}
-
-#[test]
-fn tampered_coverage_digest_is_rejected() {
-    let mut made = contribution();
-    made.coverage_digest = "not-a-digest".to_owned();
-    let error = made.validate().expect_err("tampered coverage must fail");
-    assert!(matches!(error, ContributionError::InvalidField { .. }));
-}
-
-#[test]
-fn tampered_scope_is_rejected() {
-    let mut made = contribution();
-    made.admission_scope = "   ".to_owned();
-    let error = made.validate().expect_err("tampered scope must fail");
-    assert!(matches!(error, ContributionError::InvalidField { .. }));
+    assert!(matches!(error, ContributionError::Upstream(_)));
 }
 
 #[test]
 fn unknown_wire_fields_are_rejected() {
     let json = serde_json::json!({
-        "contract_version": {"major": 1, "minor": 2, "patch": 0},
-        "provider": "smart.epistemic.context-provider",
-        "position_digest": hex64(),
-        "claim": "claim-1",
-        "admission_scope": "scope-epi",
-        "admission_fence": {
-            "authority_epoch": {
-                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
-                "sequence": 1
+        "contribution": {
+            "contract_version": {"major": 1, "minor": 2, "patch": 0},
+            "view_kind": "CURRENT_EPISTEMIC_POSITION",
+            "position_digest": hex64(),
+            "claim": "claim-1",
+            "currentness": "CURRENT",
+            "scope": "scope-epi",
+            "fence": {
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 1
+                },
+                "resource_generation": 1,
+                "task_revision": null,
+                "policy_revision": null,
+                "integration_revision": null
             },
-            "resource_generation": 1,
-            "task_revision": null,
-            "policy_revision": null,
-            "integration_revision": null
+            "source_revision": "rev-1",
+            "coverage_digest": hex64(),
+            "receipt_digest": hex64()
         },
-        "admission_revision": "rev-1",
-        "coverage_digest": hex64(),
+        "provider": "smart.epistemic.context-provider",
         "support_score": 0.97
     });
     let error = serde_json::from_value::<EpistemicContextContribution>(json)
