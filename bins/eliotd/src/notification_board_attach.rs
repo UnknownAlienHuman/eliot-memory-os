@@ -36,6 +36,39 @@ pub enum NotificationBoardAttach {
     Unavailable { reason: String },
 }
 
+/// Startup board-inbox evidence published to diagnostics after attach.
+///
+/// Pure projection over noted records using the canonical board helpers:
+/// unresolved rows stay visible (acknowledged included), critical and
+/// failed-delivery rows stay counted, resolved rows count separately.
+/// Emitted once at startup so the populated path is observable in the
+/// production diagnostics sink without inventing a dispatch loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoardInboxEvidence {
+    pub total: usize,
+    pub unresolved: usize,
+    pub critical_unresolved: usize,
+    pub failed_delivery_unresolved: usize,
+    pub acknowledged_unresolved: usize,
+    pub resolved: usize,
+}
+
+/// Projects inbox evidence for diagnostics from noted canonical records.
+#[must_use]
+pub fn board_inbox_evidence(records: &[Notification]) -> BoardInboxEvidence {
+    let rows = eliot_controlboard::project(records);
+    let metrics = eliot_controlboard::metrics(&rows);
+    let resolved = metrics.total.saturating_sub(metrics.unresolved);
+    BoardInboxEvidence {
+        total: metrics.total,
+        unresolved: metrics.unresolved,
+        critical_unresolved: metrics.critical_unresolved,
+        failed_delivery_unresolved: metrics.failed_delivery,
+        acknowledged_unresolved: metrics.acknowledged_unresolved,
+        resolved,
+    }
+}
+
 /// Builds the closed board read: every scope, resolved records included
 /// (closure evidence stays visible), one bounded page at the contract max.
 pub fn build_closed_board_read(state_fence: StateFence) -> Result<NamedReadRequest, StoreError> {
@@ -226,5 +259,86 @@ mod tests {
         ));
         let missing = serde_json::json!({"metrics": {}});
         assert!(decode_board_records(&missing, &fence).is_err());
+    }
+
+    #[test]
+    fn board_inbox_evidence_keeps_ack_critical_failed_and_resolved() {
+        use eliot_kernel_core::{
+            DeliveryChannel, DeliveryState, Notification, NotificationSeverity,
+        };
+        use eliot_platform::PlatformHandle;
+
+        fn record(
+            key: &str,
+            severity: NotificationSeverity,
+            failed: bool,
+            acknowledged: bool,
+            resolved: bool,
+        ) -> Notification {
+            Notification {
+                notification_id: PlatformHandle::new(format!("notification-{key}"))
+                    .expect("notification id"),
+                severity,
+                subject: "subject".to_owned(),
+                summary: "summary".to_owned(),
+                evidence_handles: vec!["evidence-1".to_owned()],
+                affected_scope: "scope-1".to_owned(),
+                owner: "owner-1".to_owned(),
+                required_action: "review".to_owned(),
+                deadline_or_review: None,
+                dedup_key: key.to_owned(),
+                delivery_channels: vec![DeliveryChannel::ControlBoard],
+                occurrences: 1,
+                delivery: if failed {
+                    DeliveryState::Failed {
+                        reason: "toast provider failed".to_owned(),
+                    }
+                } else {
+                    DeliveryState::Delivered
+                },
+                acknowledgement: acknowledged.then(|| eliot_kernel_core::Acknowledgement {
+                    principal: "operator-1".to_owned(),
+                    sequence: 1,
+                }),
+                resolution_ref: resolved.then(|| eliot_kernel_core::ResolutionRef {
+                    receipt_id: "receipt-1".to_owned(),
+                    authority_id: "authority-1".to_owned(),
+                    authority_owner: "owner-1".to_owned(),
+                    evidence_handles: vec!["evidence-1".to_owned()],
+                    disposition: "fixed".to_owned(),
+                }),
+                state_fence: fence(),
+                revision: 1,
+            }
+        }
+
+        use NotificationSeverity::{Critical, Information};
+        let evidence = board_inbox_evidence(&[
+            record("backup-failed", Critical, true, true, false),
+            record("routine-sync", Information, false, false, false),
+            record("old-news", Critical, false, false, true),
+        ]);
+        assert_eq!(
+            evidence,
+            BoardInboxEvidence {
+                total: 3,
+                unresolved: 2,
+                critical_unresolved: 1,
+                failed_delivery_unresolved: 1,
+                acknowledged_unresolved: 1,
+                resolved: 1,
+            }
+        );
+        assert_eq!(
+            board_inbox_evidence(&[]),
+            BoardInboxEvidence {
+                total: 0,
+                unresolved: 0,
+                critical_unresolved: 0,
+                failed_delivery_unresolved: 0,
+                acknowledged_unresolved: 0,
+                resolved: 0,
+            }
+        );
     }
 }

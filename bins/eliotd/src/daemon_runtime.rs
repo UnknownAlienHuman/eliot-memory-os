@@ -262,10 +262,15 @@ pub(super) fn run() -> Result<(), String> {
     match eliotd::notification_board_attach::attach_notification_snapshot(&kernel, &mut composition)
     {
         eliotd::notification_board_attach::NotificationBoardAttach::Ready(records) => {
+            let evidence = eliotd::notification_board_attach::board_inbox_evidence(&records);
             tracing::info!(
                 target: "eliotd::diagnostics",
                 event = "eliotd.notification_snapshot_attached",
                 record_count = records.len(),
+                inbox_unresolved = evidence.unresolved,
+                inbox_critical_unresolved = evidence.critical_unresolved,
+                inbox_failed_delivery = evidence.failed_delivery_unresolved,
+                inbox_acknowledged_unresolved = evidence.acknowledged_unresolved,
             );
         }
         eliotd::notification_board_attach::NotificationBoardAttach::Unavailable { reason } => {
