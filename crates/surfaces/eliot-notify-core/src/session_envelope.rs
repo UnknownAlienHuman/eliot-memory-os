@@ -9,12 +9,16 @@
 //!
 //! Absence: none of those holders is session-bound. Recipients live per
 //! delivery effect and per notification envelope; no live per-reactive-session
-//! recipient exists anywhere in the notification owner state. There is
-//! therefore no live source for `snapshot.recipient_id`, and
-//! [`produce_recipient_id`] fails closed naming it instead of conflating the
-//! recipient with the attach principal (the snapshot carries `principal_id`
-//! as a separate live bridge fact; recipient and principal are distinct
-//! owners and identities).
+//! recipient exists in notification owner state. The delivery-recipient read
+//! for reactive sessions lives one owner over: the Host journal-retained
+//! Context-owner payloads, read live by the `eliot-host-service`
+//! `session_envelope` producer (`produce_admitted_deliveries`). This module
+//! stays the source-exclusion contract for the notification domain: do not
+//! source `snapshot.recipient_id` here. There is therefore no live source in
+//! this crate, and [`produce_recipient_id`] fails closed naming it instead
+//! of conflating the recipient with the attach principal (the snapshot
+//! carries `principal_id` as a separate live bridge fact; recipient and
+//! principal are distinct owners and identities).
 //!
 //! Consumer: `resolve_runtime_envelope` in
 //! `bins/eliot-agent-bridge/src/reactive_owner_publication.rs` (D2 lane,

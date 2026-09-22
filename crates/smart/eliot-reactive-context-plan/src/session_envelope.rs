@@ -12,9 +12,16 @@
 //! the plan-scoped cue identity (`cue_id`, which doubles as the ledger cue
 //! identity).
 //!
-//! Absence: no owner anywhere holds the per-record operation envelope
-//! (`record.operation_id`, `record.request_id`, `record.idempotency_key`).
-//! Examined and distinct:
+//! Absence: no operation owner exists on the bridge admission path itself
+//! (`BridgeAdmissionInstruction` carries cue, firing, scope, governance,
+//! fence, and dedup facts — no operation, request, or idempotency identity),
+//! so [`produce_record_operation_envelope`] fails closed naming the three
+//! facts. The live operation envelope does exist one owner over: the Context
+//! owner's payload triple (`operation_id`, `request_id`, `idempotency_key`),
+//! durably retained per entry by the Host journal queue and read live by the
+//! `eliot-host-service` `session_envelope` producer
+//! (`produce_admitted_deliveries`) — that producer, not this one, owns the
+//! retained operation-envelope read. Examined and distinct:
 //!
 //! - the bridge ledger rows (`NormalizedCue`, `FiringEvidence`,
 //!   `AdmissionBasis`, `DeliveryPoint` in

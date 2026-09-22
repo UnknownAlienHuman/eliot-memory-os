@@ -17,9 +17,13 @@
 //! Absence: the kernel candidate vocabulary (`HostKernelCandidateBinding` in
 //! `protocol.rs`: installation, host/kernel epochs, activation identity,
 //! artifact/config hashes, job/pipe/process/job bindings, supervision
-//! incarnation, restart budget) carries no runtime identity string, so
-//! `snapshot.runtime_id` has no live source and [`produce_runtime_id`]
-//! fails closed naming it.
+//! incarnation, restart budget) carries no runtime identity string, so the
+//! Kernel owner has no live source for `snapshot.runtime_id` and
+//! [`produce_runtime_id`] fails closed naming it. The opaque runtime identity
+//! does exist one owner over: the admitted delivery recipient's `runtime_id`,
+//! read live by the `eliot-host-service` `session_envelope` producer
+//! (`produce_admitted_deliveries`) from journal-retained Context-owner
+//! payloads — that producer, not this one, owns the runtime-identity read.
 //!
 //! Non-conflation note: the activation receipt's `operation_id` is a
 //! `PlatformHandle` scoped to the Host-owned activation operation. It is a

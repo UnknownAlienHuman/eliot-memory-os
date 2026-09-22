@@ -40,7 +40,7 @@ pub use crate::provider_account_catalogue::{
 };
 pub use crate::provider_admission::AdmittedProviderCapability;
 pub use crate::session_envelope::{
-    AttemptEnvelopeError, AttemptEnvelopeFacts, produce_attempt_envelope,
+    SessionAttemptError, SessionBoundAttemptFacts, produce_session_bound_attempts,
 };
 pub use crate::swarm_command_candidate::*;
 pub use crate::swarm_controlboard::*;

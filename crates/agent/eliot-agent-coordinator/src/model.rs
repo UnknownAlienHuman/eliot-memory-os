@@ -2,8 +2,8 @@ use eliot_agent_api::{
     AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, BudgetEnvelope, CancelReason,
     EpochId, EventId, HostEventNormalizationReceipt, HostEventQuarantineReason, LaunchRequestId,
     NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
-    ResultDisposition, RouteFingerprint, RouteSelectionCandidate, StateFence, TaskId, WorkLeaseId,
-    WorkUnitId,
+    ResultDisposition, RouteFingerprint, RouteSelectionCandidate, SessionId, StateFence, TaskId,
+    WorkLeaseId, WorkUnitId,
 };
 use eliot_agent_contracts::{
     DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, MessageId,
@@ -387,6 +387,13 @@ pub struct AttemptRecord {
     pub role_id: RoleProfileId,
     pub role_revision: RevisionId,
     pub attempt_id: AttemptId,
+    /// Admitted session for this attempt (issue #1942 lane O1, T1/T5 session
+    /// admission). `None` until the first provider-execution bind records the
+    /// session carried by the authenticated binding; a later bind naming
+    /// another session fails closed as a silent rebind. The `#[serde(default)]`
+    /// keeps pre-session wire readable (additive, cf. S2 `provider_binding`).
+    #[serde(default)]
+    pub session: Option<SessionId>,
     pub lease_id: WorkLeaseId,
     pub worker_id: WorkerId,
     /// I14.1 work class carried from the admitted lane (issue #1698) as the
