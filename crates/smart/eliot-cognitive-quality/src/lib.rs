@@ -46,6 +46,15 @@
 //! This crate performs no retrieval, ranking, promotion, admission,
 //! compilation, model work, or reactive-path work. Fences are carried, not
 //! gated: consumers gate compatibility at their edge.
+//!
+//! Wire acceptance and edge authority: [`QualityAssessmentCandidate`] carries
+//! its own [`CONTRACT_VERSION`] and [`QualityAssessmentCandidate::validate`]
+//! rejects an unequal triple before any other check, so a foreign-triple
+//! candidate never validates. Self-digests prove shape integrity only.
+//! [`recheck_candidate`] is the in-crate owner-bound authority path: the
+//! edge supplies the owner inputs whole, every echoed digest, denominator,
+//! and cited handle must re-resolve against them exactly, and anything
+//! drifted, uncited, or unattested fails closed.
 
 #![forbid(unsafe_code)]
 
@@ -61,8 +70,8 @@ use eliot_learning_contracts::{
     HarnessActivationReceiptCandidate, LearningContractError, SourceDenominator,
 };
 use eliot_observation_contracts::{
-    BankProjection, FeedbackProjection, JournalProjection, ObservationError, ProjectionOmission,
-    MAX_PROJECTION_OMISSIONS,
+    BankProjection, FeedbackProjection, JournalProjection, ObservationError, ObservationScope,
+    ProjectionOmission, MAX_PROJECTION_OMISSIONS,
 };
 use eliot_receipts::WorkScopeId;
 use schemars::JsonSchema;
@@ -412,10 +421,16 @@ pub enum AssessmentSection {
 /// available, owner-held handles cited by handle only, and closed-class
 /// omissions. It carries no findings, no verdict, no score, and no
 /// completeness posture: acceptance happens at the consumer edge and product
-/// pulse, which re-resolve every cited handle and recheck every denominator.
+/// pulse, which re-resolve every cited handle and recheck every denominator
+/// through [`recheck_candidate`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QualityAssessmentCandidate {
+    /// Contract version of this candidate; must equal [`CONTRACT_VERSION`].
+    ///
+    /// Checked first in [`QualityAssessmentCandidate::validate`]: an unequal
+    /// triple is rejected before any wire acceptance.
+    pub contract_version: ContractVersion,
     /// Stable assessment identity.
     pub assessment_id: ArtifactId,
     /// Which quality section this candidate assesses.
@@ -445,6 +460,7 @@ impl QualityAssessmentCandidate {
             });
         }
         canonical_json_bytes(&(
+            &self.contract_version,
             &self.assessment_id,
             &self.section,
             &self.scope,
@@ -461,9 +477,18 @@ impl QualityAssessmentCandidate {
         })
     }
 
-    /// Validate scope, fence, echoed digests and denominators, cited
-    /// handles, omissions, and the frozen digest.
+    /// Validate version, scope, fence, echoed digests and denominators,
+    /// cited handles, omissions, and the frozen digest.
+    ///
+    /// The version gate runs before any wire acceptance: a candidate written
+    /// against a different triple is rejected here, never interpreted.
     pub fn validate(&self) -> Result<(), QualityError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(QualityError::InvalidField {
+                field: "candidate.contract_version",
+                reason: "unsupported contract version",
+            });
+        }
         scope_shape(&self.scope, "candidate.scope")?;
         fence_shape(&self.fence, "candidate.fence")?;
         if self.input_digests.len() > MAX_CANDIDATE_DIGESTS {
@@ -535,6 +560,7 @@ fn finalize(
     omissions: Vec<ProjectionOmission>,
 ) -> Result<QualityAssessmentCandidate, QualityError> {
     let mut candidate = QualityAssessmentCandidate {
+        contract_version: CONTRACT_VERSION,
         assessment_id,
         section,
         scope,
@@ -618,7 +644,9 @@ pub fn assess_skill_lifecycle(
         input_digests,
         denominators,
         Vec::new(),
-        Vec::new(),
+        // Status-level named gaps travel into the candidate: a candidate
+        // reporting zero omissions over a gapped status would lie.
+        status.omissions.clone(),
     )
 }
 
@@ -706,6 +734,9 @@ pub fn assess_dreamer_economics(
         input_digests,
         denominators,
         job_handles.to_vec(),
+        // No droppable omission sets exist on this leg: per-attempt receipts
+        // carry attrition/confounder handles rather than omissions, and job
+        // bodies travel as handles only.
         Vec::new(),
     )
 }
@@ -728,11 +759,12 @@ pub struct ExperienceProjections<'a> {
 /// projections, the admitted epistemic position, per-attempt receipts, and
 /// obligation-profile handles (order 83).
 ///
-/// Observation coverage is compared against the obligation profile by handle:
-/// the profile type is not frozen, so handles only. Bottleneck inputs are
-/// the per-attempt receipts. The admitted position must be current; a
-/// superseded position contributes nothing. No global score is emitted: the
-/// candidate freezes the assessed closure for problem-oriented review.
+/// Observation coverage is co-cited with obligation-profile handles (the
+/// profile type is not frozen, so comparison executes at the consumer edge,
+/// not here). Bottleneck inputs are the per-attempt receipts. The admitted
+/// position must be current; a superseded position contributes nothing. No
+/// global score is emitted: the candidate freezes the assessed closure for
+/// problem-oriented review.
 pub fn assess_self_quality(
     assessment_id: ArtifactId,
     scope: WorkScopeId,
@@ -761,6 +793,7 @@ pub fn assess_self_quality(
     }
     let mut input_digests = Vec::new();
     let mut evidence_handles = Vec::new();
+    let mut omissions = Vec::new();
     if let Some(journal) = projections.journal {
         journal.validate()?;
         if journal.scope.work_scope != scope {
@@ -778,6 +811,7 @@ pub fn assess_self_quality(
         input_digests.push(journal.digest.clone());
         input_digests.push(journal.coverage.coverage_digest.clone());
         evidence_handles.push(journal.projection_id.clone());
+        omissions.extend(journal.omissions.iter().cloned());
     }
     if let Some(bank) = projections.bank {
         bank.validate()?;
@@ -796,6 +830,7 @@ pub fn assess_self_quality(
         input_digests.push(bank.digest.clone());
         input_digests.push(bank.coverage.coverage_digest.clone());
         evidence_handles.push(bank.projection_id.clone());
+        omissions.extend(bank.omissions.iter().cloned());
     }
     if let Some(feedback) = projections.feedback {
         feedback.validate()?;
@@ -814,6 +849,7 @@ pub fn assess_self_quality(
         input_digests.push(feedback.digest.clone());
         input_digests.push(feedback.coverage.coverage_digest.clone());
         evidence_handles.push(feedback.projection_id.clone());
+        omissions.extend(feedback.omissions.iter().cloned());
     }
     input_digests.push(position.digest.clone());
     if receipts.is_empty() {
@@ -852,7 +888,9 @@ pub fn assess_self_quality(
         input_digests,
         denominators,
         evidence_handles,
-        Vec::new(),
+        // Owner-named gaps from every cited envelope travel into the
+        // candidate; receipt and position legs carry no omission sets.
+        omissions,
     )
 }
 
@@ -925,6 +963,8 @@ pub fn assess_intervention(
         Vec::new(),
         Vec::new(),
         evidence_handles,
+        // No droppable omission sets exist on this leg: problem, improvement,
+        // and verifier bodies travel as handles only.
         Vec::new(),
     )
 }
@@ -939,4 +979,225 @@ fn same_handle_closure(first: &[ArtifactId], second: &[ArtifactId]) -> bool {
     first_sorted.sort_unstable();
     second_sorted.sort_unstable();
     first_sorted == second_sorted
+}
+
+/// Owner inputs supplied by the consumer edge for candidate re-resolution.
+///
+/// The edge resolves every cited handle against its owner at the candidate
+/// fence and supplies the owner inputs whole. Handles for bodies this crate
+/// never opens (tool versions, jobs, obligation profiles, problems,
+/// improvements, verifiers) arrive as edge attestation: the edge attests
+/// each resolved against its owner. Anything cited but neither owner-held
+/// nor attested fails closed.
+pub struct OwnerSnapshot<'a> {
+    /// Owner skill-evidence statuses read for this recheck.
+    pub statuses: Vec<&'a SkillEvidenceProjectionStatus>,
+    /// Owner per-attempt receipts read for this recheck.
+    pub receipts: Vec<&'a HarnessActivationReceiptCandidate>,
+    /// Owner journal envelopes read for this recheck.
+    pub journals: Vec<&'a JournalProjection>,
+    /// Owner bank envelopes read for this recheck.
+    pub banks: Vec<&'a BankProjection>,
+    /// Owner feedback envelopes read for this recheck.
+    pub feedbacks: Vec<&'a FeedbackProjection>,
+    /// Admitted epistemic positions read for this recheck.
+    pub positions: Vec<&'a CurrentEpistemicPosition>,
+    /// Edge-attested handles for owner-held bodies cited by handle only.
+    pub attested_handles: Vec<ArtifactId>,
+}
+
+/// Check one supplied projection envelope against the candidate scope and
+/// fence, and collect its digests plus its owner-held handles.
+fn collect_projection(
+    projection_id: &ArtifactId,
+    scope: &ObservationScope,
+    fence: &StateFence,
+    digest: &str,
+    coverage_digest: &str,
+    member_handles: &[&ArtifactId],
+    candidate: &QualityAssessmentCandidate,
+    known_digests: &mut BTreeSet<String>,
+    owner_held: &mut BTreeSet<String>,
+) -> Result<(), QualityError> {
+    if scope.work_scope != candidate.scope {
+        return Err(QualityError::InvalidField {
+            field: "recheck.projection.scope",
+            reason: "projection scope does not match candidate scope",
+        });
+    }
+    if !fence.is_compatible_with(&candidate.fence) {
+        return Err(QualityError::InvalidField {
+            field: "recheck.projection.fence",
+            reason: "projection fence is not compatible with candidate fence",
+        });
+    }
+    known_digests.insert(digest.to_owned());
+    known_digests.insert(coverage_digest.to_owned());
+    owner_held.insert(projection_id.as_str().to_owned());
+    for handle in member_handles {
+        owner_held.insert(handle.as_str().to_owned());
+    }
+    Ok(())
+}
+
+/// Re-resolve one candidate against owner inputs supplied by the edge.
+///
+/// This is the in-crate authority path the candidate design requires: the
+/// candidate's self-digest proves shape integrity only, never owner truth.
+/// Re-resolution runs every supplied owner input through its own closed
+/// validation (status observed==carried accounting and digest recompute live
+/// there), then requires each echoed digest, each echoed denominator, and
+/// each cited handle to resolve exactly: digests and denominators must equal
+/// a supplied owner value; scope-carrying inputs must name the candidate
+/// scope with a compatible fence; cited handles must be owner-held or
+/// edge-attested. Positions contribute digest echoes only: the admission
+/// scope vocabulary differs from the assessment scope, so position scope and
+/// liveness stay edge-gated. Drifted, uncited, or unattested material fails
+/// closed. No score, verdict, or completeness is adjudicated: a passing
+/// recheck states that the frozen closure still resolves, nothing more.
+pub fn recheck_candidate(
+    candidate: &QualityAssessmentCandidate,
+    snapshot: &OwnerSnapshot<'_>,
+) -> Result<(), QualityError> {
+    candidate.validate()?;
+    let mut known_digests: BTreeSet<String> = BTreeSet::new();
+    let mut known_denominators: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut owner_held: BTreeSet<String> = BTreeSet::new();
+    for status in &snapshot.statuses {
+        status.validate()?;
+        if status.scope != candidate.scope {
+            return Err(QualityError::InvalidField {
+                field: "recheck.status.scope",
+                reason: "status scope does not match candidate scope",
+            });
+        }
+        if !status.fence.is_compatible_with(&candidate.fence) {
+            return Err(QualityError::InvalidField {
+                field: "recheck.status.fence",
+                reason: "status fence is not compatible with candidate fence",
+            });
+        }
+        known_digests.insert(status.digest.clone());
+        known_denominators.insert((status.denominator.declared, status.denominator.observed));
+        owner_held.insert(status.status_id.as_str().to_owned());
+        owner_held.insert(status.skill_ref.as_str().to_owned());
+        for reference in &status.evidence {
+            owner_held.insert(reference.evidence_handle.as_str().to_owned());
+        }
+        for handle in &status.receipt_refs {
+            owner_held.insert(handle.as_str().to_owned());
+        }
+    }
+    for receipt in &snapshot.receipts {
+        check_receipt_scope_fence(receipt, &candidate.scope, &candidate.fence)?;
+        known_digests.insert(receipt.canonical_digest.clone());
+        known_denominators.insert((
+            receipt.member_denominator.declared,
+            receipt.member_denominator.observed,
+        ));
+        owner_held.insert(receipt.activation_id.as_str().to_owned());
+    }
+    for journal in &snapshot.journals {
+        journal.validate()?;
+        // Journal record ids are owner Strings, never cited by candidates,
+        // so only the envelope identity resolves here.
+        collect_projection(
+            &journal.projection_id,
+            &journal.scope,
+            &journal.fence,
+            &journal.digest,
+            &journal.coverage.coverage_digest,
+            &[],
+            candidate,
+            &mut known_digests,
+            &mut owner_held,
+        )?;
+    }
+    for bank in &snapshot.banks {
+        bank.validate()?;
+        let members: Vec<&ArtifactId> =
+            bank.refs.iter().map(|reference| &reference.handle).collect();
+        collect_projection(
+            &bank.projection_id,
+            &bank.scope,
+            &bank.fence,
+            &bank.digest,
+            &bank.coverage.coverage_digest,
+            &members,
+            candidate,
+            &mut known_digests,
+            &mut owner_held,
+        )?;
+    }
+    for feedback in &snapshot.feedbacks {
+        feedback.validate()?;
+        let members: Vec<&ArtifactId> =
+            feedback.refs.iter().map(|reference| &reference.handle).collect();
+        collect_projection(
+            &feedback.projection_id,
+            &feedback.scope,
+            &feedback.fence,
+            &feedback.digest,
+            &feedback.coverage.coverage_digest,
+            &members,
+            candidate,
+            &mut known_digests,
+            &mut owner_held,
+        )?;
+    }
+    for position in &snapshot.positions {
+        position.validate()?;
+        if position.currentness != Currentness::Current {
+            return Err(QualityError::InvalidField {
+                field: "recheck.position.currentness",
+                reason: "position is superseded",
+            });
+        }
+        known_digests.insert(position.digest.clone());
+    }
+    let mut attested: BTreeSet<String> = BTreeSet::new();
+    for handle in &snapshot.attested_handles {
+        if !attested.insert(handle.as_str().to_owned()) {
+            return Err(QualityError::InvalidField {
+                field: "recheck.attested_handles",
+                reason: "duplicate handle",
+            });
+        }
+    }
+    for echoed in &candidate.input_digests {
+        if !known_digests.contains(echoed) {
+            return Err(QualityError::InvalidField {
+                field: "recheck.input_digests",
+                reason: "echoed digest resolves to no supplied owner input",
+            });
+        }
+    }
+    for denominator in &candidate.denominators {
+        if !known_denominators.contains(&(denominator.declared, denominator.observed)) {
+            return Err(QualityError::InvalidField {
+                field: "recheck.denominators",
+                reason: "echoed denominator matches no supplied owner denominator",
+            });
+        }
+    }
+    for handle in &candidate.evidence_handles {
+        if !owner_held.contains(handle.as_str()) && !attested.contains(handle.as_str()) {
+            return Err(QualityError::InvalidField {
+                field: "recheck.evidence_handles",
+                reason: "cited handle is neither owner-held nor edge-attested",
+            });
+        }
+    }
+    for omission in &candidate.omissions {
+        omission.validate()?;
+        if !owner_held.contains(omission.handle.as_str())
+            && !attested.contains(omission.handle.as_str())
+        {
+            return Err(QualityError::InvalidField {
+                field: "recheck.omissions",
+                reason: "omitted handle is neither owner-held nor edge-attested",
+            });
+        }
+    }
+    Ok(())
 }

@@ -105,7 +105,7 @@ members = [
   "crates/meta/eliot-runtime-status",
   "crates/security/eliot-erasure",
   "crates/security/eliot-influence",
-  "crates/smart/eliot-cognitive-quality",
+  "crates/smart/eliot-cognitive-quality",  # agent_order 80
   "crates/smart/eliot-context",
   "crates/smart/eliot-cues",
   "crates/smart/eliot-dreamer-core",

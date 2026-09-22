@@ -27,9 +27,9 @@ depends_on = ["eliot-contracts", "eliot-observation-contracts", "eliot-epistemic
 providers = ["Context/host observations", "attempt/verifier evidence", "Governor/Diagnostic Compiler projection owner (candidate supply only)"]
 consumers = ["Dreamer/Curator review surface", "Human/Main Agent/Governor decision owner"]
 non_goals = ["Skill/tool/config/route mutation", "scheduler/effect/authority ownership", "task finish", "promotion decision", "aggregate intelligence or learning score", "self-certification or self-promotion"]
-invariants = ["installed != delivered != executed != useful", "acknowledgement is not use, use is not adherence, adherence is not benefit", "retrieval/repetition/agreement never reinforce a Skill", "Dreamer/Curator proposals remain reversible candidates until governed promotion", "recurring failure without changed hypothesis or discriminator opens Mechanism Review", "every Complete state requires its exact per-sub-assessment denominator"]
-failure_behavior = "Return explicit inconclusive/no-change/unsupported output with exact missing evidence; never fabricate quality, benefit, or promotion."
-proof_surface = ["projection-status exact denominator accounting", "per-attempt receipt scope/fence/denominator echo", "owner projection scope/fence/denominator echo", "closed-class omissions", "equivalent-retry Mechanism Review gate", "frozen digest recompute", "wire roundtrip with deny_unknown_fields"]
+invariants = ["installed != delivered != executed != useful", "acknowledgement is not use, use is not adherence, adherence is not benefit", "retrieval/repetition/agreement never reinforce a Skill", "Dreamer/Curator proposals remain reversible candidates until governed promotion", "recurring failure without changed hypothesis or discriminator opens Mechanism Review", "every candidate freezes its exact assessed inputs; insufficiency is Err, never a silent adequate; no Complete state is emitted"]
+failure_behavior = "Return Err with the exact missing evidence, or a candidate freezing the assessed closure; never fabricate quality, benefit, promotion, or completeness."
+proof_surface = ["projection-status exact denominator accounting", "per-attempt receipt scope/fence/denominator echo", "owner projection scope/fence/denominator echo", "closed-class omissions propagated into candidates", "candidate contract-version gate before wire acceptance", "owner-bound recheck entry for digests, denominators, and handles", "equivalent-retry Mechanism Review gate", "frozen digest recompute", "wire roundtrip with deny_unknown_fields"]
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
 replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
@@ -60,7 +60,7 @@ integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+workspace_admission = "registered in work/223-cognitive-quality-scope lane copy only; package proof pending; no edge or pulse"
 
 # Acceptance is decided by the owning contract and independent review
 # (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`

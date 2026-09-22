@@ -12,13 +12,13 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use eliot_cognitive_quality::{
-    ExperienceProjections, QualityAssessmentCandidate, QualityError, SkillEvidenceProjectionStatus,
-    SkillEvidenceRef, assess_dreamer_economics, assess_intervention, assess_self_quality,
-    assess_skill_lifecycle, assess_tool_surface,
+    ExperienceProjections, OwnerSnapshot, QualityAssessmentCandidate, QualityError,
+    SkillEvidenceProjectionStatus, SkillEvidenceRef, assess_dreamer_economics, assess_intervention,
+    assess_self_quality, assess_skill_lifecycle, assess_tool_surface, recheck_candidate,
 };
 use eliot_contracts::{
-    ArtifactId, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId, RequestId,
-    ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision,
+    ArtifactId, ContractVersion, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId,
+    RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision,
 };
 use eliot_epistemic_contracts::{
     AdmittedReceipt, AdmittedReceiptParams, ClaimId, CurrentEpistemicPosition, Currentness,
@@ -604,6 +604,7 @@ fn candidate_tampered_digest_is_rejected() {
 #[test]
 fn unknown_wire_fields_are_rejected() {
     let json = serde_json::json!({
+        "contract_version": {"major": 0, "minor": 1, "patch": 0},
         "assessment_id": "assess-int-1",
         "section": "INTERVENTION_CANDIDATE",
         "scope": "scope-cogq",
@@ -636,6 +637,266 @@ fn candidate_roundtrips_over_the_wire() {
     let back: QualityAssessmentCandidate =
         serde_json::from_str(&wire).expect("deserialize candidate");
     assert_eq!(made, back);
+}
+
+#[test]
+fn candidate_foreign_version_is_rejected_before_wire_acceptance() {
+    let mut made = intervention();
+    made.contract_version = ContractVersion::new(9, 9, 9);
+    let error = made.validate().expect_err("foreign version must fail");
+    assert!(matches!(error, QualityError::InvalidField { .. }));
+    let error = recheck_candidate(&made, &OwnerSnapshot {
+        statuses: vec![],
+        receipts: vec![],
+        journals: vec![],
+        banks: vec![],
+        feedbacks: vec![],
+        positions: vec![],
+        attested_handles: vec![],
+    })
+    .expect_err("foreign version must fail recheck");
+    assert!(matches!(error, QualityError::InvalidField { .. }));
+}
+
+fn status_with_omission() -> SkillEvidenceProjectionStatus {
+    let omission = ProjectionOmission {
+        handle: aid("ev-9"),
+        class: ProjectionOmissionClass::TruncatedAtBound,
+        detail: "assembly bound 256".to_owned(),
+    };
+    SkillEvidenceProjectionStatus::assemble(
+        aid("status-1"),
+        aid("skill-1"),
+        SourceId::new("governor.skill").expect("fixture owner"),
+        scope(),
+        fence(),
+        vec![evidence_ref("ev-1", "r1")],
+        vec![],
+        SourceDenominator {
+            declared: 2,
+            observed: 1,
+        },
+        vec![omission],
+    )
+    .expect("fixture status with omission")
+}
+
+#[test]
+fn status_omissions_propagate_into_skill_candidate() {
+    let made = assess_skill_lifecycle(aid("assess-skill-1"), &status_with_omission(), &[receipt()])
+        .expect("valid assessment");
+    made.validate().expect("candidate validates");
+    assert_eq!(made.omissions.len(), 1);
+    assert_eq!(
+        made.omissions[0].class,
+        ProjectionOmissionClass::TruncatedAtBound
+    );
+}
+
+#[test]
+fn projection_omissions_propagate_into_self_candidate() {
+    let omission = ProjectionOmission {
+        handle: aid("bk-9"),
+        class: ProjectionOmissionClass::TruncatedAtBound,
+        detail: "assembly bound 1024".to_owned(),
+    };
+    let gapped = BankProjection::assemble(
+        aid("proj-bank-1"),
+        observation_scope(),
+        fence(),
+        "r1".to_owned(),
+        vec![record_ref("bk-1")],
+        coverage(2),
+        vec![omission],
+    )
+    .expect("fixture gapped bank");
+    let made = assess_self_quality(
+        aid("assess-self-1"),
+        scope(),
+        fence(),
+        &projections(None, Some(&gapped), None),
+        &position(Currentness::Current),
+        &[receipt()],
+        &[aid("obl-1")],
+    )
+    .expect("valid self assessment");
+    made.validate().expect("candidate validates");
+    assert_eq!(made.omissions.len(), 1);
+}
+
+fn self_snapshot<'a>(
+    journal: Option<&'a JournalProjection>,
+    bank: Option<&'a BankProjection>,
+    feedback: Option<&'a FeedbackProjection>,
+    position: &'a CurrentEpistemicPosition,
+    receipt: &'a HarnessActivationReceiptCandidate,
+    attested: Vec<ArtifactId>,
+) -> OwnerSnapshot<'a> {
+    OwnerSnapshot {
+        statuses: vec![],
+        receipts: vec![receipt],
+        journals: journal.into_iter().collect(),
+        banks: bank.into_iter().collect(),
+        feedbacks: feedback.into_iter().collect(),
+        positions: vec![position],
+        attested_handles: attested,
+    }
+}
+
+#[test]
+fn recheck_valid_closure_passes() {
+    let journal_value = journal();
+    let bank_value = bank();
+    let feedback_value = feedback();
+    let position_value = position(Currentness::Current);
+    let receipt_value = receipt();
+    let made = assess_self_quality(
+        aid("assess-self-1"),
+        scope(),
+        fence(),
+        &projections(
+            Some(&journal_value),
+            Some(&bank_value),
+            Some(&feedback_value),
+        ),
+        &position_value,
+        std::slice::from_ref(&receipt_value),
+        &[aid("obl-1")],
+    )
+    .expect("valid self assessment");
+    recheck_candidate(
+        &made,
+        &self_snapshot(
+            Some(&journal_value),
+            Some(&bank_value),
+            Some(&feedback_value),
+            &position_value,
+            &receipt_value,
+            vec![aid("obl-1")],
+        ),
+    )
+    .expect("valid closure rechecks");
+}
+
+#[test]
+fn recheck_stale_digest_fails() {
+    let bank_value = bank();
+    let position_value = position(Currentness::Current);
+    let receipt_value = receipt();
+    let made = assess_self_quality(
+        aid("assess-self-1"),
+        scope(),
+        fence(),
+        &projections(None, Some(&bank_value), None),
+        &position_value,
+        std::slice::from_ref(&receipt_value),
+        &[aid("obl-1")],
+    )
+    .expect("valid self assessment");
+    // Edge supplies a different receipt sealing a different digest under the
+    // same scope and fence: the echoed digest resolves nowhere.
+    let mut drifted = receipt();
+    drifted.activation_id = aid("act-cogq-2");
+    drifted.seal().expect("fixture re-seal");
+    let error = recheck_candidate(
+        &made,
+        &self_snapshot(
+            None,
+            Some(&bank_value),
+            None,
+            &position_value,
+            &drifted,
+            vec![aid("obl-1")],
+        ),
+    )
+    .expect_err("stale digest must fail");
+    assert!(matches!(error, QualityError::InvalidField { .. }));
+}
+
+#[test]
+fn recheck_denominator_mismatch_fails() {
+    let bank_value = bank();
+    let position_value = position(Currentness::Current);
+    let receipt_value = receipt();
+    let mut made = assess_self_quality(
+        aid("assess-self-1"),
+        scope(),
+        fence(),
+        &projections(None, Some(&bank_value), None),
+        &position_value,
+        std::slice::from_ref(&receipt_value),
+        &[aid("obl-1")],
+    )
+    .expect("valid self assessment");
+    made.denominators.push(SourceDenominator {
+        declared: 9,
+        observed: 9,
+    });
+    made.digest = made.compute_digest().expect("re-digest");
+    let error = recheck_candidate(
+        &made,
+        &self_snapshot(
+            None,
+            Some(&bank_value),
+            None,
+            &position_value,
+            &receipt_value,
+            vec![aid("obl-1")],
+        ),
+    )
+    .expect_err("foreign denominator must fail");
+    assert!(matches!(error, QualityError::InvalidField { .. }));
+}
+
+#[test]
+fn recheck_unattested_handle_fails() {
+    let made = intervention();
+    let empty = OwnerSnapshot {
+        statuses: vec![],
+        receipts: vec![],
+        journals: vec![],
+        banks: vec![],
+        feedbacks: vec![],
+        positions: vec![],
+        attested_handles: vec![],
+    };
+    let error = recheck_candidate(&made, &empty).expect_err("unattested handles must fail");
+    assert!(matches!(error, QualityError::InvalidField { .. }));
+}
+
+#[test]
+fn recheck_attested_handles_pass() {
+    let made = intervention();
+    let snapshot = OwnerSnapshot {
+        statuses: vec![],
+        receipts: vec![],
+        journals: vec![],
+        banks: vec![],
+        feedbacks: vec![],
+        positions: vec![],
+        attested_handles: vec![aid("prob-1"), aid("imp-1"), aid("ver-1")],
+    };
+    recheck_candidate(&made, &snapshot).expect("attested closure rechecks");
+}
+
+#[test]
+fn recheck_resolves_propagated_omissions_via_attestation() {
+    let gapped = status_with_omission();
+    let receipt_value = receipt();
+    let made = assess_skill_lifecycle(aid("assess-skill-1"), &gapped, std::slice::from_ref(&receipt_value))
+        .expect("valid assessment");
+    assert_eq!(made.omissions.len(), 1);
+    let snapshot = OwnerSnapshot {
+        statuses: vec![&gapped],
+        receipts: vec![&receipt_value],
+        journals: vec![],
+        banks: vec![],
+        feedbacks: vec![],
+        positions: vec![],
+        // ev-9 is named-but-uncarried: only edge attestation resolves it.
+        attested_handles: vec![aid("ev-9")],
+    };
+    recheck_candidate(&made, &snapshot).expect("gapped closure rechecks");
 }
 
 #[test]
