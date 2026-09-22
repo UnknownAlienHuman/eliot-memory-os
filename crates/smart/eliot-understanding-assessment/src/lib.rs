@@ -93,7 +93,17 @@ use thiserror::Error;
 pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22";
 /// Exact contract version every assessment candidate in this crate is written
 /// against (`VR-EXACT-CONTRACT-VERSION` applied to the own wire shape).
-pub const UA_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+///
+/// Amendment history: 1.0.0 wrote CommonGround candidates without the
+/// closure annex; 1.1.0 persists the role-labeled closure annex plus the
+/// product-claim flag, both digest-bound, so recheck re-applies identical
+/// role gating. The frozen `UnderstandingAssessment` 24-field contract is
+/// preserved verbatim — annex and flag are crate envelope, like
+/// version/scope/status/digest — so the freeze file needs no edit.
+/// `validate()` accepts exactly the current version: 1.0.0 artifacts exist
+/// only in branch history (crate unreleased, zero consumers) and are
+/// rejected with `VersionMismatch`.
+pub const UA_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
 /// Maximum evidence cites carried by one assessment slot list.
 pub const MAX_EVIDENCE_CITES: usize = 256;
 /// Maximum Unicode scalar values accepted for one scope/identity text field.
@@ -118,6 +128,89 @@ const ACTION_KINDS: [ObservationKind; 2] = [
 /// View semantic roles carrying outcome semantics (`SemanticRole`, owner
 /// vocabulary): only these qualify a compiled atom as outcome evidence.
 const OUTCOME_ROLES: [SemanticRole; 2] = [SemanticRole::Evidence, SemanticRole::Acceptance];
+
+/// Closure leg label: which adequacy leg a persisted cite list fills.
+/// Labels are stored, never inferred — recheck gates each list by its label.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ClosureLeg {
+    /// Public rival-aware model refs.
+    RivalModel,
+    /// Predictions fixed before observation.
+    PreProbePrediction,
+    /// Selected discriminative probe/action refs.
+    Discriminator,
+    /// Applicable outcome/verifier evidence refs.
+    OutcomeVerifier,
+    /// Model revision after outcome refs.
+    Revision,
+    /// Held-out/compositional transfer evidence refs.
+    HeldOut,
+}
+
+/// Canonical persistence order for the closure annex.
+const CLOSURE_LEG_ORDER: [ClosureLeg; 6] = [
+    ClosureLeg::RivalModel,
+    ClosureLeg::PreProbePrediction,
+    ClosureLeg::Discriminator,
+    ClosureLeg::OutcomeVerifier,
+    ClosureLeg::Revision,
+    ClosureLeg::HeldOut,
+];
+
+/// One role-labeled closure leg persisted in the artifact so recheck
+/// re-applies the identical role gate the constructor ran.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LegEvidence {
+    /// Which adequacy leg these cites fill.
+    pub leg: ClosureLeg,
+    /// The cites, in deterministic supply order.
+    pub cites: Vec<EvidenceCite>,
+}
+
+impl LegEvidence {
+    /// Build the annex in canonical leg order from a closure.
+    #[must_use]
+    pub fn annex(closure: &AssessmentClosure) -> Vec<LegEvidence> {
+        vec![
+            LegEvidence { leg: ClosureLeg::RivalModel, cites: closure.rival_model.clone() },
+            LegEvidence { leg: ClosureLeg::PreProbePrediction, cites: closure.pre_probe_prediction.clone() },
+            LegEvidence { leg: ClosureLeg::Discriminator, cites: closure.discriminator.clone() },
+            LegEvidence { leg: ClosureLeg::OutcomeVerifier, cites: closure.outcome_verifier.clone() },
+            LegEvidence { leg: ClosureLeg::Revision, cites: closure.revision.clone() },
+            LegEvidence { leg: ClosureLeg::HeldOut, cites: closure.held_out.clone() },
+        ]
+    }
+
+    /// Stable slot name for diagnostics.
+    #[must_use]
+    pub fn name(leg: ClosureLeg) -> &'static str {
+        match leg {
+            ClosureLeg::RivalModel => "closure.rival_model",
+            ClosureLeg::PreProbePrediction => "closure.pre_probe_prediction",
+            ClosureLeg::Discriminator => "closure.discriminator",
+            ClosureLeg::OutcomeVerifier => "closure.outcome_verifier",
+            ClosureLeg::Revision => "closure.revision",
+            ClosureLeg::HeldOut => "closure.held_out",
+        }
+    }
+
+    /// Role gate for one persisted leg.
+    #[must_use]
+    fn gate(leg: ClosureLeg) -> CiteLeg {
+        match leg {
+            ClosureLeg::Discriminator => CiteLeg::Discriminator,
+            ClosureLeg::OutcomeVerifier => CiteLeg::Outcome,
+            _ => CiteLeg::Neutral,
+        }
+    }
+
+    /// Validate one annex entry bound.
+    pub fn validate_cites(cites: &[EvidenceCite], field: &'static str) -> Result<(), AssessmentError> {
+        AssessmentClosure::cites(cites, field)
+    }
+}
 
 /// Assessment failure: every case fails closed with its reason.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -868,6 +961,14 @@ pub struct CommonGroundAssessment {
     pub common_ground_public_inheritance_transfer_refs: Vec<EvidenceCite>,
     /// Requalification scope for tacit competence.
     pub common_ground_requalification_scope_for_tacit_competence: String,
+    /// Persisted role-labeled closure annex in canonical leg order: the
+    /// exact evidence the verdict was assessed under, so recheck re-applies
+    /// identical role gating. Crate envelope, not part of the frozen field
+    /// contract.
+    pub closure_evidence: Vec<LegEvidence>,
+    /// Product-claim flag the verdict was assessed under (held-out required
+    /// iff true). Crate envelope.
+    pub product_claims: bool,
     /// Assessment status; never adequate without the full closure.
     pub status: AssessmentStatus,
     /// Frozen digest over this shape, excluding this field.
@@ -900,6 +1001,8 @@ impl CommonGroundAssessment {
             survival: &'a [EvidenceCite],
             transfer_refs: &'a [EvidenceCite],
             requalification_scope: &'a str,
+            closure_evidence: &'a [LegEvidence],
+            product_claims: bool,
             status: AssessmentStatus,
         }
         canonical_json_bytes(&CommonGroundDigest {
@@ -914,6 +1017,8 @@ impl CommonGroundAssessment {
             transfer_refs: &self.common_ground_public_inheritance_transfer_refs,
             requalification_scope: &self
                 .common_ground_requalification_scope_for_tacit_competence,
+            closure_evidence: &self.closure_evidence,
+            product_claims: self.product_claims,
             status: self.status,
         })
         .map(|bytes| sha256_hex(&bytes))
@@ -922,7 +1027,7 @@ impl CommonGroundAssessment {
         })
     }
 
-    /// Validate version, scope, slots, requalification text, and digest.
+    /// Validate version, scope, slots, annex order, flag, text, and digest.
     pub fn validate(&self) -> Result<(), AssessmentError> {
         if self.contract_version != UA_CONTRACT_VERSION {
             return Err(AssessmentError::VersionMismatch);
@@ -930,6 +1035,21 @@ impl CommonGroundAssessment {
         self.scope.validate()?;
         for slot in self.slot_lists() {
             AssessmentClosure::cites(slot, "assessment.slot")?;
+        }
+        if self.closure_evidence.len() != CLOSURE_LEG_ORDER.len() {
+            return Err(AssessmentError::InvalidField {
+                field: "assessment.closure_evidence",
+                reason: "annex must carry exactly one entry per closure leg",
+            });
+        }
+        for (entry, expected) in self.closure_evidence.iter().zip(CLOSURE_LEG_ORDER.iter()) {
+            if entry.leg != *expected {
+                return Err(AssessmentError::InvalidField {
+                    field: "assessment.closure_evidence",
+                    reason: "annex legs must follow canonical order",
+                });
+            }
+            LegEvidence::validate_cites(&entry.cites, "assessment.closure_evidence")?;
         }
         text(
             &self.common_ground_requalification_scope_for_tacit_competence,
@@ -964,6 +1084,11 @@ impl CommonGroundAssessment {
             ],
             owner,
         )?;
+        let mut annexed: Vec<(&[EvidenceCite], &str, CiteLeg)> = Vec::new();
+        for entry in &self.closure_evidence {
+            annexed.push((entry.cites.as_slice(), LegEvidence::name(entry.leg), LegEvidence::gate(entry.leg)));
+        }
+        rollup.classify_slots(&annexed, owner)?;
         let mut missing = Vec::new();
         for (slot, name) in self.slot_lists().iter().zip(
             [
@@ -977,6 +1102,12 @@ impl CommonGroundAssessment {
         ) {
             if slot.is_empty() {
                 missing.push(name.to_string());
+            }
+        }
+        for entry in &self.closure_evidence {
+            let required = !matches!(entry.leg, ClosureLeg::HeldOut) || self.product_claims;
+            if required && entry.cites.is_empty() {
+                missing.push(LegEvidence::name(entry.leg).to_string());
             }
         }
         let mut drifted = rollup.stale;
@@ -1029,7 +1160,9 @@ pub struct CommonGroundInput<'a> {
 /// cite caps the verdict below adequate. Status follows the closure rule:
 /// not onboarded without a slice, untested without a discriminator run,
 /// inconclusive on a partial closure or unbound evidence, adequate only with
-/// the full bound closure (plus held-out for product claims). Never assigns
+/// the full bound closure (plus held-out for product claims). The closure is
+/// persisted as a leg-labeled annex plus the product-claim flag, both
+/// digest-bound, so recheck re-applies identical role gating. Never assigns
 /// scores and never promotes.
 pub fn assess_common_ground(input: CommonGroundInput<'_>) -> Result<CommonGroundAssessment, AssessmentError> {
     input.scope.validate()?;
@@ -1087,6 +1220,8 @@ pub fn assess_common_ground(input: CommonGroundInput<'_>) -> Result<CommonGround
             slots[4].clone(),
         common_ground_public_inheritance_transfer_refs: slots[5].clone(),
         common_ground_requalification_scope_for_tacit_competence: input.requalification_scope,
+        closure_evidence: LegEvidence::annex(&input.closure),
+        product_claims: input.product_claims,
         status,
         digest: String::new(),
     };
