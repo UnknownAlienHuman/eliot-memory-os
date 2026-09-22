@@ -27,7 +27,7 @@ eliot-ipc.workspace = true
 eliot-mcp.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
-eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan" }
+eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan", version = "0.1.0" }
 eliot-receipts.workspace = true
 eliot-runtime.workspace = true
 serde.workspace = true
@@ -36,8 +36,8 @@ tokio.workspace = true
 
 [dev-dependencies]
 eliot-agent-contracts.workspace = true
-eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts" }
-eliot-cue-contracts = { path = "../../crates/smart/eliot-cue-contracts" }
+eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts", version = "0.1.0" }
+eliot-cue-contracts = { path = "../../crates/smart/eliot-cue-contracts", version = "0.1.0" }
 eliot-evidence.workspace = true
 eliot-runtime-contracts.workspace = true
 

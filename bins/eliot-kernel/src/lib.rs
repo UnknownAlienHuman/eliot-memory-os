@@ -164,7 +164,7 @@ use runtime_identity::{
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 /// DISPATCH-CONTOUR-2 Slice B launch contour (issues #461 and #22).
@@ -483,6 +483,12 @@ pub struct KernelComposition {
     /// declaration, if the active candidate supplied one.
     #[cfg(windows)]
     agent_bridge_profile: Mutex<Option<AgentBridgeProfile>>,
+    /// Serializes the complete bridge profile transition boundary. Promotion
+    /// holds the write guard while it fences, drains, and publishes a profile;
+    /// synchronous bridge and host ingress holds one read guard across its
+    /// state publication. The guard is never held across an async wait.
+    #[cfg(windows)]
+    agent_bridge_transition: RwLock<()>,
     #[cfg(windows)]
     /// Host-carried descriptor retained as inert composition input. It is
     /// never exposed to the front door until the matching candidate is Ready.
@@ -1015,6 +1021,33 @@ impl KernelComposition {
 }
 
 impl KernelComposition {
+    /// Acquires the read side of the bridge profile transition boundary.
+    ///
+    /// Each synchronous ingress acquires this exactly once and passes through
+    /// private under-transition helpers. In particular, callers must not
+    /// reacquire it from a nested helper while a promotion writer may be
+    /// queued: `std::sync::RwLock` can block recursive readers in that state.
+    #[cfg(windows)]
+    pub(crate) fn agent_bridge_transition_read(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, ()>, TransportError> {
+        self.agent_bridge_transition
+            .read()
+            .map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Acquires the write side of the bridge profile transition boundary.
+    /// The caller must keep it through profile fencing, ownership drain, and
+    /// replacement publication.
+    #[cfg(windows)]
+    pub(crate) fn agent_bridge_transition_write(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, TransportError> {
+        self.agent_bridge_transition
+            .write()
+            .map_err(|_| TransportError::SessionFenced)
+    }
+
     /// Monotonic revision of the promoted bridge profile. The production
     /// listener uses this to rebuild a pending pipe after Host activation
     /// changes the bounded DACL/peer set.

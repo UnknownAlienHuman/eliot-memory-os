@@ -21,10 +21,10 @@ runtime_bundle = "eliotd"
 agent_order = 14
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
-eliot-receipts = { path = "../../foundation/eliot-receipts" }
-eliot-cue-contracts = { path = "../eliot-cue-contracts" }
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
+eliot-cue-contracts = { path = "../eliot-cue-contracts", version = "0.1.0" }
 schemars = { version = "1.2.1", features = ["derive", "uuid1"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
