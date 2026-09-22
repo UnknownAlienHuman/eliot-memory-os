@@ -122,7 +122,7 @@ enum Command {
         #[command(subcommand)]
         command: ControlBoardCommand,
     },
-    /// Preview backup creation/restore plans and key coverage (#1873; preview-only, no execution).
+    /// Backup creation/restore previews, issuance, isolated restore runs, and key coverage (#1873; previews never issue; restore runs never cut over).
     Backup {
         #[command(subcommand)]
         command: backup_entry::BackupCommand,

@@ -592,6 +592,8 @@ dependencies = [
  "eliot-protocol",
  "eliot-runtime-contracts",
  "eliot-runtime-status",
+ "eliot-security-contracts",
+ "eliot-store-api",
  "eliot-store-surreal",
  "serde",
  "serde_json",
