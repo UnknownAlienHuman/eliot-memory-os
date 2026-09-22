@@ -3,7 +3,8 @@
 //! [`assess_common_ground`] checks Common Ground as public causal-inheritance
 //! survival across model/harness change, and [`assess_scoped`] emits one
 //! [`ScopedUnderstandingAssessment`] per question/task family at one State
-//! Fence. Both consume immutable owner projections **by handle only**:
+//! Fence. Both consume immutable owner projections **by handle only**,
+//! bundled as one [`OwnerContext`]:
 //!
 //! * the already-compiled [`ActiveUnderstandingView`] (frozen 9/9,
 //!   `eliot-context-contracts`), never a second `ContextCompiler`
@@ -11,13 +12,32 @@
 //! * the unit-#3 [`AcceptedSourceProjection`] (frozen owner contract,
 //!   `eliot-dreamer-contracts`), cited by exact handle/revision/digest
 //!   triple with no similarity fallback;
-//! * the owner [`ProviderContribution`] (frozen 11/11,
-//!   `eliot-epistemic-contracts`), validated and fence-gated, echoed by
-//!   digest and claim;
+//! * the owner [`ProviderContribution`] (`eliot-epistemic-contracts`),
+//!   validated and fence-gated, echoed by digest and claim;
 //! * owner experience envelopes ([`JournalProjection`], [`BankProjection`],
 //!   [`FeedbackProjection`], `eliot-observation-contracts`) for
 //!   outcome/verifier-side evidence, validated as wholes with carried
 //!   (never inferred) fences.
+//!
+//! Every carried cite must resolve into one of those passed owner objects
+//! before any adequacy verdict: accepted-source triples by exact match,
+//! contribution cites by position digest plus claim plus source revision,
+//! bank/feedback cites by handle plus revision cursor plus content digest,
+//! and journal/outcome/verifier cites by record handle inside a passed
+//! journal envelope (record identity plus envelope digest plus source
+//! revision). Cite-family labels record the caller's claimed role; binding
+//! proves owner-record existence, never role correctness — which is why
+//! verdicts stay candidates.
+//!
+//! Authority boundary: `validate()` is a shape and tamper check only, never
+//! authority — a shape hash is not provenance. The consumer authority path
+//! is [`CommonGroundAssessment::recheck`] /
+//! [`ScopedUnderstandingAssessment::recheck`], which re-resolve every cite
+//! against caller-supplied owner objects. Integration must source the view,
+//! projection, contribution, and envelopes ONLY from their owners. `Stale`
+//! is never assigned in-crate: on a non-complete [`DenominatorRecheck`],
+//! the owning review path (model/harness-change review for Common Ground,
+//! product acceptance for scoped assessments) transitions the candidate.
 //!
 //! Outputs are reversible candidates with the exact independently recheckable
 //! denominator (`declared_question_task_family_times_state_fence_with_
@@ -187,6 +207,8 @@ pub enum AssessmentStatus {
     /// Probed but the closure is partial or unresolved.
     Inconclusive,
     /// A recheck found drifted inputs; the candidate no longer binds.
+    /// Never assigned in-crate: on a non-complete [`DenominatorRecheck`],
+    /// the owning review path transitions the candidate.
     Stale,
 }
 
@@ -460,56 +482,186 @@ pub struct DenominatorRecheck {
     pub drifted: Vec<String>,
 }
 
-/// Check every accepted-source cite in `slots` against the projection by
-/// exact triple match; other families are shape-checked only.
-fn check_slot_cites(
-    slots: &[&[EvidenceCite]],
-    sources: &AcceptedSourceProjection,
-    drifted: &mut Vec<String>,
-    slot_names: &[&str],
-) -> Result<(), AssessmentError> {
-    for (slot, name) in slots.iter().zip(slot_names.iter()) {
-        for cite in slot.iter() {
-            cite.validate()?;
-            if cite.family == CitedFamily::AcceptedSource
-                && sources
-                    .check_cited(&cite.handle, &cite.revision, &cite.digest)
-                    .is_err()
+/// Shared owner-envelope intake for assessment and recheck: the compiled
+/// view, the accepted-source projection, the optional admitted
+/// contribution, and the optional experience envelopes — all by handle,
+/// all sourced ONLY from their owners.
+#[derive(Clone, Copy, Debug)]
+pub struct OwnerContext<'a> {
+    /// Already-compiled understanding view, by handle.
+    pub view: &'a ActiveUnderstandingView,
+    /// Accepted-source projection for citation checks.
+    pub sources: &'a AcceptedSourceProjection,
+    /// Optional admitted epistemic contribution, echoed by digest/claim.
+    pub contribution: Option<&'a ProviderContribution>,
+    /// Optional experience envelopes for outcome-side evidence.
+    pub experience: &'a [ExperienceEvidence<'a>],
+}
+
+/// Outcome of binding one cite into the passed owner objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CiteBinding {
+    /// The cite matches an owner record exactly.
+    Bound,
+    /// The cite contradicts its owner projection (accepted-source triple
+    /// drift only).
+    Stale,
+    /// The cite is well-formed but matches no passed owner object.
+    Unbound,
+}
+
+/// Match a contribution cite by position digest plus claim plus revision.
+fn match_contribution(
+    cite: &EvidenceCite,
+    contribution: &ProviderContribution,
+) -> bool {
+    cite.digest == contribution.position_digest
+        && cite.revision == contribution.source_revision
+        && cite.handle.as_str() == contribution.claim.as_str()
+}
+
+/// Match a journal/outcome/verifier cite by record handle inside a passed
+/// journal envelope, pinned by envelope digest plus source revision.
+fn match_journal_record(cite: &EvidenceCite, envelope_digest: &str, source_revision: &str) -> bool {
+    cite.digest == envelope_digest && cite.revision == source_revision
+}
+
+/// Match a bank/feedback cite by handle plus revision cursor plus content
+/// digest against one owner ref.
+fn match_record_ref(cite: &EvidenceCite, reference: &ExperienceRecordRef) -> bool {
+    cite.handle == reference.handle
+        && cite.revision == reference.revision.revision
+        && cite.digest == reference.revision.content_sha256
+}
+
+/// Classify one cite against the passed owner objects.
+///
+/// Accepted-source triples re-resolve by exact match (`Stale` on drift);
+/// contribution cites match the passed contribution by digest, claim, and
+/// revision; journal/outcome/verifier cites match a passed journal
+/// envelope's record set pinned by envelope digest and source revision;
+/// bank/feedback cites match passed envelope refs by handle, cursor, and
+/// content digest. Anything well-formed but unmatched is `Unbound`.
+/// Errors are reserved for malformed shapes.
+fn classify_cite(
+    cite: &EvidenceCite,
+    owner: &OwnerContext<'_>,
+) -> Result<CiteBinding, AssessmentError> {
+    cite.validate()?;
+    match cite.family {
+        CitedFamily::AcceptedSource => {
+            if owner
+                .sources
+                .check_cited(&cite.handle, &cite.revision, &cite.digest)
+                .is_err()
             {
-                drifted.push((*name).to_string());
+                Ok(CiteBinding::Stale)
+            } else {
+                Ok(CiteBinding::Bound)
             }
         }
+        CitedFamily::EpistemicContribution => Ok(match owner.contribution {
+            Some(contribution) if match_contribution(cite, contribution) => CiteBinding::Bound,
+            _ => CiteBinding::Unbound,
+        }),
+        CitedFamily::JournalRecord | CitedFamily::OutcomeRecord | CitedFamily::VerifierReceipt => {
+            let mut bound = false;
+            for evidence in owner.experience {
+                if let ExperienceEvidence::Journal(projection) = evidence {
+                    if projection
+                        .records
+                        .iter()
+                        .any(|record| record.record_id == cite.handle.as_str())
+                        && match_journal_record(cite, &projection.digest, &projection.source_revision)
+                    {
+                        bound = true;
+                        break;
+                    }
+                }
+            }
+            Ok(if bound { CiteBinding::Bound } else { CiteBinding::Unbound })
+        }
+        CitedFamily::BankRecord | CitedFamily::FeedbackRecord => {
+            let mut bound = false;
+            for evidence in owner.experience {
+                let refs = match (evidence, cite.family) {
+                    (ExperienceEvidence::Bank(projection), CitedFamily::BankRecord) => {
+                        Some(projection.refs.as_slice())
+                    }
+                    (ExperienceEvidence::Feedback(projection), CitedFamily::FeedbackRecord) => {
+                        Some(projection.refs.as_slice())
+                    }
+                    _ => None,
+                };
+                if refs
+                    .map(|refs| refs.iter().any(|reference| match_record_ref(cite, reference)))
+                    .unwrap_or(false)
+                {
+                    bound = true;
+                    break;
+                }
+            }
+            Ok(if bound { CiteBinding::Bound } else { CiteBinding::Unbound })
+        }
     }
-    Ok(())
+}
+
+/// Binding rollup over every carried cite list: stale accepted-source
+/// triples fail closed; every other unbound cite caps adequacy.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BindingRollup {
+    /// Accepted-source cites contradicting their projection.
+    stale: Vec<String>,
+    /// Well-formed cites matching no passed owner object.
+    unbound: Vec<String>,
+}
+
+impl BindingRollup {
+    fn classify_slots(
+        &mut self,
+        slots: &[(&[EvidenceCite], &str)],
+        owner: &OwnerContext<'_>,
+    ) -> Result<(), AssessmentError> {
+        for (slot, name) in slots {
+            for cite in slot.iter() {
+                match classify_cite(cite, owner)? {
+                    CiteBinding::Bound => {}
+                    CiteBinding::Stale => self.stale.push((*name).to_string()),
+                    CiteBinding::Unbound => self.unbound.push((*name).to_string()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// True only when every carried cite resolved into an owner object.
+    #[must_use]
+    fn fully_bound(&self) -> bool {
+        self.stale.is_empty() && self.unbound.is_empty()
+    }
 }
 
 /// Gate every carried fence against the assessment fence.
-fn gate_inputs(
-    view: &ActiveUnderstandingView,
-    sources: &AcceptedSourceProjection,
-    contribution: Option<&ProviderContribution>,
-    experience: &[ExperienceEvidence<'_>],
-    scope: &AssessmentScope,
-) -> Result<(), AssessmentError> {
-    view.validate()?;
-    sources.validate()?;
-    if view.binding.scope_id.as_str() != scope.scope_id {
+fn gate_owner(owner: &OwnerContext<'_>, scope: &AssessmentScope) -> Result<(), AssessmentError> {
+    owner.view.validate()?;
+    owner.sources.validate()?;
+    if owner.view.binding.scope_id.as_str() != scope.scope_id {
         return Err(AssessmentError::InvalidField {
             field: "assessment.scope_id",
             reason: "compiled view is bound to a different work scope",
         });
     }
     gate_compatible(
-        &view.binding.state_fence,
+        &owner.view.binding.state_fence,
         &scope.state_fence,
         "assessment.view_fence",
     )?;
     gate_compatible(
-        &sources.fence,
+        &owner.sources.fence,
         &scope.state_fence,
         "assessment.sources_fence",
     )?;
-    if let Some(contribution) = contribution {
+    if let Some(contribution) = owner.contribution {
         contribution.validate()?;
         gate_compatible(
             &contribution.fence,
@@ -517,7 +669,7 @@ fn gate_inputs(
             "assessment.contribution_fence",
         )?;
     }
-    for (index, evidence) in experience.iter().enumerate() {
+    for (index, evidence) in owner.experience.iter().enumerate() {
         evidence.validate()?;
         if index >= MAX_EVIDENCE_CITES {
             return Err(AssessmentError::InvalidField {
@@ -537,14 +689,15 @@ fn gate_inputs(
 fn decide_status(
     onboarded: bool,
     slots_filled: bool,
-    closure: &AssessmentClosure,
-    product_claims: bool,
+    closure_complete: bool,
+    discriminator_present: bool,
+    fully_bound: bool,
 ) -> AssessmentStatus {
     if !onboarded {
         return AssessmentStatus::NotOnboarded;
     }
-    if !closure.is_complete_for(product_claims) {
-        if closure.discriminator.is_empty() {
+    if !closure_complete || !fully_bound {
+        if !discriminator_present {
             return AssessmentStatus::Untested;
         }
         return AssessmentStatus::Inconclusive;
@@ -655,37 +808,25 @@ impl CommonGroundAssessment {
         Ok(())
     }
 
-    /// Independently recheck the denominator: fences, cited triples, digest.
-    pub fn recheck(
-        &self,
-        view: &ActiveUnderstandingView,
-        sources: &AcceptedSourceProjection,
-    ) -> Result<DenominatorRecheck, AssessmentError> {
-        view.validate()?;
-        sources.validate()?;
-        gate_compatible(
-            &view.binding.state_fence,
-            &self.scope.state_fence,
-            "assessment.view_fence",
-        )?;
-        gate_compatible(
-            &sources.fence,
-            &self.scope.state_fence,
-            "assessment.sources_fence",
-        )?;
-        let mut drifted = Vec::new();
-        check_slot_cites(
-            &self.slot_lists(),
-            sources,
-            &mut drifted,
+    /// Independently recheck the denominator against current owner objects:
+    /// fences re-gated, every cite re-resolved, digest recomputed.
+    ///
+    /// This is the consumer authority path: `validate()` proves shape only.
+    /// A non-complete verdict means the candidate no longer binds; the
+    /// owning review path transitions it to `Stale`.
+    pub fn recheck(&self, owner: &OwnerContext<'_>) -> Result<DenominatorRecheck, AssessmentError> {
+        gate_owner(owner, &self.scope)?;
+        let mut rollup = BindingRollup::default();
+        rollup.classify_slots(
             &[
-                "common_ground_terminology_compatibility",
-                "common_ground_reference_compatibility",
-                "common_ground_commitment_compatibility",
-                "common_ground_action_consequence_compatibility",
-                "common_ground_goals_decisions_invariants_rivals_unknowns_survival_after_model_harness_change",
-                "common_ground_public_inheritance_transfer_refs",
+                (&self.common_ground_terminology_compatibility[..], "common_ground_terminology_compatibility"),
+                (&self.common_ground_reference_compatibility[..], "common_ground_reference_compatibility"),
+                (&self.common_ground_commitment_compatibility[..], "common_ground_commitment_compatibility"),
+                (&self.common_ground_action_consequence_compatibility[..], "common_ground_action_consequence_compatibility"),
+                (&self.common_ground_goals_decisions_invariants_rivals_unknowns_survival_after_model_harness_change[..], "common_ground_goals_decisions_invariants_rivals_unknowns_survival_after_model_harness_change"),
+                (&self.common_ground_public_inheritance_transfer_refs[..], "common_ground_public_inheritance_transfer_refs"),
             ],
+            owner,
         )?;
         let mut missing = Vec::new();
         for (slot, name) in self.slot_lists().iter().zip(
@@ -702,6 +843,8 @@ impl CommonGroundAssessment {
                 missing.push(name.to_string());
             }
         }
+        let mut drifted = rollup.stale;
+        drifted.extend(rollup.unbound);
         if self.digest != self.compute_digest()? {
             drifted.push("assessment.digest".to_string());
         }
@@ -713,18 +856,12 @@ impl CommonGroundAssessment {
     }
 }
 
-/// Inputs to [`assess_common_ground`]: by-handle owner evidence plus the
+/// Inputs to [`assess_common_ground`]: shared owner intake plus the
 /// declared scope, compatibility slots, closure, and product-claim flag.
 #[derive(Clone, Debug)]
 pub struct CommonGroundInput<'a> {
-    /// Already-compiled understanding view, by handle.
-    pub view: &'a ActiveUnderstandingView,
-    /// Accepted-source projection for citation checks.
-    pub sources: &'a AcceptedSourceProjection,
-    /// Optional admitted epistemic contribution, echoed by digest/claim.
-    pub contribution: Option<&'a ProviderContribution>,
-    /// Optional experience envelopes for outcome-side context.
-    pub experience: Vec<ExperienceEvidence<'a>>,
+    /// Owner envelopes, sourced ONLY from their owners.
+    pub owner: OwnerContext<'a>,
     /// Denominator anchor.
     pub scope: AssessmentScope,
     /// Terminology compatibility cites.
@@ -750,21 +887,17 @@ pub struct CommonGroundInput<'a> {
 /// Assess Common Ground over frozen by-handle inputs.
 ///
 /// Validates every owner shape, gates every carried fence against the
-/// assessment fence, revalidates accepted-source triples by exact match, and
-/// emits a typed candidate. Status follows the closure rule: not onboarded
-/// without a slice, untested without a discriminator run, inconclusive on a
-/// partial closure, adequate only with the full closure (plus held-out for
-/// product claims). Never assigns scores and never promotes.
+/// assessment fence, binds every cite into a passed owner object, and emits
+/// a typed candidate. Accepted-source drift fails closed; any other unbound
+/// cite caps the verdict below adequate. Status follows the closure rule:
+/// not onboarded without a slice, untested without a discriminator run,
+/// inconclusive on a partial closure or unbound evidence, adequate only with
+/// the full bound closure (plus held-out for product claims). Never assigns
+/// scores and never promotes.
 pub fn assess_common_ground(input: CommonGroundInput<'_>) -> Result<CommonGroundAssessment, AssessmentError> {
     input.scope.validate()?;
     input.closure.validate()?;
-    gate_inputs(
-        input.view,
-        input.sources,
-        input.contribution,
-        &input.experience,
-        &input.scope,
-    )?;
+    gate_owner(&input.owner, &input.scope)?;
     let slots = [
         input.terminology.clone(),
         input.reference.clone(),
@@ -773,23 +906,25 @@ pub fn assess_common_ground(input: CommonGroundInput<'_>) -> Result<CommonGround
         input.survival.clone(),
         input.transfer_refs.clone(),
     ];
-    let mut drifted = Vec::new();
-    check_slot_cites(
+    let mut rollup = BindingRollup::default();
+    rollup.classify_slots(
         &[
-            &slots[0], &slots[1], &slots[2], &slots[3], &slots[4], &slots[5],
+            (&slots[0][..], "assessment.terminology"),
+            (&slots[1][..], "assessment.reference"),
+            (&slots[2][..], "assessment.commitment"),
+            (&slots[3][..], "assessment.action_consequence"),
+            (&slots[4][..], "assessment.survival"),
+            (&slots[5][..], "assessment.transfer_refs"),
+            (&input.closure.rival_model[..], "closure.rival_model"),
+            (&input.closure.pre_probe_prediction[..], "closure.pre_probe_prediction"),
+            (&input.closure.discriminator[..], "closure.discriminator"),
+            (&input.closure.outcome_verifier[..], "closure.outcome_verifier"),
+            (&input.closure.revision[..], "closure.revision"),
+            (&input.closure.held_out[..], "closure.held_out"),
         ],
-        input.sources,
-        &mut drifted,
-        &[
-            "assessment.terminology",
-            "assessment.reference",
-            "assessment.commitment",
-            "assessment.action_consequence",
-            "assessment.survival",
-            "assessment.transfer_refs",
-        ],
+        &input.owner,
     )?;
-    if !drifted.is_empty() {
+    if !rollup.stale.is_empty() {
         return Err(AssessmentError::StaleCitation { field: "assessment.slot" });
     }
     text(
@@ -800,8 +935,9 @@ pub fn assess_common_ground(input: CommonGroundInput<'_>) -> Result<CommonGround
     let status = decide_status(
         input.scope.is_onboarded(),
         slots_filled,
-        &input.closure,
-        input.product_claims,
+        input.closure.is_complete_for(input.product_claims),
+        !input.closure.discriminator.is_empty(),
+        rollup.fully_bound(),
     );
     let mut assessment = CommonGroundAssessment {
         contract_version: UA_CONTRACT_VERSION,
@@ -979,46 +1115,37 @@ impl ScopedUnderstandingAssessment {
         Ok(())
     }
 
-    /// Independently recheck the denominator: fences, cited triples, digest.
+    /// Independently recheck the denominator against current owner objects:
+    /// fences re-gated, every cite re-resolved, digest recomputed.
     ///
     /// `product_claims` must match the flag the candidate was assessed under:
     /// held-out slots join the missing set only for product claims.
-    /// `*_where_applicable` slots are checked for drift but never required.
+    /// `*_where_applicable` slots are re-resolved for drift but never
+    /// required. This is the consumer authority path: `validate()` proves
+    /// shape only. A non-complete verdict means the candidate no longer
+    /// binds; the product acceptance path transitions it to `Stale`.
     pub fn recheck(
         &self,
-        view: &ActiveUnderstandingView,
-        sources: &AcceptedSourceProjection,
+        owner: &OwnerContext<'_>,
         product_claims: bool,
     ) -> Result<DenominatorRecheck, AssessmentError> {
-        view.validate()?;
-        sources.validate()?;
-        gate_compatible(
-            &view.binding.state_fence,
-            &self.scope.state_fence,
-            "assessment.view_fence",
-        )?;
-        gate_compatible(
-            &sources.fence,
-            &self.scope.state_fence,
-            "assessment.sources_fence",
-        )?;
-        let mut drifted = Vec::new();
-        check_slot_cites(
-            &self.slot_lists(),
-            sources,
-            &mut drifted,
+        gate_owner(owner, &self.scope)?;
+        let mut rollup = BindingRollup::default();
+        rollup.classify_slots(
             &[
-                "scoped_current_model_and_rivals",
-                "scoped_material_unknowns",
-                "scoped_pre_probe_predictions_fixed_before_observation",
-                "scoped_selected_discriminator_or_action",
-                "scoped_observed_outcome_and_verifier",
-                "scoped_model_revision_after_outcome",
-                "scoped_counterfactual_or_held_out_evidence",
-                "scoped_unanswerable_stale_case_where_applicable",
-                "scoped_counterfactual_intervention_or_state_update_case_where_applicable",
-                "scoped_held_out_compositional_transfer_where_applicable",
+                (&self.scoped_current_model_and_rivals[..], "scoped_current_model_and_rivals"),
+                (&self.scoped_material_unknowns[..], "scoped_material_unknowns"),
+                (&self.scoped_pre_probe_predictions_fixed_before_observation[..], "scoped_pre_probe_predictions_fixed_before_observation"),
+                (&self.scoped_selected_discriminator_or_action[..], "scoped_selected_discriminator_or_action"),
+                (&self.scoped_observed_outcome_and_verifier[..], "scoped_observed_outcome_and_verifier"),
+                (&self.scoped_model_revision_after_outcome[..], "scoped_model_revision_after_outcome"),
+                (&self.scoped_counterfactual_or_held_out_evidence[..], "scoped_counterfactual_or_held_out_evidence"),
+                (&self.scoped_unanswerable_stale_case_where_applicable[..], "scoped_unanswerable_stale_case_where_applicable"),
+                (&self.scoped_counterfactual_intervention_or_state_update_case_where_applicable[..], "scoped_counterfactual_intervention_or_state_update_case_where_applicable"),
+                (&self.scoped_held_out_compositional_transfer_where_applicable[..], "scoped_held_out_compositional_transfer_where_applicable"),
+                (&self.scoped_abstention_precision_coverage_where_applicable[..], "scoped_abstention_precision_coverage_where_applicable"),
             ],
+            owner,
         )?;
         let mut missing = Vec::new();
         for (slot, name) in self.slot_lists()[..6].iter().zip(
@@ -1042,6 +1169,8 @@ impl ScopedUnderstandingAssessment {
                 missing.push("scoped_held_out_evidence".to_string());
             }
         }
+        let mut drifted = rollup.stale;
+        drifted.extend(rollup.unbound);
         if self.digest != self.compute_digest()? {
             drifted.push("assessment.digest".to_string());
         }
@@ -1053,18 +1182,12 @@ impl ScopedUnderstandingAssessment {
     }
 }
 
-/// Inputs to [`assess_scoped`]: by-handle owner evidence plus the declared
+/// Inputs to [`assess_scoped`]: shared owner intake plus the declared
 /// scope, identity texts, closure evidence, and product-claim flag.
 #[derive(Clone, Debug)]
 pub struct ScopedInput<'a> {
-    /// Already-compiled understanding view, by handle.
-    pub view: &'a ActiveUnderstandingView,
-    /// Accepted-source projection for citation checks.
-    pub sources: &'a AcceptedSourceProjection,
-    /// Optional admitted epistemic contribution, echoed by digest/claim.
-    pub contribution: Option<&'a ProviderContribution>,
-    /// Optional experience envelopes for outcome/verifier-side evidence.
-    pub experience: Vec<ExperienceEvidence<'a>>,
+    /// Owner envelopes, sourced ONLY from their owners.
+    pub owner: OwnerContext<'a>,
     /// Denominator anchor.
     pub scope: AssessmentScope,
     /// Subject route or coupled system.
@@ -1088,52 +1211,42 @@ pub struct ScopedInput<'a> {
 /// Emit one scoped understanding assessment per question/task family at one
 /// State Fence.
 ///
-/// Runs the same owner validation, fence gating, and exact-triple citation
-/// checks as [`assess_common_ground`], then binds the closure legs into the
-/// frozen `scoped_*` fields. Status follows the closure rule; held-out
-/// evidence is required for product claims. Candidates only: no scores, no
-/// promotion, no second compilation or admission.
+/// Runs the same owner validation, fence gating, and cite binding as
+/// [`assess_common_ground`], then binds the closure legs into the
+/// frozen `scoped_*` fields. Every carried cite must resolve into a passed
+/// owner object; accepted-source drift fails closed and any other unbound
+/// cite caps the verdict below adequate. Status follows the closure rule;
+/// held-out evidence is required for product claims. Candidates only: no
+/// scores, no promotion, no second compilation or admission.
 pub fn assess_scoped(input: ScopedInput<'_>) -> Result<ScopedUnderstandingAssessment, AssessmentError> {
     input.scope.validate()?;
     input.closure.validate()?;
-    gate_inputs(
-        input.view,
-        input.sources,
-        input.contribution,
-        &input.experience,
-        &input.scope,
-    )?;
-    let closure_slots: [&[EvidenceCite]; 6] = [
-        &input.closure.rival_model,
-        &input.closure.pre_probe_prediction,
-        &input.closure.discriminator,
-        &input.closure.outcome_verifier,
-        &input.closure.revision,
-        &input.closure.held_out,
-    ];
-    let mut drifted = Vec::new();
-    check_slot_cites(
-        &closure_slots,
-        input.sources,
-        &mut drifted,
-        &[
-            "closure.rival_model",
-            "closure.pre_probe_prediction",
-            "closure.discriminator",
-            "closure.outcome_verifier",
-            "closure.revision",
-            "closure.held_out",
-        ],
-    )?;
-    if !drifted.is_empty() {
-        return Err(AssessmentError::StaleCitation {
-            field: "assessment.closure",
-        });
-    }
+    gate_owner(&input.owner, &input.scope)?;
     AssessmentClosure::cites(&input.material_unknowns, "assessment.material_unknowns")?;
     AssessmentClosure::cites(&input.abstention, "assessment.abstention")?;
     AssessmentClosure::cites(&input.unanswerable, "assessment.unanswerable")?;
     AssessmentClosure::cites(&input.counterfactual, "assessment.counterfactual")?;
+    let mut rollup = BindingRollup::default();
+    rollup.classify_slots(
+        &[
+            (&input.closure.rival_model[..], "closure.rival_model"),
+            (&input.closure.pre_probe_prediction[..], "closure.pre_probe_prediction"),
+            (&input.closure.discriminator[..], "closure.discriminator"),
+            (&input.closure.outcome_verifier[..], "closure.outcome_verifier"),
+            (&input.closure.revision[..], "closure.revision"),
+            (&input.closure.held_out[..], "closure.held_out"),
+            (&input.material_unknowns[..], "assessment.material_unknowns"),
+            (&input.abstention[..], "assessment.abstention"),
+            (&input.unanswerable[..], "assessment.unanswerable"),
+            (&input.counterfactual[..], "assessment.counterfactual"),
+        ],
+        &input.owner,
+    )?;
+    if !rollup.stale.is_empty() {
+        return Err(AssessmentError::StaleCitation {
+            field: "assessment.closure",
+        });
+    }
     text(&input.subject, "assessment.subject")?;
     text(&input.transfer_boundary, "assessment.transfer_boundary")?;
     let question_and_task_family =
@@ -1144,6 +1257,7 @@ pub fn assess_scoped(input: ScopedInput<'_>) -> Result<ScopedUnderstandingAssess
         input.scope.onboarding_slice.clone()
     };
     let slots_filled = !input.closure.rival_model.is_empty()
+        && !input.material_unknowns.is_empty()
         && !input.closure.pre_probe_prediction.is_empty()
         && !input.closure.discriminator.is_empty()
         && !input.closure.outcome_verifier.is_empty()
@@ -1151,8 +1265,9 @@ pub fn assess_scoped(input: ScopedInput<'_>) -> Result<ScopedUnderstandingAssess
     let status = decide_status(
         input.scope.is_onboarded(),
         slots_filled,
-        &input.closure,
-        input.product_claims,
+        input.closure.is_complete_for(input.product_claims),
+        !input.closure.discriminator.is_empty(),
+        rollup.fully_bound(),
     );
     let mut assessment = ScopedUnderstandingAssessment {
         contract_version: UA_CONTRACT_VERSION,
