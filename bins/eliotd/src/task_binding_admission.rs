@@ -26,6 +26,10 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::StateFence;
+use eliot_governor::{
+    GenerationEvidence, ScopeBinding, TaskScopeOutcome, WorkspaceInstanceIdentity,
+    check_task_observation,
+};
 use eliot_observation::TaskSelectionEvidence;
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
@@ -241,6 +245,66 @@ pub fn admit_task_bound(
             "task selection is incompatible with the target WorkScope",
         )),
     }
+}
+
+/// Admits one task-relative transition with observed workspace identity.
+///
+/// Extends [`admit_task_bound`] with the scope-identity legs for the first
+/// tool-event trigger: the evidence's `WorkScope` claim is checked against
+/// the retained Governor binding (`expected`) and the host-observed workspace
+/// instance and generation. A mismatching checkout fails closed with
+/// `TASK_SCOPE_INCOMPATIBLE` naming the exact disposition
+/// (`DIFFERENT_INSTANCE`, `AMBIGUOUS`, or `STALE_BINDING`); the retained
+/// binding, task state, and project memory are untouched. When the
+/// observation agrees, the existing alias, fence, and compatibility checks
+/// run unchanged. Lineage is enforced on lineage-observing paths, not here:
+/// the daemon edge does not observe it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "admission joins the retained binding, live observation, fence, and compatibility in one edge"
+)]
+pub fn admit_task_bound_with_observed_scope(
+    selection: Option<&TaskSelectionEvidence>,
+    expected_task_ref: &str,
+    expected: &ScopeBinding,
+    observed_instance: &WorkspaceInstanceIdentity,
+    observed_generation: &GenerationEvidence,
+    expected_fence: &StateFence,
+    compatibility: CompatibilityDisposition,
+) -> Result<(), TaskBindingError> {
+    let Some(evidence) = selection else {
+        return admit_task_bound(
+            None,
+            expected_task_ref,
+            &expected.scope.scope_ref,
+            expected_fence,
+            compatibility,
+        );
+    };
+    let check = check_task_observation(
+        expected,
+        &evidence.work_scope_ref,
+        observed_instance,
+        observed_generation,
+    );
+    match check.outcome {
+        TaskScopeOutcome::Clear => {}
+        TaskScopeOutcome::DifferentInstance
+        | TaskScopeOutcome::Ambiguous
+        | TaskScopeOutcome::StaleBinding => {
+            return Err(TaskBindingError::scope_incompatible(format!(
+                "task observation scope identity check {:?}: {}",
+                check.outcome, check.detail
+            )));
+        }
+    }
+    admit_task_bound(
+        selection,
+        expected_task_ref,
+        &expected.scope.scope_ref,
+        expected_fence,
+        compatibility,
+    )
 }
 
 #[cfg(test)]
