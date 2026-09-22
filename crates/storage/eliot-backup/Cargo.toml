@@ -10,11 +10,13 @@ description = "Governed ECXF logical backup and isolated restore contracts"
 workspace_admission = "admitted bounded non-runtime product surface per #1873 (operator CLI previews/coverage plus isolated rehearsal runner; governed export path: #1871); production execution/cutover stays with #960/#961 owners; not a selectable storage fallback"
 
 [dependencies]
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc"] }
 eliot-blob-api.workspace = true
 eliot-contracts.workspace = true
 eliot-platform-windows.workspace = true
 eliot-security-contracts.workspace = true
 eliot-store-api.workspace = true
+getrandom = "=0.2.17"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
