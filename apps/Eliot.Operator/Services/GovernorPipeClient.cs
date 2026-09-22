@@ -5,19 +5,38 @@ using Eliot.Operator.Protocol;
 
 namespace Eliot.Operator.Services;
 
+/// Role-filtered Governor pipe client. This is the single admitted consumer
+/// of the versioned [`LegacyOperatorAdapter`] wire path (`eliot_operator_*`
+/// tools); reads migrate to the current ControlBoard/runtime-status owner and
+/// mutations to the current typed Operator-intent owner as soon as the
+/// Governor serves a current-owner route on this pipe (see
+/// [`LegacyOperatorAdapter.ExpiryRemoval`]).
+///
+/// Handoff/reconnect rule: the one-shot broker endpoint is consumed once. A
+/// lost pipe never loops on the consumed value and never infers continuity
+/// from PID, pipe name, or cached state. Pipe loss during a mutation becomes
+/// the typed unknown-outcome fault carrying the same operation identity for
+/// reconciliation; pipe loss with no replacement handoff becomes the typed
+/// restart-required disposition.
 public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGovernorClient, IAsyncDisposable
 {
-    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
+    {
+        // Explicit, never wider than the framework default.
+        MaxDepth = 64
+    };
     private NamedPipeClientStream? _pipe;
     private StreamReader? _reader;
     private StreamWriter? _writer;
     private OperatorEndpoint? _endpoint;
     private long _requestId;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
+    private readonly StringBuilder _readAhead = new();
 
     public async Task<OperatorSnapshot> SnapshotAsync(string? projectId = null, string? taskId = null, CancellationToken cancellationToken = default)
     {
-        var contract = await CallToolAsync<OperatorContractResponse>("eliot_operator_contract", new { }, cancellationToken);
+        var contract = await CallToolAsync<OperatorContractResponse>(
+            LegacyOperatorAdapter.ToolContract, new { }, "read:contract", cancellationToken);
         if (contract.SchemaVersion != OperatorProtocol.SchemaVersion
             || contract.IpcProtocolVersion != OperatorProtocol.IpcProtocolVersion
             || contract.ProtocolHash != OperatorProtocol.PinnedContractHash)
@@ -25,26 +44,29 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             throw new InvalidOperationException("Governor operator contract differs from the client-pinned version/hash");
         }
         return await CallToolAsync<OperatorSnapshot>(
-            "eliot_operator_snapshot",
+            LegacyOperatorAdapter.ToolSnapshot,
             new { project_id = projectId, task_id = taskId },
+            "read:snapshot",
             cancellationToken);
     }
 
     public async Task<JsonElement> CommandAsync(object commandEnvelope, CancellationToken cancellationToken = default)
     {
         var envelope = JsonSerializer.SerializeToElement(commandEnvelope, Json);
-        if (!envelope.TryGetProperty("idempotency_key", out var key)
-            || key.ValueKind != JsonValueKind.String
-            || string.IsNullOrWhiteSpace(key.GetString()))
-        {
-            throw new ArgumentException(
-                "Operator mutation commands require one client-generated idempotency_key.",
-                nameof(commandEnvelope));
-        }
+        var operationId = RequireOperationId(envelope);
         await ValidateContractAsync(cancellationToken);
-        // CallToolAsync reuses this exact serialized envelope across its reconnect retry, so
-        // a lost response cannot create a second logical mutation.
-        return await CallToolAsync<JsonElement>("eliot_operator_command", envelope, cancellationToken);
+        // One send; a lost response reconciles the same identity through
+        // ReconcileAsync, never a second logical mutation.
+        return await CallToolAsync<JsonElement>(LegacyOperatorAdapter.ToolCommand, envelope, operationId, cancellationToken);
+    }
+
+    public async Task<JsonElement> ReconcileAsync(JsonElement commandEnvelope, CancellationToken cancellationToken = default)
+    {
+        var operationId = RequireOperationId(commandEnvelope);
+        await ValidateContractAsync(cancellationToken);
+        // The exact retained envelope bytes travel again under the same
+        // operation identity; only the transport correlation id is new.
+        return await CallToolAsync<JsonElement>(LegacyOperatorAdapter.ToolCommand, commandEnvelope, operationId, cancellationToken);
     }
 
     public Task<JsonElement> UserAutomationAsync(
@@ -56,7 +78,8 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         // Kernel/Host authenticates this route and supplies RequestMetadata,
         // principal, State Fence and OperationIdentity. Reusing the generic
         // task-scoped operator-command envelope would discard that contract.
-        return CallToolAsync<JsonElement>(UserAutomationContract.Route, request, cancellationToken);
+        return CallToolAsync<JsonElement>(
+            UserAutomationContract.Route, request, $"automation:{request.IdempotencyKey}", cancellationToken);
     }
 
     public async Task<OperatorProjectionPage> QueryAsync(
@@ -64,14 +87,15 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         CancellationToken cancellationToken = default)
     {
         await ValidateContractAsync(cancellationToken);
-        return await CallToolAsync<OperatorProjectionPage>("eliot_operator_query", request, cancellationToken);
+        return await CallToolAsync<OperatorProjectionPage>(LegacyOperatorAdapter.ToolQuery, request, "read:query", cancellationToken);
     }
 
     private async Task ValidateContractAsync(CancellationToken cancellationToken)
     {
         var contract = await CallToolAsync<OperatorContractResponse>(
-            "eliot_operator_contract",
+            LegacyOperatorAdapter.ToolContract,
             new { },
+            "read:contract",
             cancellationToken);
         if (contract.SchemaVersion != OperatorProtocol.SchemaVersion
             || contract.IpcProtocolVersion != OperatorProtocol.IpcProtocolVersion
@@ -81,32 +105,138 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         }
     }
 
-    private async Task<T> CallToolAsync<T>(string tool, object arguments, CancellationToken cancellationToken)
+    private static string RequireOperationId(JsonElement envelope)
+    {
+        if (envelope.ValueKind == JsonValueKind.Object
+            && envelope.TryGetProperty("idempotency_key", out var key)
+            && key.ValueKind == JsonValueKind.String
+            && !string.IsNullOrWhiteSpace(key.GetString()))
+        {
+            return key.GetString()!;
+        }
+        throw new ArgumentException(
+            "Operator mutation commands require one retained idempotency_key; retries reuse the same identity.",
+            nameof(envelope));
+    }
+
+    private async Task<T> CallToolAsync<T>(string tool, object arguments, string operationScope, CancellationToken cancellationToken)
     {
         await _requestGate.WaitAsync(cancellationToken);
         try
         {
+            // Connection establishment and handshake failures happen before
+            // this mutation/read request is written. They still cannot
+            // compact a retained reconciliation entry: a fresh connection
+            // refusal says nothing about the original effect. Convert every
+            // known local/pre-send failure to the same typed recovery outcome
+            // used after a possible send.
             try
             {
                 await EnsureConnectedAsync(cancellationToken);
+            }
+            catch (OperatorRestartRequiredException)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (RuntimeDiscoveryException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (UnauthorizedAccessException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (IOException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (OperatorProtocolException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (JsonException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (InvalidOperationException error)
+            {
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            var requestId = Interlocked.Increment(ref _requestId);
+            try
+            {
                 var response = await RequestAsync<JsonRpcResponse<McpToolResult>>(new
                 {
                     jsonrpc = "2.0",
-                    id = Interlocked.Increment(ref _requestId),
+                    id = requestId,
                     method = "tools/call",
                     @params = new { name = tool, arguments }
                 }, cancellationToken);
-                if (response.Error is not null || response.Result is null)
+                ValidateJsonRpcResponse(response, requestId);
+                if (response.Error is not null)
                 {
-                    throw new InvalidOperationException($"Governor rejected operator tool {tool}");
+                    // A JSON-RPC error carries no owner-bound terminal receipt;
+                    // the request may already have reached the mutation owner.
+                    throw new OperatorUnknownOutcomeException(
+                        operationScope, tool, "owner returned an unbound JSON-RPC error");
                 }
-                return response.Result.StructuredContent.Deserialize<T>(Json)
-                    ?? throw new InvalidOperationException($"Governor returned an empty {tool} result");
+                if (response.Result is null)
+                {
+                    throw new OperatorUnknownOutcomeException(
+                        operationScope, tool, "owner returned no result");
+                }
+                try
+                {
+                    return response.Result.StructuredContent.Deserialize<T>(Json)
+                        ?? throw new OperatorUnknownOutcomeException(
+                            operationScope, tool, "owner answer was empty and unproven");
+                }
+                catch (JsonException error)
+                {
+                    // The owner answered but the bytes prove nothing: the same
+                    // operation must be reconciled, on the live connection.
+                    throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+                }
             }
-            catch (IOException)
+            catch (OperatorUnknownOutcomeException)
             {
                 await DisconnectAsync();
                 throw;
+            }
+            catch (OperationCanceledException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(
+                    operationScope, tool, $"request cancelled after send: {error.Message}");
+            }
+            catch (IOException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (OperatorProtocolException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (JsonException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (NotSupportedException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
+            }
+            catch (InvalidOperationException error)
+            {
+                await DisconnectAsync();
+                throw new OperatorUnknownOutcomeException(operationScope, tool, error.Message);
             }
         }
         finally
@@ -121,7 +251,16 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         {
             return;
         }
-        var activeRuntime = await discovery.DiscoverAsync(cancellationToken);
+        OperatorEndpoint activeRuntime;
+        try
+        {
+            activeRuntime = await discovery.DiscoverAsync(cancellationToken);
+        }
+        catch (RuntimeDiscoveryException error) when (error.Code == "endpoint_missing")
+        {
+            throw new OperatorRestartRequiredException(
+                "one-shot broker handoff is consumed and no replacement handoff is available in-process");
+        }
         if (_pipe is not null)
         {
             await DisconnectAsync();
@@ -129,43 +268,85 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         _endpoint = activeRuntime;
         var pipeName = _endpoint.PipeName.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase);
         _pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-        await _pipe.ConnectAsync(TimeSpan.FromSeconds(10), cancellationToken);
+        try
+        {
+            await _pipe.ConnectAsync(TimeSpan.FromSeconds(OperatorProtocol.ConnectTimeoutSeconds), cancellationToken);
+        }
+        catch (Exception error) when (error is IOException or TimeoutException or OperationCanceledException)
+        {
+            await DisconnectAsync();
+            throw new OperatorRestartRequiredException($"Governor pipe is unreachable: {error.GetType().Name}");
+        }
         _reader = new StreamReader(_pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
         _writer = new StreamWriter(_pipe, new UTF8Encoding(false), 4096, leaveOpen: true) { AutoFlush = true };
-        await _writer.WriteLineAsync(JsonSerializer.Serialize(new
+        try
         {
-            kind = "eliot_ipc_handshake",
-            protocol_version = OperatorProtocol.IpcProtocolVersion,
-            broker_epoch = _endpoint.BrokerEpoch,
-            interactive_session_id = _endpoint.InteractiveSessionId,
-            handoff_nonce = _endpoint.HandoffNonce,
-            client_nonce = Guid.NewGuid().ToString("N"),
-            profile = "human_operator",
-            requested_session_id = (string?)null
-        }, Json));
-        var handshakeLine = await _reader.ReadLineAsync(cancellationToken)
-            ?? throw new IOException("Governor closed the pipe during handshake");
-        using var handshake = JsonDocument.Parse(handshakeLine);
-        if (!handshake.RootElement.GetProperty("accepted").GetBoolean())
-        {
-            throw new UnauthorizedAccessException("Governor rejected the operator handshake");
-        }
-        var initialize = await RequestAsync<JsonRpcResponse<JsonElement>>(new
-        {
-            jsonrpc = "2.0",
-            id = Interlocked.Increment(ref _requestId),
-            method = "initialize",
-            @params = new
+            await _writer.WriteLineAsync(JsonSerializer.Serialize(new
             {
-                protocolVersion = "2025-06-18",
-                eliotProfile = "human_operator",
-                clientInfo = new { name = "Eliot.Operator", version = "0.1.0" },
-                capabilities = new { }
+                kind = "eliot_ipc_handshake",
+                protocol_version = OperatorProtocol.IpcProtocolVersion,
+                broker_epoch = _endpoint.BrokerEpoch,
+                interactive_session_id = _endpoint.InteractiveSessionId,
+                handoff_nonce = _endpoint.HandoffNonce,
+                client_nonce = Guid.NewGuid().ToString("N"),
+                profile = "human_operator",
+                requested_session_id = (string?)null
+            }, Json));
+            var handshakeLine = await ReadBoundedLineAsync(cancellationToken)
+                ?? throw new IOException("Governor closed the pipe during handshake");
+            OperatorJsonGuard.ValidateFramedLine(
+                handshakeLine,
+                OperatorProtocol.MaxControlMembers,
+                OperatorProtocol.MaxControlStringChars,
+                OperatorProtocol.MaxControlDepth,
+                OperatorProtocol.MaxControlTokens,
+                "handshake");
+            using var handshake = JsonDocument.Parse(handshakeLine);
+            if (!handshake.RootElement.TryGetProperty("accepted", out var accepted)
+                || accepted.ValueKind != JsonValueKind.True && accepted.ValueKind != JsonValueKind.False
+                || !accepted.GetBoolean())
+            {
+                throw new UnauthorizedAccessException("Governor rejected the operator handshake");
             }
-        }, cancellationToken);
-        if (initialize.Error is not null || initialize.Result.ValueKind == JsonValueKind.Undefined)
+            var initializeId = Interlocked.Increment(ref _requestId);
+            var initialize = await RequestAsync<JsonRpcResponse<JsonElement>>(new
+            {
+                jsonrpc = "2.0",
+                id = initializeId,
+                method = "initialize",
+                @params = new
+                {
+                    protocolVersion = "2025-06-18",
+                    eliotProfile = "human_operator",
+                    clientInfo = new { name = "Eliot.Operator", version = "0.1.0" },
+                    capabilities = new { }
+                }
+            }, cancellationToken);
+            ValidateJsonRpcResponse(initialize, initializeId);
+            if (initialize.Error is not null || initialize.Result.ValueKind == JsonValueKind.Undefined)
+            {
+                throw new UnauthorizedAccessException("Governor rejected operator initialization");
+            }
+        }
+        catch (OperatorRestartRequiredException)
         {
-            throw new UnauthorizedAccessException("Governor rejected operator initialization");
+            await DisconnectAsync();
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            await DisconnectAsync();
+            throw;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            await DisconnectAsync();
+            throw;
+        }
+        catch (Exception error) when (error is IOException or OperatorProtocolException or InvalidOperationException or JsonException)
+        {
+            await DisconnectAsync();
+            throw new OperatorRestartRequiredException($"operator handshake failed closed: {error.GetType().Name}");
         }
     }
 
@@ -174,8 +355,12 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         try
         {
             await _writer!.WriteLineAsync(JsonSerializer.Serialize(request, Json));
-            var response = await _reader!.ReadLineAsync(cancellationToken)
+            var response = await ReadBoundedLineAsync(cancellationToken)
                 ?? throw new IOException("Governor closed the named pipe");
+            if (Encoding.UTF8.GetByteCount(response) > OperatorProtocol.MaxDecodedBytes)
+            {
+                throw new OperatorProtocolException("response", "body_cap");
+            }
             return JsonSerializer.Deserialize<T>(response, Json)
                 ?? throw new InvalidOperationException("Governor returned an unreadable response");
         }
@@ -184,6 +369,74 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             || error.Message.Contains("pipe is broken", StringComparison.OrdinalIgnoreCase))
         {
             throw new IOException("Governor named pipe is no longer connected", error);
+        }
+    }
+
+    /// Reads one framed line enforcing the inline ceiling before allocation
+    /// completes: over-ceiling input fails closed and is never truncated into
+    /// a valid object. Returns null only on a clean end-of-stream.
+    private async Task<string?> ReadBoundedLineAsync(CancellationToken cancellationToken)
+    {
+        var reader = _reader ?? throw new IOException("Governor pipe reader is not connected");
+        var buffer = new char[4096];
+        while (true)
+        {
+            var newlineIndex = FindNewline(_readAhead);
+            if (newlineIndex >= 0)
+            {
+                if (newlineIndex > OperatorProtocol.MaxLineChars)
+                {
+                    throw new OperatorProtocolException("response", "line_cap");
+                }
+                var line = new StringBuilder(newlineIndex);
+                for (var index = 0; index < newlineIndex; index++)
+                {
+                    var character = _readAhead[index];
+                    if (character != '\r')
+                    {
+                        if (line.Length >= OperatorProtocol.MaxLineChars)
+                        {
+                            throw new OperatorProtocolException("response", "line_cap");
+                        }
+                        line.Append(character);
+                    }
+                }
+                _readAhead.Remove(0, newlineIndex + 1);
+                return line.ToString();
+            }
+            if (_readAhead.Length > OperatorProtocol.MaxLineChars)
+            {
+                throw new OperatorProtocolException("response", "line_cap");
+            }
+            var read = await reader.ReadAsync(buffer, cancellationToken);
+            if (read == 0)
+            {
+                return _readAhead.Length == 0
+                    ? null
+                    : throw new IOException("Governor closed the pipe mid-line");
+            }
+            _readAhead.Append(buffer, 0, read);
+        }
+    }
+
+    private static int FindNewline(StringBuilder buffer)
+    {
+        for (var index = 0; index < buffer.Length; index++)
+        {
+            if (buffer[index] == '\n') return index;
+        }
+        return -1;
+    }
+
+    private static void ValidateJsonRpcResponse<T>(JsonRpcResponse<T> response, long expectedRequestId)
+    {
+        if (!string.Equals(response.JsonRpc, "2.0", StringComparison.Ordinal)
+            || response.Id is not JsonElement id
+            || id.ValueKind != JsonValueKind.Number
+            || !id.TryGetInt64(out var actualRequestId)
+            || actualRequestId != expectedRequestId)
+        {
+            throw new OperatorProtocolException("json_rpc_response", "correlation");
         }
     }
 
@@ -196,6 +449,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         _reader = null;
         _pipe = null;
         _endpoint = null;
+        _readAhead.Clear();
         try
         {
             if (writer is not null) await writer.DisposeAsync();

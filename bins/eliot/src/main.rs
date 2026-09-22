@@ -59,6 +59,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INVALID_REQUEST_EXIT: i32 = 2;
 const FRONT_DOOR_CLOSED_EXIT: i32 = 69;
 const UNKNOWN_OUTCOME_EXIT: i32 = 75;
+/// The serving owner invalidated the generation/session-bound operator
+/// handoff: the UI must restart through a fresh broker-issued binding.
+const RESTART_REQUIRED_EXIT: i32 = 77;
 const INSTALLATION_INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 const INSTALLATION_CONTRACT_VERSION: &str = "3.0.0";
 const INSTALLATION_SCOPE: &str = "bounded_all_effects_or_exact_rollback";
@@ -2987,11 +2990,6 @@ fn run_installation_effect(
     Ok(installation_command_exit_code(overall_status))
 }
 
-/// Reconciles only an exact Host-committed registry terminal.  A missing
-/// terminal is the expected fenced first-install state and remains pending;
-/// this query never starts services, rewrites descriptors, or retries a
-/// credential/SCM effect.
-///
 /// The terminal-reconcile writer open below is short-lived and bounded: it
 /// retries only redb exclusive-lock contention with backoff, then fails
 /// typed with the preserved cause (A13.9:14 no exclusive owner across an
@@ -3078,6 +3076,10 @@ fn rollback_with_activation_owner(
     coordinator.rollback_with_activation_owner(&registry, &host, transaction_id)
 }
 
+/// Reconciles only an exact Host-committed registry terminal.  A missing
+/// terminal is the expected fenced first-install state and remains pending;
+/// this query never starts services, rewrites descriptors, or retries a
+/// credential/SCM effect.
 fn reconcile_host_activation_terminal(
     store_path: &Path,
     transaction: &InstallationTransaction,
@@ -3090,7 +3092,9 @@ fn reconcile_host_activation_terminal(
             .host_state_root
             .as_str(),
     );
-    let Some(registry) = open_existing_registry_for_terminal_reconcile(host_state_root)? else {
+    let host_root = ProtectedRootLease::open_existing(host_state_root)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let Some(registry) = RedbInstallationRegistry::inspect_existing_at(host_root)? else {
         return Ok(None);
     };
     let receipt = match registry.read_committed_activation_receipt(
@@ -3409,6 +3413,27 @@ fn run_ui() -> Result<i32> {
         Err(eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(contract)) => {
             write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
             Ok(FRONT_DOOR_CLOSED_EXIT)
+        }
+        Err(eliot_cli::kernel_client::KernelClientError::RestartRequired(detail)) => {
+            // Generation/session-bound handoff invalidated by the serving
+            // owner: restart through a fresh broker-issued binding. The
+            // consumed endpoint, PID, pipe name, and cached environment are
+            // never continuity evidence.
+            write_json_error("KERNEL_OPERATOR_RESTART_REQUIRED", &detail);
+            Ok(RESTART_REQUIRED_EXIT)
+        }
+        Err(eliot_cli::kernel_client::KernelClientError::UnknownOutcome(detail)) => {
+            // Possibly launched: reconcile the same launch operation by its
+            // operation identity; never resubmit a second launch.
+            write_json_error("KERNEL_OPERATOR_LAUNCH_UNKNOWN", &detail);
+            Ok(UNKNOWN_OUTCOME_EXIT)
+        }
+        Err(eliot_cli::kernel_client::KernelClientError::MissingRequestIdentity) => {
+            write_json_error(
+                "KERNEL_OPERATOR_LAUNCH_NOT_ADMITTED",
+                "no admitted EBP request identity is bound for a broker-admitted operator launch; the identity must arrive through the admitted host request path",
+            );
+            Ok(INVALID_REQUEST_EXIT)
         }
         Err(error) => {
             write_json_error("KERNEL_OPERATOR_LAUNCH_REJECTED", &error.to_string());

@@ -699,12 +699,61 @@ impl Drop for TransportDescriptorLock {
     }
 }
 
+/// Lists the exact staging names this transport publisher can create. A
+/// process id is part of the name so a crash can leave one behind; every
+/// matching entry is recovery evidence. The caller never removes these
+/// entries because the name alone does not prove that this process owns the
+/// bytes in them.
+fn transport_staging_artifacts(path: &Path) -> Result<Vec<PathBuf>, HostError> {
+    let parent = path.parent().ok_or_else(|| {
+        HostError::Platform("heartbeat descriptor path has no parent".to_owned())
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            HostError::Platform("heartbeat descriptor path has no UTF-8 file name".to_owned())
+        })?;
+    let prefix = format!("{file_name}.tmp-");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "heartbeat transport staging directory cannot be inspected: {error}"
+            )));
+        }
+    };
+    let mut artifacts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "heartbeat transport staging directory changed during inspection: {error}"
+            ))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(pid) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !pid.is_empty()
+            && pid.bytes().all(|byte| byte.is_ascii_digit())
+            && pid.parse::<u32>().ok().is_some_and(|pid| pid != 0)
+        {
+            artifacts.push(entry.path());
+        }
+    }
+    Ok(artifacts)
+}
+
 /// Atomically stages descriptor bytes beside the target and renames over
 /// it, so the rendezvous is never absent or half-written. The staging
 /// file is contour-enforced before the rename (the DACL travels with the
 /// file object), the target contour is verified after, and callers prove
-/// the result with a verified reload. A stale staging file from a crashed
-/// attempt is removed first and on failure, never reused.
+/// the result with a verified reload. A crash-stale canonical staging file
+/// is retained as recovery evidence and makes the next publish fail closed.
 ///
 /// # Errors
 ///
@@ -719,15 +768,16 @@ fn atomic_replace_transport_file(path: &Path, bytes: &[u8]) -> Result<(), HostEr
     let file_name = path.file_name().ok_or_else(|| {
         HostError::Platform("heartbeat descriptor path has no file name".to_owned())
     })?;
+    if let Some(staging) = transport_staging_artifacts(path)?.first() {
+        return Err(HostError::RecoveryRequired(format!(
+            "heartbeat transport staging artifact is retained: {}",
+            staging.display()
+        )));
+    }
     let mut staging_name = file_name.to_owned();
     staging_name.push(format!(".tmp-{}", std::process::id()));
     let staging = path.with_file_name(staging_name);
-    match std::fs::remove_file(&staging) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(HostError::Platform(error.to_string())),
-    }
-    let staged = (|| -> Result<(), HostError> {
+    (|| -> Result<(), HostError> {
         write_watchdog_publication_child(&staging, bytes)?;
         eliot_windows_ipc::restrict_file_to_current_user_and_system(&staging).map_err(|error| {
             HostError::RecoveryRequired(format!(
@@ -740,11 +790,7 @@ fn atomic_replace_transport_file(path: &Path, bytes: &[u8]) -> Result<(), HostEr
             ))
         })?;
         verify_transport_file(path)
-    })();
-    if staged.is_err() {
-        let _ = std::fs::remove_file(&staging);
-    }
-    staged
+    })()
 }
 
 /// Returns true only for the exact already-bound conflict, so the heal
@@ -1439,6 +1485,12 @@ pub(crate) fn remove_start_artifacts_exact(
 ) -> Result<(), HostError> {
     let _lock = TransportDescriptorLock::acquire(host_state_root)?;
     let descriptor_path = host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
+    if let Some(staging) = transport_staging_artifacts(&descriptor_path)?.first() {
+        return Err(HostError::RecoveryRequired(format!(
+            "heartbeat transport staging artifact remains: {}",
+            staging.display()
+        )));
+    }
     let current = HeartbeatTransportDescriptor::load(host_state_root)?;
     let observation_path = host_state_root.join(HOST_HEARTBEAT_OBSERVATION_FILE_NAME);
     let observation = load_persisted_heartbeat_observation_strict(host_state_root)?;
@@ -1538,6 +1590,13 @@ pub(crate) fn remove_start_artifacts_exact(
 /// even an unreadable file is recovery-required; metadata is used deliberately
 /// so a corrupt file cannot be mistaken for absence by the tolerant loader.
 pub(crate) fn require_no_start_artifacts(host_state_root: &Path) -> Result<(), HostError> {
+    let descriptor_path = host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
+    if let Some(staging) = transport_staging_artifacts(&descriptor_path)?.first() {
+        return Err(HostError::RecoveryRequired(format!(
+            "heartbeat transport staging artifact remains: {}",
+            staging.display()
+        )));
+    }
     for name in [
         WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME,
         HOST_HEARTBEAT_OBSERVATION_FILE_NAME,
