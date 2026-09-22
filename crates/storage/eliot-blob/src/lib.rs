@@ -43,6 +43,7 @@ pub use eliot_blob_api::{
     BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage, BlobError,
     PublishState,
 };
+pub mod backup_io;
 pub mod demand;
 pub mod key_ports;
 pub use demand::{

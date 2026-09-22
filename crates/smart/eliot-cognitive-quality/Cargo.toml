@@ -1,0 +1,35 @@
+[package]
+name = "eliot-cognitive-quality"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded candidate-only cognitive quality assessments over frozen memory/experience/epistemic surfaces (#223)"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "IMPLEMENTED_PROTOTYPE"
+workspace_admission = "registered in work/223-cognitive-quality-scope lane copy only; package proof pending; no edge or pulse"
+functional_cell = "smart.cognitive.quality"
+source_layer = "C1"
+agent_order = 80
+freeze_ref = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-observation-contracts.workspace = true
+eliot-epistemic-contracts.workspace = true
+eliot-learning-contracts.workspace = true
+eliot-receipts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -6,10 +6,10 @@ use eliot_contracts::sha256_hex;
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
-    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, ServiceAccount,
-    ServiceBootstrapArguments, ServiceControlGrantReadback, ServiceRegistrationRequest,
-    ServiceStartMode, host_service_security_descriptor_digest,
-    watchdog_service_security_descriptor_digest,
+    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, SERVICE_EXPECTED_GROUP_SID,
+    SERVICE_EXPECTED_OWNER_SID, ServiceAccount, ServiceBootstrapArguments,
+    ServiceControlGrantReadback, ServiceRegistrationRequest, ServiceStartMode,
+    host_service_security_descriptor_digest, watchdog_service_security_descriptor_digest,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -22,8 +22,8 @@ use super::{
 /// control grant: the `EliotHost` self-grant on the canonical `EliotHost`
 /// registration, or the `EliotHost` service-SID grant on the canonical
 /// `EliotWatchdog` registration. Both carry the deterministic Host SID as
-/// principal and differ only in mask/descriptor digest. The private service
-/// key and SCM mutation handles never cross this projection.
+/// principal and the OWNER|GROUP|DACL proof read from one SCM handle. The
+/// private service key and SCM mutation handles never cross this projection.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallerServiceControlGrantReceipt {
@@ -33,6 +33,10 @@ pub struct InstallerServiceControlGrantReceipt {
     pub(super) principal_sid: PlatformHandle,
     /// Concrete minimal service-object rights mask.
     pub(super) access_mask: u32,
+    /// Exact service security-descriptor owner SID observed by SCM.
+    pub(super) security_descriptor_owner: PlatformHandle,
+    /// Exact service security-descriptor group SID observed by SCM.
+    pub(super) security_descriptor_group: PlatformHandle,
     /// Digest of the exact protected service DACL returned by SCM readback.
     pub(super) security_descriptor_digest: PlatformHandle,
 }
@@ -58,6 +62,16 @@ impl InstallerServiceControlGrantReceipt {
                 }
             })?,
             access_mask: readback.access_mask(),
+            security_descriptor_owner: PlatformHandle::new(readback.security_descriptor_owner())
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "service_control_grant.security_descriptor_owner".to_owned(),
+                    reason: error.to_string(),
+                })?,
+            security_descriptor_group: PlatformHandle::new(readback.security_descriptor_group())
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "service_control_grant.security_descriptor_group".to_owned(),
+                    reason: error.to_string(),
+                })?,
             security_descriptor_digest: PlatformHandle::new(readback.security_descriptor_digest())
                 .map_err(|error| InstallationError::InvalidField {
                     field: "service_control_grant.security_descriptor_digest".to_owned(),
@@ -92,6 +106,18 @@ impl InstallerServiceControlGrantReceipt {
         &self.security_descriptor_digest
     }
 
+    /// Returns the exact owner SID observed in the SCM security descriptor.
+    #[must_use]
+    pub fn security_descriptor_owner(&self) -> &PlatformHandle {
+        &self.security_descriptor_owner
+    }
+
+    /// Returns the exact group SID observed in the SCM security descriptor.
+    #[must_use]
+    pub fn security_descriptor_group(&self) -> &PlatformHandle {
+        &self.security_descriptor_group
+    }
+
     /// Computes the canonical binding used by the ownership marker and effect
     /// postcondition.
     pub fn canonical_digest(&self) -> Result<PlatformHandle, InstallationError> {
@@ -101,14 +127,18 @@ impl InstallerServiceControlGrantReceipt {
             principal_service: &'a PlatformHandle,
             principal_sid: &'a PlatformHandle,
             access_mask: u32,
+            security_descriptor_owner: &'a PlatformHandle,
+            security_descriptor_group: &'a PlatformHandle,
             security_descriptor_digest: &'a PlatformHandle,
         }
         self.validate()?;
         let bytes = serde_json::to_vec(&Shape {
-            schema: "eliot.installer.service-control-grant.v1",
+            schema: "eliot.installer.service-control-grant.v2",
             principal_service: &self.principal_service,
             principal_sid: &self.principal_sid,
             access_mask: self.access_mask,
+            security_descriptor_owner: &self.security_descriptor_owner,
+            security_descriptor_group: &self.security_descriptor_group,
             security_descriptor_digest: &self.security_descriptor_digest,
         })
         .map_err(|_| InstallationError::IdentityConflict)?;
@@ -128,6 +158,14 @@ impl InstallerServiceControlGrantReceipt {
             "service_control_grant.principal_service",
         )?;
         handle(&self.principal_sid, "service_control_grant.principal_sid")?;
+        handle(
+            &self.security_descriptor_owner,
+            "service_control_grant.security_descriptor_owner",
+        )?;
+        handle(
+            &self.security_descriptor_group,
+            "service_control_grant.security_descriptor_group",
+        )?;
         sha256_handle(
             &self.security_descriptor_digest,
             "service_control_grant.security_descriptor_digest",
@@ -146,6 +184,11 @@ impl InstallerServiceControlGrantReceipt {
                             || part.parse::<u32>().is_err()
                     })
             })
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.security_descriptor_owner.as_str() != SERVICE_EXPECTED_OWNER_SID
+            || self.security_descriptor_group.as_str() != SERVICE_EXPECTED_GROUP_SID
         {
             return Err(InstallationError::IdentityConflict);
         }
