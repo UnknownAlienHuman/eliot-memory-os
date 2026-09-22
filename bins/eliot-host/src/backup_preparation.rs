@@ -18,7 +18,10 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_installation::{InstallationProfile, InstallationRoots};
+use crate::backup_config_projection::{
+    ApprovedBuildBinding, ProjectionError, bind_approved_build,
+};
+use eliot_installation::{ApprovedGeneration, InstallationProfile, InstallationRoots};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -725,4 +728,153 @@ pub fn resolve_source_root(
         });
     }
     Ok(canonical)
+}
+
+/// Caller-presented preparation fields for one delegated operation.
+///
+/// The configuration manifest digest is deliberately absent: the manifest
+/// always comes from the owner-bound [`ApprovedBuildBinding`], so a caller
+/// can never assert a competing manifest. Presented build digests are
+/// subset-checked against the owner artifact set at preparation time.
+/// Numeric generation, lease, purge, and target build/profile stay
+/// caller-presented pending #954 control contracts and HostComposition
+/// delegation, which authenticate the caller.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PresentedPreparationRequest {
+    /// Operation identity (bounded text, unique per preparation).
+    pub operation_id: String,
+    /// Closed preparation class.
+    pub class: PreparationClass,
+    /// Source installation identity (bounded text).
+    pub source_installation_id: String,
+    /// Explicitly admitted staging parent (verified, never trusted).
+    pub staging_parent: PathBuf,
+    /// Approved target build identity (bounded text).
+    pub target_build: String,
+    /// Approved target profile (bounded text).
+    pub target_profile: String,
+    /// Generation approved for the destination (presented).
+    pub approved_generation: u64,
+    /// Live authority generation presented by the caller (presented).
+    pub authority_generation: u64,
+    /// Presented build digests, each verified against owner artifacts.
+    pub build_digests: Vec<String>,
+    /// Opaque owner-issued entropy for fresh identity derivation.
+    pub authority_nonce: String,
+    /// Caller-observed state fence bound into the receipt.
+    pub state_fence_digest: String,
+}
+
+/// HostComposition-side delegation handle for isolated destination
+/// preparation (issue #958).
+///
+/// This is the exact sink interface the HostComposition owner binds: it owns
+/// the installation/Host journal sink (`J`), takes the owner records it
+/// holds ([`ApprovedGeneration`], [`InstallationRoots`]) plus one presented
+/// request, and runs the full owner-bound preparation lifecycle. Caller
+/// authentication stays parameterized pending #954; every owner or
+/// presented-evidence failure maps to a static fail-closed
+/// [`PreparationError`] without echoing owner internals.
+pub struct DelegatedPreparation<J: PreparationJournal> {
+    journal: J,
+}
+
+impl<J: PreparationJournal> DelegatedPreparation<J> {
+    /// Binds one journal sink for the preparation lifecycle.
+    pub fn new(journal: J) -> Self {
+        Self { journal }
+    }
+
+    /// Prepares one isolated destination from owner evidence plus one
+    /// presented request.
+    ///
+    /// Order: bind the active approved generation, resolve the owner source
+    /// root, subset-check presented builds against owner artifacts, admit,
+    /// then prepare idempotently. The manifest digest is always the owner
+    /// configuration digest; generation/lease/purge/target evidence stays
+    /// presented as documented at [`PresentedPreparationRequest`].
+    pub fn prepare(
+        &mut self,
+        approved: &ApprovedGeneration,
+        roots: &InstallationRoots,
+        profile: InstallationProfile,
+        request: &PresentedPreparationRequest,
+    ) -> Result<PreparedDestination, PreparationError> {
+        let binding: ApprovedBuildBinding =
+            bind_approved_build(approved).map_err(projection_to_preparation)?;
+        let source_root = resolve_source_root(roots, profile)?;
+        for digest in &request.build_digests {
+            check_digest(digest, "build_digests")?;
+            if !binding
+                .artifact_digests
+                .iter()
+                .any(|artifact| artifact == digest)
+            {
+                return Err(PreparationError::InvalidRequest {
+                    field: "build_digests",
+                    reason: "build digest is not an owner-approved artifact".to_owned(),
+                });
+            }
+        }
+        let admission = DestinationAdmission {
+            operation_id: request.operation_id.clone(),
+            class: request.class,
+            source_installation_id: request.source_installation_id.clone(),
+            source_root,
+            staging_parent: request.staging_parent.clone(),
+            target_build: request.target_build.clone(),
+            target_profile: request.target_profile.clone(),
+            approved_generation: request.approved_generation,
+            authority_generation: request.authority_generation,
+            manifest_digest: binding.config_digest.clone(),
+            authority_nonce: request.authority_nonce.clone(),
+            state_fence_digest: request.state_fence_digest.clone(),
+        };
+        prepare_isolated_destination(&mut self.journal, &admission)
+    }
+
+    /// Reconciles one operation without duplicating effects.
+    pub fn reconcile(
+        &self,
+        operation_id: &str,
+    ) -> Result<ReconcileDisposition, PreparationError> {
+        reconcile_preparation(&self.journal, operation_id)
+    }
+
+    /// Cancels one prepared operation, preserving its prior receipt.
+    pub fn cancel(&mut self, operation_id: &str) -> Result<(), PreparationError> {
+        cancel_preparation(&mut self.journal, operation_id)
+    }
+
+    /// Cleans up owned unactivated destinations, preserving unknowns.
+    pub fn cleanup(
+        &self,
+        operation_ids: &[String],
+    ) -> Result<CleanupReport, PreparationError> {
+        cleanup_preparations(&self.journal, operation_ids)
+    }
+}
+
+/// Maps owner-binding projection failures to static fail-closed preparation
+/// errors, preserving the offending field name without echoing owner
+/// internals.
+fn projection_to_preparation(error: ProjectionError) -> PreparationError {
+    match error {
+        ProjectionError::InvalidDigest { field } => PreparationError::InvalidRequest {
+            field,
+            reason: "digest shape required".to_owned(),
+        },
+        ProjectionError::InvalidIdentity { field } => PreparationError::InvalidRequest {
+            field,
+            reason: "bounded printable text required".to_owned(),
+        },
+        ProjectionError::BoundsExceeded { field } => PreparationError::InvalidRequest {
+            field,
+            reason: "bounded collection exceeded".to_owned(),
+        },
+        ProjectionError::StaleEvidence { field } => PreparationError::InvalidRequest {
+            field,
+            reason: "evidence is not current owner evidence".to_owned(),
+        },
+    }
 }
