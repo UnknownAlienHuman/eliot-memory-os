@@ -30,6 +30,7 @@ mod write_scheduler;
 use std::fmt;
 use std::num::NonZeroUsize;
 
+pub use crate::client::session_pool::{PoolAdmission, PoolOccupancy, SessionRole};
 pub use config::{
     ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
     PINNED_SURREALDB_MAJOR, SchemaGeneration, SchemaGenerationError, SurrealAdapterConfig,
@@ -37,17 +38,20 @@ pub use config::{
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::RetainedProcessPathLease;
 use eliot_store_api::{
-    CAPABILITY_RESERVED_WRITE, CanonicalStoreClient, CanonicalValidationSnapshot, ExactJsonBytes,
-    GENESIS_MANIFEST_NAME, NamedOperationManifest, NamedReadRequest, NamedReadResponse,
-    OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
-    RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
-    operation_manifest_set_digest,
+    CAPABILITY_RESERVED_WRITE, CanonicalBackupPorts, CanonicalStoreClient,
+    CanonicalValidationSnapshot, ExactJsonBytes, GENESIS_MANIFEST_NAME, NamedOperationManifest,
+    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StateFence,
+    StoreBackupBeginRequest, StoreBackupCompletionReceipt, StoreBackupConsistency,
+    StoreBackupEndRequest, StoreBackupPage, StoreBackupPageRequest, StoreBackupReconcileRequest,
+    StoreBackupReconciliation, StoreBackupStatusReport, StoreBackupStatusRequest,
+    StoreBackupValidationReceipt, StoreBackupValidationRequest, StoreError, StoreGenesisRequest,
+    StoreHealth, StoreIsolatedRestoreRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
+    WriteReceipt, generated_operation_manifests, operation_manifest_set_digest,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
-pub use crate::client::session_pool::{PoolAdmission, PoolOccupancy, SessionRole};
 
 /// Server identity proved by the last ownership-verified authentication on
 /// the live provider transport (issue #1932).
@@ -308,7 +312,10 @@ impl SurrealStoreAdapter {
     #[must_use]
     pub fn reserved_write_capability(&self) -> Option<&'static str> {
         let slot = self.execution.lock().ok()?;
-        if slot.as_ref().is_some_and(|execution| execution.is_concurrent()) {
+        if slot
+            .as_ref()
+            .is_some_and(|execution| execution.is_concurrent())
+        {
             Some(CAPABILITY_RESERVED_WRITE)
         } else {
             None
@@ -577,6 +584,25 @@ impl SurrealStoreAdapter {
             SchemaGeneration::v2(),
         )
     }
+
+    /// Builds the additive backup-tables migration (issues #951/#952). The
+    /// delta creates only the three backup coordination tables on top of a
+    /// v2 baseline without changing the generation, in the v1-to-v2 delta
+    /// style. Applied explicitly by the deployment owner through
+    /// [`SurrealStoreAdapter::apply_migration`]; never implicitly.
+    pub fn backup_tables_migration() -> CompiledMigration {
+        CompiledMigration::new(
+            schema::MIGRATION_ID_BACKUP_TABLES,
+            schema::BACKUP_TABLES_DDL,
+            SchemaGeneration::v2(),
+        )
+    }
+
+    /// Proves backup-table provisioning for truthful capability
+    /// advertisement. See [`apply::backup_provisioned`].
+    pub async fn backup_provisioned(&self) -> bool {
+        apply::backup_provisioned(self).await
+    }
 }
 
 impl CanonicalStoreClient for SurrealStoreAdapter {
@@ -686,6 +712,71 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         // Boxed: the ledger future holds multi-kilobyte canonical payloads
         // across provider awaits, exceeding the default future-size lint.
         Box::pin(dreamer_job::dreamer_job(self, ctx, request))
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+}
+
+impl CanonicalBackupPorts for SurrealStoreAdapter {
+    async fn backup_begin(
+        &self,
+        request: StoreBackupBeginRequest,
+    ) -> Result<StoreBackupConsistency, StoreError> {
+        apply::backup_begin(self, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn backup_page(
+        &self,
+        request: StoreBackupPageRequest,
+    ) -> Result<StoreBackupPage, StoreError> {
+        apply::backup_page(self, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn backup_end(
+        &self,
+        request: StoreBackupEndRequest,
+    ) -> Result<StoreBackupCompletionReceipt, StoreError> {
+        apply::backup_end(self, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn backup_isolated_restore(
+        &self,
+        request: StoreIsolatedRestoreRequest,
+    ) -> Result<StoreBackupCompletionReceipt, StoreError> {
+        apply::backup_isolated_restore(self, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn backup_validate(
+        &self,
+        request: StoreBackupValidationRequest,
+    ) -> Result<StoreBackupValidationReceipt, StoreError> {
+        apply::backup_validate(self, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn backup_status(
+        &self,
+        request: StoreBackupStatusRequest,
+    ) -> Result<StoreBackupStatusReport, StoreError> {
+        apply::backup_status(self, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn backup_reconcile(
+        &self,
+        request: StoreBackupReconcileRequest,
+    ) -> Result<StoreBackupReconciliation, StoreError> {
+        apply::backup_reconcile(self, request)
             .await
             .map_err(AdapterError::into_store_error)
     }

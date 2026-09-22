@@ -22,12 +22,12 @@ use crate::{
     OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
     RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
     StateFence, StoreBackupBeginRequest, StoreBackupCompletionReceipt, StoreBackupConsistency,
-    StoreBackupEndRequest, StoreBackupPage, StoreBackupPageRequest,
-    StoreBackupReconcileRequest, StoreBackupReconciliation, StoreBackupStatusReport,
-    StoreBackupStatusRequest, StoreBackupValidationReceipt, StoreBackupValidationRequest,
-    StoreError, StoreEvidencePack, StoreGenesisRequest, StoreHealth, StoreIsolatedRestoreRequest,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, dreamer_job::map_durable_error,
-    json_shape_name, verify_canonical_request_hash,
+    StoreBackupEndRequest, StoreBackupPage, StoreBackupPageRequest, StoreBackupReconcileRequest,
+    StoreBackupReconciliation, StoreBackupStatusReport, StoreBackupStatusRequest,
+    StoreBackupValidationReceipt, StoreBackupValidationRequest, StoreError, StoreEvidencePack,
+    StoreGenesisRequest, StoreHealth, StoreIsolatedRestoreRequest, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt, dreamer_job::map_durable_error, json_shape_name,
+    verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -73,14 +73,17 @@ pub const CAPABILITY_DREAMER_JOB_STATUS: &str = "store.dreamer_job.status";
 pub const CAPABILITY_DREAMER_JOB_REQUEST_CANCEL: &str = "store.dreamer_job.request_cancel";
 pub const CAPABILITY_DREAMER_JOB_RECONCILE: &str = "store.dreamer_job.reconcile";
 
-/// Declared (not advertised) capability for the Store backup edge
-/// (issue #975).
+/// Declared capability for the Store backup edge (issue #975).
 ///
 /// The wire variant selects this capability through
-/// [`StoreRequest::capability`], but it is deliberately absent from
-/// [`CAPABILITIES`]: API enum presence is not readiness, and the capability
-/// stays unadvertised until the #951/#952 backends are accepted. A session
-/// without this admitted capability rejects the operation before dispatch.
+/// [`StoreRequest::capability`]. It stays absent from [`CAPABILITIES`] by
+/// design: API enum presence is not readiness. The Store process admits it
+/// into a session only with live backend-provisioning proof (backup
+/// coordination tables proved at composition `connect` time), so
+/// capability listing describes supported schema separately from runtime
+/// availability without ever claiming an unbound implementation works. A
+/// session without this admitted capability rejects the operation before
+/// dispatch.
 pub const CAPABILITY_STORE_BACKUP: &str = "store.backup";
 /// Capabilities advertised by the canonical store process.
 pub const CAPABILITIES: &[&str] = &[
@@ -1281,17 +1284,11 @@ fn validate_erasure_surface_request(
 #[serde(tag = "backup_op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StoreBackupOperation {
     /// Open one bounded coherent canonical snapshot.
-    Begin {
-        request: StoreBackupBeginRequest,
-    },
+    Begin { request: StoreBackupBeginRequest },
     /// Read one page of an open capture.
-    Page {
-        request: StoreBackupPageRequest,
-    },
+    Page { request: StoreBackupPageRequest },
     /// Close one capture and issue its completion receipt.
-    End {
-        request: StoreBackupEndRequest,
-    },
+    End { request: StoreBackupEndRequest },
     /// Restore validated canonical records into the admitted isolated
     /// destination only.
     IsolatedRestore {
@@ -1302,9 +1299,7 @@ pub enum StoreBackupOperation {
         request: StoreBackupValidationRequest,
     },
     /// Observe the status of one backup operation.
-    Status {
-        request: StoreBackupStatusRequest,
-    },
+    Status { request: StoreBackupStatusRequest },
     /// Reconcile one uncertain backup mutation by exact identity.
     Reconcile {
         request: StoreBackupReconcileRequest,
@@ -1447,29 +1442,21 @@ impl StoreBackupEnvelope {
 #[serde(tag = "backup_outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StoreBackupOutcome {
     /// Opened capture consistency handle.
-    Begun {
-        consistency: StoreBackupConsistency,
-    },
+    Begun { consistency: StoreBackupConsistency },
     /// One bounded capture page.
-    Page {
-        page: StoreBackupPage,
-    },
+    Page { page: StoreBackupPage },
     /// Capture or isolated-restore completion receipt.
     Completion {
         receipt: StoreBackupCompletionReceipt,
     },
     /// Consumer evidence pack for the completed capture.
-    Evidence {
-        pack: StoreEvidencePack,
-    },
+    Evidence { pack: StoreEvidencePack },
     /// Snapshot validation receipt.
     Validation {
         receipt: StoreBackupValidationReceipt,
     },
     /// Backup operation status report.
-    Status {
-        report: StoreBackupStatusReport,
-    },
+    Status { report: StoreBackupStatusReport },
     /// Reconciliation outcome for one backup operation.
     Reconciliation {
         reconciliation: StoreBackupReconciliation,

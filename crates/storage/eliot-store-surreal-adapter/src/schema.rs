@@ -70,6 +70,25 @@ pub(crate) mod table {
     /// row per `automation_id` naming the most recently committed
     /// failure key. Last write wins; no compare-and-set.
     pub(crate) const AUTOMATION_LAST_FAILURE: &str = "automation_last_failure";
+    /// Durable backup-operation row per operation (issues #951/#952/#975).
+    /// One row per `operation_id` carrying the admitted identity, fence,
+    /// scope, lifecycle status, frozen fence sequences, frozen heads
+    /// digest, counters, and the final receipt once completed. The unique
+    /// index arbitrates concurrent same-identity begins: one winner
+    /// creates, losers replay-or-conflict against the durable row.
+    pub(crate) const BACKUP_OPERATION: &str = "backup_operation";
+    /// Frozen capture member row per operation and member digest
+    /// (issues #951/#952). One row per `(operation_id, member_digest)`
+    /// carrying the member evidence plus the verbatim projected canonical
+    /// row the restore replay converges against. Written once at `Begin`
+    /// inside the freezing transaction; never mutated afterwards.
+    pub(crate) const BACKUP_MEMBER: &str = "backup_member";
+    /// Accumulated per-residency disposition row per operation and
+    /// residency digest (issues #951/#952). One row per
+    /// `(operation_id, residency_digest)` carrying the domain label and
+    /// the exact member/byte denominators. Written once at `Begin`
+    /// alongside the frozen members; never mutated afterwards.
+    pub(crate) const BACKUP_RESIDENCY: &str = "backup_residency";
 }
 
 /// Record key of the single canonical fence/sequence row.
@@ -278,6 +297,61 @@ DEFINE FIELD scope_id ON automation_invocation TYPE string;
 DEFINE FIELD task_id ON automation_invocation TYPE option<string>;
 DEFINE INDEX invocation_occurrence ON automation_invocation FIELDS occurrence_id UNIQUE;
 ";
+
+/// Backup coordination tables (issues #951/#952/#975). Additive delta in
+/// the notification style: `backup_operation` carries one row per backup
+/// operation with the admitted identity, fence, scope, lifecycle status,
+/// frozen fence sequences, and the final receipt once completed;
+/// `backup_member` carries one frozen member row per operation and member
+/// digest with the verbatim projected canonical row the restore replay
+/// converges against; `backup_residency` carries one exact disposition row
+/// per operation and residency digest. Applied explicitly by the deployment
+/// owner through [`crate::SurrealStoreAdapter::backup_tables_migration`];
+/// never executed implicitly by the adapter. Bodies fail closed with
+/// `MigrationRequired` while the tables are absent.
+pub(crate) const BACKUP_TABLES_DDL: &str = r"
+DEFINE TABLE backup_operation SCHEMALESS;
+DEFINE FIELD operation_id ON backup_operation TYPE string;
+DEFINE FIELD operation_kind ON backup_operation TYPE string;
+DEFINE FIELD idempotency_key ON backup_operation TYPE string;
+DEFINE FIELD canonical_request_hash ON backup_operation TYPE string;
+DEFINE FIELD state_fence ON backup_operation TYPE object;
+DEFINE FIELD scope_json ON backup_operation TYPE string;
+DEFINE FIELD status ON backup_operation TYPE string;
+DEFINE FIELD consistency_point ON backup_operation TYPE string;
+DEFINE FIELD snapshot_digest ON backup_operation TYPE option<string>;
+DEFINE FIELD member_count ON backup_operation TYPE int;
+DEFINE FIELD total_bytes ON backup_operation TYPE int;
+DEFINE FIELD receipt_json ON backup_operation TYPE option<string>;
+DEFINE FIELD frozen_commit_sequence ON backup_operation TYPE int;
+DEFINE FIELD frozen_outbox_sequence ON backup_operation TYPE int;
+DEFINE FIELD frozen_heads_digest ON backup_operation TYPE string;
+DEFINE INDEX backup_operation_id ON backup_operation FIELDS operation_id UNIQUE;
+
+DEFINE TABLE backup_member SCHEMALESS;
+DEFINE FIELD operation_id ON backup_member TYPE string;
+DEFINE FIELD member_digest ON backup_member TYPE string;
+DEFINE FIELD content_digest ON backup_member TYPE string;
+DEFINE FIELD residency_digest ON backup_member TYPE string;
+DEFINE FIELD member_bytes ON backup_member TYPE int;
+DEFINE FIELD page_cursor ON backup_member TYPE int;
+DEFINE FIELD member_table ON backup_member TYPE string;
+DEFINE FIELD member_id ON backup_member TYPE string;
+DEFINE FIELD member_json ON backup_member TYPE string;
+DEFINE INDEX backup_member_key ON backup_member FIELDS operation_id, member_digest UNIQUE;
+
+DEFINE TABLE backup_residency SCHEMALESS;
+DEFINE FIELD operation_id ON backup_residency TYPE string;
+DEFINE FIELD residency_digest ON backup_residency TYPE string;
+DEFINE FIELD domain ON backup_residency TYPE string;
+DEFINE FIELD member_count ON backup_residency TYPE int;
+DEFINE FIELD member_bytes ON backup_residency TYPE int;
+DEFINE FIELD content_digest ON backup_residency TYPE string;
+DEFINE INDEX backup_residency_key ON backup_residency FIELDS operation_id, residency_digest UNIQUE;
+";
+
+/// Migration identity of the additive backup-tables delta.
+pub(crate) const MIGRATION_ID_BACKUP_TABLES: &str = "eliot.store.surreal.schema.backup_tables";
 
 pub(crate) const SCHEMA_DDL_V2: &str = r"
 DEFINE TABLE schema_meta SCHEMALESS;
