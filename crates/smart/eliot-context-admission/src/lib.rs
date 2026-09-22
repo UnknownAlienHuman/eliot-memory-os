@@ -7,8 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod learning_gate;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use learning_gate::{
     LearningSubject, admit_context_with_learning, screen_admission_input_learning,
     screen_learning_subjects,

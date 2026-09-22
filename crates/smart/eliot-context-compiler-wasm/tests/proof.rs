@@ -374,6 +374,7 @@ fn input_with_optional(optional_cost: AdmissionMeasuredCost) -> AdmissionInput {
             ),
             measurement(&context, &optional, "optional-measurement", optional_cost),
         ],
+        learning_tickets: Vec::new(),
     }
 }
 

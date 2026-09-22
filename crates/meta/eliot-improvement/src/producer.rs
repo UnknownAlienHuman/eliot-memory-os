@@ -67,9 +67,22 @@ pub fn produce_learning_candidate(
     request: LearningProduction<'_>,
 ) -> Result<ContextCandidate, BoundsError> {
     let permit = request.verified.permit();
-    // Registry proof: only an ACTIVE backlog entry may be (re)produced.
-    if request.backlog.entry_for(request.candidate_id).is_none() {
-        return Err(BoundsError::NotBacklogAdmitted);
+    // Registry proof: only an ACTIVE backlog entry admitted under the
+    // permit-bound Governor authority may be (re)produced, and the
+    // presented owner and source must equal those retained identities —
+    // never arbitrary caller labels.
+    let retained = request.backlog.entry_for(request.candidate_id).ok_or(
+        BoundsError::NotBacklogAdmitted,
+    )?;
+    if retained.admitted_under_authority.as_deref() != Some(permit.authority_ref()) {
+        return Err(BoundsError::GovernorAuthorityUnconfirmed);
+    }
+    let retained_owner = retained.owner.as_deref().ok_or(BoundsError::OwnerlessRecord)?;
+    if request.owner.trim() != retained_owner {
+        return Err(BoundsError::GovernorAuthorityUnconfirmed);
+    }
+    if request.source_owner.trim() != permit.authority_ref() {
+        return Err(BoundsError::GovernorAuthorityUnconfirmed);
     }
     // Subject proof: the permit must bind this exact reusable candidate.
     if Some(request.candidate_id) != permit.candidate_id() {

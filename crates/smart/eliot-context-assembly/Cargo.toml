@@ -24,10 +24,14 @@ agent_order = 18
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-context-contracts = { path = "../eliot-context-contracts" }
 eliot-context-admission = { path = "../eliot-context-admission" }
-eliot-governor = { path = "../../governor/eliot-governor" }
 eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts" }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
+
+# Host-only owner evidence (same rule as eliot-context-admission): the
+# permit-based delivery screen never enters a guest closure.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+eliot-governor = { path = "../../governor/eliot-governor" }
 
 [dev-dependencies]
 eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts" }

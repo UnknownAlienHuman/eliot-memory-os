@@ -27,6 +27,7 @@
 pub mod conversion;
 pub mod descriptor;
 pub mod export;
+pub mod guest_gate;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod host;
 

@@ -46,6 +46,7 @@ eliot-governor = { path = "../../governor/eliot-governor", version = "0.1.0" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 eliot-improvement = { path = "../../meta/eliot-improvement", version = "0.1.0" }
+eliot-governor = { path = "../../governor/eliot-governor", version = "0.1.0" }
 
 [lints]
 workspace = true

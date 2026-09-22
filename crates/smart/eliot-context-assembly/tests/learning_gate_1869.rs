@@ -10,6 +10,7 @@
 //! and expired marks refuse before anything renders; plain
 //! [`assemble_active_view`] behavior is preserved.
 
+#![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::num::NonZeroU64;

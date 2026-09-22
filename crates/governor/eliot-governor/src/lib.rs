@@ -89,7 +89,8 @@ pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
 pub use learning_admission::{
     LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
     LearningAdmissionError, LearningAdmissionPermit, VerifiedLearningAdmission,
-    issue_learning_admission, verify_learning_admission,
+    issue_learning_admission, issue_learning_ticket, verify_learning_admission,
+    verify_learning_ticket,
 };
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,

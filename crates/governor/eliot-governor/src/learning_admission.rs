@@ -1,23 +1,33 @@
-//! Governor-issued learning admission permits (I12.24, #1869).
+//! Governor-issued learning admission permits and tickets (I12.24, #1869).
 //!
-//! Owner-issued, digest-bound, fence-checked permits for learning-overlay and
-//! reusable-candidate influence. This module follows the established
+//! Owner-issued, digest-bound, fence-checked admission for learning-overlay
+//! and reusable-candidate influence. This module follows the established
 //! Kernel `DispatchPermit` pattern (`I10-08-02`): the owner mints; the
 //! consumer validates against the current fence and epochs before use;
-//! missing, expired, or mismatched permits are refused (`STALE_STATE_FENCE`,
-//! `STALE_AUTHORITY_EPOCH`) and never refreshed silently.
+//! missing, expired, or mismatched admission is refused
+//! (`STALE_STATE_FENCE`, `STALE_AUTHORITY_EPOCH`) and never refreshed
+//! silently.
 //!
-//! Authentication boundary (deliberate):
-//! - [`LearningAdmissionClaim`] is requester-supplied and serializable: it is
-//!   the *request*, never proof.
-//! - [`LearningAdmissionPermit`] has private fields and no `Serialize` impl:
-//!   only [`issue_learning_admission`] can construct it, and only after live
-//!   admission checks against the [`Governor`] owner. External crates cannot
-//!   forge one; they cannot even name its digest preimage fields.
-//! - [`VerifiedLearningAdmission`] is lifetime-bound to the verified permit
-//!   and constructible only via [`verify_learning_admission`], which rebinds
-//!   the permit to the *current* owner epoch/generation and the presented
-//!   fence. Epoch rotation or fence drift invalidates old permits.
+//! Two shapes, one meaning, split by travel:
+//!
+//! - [`LearningAdmissionPermit`] is the opaque in-process handle: private
+//!   fields, no `Serialize` impl. Only [`issue_learning_admission`] can
+//!   construct it, and only after live admission checks against the
+//!   [`Governor`] owner. External crates cannot forge one.
+//! - [`LearningAdmissionTicket`] (contract type, serializable) is the wire
+//!   twin for process boundaries the opaque handle cannot cross
+//!   (out-of-process host dispatch, guest envelope). It carries the exact
+//!   same bound fields and the exact same digest, minted by
+//!   [`issue_learning_ticket`] under the exact same live checks. See the
+//!   ticket contract docs for the honest boundary statement: digest
+//!   recomputation detects tampering, transplanting, and rotation, while
+//!   wall-clock expiry and stale-together replay remain native/contour
+//!   responsibilities.
+//!
+//! [`VerifiedLearningAdmission`] is lifetime-bound to the verified permit
+//! and constructible only via [`verify_learning_admission`], which rebinds
+//! the permit to the *current* owner epoch/generation and the presented
+//! fence. Epoch rotation or fence drift invalidates old permits.
 //!
 //! The module is stateless: no registry, no second scheduler, no durable
 //! writes. Permit lifetime is bounded by epoch/fence/overlay expiry; there is
@@ -25,8 +35,10 @@
 //! one-shot nonce (no registry to consume it). Overlay wall-clock expiry is
 //! enforced by the retrieval gate holding the overlay record.
 
-use blake3::Hasher;
-use eliot_contracts::{EpochId, ResourceGeneration, StateFence, fences_match_exact};
+use eliot_context_contracts::{
+    LEARNING_TICKET_SCHEMA_VERSION, LearningAdmissionTicket, learning_ticket_digest,
+};
+use eliot_contracts::{StateFence, fences_match_exact};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -34,11 +46,8 @@ use crate::{Governor, GovernorState};
 
 /// Stable identity of this admission contract.
 pub const LEARNING_ADMISSION_CONTRACT: &str = "eliot.governor.learning-admission";
-/// Wire revision of the claim shape accepted by [`issue_learning_admission`].
-pub const LEARNING_ADMISSION_SCHEMA_VERSION: u32 = 1;
-/// Digest domain separator for permit binding (see APPENDIX-P: canonical
-/// hashes use normalized versioned serialization).
-const PERMIT_DIGEST_DOMAIN: &str = "eliot.governor.learning-admission.permit.v1";
+/// Wire revision of the claim shape accepted by issuance.
+pub const LEARNING_ADMISSION_SCHEMA_VERSION: u32 = LEARNING_TICKET_SCHEMA_VERSION;
 
 /// Requester-supplied learning admission claim: the request, never proof.
 ///
@@ -63,8 +72,7 @@ pub struct LearningAdmissionClaim {
 }
 
 impl LearningAdmissionClaim {
-    /// Shape validation only; owner checks happen in
-    /// [`issue_learning_admission`].
+    /// Shape validation only; owner checks happen at issuance.
     pub fn validate(&self) -> Result<(), LearningAdmissionError> {
         if self.schema_version != LEARNING_ADMISSION_SCHEMA_VERSION {
             return Err(LearningAdmissionError::UnsupportedSchema {
@@ -120,67 +128,63 @@ pub enum LearningAdmissionError {
     StaleAuthorityEpoch,
     #[error("claim generation is not the live resource generation")]
     GenerationMismatch,
-    #[error("permit digest does not match live owner state: tampered or stale epoch")]
+    #[error("admission digest does not match live owner state: tampered or stale epoch")]
     DigestMismatch,
     #[error("presented fence does not exactly match the admitted fence")]
     StaleStateFence,
 }
 
-/// Owner-issued learning admission permit.
+/// Owner-issued learning admission permit (opaque in-process handle).
 ///
-/// Fields are private and there is intentionally no `Serialize` impl: a
-/// permit is in-process owner evidence, not caller-owned data. The digest
-/// binds the live authority epoch, the live resource generation, the exact
-/// fence, and every claim field, so any tampering or epoch rotation
-/// invalidates it at [`verify_learning_admission`].
+/// Wraps the wire [`LearningAdmissionTicket`] in a private field with no
+/// `Serialize` impl: a permit is in-process owner evidence, not
+/// caller-owned data. All getters delegate to the bound ticket, so the
+/// permit digest and any ticket minted for the same claim are identical by
+/// construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LearningAdmissionPermit {
-    source_campaign_id: String,
-    target_task_id: String,
-    fence: StateFence,
-    overlay_id: Option<String>,
-    candidate_id: Option<String>,
-    scope_ref: String,
-    authority_ref: String,
-    retention_ref: String,
-    evaluator_ref: String,
-    rollback_ref: String,
-    digest: String,
+    ticket: LearningAdmissionTicket,
 }
 
 impl LearningAdmissionPermit {
     pub fn source_campaign_id(&self) -> &str {
-        &self.source_campaign_id
+        &self.ticket.source_campaign_id
     }
     pub fn target_task_id(&self) -> &str {
-        &self.target_task_id
+        &self.ticket.target_task_id
     }
     pub fn fence(&self) -> &StateFence {
-        &self.fence
+        &self.ticket.fence
     }
     pub fn overlay_id(&self) -> Option<&str> {
-        self.overlay_id.as_deref()
+        self.ticket.overlay_id.as_deref()
     }
     pub fn candidate_id(&self) -> Option<&str> {
-        self.candidate_id.as_deref()
+        self.ticket.candidate_id.as_deref()
     }
     pub fn scope_ref(&self) -> &str {
-        &self.scope_ref
+        &self.ticket.scope_ref
     }
     pub fn authority_ref(&self) -> &str {
-        &self.authority_ref
+        &self.ticket.authority_ref
     }
     pub fn retention_ref(&self) -> &str {
-        &self.retention_ref
+        &self.ticket.retention_ref
     }
     pub fn evaluator_ref(&self) -> &str {
-        &self.evaluator_ref
+        &self.ticket.evaluator_ref
     }
     pub fn rollback_ref(&self) -> &str {
-        &self.rollback_ref
+        &self.ticket.rollback_ref
     }
     pub fn digest(&self) -> &str {
-        &self.digest
+        &self.ticket.digest
+    }
+    /// The bound wire ticket. Exposed so owner-side flows can transport the
+    /// exact minted artifact across process boundaries; possession of the
+    /// ticket alone authorizes nothing without live verification.
+    pub fn ticket(&self) -> &LearningAdmissionTicket {
+        &self.ticket
     }
 }
 
@@ -192,67 +196,22 @@ fn admitting(state: GovernorState) -> bool {
     )
 }
 
-fn permit_digest(
-    epoch: &EpochId,
-    generation: ResourceGeneration,
-    claim: &LearningAdmissionClaim,
-) -> String {
-    let mut hasher = Hasher::new();
-    hasher.update(PERMIT_DIGEST_DOMAIN.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(claim.fence.authority_epoch.lineage_id.as_str().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(&claim.fence.authority_epoch.sequence.get().to_le_bytes());
-    hasher.update(b"\0");
-    hasher.update(epoch.lineage_id.as_str().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(&epoch.sequence.get().to_le_bytes());
-    hasher.update(b"\0");
-    hasher.update(&generation.value().to_le_bytes());
-    hasher.update(b"\0");
-    hasher.update(&claim.fence.resource_generation.value().to_le_bytes());
-    hasher.update(b"\0");
-    for part in [
-        claim.source_campaign_id.as_str(),
-        claim.target_task_id.as_str(),
-        claim.overlay_id.as_deref().unwrap_or(""),
-        claim.candidate_id.as_deref().unwrap_or(""),
-        claim.scope_ref.as_str(),
-        claim.authority_ref.as_str(),
-        claim.retention_ref.as_str(),
-        claim.evaluator_ref.as_str(),
-        claim.rollback_ref.as_str(),
-    ] {
-        hasher.update(part.trim().as_bytes());
-        hasher.update(b"\0");
-    }
-    for revision in [
-        claim.fence.task_revision.map(|value| value.value()),
-        claim.fence.policy_revision.map(|value| value.value()),
-        claim.fence.integration_revision.map(|value| value.value()),
-    ] {
-        match revision {
-            Some(value) => {
-                hasher.update(&value.to_le_bytes());
-            }
-            None => {
-                hasher.update(b"none");
-            }
-        }
-        hasher.update(b"\0");
-    }
-    hasher.finalize().to_hex().to_string()
+fn trim_owned(value: &str) -> String {
+    value.trim().to_string()
 }
 
-/// Mint a learning admission permit after live owner checks.
-///
-/// Refuses unless the Governor is admitting, the claim fence carries the
-/// live authority epoch and generation, and the claim shape validates. The
-/// returned permit is bound to the live epoch: rotation invalidates it.
-pub fn issue_learning_admission(
+fn trim_optional(value: &Option<String>) -> Option<String> {
+    value
+        .as_ref()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+/// Live owner checks shared by permit and ticket minting.
+fn check_live_admission(
     governor: &Governor,
     claim: &LearningAdmissionClaim,
-) -> Result<LearningAdmissionPermit, LearningAdmissionError> {
+) -> Result<(), LearningAdmissionError> {
     claim.validate()?;
     if !admitting(governor.snapshot().state) {
         return Err(LearningAdmissionError::GovernorNotAdmitting);
@@ -265,28 +224,57 @@ pub fn issue_learning_admission(
     if claim.fence.resource_generation != live_generation {
         return Err(LearningAdmissionError::GenerationMismatch);
     }
-    let digest = permit_digest(live_epoch, live_generation, claim);
-    Ok(LearningAdmissionPermit {
-        source_campaign_id: claim.source_campaign_id.trim().to_string(),
-        target_task_id: claim.target_task_id.trim().to_string(),
+    Ok(())
+}
+
+fn mint_ticket(claim: &LearningAdmissionClaim) -> Result<LearningAdmissionTicket, LearningAdmissionError> {
+    let mut ticket = LearningAdmissionTicket {
+        schema_version: LEARNING_TICKET_SCHEMA_VERSION,
+        source_campaign_id: trim_owned(&claim.source_campaign_id),
+        target_task_id: trim_owned(&claim.target_task_id),
         fence: claim.fence.clone(),
-        overlay_id: claim
-            .overlay_id
-            .clone()
-            .map(|id| id.trim().to_string())
-            .filter(|id| !id.is_empty()),
-        candidate_id: claim
-            .candidate_id
-            .clone()
-            .map(|id| id.trim().to_string())
-            .filter(|id| !id.is_empty()),
-        scope_ref: claim.scope_ref.trim().to_string(),
-        authority_ref: claim.authority_ref.trim().to_string(),
-        retention_ref: claim.retention_ref.trim().to_string(),
-        evaluator_ref: claim.evaluator_ref.trim().to_string(),
-        rollback_ref: claim.rollback_ref.trim().to_string(),
-        digest,
+        overlay_id: trim_optional(&claim.overlay_id),
+        candidate_id: trim_optional(&claim.candidate_id),
+        scope_ref: trim_owned(&claim.scope_ref),
+        authority_ref: trim_owned(&claim.authority_ref),
+        retention_ref: trim_owned(&claim.retention_ref),
+        evaluator_ref: trim_owned(&claim.evaluator_ref),
+        rollback_ref: trim_owned(&claim.rollback_ref),
+        digest: String::new(),
+    };
+    ticket.digest = learning_ticket_digest(&ticket)
+        .map_err(|_| LearningAdmissionError::InvalidFence)?;
+    Ok(ticket)
+}
+
+/// Mint a learning admission permit after live owner checks.
+///
+/// Refuses unless the Governor is admitting, the claim fence carries the
+/// live authority epoch and generation, and the claim shape validates. The
+/// returned permit is bound to the live epoch: rotation invalidates it.
+pub fn issue_learning_admission(
+    governor: &Governor,
+    claim: &LearningAdmissionClaim,
+) -> Result<LearningAdmissionPermit, LearningAdmissionError> {
+    check_live_admission(governor, claim)?;
+    Ok(LearningAdmissionPermit {
+        ticket: mint_ticket(claim)?,
     })
+}
+
+/// Mint the serializable wire twin of a permit after the same live checks.
+///
+/// The ticket carries the exact bound fields and digest a permit would;
+/// transport it across process boundaries and verify with live state plus
+/// [`eliot_context_contracts::ticket_fresh_for`] (or re-verify owner-side
+/// with [`verify_learning_ticket`]). Minting is owner-only; verification is
+/// recomputation any holder performs.
+pub fn issue_learning_ticket(
+    governor: &Governor,
+    claim: &LearningAdmissionClaim,
+) -> Result<LearningAdmissionTicket, LearningAdmissionError> {
+    check_live_admission(governor, claim)?;
+    mint_ticket(claim)
 }
 
 /// Lifetime-bound verified handle: proof that `permit` was re-bound to the
@@ -310,10 +298,10 @@ impl<'a> VerifiedLearningAdmission<'a> {
 
 /// Rebind a presented permit to the current owner state and fence.
 ///
-/// Refuses when the Governor is not admitting, when the digest does not
-/// recompute under the *live* epoch/generation (tampered fields or rotated
-/// epoch), or when `current_fence` does not exactly match the admitted
-/// fence (drifted task/policy/integration revision or epoch).
+/// Refuses with `DigestMismatch` when the digest does not recompute (tampered
+/// fields) or the bound epoch/generation is not live (rotation), and with
+/// `StaleStateFence` when only the presented fence drifted. Refuses when the
+/// Governor is not admitting.
 pub fn verify_learning_admission<'a>(
     governor: &Governor,
     permit: &'a LearningAdmissionPermit,
@@ -324,24 +312,56 @@ pub fn verify_learning_admission<'a>(
     }
     let live_epoch = &governor.config().authority_epoch;
     let live_generation = governor.config().resource_generation;
-    let claim = LearningAdmissionClaim {
-        schema_version: LEARNING_ADMISSION_SCHEMA_VERSION,
-        source_campaign_id: permit.source_campaign_id.clone(),
-        target_task_id: permit.target_task_id.clone(),
-        fence: permit.fence.clone(),
-        overlay_id: permit.overlay_id.clone(),
-        candidate_id: permit.candidate_id.clone(),
-        scope_ref: permit.scope_ref.clone(),
-        authority_ref: permit.authority_ref.clone(),
-        retention_ref: permit.retention_ref.clone(),
-        evaluator_ref: permit.evaluator_ref.clone(),
-        rollback_ref: permit.rollback_ref.clone(),
-    };
-    if permit_digest(live_epoch, live_generation, &claim) != permit.digest {
+    let recomputed =
+        learning_ticket_digest(&permit.ticket).map_err(|_| LearningAdmissionError::InvalidFence)?;
+    if recomputed != permit.ticket.digest {
         return Err(LearningAdmissionError::DigestMismatch);
     }
-    if !fences_match_exact(current_fence, &permit.fence) {
+    if !permit
+        .ticket
+        .fence
+        .authority_epoch
+        .is_same_authority(live_epoch)
+        || permit.ticket.fence.resource_generation != live_generation
+    {
+        return Err(LearningAdmissionError::DigestMismatch);
+    }
+    if !fences_match_exact(current_fence, &permit.ticket.fence) {
         return Err(LearningAdmissionError::StaleStateFence);
     }
     Ok(VerifiedLearningAdmission { permit })
+}
+
+/// Rebind a presented wire ticket to the current owner state and fence.
+///
+/// Owner-side counterpart of the pure [`eliot_context_contracts::ticket_fresh_for`]
+/// check: same verdicts, plus the admitting-state gate. Prefer this
+/// wherever a live [`Governor`] is in scope.
+pub fn verify_learning_ticket(
+    governor: &Governor,
+    ticket: &LearningAdmissionTicket,
+    current_fence: &StateFence,
+) -> Result<(), LearningAdmissionError> {
+    if !admitting(governor.snapshot().state) {
+        return Err(LearningAdmissionError::GovernorNotAdmitting);
+    }
+    ticket
+        .validate()
+        .map_err(|_| LearningAdmissionError::InvalidFence)?;
+    let recomputed =
+        learning_ticket_digest(ticket).map_err(|_| LearningAdmissionError::InvalidFence)?;
+    if recomputed != ticket.digest {
+        return Err(LearningAdmissionError::DigestMismatch);
+    }
+    let live_epoch = &governor.config().authority_epoch;
+    let live_generation = governor.config().resource_generation;
+    if !ticket.fence.authority_epoch.is_same_authority(live_epoch)
+        || ticket.fence.resource_generation != live_generation
+    {
+        return Err(LearningAdmissionError::DigestMismatch);
+    }
+    if !fences_match_exact(current_fence, &ticket.fence) {
+        return Err(LearningAdmissionError::StaleStateFence);
+    }
+    Ok(())
 }

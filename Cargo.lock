@@ -1722,13 +1722,13 @@ dependencies = [
 name = "eliot-governor"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "eliot-authority",
  "eliot-budget",
  "eliot-canonical",
  "eliot-change-monitor",
  "eliot-config",
  "eliot-context-candidates",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-coordination",
  "eliot-cue-contracts",

@@ -209,6 +209,7 @@ fn envelope(candidate: ContextCandidate) -> GuestRequest {
             },
             supplied_omissions: Vec::new(),
             measurements: Vec::new(),
+            learning_tickets: Vec::new(),
         },
     }
 }

@@ -10,6 +10,7 @@ mod assemble;
 mod bounds;
 mod cite;
 mod error;
+#[cfg(not(target_arch = "wasm32"))]
 mod learning_gate;
 mod measurement;
 mod readback;
@@ -18,6 +19,7 @@ mod render;
 pub use assemble::{
     ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use learning_gate::assemble_active_view_with_learning;
 pub use cite::project_citation;
 pub use error::AssemblyError;

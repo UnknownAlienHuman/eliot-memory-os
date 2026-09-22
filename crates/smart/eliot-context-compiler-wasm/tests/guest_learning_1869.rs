@@ -1,22 +1,22 @@
-//! Host preflight composition proof for issue #1869 (round 6).
+//! In-guest learning ticket enforcement proof for issue #1869 (round 7).
 //!
-//! Genuine production call path on the native host (never the guest):
-//! improvement producer emits a permit-bound marked atom from a closed,
-//! backlog-active reusable candidate -> the composed
-//! [`compile_learning_context`] entrypoint rebinds the owner-issued permit,
-//! preflights the compilation, then invokes the real guest/native
-//! retrieval. Fabricated digests, stale fences, and foreign tasks refuse
-//! with `native_calls == 0`, proving `admit_context` never ran.
+//! Genuine guest contour: the real `run` entrypoint (native execution of
+//! guest logic) refuses learning-marked atoms without covering owner-minted
+//! tickets, with tampered or transplanted tickets, and for foreign tasks —
+//! all with `native_calls == 0`, proving `admit_context` never ran. A
+//! covered input admitted through tickets issued by the real [`Governor`]
+//! owner completes. Host-only test (Governor evidence never enters the
+//! guest build); the guest code under test imports contracts only.
 
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use eliot_agent_contracts::AgentAttemptId;
-use eliot_context_compiler_wasm::host::compile_learning_context;
-use eliot_context_compiler_wasm::{GUEST_ABI_VERSION, GuestRequest, HANDLER_SUBTYPE, WORLD_NAME};
+use eliot_context_compiler_wasm::{
+    GUEST_ABI_VERSION, HANDLER_SUBTYPE, WORLD_NAME, GuestRequest, handle_request_typed,
+};
 use eliot_context_contracts::*;
 use eliot_contracts::{
     ArtifactId, DecisionId, EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence,
@@ -25,12 +25,7 @@ use eliot_contracts::{
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_governor::{
     Governor, GovernorConfig, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
-    QueueLimits, issue_learning_admission,
-};
-use eliot_improvement::candidate_bounds::{AdmitOutcome, BoundedBacklog, CandidateBoundPolicy};
-use eliot_improvement::{
-    ImprovementCandidate, ImprovementSurface, ReplayPlan,
-    producer::{LearningProduction, produce_learning_candidate},
+    QueueLimits, issue_learning_ticket,
 };
 use eliot_receipts::{ProofCeiling, WorkScopeId};
 
@@ -38,7 +33,6 @@ const LINEAGE_1869: &str = "550e8400-e29b-41d4-a716-446655440000";
 const CAMPAIGN_1869: &str = "campaign-1869-a";
 const TASK_1869: &str = "task-1869-a";
 const OVERLAY_1869: &str = "overlay-1869-live";
-const NOW_1869: u64 = 1_800_000_000;
 
 fn id(value: &str) -> ArtifactId {
     ArtifactId::new(value).expect("fixture artifact id")
@@ -77,12 +71,12 @@ fn governor_1869() -> Governor {
     governor
 }
 
-fn binding(task: &str, fence: &StateFence) -> ContextBinding {
+fn binding(task: &str) -> ContextBinding {
     ContextBinding {
         task_id: TaskId::new(task).expect("task"),
         attempt_id: AgentAttemptId::new("attempt-1869").expect("attempt"),
         scope_id: WorkScopeId::new("scope-1869").expect("scope"),
-        state_fence: fence.clone(),
+        state_fence: fence_1869(),
         decision_id: DecisionId::new("decision-1869").expect("decision"),
         operation_id: None,
     }
@@ -103,10 +97,11 @@ fn decision(context: &ContextBinding) -> DecisionRevision {
     }
 }
 
-fn plain_candidate(
+fn candidate(
     context: &ContextBinding,
     atom_id: &str,
     provider_role: ProviderRole,
+    learning: Option<LearningProvenance>,
 ) -> ContextCandidate {
     ContextCandidate {
         binding: context.clone(),
@@ -123,10 +118,10 @@ fn plain_candidate(
         representation: AtomRepresentation::Whole {
             content: format!("content-{atom_id}"),
         },
-        learning: None,
-        loss_policy: LossPolicy::NonDroppable,
+        learning,
+        loss_policy: LossPolicy::Summarizable,
         availability: AtomAvailability::PresentCurrent,
-        protected: true,
+        protected: false,
         privacy: PrivacyClass::Public,
         authority: AuthorityClass::DecisionRelevant,
         status: EpistemicStatus::Observed,
@@ -140,6 +135,19 @@ fn plain_candidate(
             evidence_id: id(&format!("evidence-{atom_id}")),
             ceiling: ProofCeiling::Observation,
         },
+    }
+}
+
+fn mark(digest_value: &str) -> LearningProvenance {
+    LearningProvenance {
+        campaign_id: CAMPAIGN_1869.to_string(),
+        overlay_id: Some(OVERLAY_1869.to_string()),
+        candidate_id: None,
+        closure_ref: None,
+        owner: None,
+        draft: false,
+        expires_at_unix_secs: Some(1_800_003_600),
+        permit_digest: digest_value.to_string(),
     }
 }
 
@@ -170,40 +178,28 @@ fn measurement(
     }
 }
 
-fn replay_plan() -> ReplayPlan {
-    ReplayPlan {
-        fixed_replay_refs: vec!["replay-1869-a".to_string()],
-        holdout_refs: vec!["holdout-1869-a".to_string()],
-        transfer_refs: vec!["transfer-1869-a".to_string()],
-        counter_metric_names: vec!["cost-1869".to_string()],
-        verifier_refs: vec!["verifier-1869-a".to_string()],
-    }
-}
-
-/// Full valid admission input embedding one producer-emitted marked atom
-/// plus one required floor atom, all bound to `task`/`fence`.
-fn input_with_produced(
+/// Compact valid input: required floor atom plus marked learning atom plus
+/// the presented tickets. The `task` parameter re-binds coherently.
+fn input_with_mark(
     task: &str,
-    fence: &StateFence,
-    produced: ContextCandidate,
+    permit_digest: &str,
+    tickets: Vec<LearningAdmissionTicket>,
 ) -> AdmissionInput {
-    let context = binding(task, fence);
-    let mut required = plain_candidate(
+    let context = binding(task);
+    let required_role = role("required-provider", SemanticRole::Goal);
+    let learning_role = role("learning-provider", SemanticRole::Optional);
+    let required = candidate(&context, "required-1869", required_role.clone(), None);
+    // Required atom stays loss-protected on the floor.
+    let mut required = required;
+    required.loss_policy = LossPolicy::NonDroppable;
+    required.protected = true;
+    let learning = candidate(
         &context,
-        "required-1869",
-        role("required-provider", SemanticRole::Goal),
+        "learning-1869",
+        learning_role.clone(),
+        Some(mark(permit_digest)),
     );
-    required.binding = context.clone();
-    let mut learning = produced;
-    learning.binding = context.clone();
-    let requested = vec![
-        required.provider_role.clone(),
-        learning.provider_role.clone(),
-    ];
-    // The produced atom arrives Summarizable-capable: admit it through the
-    // optional policy exactly like any summarizable atom.
-    learning.loss_policy = LossPolicy::Summarizable;
-    learning.protected = false;
+    let requested = vec![required_role.clone(), learning_role.clone()];
     let denominator = ProviderRoleDenominator {
         requested: requested.clone(),
         dispositions: requested
@@ -237,7 +233,7 @@ fn input_with_produced(
                 allowed_representations: vec![RepresentationKind::Whole],
             },
             RoleLossRule {
-                role: learning.provider_role.role.clone(),
+                role: SemanticRole::Optional,
                 loss_policy: LossPolicy::Summarizable,
                 required: false,
                 allowed_representations: vec![
@@ -256,9 +252,9 @@ fn input_with_produced(
         mandatory_atoms: vec![required.atom_id.clone()],
         mandatory_roles: vec![SemanticRole::Goal],
         providers: ProviderRoleDenominator {
-            requested: vec![required.provider_role.clone()],
+            requested: vec![required_role.clone()],
             dispositions: vec![ProviderDisposition {
-                slot: required.provider_role.clone(),
+                slot: required_role,
                 state: AtomAvailability::PresentCurrent,
                 evidence: None,
             }],
@@ -337,67 +333,20 @@ fn input_with_produced(
             measurement(&context, &required, "required-measurement"),
             measurement(&context, &learning, "learning-measurement"),
         ],
-        learning_tickets: Vec::new(),
+        learning_tickets: tickets,
     }
 }
 
-struct Chain {
-    governor: Governor,
-    fence: StateFence,
-    backlog: BoundedBacklog,
-    candidate_id: String,
-}
-
-fn live_chain() -> Chain {
-    let governor = governor_1869();
-    let fence = fence_1869();
-    let mut backlog = BoundedBacklog::new(vec![CandidateBoundPolicy {
-        target_surface: ImprovementSurface::Memory,
-        max_active: 8,
-        min_value: 1.0,
-        governor_authority_ref: "governor-1869".to_string(),
-        policy_revision: 1,
-    }])
-    .expect("policy validates");
-    let candidate = ImprovementCandidate::new(
-        "project-1869",
-        ImprovementSurface::Memory,
-        "tighten context budget",
-        vec!["retrieval-regret".to_string()],
-        vec!["authority-change".to_string()],
-        vec!["trace-1869-a".to_string()],
-        vec!["ev-1869-chain-a".to_string()],
-        replay_plan(),
-        BTreeMap::new(),
-    )
-    .expect("fixture candidate validates");
-    let candidate_id = candidate.candidate_id.clone();
-    assert!(matches!(
-        backlog.admit(candidate, 3.0, Some("governor-1869".to_string())),
-        Ok(AdmitOutcome::Admitted { .. })
-    ));
-    Chain {
-        governor,
-        fence,
-        backlog,
-        candidate_id,
-    }
-}
-
-fn issue_chain(
-    chain: &Chain,
-    overlay: Option<&str>,
-    candidate: Option<&str>,
-) -> eliot_governor::LearningAdmissionPermit {
-    issue_learning_admission(
-        &chain.governor,
+fn owner_ticket(fence: &StateFence, overlay: Option<&str>) -> LearningAdmissionTicket {
+    issue_learning_ticket(
+        &governor_1869(),
         &LearningAdmissionClaim {
             schema_version: LEARNING_ADMISSION_SCHEMA_VERSION,
             source_campaign_id: CAMPAIGN_1869.to_string(),
             target_task_id: TASK_1869.to_string(),
-            fence: chain.fence.clone(),
+            fence: fence.clone(),
             overlay_id: overlay.map(str::to_string),
-            candidate_id: candidate.map(str::to_string),
+            candidate_id: None,
             scope_ref: "scope-1869".to_string(),
             authority_ref: "governor-1869".to_string(),
             retention_ref: "retention-1869".to_string(),
@@ -408,53 +357,21 @@ fn issue_chain(
     .expect("live owner issues")
 }
 
-/// Producer -> request -> composed host entrypoint.
-fn composed_request(
-    chain: &Chain,
-    task: &str,
-    fence: &StateFence,
-) -> (GuestRequest, eliot_governor::LearningAdmissionPermit) {
-    use eliot_governor::verify_learning_admission;
-    let permit = issue_chain(chain, Some(OVERLAY_1869), Some(&chain.candidate_id.clone()));
-    let verified = verify_learning_admission(&chain.governor, &permit, &chain.fence)
-        .expect("live owner verifies");
-    let atom = produce_learning_candidate(LearningProduction {
-        backlog: &chain.backlog,
-        candidate_id: &chain.candidate_id,
-        closure_ref: "closure-1869-a",
-        owner: "governor-1869",
-        binding: &binding(TASK_1869, &chain.fence),
-        atom_id: "atom-learning-1869",
-        provider_role: &role("learning-provider", SemanticRole::Optional),
-        source_id: "source-learning-1869",
-        source_owner: "learning-pipeline",
-        snapshot_id: "snapshot-learning-1869",
-        source_revision: "closure-1869-a",
-        content: "local update: tighten context budget",
-        overlay_id: Some(OVERLAY_1869),
-        expires_at_unix_secs: Some(NOW_1869 + 3600),
-        measurement_digest: &"d".repeat(64),
-        measurement_serializer: "json-v1",
-        verified: &verified,
-    })
-    .expect("covered production emits");
-    let input = input_with_produced(task, fence, atom);
-    (
-        GuestRequest {
-            abi_version: GUEST_ABI_VERSION,
-            world: WORLD_NAME.to_string(),
-            handler_subtype: HANDLER_SUBTYPE.to_string(),
-            input,
-        },
-        permit,
-    )
+fn request_for(task: &str, permit_digest: &str, tickets: Vec<LearningAdmissionTicket>) -> GuestRequest {
+    GuestRequest {
+        abi_version: GUEST_ABI_VERSION,
+        world: WORLD_NAME.to_string(),
+        handler_subtype: HANDLER_SUBTYPE.to_string(),
+        input: input_with_mark(task, permit_digest, tickets),
+    }
 }
 
 #[test]
-fn producer_to_consumer_chain_admits() {
-    let chain = live_chain();
-    let (request, permit) = composed_request(&chain, TASK_1869, &chain.fence.clone());
-    let response = compile_learning_context(&chain.governor, &permit, &request, NOW_1869);
+fn covered_mark_admits_through_guest() {
+    let fence = fence_1869();
+    let ticket = owner_ticket(&fence, Some(OVERLAY_1869));
+    let request = request_for(TASK_1869, &ticket.digest.clone(), vec![ticket]);
+    let response = handle_request_typed(&request);
     assert_eq!(response.error, None);
     assert_eq!(response.native_calls, 1);
     let result = response.result.expect("admission result present");
@@ -464,72 +381,56 @@ fn producer_to_consumer_chain_admits() {
                 admitted
                     .records
                     .iter()
-                    .any(|record| record.candidate.atom_id == id("atom-learning-1869")),
-                "producer-emitted atom surfaces admitted"
+                    .any(|record| record.candidate.atom_id == id("learning-1869")),
+                "covered marked atom surfaces admitted"
             );
         }
         ContextOutcome::Incomplete(incomplete) => {
-            panic!("covered chain must complete, got {incomplete:?}")
+            panic!("covered guest retrieval must complete, got {incomplete:?}")
         }
     }
 }
 
 #[test]
-fn fabricated_digest_refuses_before_native_call() {
-    let chain = live_chain();
-    // Mark cites another issuance; compose against this permit.
-    let other = issue_chain(
-        &chain,
-        Some("overlay-other"),
-        Some(&chain.candidate_id.clone()),
-    );
-    let (mut request, permit) = composed_request(&chain, TASK_1869, &chain.fence.clone());
-    for candidate in &mut request.input.candidates.candidates {
-        if let Some(mark) = &mut candidate.learning {
-            mark.permit_digest = other.digest().to_string();
-        }
-    }
-    // Rebind measurements to the remarked atoms, so only the digest
-    // binding is under test (not measurement closure).
-    for measurement in &mut request.input.measurements {
-        let candidate = request
-            .input
-            .candidates
-            .candidates
-            .iter()
-            .find(|candidate| candidate.atom_id == measurement.atom_id)
-            .expect("measured candidate");
-        measurement.binding.subject_digest = canonical_digest(candidate).expect("remarked subject");
-    }
-    let response = compile_learning_context(&chain.governor, &permit, &request, NOW_1869);
+fn missing_ticket_refuses_before_native_call() {
+    let fence = fence_1869();
+    let ticket = owner_ticket(&fence, Some(OVERLAY_1869));
+    let request = request_for(TASK_1869, &ticket.digest.clone(), Vec::new());
+    let response = handle_request_typed(&request);
     assert_eq!(response.native_calls, 0);
-    assert!(
-        response.result.is_none(),
-        "refused retrieval admits nothing"
-    );
-    assert!(response.error.is_some(), "refusal is typed");
+    assert!(response.result.is_none());
+    assert!(response.error.is_some(), "missing ticket is typed");
 }
 
 #[test]
-fn stale_fence_and_foreign_task_refuse_before_native_call() {
-    let chain = live_chain();
-    // Stale fence: advance the compilation fence past the admitted one.
-    let (mut request, permit) = composed_request(&chain, TASK_1869, &chain.fence.clone());
-    let mut drifted = chain.fence.clone();
-    drifted.task_revision = Some(TaskRevision::new(2).expect("task revision"));
-    request.input.binding.state_fence = drifted.clone();
-    for candidate in &mut request.input.candidates.candidates {
-        candidate.binding.state_fence = drifted.clone();
-    }
-    let response = compile_learning_context(&chain.governor, &permit, &request, NOW_1869);
+fn tampered_and_transplanted_tickets_refused() {
+    let fence = fence_1869();
+    let ticket = owner_ticket(&fence, Some(OVERLAY_1869));
+    // Tampered subject: digest no longer recomputes.
+    let mut forged = ticket.clone();
+    forged.overlay_id = Some("overlay-forged".to_string());
+    let response =
+        handle_request_typed(&request_for(TASK_1869, &ticket.digest.clone(), vec![forged]));
     assert_eq!(response.native_calls, 0);
     assert!(response.result.is_none());
-    assert!(response.error.is_some());
 
-    // Foreign task: same permit, compilation for another task.
-    let (request, permit) = composed_request(&chain, "task-1869-foreign", &chain.fence.clone());
-    let response = compile_learning_context(&chain.governor, &permit, &request, NOW_1869);
+    // Transplanted issuance: genuine ticket for another overlay.
+    let other = owner_ticket(&fence, Some("overlay-other"));
+    let response = handle_request_typed(&request_for(
+        TASK_1869,
+        &other.digest.clone(),
+        vec![other],
+    ));
     assert_eq!(response.native_calls, 0);
     assert!(response.result.is_none());
-    assert!(response.error.is_some());
+}
+
+#[test]
+fn foreign_task_refused_in_guest() {
+    let fence = fence_1869();
+    let ticket = owner_ticket(&fence, Some(OVERLAY_1869));
+    let request = request_for("task-1869-foreign", &ticket.digest.clone(), vec![ticket]);
+    let response = handle_request_typed(&request);
+    assert_eq!(response.native_calls, 0);
+    assert!(response.result.is_none());
 }

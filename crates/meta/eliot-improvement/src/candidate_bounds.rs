@@ -114,6 +114,11 @@ pub fn evidence_lineage_digest(canonical_lineage: &[String]) -> String {
 ///
 /// `value` is the owner-assessed expected value used for bound ordering;
 /// `owner` is the owning decision authority (None = ownerless).
+/// `admitted_under_authority` records the Governor authority the entry was
+/// admitted under via [`BoundedBacklog::admit_governed`] (`None` for
+/// registry-only [`BoundedBacklog::admit`); the producer requires it to
+/// match the verified permit, so production binds retained owner identity
+/// rather than caller labels.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrackedCandidate {
     pub candidate: ImprovementCandidate,
@@ -121,6 +126,7 @@ pub struct TrackedCandidate {
     pub owner: Option<String>,
     pub lineage_digest: String,
     pub merged_from: Vec<String>,
+    pub admitted_under_authority: Option<String>,
 }
 
 /// Outcome of [`BoundedBacklog::admit`].
@@ -219,12 +225,13 @@ impl BoundedBacklog {
         owner: Option<String>,
     ) -> Result<AdmitOutcome, BoundsError> {
         let policy = self.policy_for(candidate.target_surface)?.clone();
-        self.admit_inner(&policy, candidate, value, owner)
+        self.admit_inner(&policy, candidate, value, owner, None)
     }
 
     /// Governor-bound admission: as [`BoundedBacklog::admit`], but the
     /// surface policy's owning authority must equal the authority bound in
-    /// an owner-verified permit. Forged authority strings are refused.
+    /// an owner-verified permit. Forged authority strings are refused. The
+    /// verified authority is retained on the entry for production binding.
     pub fn admit_governed(
         &mut self,
         candidate: ImprovementCandidate,
@@ -234,7 +241,8 @@ impl BoundedBacklog {
     ) -> Result<AdmitOutcome, BoundsError> {
         let policy = self.policy_for(candidate.target_surface)?.clone();
         policy.validate_governed(verified)?;
-        self.admit_inner(&policy, candidate, value, owner)
+        let authority = verified.permit().authority_ref().to_string();
+        self.admit_inner(&policy, candidate, value, owner, Some(&authority))
     }
 
     fn admit_inner(
@@ -243,7 +251,12 @@ impl BoundedBacklog {
         candidate: ImprovementCandidate,
         value: f64,
         owner: Option<String>,
+        governed_authority: Option<&str>,
     ) -> Result<AdmitOutcome, BoundsError> {
+        candidate.validate().map_err(BoundsError::Candidate)?;
+        if !value.is_finite() || value < 0.0 {
+            return Err(BoundsError::InvalidValue);
+        }
         let lineage = canonical_evidence_lineage(&candidate.evidence_refs);
         if lineage.is_empty() {
             return Err(BoundsError::EmptyEvidenceLineage);
@@ -273,7 +286,7 @@ impl BoundedBacklog {
         if let Some(index) = merge_target {
             let surviving_id = self.entries[index].candidate.candidate_id.clone();
             let absorbed_id = candidate.candidate_id.clone();
-            self.merge_into(index, &candidate, value, owner)?;
+            self.merge_into(index, &candidate, value, owner, governed_authority)?;
             return Ok(AdmitOutcome::Merged {
                 surviving_candidate_id: surviving_id,
                 absorbed_candidate_id: absorbed_id,
@@ -302,19 +315,21 @@ impl BoundedBacklog {
                 .filter(|o| !o.is_empty()),
             lineage_digest: digest,
             merged_from: Vec::new(),
+            admitted_under_authority: governed_authority.map(str::to_string),
         });
         Ok(AdmitOutcome::Admitted { candidate_id })
     }
 
     /// Merge an absorbed candidate into the entry at `index`, preserving
     /// provenance: unioned evidence/source refs, recorded `merged_from`,
-    /// best value/owner, and a revision bump.
+    /// best value/owner, retained governed authority, and a revision bump.
     fn merge_into(
         &mut self,
         index: usize,
         absorbed: &ImprovementCandidate,
         value: f64,
         owner: Option<String>,
+        governed_authority: Option<&str>,
     ) -> Result<(), BoundsError> {
         let entry = &mut self.entries[index];
         let mut evidence: BTreeSet<String> =
@@ -335,6 +350,9 @@ impl BoundedBacklog {
             entry.owner = owner
                 .map(|o| o.trim().to_string())
                 .filter(|o| !o.is_empty());
+        }
+        if entry.admitted_under_authority.is_none() {
+            entry.admitted_under_authority = governed_authority.map(str::to_string);
         }
         entry.candidate.revision += 1;
         entry.candidate.updated_at = OffsetDateTime::now_utc();

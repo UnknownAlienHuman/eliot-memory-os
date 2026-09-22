@@ -9,6 +9,9 @@
 //! value surfaces. Plain [`admit_context`] behavior is preserved bit-for-bit
 //! for unmarked atoms.
 
+//! Host-only proof: the gated entrypoints below require Governor evidence,
+//! which never enters the wasm32 guest contour.
+#![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::num::NonZeroU64;
@@ -336,6 +339,7 @@ fn input_with_learning(task: &str, permit_digest: &str, expires: Option<u64>) ->
             measurement(&context, &required, "required-measurement"),
             measurement(&context, &learning, "learning-measurement"),
         ],
+        learning_tickets: Vec::new(),
     }
 }
 

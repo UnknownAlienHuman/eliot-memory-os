@@ -128,8 +128,28 @@ fn live_setup() -> LiveSetup {
     let mut backlog = BoundedBacklog::new(vec![bound_policy()]).expect("policy validates");
     let candidate = candidate_fixture(&["ev-1869-producer-a"]);
     let candidate_id = candidate.candidate_id.clone();
+    // Governed admission retains the owner identity production binds.
+    let permit = issue_learning_admission(
+        &governor,
+        &LearningAdmissionClaim {
+            schema_version: LEARNING_ADMISSION_SCHEMA_VERSION,
+            source_campaign_id: CAMPAIGN_1869.to_string(),
+            target_task_id: TASK_1869.to_string(),
+            fence: fence.clone(),
+            overlay_id: Some(OVERLAY_1869.to_string()),
+            candidate_id: Some(candidate_id.clone()),
+            scope_ref: "scope-1869".to_string(),
+            authority_ref: "governor-1869".to_string(),
+            retention_ref: "retention-1869".to_string(),
+            evaluator_ref: "evaluator-1869-a".to_string(),
+            rollback_ref: "rollback-1869".to_string(),
+        },
+    )
+    .expect("live owner issues setup permit");
+    let verified = verify_learning_admission(&governor, &permit, &fence)
+        .expect("live owner verifies setup permit");
     assert!(matches!(
-        backlog.admit(candidate, 3.0, Some("governor-1869".to_string())),
+        backlog.admit_governed(candidate, 3.0, Some("governor-1869".to_string()), &verified),
         Ok(AdmitOutcome::Admitted { .. })
     ));
     LiveSetup {
@@ -184,7 +204,7 @@ fn produce(
         atom_id: "atom-learning-1869",
         provider_role: &provider_role(),
         source_id: "source-learning-1869",
-        source_owner: "learning-pipeline",
+        source_owner: "governor-1869",
         snapshot_id: "snapshot-learning-1869",
         source_revision: "closure-1869-a",
         content: "local update: tighten context budget",
@@ -320,7 +340,10 @@ fn unclosed_and_ownerless_reusables_refused() {
             Some(OVERLAY_1869),
             &verified,
         ),
-        Err(BoundsError::OwnerlessRecord)
+        // Presented owner must equal the retained backlog owner; an empty
+        // label fails that binding (retained-owner equality subsumes the
+        // presence check here).
+        Err(BoundsError::GovernorAuthorityUnconfirmed)
     );
 }
 

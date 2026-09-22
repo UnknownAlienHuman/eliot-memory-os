@@ -13,6 +13,7 @@ eliot-canonical.workspace = true
 eliot-change-monitor.workspace = true
 eliot-config.workspace = true
 eliot-context-candidates = { path = "../../smart/eliot-context-candidates" }
+eliot-context-contracts = { path = "../../smart/eliot-context-contracts" }
 eliot-coordination.workspace = true
 eliot-contracts.workspace = true
 eliot-cue-contracts = { path = "../../smart/eliot-cue-contracts" }
@@ -40,7 +41,6 @@ eliot-workscope.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-security-contracts.workspace = true
 eliot-wasm-runtime = { path = "../../modules/eliot-wasm-runtime" }
-blake3.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

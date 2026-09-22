@@ -12,7 +12,8 @@ use std::num::NonZeroU64;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskRevision};
 use eliot_governor::{
     Governor, GovernorConfig, LearningAdmissionClaim, LearningAdmissionError, QueueLimits,
-    issue_learning_admission, verify_learning_admission,
+    issue_learning_admission, issue_learning_ticket, verify_learning_admission,
+    verify_learning_ticket,
 };
 
 const LINEAGE_1869: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -148,4 +149,57 @@ fn subjectless_claim_refused() {
     let err = issue_learning_admission(&governor, &claim)
         .expect_err("permits bind at least one influence subject");
     assert_eq!(err, LearningAdmissionError::NoInfluenceSubject);
+}
+
+#[test]
+fn ticket_mint_shares_permit_digest() {
+    use eliot_context_contracts::{learning_ticket_digest, ticket_fresh_for};
+    let governor = governor_at(3);
+    let fence = fence_at(3);
+    let permit = issue_learning_admission(&governor, &claim_1869(3)).expect("permit issues");
+    let ticket = issue_learning_ticket(&governor, &claim_1869(3)).expect("ticket issues");
+    assert_eq!(
+        ticket.digest, permit.digest(),
+        "wire twin carries the identical binding digest"
+    );
+    assert_eq!(
+        learning_ticket_digest(&ticket).expect("digest recomputes"),
+        ticket.digest
+    );
+    assert!(
+        ticket_fresh_for(&ticket, &epoch(3), generation_of(&governor), &fence),
+        "fresh ticket verifies against live owner state"
+    );
+}
+
+fn generation_of(governor: &Governor) -> ResourceGeneration {
+    governor.config().resource_generation
+}
+
+#[test]
+fn ticket_verify_roundtrip_and_negatives() {
+    let governor = governor_at(3);
+    let fence = fence_at(3);
+    let ticket = issue_learning_ticket(&governor, &claim_1869(3)).expect("ticket issues");
+    verify_learning_ticket(&governor, &ticket, &fence).expect("owner verifies its ticket");
+    // Rotated epoch: stale.
+    let rotated = governor_at(4);
+    assert_eq!(
+        verify_learning_ticket(&rotated, &ticket, &fence),
+        Err(LearningAdmissionError::DigestMismatch)
+    );
+    // Drifted fence under the same epoch: stale fence.
+    let mut drifted = fence.clone();
+    drifted.task_revision = Some(TaskRevision::new(2).expect("valid task revision"));
+    assert_eq!(
+        verify_learning_ticket(&governor, &ticket, &drifted),
+        Err(LearningAdmissionError::StaleStateFence)
+    );
+    // Tampered subject: digest mismatch.
+    let mut forged = ticket.clone();
+    forged.overlay_id = Some("overlay-forged".to_string());
+    assert_eq!(
+        verify_learning_ticket(&governor, &forged, &fence),
+        Err(LearningAdmissionError::DigestMismatch)
+    );
 }

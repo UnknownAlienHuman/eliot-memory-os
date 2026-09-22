@@ -216,6 +216,7 @@ fn input() -> AdmissionInput {
             cost: AdmissionMeasuredCost::ExactUtf8Bytes { value: 4 },
             observation: None,
         }],
+        learning_tickets: Vec::new(),
     }
 }
 
