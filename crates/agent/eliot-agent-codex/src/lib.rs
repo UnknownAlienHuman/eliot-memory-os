@@ -3285,8 +3285,7 @@ mod tests {
             _operation_id: &eliot_process::OperationId,
             _max_bytes: usize,
             _deadline: std::time::Duration,
-        ) -> eliot_process::InteractiveChildFuture<'_, eliot_process::ChildStdoutChunk>
-        {
+        ) -> eliot_process::InteractiveChildFuture<'_, eliot_process::ChildStdoutChunk> {
             let chunk = {
                 let mut reads = self.reads.lock().expect("reads lock");
                 match reads.front() {
@@ -3427,7 +3426,10 @@ mod tests {
             observe_measured_tool_result(b"hello world", &terminal, &binding, &admission)?;
         // Observed route is the wire-attributed binding's route, in full
         // triangle agreement with requested and admitted-selected.
-        assert_eq!(carrier.observation.route_state, RouteObservationState::Matched);
+        assert_eq!(
+            carrier.observation.route_state,
+            RouteObservationState::Matched
+        );
         assert_eq!(
             carrier.observation.observed_route,
             Some(binding.route.clone())
@@ -3447,10 +3449,7 @@ mod tests {
         // Turn-level usage never enters; unknown stays unknown, never zero.
         assert_eq!(carrier.observation.usage.input_tokens, None);
         assert_eq!(carrier.observation.usage.output_tokens, None);
-        assert_eq!(
-            carrier.observation.usage.quota,
-            QuotaKnowledge::Unknown
-        );
+        assert_eq!(carrier.observation.usage.quota, QuotaKnowledge::Unknown);
         // Terminal time is the wire fact's own observation time.
         assert_eq!(
             carrier.observation.terminal.valid_time_ms,
@@ -3579,9 +3578,7 @@ mod tests {
         assert_eq!(sent["method"], "turn/start");
         assert_eq!(sent["params"]["threadId"], "thread-1");
         assert_eq!(sent["params"]["input"]["prompt"], "hello");
-        assert!(sent["id"]
-            .as_str()
-            .is_some_and(|id| id.ends_with("-start")));
+        assert!(sent["id"].as_str().is_some_and(|id| id.ends_with("-start")));
         // Canonical turn receipt over the pumped text and derived terminal.
         assert_eq!(drive.result.disposition, ResultDisposition::Partial);
         assert_eq!(drive.result.attempt_id, binding.attempt_id);
@@ -3771,7 +3768,8 @@ mod tests {
         let admission = admission_for(&binding)?;
         let channel = Arc::new(FakeChannel::scripted(vec![FakeRead::Data(vec![
             b'x';
-            CODEX_TURN_WIRE_MAX_BYTES + 1
+            CODEX_TURN_WIRE_MAX_BYTES
+                + 1
         ])]));
         assert!(matches!(
             drive_codex_turn(drive_inputs(
@@ -3980,6 +3978,251 @@ mod tests {
         );
         assert!(attached.process_request().is_none());
         assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Test-only OS child halves sharing one spawned process per operation:
+    /// the executor spawns and retains stdio under the operation id; the
+    /// channel speaks the contract over the same handles. No Job
+    /// containment here (test scope only; production P-04 contains); the
+    /// child is a PowerShell single-quoted echo (exact JSON bytes,
+    /// immediately exiting, kill-on-drop).
+    #[cfg(windows)]
+    struct OsChildHandles {
+        // The child is retained (kill-on-drop cleanup): dropping it here
+        // would close the pipes the channel must speak.
+        _child: tokio::process::Child,
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+    }
+
+    #[cfg(windows)]
+    struct OsDuplexHarness {
+        children: tokio::sync::Mutex<std::collections::HashMap<String, OsChildHandles>>,
+        starts: AtomicUsize,
+        writes: tokio::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[cfg(windows)]
+    impl OsDuplexHarness {
+        fn script_lines() -> Vec<String> {
+            vec![
+                r#"{"id":"turn-1-start","result":{"ok":true}}"#.to_owned(),
+                r#"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"i-1","delta":"hello world"}}"#.to_owned(),
+                r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}"#.to_owned(),
+            ]
+        }
+
+        fn spawn_echo_child() -> TestResult<tokio::process::Child> {
+            // PowerShell single-quoted literals carry the JSON double
+            // quotes exactly (cmd /c would strip nested quotes); each
+            // Write-Output line is one CRLF-terminated JSONL frame.
+            let script = Self::script_lines()
+                .iter()
+                .map(|line| format!("Write-Output '{line}'"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Ok(tokio::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?)
+        }
+
+        fn child_key(operation_id: &eliot_process::OperationId) -> String {
+            operation_id.as_str().to_owned()
+        }
+    }
+
+    #[cfg(windows)]
+    impl eliot_process::ProcessExecutor for OsDuplexHarness {
+        async fn start(
+            &self,
+            request: ProcessRequest,
+            _sink: Arc<dyn ProcessEvidenceSink>,
+        ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let state = validated_process_state(request)?;
+            let mut child = Self::spawn_echo_child().map_err(|error| {
+                ProcessExecutionError::Unavailable(format!("test spawn: {error}"))
+            })?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| ProcessExecutionError::Unavailable("test child stdin".to_owned()))?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                ProcessExecutionError::Unavailable("test child stdout".to_owned())
+            })?;
+            // Retain the child (kill-on-drop cleanup) alongside its stdio:
+            // dropping here would close the pipes the channel must speak.
+            self.children.lock().await.insert(
+                Self::child_key(state.binding().operation_id()),
+                OsChildHandles {
+                    _child: child,
+                    stdin,
+                    stdout,
+                },
+            );
+            ProcessStartReceipt::new(&state).map_err(ProcessExecutionError::from)
+        }
+
+        async fn inspect(
+            &self,
+            _operation_id: eliot_process::OperationId,
+        ) -> Result<ProcessExecutionView, ProcessExecutionError> {
+            Err(ProcessExecutionError::Unavailable("fixture".into()))
+        }
+
+        async fn cancel(
+            &self,
+            _operation_id: eliot_process::OperationId,
+        ) -> Result<CancellationReceipt, ProcessExecutionError> {
+            Err(ProcessExecutionError::Unavailable("fixture".into()))
+        }
+
+        async fn reconcile(
+            &self,
+            _operation_id: eliot_process::OperationId,
+        ) -> Result<ProcessEvidence, ProcessExecutionError> {
+            Err(ProcessExecutionError::Unavailable("fixture".into()))
+        }
+    }
+
+    #[cfg(windows)]
+    struct OsDuplexChannel {
+        harness: Arc<OsDuplexHarness>,
+    }
+
+    #[cfg(windows)]
+    impl eliot_process::InteractiveChildChannel for OsDuplexChannel {
+        fn write_child_stdin(
+            &self,
+            operation_id: eliot_process::OperationId,
+            bytes: Vec<u8>,
+        ) -> eliot_process::InteractiveChildFuture<'_, usize> {
+            let key = OsDuplexHarness::child_key(&operation_id);
+            let harness = Arc::clone(&self.harness);
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let len = bytes.len();
+                {
+                    let mut children = harness.children.lock().await;
+                    let handles = children
+                        .get_mut(&key)
+                        .ok_or(ProcessExecutionError::NotFound)?;
+                    handles.stdin.write_all(&bytes).await.map_err(|_| {
+                        ProcessExecutionError::Unavailable("test stdin write".to_owned())
+                    })?;
+                }
+                // Record the exact written bytes for protocol assertions.
+                harness.writes.lock().await.push(bytes);
+                Ok(len)
+            })
+        }
+
+        fn read_child_stdout(
+            &self,
+            operation_id: &eliot_process::OperationId,
+            max_bytes: usize,
+            deadline: std::time::Duration,
+        ) -> eliot_process::InteractiveChildFuture<'_, eliot_process::ChildStdoutChunk> {
+            let key = OsDuplexHarness::child_key(operation_id);
+            let harness = Arc::clone(&self.harness);
+            Box::pin(async move {
+                use tokio::io::AsyncReadExt as _;
+                let mut slot: Vec<u8> = vec![0; max_bytes.min(64 * 1024)];
+                let outcome = tokio::time::timeout(deadline, async {
+                    let mut children = harness.children.lock().await;
+                    let handles = children
+                        .get_mut(&key)
+                        .ok_or(ProcessExecutionError::NotFound)?;
+                    handles.stdout.read(&mut slot).await.map_err(|_| {
+                        ProcessExecutionError::Unavailable("test stdout read".to_owned())
+                    })
+                })
+                .await;
+                match outcome {
+                    Err(_) => Ok(eliot_process::ChildStdoutChunk {
+                        bytes: Vec::new(),
+                        end_of_stream: false,
+                    }),
+                    Ok(Err(error)) => Err(error),
+                    Ok(Ok(0)) => Ok(eliot_process::ChildStdoutChunk {
+                        bytes: Vec::new(),
+                        end_of_stream: true,
+                    }),
+                    Ok(Ok(count)) => {
+                        slot.truncate(count);
+                        Ok(eliot_process::ChildStdoutChunk {
+                            bytes: slot,
+                            end_of_stream: false,
+                        })
+                    }
+                }
+            })
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn turn_driver_duplex_real_child_echo() -> TestResult {
+        use super::turn_driver::{CodexTurnDriverInputs, drive_codex_turn};
+        let harness = Arc::new(OsDuplexHarness {
+            children: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            starts: AtomicUsize::new(0),
+            writes: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let sink: Arc<Sink> = Arc::new(Sink);
+        let mut attached = attached_with_model("gpt-5-codex")?;
+        let binding = bound_binding_with_model("gpt-5-codex")?;
+        let admission = admission_for(&binding)?;
+        // Single real OS child (PowerShell echo, immediately exiting,
+        // kill-on-drop): the harness spawns through the P-03 executor
+        // shape and speaks the channel over the same handles. No Job
+        // containment here — test scope only; production P-04 contains.
+        let drive = drive_codex_turn(CodexTurnDriverInputs {
+            executor: Arc::clone(&harness),
+            channel: Arc::new(OsDuplexChannel {
+                harness: Arc::clone(&harness),
+            }),
+            attached: &mut attached,
+            binding: &binding,
+            admission: &admission,
+            evidence_sink: Some(sink),
+            turn_input: serde_json::json!({"prompt": "hello"}),
+            turn_timeout: std::time::Duration::from_secs(30),
+            owner_event: turn_owner_event(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            continuation: None,
+            proposed_effects: Vec::new(),
+            cancelled: false,
+        })
+        .await?;
+        // Real launch happened exactly once through the executor.
+        assert_eq!(harness.starts.load(Ordering::SeqCst), 1);
+        assert!(drive.launch.is_some());
+        // The turn/start frame really crossed the OS stdin pipe.
+        let writes = harness.writes.lock().await;
+        assert_eq!(writes.len(), 1);
+        let sent: serde_json::Value = serde_json::from_slice(&writes[0])?;
+        assert_eq!(sent["method"], "turn/start");
+        assert_eq!(sent["params"]["threadId"], "thread-1");
+        // The echoed stdout really pumped, derived terminal included.
+        assert_eq!(drive.result.disposition, ResultDisposition::Partial);
+        let carrier = drive.measured.expect("echoed turn measures");
+        assert_eq!(carrier.tokens, 2);
+        assert_eq!(carrier.result_bytes, b"hello world");
+        assert_eq!(
+            carrier.result_digest,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
         Ok(())
     }
 
