@@ -3286,34 +3286,39 @@ mod tests {
             _max_bytes: usize,
             _deadline: std::time::Duration,
         ) -> eliot_process::InteractiveChildFuture<'_, eliot_process::ChildStdoutChunk> {
-            let chunk = {
-                let mut reads = self.reads.lock().expect("reads lock");
-                match reads.front() {
-                    // Explicit hang: repeats forever; the driver deadline
-                    // bounds the wait.
-                    Some(FakeRead::Empty) => eliot_process::ChildStdoutChunk {
+            let mut reads = self.reads.lock().expect("reads lock");
+            match reads.front() {
+                // Explicit hang: repeats forever; the driver deadline
+                // bounds the wait.
+                Some(FakeRead::Empty) => Box::pin(async move {
+                    Ok(eliot_process::ChildStdoutChunk {
                         bytes: Vec::new(),
                         end_of_stream: false,
-                    },
-                    // Script exhausted: the scripted server said all it will
-                    // say; the stream is over.
-                    Some(FakeRead::Eof) | None => eliot_process::ChildStdoutChunk {
+                    })
+                }),
+                // Script exhausted: the scripted server said all it will
+                // say; the stream is over.
+                Some(FakeRead::Eof) | None => Box::pin(async move {
+                    Ok(eliot_process::ChildStdoutChunk {
                         bytes: Vec::new(),
                         end_of_stream: true,
-                    },
-                    Some(FakeRead::Data(_)) => match reads.pop_front() {
-                        Some(FakeRead::Data(bytes)) => eliot_process::ChildStdoutChunk {
+                    })
+                }),
+                Some(FakeRead::Data(_)) => match reads.pop_front() {
+                    Some(FakeRead::Data(bytes)) => Box::pin(async move {
+                        Ok(eliot_process::ChildStdoutChunk {
                             bytes,
                             end_of_stream: false,
-                        },
-                        _ => eliot_process::ChildStdoutChunk {
+                        })
+                    }),
+                    _ => Box::pin(async move {
+                        Ok(eliot_process::ChildStdoutChunk {
                             bytes: Vec::new(),
                             end_of_stream: false,
-                        },
-                    },
-                }
-            };
-            Box::pin(async move { Ok(chunk) })
+                        })
+                    }),
+                },
+            }
         }
     }
 

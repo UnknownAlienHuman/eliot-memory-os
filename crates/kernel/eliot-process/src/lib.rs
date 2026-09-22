@@ -436,6 +436,14 @@ pub struct ProcessIntent {
     environment: EnvironmentProjection,
     resource_limits: ResourceLimits,
     effect_digest: String,
+    /// Opt-in interactive stdin retention (issue #1941 result flow).
+    /// `false` preserves the default deterministic-EOF behavior for every
+    /// existing non-interactive launch; `true` (via
+    /// [`with_interactive_stdin`](Self::with_interactive_stdin)) keeps the
+    /// parent stdin writer so a turn protocol can write post-launch. The
+    /// flag is digest-bound, so the dispatch permit authorizes it.
+    #[serde(default)]
+    interactive_stdin: bool,
 }
 
 impl ProcessIntent {
@@ -469,10 +477,35 @@ impl ProcessIntent {
             environment,
             resource_limits,
             effect_digest: String::new(),
+            interactive_stdin: false,
         };
         intent.validate_without_digest()?;
         intent.effect_digest = intent.compute_effect_digest()?;
         Ok(intent)
+    }
+
+    /// Opts into interactive stdin retention, resealing the digest.
+    ///
+    /// The dispatch permit issued over the resealed digest authorizes the
+    /// interactive mode explicitly; permits issued before the opt-in do not
+    /// cover it. Validates shape plus digest before return.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError`] when the resealed digest cannot be computed.
+    pub fn with_interactive_stdin(mut self) -> Result<Self, ContractError> {
+        self.interactive_stdin = true;
+        self.effect_digest = self.compute_effect_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Returns whether the parent stdin writer is retained for post-launch
+    /// turn-protocol writes. `false` keeps deterministic EOF for every
+    /// existing non-interactive launch.
+    #[must_use]
+    pub const fn interactive_stdin(&self) -> bool {
+        self.interactive_stdin
     }
 
     /// Validates exact launch material and its digest.
@@ -527,6 +560,7 @@ impl ProcessIntent {
             working_directory: &'a str,
             environment: &'a EnvironmentProjection,
             resource_limits: ResourceLimits,
+            interactive_stdin: bool,
         }
         hash_serialized(&EffectMaterial {
             operation_id: &self.operation_id,
@@ -541,6 +575,7 @@ impl ProcessIntent {
             working_directory: &self.working_directory,
             environment: &self.environment,
             resource_limits: self.resource_limits,
+            interactive_stdin: self.interactive_stdin,
         })
     }
 
@@ -2686,6 +2721,9 @@ pub type InteractiveChildFuture<'a, T> =
 /// Provider-neutral capability boundary for JSONL-style turn sessions over
 /// an admitted child's stdio: write bounded input frames (turn requests)
 /// and read bounded stdout windows with an explicit per-call deadline.
+/// Methods are async for caller citizenship; implementations back waits
+/// with blocking pipe IO bounded by the deadline (no async runtime
+/// required — the existing P-03 async methods already work this way).
 /// Pipe mechanics, handle retention, Job containment, and deadlines stay
 /// with the physical implementation (P-04); this contract only bounds
 /// shapes, identities, and failure dimensions. It mints nothing: the
@@ -2697,6 +2735,7 @@ pub type InteractiveChildFuture<'a, T> =
 /// [`Contract`](ProcessExecutionError::Contract)
 /// (`LimitExceeded` on `stdin_write_bytes`); evidence-sink interaction
 /// stays with [`ProcessExecutor`], never this channel.
+#[allow(async_fn_in_trait)]
 pub trait InteractiveChildChannel: Send + Sync {
     /// Writes one bounded input frame to the admitted child's stdin.
     /// Implementations write all bytes or fail; short writes are errors,

@@ -50,6 +50,12 @@ use eliot_platform_windows::{
 /// See [`wasm_p03_adapter`] for the authority stance and proof entrypoint.
 pub mod wasm_p03_adapter;
 
+/// Interactive child stdio channel over registered P-04 operations
+/// (issue #1941 result flow): retained-stdin writes plus stdout-drain
+/// reads through per-operation offsets. The implementation lives here so
+/// review covers it with the operation lifecycle it borrows.
+mod interactive_channel;
+
 const DEFAULT_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 const EVIDENCE_PREVIEW_CEILING: usize = 16 * 1024 * 1024;
 const JOB_TERMINATION_CODE: u32 = 0xE1_04;
@@ -1158,6 +1164,16 @@ struct Operation {
     cleanup_required: bool,
     termination: Option<TerminatedJobChild>,
     capture_failures: Vec<CaptureFailure>,
+    /// Retained parent stdin writer for interactive turn protocols, taken
+    /// at capture setup when the intent opts in (`Some`) and closed
+    /// immediately otherwise (deterministic EOF preserved). Closed with the
+    /// operation: drop, terminal cleanup, and cancel paths all release it
+    /// through struct drop, so no orphaned writer survives.
+    stdin: Option<std::fs::File>,
+    /// Bytes of the stdout capture prefix already served through the
+    /// interactive channel. Monotonic: concurrent readers share the
+    /// furthest position, never rewind.
+    channel_read_offset: usize,
 }
 
 /// Explicit start state machine for `WindowsProcessExecutor::start`
@@ -1946,6 +1962,11 @@ impl ProcessExecutor for WindowsProcessExecutor {
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         request.validate()?;
         let operation_id = request.operation_id().clone();
+        // Capture the interactive-stdin opt-in before the request is
+        // consumed by authority validation: the capture-setup boundary
+        // below closes stdin immediately unless the admitted intent
+        // carries the digest-bound opt-in.
+        let interactive_stdin = request.intent().interactive_stdin();
         let _reservation = self.reserve_operation(operation_id.clone())?;
 
         #[cfg(not(windows))]
@@ -2173,8 +2194,15 @@ impl ProcessExecutor for WindowsProcessExecutor {
             };
             // `CaptureSetup` reached: both read-handle takes are consumed
             // (state fences the flow — a take consumes the handle, so the
-            // second arm cannot re-take).
+            // second arm cannot re-take). The retained parent stdin writer
+            // is taken here as well: interactive launches keep it in the
+            // operation (exactly one writer ever), non-interactive launches
+            // drop it at once so deterministic EOF lands as before.
             debug_assert_eq!(start_phase, StartPhase::CaptureSetup);
+            let stdin = match running.take_stdin() {
+                Some(handle) if interactive_stdin => Some(handle),
+                _ => None,
+            };
             let operation = Arc::new(Mutex::new(Operation {
                 state,
                 sink,
@@ -2195,6 +2223,8 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 cleanup_required: false,
                 termination: None,
                 capture_failures: capture_failure.into_iter().collect(),
+                stdin,
+                channel_read_offset: 0,
             }));
             if capture_spawn_error.is_some() {
                 let Some(error) = capture_spawn_error else {
@@ -4448,6 +4478,23 @@ mod tests {
         ])
     }
 
+    /// Explicit non-secret system environment for tests that spawn real
+    /// Windows binaries: PowerShell needs its system directory from the
+    /// environment, and `Allowlisted` merging is declared but unimplemented,
+    /// so values travel explicitly here (never secrets, never authority).
+    fn test_system_env() -> Result<EnvironmentProjection, Box<dyn std::error::Error>> {
+        let mut values = BTreeMap::new();
+        values.insert("SystemRoot".to_owned(), std::env::var("SystemRoot")?);
+        let temp_dir = std::env::temp_dir().to_string_lossy().into_owned();
+        values.insert("TEMP".to_owned(), temp_dir.clone());
+        values.insert("TMP".to_owned(), temp_dir);
+        Ok(EnvironmentProjection::new(
+            values,
+            Vec::new(),
+            EnvironmentInheritance::None,
+        )?)
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         evidence: Mutex<Vec<ProcessEvidence>>,
@@ -4607,6 +4654,202 @@ mod tests {
         assert_eq!(evidence.axes(), EvidenceAxes::observed());
         let inspected = block_on(executor.inspect(operation_id))?;
         assert_eq!(inspected.lifecycle(), ProcessLifecycle::Running);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn interactive_stdin_write_read_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_process::InteractiveChildChannel;
+        use std::time::{Duration, Instant};
+        // PowerShell `$input` streams stdin bytes to stdout verbatim: bare
+        // tokens with no quoting hazards, and the echoed bytes prove
+        // delivery end to end. EOF is covered by the prompt test below
+        // (this child waits on stdin by design, so no EOF is expected
+        // here); cleanup rides Job kill-on-close when the executor drops.
+        let executable =
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = OperationId::new("op-t9-ich-01")?;
+        let generation = Generation::new(1)?;
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            ProcessTreeId::new("tree-t9-ich-01")?,
+            JobId::new("job-t9-ich-01")?,
+            ImageId::new("image-t9-ich-01")?,
+            SessionId::new("session-t9-ich-01")?,
+            generation,
+            executable,
+            digest,
+            vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                "$input".to_owned(),
+            ],
+            working_directory,
+            test_system_env()?,
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?
+        .with_interactive_stdin()?;
+        assert!(intent.interactive_stdin());
+        let fence = FencingToken::new(test_epoch(1), generation, "fence-t9-ich-01")?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("auth-t9-ich")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-t9-ich-01")?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                "nonce-t9-ich-01",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            test_epoch(1),
+            revisions(),
+            41,
+        )?;
+        let port = FakePort {
+            authority: Mutex::new(authority),
+            context,
+        };
+        let executor = WindowsProcessExecutor::new(Arc::new(port));
+        let sink = Arc::new(RecordingSink::default());
+        let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+        let _receipt = block_on(executor.start(request, sink_dyn))?;
+        // The stdin frame really crosses into the child.
+        let written = block_on(executor.write_child_stdin(operation_id.clone(), b"ping\n".to_vec()))?;
+        assert_eq!(written, 5);
+        // Pump until the echoed bytes arrive; `$input` streams them back
+        // verbatim (CRLF-terminated by the console writer).
+        let started = Instant::now();
+        let mut collected = Vec::new();
+        while started.elapsed() < Duration::from_secs(20) {
+            let chunk = block_on(executor.read_child_stdout(
+                &operation_id,
+                64 * 1024,
+                Duration::from_secs(2),
+            ))?;
+            collected.extend_from_slice(&chunk.bytes);
+            if collected.windows(4).any(|window| window == b"ping") {
+                break;
+            }
+            if chunk.end_of_stream {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&collected);
+        assert!(
+            text.contains("ping"),
+            "echoed stdin must pump back, saw: {text}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn noninteractive_stdin_closes_for_prompt_read() -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_process::InteractiveChildChannel;
+        use std::time::{Duration, Instant};
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = OperationId::new("op-t9-ich-02")?;
+        let generation = Generation::new(1)?;
+        // No interactive opt-in: the stdin writer must close at setup so
+        // the prompt read observes EOF instead of blocking.
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            ProcessTreeId::new("tree-t9-ich-02")?,
+            JobId::new("job-t9-ich-02")?,
+            ImageId::new("image-t9-ich-02")?,
+            SessionId::new("session-t9-ich-02")?,
+            generation,
+            executable,
+            digest,
+            vec!["/c".to_owned(), "set /p line=".to_owned()],
+            working_directory,
+            EnvironmentProjection::default(),
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        assert!(!intent.interactive_stdin());
+        let fence = FencingToken::new(test_epoch(1), generation, "fence-t9-ich-02")?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("auth-t9-ich")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-t9-ich-02")?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                "nonce-t9-ich-02",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            test_epoch(1),
+            revisions(),
+            41,
+        )?;
+        let port = FakePort {
+            authority: Mutex::new(authority),
+            context,
+        };
+        let executor = WindowsProcessExecutor::new(Arc::new(port));
+        let sink = Arc::new(RecordingSink::default());
+        let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+        let started = Instant::now();
+        let _receipt = block_on(executor.start(request, sink_dyn))?;
+        // Writes without retention fail closed instead of reaching a pipe.
+        assert!(matches!(
+            block_on(executor.write_child_stdin(operation_id.clone(), b"x".to_vec())),
+            Err(ProcessExecutionError::Unavailable(_))
+        ));
+        // The prompt read observes EOF and exits promptly: far below the
+        // 30 s wall timeout that would fence a blocked stdin reader.
+        loop {
+            let chunk = block_on(executor.read_child_stdout(
+                &operation_id,
+                64 * 1024,
+                Duration::from_secs(2),
+            ))?;
+            if chunk.end_of_stream {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "prompt read must observe EOF promptly, not hang on open stdin"
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "non-interactive prompt must complete promptly"
+        );
         Ok(())
     }
 
