@@ -21,13 +21,13 @@ runtime_bundle = "eliotd"
 agent_order = 17
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
-eliot-context-contracts = { path = "../eliot-context-contracts" }
-eliot-receipts = { path = "../../foundation/eliot-receipts" }
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-context-contracts = { path = "../eliot-context-contracts", version = "0.1.0" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
 
 [dev-dependencies]
-eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts" }
+eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts", version = "0.1.0" }
 
 [lints]
 workspace = true

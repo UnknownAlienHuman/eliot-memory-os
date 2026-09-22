@@ -21,15 +21,15 @@ runtime_bundle = "eliot-dreamer"
 agent_order = 26
 
 [dependencies]
-eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
-eliot-receipts = { path = "../../foundation/eliot-receipts" }
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts", version = "0.1.0" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
 schemars = { version = "1.2.1", features = ["derive", "uuid1"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150" }
 
 [dev-dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
 
 [lints]
 workspace = true

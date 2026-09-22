@@ -23,24 +23,24 @@ eliot-contracts.workspace = true
 eliot-config.workspace = true
 eliot-controlboard.workspace = true
 eliot-doctor-core.workspace = true
-eliot-dreamer-bundle = { path = "../../crates/smart/eliot-dreamer-bundle" }
-eliot-dreamer-candidate-validation = { path = "../../crates/smart/eliot-dreamer-candidate-validation" }
-eliot-dreamer-claim-grounding = { path = "../../crates/smart/eliot-dreamer-claim-grounding" }
-eliot-dreamer-probe-plan = { path = "../../crates/smart/eliot-dreamer-probe-plan" }
-eliot-dreamer-rival-model = { path = "../../crates/smart/eliot-dreamer-rival-model" }
+eliot-dreamer-bundle = { path = "../../crates/smart/eliot-dreamer-bundle", version = "0.1.0" }
+eliot-dreamer-candidate-validation = { path = "../../crates/smart/eliot-dreamer-candidate-validation", version = "0.1.0" }
+eliot-dreamer-claim-grounding = { path = "../../crates/smart/eliot-dreamer-claim-grounding", version = "0.1.0" }
+eliot-dreamer-probe-plan = { path = "../../crates/smart/eliot-dreamer-probe-plan", version = "0.1.0" }
+eliot-dreamer-rival-model = { path = "../../crates/smart/eliot-dreamer-rival-model", version = "0.1.0" }
 eliot-evaluation-contracts.workspace = true
 eliot-governor.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-maintenance.workspace = true
-eliot-observability = { path = "../../crates/instrument/eliot-observability" }
+eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
 eliot-observation.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 eliot-protocol.workspace = true
 eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan", version = "0.1.0" }
-eliot-read = { path = "../../crates/governor/eliot-read" }
+eliot-read = { path = "../../crates/governor/eliot-read", version = "0.1.0" }
 eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-security-contracts.workspace = true
