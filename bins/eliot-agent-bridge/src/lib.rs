@@ -49,6 +49,7 @@ pub mod memory_handle_join;
 pub mod reactive_injection_receipts;
 pub mod reactive_owner_publication;
 pub mod reactive_runtime_composition;
+pub mod session_envelope_join;
 pub mod settled_plan_transport;
 mod understanding_bootstrap;
 pub(crate) use cli_contract::validate_client_declaration_path;
@@ -69,6 +70,10 @@ pub use reactive_injection_receipts::{
 pub use reactive_owner_publication::{
     LiveLedgerAttention, LiveLedgerSession, OwnerPublicationError, publish_live_ledger_attention,
     publish_live_ledger_session,
+};
+pub use session_envelope_join::{
+    AttemptJoinFact, DeliveryJoinFact, JoinedSessionEnvelope, SessionJoinError,
+    derive_recipient_id, join_live_session_envelope,
 };
 pub use settled_plan_transport::{
     AdmittedPlanItem, FeedAdmissionOutcome, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS,
