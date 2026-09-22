@@ -63,6 +63,7 @@ fn candidate(context: &ContextBinding) -> ContextCandidate {
             content_sha256: digest(),
             predecessor: None,
         },
+        learning: None,
         representation: AtomRepresentation::Whole {
             content: "whole goal matériél".to_owned(),
         },
