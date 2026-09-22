@@ -93,8 +93,8 @@ use eliot_backup::{
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreObligations, RestoreProvenance};
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseOperation};
-use eliot_runtime_contracts::LeaseState;
+use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseOperation, SupervisionLeasePrepareRequest};
+use eliot_runtime_contracts::{LeaseState, SupervisionLeaseTerminalDisposition};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 use serde::Serialize;
@@ -218,17 +218,34 @@ struct LeaseTerminalProof {
 }
 
 /// Caller-supplied cutover authority bundle: the separate Human/System
-/// Owner authorization plus the lease-owner terminal ticket that alone
-/// satisfies the lease leg. The shape-only authorization never suffices;
-/// no ticket means no cutover, failed closed with the exact missing
-/// artifact before any effect.
+/// Owner authorization, the lease invalidation to execute, and the live
+/// fence the delivered authorization must still match. The shape-only
+/// authorization never suffices; an unbound lease or stale fence fails
+/// closed with the exact missing cause before any effect.
 #[derive(Clone, Copy, Debug)]
 pub struct CutoverAuthority<'a> {
     /// Separate cutover authorization bound to this exact plan and bundle.
     pub authorization: Option<&'a CutoverAuthorization>,
-    /// Lease-owner terminal ticket with genuine predecessor proof.
-    pub lease_terminal:
-        Option<(&'a KernelSupervisionLeaseAuthority, &'a SupervisionLeaseCommitTicket)>,
+    /// Lease invalidation to propose, commit, and verify through the
+    /// supervision-lease owner.
+    pub lease_invalidation: CutoverLeaseInvalidation<'a>,
+    /// Caller-live authority fence for delivered-generation currency.
+    pub live_fence: &'a StateFence,
+}
+
+/// Lease invalidation bound to one live supervision lease: the authority
+/// that owns it, the lease identity from the activation context, and the
+/// terminal operation to execute. The ticket itself is always proposed
+/// from live ORS state inside the cutover path — never caller-supplied,
+/// never replayed.
+#[derive(Clone, Copy, Debug)]
+pub struct CutoverLeaseInvalidation<'a> {
+    /// Supervision-lease authority owning the lease.
+    pub authority: &'a KernelSupervisionLeaseAuthority,
+    /// Active supervision lease identity to invalidate.
+    pub lease_id: &'a str,
+    /// Terminal operation to execute (non-terminal refuses up front).
+    pub operation: SupervisionLeaseOperation,
 }
 
 impl KernelBackupRestore {
@@ -341,6 +358,7 @@ impl KernelBackupRestore {
             bundle,
             manifest_evidence.as_ref(),
             &delivered,
+            kernel_fence,
         )?;
         let receipts = match keys {
             Some(manifest) => BlobOwnerClient::issue_receipts(
@@ -476,6 +494,7 @@ impl KernelBackupRestore {
         bundle: &BackupBundle,
         manifest_evidence: Option<&DestinationManifestEvidence>,
         delivered: &[u8],
+        live_fence: &StateFence,
     ) -> Result<(VerifiedDestinationBinding, String), KernelRestoreError> {
         // Without the trusted in-process projection the delivered bytes
         // stand alone: refuse with the exact missing owner instead of
@@ -541,15 +560,29 @@ impl KernelBackupRestore {
         if verified.binding_digest() != filtered.binding_digest() {
             return Err(KernelRestoreError::JournalCorrupt);
         }
+        // Canonical owner fencing: the delivered authority generation must
+        // equal the live fence generation — any activation between issuance
+        // and effect moved the generation and the binding is stale. Exact
+        // owner-typed equality, never caller arithmetic, never compatibility
+        // coercion. Same-installation restores only; migration lanes carry
+        // their own lineage proof.
+        if verified.fence_authority_generation() != live_fence.resource_generation.value() {
+            return Err(KernelRestoreError::FenceMismatch(
+                "destination authority generation is not current".to_owned(),
+            ));
+        }
         // Continuity: a previously pinned binding (resume/cutover) must
         // equal this observation — transaction, target, digest,
-        // installation, and generation.
+        // installation, generation, and fence.
         if let Some(pinned) = Self::read_optional_pin(destination)?
             && (pinned.transaction_id != transaction.transaction_id
                 || pinned.target_id != plan.target.target_id
                 || pinned.authorization_digest != authorization_digest
                 || pinned.source_installation_id != verified.source_installation_id()
-                || pinned.approved_generation != verified.approved_generation())
+                || pinned.approved_generation != verified.approved_generation()
+                || pinned.fence_generation != verified.fence_generation()
+                || pinned.fence_config_digest != verified.fence_config_digest()
+                || pinned.fence_authority_generation != verified.fence_authority_generation())
         {
             return Err(KernelRestoreError::DestinationInvalid(
                 "destination authorization drifted from the pinned admission".to_owned(),
@@ -662,6 +695,7 @@ impl KernelBackupRestore {
         destination: &KernelIsolatedDestination,
         plan: &RestorePlan,
         bundle: &BackupBundle,
+        live_fence: &StateFence,
     ) -> Result<PinnedDestinationAdmission, KernelRestoreError> {
         let admission_bytes = std::fs::read(destination.root().join(DESTINATION_ADMISSION_FILE))
             .map_err(|_| {
@@ -684,8 +718,88 @@ impl KernelBackupRestore {
             bundle,
             Some(&pinned.evidence),
             &delivered,
+            live_fence,
         )?;
         Ok(pinned)
+    }
+
+    /// Proposes one terminal ticket from live ORS state through the lease
+    /// owner (the real #961 ticket supplier): reads the current snapshot,
+    /// requires `Active`, clones the owner binding with terminal state and
+    /// disposition, and reserves the ticket — revision continuity, lineage,
+    /// expiry, and conflict checks all owner-enforced. No fabricated
+    /// fields: every identity comes from the live record; the deterministic
+    /// ticket identity makes same-descriptor retry idempotent through the
+    /// staged-table replay path instead of conflicting.
+    pub fn propose_lease_terminal_ticket(
+        authority: &KernelSupervisionLeaseAuthority,
+        lease_id: &str,
+        operation: SupervisionLeaseOperation,
+    ) -> Result<SupervisionLeaseCommitTicket, KernelRestoreError> {
+        let disposition = match operation {
+            SupervisionLeaseOperation::Commit | SupervisionLeaseOperation::Renew => {
+                return Err(KernelRestoreError::LeaseTerminal(
+                    "terminal ticket requires a terminal operation".to_owned(),
+                ));
+            }
+            SupervisionLeaseOperation::Revoke => SupervisionLeaseTerminalDisposition::Revoked,
+            SupervisionLeaseOperation::Expire => SupervisionLeaseTerminalDisposition::Expired,
+            SupervisionLeaseOperation::Supersede => {
+                SupervisionLeaseTerminalDisposition::Superseded
+            }
+            SupervisionLeaseOperation::Close => SupervisionLeaseTerminalDisposition::Closed,
+        };
+        if lease_id.trim().is_empty() {
+            return Err(KernelRestoreError::CapabilityMissing {
+                capability: "lease-terminal-ticket",
+            });
+        }
+        let current = authority
+            .current_snapshot(lease_id)
+            .map_err(|error| KernelRestoreError::LeaseTerminal(error.to_string()))?
+            .ok_or_else(|| {
+                KernelRestoreError::LeaseTerminal(
+                    "no active supervision lease to invalidate".to_owned(),
+                )
+            })?;
+        current
+            .validate()
+            .map_err(|error| KernelRestoreError::LeaseTerminal(error.to_string()))?;
+        if current.record.state != LeaseState::Active {
+            return Err(KernelRestoreError::LeaseTerminal(
+                "supervision lease is not active".to_owned(),
+            ));
+        }
+        let next_revision = current.record.revision.checked_add(1).ok_or_else(|| {
+            KernelRestoreError::LeaseTerminal("lease revision counter exhausted".to_owned())
+        })?;
+        let mut binding = current.record.binding.clone();
+        binding.state = operation.target_state();
+        binding.terminal_disposition = Some(disposition);
+        let ticket_id = eliot_ors::OperationIdentity::new(format!(
+            "{}::cutover-t{:020}",
+            current.record.lease_id.as_str(),
+            next_revision
+        ))
+        .map_err(|error| KernelRestoreError::LeaseTerminal(error.to_string()))?;
+        let operation_id = eliot_ors::OperationIdentity::new(format!(
+            "{}::cutover-o{:020}",
+            current.record.lease_id.as_str(),
+            next_revision
+        ))
+        .map_err(|error| KernelRestoreError::LeaseTerminal(error.to_string()))?;
+        let request = SupervisionLeasePrepareRequest {
+            ticket_id,
+            operation_id,
+            lease_id: current.record.lease_id.clone(),
+            expected_revision: Some(current.record.revision),
+            operation,
+            binding,
+        };
+        let stage = authority
+            .prepare(request)
+            .map_err(|error| KernelRestoreError::LeaseTerminal(error.to_string()))?;
+        Ok(stage.ticket().clone())
     }
 
     /// Commits one terminal ticket through the lease owner and verifies the
@@ -779,13 +893,14 @@ impl KernelBackupRestore {
     /// or non-lease live-authority invalidation: runtime/session/route/
     /// user-broker invalidation and cutover execution belong to the
     /// installer/Hume owner (#961), whose files are untouched here. The
-    /// lease leg alone executes here through a caller-supplied terminal
-    /// ticket (F2 repair): without a lease-owner-committed ticket there is
-    /// no cutover. A committed ticket without a journaled decision still
-    /// leaves cutover unperformed — retry then requires a fresh ticket from
-    /// current lease state, never a replay of the consumed one. Rehearsal
-    /// is safe by construction — there is simply no effect to rehearse
-    /// beyond validation, ticket commit, and journaling the decision.
+    /// lease leg alone executes here: the path proposes a terminal ticket
+    /// from live ORS state and commits it through the supervision-lease
+    /// owner (F2 repair). Without a bound lease there is no cutover; a
+    /// committed ticket without a journaled decision still leaves cutover
+    /// unperformed, and retry proposes fresh from current lease state
+    /// rather than replaying a consumed ticket. Rehearsal covers
+    /// validation, the ticket proposal and commit, and journaling the
+    /// decision only.
     pub async fn request_cutover(
         &mut self,
         plan: &RestorePlan,
@@ -797,16 +912,19 @@ impl KernelBackupRestore {
     ) -> Result<CutoverReceipt, KernelRestoreError> {
         let CutoverAuthority {
             authorization: auth,
-            lease_terminal,
+            lease_invalidation,
+            live_fence,
         } = *authority;
         Self::check_cutover_inputs(plan, bundle, receipt, evidence, auth)?;
         let auth = auth.ok_or(KernelRestoreError::CutoverNotAuthorized)?;
-        // F2: no lease-owner-committed terminal ticket → no cutover. The
-        // shape-only cutover receipt never authorizes alone.
-        let (lease_authority, lease_ticket) =
-            lease_terminal.ok_or(KernelRestoreError::CapabilityMissing {
+        // F2: no bound lease → no cutover. The shape-only cutover receipt
+        // never authorizes alone; the ticket is always proposed fresh from
+        // live state below, never caller-supplied.
+        if lease_invalidation.lease_id.trim().is_empty() {
+            return Err(KernelRestoreError::CapabilityMissing {
                 capability: "lease-terminal-ticket",
-            })?;
+            });
+        }
         if destination.label() != plan.target.target_id
             || !destination.root().starts_with(&self.work_root)
         {
@@ -815,7 +933,7 @@ impl KernelBackupRestore {
             ));
         }
         let pinned = self
-            .load_verified_destination_admission(destination, plan, bundle)
+            .load_verified_destination_admission(destination, plan, bundle, live_fence)
             .await?;
         let transaction = self.check_cutover_stream_binding(plan, bundle, &pinned)?;
         let carrier = IsolatedRestorePlan {
@@ -831,12 +949,18 @@ impl KernelBackupRestore {
         cutover
             .validate()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
-        // F2: drive the real lease-owner terminal path with genuine
-        // predecessor proof; verify by owner validation plus live ORS
-        // readback. Only a committed ticket satisfies the lease leg of the
-        // denominator below — the shape-only receipt never does.
+        // F2: propose the terminal ticket from live ORS state, then drive
+        // the real lease-owner terminal path with genuine predecessor
+        // proof; verify by owner validation plus live ORS readback. Only a
+        // committed ticket satisfies the lease leg of the denominator
+        // below — the shape-only receipt never does.
+        let ticket = Self::propose_lease_terminal_ticket(
+            lease_invalidation.authority,
+            lease_invalidation.lease_id,
+            lease_invalidation.operation,
+        )?;
         let lease_proof =
-            Self::commit_lease_terminal(lease_authority, lease_ticket, &self.journal)?;
+            Self::commit_lease_terminal(lease_invalidation.authority, &ticket, &self.journal)?;
         let evidence = evidence.ok_or(KernelRestoreError::OwnerEvidenceInvalid(
             "no observed restore evidence".to_owned(),
         ))?;
@@ -1041,6 +1165,9 @@ struct PinnedDestinationAdmission {
     authorization_digest: String,
     source_installation_id: String,
     approved_generation: String,
+    fence_generation: String,
+    fence_config_digest: String,
+    fence_authority_generation: u64,
 }
 
 /// Admission file name inside the isolated destination.
@@ -1300,6 +1427,9 @@ impl<'a> KernelRestoreTarget<'a> {
                 authorization_digest: self.verified.authorization_digest.clone(),
                 source_installation_id: self.verified.binding.source_installation_id().to_owned(),
                 approved_generation: self.verified.binding.approved_generation().to_owned(),
+                fence_generation: self.verified.binding.fence_generation().to_owned(),
+                fence_config_digest: self.verified.binding.fence_config_digest().to_owned(),
+                fence_authority_generation: self.verified.binding.fence_authority_generation(),
             };
             let bytes = canonical_json_bytes(&pinned)
                 .map_err(|error| BackupError::Serialization(error.to_string()))?;

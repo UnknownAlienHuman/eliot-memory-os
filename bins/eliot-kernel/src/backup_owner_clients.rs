@@ -183,6 +183,9 @@ pub struct VerifiedDestinationBinding {
     registry_revision: u64,
     source_installation_id: String,
     approved_generation: String,
+    fence_generation: String,
+    fence_config_digest: String,
+    fence_authority_generation: u64,
 }
 
 impl VerifiedDestinationBinding {
@@ -196,6 +199,9 @@ impl VerifiedDestinationBinding {
             self.registry_revision,
             self.source_installation_id.as_str(),
             self.approved_generation.as_str(),
+            self.fence_generation.as_str(),
+            self.fence_config_digest.as_str(),
+            self.fence_authority_generation,
         ))
         .unwrap_or_default();
         sha256_hex(&bytes)
@@ -224,6 +230,21 @@ impl VerifiedDestinationBinding {
     /// Active approved generation identity bound by this verification.
     pub fn approved_generation(&self) -> &str {
         &self.approved_generation
+    }
+
+    /// Committed fence generation bound by this verification.
+    pub fn fence_generation(&self) -> &str {
+        &self.fence_generation
+    }
+
+    /// Committed fence config digest bound by this verification.
+    pub fn fence_config_digest(&self) -> &str {
+        &self.fence_config_digest
+    }
+
+    /// Committed fence authority generation bound by this verification.
+    pub fn fence_authority_generation(&self) -> u64 {
+        self.fence_authority_generation
     }
 }
 
@@ -294,6 +315,25 @@ pub fn verify_destination_authorization(
     if !auth_identity(approved_generation) {
         return Err(BackupError::PlanMismatch);
     }
+    let fence_generation = auth_text(&auth, "fence_generation")?;
+    if !auth_identity(fence_generation) {
+        return Err(BackupError::PlanMismatch);
+    }
+    let fence_config_digest = auth_text(&auth, "fence_config_digest")?;
+    if !is_hex64(fence_config_digest) {
+        return Err(BackupError::PlanMismatch);
+    }
+    let fence_authority_generation = auth
+        .get("fence_authority_generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(BackupError::PlanMismatch)?;
+    // Fence↔manifest agreement re-proven from the delivered fields: a
+    // splice of manifest facts from different inspections refuses here.
+    if fence_generation != approved_generation
+        || fence_config_digest != manifest_digest
+    {
+        return Err(BackupError::PlanMismatch);
+    }
     let bound_root = auth_text(&auth, "kernel_work_root")?;
     let own_root = std::fs::canonicalize(expectation.kernel_work_root)
         .map_err(|error| BackupError::Target(error.to_string()))?;
@@ -317,6 +357,9 @@ pub fn verify_destination_authorization(
         registry_revision,
         source_installation_id: source_installation_id.to_owned(),
         approved_generation: approved_generation.to_owned(),
+        fence_generation: fence_generation.to_owned(),
+        fence_config_digest: fence_config_digest.to_owned(),
+        fence_authority_generation,
     })
 }
 

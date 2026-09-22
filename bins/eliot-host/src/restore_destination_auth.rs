@@ -49,7 +49,7 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_host_service::runtime_control::{
     HostRestoreDestinationReceipt, HostRuntimeControlOperation, HostRuntimeControlRequest,
     HostRuntimeControlResponse, RESTORE_DESTINATION_ISSUER, RESTORE_DESTINATION_WIRE,
-    runtime_control_unknown_ref,
+    runtime_control_refusal_ref,
 };
 use eliot_installation::{
     ActivationCommitFence, ApprovedGeneration, ApprovedGenerationRegistry, RedbInstallationRegistry,
@@ -160,6 +160,12 @@ pub struct DestinationAuthorization {
     pub kernel_work_root: String,
     /// Active approved generation identity.
     pub approved_generation: String,
+    /// Committed activation-fence generation bound to the manifest.
+    pub fence_generation: String,
+    /// Committed activation-fence config digest bound to the manifest.
+    pub fence_config_digest: String,
+    /// Committed activation-fence authority generation (live currency).
+    pub fence_authority_generation: u64,
 }
 
 impl DestinationAuthorization {
@@ -183,6 +189,16 @@ impl DestinationAuthorization {
         }
         if !is_hex64(&self.manifest_digest) || !is_hex64(&self.roots_digest) {
             return Err(DestinationAuthError::InvalidRequest("manifest_digest"));
+        }
+        if !is_hex64(&self.fence_config_digest) {
+            return Err(DestinationAuthError::InvalidRequest("fence_config_digest"));
+        }
+        for (value, field) in [
+            (&self.fence_generation, "fence_generation"),
+        ] {
+            if value.is_empty() || value.len() > 256 {
+                return Err(DestinationAuthError::InvalidRequest(field));
+            }
         }
         Ok(())
     }
@@ -336,6 +352,7 @@ impl HostRestoreDestinationAuth {
         if !is_hex64(manifest_digest) || !is_hex64(roots_digest) {
             return Err(DestinationAuthError::OwnerEvidenceWithheld("manifest_digest"));
         }
+        let fence = &evidence.fence;
         let auth = DestinationAuthorization {
             wire: DESTINATION_AUTHORIZATION_WIRE.to_owned(),
             issuer: DESTINATION_AUTHORIZATION_ISSUER.to_owned(),
@@ -347,6 +364,9 @@ impl HostRestoreDestinationAuth {
             registry_revision: evidence.revision(),
             kernel_work_root: roots.kernel_work_root.as_str().to_owned(),
             approved_generation: evidence.approved.manifest.generation.as_str().to_owned(),
+            fence_generation: fence.generation.as_str().to_owned(),
+            fence_config_digest: fence.config_digest.as_str().to_owned(),
+            fence_authority_generation: fence.authority_generation.value(),
         };
         auth.validate()?;
         Ok(auth)
@@ -374,26 +394,28 @@ impl HostComposition {
     /// descriptors, requires the live owner lease, issues fresh from live
     /// inspection, and returns the Host-issued receipt.
     ///
-    /// Failures stay typed `Unknown` preserving identity; never
-    /// false-success. Issuance is effect-free read-only: a repeated request
-    /// re-inspects and returns current owner facts rather than replaying
-    /// possibly stale bytes.
+    /// Deterministic failures (validation, lease fence, issuance) return
+    /// typed `Refused` with the exact reason — final for these descriptors,
+    /// never confused with the genuine uncertainty `Unknown` reserves for
+    /// queue/transport loss. Issuance is effect-free read-only: a repeated
+    /// request re-inspects and returns current owner facts rather than
+    /// replaying possibly stale bytes.
     pub fn handle_restore_destination_request(
         &self,
         request: &HostRuntimeControlRequest,
     ) -> HostRuntimeControlResponse {
-        let unknown = |reason: &str| {
+        let refused = |reason: &str| {
             super::host_lifecycle_observe_terminal("host-restore-destination-unknown");
-            HostRuntimeControlResponse::unknown_for(
+            HostRuntimeControlResponse::refused_for(
                 request,
-                runtime_control_unknown_ref(reason, request),
+                runtime_control_refusal_ref(reason, request),
             )
         };
         super::host_lifecycle_observe_scm("host.restore-destination requested");
         if request.operation != HostRuntimeControlOperation::DeliverRestoreDestinationAuth
             || request.validate().is_err()
         {
-            return unknown("restore-destination-authorization");
+            return refused("restore-destination-validation");
         }
         if self
             .owner_lease
@@ -401,10 +423,10 @@ impl HostComposition {
             .live_guard()
             .is_err()
         {
-            return unknown("restore-destination-authorization");
+            return refused("restore-destination-lease-fenced");
         }
         let Some(input) = request.restore_destination.as_ref() else {
-            return unknown("restore-destination-authorization");
+            return refused("restore-destination-validation");
         };
         let issue_request = DestinationAuthRequest {
             source_installation_id: input.source_installation_id.as_str().to_owned(),
@@ -414,7 +436,7 @@ impl HostComposition {
         let Ok(auth) =
             HostRestoreDestinationAuth::issue(&self.registry_host_root, &issue_request)
         else {
-            return unknown("restore-destination-authorization");
+            return refused("restore-destination-issuance");
         };
         let handle = |value: &str| PlatformHandle::new(value.to_owned());
         let mut receipt = HostRestoreDestinationReceipt {
@@ -422,51 +444,60 @@ impl HostComposition {
             request_digest: request.request_digest.clone(),
             wire: match handle(RESTORE_DESTINATION_WIRE) {
                 Ok(wire) => wire,
-                Err(_) => return unknown("restore-destination-authorization"),
+                Err(_) => return refused("restore-destination-issuance"),
             },
             issuer: match handle(RESTORE_DESTINATION_ISSUER) {
                 Ok(issuer) => issuer,
-                Err(_) => return unknown("restore-destination-authorization"),
+                Err(_) => return refused("restore-destination-issuance"),
             },
             source_installation_id: match handle(&auth.source_installation_id) {
                 Ok(value) => value,
-                Err(_) => return unknown("restore-destination-authorization"),
+                Err(_) => return refused("restore-destination-issuance"),
             },
             target_id: match handle(&auth.target_id) {
                 Ok(value) => value,
-                Err(_) => return unknown("restore-destination-authorization"),
+                Err(_) => return refused("restore-destination-issuance"),
             },
             transaction_id: match handle(&auth.transaction_id) {
                 Ok(value) => value,
-                Err(_) => return unknown("restore-destination-authorization"),
+                Err(_) => return refused("restore-destination-issuance"),
             },
             manifest_digest: match handle(&auth.manifest_digest) {
                 Ok(value) => value,
-                Err(_) => return unknown("restore-destination-authorization"),
+                Err(_) => return refused("restore-destination-issuance"),
             },
             roots_digest: match handle(&auth.roots_digest) {
                 Ok(value) => value,
-                Err(_) => return unknown("restore-destination-authorization"),
+                Err(_) => return refused("restore-destination-issuance"),
             },
             registry_revision: auth.registry_revision,
             kernel_work_root: match handle(&auth.kernel_work_root) {
                 Ok(value) => value,
-                Err(_) => return unknown("restore-destination-authorization"),
+                Err(_) => return refused("restore-destination-issuance"),
             },
             approved_generation: match handle(&auth.approved_generation) {
                 Ok(value) => value,
-                Err(_) => return unknown("restore-destination-authorization"),
+                Err(_) => return refused("restore-destination-issuance"),
             },
+            fence_generation: match handle(&auth.fence_generation) {
+                Ok(value) => value,
+                Err(_) => return refused("restore-destination-issuance"),
+            },
+            fence_config_digest: match handle(&auth.fence_config_digest) {
+                Ok(value) => value,
+                Err(_) => return refused("restore-destination-issuance"),
+            },
+            fence_authority_generation: auth.fence_authority_generation,
             // Placeholder replaced by the computed digest below; the
             // request digest is a valid handle of the right shape.
             receipt_digest: request.request_digest.clone(),
         };
         receipt.receipt_digest = match receipt.computed_digest() {
             Ok(digest) => digest,
-            Err(_) => return unknown("restore-destination-authorization"),
+            Err(_) => return refused("restore-destination-issuance"),
         };
         if receipt.validate().is_err() {
-            return unknown("restore-destination-authorization");
+            return refused("restore-destination-issuance");
         }
         super::host_lifecycle_observe_scm("host.restore-destination receipt completion");
         HostRuntimeControlResponse::destination_authorized_for(request, receipt)

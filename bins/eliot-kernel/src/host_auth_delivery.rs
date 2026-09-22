@@ -159,6 +159,9 @@ pub fn authorization_bytes(
         "registry_revision": receipt.registry_revision,
         "kernel_work_root": receipt.kernel_work_root.as_str(),
         "approved_generation": receipt.approved_generation.as_str(),
+        "fence_generation": receipt.fence_generation.as_str(),
+        "fence_config_digest": receipt.fence_config_digest.as_str(),
+        "fence_authority_generation": receipt.fence_authority_generation,
     });
     serde_json::to_vec(&value).map_err(|_| {
         HostDeliveryError::Rejected("delivered receipt could not be encoded".to_owned())

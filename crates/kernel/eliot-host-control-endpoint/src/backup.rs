@@ -5,9 +5,10 @@
 //! established by the installation boundary, never self-declared);
 //! A13.2 Kernel and Failure Domains (Host Supervisor outside the Kernel
 //! failure domain); I1.8 Exact Ownership and Call Paths; I5.27 canonical
-//! operation identity (fresh transport identity per call, stable mutation
-//! identity for reconciliation); I14.21 unknown-commit recovery (timeout
-//! after send stays `Unknown` for reconcile replay, never a blind retry).
+//! operation identity (deterministic digest-bound request identity per
+//! target/transaction/source; issuance is effect-free read-only so a fresh
+//! request duplicates nothing); I14.21 unknown-commit recovery (timeout
+//! after send stays `Unknown` for a fresh retry, never a blind retry).
 //! Implementation: I7.2/I7.3 framed IPC (existing `FrameKind::Control`
 //! Start/Ready envelopes over the existing pipe).
 //!
@@ -18,11 +19,13 @@
 //! existing pipe (`HOST_RUNTIME_CONTROL_PIPE`), the existing frame
 //! envelope, the existing version policy, and the existing OS peer
 //! authorities are reused. The server side keeps requiring Builtin
-//! Administrators; this client mirrors that policy when verifying the
-//! Host server peer (`connect_authenticated`), so an unprivileged pipe
-//! squatter cannot feed forged bytes. Digest-bound request/response
-//! correlation (`response_matches_request`) binds every receipt to the
-//! exact fresh request: a recorded response never satisfies a new call.
+//! Administrators; this client additionally binds the exact Host service
+//! process — the canonical SCM service identity resolved from the OS plus
+//! the stability-sampled live process binding (PID, creation time, image)
+//! — so only the running Host service answers, never any elevated
+//! squatter. Digest-bound request/response correlation binds every receipt
+//! to the exact fresh request: a recorded response never satisfies a new
+//! call.
 //!
 //! Capability cell: Host-control backup delivery (authenticated request,
 //! correlated receipt).
@@ -103,13 +106,29 @@ pub struct HostRestoreDestinationClient;
 impl HostRestoreDestinationClient {
     /// Exchanges one digest-bound authorization request for the Host-issued
     /// receipt over the authenticated Host pipe.
+    ///
+    /// Peer binding, all OS-observed at call time, never caller-asserted:
+    /// the canonical SCM service identity is resolved from the OS, the
+    /// live Host service process is stability-sampled from SCM plus
+    /// process observation, and the connected server must equal that exact
+    /// process (PID, creation time, image) under that exact service SID in
+    /// session 0. Any mismatch fails closed before a byte is sent.
     pub async fn exchange(
         request: &HostRuntimeControlRequest,
     ) -> Result<HostRestoreDestinationReceipt, RestoreDestinationDeliveryError> {
         use RestoreDestinationDeliveryError::{Rejected, Transport, Unknown};
-        let expectation =
-            eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
+        let host_sid = eliot_platform_windows::resolve_service_sid(
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+        )
+        .map_err(|error| Transport(error.to_string()))?;
+        let host_process =
+            eliot_platform_windows::observe_running_eliot_host_process()
                 .map_err(|error| Transport(error.to_string()))?;
+        // Services run in session 0 (OS invariant); mismatch fails closed.
+        let expectation = eliot_platform_windows::NamedPipePeerExpectation::new(host_sid, 0)
+            .map_err(|error| Transport(error.to_string()))?
+            .with_process_binding(host_process)
+            .map_err(|error| Transport(error.to_string()))?;
         let mut transport = NamedPipeTransport::connect_authenticated(
             HOST_RUNTIME_CONTROL_PIPE,
             HOST_RESTORE_DESTINATION_CONNECT_TIMEOUT,
@@ -135,6 +154,10 @@ impl HostRestoreDestinationClient {
         }
         match outcome {
             HostRuntimeControlResponse::DestinationAuthorized { receipt } => Ok(receipt),
+            HostRuntimeControlResponse::Refused { refusal_ref } => Err(Rejected(format!(
+                "restore destination refused: {}",
+                refusal_ref.as_str()
+            ))),
             HostRuntimeControlResponse::Unknown { pending_ref } => Err(Unknown {
                 pending_ref: pending_ref.as_str().to_owned(),
             }),

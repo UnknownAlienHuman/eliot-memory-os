@@ -66,7 +66,7 @@ pub use backup_owner_clients::{
     DESTINATION_AUTHORIZATION_WIRE, PURGE_MEMBER_SUPPRESSION, STORE_IMPORT_CHANNEL,
     verify_destination_authorization,
 };
-pub use backup_restore::{CutoverAuthority, KernelBackupRestore, KernelRestoreOutcome, phase_owner};
+pub use backup_restore::{CutoverAuthority, CutoverLeaseInvalidation, KernelBackupRestore, KernelRestoreOutcome, phase_owner};
 pub use backup_restore_ports::{
     DestinationManifestEvidence, KernelIsolatedDestination, KernelRestoreError, KernelRestoreJournal,
     RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_KEEP_RESOLVED,

@@ -185,6 +185,77 @@ pub fn runtime_control_unknown_ref(
         .unwrap_or_else(|_| unreachable!())
 }
 
+/// Closed refusal reasons for deterministic restore-destination failures.
+/// Validation, lease-fence, and issuance refusals are final for these
+/// descriptors; `Unknown` stays reserved for genuine uncertainty (queue
+/// loss, timeouts, lost responses).
+const REFUSAL_TAG: &str = "refused";
+const REFUSAL_REASONS: &[&str] = &[
+    "restore-destination-validation",
+    "restore-destination-lease-fenced",
+    "restore-destination-issuance",
+];
+
+/// Builds the canonical refusal reference binding one deterministic
+/// refusal to its exact request identity.
+pub fn runtime_control_refusal_ref(
+    reason: &str,
+    request: &HostRuntimeControlRequest,
+) -> PlatformHandle {
+    let payload = serde_json::to_string(&(
+        canonical_operation_name(&request.operation),
+        request.request_id.as_str(),
+        request.mutation_digest.as_str(),
+        request.request_digest.as_str(),
+    ))
+    .unwrap_or_else(|_| unreachable!());
+    PlatformHandle::new(format!("{WIRE}:{REFUSAL_TAG}:{reason}:{payload}"))
+        .unwrap_or_else(|_| unreachable!())
+}
+
+fn parse_runtime_control_refusal_ref(
+    refusal_ref: &PlatformHandle,
+) -> Option<HostRuntimeControlRequest> {
+    let mut parts = refusal_ref.as_str().splitn(4, ':');
+    let wire = parts.next()?;
+    let tag = parts.next()?;
+    let reason = parts.next()?;
+    let payload = parts.next()?;
+    if wire != WIRE || tag != REFUSAL_TAG || !REFUSAL_REASONS.contains(&reason) {
+        return None;
+    }
+    let (operation_name, request_id, mutation_digest, request_digest) =
+        serde_json::from_str::<(String, String, String, String)>(payload).ok()?;
+    if serde_json::to_string(&(
+        operation_name.as_str(),
+        request_id.as_str(),
+        mutation_digest.as_str(),
+        request_digest.as_str(),
+    ))
+    .ok()
+    .as_deref()
+        != Some(payload)
+    {
+        return None;
+    }
+    let operation = match operation_name.as_str() {
+        "DeliverRestoreDestinationAuth" => {
+            HostRuntimeControlOperation::DeliverRestoreDestinationAuth
+        }
+        _ => return None,
+    };
+    let request = HostRuntimeControlRequest {
+        wire: PlatformHandle::new(wire.to_owned()).ok()?,
+        operation,
+        request_id: PlatformHandle::new(request_id).ok()?,
+        mutation_digest: PlatformHandle::new(mutation_digest).ok()?,
+        request_digest: PlatformHandle::new(request_digest).ok()?,
+        reactive_context: None,
+        restore_destination: None,
+    };
+    request.validate_identity().ok().map(|_| request)
+}
+
 fn parse_runtime_control_unknown_ref(
     pending_ref: &PlatformHandle,
 ) -> Option<HostRuntimeControlRequest> {
@@ -709,6 +780,12 @@ pub struct HostRestoreDestinationReceipt {
     pub kernel_work_root: PlatformHandle,
     /// Active approved generation identity.
     pub approved_generation: PlatformHandle,
+    /// Committed activation-fence generation bound to the manifest.
+    pub fence_generation: PlatformHandle,
+    /// Committed activation-fence config digest bound to the manifest.
+    pub fence_config_digest: PlatformHandle,
+    /// Committed activation-fence authority generation (live currency).
+    pub fence_authority_generation: u64,
     pub receipt_digest: PlatformHandle,
 }
 
@@ -727,6 +804,9 @@ impl HostRestoreDestinationReceipt {
             self.registry_revision,
             self.kernel_work_root.as_str(),
             self.approved_generation.as_str(),
+            self.fence_generation.as_str(),
+            self.fence_config_digest.as_str(),
+            self.fence_authority_generation,
         ))
         .map_err(|e| e.to_string())?;
         PlatformHandle::new(sha256_hex(&bytes)).map_err(|e| e.to_string())
@@ -755,6 +835,10 @@ impl HostRestoreDestinationReceipt {
         }
         restore_destination_text(&self.kernel_work_root, "kernel_work_root")?;
         restore_destination_text(&self.approved_generation, "approved_generation")?;
+        restore_destination_text(&self.fence_generation, "fence_generation")?;
+        if !is_sha256_digest(&self.fence_config_digest) {
+            return Err("fence_config_digest must be sha256".to_owned());
+        }
         if self.receipt_digest != self.computed_digest()? {
             return Err("receipt_digest mismatch".to_owned());
         }
@@ -773,6 +857,11 @@ pub enum HostRuntimeControlResponse {
     Restarted { receipt: HostKernelRestartReceipt },
     StoreRecovered { receipt: HostStoreRecoveryReceipt },
     DestinationAuthorized { receipt: HostRestoreDestinationReceipt },
+    /// Deterministic refusal: validation, lease-fence, or issuance failure.
+    /// Final for these descriptors — retrying the identical request is
+    /// futile; only genuinely new owner facts change the outcome. Never
+    /// used for uncertain outcomes; those stay `Unknown`.
+    Refused { refusal_ref: PlatformHandle },
     Unknown { pending_ref: PlatformHandle },
 }
 
@@ -801,6 +890,11 @@ impl HostRuntimeControlResponse {
         Self::DestinationAuthorized { receipt }
     }
 
+    pub fn refused_for(request: &HostRuntimeControlRequest, refusal_ref: PlatformHandle) -> Self {
+        let _ = request;
+        Self::Refused { refusal_ref }
+    }
+
     pub fn unknown_for(request: &HostRuntimeControlRequest, pending_ref: PlatformHandle) -> Self {
         let _ = request;
         Self::Unknown { pending_ref }
@@ -811,6 +905,9 @@ impl HostRuntimeControlResponse {
             Self::Restarted { receipt, .. } => receipt.validate(),
             Self::StoreRecovered { receipt, .. } => receipt.validate(),
             Self::DestinationAuthorized { receipt, .. } => receipt.validate(),
+            Self::Refused { refusal_ref, .. } => parse_runtime_control_refusal_ref(refusal_ref)
+                .map(|_| ())
+                .ok_or_else(|| "refusal_ref is not canonical".to_owned()),
             Self::Unknown { pending_ref, .. } => parse_runtime_control_unknown_ref(pending_ref)
                 .map(|_| ())
                 .ok_or_else(|| "pending_ref is not canonical".to_owned()),
@@ -823,6 +920,19 @@ fn pending_ref_matches_request(
     request: &HostRuntimeControlRequest,
 ) -> bool {
     parse_runtime_control_unknown_ref(pending_ref).is_some_and(|parsed| {
+        parsed.wire == request.wire
+            && parsed.operation == request.operation
+            && parsed.request_id == request.request_id
+            && parsed.mutation_digest == request.mutation_digest
+            && parsed.request_digest == request.request_digest
+    })
+}
+
+fn refusal_ref_matches_request(
+    refusal_ref: &PlatformHandle,
+    request: &HostRuntimeControlRequest,
+) -> bool {
+    parse_runtime_control_refusal_ref(refusal_ref).is_some_and(|parsed| {
         parsed.wire == request.wire
             && parsed.operation == request.operation
             && parsed.request_id == request.request_id
@@ -853,6 +963,9 @@ pub fn response_matches_request(
         }
         HostRuntimeControlResponse::Unknown { pending_ref } => {
             pending_ref_matches_request(pending_ref, request)
+        }
+        HostRuntimeControlResponse::Refused { refusal_ref } => {
+            refusal_ref_matches_request(refusal_ref, request)
         }
     }
 }
@@ -984,6 +1097,13 @@ pub fn runtime_control_response_frame(
                 .as_str()
                 .to_owned()
         }
+        HostRuntimeControlResponse::Refused { refusal_ref, .. } => {
+            parse_runtime_control_refusal_ref(refusal_ref)
+                .ok_or_else(|| "SessionFenced".to_owned())?
+                .request_digest
+                .as_str()
+                .to_owned()
+        }
     };
     let (request_id, request_identity) =
         durable_frame_identity(&digest).map_err(|_| "SessionFenced".to_owned())?;
@@ -1054,6 +1174,13 @@ pub fn decode_runtime_control_response_frame(
             let pending_request = parse_runtime_control_unknown_ref(pending_ref)
                 .ok_or_else(|| "SessionFenced".to_owned())?;
             if frame_request_id.as_str() != pending_request.request_digest.as_str() {
+                return Err("SessionFenced".to_owned());
+            }
+        }
+        HostRuntimeControlResponse::Refused { refusal_ref, .. } => {
+            let refused_request = parse_runtime_control_refusal_ref(refusal_ref)
+                .ok_or_else(|| "SessionFenced".to_owned())?;
+            if frame_request_id.as_str() != refused_request.request_digest.as_str() {
                 return Err("SessionFenced".to_owned());
             }
         }
