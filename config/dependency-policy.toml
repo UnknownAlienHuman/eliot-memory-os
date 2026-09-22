@@ -44,7 +44,7 @@ ecosystem = "rust"
 consumer = "eliot-backup"
 owner = "crates/storage/eliot-backup"
 reason = "vetted AES-256-GCM for portable backup envelope open and re-seal (#1873)"
-features = ["aes", "alloc"]
+features = ["aes", "alloc", "zeroize"]
 public_exposure = "none (sealed bytes and digests only; no key or plaintext types cross the API)"
 removal_plan = "installation-bound DPAPI path remains; portable restore degrades to refused"
 
@@ -110,6 +110,15 @@ reason = "OS randomness for portable envelope nonces (#1873)"
 features = []
 public_exposure = "none"
 removal_plan = "installation-bound DPAPI path remains; portable sealing refused without nonces"
+
+[direct_dependencies.zeroize]
+ecosystem = "rust"
+consumer = "eliot-backup"
+owner = "crates/storage/eliot-backup"
+reason = "vetted RAII zeroization for portable key material and plaintext (#1873)"
+features = []
+public_exposure = "zeroizing key and plaintext memory wrappers only"
+removal_plan = "standardized secret-memory owner"
 
 [direct_dependencies.wasmtime]
 ecosystem = "rust"
