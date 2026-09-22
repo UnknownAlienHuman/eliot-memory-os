@@ -408,3 +408,161 @@ impl ReactiveCueActivation {
         Ok(())
     }
 }
+
+/// Owner-issued parts for one retained A10 cue activation pair (#1942 lane D).
+///
+/// Issued by the cue-activation owner from the live A10 request/result. The
+/// target-to-atom bindings join opaque A10 targets to current A15 view items;
+/// a target without a binding stays activation frontier evidence and is never
+/// silently dropped by the producer.
+pub struct ReactiveCueActivationParts {
+    /// Live A10 activation request carrying the authenticated cue seeds.
+    pub request: ActivationRequest,
+    /// Live A10 activation result for the request.
+    pub result: ActivationResult,
+    /// Optional expected view identity the pair was evaluated against.
+    pub expected_view_id: Option<ArtifactId>,
+    /// Optional expected admitted-set digest the pair was evaluated against.
+    pub expected_admitted_set_digest: Option<String>,
+    /// Explicit target-to-atom bindings.
+    pub target_bindings: Vec<ReactiveTargetBinding>,
+}
+
+/// Produce (retain + validate against the live view) one cue activation.
+///
+/// Authority boundary: the cue-activation owner owns firing evaluation; this
+/// producer only retains the supplied A10 pair and runs the existing join
+/// validation against the supplied live view. It invokes no activation
+/// algorithm, derives no targets, and delivers nothing. Cues enter planning
+/// only through request seeds whose task/scope/fence equal the view binding.
+/// Fail-closed: any request/result, seed-context, fence, or binding mismatch
+/// is returned, never defaulted.
+pub fn produce_reactive_cue_activation(
+    parts: ReactiveCueActivationParts,
+    view: &ContextPlanningView,
+) -> Result<ReactiveCueActivation, ReactiveInputError> {
+    let activation = ReactiveCueActivation {
+        request: parts.request,
+        result: parts.result,
+        expected_view_id: parts.expected_view_id,
+        expected_admitted_set_digest: parts.expected_admitted_set_digest,
+        target_bindings: parts.target_bindings,
+    };
+    activation.validate_against(view)?;
+    Ok(activation)
+}
+
+/// Owner-issued parts for one versioned delivery policy (#1942 lane D).
+///
+/// Issued by the policy owner from live delivery limits and choices. The
+/// policy digest is computed by [`produce_reactive_delivery_policy`], never
+/// supplied by callers.
+#[allow(clippy::struct_excessive_bools)]
+pub struct ReactiveDeliveryPolicyParts {
+    /// Policy identity.
+    pub policy_id: ArtifactId,
+    /// Policy revision (non-zero).
+    pub policy_revision: u32,
+    /// Planning request identity.
+    pub request_id: RequestId,
+    /// Planning operation identity.
+    pub operation_id: OperationId,
+    /// Planning idempotency key.
+    pub idempotency_key: String,
+    /// Canonical plan identity the policy governs.
+    pub plan_id: ArtifactId,
+    /// Optional target event identity.
+    pub target_event_id: Option<ArtifactId>,
+    /// Target delivery event name.
+    pub target_event: String,
+    /// Downstream delivery profile handle.
+    pub delivery_profile: ReactiveContextContentRef,
+    /// Downstream delivery contract identity.
+    pub delivery_contract: ContractIdentity,
+    /// Allowed delivery modes.
+    pub allowed_modes: Vec<eliot_context_contracts::ReactiveDeliveryMode>,
+    /// Maximum retained input bytes.
+    pub max_input_bytes: u64,
+    /// Maximum considered semantic members.
+    pub max_items: u64,
+    /// Maximum retained references and handles.
+    pub max_references: u64,
+    /// Maximum deterministic planning work.
+    pub max_work: u64,
+    /// Maximum delivery bytes.
+    pub max_delivery_bytes: u64,
+    /// Optional maximum delivery STU.
+    pub max_delivery_stu: Option<u64>,
+    /// Fixed cost reserve.
+    pub fixed_reserve: u64,
+    /// Protocol cost reserve.
+    pub protocol_reserve: u64,
+    /// Output cost reserve.
+    pub output_reserve: u64,
+    /// Review cost reserve.
+    pub review_reserve: u64,
+    /// Delivery cost reserve.
+    pub delivery_reserve: u64,
+    /// Priority order over semantic roles.
+    pub priority: Vec<eliot_context_contracts::SemanticRole>,
+    /// Disclosure permissions for unresolved Attention claims.
+    pub attention_disclosure: Vec<AttentionDisclosureRule>,
+    /// Tie-break revision (must be 1).
+    pub tie_break_revision: u32,
+    /// Supplied observation clock.
+    pub observed_at: ClockReading,
+    /// Optional planning deadline.
+    pub deadline_ms: Option<i64>,
+    /// Whether the policy is cancelled.
+    pub cancelled: bool,
+}
+
+/// Produce (assemble + digest + validate) one delivery policy.
+///
+/// Authority boundary: the policy owner owns limits and delivery choices;
+/// this producer only assembles the supplied fields, computes the canonical
+/// digest, and runs the existing intrinsic validation. It grants no
+/// authority, admits nothing, and delivers nothing. Fail-closed: any
+/// identity, limit, selection, or digest violation is returned, never
+/// defaulted.
+pub fn produce_reactive_delivery_policy(
+    parts: ReactiveDeliveryPolicyParts,
+) -> Result<ReactiveDeliveryPolicy, ReactiveInputError> {
+    let mut policy = ReactiveDeliveryPolicy {
+        policy_id: parts.policy_id,
+        policy_revision: parts.policy_revision,
+        policy_digest: String::new(),
+        request_id: parts.request_id,
+        operation_id: parts.operation_id,
+        idempotency_key: parts.idempotency_key,
+        plan_id: parts.plan_id,
+        target_event_id: parts.target_event_id,
+        target_event: parts.target_event,
+        delivery_profile: parts.delivery_profile,
+        delivery_contract: parts.delivery_contract,
+        allowed_modes: parts.allowed_modes,
+        max_input_bytes: parts.max_input_bytes,
+        max_items: parts.max_items,
+        max_references: parts.max_references,
+        max_work: parts.max_work,
+        max_delivery_bytes: parts.max_delivery_bytes,
+        max_delivery_stu: parts.max_delivery_stu,
+        fixed_reserve: parts.fixed_reserve,
+        protocol_reserve: parts.protocol_reserve,
+        output_reserve: parts.output_reserve,
+        review_reserve: parts.review_reserve,
+        delivery_reserve: parts.delivery_reserve,
+        priority: parts.priority,
+        attention_disclosure: parts.attention_disclosure,
+        tie_break_revision: parts.tie_break_revision,
+        observed_at: parts.observed_at,
+        deadline_ms: parts.deadline_ms,
+        cancelled: parts.cancelled,
+    };
+    // `policy_digest` is not part of the canonical digest input, so it is
+    // computed over the assembled fields before validation binds it.
+    let digest = policy.canonical_digest()?;
+    digest.clone_into(&mut policy.policy_digest);
+    policy.validate()?;
+    Ok(policy)
+}

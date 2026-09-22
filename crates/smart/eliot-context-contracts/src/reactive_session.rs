@@ -839,3 +839,85 @@ impl SessionDeliverySnapshot {
         Ok(())
     }
 }
+
+/// Owner-issued parts for one immutable session delivery snapshot (#1942 lane D).
+///
+/// Issued by the session owner from live delivery history. The snapshot
+/// digest is computed by [`produce_session_delivery_snapshot`], never
+/// supplied by callers.
+pub struct SessionDeliverySnapshotParts {
+    /// Session history owner identity.
+    pub owner_id: String,
+    /// Owner source identity of the history.
+    pub source_id: SourceId,
+    /// Owner revision of the source at snapshot time.
+    pub source_revision: String,
+    /// Owner revision of this snapshot.
+    pub snapshot_revision: String,
+    /// Live session the history belongs to.
+    pub session_id: SessionId,
+    /// Principal the history was observed for.
+    pub principal_id: String,
+    /// Delivery recipient identity.
+    pub recipient_id: String,
+    /// Runtime that performed the deliveries.
+    pub runtime_id: String,
+    /// Host that performed the deliveries.
+    pub host_id: String,
+    /// Runtime generation of the deliveries.
+    pub runtime_generation: ResourceGeneration,
+    /// Host generation of the deliveries.
+    pub host_generation: ResourceGeneration,
+    /// Task the deliveries were planned under.
+    pub task_id: TaskId,
+    /// Attempt the deliveries were planned under.
+    pub attempt_id: AgentAttemptId,
+    /// Work scope the deliveries were planned under.
+    pub scope_id: WorkScopeId,
+    /// State fence the deliveries were evaluated under.
+    pub state_fence: StateFence,
+    /// Observed/expected denominator for the retained records.
+    pub denominator: SnapshotDenominator,
+    /// Historical delivery records with original operation identity.
+    pub records: Vec<PriorDeliveryBinding>,
+}
+
+/// Produce (assemble + digest + validate) one immutable session snapshot.
+///
+/// Authority boundary: the session owner owns delivery history; this
+/// producer only assembles the supplied records, computes the canonical
+/// digest over them, and runs the existing intrinsic validation. It mints
+/// no history, rewrites no original operation, and delivers nothing.
+/// Fail-closed: any denominator, binding, or digest violation is returned,
+/// never defaulted — a missing owner stays withheld upstream, never a
+/// fabricated empty snapshot.
+pub fn produce_session_delivery_snapshot(
+    parts: SessionDeliverySnapshotParts,
+) -> Result<SessionDeliverySnapshot, ReactiveInputError> {
+    let mut snapshot = SessionDeliverySnapshot {
+        owner_id: parts.owner_id,
+        source_id: parts.source_id,
+        source_revision: parts.source_revision,
+        snapshot_revision: parts.snapshot_revision,
+        snapshot_digest: String::new(),
+        session_id: parts.session_id,
+        principal_id: parts.principal_id,
+        recipient_id: parts.recipient_id,
+        runtime_id: parts.runtime_id,
+        host_id: parts.host_id,
+        runtime_generation: parts.runtime_generation,
+        host_generation: parts.host_generation,
+        task_id: parts.task_id,
+        attempt_id: parts.attempt_id,
+        scope_id: parts.scope_id,
+        state_fence: parts.state_fence,
+        denominator: parts.denominator,
+        records: parts.records,
+    };
+    // `snapshot_digest` is not part of the canonical digest input, so it is
+    // computed over the assembled fields before validation binds it.
+    let digest = snapshot.canonical_digest()?;
+    digest.clone_into(&mut snapshot.snapshot_digest);
+    snapshot.validate()?;
+    Ok(snapshot)
+}

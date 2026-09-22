@@ -29,12 +29,20 @@
 
 use eliot_agent_bridge_core::{AttachBinding, BridgeError, ResourceUri};
 use eliot_contracts::{ResourceGeneration, StateFence};
+use eliot_integration_coverage::GovernorCoverageDerivation;
 use eliot_mcp::{KernelHostRequestPort, PortFailure};
 use eliot_protocol::{
     MAX_RESTORE_URIS, ReactiveRestoreQuery, ReactiveRestoreReply, RestoredSnapshot,
 };
+use eliot_reactive_context_plan::{
+    LiveActivationBindings, SettledPlanFeedError, SettledPlanFeedInputs, drive_live_feed,
+};
+use std::fmt;
 
 use super::BridgeRunner;
+use super::settled_plan_transport::{
+    FeedAdmissionOutcome, PlanAdmissionError, SettledPlanAdmission, admit_producer_feed,
+};
 
 /// Outcome of the ledger leg of one restore.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -520,4 +528,82 @@ mod tests {
         assert_eq!(live_ids(&runner).len(), 1, "ledger restore stands");
         assert_eq!(runner.resource_registry_len(), 1, "only the valid snapshot landed");
     }
+}
+
+/// Fail-closed errors for the owner-projection feed driver (#1942 lane D).
+///
+/// Stale projections, planning rejections, and plan defects surface here.
+/// Nothing is admitted after the error point; a withheld owner stays
+/// withheld upstream, never a fabricated batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnerProjectionFeedError {
+    /// Supplied projections disagree with the live activation bindings.
+    Stale {
+        /// Projection whose binding disagreed.
+        projection: &'static str,
+        /// Exact binding field that disagreed.
+        field: &'static str,
+    },
+    /// The planner rejected the projections (invalid, stale, conflicted).
+    Planning(String),
+    /// A settled plan item is unusable as a bridge instruction.
+    Producer(String),
+    /// Admission into the live ledger failed (session, attach, or bridge).
+    Admission(PlanAdmissionError),
+}
+
+impl fmt::Display for OwnerProjectionFeedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stale { projection, field } => write!(
+                formatter,
+                "owner projections stale: {projection}.{field} disagrees with the live activation"
+            ),
+            Self::Planning(detail) => write!(formatter, "owner feed planning: {detail}"),
+            Self::Producer(detail) => write!(formatter, "owner feed producer: {detail}"),
+            Self::Admission(error) => write!(formatter, "owner feed admission: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OwnerProjectionFeedError {}
+
+/// Drive one owner-projection feed evaluation into the live ledger.
+///
+/// Composition only (no new cadence, no second ledger): it runs the existing
+/// liveness-gated settled-plan feed
+/// ([`drive_live_feed`](eliot_reactive_context_plan::drive_live_feed)) over
+/// the six owner-issued projections produced by the lane-D producers, then
+/// admits the outcome through the existing governed transport
+/// ([`admit_producer_feed`](admit_producer_feed)) with the live Governor
+/// derivation. Afterwards the existing bridge machinery owns delivery
+/// (host-hook and next-response drains issue receipts).
+///
+/// Authority boundaries (unchanged):
+/// ```text
+/// producers own:  the six immutable projections (assembled + validated);
+/// feed owns:      one causal evaluation (projections → plan → batch);
+/// bridge owns:    session binding, ledger mutation, receipts, stickiness;
+/// governor owns:  per-item risk tier (live derivation, never defaulted).
+/// ```
+pub fn drive_owner_projections_to_ledger(
+    runner: &mut BridgeRunner,
+    derivation: &GovernorCoverageDerivation,
+    admission: &mut SettledPlanAdmission,
+    bindings: &LiveActivationBindings,
+    inputs: SettledPlanFeedInputs<'_>,
+) -> Result<FeedAdmissionOutcome, OwnerProjectionFeedError> {
+    let outcome = drive_live_feed(bindings, inputs).map_err(|error| match error {
+        SettledPlanFeedError::StaleActivation { projection, field } => {
+            OwnerProjectionFeedError::Stale { projection, field }
+        }
+        SettledPlanFeedError::Planning(error) => {
+            OwnerProjectionFeedError::Planning(format!("{error:?}"))
+        }
+        SettledPlanFeedError::Producer(error) => {
+            OwnerProjectionFeedError::Producer(error.to_string())
+        }
+    })?;
+    admit_producer_feed(admission, runner, derivation, outcome)
+        .map_err(OwnerProjectionFeedError::Admission)
 }

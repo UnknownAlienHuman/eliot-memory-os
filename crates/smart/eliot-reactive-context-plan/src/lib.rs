@@ -21,7 +21,9 @@ pub use bridge_admission::{
 };
 
 pub use input::{
-    AttentionDisclosureRule, ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTargetBinding,
+    AttentionDisclosureRule, ReactiveCueActivation, ReactiveCueActivationParts,
+    ReactiveDeliveryPolicy, ReactiveDeliveryPolicyParts, ReactiveTargetBinding,
+    produce_reactive_cue_activation, produce_reactive_delivery_policy,
 };
 pub use plan::plan_pending_context_injection;
 pub use result::{
