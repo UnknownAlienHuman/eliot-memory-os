@@ -50,8 +50,10 @@ IDENTITY_BINDING_FINDING = "DEP-014"
 NODE_ECOSYSTEM_FINDING = "DEP-015"
 
 _HEX64 = re.compile(r"[0-9a-fA-F]{64}")
+_HEX40 = re.compile(r"[0-9a-fA-F]{40}")
 _GHSA_ID = re.compile(r"GHSA-[0-9A-Za-z]+-[0-9A-Za-z]+-[0-9A-Za-z]+$")
 _TARGET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_SEMVER = re.compile(r"(\d+)\.(\d+)\.(\d+)$")
 _SCANNER_RECORD_TYPES = {"diagnostic", "summary"}
 _DIAGNOSTIC_SEVERITIES = {"error", "warning", "note", "help"}
 _SUMMARY_CHECKS = {"advisories", "bans", "licenses", "sources"}
@@ -471,32 +473,44 @@ def _validated_node_input(
         findings.extend(path_findings)
     if path is None:
         return None, None
-    try:
-        resolved_path = path.resolve()
-        relative_path = resolved_path.relative_to(root.resolve())
-    except (OSError, ValueError):
+
+    def fail(detail: str) -> tuple[Path | None, str | None]:
         if findings is not None:
-            findings.append(
-                Finding(
-                    NODE_ECOSYSTEM_FINDING,
-                    "config/dependency-policy.toml",
-                    1,
-                    f"{label} must resolve within the repository",
-                )
-            )
+            findings.append(Finding(NODE_ECOSYSTEM_FINDING, "config/dependency-policy.toml", 1, detail))
         return None, None
+
+    try:
+        root_resolved = root.resolve(strict=True)
+        lexical_path = root_resolved / Path(raw_value)
+        lexical_relative = lexical_path.relative_to(root_resolved)
+    except (OSError, TypeError, ValueError):
+        return fail(f"{label} must resolve within the repository")
+
+    # Resolve and inspect every existing component.  Path.resolve() alone is
+    # insufficient for the receipt boundary: a symlink/junction can change
+    # between the textual path check and the later read/hash operation.  Node
+    # inputs are metadata, so rejecting all reparse components is the safe
+    # policy even when the target would resolve back inside the repository.
+    current = root_resolved
+    for component in lexical_relative.parts:
+        current = current / component
+        try:
+            attributes = getattr(current.lstat(), "st_file_attributes", 0)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return fail(f"{label} cannot inspect repository path component {current}: {exc}")
+        if current.is_symlink() or attributes & 0x400:
+            return fail(f"{label} contains a symlink or reparse-point component: {current}")
+
+    try:
+        resolved_path = lexical_path.resolve(strict=False)
+        relative_path = resolved_path.relative_to(root_resolved)
+    except (OSError, ValueError):
+        return fail(f"{label} must resolve within the repository")
     relative = str(relative_path).replace("\\", "/")
     if not relative or relative == ".":
-        if findings is not None:
-            findings.append(
-                Finding(
-                    NODE_ECOSYSTEM_FINDING,
-                    "config/dependency-policy.toml",
-                    1,
-                    f"{label} must resolve to a non-root repository path",
-                )
-            )
-        return None, None
+        return fail(f"{label} must resolve to a non-root repository path")
     return resolved_path, relative
 
 
@@ -536,9 +550,8 @@ def _node_input_paths(root: Path, node_policy: dict | None) -> list[str]:
         if isinstance(instructions, list):
             for instruction in instructions:
                 if isinstance(instruction, str) and instruction.strip():
-                    instruction_path = (manifest_path.parent / instruction).resolve()
                     try:
-                        relative_instruction = instruction_path.relative_to(root.resolve())
+                        relative_instruction = (manifest_path.parent / instruction).relative_to(root.resolve())
                     except ValueError:
                         continue
                     _, instruction_relative = _validated_node_input(
@@ -633,13 +646,15 @@ def check_node_ecosystem(root: Path, node_policy: dict | None = None) -> list[Fi
                     if not isinstance(instruction, str) or not instruction.strip():
                         findings.append(Finding(NODE_ECOSYSTEM_FINDING, "config/dependency-policy.toml", 1, "Node manifest instruction path must be a string"))
                         continue
-                    instruction_path = (manifest_path.parent / instruction).resolve()
                     try:
-                        instruction_path.relative_to(root.resolve())
+                        relative_instruction = (manifest_path.parent / instruction).relative_to(root.resolve())
                     except ValueError:
                         findings.append(Finding(NODE_ECOSYSTEM_FINDING, "config/dependency-policy.toml", 1, f"Node instruction escapes repository: {instruction}"))
                     else:
-                        if not instruction_path.is_file():
+                        instruction_path, instruction_relative = _validated_node_input(
+                            root, str(relative_instruction), "Node manifest instruction", findings
+                        )
+                        if instruction_path is not None and not instruction_path.is_file():
                             findings.append(Finding(NODE_ECOSYSTEM_FINDING, instruction.replace("\\", "/"), 0, "Node manifest instruction is missing"))
 
             mcp = manifest.get("mcp")
@@ -707,6 +722,216 @@ def _extract_external_version(output: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _release_version(value: object) -> tuple[int, int, int] | None:
+    match = _SEMVER.fullmatch(str(value))
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def _validate_surreal_binary_evidence(
+    surreal: dict, advisory_findings: list[str], findings: list[Finding]
+) -> dict:
+    """Require official source/build evidence before marking crate findings binary-applicable."""
+
+    evidence = surreal.get("distributed_binary_evidence")
+    if not isinstance(evidence, dict):
+        findings.append(
+            Finding(
+                "DEP-009",
+                "config/dependency-policy.toml",
+                1,
+                "surrealdb distributed_binary_evidence must be an official source-build table",
+            )
+        )
+        return {}
+
+    expected_command = (
+        "cargo build --no-default-features --features default "
+        "--features storage-tikv,jwks,ml --locked --target x86_64-pc-windows-msvc"
+    )
+    if evidence.get("status") != "official-source-build":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence status must be official-source-build"))
+    if evidence.get("source_repository") != "https://github.com/surrealdb/surrealdb":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence must name the official source repository"))
+    if evidence.get("source_tag") != surreal.get("source_tag"):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence source_tag must match the pinned release artifact"))
+    source_commit = evidence.get("source_commit")
+    if not isinstance(source_commit, str) or not _HEX40.fullmatch(source_commit):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence source_commit must be a 40-character source tag commit"))
+    if evidence.get("build_target") != "x86_64-pc-windows-msvc":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence build_target must be x86_64-pc-windows-msvc"))
+    if evidence.get("build_command") != expected_command:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence build_command does not match the official Windows action"))
+
+    build_features = evidence.get("build_features")
+    required_features = {"default", "storage-tikv", "jwks", "ml"}
+    if not isinstance(build_features, list) or any(not isinstance(feature, str) for feature in build_features):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence build_features must be a string list"))
+        build_features = []
+    if not required_features.issubset(set(build_features)):
+        missing = sorted(required_features - set(build_features))
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb binary evidence is missing official build features: {', '.join(missing)}"))
+
+    source_paths = evidence.get("source_paths")
+    if not isinstance(source_paths, list) or not source_paths or any(
+        not isinstance(path, str) or not path.strip() or Path(path).is_absolute() or ".." in Path(path).parts
+        for path in source_paths
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence source_paths must be non-empty safe upstream-relative paths"))
+
+    fixes = evidence.get("advisory_fix_versions")
+    conditions = evidence.get("advisory_conditions")
+    advisory_paths = evidence.get("advisory_source_paths")
+    advisory_features = evidence.get("advisory_features")
+    if not isinstance(fixes, dict) or set(fixes) != set(advisory_findings):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence advisory_fix_versions must cover exactly every recorded GHSA"))
+        fixes = {}
+    if not isinstance(conditions, dict) or set(conditions) != set(advisory_findings):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence advisory_conditions must cover exactly every recorded GHSA"))
+        conditions = {}
+    if not isinstance(advisory_paths, dict) or set(advisory_paths) != set(advisory_findings):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence advisory_source_paths must cover exactly every recorded GHSA"))
+        advisory_paths = {}
+    if not isinstance(advisory_features, dict) or set(advisory_features) != set(advisory_findings):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb binary evidence advisory_features must cover exactly every recorded GHSA"))
+        advisory_features = {}
+
+    configured_version = _release_version(surreal.get("version"))
+    for advisory_id in sorted(advisory_findings):
+        fixed_version = _release_version(fixes.get(advisory_id)) if isinstance(fixes, dict) else None
+        if fixed_version is None or (configured_version is not None and fixed_version <= configured_version):
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb binary evidence fixed version for {advisory_id} must be newer than the pinned vulnerable artifact"))
+        condition = conditions.get(advisory_id) if isinstance(conditions, dict) else None
+        if not isinstance(condition, str) or not condition.strip():
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb binary evidence condition for {advisory_id} is missing"))
+        paths = advisory_paths.get(advisory_id) if isinstance(advisory_paths, dict) else None
+        if not isinstance(paths, list) or not paths or any(
+            not isinstance(path, str) or not path.strip() or Path(path).is_absolute() or ".." in Path(path).parts
+            for path in paths
+        ):
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb binary evidence source path for {advisory_id} is missing or unsafe"))
+        features = advisory_features.get(advisory_id) if isinstance(advisory_features, dict) else None
+        if not isinstance(features, list) or not features or any(
+            not isinstance(feature, str) or feature not in build_features for feature in features
+        ):
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb binary evidence features for {advisory_id} are missing or outside the official build"))
+
+    return {
+        "status": evidence.get("status"),
+        "source_repository": evidence.get("source_repository"),
+        "source_tag": evidence.get("source_tag"),
+        "source_commit": source_commit,
+        "build_target": evidence.get("build_target"),
+        "build_features": build_features,
+        "build_command": evidence.get("build_command"),
+        "source_paths": source_paths,
+        "advisory_fix_versions": fixes,
+        "advisory_conditions": conditions,
+        "advisory_source_paths": advisory_paths,
+        "advisory_features": advisory_features,
+    }
+
+
+def _validate_patched_candidate(
+    surreal: dict, catalog: dict, advisory_fix_versions: dict, findings: list[Finding]
+) -> dict:
+    """Validate a project-local release lock without treating metadata as installed bytes."""
+
+    candidate = surreal.get("patched_candidate")
+    required = (
+        "status",
+        "name",
+        "version",
+        "architecture",
+        "pe_machine",
+        "sha256",
+        "release_source",
+        "release_asset",
+        "source_tag",
+        "source_commit",
+        "build_target",
+        "build_features",
+        "build_command",
+        "provisioning",
+        "installation_approval",
+    )
+    if not isinstance(candidate, dict):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate must be a project-local release lock table"))
+        return {}
+    for field in required:
+        if field not in candidate:
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb patched_candidate missing '{field}'"))
+
+    if candidate.get("status") != "release_locked_not_staged":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate status must remain release_locked_not_staged until a project-local artifact is staged"))
+    if candidate.get("provisioning") != "project_local_lock_only":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate provisioning must be project_local_lock_only"))
+    if candidate.get("installation_approval") != "not-issued":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate cannot issue installation approval"))
+    if candidate.get("name") != surreal.get("name"):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate name must match the external executable"))
+    if candidate.get("architecture") != "windows-x64" or candidate.get("pe_machine") != "8664":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate must pin the Windows x64 PE identity"))
+    candidate_sha = str(candidate.get("sha256", "")).lower()
+    if not _HEX64.fullmatch(candidate_sha):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate sha256 must be a 64-character hexadecimal digest"))
+    candidate_version = _release_version(candidate.get("version"))
+    current_version = _release_version(surreal.get("version"))
+    if candidate_version is None or current_version is None or candidate_version <= current_version:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate version must be newer than the installed/pinned vulnerable version"))
+    if isinstance(advisory_fix_versions, dict):
+        fixed_versions = [_release_version(value) for value in advisory_fix_versions.values()]
+        fixed_versions = [value for value in fixed_versions if value is not None]
+        if candidate_version is None or (fixed_versions and candidate_version < max(fixed_versions)):
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate version does not cover every recorded advisory fix version"))
+
+    for field in ("release_source", "release_asset"):
+        value = candidate.get(field)
+        if not isinstance(value, str) or not value.startswith("https://"):
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb patched_candidate {field} must be an HTTPS URL"))
+    if candidate.get("source_tag") != f"v{candidate.get('version')}":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate source_tag must identify its release version"))
+    if not isinstance(candidate.get("source_commit"), str) or not _HEX40.fullmatch(candidate.get("source_commit", "")):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate source_commit must be a 40-character source tag commit"))
+    if candidate.get("build_target") != "x86_64-pc-windows-msvc":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate build_target must be x86_64-pc-windows-msvc"))
+    build_features = candidate.get("build_features")
+    required_features = {"default", "storage-tikv", "jwks", "ml"}
+    if not isinstance(build_features, list) or not required_features.issubset(set(build_features)):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate build_features must include default, storage-tikv, jwks and ml"))
+    expected_command = (
+        "cargo build --no-default-features --features default "
+        "--features storage-tikv,jwks,ml --locked --target x86_64-pc-windows-msvc"
+    )
+    if candidate.get("build_command") != expected_command:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate build_command does not match the official Windows action"))
+
+    catalog_candidate = catalog.get("patched_candidate") if isinstance(catalog, dict) else None
+    if not isinstance(catalog_candidate, dict):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb catalog is missing the patched_candidate release lock"))
+    else:
+        for field in required:
+            if catalog_candidate.get(field) != candidate.get(field):
+                findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb catalog patched_candidate differs from configured field '{field}'"))
+
+    return {
+        "status": candidate.get("status"),
+        "name": candidate.get("name"),
+        "version": candidate.get("version"),
+        "architecture": candidate.get("architecture"),
+        "pe_machine": candidate.get("pe_machine"),
+        "sha256": candidate_sha,
+        "release_source": candidate.get("release_source"),
+        "release_asset": candidate.get("release_asset"),
+        "source_tag": candidate.get("source_tag"),
+        "source_commit": candidate.get("source_commit"),
+        "build_target": candidate.get("build_target"),
+        "build_features": candidate.get("build_features"),
+        "build_command": candidate.get("build_command"),
+        "provisioning": candidate.get("provisioning"),
+        "installation_approval": candidate.get("installation_approval"),
+    }
+
+
 def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
     evidence: dict = {}
@@ -741,6 +966,8 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
         "advisory_ecosystem",
         "advisory_scope",
         "distributed_binary_applicability",
+        "distributed_binary_evidence",
+        "patched_candidate",
         "advisory_source",
         "advisory_query",
         "advisory_checked_at",
@@ -787,6 +1014,8 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb advisory_scope must be rust-crate"))
     if binary_applicability not in {"unestablished", "established"}:
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb distributed_binary_applicability is unsupported"))
+    elif binary_applicability != "established":
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb distributed_binary_applicability must be established by official source-build evidence"))
 
     advisory_query = surreal.get("advisory_query")
     if not isinstance(advisory_query, str) or not advisory_query.strip():
@@ -849,6 +1078,8 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
                 )
             )
 
+    binary_evidence = _validate_surreal_binary_evidence(surreal, advisory_findings, findings)
+
     observed_path_value = surreal.get("observed_path")
     observed_path: Path | None = None
     observed_sha = None
@@ -902,6 +1133,7 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
     )
     findings.extend(catalog_findings)
     catalog_evidence: dict = {"status": "not_observed"}
+    catalog: dict = {}
     if catalog_path is not None:
         catalog_rel = str(catalog_path.relative_to(root)).replace("\\", "/")
         try:
@@ -915,6 +1147,7 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
                 "version": catalog.get("version"),
                 "sha256_pin": catalog.get("sha256"),
                 "architecture": catalog.get("architecture"),
+                "patched_candidate": catalog.get("patched_candidate"),
             }
             if catalog.get("artifact") != str(surreal.get("name", "")):
                 findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb catalog artifact does not match executable name"))
@@ -924,6 +1157,13 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
             catalog_evidence = {"status": "invalid", "path": catalog_rel}
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"malformed surrealdb catalog: {exc}"))
 
+    candidate_evidence = _validate_patched_candidate(
+        surreal,
+        catalog,
+        binary_evidence.get("advisory_fix_versions", {}),
+        findings,
+    )
+
     evidence[name] = {
         "status": "findings" if findings else "observed",
         "configured": surreal,
@@ -931,6 +1171,7 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
             "version": surreal.get("version"),
             "sha256": configured_sha,
             "catalog": catalog_evidence,
+            "patched_candidate": candidate_evidence,
         },
         "observed_installed": {
             "path": str(observed_path.resolve()) if observed_path else None,
@@ -950,6 +1191,7 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
             "status": advisory_status,
             "findings": sorted(advisory_findings),
             "distributed_binary_applicability": binary_applicability,
+            "distributed_binary_evidence": binary_evidence,
             "release_source": release_source,
             "release_asset": release_asset,
             "source_tag": source_tag,
