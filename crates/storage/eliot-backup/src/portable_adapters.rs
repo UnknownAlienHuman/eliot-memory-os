@@ -9,9 +9,8 @@
 //! associated data binds the backup/blob/lineage identity through
 //! length-framed domain-separated fields, so envelopes
 //! cannot move across archives, blobs, or lineages. Keys arrive as
-//! caller-supplied 32-byte copies resolved by the coordinator from its
-//! admitted secret surface ("copies", not handles: raw key material, not
-//! capability references): this module never fetches, persists, mints, or
+//! `PortableSecretKey` values resolved by the coordinator from its admitted
+//! secret surface: this module never fetches, persists, mints, or
 //! exports key material. Unwrapped keys and plaintext live in memory only
 //! inside vetted zeroizing wrappers; the only success outputs are sealed
 //! bytes, descriptors, digests, and receipts.
@@ -66,8 +65,8 @@ impl std::fmt::Debug for UnwrappedPortableKey {
 /// Memory-only 32-byte key material for admitted resolution.
 ///
 /// Carries KEK or destination data-key bytes from the coordinator's
-/// admitted secret surface to exactly one restore call. This is raw key
-/// material in memory, not a capability reference; it zeroizes via the
+/// admitted secret surface to exactly one restore call. It is raw key
+/// material in memory, not a capability reference, and zeroizes via the
 /// vetted `zeroize` RAII wrapper.
 /// Content never Debug-printed, serialized, or logged.
 pub struct PortableSecretKey {
@@ -135,37 +134,34 @@ pub trait PortableKeyVault: Send + Sync {
 /// admitted secret surface.
 pub struct AdmittedKeyMap {
     backup_id: String,
-    keks: std::collections::BTreeMap<String, Zeroizing<[u8; PORTABLE_KEY_BYTES]>>,
-    dest_keys: std::collections::BTreeMap<String, Zeroizing<[u8; PORTABLE_KEY_BYTES]>>,
+    keks: std::collections::BTreeMap<String, PortableSecretKey>,
+    dest_keys: std::collections::BTreeMap<String, PortableSecretKey>,
 }
 
 impl AdmittedKeyMap {
-    /// Admits explicit key material for exactly one backup archive.
+    /// Admits already-zeroizing key material for exactly one backup archive.
     ///
-    /// Caller-side arrays are copied into zeroizing storage; the caller's
-    /// originals remain the provisioning surface's responsibility.
+    /// Callers construct values with [`PortableSecretKey::new`] before
+    /// inserting them into the maps. This guarantees that key values owned by
+    /// these maps are zeroized even when backup or identity validation returns
+    /// an error.
     ///
     /// # Errors
     ///
     /// Returns [`BackupError::InvalidField`] for blank backup or map ids.
     pub fn for_backup(
         backup_id: String,
-        keks: std::collections::BTreeMap<String, [u8; PORTABLE_KEY_BYTES]>,
-        dest_keys: std::collections::BTreeMap<String, [u8; PORTABLE_KEY_BYTES]>,
+        keks: std::collections::BTreeMap<String, PortableSecretKey>,
+        dest_keys: std::collections::BTreeMap<String, PortableSecretKey>,
     ) -> Result<Self, BackupError> {
         text(&backup_id, "restore.backup_id")?;
         for id in keks.keys().chain(dest_keys.keys()) {
             text(id, "restore.key_identity")?;
         }
-        let wrap = |map: std::collections::BTreeMap<String, [u8; PORTABLE_KEY_BYTES]>| {
-            map.into_iter()
-                .map(|(id, bytes)| (id, Zeroizing::new(bytes)))
-                .collect()
-        };
         Ok(Self {
             backup_id,
-            keks: wrap(keks),
-            dest_keys: wrap(dest_keys),
+            keks,
+            dest_keys,
         })
     }
 }
@@ -179,7 +175,7 @@ impl PortableKeyVault for AdmittedKeyMap {
         text(wrapping_key_id, "key_manifest.wrapping_key_id")?;
         self.keks
             .get(wrapping_key_id)
-            .map(|key| PortableSecretKey::new(**key))
+            .map(|key| PortableSecretKey::new(*key.expose()))
             .ok_or(BackupError::MissingRecoveryComponent("blob_key_material"))
     }
 
@@ -187,7 +183,7 @@ impl PortableKeyVault for AdmittedKeyMap {
         text(key_lineage, "restore.dest_key_lineage")?;
         self.dest_keys
             .get(key_lineage)
-            .map(|key| PortableSecretKey::new(**key))
+            .map(|key| PortableSecretKey::new(*key.expose()))
             .ok_or(BackupError::MissingRecoveryComponent("blob_key_material"))
     }
 }
@@ -197,9 +193,9 @@ impl PortableKeyVault for AdmittedKeyMap {
 /// Binds the vault to the archive (`vault.backup_id` must equal
 /// `manifest.backup_id`), resolves the source KEK and the destination data
 /// key through the vault, then runs [`restore_portable_blob`]. This is the
-/// composition entry the coordinator calls per sealed blob: no raw key
-/// crosses the coordinator/adapter boundary except inside zeroizing
-/// handles, and every refusal fails the phase closed.
+/// composition entry the coordinator calls per sealed blob: key material
+/// crosses the coordinator/adapter boundary only inside `PortableSecretKey`,
+/// and every refusal fails the phase closed.
 ///
 /// # Errors
 ///

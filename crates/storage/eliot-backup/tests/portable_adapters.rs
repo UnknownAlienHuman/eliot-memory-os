@@ -11,8 +11,8 @@
 
 use eliot_backup::{
     AdmittedKeyMap, BackupBlob, BackupError, BlobRestorationReceipt, DestinationScope,
-    PORTABLE_ENVELOPE_ALGORITHM, WrappedKeyEntry, WrappedKeyManifest, portable_blob_ad,
-    portable_keywrap_ad, restore_portable_blob, restore_portable_blob_admitted,
+    PORTABLE_ENVELOPE_ALGORITHM, PortableSecretKey, WrappedKeyEntry, WrappedKeyManifest,
+    portable_blob_ad, portable_keywrap_ad, restore_portable_blob, restore_portable_blob_admitted,
     rewrap_portable_data_key, seal_portable_envelope, verify_portable_restorable,
 };
 use eliot_blob_api::{
@@ -223,9 +223,9 @@ fn admitted_vault_binds_portable_restore_to_backup_and_ids() {
     let plaintext = b"admitted-portable-plaintext-1873x";
     let (blob, manifest, receipt) = full_triple(plaintext);
     let mut keks = std::collections::BTreeMap::new();
-    keks.insert(WRAPPING_ID.to_owned(), KEK_A);
+    keks.insert(WRAPPING_ID.to_owned(), PortableSecretKey::new(KEK_A));
     let mut dest_keys = std::collections::BTreeMap::new();
-    dest_keys.insert(DEST_LINEAGE.to_owned(), DEST_KEY);
+    dest_keys.insert(DEST_LINEAGE.to_owned(), PortableSecretKey::new(DEST_KEY));
     let vault = AdmittedKeyMap::for_backup(BACKUP_ID.to_owned(), keks, dest_keys)
         .expect("admitted key map");
 
@@ -234,6 +234,18 @@ fn admitted_vault_binds_portable_restore_to_backup_and_ids() {
             .expect("admitted restore must succeed");
     assert_eq!(restored.source_plaintext_sha256, sha256_hex(plaintext));
     assert_eq!(restored.dest_crypto.key_lineage.as_str(), DEST_LINEAGE);
+}
+
+#[test]
+fn admitted_vault_rejects_invalid_identity_after_zeroizing_ingress() {
+    let mut keks = std::collections::BTreeMap::new();
+    keks.insert(String::new(), PortableSecretKey::new(KEK_A));
+    let result = AdmittedKeyMap::for_backup(
+        String::new(),
+        keks,
+        std::collections::BTreeMap::new(),
+    );
+    assert!(matches!(result, Err(BackupError::InvalidField { .. })));
 }
 
 #[test]
