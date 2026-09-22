@@ -728,8 +728,9 @@ pub enum EvaluationIntegrityStatus {
 /// The current `EvalCase` API supplies declarations and fixture metadata, but
 /// no runtime artifact, effect trace, independent oracle, or second route.
 /// This projection therefore remains `INCONCLUSIVE` at the explicit
-/// `STRUCTURAL_ONLY` proof ceiling. It is a report reference for the existing
-/// eval result path, not ProductProof or a durable canonical receipt.
+/// `STRUCTURAL_ONLY` proof ceiling. It is an in-memory advisory projection for
+/// the existing eval result path; `EvalCaseResult` does not retain it, so it is
+/// not ProductProof or a durable canonical receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EvaluationIntegrityReceipt {
     pub receipt_id: String,
@@ -785,12 +786,6 @@ pub struct EvaluationIntegrityReceipt {
     pub unobserved_measurement_kinds: Vec<EvalMeasurementKind>,
     pub status: EvaluationIntegrityStatus,
     pub proof_ceiling: String,
-}
-
-impl EvaluationIntegrityReceipt {
-    fn receipt_ref(&self) -> String {
-        self.receipt_id.clone()
-    }
 }
 
 pub struct EvalRunnerService;
@@ -914,18 +909,38 @@ impl EvalMeasurementService {
             .map(|spec| Self::measure(case, spec))
             .collect::<Vec<_>>();
         let receipt = Self::evaluation_integrity_receipt(case, &measurements);
+        let mut errors = Vec::new();
         let failed_required = case.criteria.iter().any(|criterion| {
-            criterion.required
-                && measurements.iter().any(|measurement| {
-                    measurement.measurement_id == criterion.measurement_id && !measurement.passed
-                })
+            if !criterion.required {
+                return false;
+            }
+            match measurements
+                .iter()
+                .find(|measurement| measurement.measurement_id == criterion.measurement_id)
+            {
+                Some(measurement) => !measurement.passed,
+                None => {
+                    errors.push(format!(
+                        "required criterion {} has no matching measurement result ({})",
+                        criterion.criterion_id, criterion.measurement_id
+                    ));
+                    true
+                }
+            }
         });
         let not_implemented = measurements.iter().any(|measurement| {
             measurement
                 .observed
                 .starts_with(NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX)
         });
-        let status = if not_implemented {
+        let integrity_not_measured = receipt.status != EvaluationIntegrityStatus::Measured;
+        if integrity_not_measured {
+            errors.push(format!(
+                "evaluation integrity receipt is {:?}; case cannot claim a measured result",
+                receipt.status
+            ));
+        }
+        let status = if integrity_not_measured || not_implemented {
             EvalCaseStatus::NotYetImplemented
         } else if failed_required {
             EvalCaseStatus::Failed
@@ -938,11 +953,8 @@ impl EvalMeasurementService {
             family: case.family,
             status,
             measurements,
-            produced_refs: vec![
-                format!("eval:{}:report", family_slug(case.family)),
-                receipt.receipt_ref(),
-            ],
-            errors: Vec::new(),
+            produced_refs: vec![format!("eval:{}:report", family_slug(case.family))],
+            errors,
             duration_ms: 0,
         }
     }
@@ -1020,7 +1032,8 @@ impl EvalMeasurementService {
                 "EvalCase declarations and fixture metadata".to_owned(),
             ],
             human_visible_inputs: vec![
-                "receipt status, proof ceiling and produced reference".to_owned(),
+                "receipt status and proof ceiling; no durable receipt reference is emitted"
+                    .to_owned(),
             ],
             reference_leakage_checks: vec![
                 "not run: no blind worker/evaluator separation on this path".to_owned(),
@@ -1090,33 +1103,19 @@ impl EvalMeasurementService {
         }
     }
 
-    pub fn measure(case: &EvalCase, spec: &EvalMeasurementSpec) -> EvalMeasurementResult {
-        let expected = spec.expected_ref.clone().unwrap_or_default();
+    pub fn measure(_case: &EvalCase, spec: &EvalMeasurementSpec) -> EvalMeasurementResult {
         let (passed, observed, evidence_refs) = match spec.kind {
-            EvalMeasurementKind::MustIncludeEvidence => {
-                (
-                    !expected.trim().is_empty() && case.expected_evidence_refs.contains(&expected),
-                    "structural case declaration matched; runtime artifact not observed".to_owned(),
-                    case.expected_evidence_refs.clone(),
-                )
-            }
-            EvalMeasurementKind::MustExcludeEvidence => (
-                !case.expected_evidence_refs.contains(&expected),
-                "structural case declaration matched; runtime artifact not observed".to_owned(),
-                case.expected_evidence_refs.clone(),
+            EvalMeasurementKind::MustIncludeEvidence
+            | EvalMeasurementKind::MustExcludeEvidence
+            | EvalMeasurementKind::MustBlockAction
+            | EvalMeasurementKind::MustRequireVerifier => (
+                false,
+                format!(
+                    "{NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX} {:?} has only a case declaration; a runtime artifact or effect observation is required",
+                    spec.kind
+                ),
+                Vec::new(),
             ),
-            EvalMeasurementKind::MustBlockAction => (
-                case.forbidden_effects.contains(&expected),
-                "structural case declaration matched; runtime artifact not observed".to_owned(),
-                case.expected_evidence_refs.clone(),
-            ),
-            EvalMeasurementKind::MustRequireVerifier => {
-                (
-                    case.expected_evidence_refs.contains(&expected),
-                    "structural case declaration matched; runtime artifact not observed".to_owned(),
-                    case.expected_evidence_refs.clone(),
-                )
-            }
             EvalMeasurementKind::MustPreserveTaint
             | EvalMeasurementKind::MustNotMutate
             | EvalMeasurementKind::MustGenerateVerdict
