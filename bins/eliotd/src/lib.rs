@@ -41,6 +41,7 @@ mod capability_admission;
 mod capability_evidence_wiring;
 pub mod capability_outcome;
 mod controlboard_adapters;
+pub mod controlboard_serve;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
@@ -722,6 +723,23 @@ impl DaemonComposition {
             // attach; empty until that attach lands, never fabricated.
             self.notification_snapshot.clone(),
         ))
+    }
+
+    /// Serves one live `ControlBoard` inbox for the single owner session (#1780).
+    ///
+    /// Dedicated daemon serve path over the current Governor projection
+    /// snapshot: admits the serve request from the held Kernel-issued owner
+    /// facts (unadmitted when absent), builds one board through
+    /// [`Self::controlboard`], and serves the exact-revision inbox section
+    /// via [`controlboard_serve`]. No owner session → typed access-resolver
+    /// gap; Governor not ready → composition error; view refusals → typed
+    /// board gaps. Pure in-memory reads: no I/O, no new thread, no stored
+    /// client, no run-loop change.
+    pub fn serve_controlboard_inbox(
+        &self,
+    ) -> Result<controlboard_serve::ServedBoardInbox, controlboard_serve::ControlboardServeError>
+    {
+        controlboard_serve::serve_live_inbox(self.owner_session.as_ref(), || self.controlboard())
     }
 
     /// Borrows the single Governor Skill lifecycle owner as a forwarding

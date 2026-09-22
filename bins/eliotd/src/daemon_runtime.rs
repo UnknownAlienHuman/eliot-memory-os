@@ -282,6 +282,36 @@ pub(super) fn run() -> Result<(), String> {
             .emit();
         }
     }
+    // #1780: serve the populated board inbox at the same attach site (server
+    // caller). The server builds one board over the current snapshot through
+    // the composition and serves the exact-revision inbox for the admitted
+    // owner session; a gap (unadmitted session, unready Governor, view
+    // refusal) degrades to diagnostics exactly like the attach path above: it
+    // emits an error record and never fails readiness for an unservable
+    // inbox. No new thread, no new transport, no run-loop change.
+    match composition.serve_controlboard_inbox() {
+        Ok(served) => {
+            let evidence = eliotd::controlboard_serve::served_inbox_evidence(&served);
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.controlboard_inbox_served",
+                inbox_total = evidence.total,
+                inbox_unresolved = evidence.unresolved,
+                inbox_critical_unresolved = evidence.critical_unresolved,
+                inbox_failed_delivery = evidence.failed_delivery_unresolved,
+                inbox_acknowledged_unresolved = evidence.acknowledged_unresolved,
+                inbox_resolved = evidence.resolved,
+            );
+        }
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "controlboard-inbox",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
     // T12-06: gated Dreamer intake registration at the same attach site. The
     // readiness-gated accessor plus the fence-bound route-context check prove
     // the intake wiring before readiness is reported; no thread, no transport,

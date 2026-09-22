@@ -74,10 +74,10 @@ use super::daemon_kernel_client::OwnerSessionFacts;
 /// admitting it twice. `admitted` carries owner-issued session bindings for
 /// the access resolver; production passes none (the session owner is
 /// deferred), which keeps the unadmitted typed gap. `notifications` carries
-/// pre-fetched canonical notification records (issue #1780) from an
-/// authenticated `GetNotificationState` read at the snapshot fence;
-/// production passes none until the daemon wires that read, which keeps the
-/// inbox empty rather than fabricated.
+/// pre-fetched canonical notification records (issue #1780) from the
+/// authenticated `GetNotificationState` startup attach at the snapshot fence;
+/// production passes the runtime-noted snapshot (empty until that attach
+/// lands), which keeps the inbox empty rather than fabricated.
 pub(crate) fn controlboard_over_snapshot(
     snapshot: ControlBoardGovernorSnapshot,
     shared: &SharedOperatorReplay,
@@ -266,6 +266,15 @@ impl AdmittedSessionAccess {
             // Kernel authority.
             now.saturating_add(300_000),
         )
+    }
+
+    /// Session id of this admitted binding for daemon serve requests.
+    ///
+    /// The id comes only from the owner-issued `sid=..;session=..` binding
+    /// parsed by [`Self::from_kernel_owner_facts`]; serve requests mint
+    /// nothing of their own.
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     fn validate(&self) -> Result<Self, PortError> {
@@ -491,11 +500,9 @@ impl CanonicalStatePort for GovernorCanonicalState {
             items: Vec::new(),
             reviews: Vec::new(),
             provenance: Vec::new(),
-            // Canonical notification records supplied pre-fetched by the
-            // board constructor (issue #1780). The daemon does not yet read
-            // notification state into its snapshot composition, so production
-            // passes none here; an empty supply reads as an empty inbox,
-            // never as resolved or suppressed state.
+            // Canonical notification records noted by the startup
+            // `GetNotificationState` attach (issue #1780). An empty supply
+            // reads as an empty inbox, never as resolved or suppressed state.
             notifications: self.notifications.clone(),
         };
         state
