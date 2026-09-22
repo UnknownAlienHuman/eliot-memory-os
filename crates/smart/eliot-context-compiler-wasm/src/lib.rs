@@ -48,4 +48,6 @@ pub use descriptor::{
 };
 pub use export::{qualified_export_name, run, run_with_ledger};
 #[cfg(not(target_arch = "wasm32"))]
-pub use governed_compose::{ComposeError, GovernedCompilation, compose_governed_compilation};
+pub use governed_compose::{
+    ComposeError, GovernedCompilation, HonorError, check_honored_output, compose_governed_compilation,
+};

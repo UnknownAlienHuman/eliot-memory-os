@@ -787,6 +787,8 @@ pub fn retrieve_for_attempt(
 /// `archive` revokes it. The backlog registry handle is non-optional on
 /// this governed path: pass the production [`BoundedBacklog`] even for
 /// overlay-only retrieval.
+///
+/// `now` MUST be owner/host-sourced live time, never a requester value.
 pub struct GovernedRetrieval<'a> {
     pub requesting_campaign_id: &'a str,
     pub requesting_task_id: &'a str,
