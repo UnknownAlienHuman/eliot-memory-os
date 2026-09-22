@@ -1,12 +1,12 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r2"
-revision = 2
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22"
-supersedes_freeze_digest = "sha256:8aad397375a1c71da433a55d8a3881c5c009524e51fa7ec70f3ed77376727f13"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r3"
+revision = 3
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r2"
+supersedes_freeze_digest = "sha256:05e96b5e1edca044ec1831853b7d5a62135a47538b4ba9c97da39fba44012fbd"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
-purpose = "Single versioned upstream projection surface for #223 Wave 1 projection packages. Reuses exact public fields, type owners, version-compatibility rules, scope/fence bindings, and denominator definitions from existing memory-projection, context, learning, and epistemic contracts. No invented authority, no guessed cell mapping."
+purpose = "Single versioned upstream projection surface for #223 Wave 1 projection packages. Reuses exact public fields, type owners, version-compatibility rules, scope/fence bindings, and denominator definitions from memory-projection, context, learning, epistemic, dreamer, and observation contracts. No invented authority, no guessed cell mapping."
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
@@ -274,6 +274,175 @@ crate = "eliot-epistemic-contracts"
 rust_path = "eliot_epistemic_contracts enums"
 fields = ["AdmittedKind{CURRENT_EPISTEMIC_POSITION}", "Currentness{Current, Superseded}"]
 
+[[frozen_type]]
+crate = "eliot-epistemic-contracts"
+rust_path = "eliot_epistemic_contracts::ProviderContribution"
+fields = ["contract_version", "view_kind", "position_digest", "claim", "currentness", "scope", "fence", "source_revision", "coverage_digest", "receipt_digest"]
+scope_fence_fields = ["scope", "fence"]
+denominator_note = "Whole envelope or error: construction runs closed position validation, so completeness is derived from the governing records. Currentness is the owner verdict at contribution time; no partial contributions and no omission entries exist. Provider-neutral: no per-provider identity or request state."
+
+[[upstream_crate]]
+crate = "eliot-dreamer-contracts"
+source_path = "crates/smart/eliot-dreamer-contracts"
+contract_name = "eliot.smart.dreamer.contracts"
+contract_version = "1.0.0"
+version_scheme = "hub string, equality only (not a ContractVersion triple)"
+self_query_schema = 1
+frozen = true
+role = "Provider-neutral Dreamer contract hub: job/bundle/draft/candidate schemas plus the self-query input, accepted-source, anchor, and denominator vocabulary (A-03 owner, merged PR #1060). Performs shape and binding checks only."
+
+[[frozen_type]]
+crate = "eliot-dreamer-contracts"
+rust_path = "eliot_dreamer_contracts::self_query::SelfQueryInput"
+fields = ["schema_version", "validated_candidate", "profile", "attempt", "question", "source_bundle_handle", "source", "anchors", "denominator", "policy", "usage", "preservation", "invalidation_conditions"]
+scope_fence_fields = ["validated_candidate job/bundle/receipt bindings"]
+denominator_note = "Denominator travels as ArchitectureDependencyDenominator with frozen digest; binding checks pin job class, bundle/job/receipt/grounded/validated joins, policy, preservation, and question. The canonical input_digest() identifies the validated closure for brief projectors."
+
+[[frozen_type]]
+crate = "eliot-dreamer-contracts"
+rust_path = "eliot_dreamer_contracts::self_query::ArchitectureSourceSnapshot"
+fields = ["schema_version", "source_handle", "owner", "revision", "digest", "status", "pair", "acceptance_receipt", "bytes", "supersedes", "invalidation"]
+denominator_note = "Full snapshot with bytes for brief projection. Accepted status additionally requires non-empty bytes, matching acceptance receipt and owner, and digest over bytes."
+
+[[frozen_type]]
+crate = "eliot-dreamer-contracts"
+rust_path = "eliot_dreamer_contracts::self_query::NormativePairBinding"
+fields = ["architecture_digest", "implementation_digest", "pair_key", "document_set", "architecture_revision", "implementation_revision", "accepted_by", "acceptance_receipt"]
+denominator_note = "Edition identity: pair_key is sha256: plus 64 hex (71 chars total)."
+
+[[frozen_type]]
+crate = "eliot-dreamer-contracts"
+rust_path = "eliot_dreamer_contracts::self_query::ArchitectureAnchor"
+fields = ["schema_version", "anchor_id", "source_handle", "revision", "source_digest", "byte_start", "byte_end", "class", "modality", "text", "applicability", "dependency_refs"]
+denominator_note = "Byte-range citation validated against its snapshot: lineage triple must match, range must land inside bytes, excerpt text must match."
+
+[[frozen_type]]
+crate = "eliot-dreamer-contracts"
+rust_path = "eliot_dreamer_contracts::self_query::ArchitectureDependencyDenominator"
+fields = ["schema_version", "denominator_id", "members", "complete", "digest"]
+denominator_note = "Members carry member/anchor/source identities; complete with empty members is rejected; digest recomputed over (schema, id, members, complete)."
+
+[[frozen_type]]
+crate = "eliot-dreamer-contracts"
+rust_path = "eliot_dreamer_contracts::self_query::AcceptedSourceRef"
+fields = ["source_handle", "owner", "revision", "digest", "status", "acceptance_receipt"]
+denominator_note = "Handle-bound citation without bytes. Status must be Accepted; joins acceptance lineage without source bytes."
+
+[[frozen_type]]
+crate = "eliot-dreamer-contracts"
+rust_path = "eliot_dreamer_contracts::self_query::AcceptedSourceProjection"
+fields = ["schema_version", "projection_id", "pair", "fence", "sources", "digest"]
+scope_fence_fields = ["fence"]
+denominator_note = "Covers exactly its listed refs; no completeness claim. Pair pins the edition, fence is carried for edge gating, cited triples revalidate by exact match (stale on any drift, no similarity fallback)."
+
+[[upstream_crate]]
+crate = "eliot-observation-contracts"
+source_path = "crates/foundation/eliot-observation-contracts"
+contract_name = "eliot.foundation.observation-contracts"
+contract_version = "1.0.0"
+frozen = true
+role = "Observation obligation, coverage, gap, record-family, handle, and experience-projection contracts (C0-11). The live journal stays Governor-owned; this crate owns versioned wire shapes."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::SystemObservationJournalRecord"
+fields = ["record_id", "kind", "event", "coverage_gap", "journal_control_event", "parent_record_id"]
+denominator_note = "Wire name for ObservationRecordEnvelope. CoverageGap kind pairs with a gap and no event; ordinary kinds pair with an event and no gap."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::CoverageEvidence"
+fields = ["disposition", "denominator_source_ref", "interval", "blind_intervals", "observed_count"]
+denominator_note = "Owner coverage posture with denominator provenance, cursor range, explicit blind spots, and owner-observed volume."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::CoverageGap"
+fields = ["gap_id", "obligation_profile_ref", "reason_ref", "affected_interval", "disposition", "protected", "evidence_refs"]
+denominator_note = "Explicit typed gap, never inferred from absent rows."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::CoverageDisposition"
+fields = ["Complete", "Partial", "IncompleteCoverage", "Unavailable", "Unknown", "Blind", "JournalReplayed"]
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::SourceRevisionHandle"
+fields = ["source_id", "revision", "content_sha256", "byte_length"]
+denominator_note = "Owner revision cursor: identity, immutable revision, content digest, length. Validated without opening bytes."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::ExperienceSourceFamily"
+fields = ["SystemObservationJournal", "SystemExperienceBank", "AgentFeedback"]
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::ExperienceRecordRef"
+fields = ["handle", "revision", "scope", "fence"]
+scope_fence_fields = ["scope", "fence"]
+denominator_note = "Opaque ref: owner revision cursor plus scope/fence echoes, no bodies. Echoes are checked against the envelope scope/fence."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::ProjectionOmissionClass"
+fields = ["ScopeMismatch", "FenceMismatch", "ProtectedWithheld", "TruncatedAtBound", "SupersededBeforeProjection"]
+denominator_note = "Closed omission classes. Free-form reason strings cannot cross this boundary; operational context travels in the bounded detail note."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::ProjectionOmission"
+fields = ["handle", "class", "detail"]
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::ProjectionCoverage"
+fields = ["evidence", "coverage_digest"]
+denominator_note = "Owner coverage binding: evidence plus the digest of the owner coverage evidence it repeats. Counts reconcile against carried members but never establish completeness alone."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::JournalProjection"
+fields = ["contract_version", "projection_id", "family", "scope", "fence", "source_revision", "records", "coverage", "omissions", "digest"]
+scope_fence_fields = ["scope", "fence"]
+denominator_note = "Full owner records; event-carrying records must name the envelope scope. Completeness requires owner Complete posture with exact count, empty omissions, and empty blind intervals."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::BankProjection"
+fields = ["contract_version", "projection_id", "family", "scope", "fence", "source_revision", "refs", "coverage", "omissions", "digest"]
+scope_fence_fields = ["scope", "fence"]
+denominator_note = "Opaque bank refs; no bank record type exists upstream so bodies cannot travel. Same completeness rule as the journal envelope."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::FeedbackProjection"
+fields = ["contract_version", "projection_id", "family", "scope", "fence", "source_revision", "refs", "coverage", "omissions", "digest"]
+scope_fence_fields = ["scope", "fence"]
+denominator_note = "Opaque feedback refs; no feedback receipt type exists upstream so bodies cannot travel. Same completeness rule as the journal envelope."
+
+[[bound]]
+crate = "eliot-observation-contracts"
+name = "MAX_PROJECTION_MEMBERS"
+value = 1024
+[[bound]]
+crate = "eliot-observation-contracts"
+name = "MAX_PROJECTION_OMISSIONS"
+value = 256
+[[bound]]
+crate = "eliot-observation-contracts"
+name = "MAX_DENOMINATOR_REF_CHARS"
+value = 1024
+[[bound]]
+crate = "eliot-observation-contracts"
+name = "MAX_OMISSION_DETAIL_CHARS"
+value = 256
+[[bound]]
+crate = "eliot-observation-contracts"
+name = "MAX_SOURCE_REVISION_CHARS"
+value = 256
+
 [[version_rule]]
 id = "VR-EXACT-CONTRACT-VERSION"
 rule = "A record, batch, set, or view written against a different ContractVersion triple is rejected with VersionMismatch. Equality only; no range, no negotiation."
@@ -299,6 +468,16 @@ id = "VR-FENCE-GATE"
 rule = "Cross-record or cross-projection acceptance requires StateFence::is_compatible_with against the governing fence. Incompatible material becomes a named omission or exclusion, never silent loss or filler."
 applies_to = ["all frozen types"]
 
+[[version_rule]]
+id = "VR-DREAMER-HUB-VERSION"
+rule = "The dreamer hub version is a string equality (1.0.0), not a ContractVersion triple; self_query shapes additionally require schema_version exactly 1. Mismatch fails closed."
+applies_to = ["eliot-dreamer-contracts"]
+
+[[version_rule]]
+id = "VR-EXACT-CONTRACT-VERSION-EXT"
+rule = "Same equality rule as VR-EXACT-CONTRACT-VERSION, extended to the observation family admitted in r3."
+applies_to = ["eliot-observation-contracts"]
+
 [[denominator]]
 id = "DEN-MEMORY-BATCH"
 definition = "DenominatorState::Known{total} over the read-side observed volume at the named batch fence, with explicit truncation frontier, named omissions, and revalidation flag. Every Complete state requires this exact independently recheckable denominator."
@@ -318,6 +497,11 @@ owner = "eliot-learning-contracts"
 id = "DEN-EPISTEMIC-CLOSURE"
 definition = "Coverage completeness derived only by explicit closed validation with the governing records (admission envelope, evidence, coverage, conflict, proof digests). Unknown, assumed, conflicted, and stale stay distinct."
 owner = "eliot-epistemic-contracts"
+
+[[denominator]]
+id = "DEN-EXPERIENCE-COVERAGE"
+definition = "Owner coverage binding per envelope: disposition plus denominator source ref plus coverage digest plus observed count plus explicit blind intervals. Carried members reconciling against observed volume is necessary but never sufficient; completeness additionally requires the owner Complete posture with exact count, empty omissions, and empty blind intervals. Bare counts never establish completeness."
+owner = "eliot-observation-contracts"
 
 [[cell_binding]]
 order = 44
@@ -352,7 +536,7 @@ order = 6
 crate = "eliot-epistemic-contracts"
 functional_cell = "smart.epistemic.contracts"
 frozen_inputs = []
-frozen_outputs = ["CurrentEpistemicPosition"]
+frozen_outputs = ["CurrentEpistemicPosition", "ProviderContribution"]
 
 [[cell_binding]]
 order = 76
@@ -374,7 +558,7 @@ order = 80
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.skill.lifecycle"
 frozen_inputs = ["HarnessActivationReceiptCandidate by handle"]
-blocked_inputs = ["Skill execution evidence typed projections (NOT_FROZEN)", "SystemObservationJournal/EliotSystemExperienceBank/AgentFeedbackReceipt typed projections (NOT_FROZEN)"]
+blocked_inputs = ["Skill/tool/job typed evidence projections (NOT_FROZEN: Governor SkillExecutionEvidence and protocol DurableJob* exist but carry no versioned owner-neutral projection status with per-sub-assessment denominators; no tool-definition version type exists)", "Journal/bank/feedback projections (contracts exist per unit #4; provider edge and pulse pending)"]
 consumer_of_freeze = true
 
 [[cell_binding]]
@@ -382,7 +566,7 @@ order = 85
 crate = "eliot-understanding-assessment"
 functional_cell = "smart.understanding.common_ground"
 frozen_inputs = ["ActiveUnderstandingView by handle"]
-blocked_inputs = ["accepted-source projection (NOT_FROZEN, CC-006)"]
+blocked_inputs = ["accepted-source projection (contract exists per unit #3; provider edge and pulse pending)"]
 consumer_of_freeze = true
 
 [[frozen_type]]
@@ -411,6 +595,18 @@ rust_path = "eliot_memory_projection_contracts::SelectionEntry"
 fields = ["handle", "kind", "disposition"]
 denominator_note = "Selected entries passed the allowlist; NotSelected entries carry ExclusionReason::Rejected with trace-local meaning (rejected by the explicit allowlist in this trace, not a governed verdict)."
 
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::SelectionCoverage"
+fields = ["considered", "selected", "not_selected"]
+denominator_note = "Exactly the presented records: considered equals entries length, selected plus not_selected equals considered. A different type from the batch denominator with different field names, so the batch total can never be echoed here."
+
+[[frozen_type]]
+crate = "eliot-memory-projection-contracts"
+rust_path = "eliot_memory_projection_contracts::SelectionDisposition"
+fields = ["SELECTED", "NOT_SELECTED{reason}"]
+denominator_note = "Trace-local outcome only. NOT_SELECTED always carries ExclusionReason::Rejected with the allowlist meaning above; selection entries never enter ApplicableMemorySet."
+
 [[challenge_closure]]
 challenge = "CC-MEMORY-PROJECTION-SCHEMA"
 status = "CLOSED_BY_OWNER_CONTRACT"
@@ -424,6 +620,51 @@ removed_in = "work/223-rev12-freeze commit 1e69357a"
 disposition = "REMOVED_SUPERSEDED"
 reason = "Candidate-query package duplicated the then-NOT_FROZEN selection surface and lost coverage semantics. Superseded by the owner selection schema above; the batch-to-applicability edge is preserved untouched. Recorded here so the removal is explicit, not silent."
 
+[[challenge_closure]]
+challenge = "CC-PROVIDER-CONTRIBUTION-SCHEMA"
+status = "CLOSED_BY_OWNER_CONTRACT"
+closed_by = "eliot-epistemic-contracts contribution.rs (ProviderContribution::contribute/validate with closed position validation and envelope binding)"
+note = "Owner-neutral envelope with whole-envelope-or-error denominator semantics. The rev12 closed seven-class provider enum stays open below; it is a separate consumer-side set, not this envelope."
+
+[[challenge_closure]]
+challenge = "CC-W9-UNDERSTANDING"
+status = "CLOSED_BY_OWNER_CONTRACT"
+closed_by = "eliot-dreamer-contracts self_query/accepted.rs (AcceptedSourceProjection::project/validate/check_cited with frozen digest and exact-triple currency)"
+note = "Accepted-source projection leg (CC-006 tag): refs by handle with identity, revision cursor, edition pair, and carried fence. Standalone accepted-source admission stays with its owner; provider edge and pulse pending."
+
+[[challenge_closure]]
+challenge = "CC-W9-COGNITIVE-QUALITY"
+status = "CLOSED_BY_OWNER_CONTRACT"
+closed_by = "eliot-observation-contracts experience_projection.rs (JournalProjection/BankProjection/FeedbackProjection with ProjectionCoverage binding, closed ProjectionOmissionClass, frozen digests)"
+note = "Journal/bank/feedback projection legs: full owner records for the journal, opaque refs for bank and feedback (no record types exist upstream). Skill/tool/job evidence legs stay open below; provider edge and pulse pending."
+
+[[challenge_closure]]
+challenge = "CC-MEMORY-PROJECTION-SCHEMA"
+status = "CLOSED_BY_OWNER_CONTRACT"
+closed_by = "eliot-memory-projection-contracts selection.rs (SelectionCoverage with considered/selected/not_selected accounting) and eliot-observation-contracts experience_projection.rs (ProjectionCoverage with Complete-posture rules via CoverageIncomplete)"
+note = "Strict-denominator-enforcement leg: counts reconcile without establishing completeness; Complete requires exact count plus owner posture with empty omissions and empty blind intervals. Supplements the r2 query/selection/trace closure above."
+
+[[lane_prototype]]
+crate = "eliot-epistemic-context-provider"
+paths = ["crates/smart/eliot-epistemic-context-provider/**"]
+status = "PROTOTYPE_PENDING_REGISTRATION"
+contract = "EpistemicContextContribution{contribution: ProviderContribution, provider: ProviderId} with from_position/from_contribution/validate"
+note = "Thin adapter over the owner envelope above. Builds independently; not a W9 unblock."
+
+[[lane_prototype]]
+crate = "eliot-dreamer-self-query"
+paths = ["crates/smart/eliot-dreamer-self-query/**"]
+status = "PROTOTYPE_PENDING_REGISTRATION"
+contract = "SelfQueryPoseReceipt{input_digest, schema_version} with pose_self_query/pose_with_sources; CitedSource{handle, revision, digest} with cited_sources/check_citations"
+note = "Thin adapter over SelfQueryInput plus AcceptedSourceProjection citation. Builds independently; not a W9 unblock."
+
+[[lane_prototype]]
+crate = "eliot-experience-projection"
+paths = ["crates/smart/eliot-experience-projection/**"]
+status = "PROTOTYPE_PENDING_REGISTRATION"
+contract = "ExperienceView{family, scope, fence, refs, coverage, omissions} with assemble/validate; Complete posture structurally rejected"
+note = "Read-aid view echoing owner coverage without establishing it. Builds independently; not a W9 unblock."
+
 [[not_frozen]]
 name = "MemoryContextProjectionRequest"
 challenge = "CC-MEMORY-PROJECTION-SCHEMA"
@@ -433,10 +674,6 @@ name = "FailureObservation (owner-neutral)"
 challenge = "CC-FAILURE-OBSERVATION-SCHEMA"
 reason = "No versioned owner-neutral observation contract with denominator, fence, scope, and omission semantics exists."
 [[not_frozen]]
-name = "ProviderContribution (owner-neutral)"
-challenge = "CC-PROVIDER-CONTRIBUTION-SCHEMA"
-reason = "No versioned owner-neutral contribution contract with denominator, fence, scope, and omission semantics exists."
-[[not_frozen]]
 name = "rev12 closed seven-class provider enum"
 challenge = "CC-PROVIDER-CONTRIBUTION-SCHEMA"
 reason = "Current ProviderRole is a provider/semantic-role slot struct; the exact rev12 closed seven-class set is not closed in source."
@@ -445,17 +682,9 @@ name = "MemoryRevisionEvidence"
 challenge = "CC-W9-MEMORY-REVISION"
 reason = "No owner-neutral revision-evidence refs contract exists."
 [[not_frozen]]
-name = "SystemObservationJournal / EliotSystemExperienceBank / AgentFeedbackReceipt typed projections"
+name = "Skill-execution / tool-definition / durable-job typed evidence projections for cognitive-quality assessment"
 challenge = "CC-W9-COGNITIVE-QUALITY"
-reason = "Consumed by handle only; no versioned owner-neutral projection types exist in source."
-[[not_frozen]]
-name = "accepted-source projection (CC-006)"
-challenge = "CC-W9-UNDERSTANDING"
-reason = "Exact accepted-source projection with edition identity, section handles, and conflict precedence is deferred to the Researcher/Architecture owner."
-[[not_frozen]]
-name = "strict complete-denominator enforcement for memory/experience selection"
-challenge = "CC-MEMORY-PROJECTION-SCHEMA"
-reason = "Complete coverage without an exact expected count is rejected by rule; the enforcing selection types do not exist yet."
+reason = "Governor SkillExecutionEvidence/SkillLifecycleView and protocol DurableJob* structures exist but carry no versioned owner-neutral projection status with per-sub-assessment denominators; no tool-definition version type exists in source. Consumed by handle only."
 
 [[rejected]]
 name = "eliot-mcp FailureObservation DTO"
