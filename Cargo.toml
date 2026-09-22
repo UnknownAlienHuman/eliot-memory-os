@@ -23,6 +23,7 @@ members = [
   "crates/foundation/eliot-contracts",
   "crates/foundation/eliot-evaluation-contracts",
   "crates/foundation/eliot-evidence",
+  "crates/foundation/eliot-memory-projection-contracts",
   "crates/foundation/eliot-observation-contracts",
   "crates/foundation/eliot-protocol",
   "crates/foundation/eliot-receipts",
@@ -177,6 +178,7 @@ members = [
   "crates/smart/eliot-learning-overlay",  # agent_order 35
   "crates/meta/eliot-learning-activation-assessment",  # agent_order 36
   "crates/meta/eliot-self-quality",  # agent_order 38
+  "crates/smart/eliot-memory-quality",  # agent_order 76
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`

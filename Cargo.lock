@@ -2343,6 +2343,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-memory-projection-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-memory-quality"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-learning-contracts",
+ "eliot-memory-projection-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-mod-research"
 version = "0.1.0"
 dependencies = [
