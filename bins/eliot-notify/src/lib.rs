@@ -1056,6 +1056,7 @@ pub mod automation_notification_adapter;
 mod fallback_verification;
 pub mod installed_binary;
 pub mod notify_declaration;
+pub mod notify_launch;
 pub mod operation_identity;
 pub mod quiet_hours;
 #[cfg(test)]
@@ -1072,6 +1073,7 @@ pub use notify_declaration::{
     NotifyDeclarationError, NotifyDeclarationInputs, RenderedNotifyDeclaration,
     render_notify_fallback_declaration,
 };
+pub use notify_launch::{NotifyLaunchError, VerifiedNotifyLaunch, resolve_notify_launch_inputs};
 
 /// Registers the installer-owned X-01 fallback task for the current
 /// interactive user.  The task receives no stdin and no caller-selected
