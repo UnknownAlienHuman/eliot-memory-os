@@ -9,6 +9,7 @@
 #![allow(clippy::result_large_err, clippy::large_enum_variant)]
 
 mod bridge_admission;
+mod delivery_policy_owner;
 mod input;
 mod plan;
 mod result;
@@ -20,6 +21,10 @@ pub use bridge_admission::{
     plan_bridge_admissions,
 };
 
+pub use delivery_policy_owner::{
+    ChoiceSnapshot, DeliveryPolicyChoices, DeliveryPolicyOwner, PolicyOwnerError,
+    assemble_delivery_policy,
+};
 pub use input::{
     AttentionDisclosureRule, ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTargetBinding,
 };

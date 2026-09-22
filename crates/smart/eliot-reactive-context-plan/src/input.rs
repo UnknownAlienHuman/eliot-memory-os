@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 /// Maximum policy identity text retained by this prototype.
 pub const MAX_POLICY_TEXT: usize = 256;
 
-fn text(value: &str, field: &'static str) -> Result<(), ReactiveInputError> {
+pub(crate) fn text(value: &str, field: &'static str) -> Result<(), ReactiveInputError> {
     if value.len() > MAX_POLICY_TEXT {
         return Err(ReactiveInputError::InvalidField {
             field,
@@ -29,7 +29,7 @@ fn text(value: &str, field: &'static str) -> Result<(), ReactiveInputError> {
     Ok(())
 }
 
-fn digest(value: &str, field: &'static str) -> Result<(), ReactiveInputError> {
+pub(crate) fn digest(value: &str, field: &'static str) -> Result<(), ReactiveInputError> {
     if value.len() != 64
         || value
             .bytes()

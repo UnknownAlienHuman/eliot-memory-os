@@ -32,6 +32,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod discovery_owner;
 pub mod discovery_publication;
 
 /// Fail-closed derivation and authorization errors.
