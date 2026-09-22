@@ -377,9 +377,17 @@ fn install_status(package: &SkillPackage) -> (SkillStatus, Option<String>) {
     (SkillStatus::Provisional, None)
 }
 
-/// Installs one canonical package source into the catalogue: projects the
+/// Installs one canonical package source into the catalogue: binds the
+/// presented materialization to its exact accepted candidate, projects the
 /// entry, runs the tool-owner existence check at insert, and returns the
 /// installed Skill identity.
+///
+/// The candidate binding runs first, so no package reaches the catalogue
+/// without the exact accepted procedure projection behind it: candidate-only
+/// shape, `Accepted` procedure state, exact behavior/host, and expected
+/// digests when the candidate carries them. A stale package still binds and
+/// installs under its governed `Stale` disposition; promotion stays with the
+/// evidence path.
 ///
 /// Re-installing a revised package replaces the entry wholesale
 /// (immutable-body revision): the catalogue digest changes, so Hotset receipts
@@ -388,15 +396,229 @@ fn install_status(package: &SkillPackage) -> (SkillStatus, Option<String>) {
 /// lifecycle `SkillRef.package_digest` (`package.digests.source_digest`).
 pub fn install_package(
     catalogue: &mut SkillCatalogue,
+    candidate: &PortableSkillPackageCandidate,
     package: &SkillPackage,
     inputs: &MaterializationInputs,
     context: &CatalogueInstallContext,
     tools: &dyn KnownTools,
 ) -> Result<String, SkillError> {
+    validate_candidate_materialization(candidate, package, inputs)?;
     let entry = project_package_to_entry(package, inputs, context)?;
     let skill_id = entry.index.skill_id.clone();
     catalogue.insert(entry, tools)?;
     Ok(skill_id)
+}
+
+/// Test-only fixture for accepted-candidate materialization sets.
+///
+/// One owner for the accepted-procedure receipt shell every install-path test
+/// binds against, so production-path tests never hand-roll competing
+/// candidate shapes. The procedure shell (evidence, verifier, acceptance
+/// receipt, safety closure, inert assets) is fixed; callers supply the
+/// procedure definition and the target profile, and the governed mapper
+/// derives the exact candidate behavior and host the presented package must
+/// carry.
+#[cfg(test)]
+pub(crate) mod candidate_fixture {
+    use eliot_skills::{
+        GovernedProcedureProjection, InertAsset, PortableSkillPackageCandidate,
+        ProcedureDefinition, ProcedureEvidence, ProcedureState, ProcedureVerifier,
+        SafetyPrivacyDisclosure, TargetProfile,
+        project_governed_procedure_to_portable_skill_candidates,
+    };
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence() -> eliot_contracts::StateFence {
+        let epoch = eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch");
+        eliot_contracts::StateFence::new(epoch, eliot_contracts::ResourceGeneration::genesis())
+    }
+
+    fn acceptance_receipt(
+        procedure_revision: &str,
+        state_fence: eliot_contracts::StateFence,
+    ) -> eliot_skills::ReceiptClaim {
+        use eliot_contracts::{
+            ArtifactId, ClockReading, ContractId, OperationId, ProductId, RequestId, SessionId,
+            SourceId, TaskId, TaskRevision, TransactionSequence,
+        };
+        use eliot_receipts::{
+            ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding,
+            ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind,
+            RequestBinding, SessionBinding, TaskBinding, VerifierBinding, WorkScopeBinding,
+            WorkScopeId,
+        };
+
+        let request_id = RequestId::new("request-1").expect("request id");
+        let task_id = TaskId::new("task-1").expect("task id");
+        let metadata = eliot_receipts::RequestMetadata {
+            request_id: request_id.clone(),
+            session_id: Some(SessionId::new("session-1").expect("session id")),
+            task_id: Some(task_id),
+            product_id: ProductId::new("product-1").expect("product id"),
+            source_id: SourceId::new("source-1").expect("source id"),
+            state_fence: state_fence.clone(),
+            clock: ClockReading {
+                valid_time_ms: Some(10),
+                known_time_ms: Some(11),
+                transaction_sequence: Some(TransactionSequence::genesis()),
+                monotonic_ns: Some(12),
+            },
+        };
+        let verifier_artifact_id = ArtifactId::new("verifier-artifact-1").expect("artifact id");
+        let rollback_artifact_id = ArtifactId::new("rollback-artifact-1").expect("artifact id");
+        let core = ReceiptCore {
+            contract: eliot_receipts::contract_identity().expect("receipt contract"),
+            kind: ReceiptKind::Verification,
+            work_scope: WorkScopeBinding {
+                scope_id: WorkScopeId::new("scope-1").expect("scope id"),
+                product_id: metadata.product_id.clone(),
+                resource_generation: eliot_contracts::ResourceGeneration::genesis(),
+                state_fence: state_fence.clone(),
+            },
+            task: Some(TaskBinding {
+                task_id: TaskId::new("task-1").expect("task id"),
+                task_revision: TaskRevision::genesis(),
+                state_fence: state_fence.clone(),
+            }),
+            session: Some(SessionBinding {
+                session_id: SessionId::new("session-1").expect("session id"),
+                authority_epoch: state_fence.authority_epoch.clone(),
+                state_fence: state_fence.clone(),
+            }),
+            causal: CausalBinding {
+                state_fence: state_fence.clone(),
+                transaction_sequence: TransactionSequence::genesis(),
+                parent_receipt_id: None,
+                predecessor_receipt_ids: Vec::new(),
+            },
+            request: RequestBinding {
+                metadata,
+                state_fence: state_fence.clone(),
+            },
+            operation: OperationBinding {
+                operation_id: OperationId::new("operation-1").expect("operation id"),
+                request_id,
+                idempotency_key: "accept-procedure".to_owned(),
+                operation_kind: "procedure.accept".to_owned(),
+                effect: EffectClass::Read,
+                state_fence: state_fence.clone(),
+            },
+            authority: AuthorityBinding {
+                authority_id: ContractId::new("authority-1").expect("authority id"),
+                authority_owner: "governor.skill".to_owned(),
+                authority_epoch: state_fence.authority_epoch.clone(),
+                state_fence: state_fence.clone(),
+                allowed_effect: EffectClass::Read,
+                proof_ceiling: ProofCeiling::ScopedVerification,
+            },
+            artifacts: vec![
+                ArtifactBinding {
+                    artifact_id: verifier_artifact_id.clone(),
+                    sha256: eliot_receipts::sha256_hex(b"accepted-procedure"),
+                    role: ReceiptKind::Artifact,
+                    source_revision: Some(procedure_revision.to_owned()),
+                },
+                ArtifactBinding {
+                    artifact_id: rollback_artifact_id,
+                    sha256: eliot_receipts::sha256_hex(b"rollback-procedure"),
+                    role: ReceiptKind::Artifact,
+                    source_revision: Some(procedure_revision.to_owned()),
+                },
+            ],
+            verifier: Some(VerifierBinding {
+                verifier_id: ContractId::new("procedure-verifier").expect("verifier id"),
+                verifier_revision: eliot_contracts::ContractVersion::new(1, 0, 0),
+                artifact_ids: vec![verifier_artifact_id],
+                proof_ceiling: ProofCeiling::ScopedVerification,
+                state_fence,
+            }),
+            problem: None,
+            coordination: None,
+            disposition: ReceiptDisposition::Success {
+                proof: ProofCeiling::ScopedVerification,
+            },
+        };
+        let envelope = ReceiptEnvelope::issue(core).expect("accepted receipt");
+        eliot_skills::ReceiptClaim {
+            evidence_ref: "receipt-evidence-1".to_owned(),
+            envelope,
+        }
+    }
+
+    fn procedure_shell(definition: ProcedureDefinition) -> GovernedProcedureProjection {
+        use eliot_skills::GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION;
+
+        let state_fence = fence();
+        let acceptance_receipt = acceptance_receipt("revision-1", state_fence.clone());
+        let mut projection = GovernedProcedureProjection {
+            schema_version: GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION.to_owned(),
+            procedure_id: "procedure-1".to_owned(),
+            procedure_revision: "revision-1".to_owned(),
+            procedure_digest: "0".repeat(64),
+            state: ProcedureState::Accepted,
+            state_fence: state_fence.clone(),
+            work_scope: acceptance_receipt.envelope.core.work_scope.clone(),
+            task: acceptance_receipt
+                .envelope
+                .core
+                .task
+                .clone()
+                .expect("task binding"),
+            acceptance_receipt,
+            definition,
+            evidence: ProcedureEvidence {
+                source_refs: vec!["source-1".to_owned()],
+                receipt_refs: vec!["receipt-evidence-1".to_owned()],
+                applicability_refs: vec!["applicability-1".to_owned()],
+                counterexample_refs: vec!["counterexample-1".to_owned()],
+                negative_trigger_refs: vec!["negative-trigger-1".to_owned()],
+                verifier_artifact_refs: vec!["verifier-artifact-1".to_owned()],
+                rollback_artifact_ref: "rollback-artifact-1".to_owned(),
+            },
+            verifier: ProcedureVerifier {
+                verifier_ref: "procedure-verifier".to_owned(),
+                verifier_revision: "1.0.0".to_owned(),
+                artifact_refs: vec!["verifier-artifact-1".to_owned()],
+            },
+            safety_privacy_disclosure: SafetyPrivacyDisclosure {
+                safety_owner_ref: "safety-owner".to_owned(),
+                safety_evidence_refs: vec!["safety-1".to_owned()],
+                privacy_owner_ref: "privacy-owner".to_owned(),
+                privacy_evidence_refs: vec!["privacy-1".to_owned()],
+                disclosure_owner_ref: "disclosure-owner".to_owned(),
+                disclosure_evidence_refs: vec!["disclosure-1".to_owned()],
+            },
+            assets: vec![InertAsset {
+                asset_ref: "asset-1".to_owned(),
+                sha256: eliot_receipts::sha256_hex(b"asset"),
+                role: "reference".to_owned(),
+                executable: false,
+            }],
+        };
+        projection.procedure_digest = projection.expected_digest().expect("procedure digest");
+        projection
+    }
+
+    /// Maps one caller-supplied definition and target to their exact accepted
+    /// candidate. The target must satisfy the definition's exact requirements;
+    /// unsupported targets have no candidate and fail here, never at install.
+    pub(crate) fn candidate_for(
+        definition: ProcedureDefinition,
+        target: TargetProfile,
+    ) -> PortableSkillPackageCandidate {
+        let projection = project_governed_procedure_to_portable_skill_candidates(
+            &procedure_shell(definition),
+            &[target],
+        )
+        .expect("projection");
+        assert_eq!(projection.candidates.len(), 1);
+        projection.candidates[0].clone()
+    }
 }
 
 #[cfg(test)]
@@ -404,9 +626,10 @@ pub fn install_package(
 mod tests {
     use super::*;
     use eliot_skills::{
-        AdvisoryRuleClaim, CapabilityVersion, DeliveryProjection, DependencyMaterial, HostLimits,
-        HostProfile, LifecycleProposal, SkillBehavior, SkillCounters, SkillInteractionProjection,
-        SkillState, ToolDefinitionMaterial, VersionedRequirement,
+        AdvisoryRuleClaim, CapabilityVersion, DeliveryProjection, DependencyMaterial,
+        LifecycleProposal, PortableSkillPackageCandidate, ProcedureDefinition, SkillBehavior,
+        SkillCounters, SkillInteractionProjection, SkillState, TargetProfile,
+        ToolDefinitionMaterial, VersionedRequirement,
     };
 
     const BODY_DIGEST_SEED: &str = "package-fixture";
@@ -482,6 +705,12 @@ mod tests {
     }
 
     fn fixture_package() -> (SkillPackage, MaterializationInputs) {
+        // The package carries the accepted candidate's own behavior and host:
+        // the mapper derives them from the definition and target below, so
+        // the binding the install path enforces holds by construction here.
+        // Candidate identity is deterministic, so tests that also need the
+        // candidate itself rebuild the equal value via `fixture_candidate`.
+        let candidate = fixture_candidate();
         let material = inputs();
         let package = SkillPackage {
             registration: eliot_skills::RegistrationIdentity::new(
@@ -491,24 +720,8 @@ mod tests {
             )
             .expect("valid test registration"),
             digests: eliot_skills::PackageDigests::derive(&material).expect("valid test inputs"),
-            host: HostProfile {
-                host: "codex".to_owned(),
-                profile: "default".to_owned(),
-                required_tools: vec![VersionedRequirement {
-                    name: "cargo".to_owned(),
-                    version: "1.89".to_owned(),
-                }],
-                required_capabilities: vec![VersionedRequirement {
-                    name: "rust-test".to_owned(),
-                    version: "1".to_owned(),
-                }],
-                limits: HostLimits {
-                    max_description_chars: 500,
-                    max_actions: 1,
-                    max_expansion_handles: 2,
-                },
-            },
-            behavior: behavior(),
+            host: candidate.host.clone(),
+            behavior: candidate.behavior.clone(),
             counters: SkillCounters::default(),
             state: current_state(),
             lifecycle_proposal: LifecycleProposal::Keep,
@@ -520,6 +733,57 @@ mod tests {
             .validate(&material)
             .expect("fixture package validates");
         (package, material)
+    }
+
+    /// Mirrors [`behavior`] as the accepted procedure definition the install
+    /// fixtures bind against: same trigger, action, obligations, stop and
+    /// exact tool/capability revisions.
+    fn candidate_definition() -> ProcedureDefinition {
+        ProcedureDefinition {
+            name: "bounded Rust verifier".to_owned(),
+            purpose: "verify one bounded Rust change".to_owned(),
+            trigger: "when a bounded Rust verifier is required load this skill".to_owned(),
+            action: "run cargo test".to_owned(),
+            applies_when: vec!["the package is exact".to_owned()],
+            where_not_apply: vec!["the host is unsupported".to_owned()],
+            required_inputs: vec!["the exact package".to_owned()],
+            ordered_steps: vec!["run cargo test".to_owned()],
+            expected_outputs: vec!["test result".to_owned()],
+            stop_conditions: vec!["stop on stale material".to_owned()],
+            required_writebacks: vec!["NONE".to_owned()],
+            escalation: "report PLAN_GAP".to_owned(),
+            challenge: "show exact conflicting identities".to_owned(),
+            rollback_or_recovery: "restore the prior revision".to_owned(),
+            required_tools: vec![VersionedRequirement {
+                name: "cargo".to_owned(),
+                version: "1.89".to_owned(),
+            }],
+            required_capabilities: vec![VersionedRequirement {
+                name: "rust-test".to_owned(),
+                version: "1".to_owned(),
+            }],
+        }
+    }
+
+    fn candidate_target() -> TargetProfile {
+        TargetProfile {
+            target_id: "candidate-target".to_owned(),
+            host: "codex".to_owned(),
+            profile: "default".to_owned(),
+            fingerprint: "1".repeat(64),
+            available_tools: vec![VersionedRequirement {
+                name: "cargo".to_owned(),
+                version: "1.89".to_owned(),
+            }],
+            available_capabilities: vec![VersionedRequirement {
+                name: "rust-test".to_owned(),
+                version: "1".to_owned(),
+            }],
+        }
+    }
+
+    fn fixture_candidate() -> PortableSkillPackageCandidate {
+        candidate_fixture::candidate_for(candidate_definition(), candidate_target())
     }
 
     fn context() -> CatalogueInstallContext {
@@ -586,8 +850,16 @@ mod tests {
     #[test]
     fn install_checks_tool_existence_and_returns_the_skill_identity() {
         let (package, material) = fixture_package();
+        let candidate = fixture_candidate();
         let mut catalogue = SkillCatalogue::default();
-        let refused = install_package(&mut catalogue, &package, &material, &context(), &EmptyTools);
+        let refused = install_package(
+            &mut catalogue,
+            &candidate,
+            &package,
+            &material,
+            &context(),
+            &EmptyTools,
+        );
         assert!(matches!(
             refused,
             Err(SkillError::InvalidField { field, .. }) if field == "body.tool_refs"
@@ -595,6 +867,7 @@ mod tests {
         assert!(catalogue.is_empty());
         let installed = install_package(
             &mut catalogue,
+            &candidate,
             &package,
             &material,
             &context(),
@@ -680,9 +953,11 @@ mod tests {
         };
 
         let (package, material) = fixture_package();
+        let candidate = fixture_candidate();
         let mut catalogue = SkillCatalogue::default();
         install_package(
             &mut catalogue,
+            &candidate,
             &package,
             &material,
             &context(),
@@ -1221,6 +1496,7 @@ mod tests {
             let mut catalogue = SkillCatalogue::default();
             let installed = install_package(
                 &mut catalogue,
+                &candidate,
                 &package,
                 &material,
                 &install_context(),

@@ -24,7 +24,10 @@ pub use canonical_tools::{
     readiness_available_for_package, sealed_materialization_check,
 };
 pub mod install;
-pub use install::{CatalogueInstallContext, install_package, project_package_to_entry};
+pub use install::{
+    CatalogueInstallContext, install_package, project_package_to_entry,
+    validate_candidate_materialization,
+};
 
 /// Canonical package-source types consumed at the installation boundary.
 ///
