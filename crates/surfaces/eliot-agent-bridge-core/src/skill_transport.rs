@@ -114,6 +114,46 @@ pub struct SkillIntakePayload {
 }
 
 impl SkillIntakePayload {
+    /// Produces the canonical authenticated v2 intake.
+    ///
+    /// The single production constructor for intake objects: stamps the
+    /// exact materialized package digests onto the accepted candidate,
+    /// binds candidate↔package↔inputs, and validates the full wire shape,
+    /// so no constructed intake exists in an unbound state. Stamping accepts
+    /// an unstamped candidate (binding it here) but refuses a candidate
+    /// already bound to different digests — one candidate identity is never
+    /// rebound to new material. Decode deliberately does NOT stamp: a wire
+    /// claim without expected digests fails there instead of being bound
+    /// by the receiver.
+    pub fn produce(
+        candidate: PortableSkillPackageCandidate,
+        package: SkillPackage,
+        inputs: MaterializationInputs,
+        context: CatalogueInstallContext,
+        readiness: ReadinessClaims,
+        scope: MaterializationScope,
+        hotset_id: String,
+        approval_ref: String,
+    ) -> Result<Self, SkillTransportError> {
+        let candidate = eliot_skill::stamp_materialization_digests(&candidate, &package, &inputs)
+            .map_err(|error| {
+            SkillTransportError::Shape(format!("intake.candidate: {error}"))
+        })?;
+        let payload = Self {
+            contract_version: SKILL_TRANSPORT_VERSION,
+            candidate,
+            package,
+            inputs,
+            context,
+            readiness,
+            scope,
+            hotset_id,
+            approval_ref,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
     /// Encodes a validated intake within the frame bound.
     pub fn encode(&self) -> Result<Vec<u8>, SkillTransportError> {
         self.validate()?;
@@ -411,9 +451,8 @@ impl SkillResultEnvelope {
 mod tests {
     use super::*;
     use eliot_skill::{
-        AdvisoryRuleClaim, CapabilityVersion, DependencyMaterial, HostLimits, HostProfile,
-        LifecycleProposal, SkillBehavior, SkillCounters, SkillInteractionProjection, SkillState,
-        ToolDefinitionMaterial, VersionedRequirement,
+        AdvisoryRuleClaim, CapabilityVersion, DependencyMaterial, LifecycleProposal, SkillBehavior,
+        SkillCounters, SkillState, ToolDefinitionMaterial,
     };
 
     fn behavior() -> SkillBehavior {
@@ -458,6 +497,9 @@ mod tests {
             ConflictState, DistractorState, FreshnessState, QuarantineState,
             SkillInteractionProjection as InteractionProjection,
         };
+        // Behavior and host are the accepted candidate's own, so the intake
+        // producer binds by construction.
+        let candidate = candidate();
         let inputs = inputs();
         let rule: AdvisoryRuleClaim = serde_json::from_value(serde_json::json!({
             "rule_ref": { "rule_id": "rule-demo-1", "revision": 1 }
@@ -471,24 +513,8 @@ mod tests {
             )
             .expect("valid test registration"),
             digests: eliot_skill::PackageDigests::derive(&inputs).expect("valid test inputs"),
-            host: HostProfile {
-                host: "codex".to_owned(),
-                profile: "default".to_owned(),
-                required_tools: vec![VersionedRequirement {
-                    name: "eliot.finish".to_owned(),
-                    version: "1.0.0".to_owned(),
-                }],
-                required_capabilities: vec![VersionedRequirement {
-                    name: "finish-cap".to_owned(),
-                    version: "1".to_owned(),
-                }],
-                limits: HostLimits {
-                    max_description_chars: 500,
-                    max_actions: 1,
-                    max_expansion_handles: 2,
-                },
-            },
-            behavior: behavior(),
+            host: candidate.host.clone(),
+            behavior: candidate.behavior.clone(),
             counters: SkillCounters::default(),
             state: SkillState {
                 freshness: FreshnessState::Current,
@@ -799,17 +825,19 @@ mod tests {
     }
 
     fn intake() -> SkillIntakePayload {
-        SkillIntakePayload {
-            contract_version: SKILL_TRANSPORT_VERSION,
-            candidate: candidate(),
-            package: package(),
-            inputs: inputs(),
-            context: context(),
-            readiness: readiness(),
-            scope: scope(),
-            hotset_id: "hotset-wire-1".to_owned(),
-            approval_ref: "approval-commit-1".to_owned(),
-        }
+        // The intake producer is the only construction path: stamping,
+        // binding, and shape validation run here, never hand-rolled.
+        SkillIntakePayload::produce(
+            candidate(),
+            package(),
+            inputs(),
+            context(),
+            readiness(),
+            scope(),
+            "hotset-wire-1".to_owned(),
+            "approval-commit-1".to_owned(),
+        )
+        .expect("fixture produces bound intake")
     }
 
     #[test]

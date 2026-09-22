@@ -153,18 +153,16 @@ pub use governor_local_read::{
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use process_origin::{
-    CapabilityEvidenceSource, Generation, OperationDisposition,
-    OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant,
-    OriginControlOperation, OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY,
-    PhysicalProcessBinding, ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError,
-    ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
-    request_origin_control,
+    CapabilityEvidenceSource, Generation, OperationDisposition, OriginChallenge,
+    OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
+    OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY, PhysicalProcessBinding,
+    ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError, ProcessOriginEvidence,
+    ProcessStatusReceipt, canonical_origin_digest, gate_process_control, request_origin_control,
 };
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
 };
-pub(crate) use skill_lifecycle_adapters::SkillHotsetRequest;
 pub use startup_evidence_producer::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, EliotdStartupEvidence, MAX_CAPABILITY_OUTCOMES,
     MAX_EVIDENCE_REFS, MAX_REQUIRED_CAPABILITIES, MirrorObservation, RetainedCapabilitySummary,
@@ -761,17 +759,42 @@ impl DaemonComposition {
         )
     }
 
+    /// Enforces the recovered Governor lifecycle standing before any
+    /// catalogue write (issue #1191).
+    ///
+    /// Reads the Governor-recovered Skill registry — rebuilt from the
+    /// canonical `Skill` named read at every recovery, advanced only through
+    /// canonical promotion commits — and refuses installs the lifecycle
+    /// owner revoked, superseded, drifted, or never fenced current. Covered
+    /// Skills must stand fence-current with exact registration revision and
+    /// material digest; uncovered Skills install provisional and the
+    /// lifecycle follows through propose/promote. The fence is always the
+    /// caller-observed live admitted fence, never a transported claim.
+    fn check_skill_lifecycle_standing(
+        &self,
+        package: &eliot_skill::SkillPackage,
+        admitted_fence: &StateFence,
+    ) -> Result<(), eliot_skill::SkillError> {
+        eliot_skill::check_lifecycle_standing(
+            &self.governor.owners().skill,
+            &package.registration.skill_id,
+            package,
+            admitted_fence,
+        )
+    }
+
     /// Installs one canonical package source into the shared Governor Skill
     /// catalogue (population caller, issue #1882).
     ///
     /// Composition seam for the runtime population driver: the Governor
     /// owner hands over the accepted candidate, a validated package claim,
     /// its actual materialization inputs, the explicit install context, and
-    /// the tool-owner view; the shared handle records the projected entry
-    /// after the candidate binding. No readiness gate: this operates purely
-    /// on daemon-held catalogue state (validated insert), never on Governor
-    /// recovery owners; promotion keeps the Governor canonical gates, and
-    /// drivers call post-admission. Returns the installed Skill identity.
+    /// the tool-owner view; the recovered lifecycle standing gates entry
+    /// first, then the shared handle records the projected entry after the
+    /// candidate binding. No readiness gate: the insert operates purely on
+    /// daemon-held catalogue state (validated insert); promotion keeps the
+    /// Governor canonical gates, and drivers call post-admission. Returns
+    /// the installed Skill identity.
     pub fn skill_install_package(
         &self,
         candidate: &eliot_skill::PortableSkillPackageCandidate,
@@ -780,6 +803,8 @@ impl DaemonComposition {
         context: &eliot_skill::CatalogueInstallContext,
         tools: &dyn eliot_skill::KnownTools,
     ) -> Result<String, eliot_skill::SkillError> {
+        let admitted = self.governor.kernel_snapshot().state_fence().clone();
+        self.check_skill_lifecycle_standing(package, &admitted)?;
         self.shared_skill_adapter()
             .install_package(candidate, package, inputs, context, tools)
     }
@@ -876,6 +901,8 @@ impl DaemonComposition {
         aliases: &eliot_skill::ToolAliasTable,
         admitted_definition_version: &str,
     ) -> Result<String, eliot_skill::SkillError> {
+        let admitted = self.governor.kernel_snapshot().state_fence().clone();
+        self.check_skill_lifecycle_standing(package, &admitted)?;
         self.shared_skill_adapter().install_package_versioned(
             candidate,
             package,
@@ -908,6 +935,7 @@ impl DaemonComposition {
         act: skill_lifecycle_adapters::VersionedDeliveryAct<'_>,
     ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
         let admitted = self.governor.kernel_snapshot().state_fence().clone();
+        self.check_skill_lifecycle_standing(act.package, &admitted)?;
         self.shared_skill_adapter()
             .run_install_to_receipt(act, &admitted)
     }
@@ -934,6 +962,7 @@ impl DaemonComposition {
         let (source, admitted_version) = eliot_governor::canonical_skill_tool_source()?;
         let aliases = eliot_skill::ToolAliasTable::new();
         let fence = self.governor.kernel_snapshot().state_fence().clone();
+        self.check_skill_lifecycle_standing(request.package, &fence)?;
         self.shared_skill_adapter().inject_hotset(
             request,
             source.as_ref(),
@@ -964,6 +993,7 @@ impl DaemonComposition {
         let (source, _) = eliot_governor::canonical_skill_tool_source()?;
         let aliases = eliot_skill::ToolAliasTable::new();
         let fence = self.governor.kernel_snapshot().state_fence().clone();
+        self.check_skill_lifecycle_standing(&payload.package, &fence)?;
         self.shared_skill_adapter()
             .ingest_wire_intake(payload, source.as_ref(), &aliases, &fence)
     }

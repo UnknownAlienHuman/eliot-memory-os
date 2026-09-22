@@ -21,12 +21,12 @@ pub use catalogue::*;
 pub mod canonical_tools;
 pub use canonical_tools::{
     CanonicalToolSource, ToolAliasTable, VersionBoundTools, install_package_versioned,
-    readiness_available_for_package, sealed_materialization_check,
+    readiness_available_for_package, readiness_names_known_to_source, sealed_materialization_check,
 };
 pub mod install;
 pub use install::{
-    CatalogueInstallContext, install_package, project_package_to_entry,
-    validate_candidate_materialization,
+    CatalogueInstallContext, check_lifecycle_standing, install_package, project_package_to_entry,
+    stamp_materialization_digests, validate_candidate_materialization,
 };
 
 /// Canonical package-source types consumed at the installation boundary.

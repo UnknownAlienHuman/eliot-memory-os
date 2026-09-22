@@ -113,39 +113,20 @@ fn drive_skill_request(
 }
 
 fn drive_inject(composition: &DaemonComposition, arguments: &Value) -> SkillResultEnvelope {
-    let payload = match canonical_json_bytes(&arguments)
-        .map_err(|error| error.to_string())
-        .and_then(|bytes| {
-            eliot_agent_bridge_core::SkillIntakePayload::decode(&bytes)
-                .map_err(|error| error.to_string())
-        }) {
-        Ok(payload) => payload,
+    // The wire intake entry decodes, rehydrates, installs, and issues in one
+    // composition call: the poller hands it the exact argument bytes, so no
+    // decoded intermediate crosses this boundary unbound.
+    let bytes = match canonical_json_bytes(&arguments).map_err(|error| error.to_string()) {
+        Ok(bytes) => bytes,
         Err(detail) => {
             return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
                 "intake arguments fail their shape: {detail}"
             )));
         }
     };
-    // The injector request borrows the decoded payload; the composition
-    // entry below takes it by value.
-    match composition.skill_inject_hotset(build_inject_request(&payload)) {
+    match composition.skill_ingest_wire_intake(&bytes) {
         Ok((_, receipt)) => SkillResultEnvelope::receipt(receipt),
         Err(error) => SkillResultEnvelope::refused(&error),
-    }
-}
-
-fn build_inject_request(
-    payload: &eliot_agent_bridge_core::SkillIntakePayload,
-) -> crate::SkillHotsetRequest<'_> {
-    crate::SkillHotsetRequest {
-        candidate: &payload.candidate,
-        package: &payload.package,
-        inputs: &payload.inputs,
-        context: &payload.context,
-        readiness: &payload.readiness,
-        scope: &payload.scope,
-        hotset_id: payload.hotset_id.clone(),
-        approval_ref: payload.approval_ref.clone(),
     }
 }
 

@@ -164,6 +164,49 @@ impl KnownTools for VersionBoundTools<'_> {
     }
 }
 
+/// Cross-checks provider availability names against the live tool source.
+///
+/// The sealed observation mirror
+/// ([`readiness_available_for_package`]) proves the provider marked every
+/// required tool and capability available at its exact version, but the
+/// claims themselves arrive from the injector lane. This predicate binds the
+/// name dimension to current owner state: every available observation must
+/// resolve through the caller-supplied tool-owner view (in production the
+/// [`VersionBoundTools`] projection over the live canonical source), so a
+/// claim for a tool the registry never admitted fails closed here instead
+/// of flowing to receipt issuance. Availability truth itself — whether the
+/// provider can actually execute — stays with the sealed G-16 ports and is
+/// never inferred from membership; unknown or unavailable observations fail
+/// in the mirror, never here.
+pub fn readiness_names_known_to_source(
+    readiness: &ReadinessClaims,
+    tools: &dyn KnownTools,
+) -> Result<(), SkillError> {
+    use eliot_skills::Availability;
+
+    fn known(
+        tools: &dyn KnownTools,
+        observations: &[eliot_skills::VersionedObservation],
+    ) -> Result<(), SkillError> {
+        for observation in observations {
+            if !matches!(observation.availability, Availability::Available { .. }) {
+                continue;
+            }
+            if !tools.knows_tool(&observation.name) {
+                return Err(SkillError::InvalidField {
+                    field: "readiness.observation.name",
+                    reason: "an available observation names a tool the owner does not admit",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    known(tools, &readiness.tools)?;
+    known(tools, &readiness.capabilities)?;
+    Ok(())
+}
+
 /// Mirrors the sealed observation rule at the delivery boundary.
 ///
 /// Every tool and capability the package requires needs an exact `(name,
@@ -411,7 +454,11 @@ mod tests {
         // Behavior and host are the accepted candidate's own: the mapper
         // derives them from the definition and target below, so the binding
         // the versioned install path enforces holds by construction here.
-        let candidate = fixture_candidate();
+        // The stamped install candidate comes from `fixture_candidate`.
+        let candidate = crate::install::candidate_fixture::candidate_for(
+            candidate_definition(),
+            candidate_target(),
+        );
         let material = inputs();
         let package = SkillPackage {
             registration: eliot_skills::RegistrationIdentity::new(
@@ -488,10 +535,14 @@ mod tests {
     }
 
     fn fixture_candidate() -> eliot_skills::PortableSkillPackageCandidate {
-        super::super::install::candidate_fixture::candidate_for(
+        // The producer stamps the exact materialized digests: the versioned
+        // install path never sees an unstamped candidate.
+        let (package, material) = fixture_package();
+        let raw = crate::install::candidate_fixture::candidate_for(
             candidate_definition(),
             candidate_target(),
-        )
+        );
+        crate::stamp_materialization_digests(&raw, &package, &material).expect("fixture stamps")
     }
 
     fn context() -> CatalogueInstallContext {

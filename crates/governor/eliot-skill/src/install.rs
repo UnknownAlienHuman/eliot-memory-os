@@ -90,6 +90,7 @@
 // allowed for this module (same precedent as the Skill catalogue module).
 #![allow(clippy::result_large_err)]
 
+use eliot_contracts::StateFence;
 use eliot_skills::{
     ConflictState, DistractorState, FreshnessState, MaterializationInputs,
     PortableSkillPackageCandidate, QuarantineState, SkillPackage,
@@ -97,7 +98,7 @@ use eliot_skills::{
 
 use super::{
     DependencyVersion, SkillBody, SkillCatalogue, SkillCatalogueEntry, SkillError, SkillIndexEntry,
-    SkillRuntimeMetadata, SkillStatus,
+    SkillRegistry, SkillRuntimeMetadata, SkillStatus,
 };
 use crate::KnownTools;
 use serde::{Deserialize, Serialize};
@@ -212,9 +213,11 @@ impl CatalogueInstallContext {
 /// binding), then the public package↔inputs binding
 /// ([`SkillPackage::validate`](eliot_skills::SkillPackage::validate)), and
 /// finally checks the presented package carries exactly the candidate's
-/// behavior and host profile. When the candidate carries expected package
-/// digests, the presented digests must match them; a candidate without
-/// expected digests binds on behavior plus host only.
+/// behavior, host profile, and expected package digests. The expected
+/// digests are mandatory: a candidate without them cannot bind, so an
+/// unstamped claim never skips the authority binding — the materializing
+/// producer stamps them with
+/// [`stamp_materialization_digests`](self::stamp_materialization_digests).
 ///
 /// Surface-wire failures map to [`SkillError::Surface`]; a behavior, host, or
 /// digest divergence is [`SkillError::InvalidField`] on the candidate field,
@@ -249,15 +252,111 @@ pub fn validate_candidate_materialization(
             reason: "presented package host differs from the accepted candidate host",
         });
     }
-    if let Some(expected) = &candidate.package_digests {
-        if expected != &package.digests {
-            return Err(SkillError::InvalidField {
-                field: "candidate.package_digests",
-                reason: "presented package digests differ from the accepted candidate digests",
-            });
-        }
+    match &candidate.package_digests {
+        Some(expected) if expected == &package.digests => Ok(()),
+        _ => Err(SkillError::InvalidField {
+            field: "candidate.package_digests",
+            reason: "presented package digests differ from the accepted candidate digests",
+        }),
     }
-    Ok(())
+}
+
+/// Stamps the exact materialized package digests onto an accepted candidate.
+///
+/// The materializing producer calls this once it has bound a validated
+/// package to its actual inputs: the package↔inputs binding and the
+/// candidate behavior/host agreement are re-verified here, then the
+/// package's derived digests become the candidate's expected digests, so
+/// every downstream install binds the exact registration, revision, and
+/// digest set — never an unstamped claim. Stamping is idempotent: a
+/// candidate that already carries the same digests validates unchanged.
+/// Overwriting different expected digests is refused rather than
+/// re-stamped, so one candidate identity cannot be rebound to new material.
+pub fn stamp_materialization_digests(
+    candidate: &PortableSkillPackageCandidate,
+    package: &SkillPackage,
+    inputs: &MaterializationInputs,
+) -> Result<PortableSkillPackageCandidate, SkillError> {
+    package
+        .validate(inputs)
+        .map_err(|error| SkillError::Surface(error.to_string()))?;
+    if package.behavior != candidate.behavior {
+        return Err(SkillError::InvalidField {
+            field: "candidate.behavior",
+            reason: "presented package behavior differs from the accepted candidate behavior",
+        });
+    }
+    if package.host != candidate.host {
+        return Err(SkillError::InvalidField {
+            field: "candidate.host",
+            reason: "presented package host differs from the accepted candidate host",
+        });
+    }
+    if let Some(expected) = &candidate.package_digests
+        && expected != &package.digests
+    {
+        return Err(SkillError::InvalidField {
+            field: "candidate.package_digests",
+            reason: "candidate already binds different package digests",
+        });
+    }
+    let mut stamped = candidate.clone();
+    stamped.package_digests = Some(package.digests.clone());
+    stamped
+        .validate()
+        .map_err(|error| SkillError::Surface(error.to_string()))?;
+    Ok(stamped)
+}
+
+/// Checks one install against the recovered Governor Skill lifecycle standing.
+///
+/// The recovered [`SkillRegistry`] is the persistent lifecycle owner: it is
+/// rebuilt from the canonical `Skill` named read at every Governor recovery,
+/// carries the fence-checked lifecycle revision per Skill, and advances only
+/// through canonical promotion commits — never through catalogue writes. An
+/// install consults it open-world: a Skill the registry does not cover yet
+/// installs provisional and the lifecycle follows through propose/promote,
+/// exactly like the promotion gate forwards uncovered Skills. A covered
+/// Skill must stand fence-current under the admitted fence, bind its exact
+/// registration revision, bind its exact material via
+/// `SkillRef.package_digest` (the `package.digests.source_digest` the
+/// install returns), and hold an install-allowed status (`Current` or
+/// `Provisional`). `Stale`, `Suppressed`, `Archived`, and `Quarantined`
+/// views refuse with a typed reason: revocation and supersession recorded
+/// by the lifecycle owner cannot be reinstalled around. Scope and task
+/// agreement stay with the candidate rehydration at the drive boundary;
+/// this gate binds identity, material, fence, and standing.
+pub fn check_lifecycle_standing(
+    registry: &SkillRegistry,
+    skill_id: &str,
+    package: &SkillPackage,
+    admitted_fence: &StateFence,
+) -> Result<(), SkillError> {
+    let Some(view) = registry.view(skill_id) else {
+        return Ok(());
+    };
+    if view.state_fence != *admitted_fence {
+        return Err(SkillError::FenceMismatch);
+    }
+    if view.skill_ref.registration.revision != package.registration.revision {
+        return Err(SkillError::InvalidField {
+            field: "lifecycle.revision",
+            reason: "lifecycle stands for a different package revision",
+        });
+    }
+    if view.skill_ref.package_digest != package.digests.source_digest {
+        return Err(SkillError::IdentityMismatch);
+    }
+    match view.status {
+        SkillStatus::Current | SkillStatus::Provisional => Ok(()),
+        SkillStatus::Stale
+        | SkillStatus::Suppressed
+        | SkillStatus::Archived
+        | SkillStatus::Quarantined => Err(SkillError::InvalidField {
+            field: "lifecycle.status",
+            reason: "lifecycle standing refuses installation; review before reinstall",
+        }),
+    }
 }
 
 /// Projects one canonical package source into a validated catalogue entry.
@@ -708,9 +807,10 @@ mod tests {
         // The package carries the accepted candidate's own behavior and host:
         // the mapper derives them from the definition and target below, so
         // the binding the install path enforces holds by construction here.
-        // Candidate identity is deterministic, so tests that also need the
-        // candidate itself rebuild the equal value via `fixture_candidate`.
-        let candidate = fixture_candidate();
+        // Candidate identity is deterministic; the stamped install
+        // candidate comes from `fixture_candidate`.
+        let candidate =
+            candidate_fixture::candidate_for(candidate_definition(), candidate_target());
         let material = inputs();
         let package = SkillPackage {
             registration: eliot_skills::RegistrationIdentity::new(
@@ -783,7 +883,13 @@ mod tests {
     }
 
     fn fixture_candidate() -> PortableSkillPackageCandidate {
-        candidate_fixture::candidate_for(candidate_definition(), candidate_target())
+        // The producer stamps the exact materialized digests: the install
+        // path never sees an unstamped candidate. Identity is
+        // deterministic, so this equals the candidate the package derives
+        // from below.
+        let (package, material) = fixture_package();
+        let raw = candidate_fixture::candidate_for(candidate_definition(), candidate_target());
+        stamp_materialization_digests(&raw, &package, &material).expect("fixture stamps")
     }
 
     fn context() -> CatalogueInstallContext {
@@ -1364,6 +1470,9 @@ mod tests {
             package
                 .validate(&material)
                 .expect("fixture package validates");
+            let candidate = crate::stamp_materialization_digests(&candidate, &package, &material)
+                .expect("producer stamps the exact digests");
+            assert_eq!(candidate.package_digests.as_ref(), Some(&package.digests));
             validate_candidate_materialization(&candidate, &package, &material)
                 .expect("exact candidate material binds");
         }
@@ -1457,6 +1566,168 @@ mod tests {
         }
 
         #[test]
+        fn stamp_binds_unstamped_and_refuses_rebinding() {
+            let candidate = candidate();
+            let material = material_for(&candidate.behavior);
+            let package = package_for(&candidate, &material);
+            let stamped = crate::stamp_materialization_digests(&candidate, &package, &material)
+                .expect("stamp");
+            assert_eq!(stamped.package_digests.as_ref(), Some(&package.digests));
+            // Stamping the stamped candidate is idempotent.
+            let restamped = crate::stamp_materialization_digests(&stamped, &package, &material)
+                .expect("idempotent");
+            assert_eq!(restamped.package_digests.as_ref(), Some(&package.digests));
+            // One candidate identity is never rebound to new material.
+            let mut other_material = material.clone();
+            other_material.canonical_source_bytes = b"other source\n".to_vec();
+            let other_package = package_for(&candidate, &other_material);
+            assert_ne!(other_package.digests, package.digests);
+            assert!(matches!(
+                crate::stamp_materialization_digests(&stamped, &other_package, &other_material),
+                Err(SkillError::InvalidField { field, .. })
+                    if field == "candidate.package_digests"
+            ));
+        }
+
+        fn standing_fence() -> eliot_contracts::StateFence {
+            let epoch = eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("lineage"),
+                std::num::NonZeroU64::new(1).expect("nonzero"),
+            )
+            .expect("epoch");
+            eliot_contracts::StateFence::new(
+                epoch,
+                eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+            )
+        }
+
+        fn standing_view(
+            fence: &eliot_contracts::StateFence,
+            package: &eliot_skills::SkillPackage,
+            status: crate::SkillStatus,
+        ) -> crate::SkillLifecycleView {
+            crate::SkillLifecycleView {
+                skill_ref: crate::SkillRef::new(
+                    package.registration.skill_id.clone(),
+                    package.registration.revision.clone(),
+                    package.registration.name.clone(),
+                    package.digests.source_digest.clone(),
+                )
+                .expect("skill ref"),
+                scope: crate::SkillScope {
+                    task_scope: "task-scope".to_owned(),
+                    host: "host-1".to_owned(),
+                    route: "route-1".to_owned(),
+                    governance_scope: "gov-1".to_owned(),
+                },
+                applies_when: vec!["when-a".to_owned()],
+                does_not_apply_when: vec!["not-when-a".to_owned()],
+                dependencies: Vec::new(),
+                counters: crate::LifecycleCounters::default(),
+                execution_evidence: Vec::new(),
+                observed_decision_or_verifier_delta: None,
+                false_activation_refs: Vec::new(),
+                interactions: crate::SkillInteractionView::default(),
+                status,
+                stale_or_quarantine_reason: None,
+                proposed_action: crate::LifecycleAction::Keep,
+                review: None,
+                state_fence: fence.clone(),
+                lifecycle_revision: 1,
+            }
+        }
+
+        fn standing_package() -> (
+            eliot_skills::PortableSkillPackageCandidate,
+            eliot_skills::SkillPackage,
+            eliot_skills::MaterializationInputs,
+        ) {
+            let candidate = candidate();
+            let material = material_for(&candidate.behavior);
+            let package = package_for(&candidate, &material);
+            let stamped = crate::stamp_materialization_digests(&candidate, &package, &material)
+                .expect("stamp");
+            (stamped, package, material)
+        }
+
+        #[test]
+        fn lifecycle_gate_allows_uncovered_current_and_provisional() {
+            let (candidate, package, material) = standing_package();
+            let fence = standing_fence();
+            let empty = crate::SkillRegistry::default();
+            crate::check_lifecycle_standing(&empty, "skill.demo", &package, &fence)
+                .expect("uncovered skill installs provisional");
+            for status in [crate::SkillStatus::Current, crate::SkillStatus::Provisional] {
+                let registry =
+                    crate::SkillRegistry::from_snapshot([standing_view(&fence, &package, status)])
+                        .expect("recovered registry");
+                crate::check_lifecycle_standing(&registry, "skill.demo", &package, &fence)
+                    .expect("standing skill installs");
+            }
+            let _ = (candidate, material);
+        }
+
+        #[test]
+        fn lifecycle_gate_refuses_drift_revocation_and_stale_fence() {
+            let (_, package, _) = standing_package();
+            let fence = standing_fence();
+            // A refreshed Governor fences old standing: currency fails first.
+            let drifted_fence = {
+                let epoch = eliot_contracts::EpochId::new(
+                    eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .expect("lineage"),
+                    std::num::NonZeroU64::new(2).expect("nonzero"),
+                )
+                .expect("epoch");
+                eliot_contracts::StateFence::new(
+                    epoch,
+                    eliot_contracts::ResourceGeneration::new(2).expect("generation"),
+                )
+            };
+            let current = crate::SkillRegistry::from_snapshot([standing_view(
+                &fence,
+                &package,
+                crate::SkillStatus::Current,
+            )])
+            .expect("recovered registry");
+            assert!(matches!(
+                crate::check_lifecycle_standing(&current, "skill.demo", &package, &drifted_fence),
+                Err(SkillError::FenceMismatch)
+            ));
+            // A package revision the lifecycle never promoted is superseded.
+            let mut revised = package.clone();
+            revised.registration.revision = "2.0.0".to_owned();
+            assert!(matches!(
+                crate::check_lifecycle_standing(&current, "skill.demo", &revised, &fence),
+                Err(SkillError::InvalidField { field, .. }) if field == "lifecycle.revision"
+            ));
+            // Material the lifecycle never bound is a different package.
+            let mut rebound = package.clone();
+            rebound.digests.source_digest = "0".repeat(64);
+            assert!(matches!(
+                crate::check_lifecycle_standing(&current, "skill.demo", &rebound, &fence),
+                Err(SkillError::IdentityMismatch)
+            ));
+            // Revocation and supersession recorded by the lifecycle owner
+            // cannot be reinstalled around.
+            for status in [
+                crate::SkillStatus::Stale,
+                crate::SkillStatus::Suppressed,
+                crate::SkillStatus::Archived,
+                crate::SkillStatus::Quarantined,
+            ] {
+                let held =
+                    crate::SkillRegistry::from_snapshot([standing_view(&fence, &package, status)])
+                        .expect("recovered registry");
+                assert!(matches!(
+                    crate::check_lifecycle_standing(&held, "skill.demo", &package, &fence),
+                    Err(SkillError::InvalidField { field, .. }) if field == "lifecycle.status"
+                ));
+            }
+        }
+
+        #[test]
         fn bound_materialization_still_installs_under_governor_context() {
             use super::{SkillCatalogue, install_package};
             use crate::KnownTools;
@@ -1491,7 +1762,14 @@ mod tests {
             let candidate = candidate();
             let material = material_for(&candidate.behavior);
             let package = package_for(&candidate, &material);
-            validate_candidate_materialization(&candidate, &package, &material)
+            // An unstamped candidate never binds: absent expected digests
+            // refuse instead of skipping the authority binding.
+            assert!(matches!(
+                validate_candidate_materialization(&candidate, &package, &material),
+                Err(SkillError::InvalidField { field, .. })
+                    if field == "candidate.package_digests"
+            ));
+            let candidate = crate::stamp_materialization_digests(&candidate, &package, &material)
                 .expect("binding passes before install");
             let mut catalogue = SkillCatalogue::default();
             let installed = install_package(

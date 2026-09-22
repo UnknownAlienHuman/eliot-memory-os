@@ -301,7 +301,9 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// [`ReadinessClaims`](eliot_skill::ReadinessClaims) — a required tool or
     /// capability the provider did not mark available at its exact version
     /// refuses issuance while the install stands (installed is not
-    /// delivered). The sealed materialization entry then runs truthfully with
+    /// delivered) — and every available observation name must resolve
+    /// through the live tool-owner view, so claims for unadmitted tools fail
+    /// closed on owner state rather than injector words. The sealed materialization entry then runs truthfully with
     /// the public missing-ports provider: sealed omissions and binding
     /// failures refuse with the owner's own voice, while verifier absence
     /// proceeds WITHOUT sealed verification as `Provisional` (never
@@ -339,14 +341,15 @@ impl<T> ForwardingSkillLifecycle<T> {
             act.aliases,
             act.admitted_definition_version,
         )?;
+        let tools = eliot_skill::VersionBoundTools::new(act.source, act.aliases);
         eliot_skill::readiness_available_for_package(act.package, act.readiness)?;
+        eliot_skill::readiness_names_known_to_source(act.readiness, &tools)?;
         eliot_skill::sealed_materialization_check(
             act.package,
             act.inputs,
             act.readiness,
             act.scope,
         )?;
-        let tools = eliot_skill::VersionBoundTools::new(act.source, act.aliases);
         let receipt = self.deliver_hotset(
             act.hotset_id,
             vec![skill_id.clone()],
@@ -416,10 +419,8 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// identity plus the receipt the injector carries to the receiver.
     /// Synchronous: each step takes and drops the guard in a closed scope.
     ///
-    /// No in-tree transport delivers intake bytes yet; the composition seam
-    /// ([`DaemonComposition::skill_ingest_wire_intake`](super::DaemonComposition::skill_ingest_wire_intake))
-    /// has landed for that lane. The allowance covers exactly that pending
-    /// adoption; it expires when the lane lands.
+    /// Production caller: the daemon poller drives wire bytes here through
+    /// [`DaemonComposition::skill_ingest_wire_intake`](super::DaemonComposition::skill_ingest_wire_intake).
     #[allow(dead_code)]
     pub(crate) fn ingest_wire_intake(
         &self,
@@ -2417,13 +2418,12 @@ mod tests {
         eliot_skill::SkillPackage,
         eliot_skill::MaterializationInputs,
     ) {
-        let inputs = package_inputs();
         // Behavior and host are the accepted candidate's own: the mapper
         // derives them from the definition and target below, so the binding
-        // the delivery act enforces holds by construction here. Candidate
-        // identity is deterministic for a fixed definition and target, so
-        // each act builds the equal value via `fixture_candidate`.
-        let candidate = fixture_candidate();
+        // the delivery act enforces holds by construction here. The stamped
+        // install candidate comes from `fixture_candidate`.
+        let candidate = raw_candidate();
+        let inputs = package_inputs();
         let rule: eliot_skill::AdvisoryRuleClaim = serde_json::from_value(serde_json::json!({
             "rule_ref": { "rule_id": "rule-demo-1", "revision": 1 }
         }))
@@ -2507,7 +2507,7 @@ mod tests {
     /// the procedure shell carries the exact work scope [`delivery_scope`]
     /// builds and the [`fence`] epoch, so rehydration passes by construction
     /// and each refusal test mutates one dimension away from it.
-    fn fixture_candidate() -> eliot_skill::PortableSkillPackageCandidate {
+    fn raw_candidate() -> eliot_skill::PortableSkillPackageCandidate {
         let fence = fence();
         let receipt = candidate_receipt(&fence);
         let mut projection = eliot_skill::GovernedProcedureProjection {
@@ -2558,6 +2558,16 @@ mod tests {
         .expect("projection");
         assert_eq!(projected.candidates.len(), 1);
         projected.candidates[0].clone()
+    }
+
+    /// Stamped install candidate: the producer binds the exact materialized
+    /// digests, so the delivery act never sees an unstamped claim. Identity
+    /// is deterministic, matching the raw candidate the package derives
+    /// from above.
+    fn fixture_candidate() -> eliot_skill::PortableSkillPackageCandidate {
+        let (package, inputs) = package_source();
+        eliot_skill::stamp_materialization_digests(&raw_candidate(), &package, &inputs)
+            .expect("fixture stamps")
     }
 
     fn candidate_receipt(fence: &StateFence) -> eliot_skill::ReceiptClaim {
