@@ -462,6 +462,29 @@ impl InstallationActivationProjectionIntent {
         &self,
         transaction: &InstallationTransaction,
     ) -> Result<(), InstallationError> {
+        self.expected_approval_from_transaction(transaction)
+            .map(|_| ())
+    }
+
+    /// Reconstructs the exact approval retained by the durable activation
+    /// intent and validates it against the current transaction contour.
+    ///
+    /// The caller cannot supply any approval fields.  Every field comes from
+    /// the persisted binding plus the immutable transaction/manifest, and the
+    /// returned value is admitted through the normal pending-activation gate.
+    pub(crate) fn derive_verified_approval(
+        &self,
+        transaction: &InstallationTransaction,
+    ) -> Result<InstallationActivationApproval, InstallationError> {
+        let approval = self.expected_approval_from_transaction(transaction)?;
+        approval.validate_against(transaction)?;
+        Ok(approval)
+    }
+
+    fn expected_approval_from_transaction(
+        &self,
+        transaction: &InstallationTransaction,
+    ) -> Result<InstallationActivationApproval, InstallationError> {
         self.validate()?;
         if self.transaction_id != transaction.transaction_id
             || self.installer_plan_digest != transaction.installer_plan_digest
@@ -485,7 +508,7 @@ impl InstallationActivationProjectionIntent {
         if self.scm_readbacks != transaction.service_registration_approvals_unchecked()? {
             return Err(InstallationError::IdentityConflict);
         }
-        let expected_approval = InstallationActivationApproval::from_verified_parts(
+        let approval = InstallationActivationApproval::from_verified_parts(
             self.verified_approval.approval_ref.clone(),
             transaction.transaction_id.clone(),
             transaction.installer_plan_digest.clone(),
@@ -518,12 +541,11 @@ impl InstallationActivationProjectionIntent {
                 .authority_state_fence
                 .clone(),
         );
-        if !self.verified_approval.matches_approval(&expected_approval) {
+        if !self.verified_approval.matches_approval(&approval) {
             return Err(InstallationError::IdentityConflict);
         }
-        Ok(())
+        Ok(approval)
     }
-
     pub(crate) fn matches_verified(
         &self,
         transaction: &InstallationTransaction,

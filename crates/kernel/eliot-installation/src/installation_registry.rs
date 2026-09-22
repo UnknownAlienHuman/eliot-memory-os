@@ -871,6 +871,90 @@ impl RedbInstallationRegistry {
         })
     }
 
+    /// Reads the current CAS revision for one exact pending activation.
+    ///
+    /// The intent records the registry snapshot used to stage the pending
+    /// projection.  Staging itself advances the registry revision, so abort
+    /// must use this guarded readback revision rather than replaying the
+    /// pre-stage snapshot number.
+    pub(crate) fn read_exact_pending_activation_revision(
+        &self,
+        host: &HostOwnerEpochCapability,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        approval: &InstallationActivationApproval,
+    ) -> Result<u64, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let registry = self.load()?;
+        let pending = registry.pending_activation().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "exact pending activation is absent before abort".to_owned(),
+            )
+        })?;
+        if pending.transaction_id != *transaction_id
+            || pending.plan_digest != *plan_digest
+            || pending.approval != *approval
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(registry.revision())
+    }
+    /// Reads an exact Host-owner acknowledgement for a first-install abort.
+    ///
+    /// A prior successful abort may have advanced the registry revision before
+    /// the transaction CAS response was observed.  This readback accepts only
+    /// the durable `ABORTED` terminal for the exact transaction, plan and
+    /// generation; it never treats a missing or different terminal as success.
+    pub(crate) fn read_exact_aborted_activation_ack(
+        &self,
+        host: &HostOwnerEpochCapability,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        generation: &PlatformHandle,
+    ) -> Result<Option<PlatformHandle>, InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let registry = self.load()?;
+        if registry.pending_activation().is_some() {
+            return Ok(None);
+        }
+        let Some(terminal) = registry.last_terminal_activation.as_ref() else {
+            return Ok(None);
+        };
+        let same_transaction_and_plan =
+            terminal.transaction_id == *transaction_id && terminal.plan_digest == *plan_digest;
+        if terminal.disposition == PendingActivationTerminalDisposition::Aborted
+            && same_transaction_and_plan
+            && terminal.generation == *generation
+            && terminal.commit_fence.is_none()
+        {
+            if registry.active_generation.is_some() || registry.last_known_good_generation.is_some()
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "aborted first-install terminal coexists with active registry state".to_owned(),
+                ));
+            }
+            let terminal_digest = activation_terminal_digest(terminal)?;
+            let evidence = PlatformHandle::new(format!(
+                "activation-abort-ack-v1:{}:{}:{}",
+                registry.revision(),
+                terminal.generation.as_str(),
+                terminal_digest,
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "activation_projection.abort_evidence".to_owned(),
+                reason: error.to_string(),
+            })?;
+            return Ok(Some(evidence));
+        }
+        if same_transaction_and_plan {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(None)
+    }
     /// Atomically aborts one exact first-install pending approval.
     pub fn abort_pending_activation(
         &self,
