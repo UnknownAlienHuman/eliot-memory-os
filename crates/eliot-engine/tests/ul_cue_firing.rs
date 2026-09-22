@@ -1,7 +1,7 @@
 use eliot_engine::{CueIndexService, ObservedCue};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CognitiveProjectionReadState, CredentialProviderKind, CueIndexRow, CueKind, CueMatchMode,
+    CognitiveProjectionReadState, CredentialProviderKind, CueIndexRow, LegacyCueKindV1, CueMatchMode,
     CueStrength, GovernorConfig, MemoryRevision, ProjectId, cue_row_id, ul_token_estimate,
 };
 use std::fs;
@@ -196,7 +196,7 @@ async fn t03_no_cross_project_or_stale_leak() -> TestResult {
 
 fn file_cue() -> ObservedCue {
     ObservedCue {
-        kind: CueKind::FilePath,
+        kind: LegacyCueKindV1::FilePath,
         value: PATH_CUE.to_owned(),
     }
 }
@@ -212,13 +212,13 @@ fn row(
     CueIndexRow {
         row_id: cue_row_id(
             project_id,
-            CueKind::FilePath,
+            LegacyCueKindV1::FilePath,
             CueMatchMode::Exact,
             PATH_CUE,
             record_ref,
         ),
         project_id,
-        cue_kind: CueKind::FilePath,
+        cue_kind: LegacyCueKindV1::FilePath,
         cue_value_norm: PATH_CUE.to_owned(),
         match_mode: CueMatchMode::Exact,
         record_ref: record_ref.to_owned(),

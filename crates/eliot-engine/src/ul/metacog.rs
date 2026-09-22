@@ -1,6 +1,6 @@
 use super::capsule_freshness;
 use eliot_types::{
-    CapsuleFreshness, ConceptNode, CoverageClass, CueKind, CueRecordSource, DangerPath,
+    CapsuleFreshness, ConceptNode, CoverageClass, LegacyCueKindV1, CueRecordSource, DangerPath,
     HotspotScore, ModuleCard, SubsystemCapsule, SubsystemCoverage, UlMetacognitionView,
     path_matches_boundary,
 };
@@ -231,7 +231,7 @@ fn count_kind(sources: &[&CueRecordSource], kinds: &[&str]) -> u32 {
 
 fn source_matches_concept(source: &CueRecordSource, concept: &ConceptNode) -> bool {
     source.cue_bindings.iter().any(|binding| {
-        matches!(binding.cue_kind, CueKind::FilePath | CueKind::DirPath)
+        matches!(binding.cue_kind, LegacyCueKindV1::FilePath | LegacyCueKindV1::DirPath)
             && concept
                 .boundary_paths
                 .iter()
@@ -246,7 +246,7 @@ fn danger_paths(hotspots: &[HotspotScore], cue_sources: &[CueRecordSource]) -> V
         .filter(|source| source.negative_memory || source.record_kind == "failure_fingerprint")
     {
         for binding in &source.cue_bindings {
-            if matches!(binding.cue_kind, CueKind::FilePath | CueKind::DirPath) {
+            if matches!(binding.cue_kind, LegacyCueKindV1::FilePath | LegacyCueKindV1::DirPath) {
                 failures
                     .entry(binding.cue_value.clone())
                     .or_default()

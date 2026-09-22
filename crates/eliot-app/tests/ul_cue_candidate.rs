@@ -4,7 +4,7 @@ use eliot_engine::{
 use eliot_store::{CanonicalStore, ControlWal};
 use eliot_types::{
     AgentCandidateSubmitInput, AgentId, ClaimCardInput, ClaimId, CommandContext, ControlWalConfig,
-    CredentialProviderKind, CueBinding, CueKind, CueMatchMode, CueStrength, EpistemicStatus,
+    CredentialProviderKind, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength, EpistemicStatus,
     GovernorConfig, LifecycleStatus, ProjectId, SemanticCommand, TaintClass, TaskId, Visibility,
     WriteId, normalize_bindings,
 };
@@ -40,7 +40,7 @@ async fn t03_candidate_persists_normalized_bindings() -> TestResult {
         provenance_refs: vec!["task:03".to_owned()],
         freshness_rule: "recheck after path changes".to_owned(),
         cue_bindings: vec![CueBinding {
-            cue_kind: CueKind::FilePath,
+            cue_kind: LegacyCueKindV1::FilePath,
             cue_value: r"Crates\Eliot-Store\src\LIB.rs".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,

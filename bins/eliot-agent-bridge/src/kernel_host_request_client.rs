@@ -34,7 +34,9 @@ use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, HARD_STRUCTURED_RESPONSE_BYTES,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestAdmissionReceipt,
     HostRequestEnvelope, HostRequestIdentity, HostRequestKind, HostRequestResultBody, MessageType,
-    ProtocolPayload, ProtocolVersion, RequestIdentity, host_request_operation_id,
+    ProtocolPayload, ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
+    REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreQuery, ReactiveRestoreReply, RequestIdentity,
+    host_request_operation_id, restore_correlation,
 };
 use eliot_receipts::RequestBinding;
 use serde::Deserialize;
@@ -365,6 +367,29 @@ fn build_invocation_envelope(
     finish_envelope(facts, HostRequestKind::Invocation, identity)
 }
 
+fn build_restore_envelope(
+    correlation: &str,
+    facts: &TransportFacts,
+    session_id: &str,
+    payload_digest: &str,
+    deadline: u64,
+) -> Result<HostRequestEnvelope, PortFailure> {
+    let identity = HostRequestIdentity {
+        request_id: RequestId::new(correlation).map_err(|_| request_failure())?,
+        idempotency_key: format!("{correlation}:restore"),
+        cancellation_id: format!("{correlation}:restore:cancel"),
+        parent_operation_id: None,
+        deadline_unix_ms: deadline,
+        capability: REACTIVE_RESTORE_CAPABILITY.to_owned(),
+        session_id: Some(session_id.to_owned()),
+        task_id: None,
+        work_scope_id: None,
+        payload_schema_id: REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID.to_owned(),
+        payload_sha256: payload_digest.to_owned(),
+    };
+    finish_envelope(facts, HostRequestKind::Invocation, identity)
+}
+
 fn build_cancellation_envelope(
     request: &HostCancellationRequest,
     facts: &TransportFacts,
@@ -677,6 +702,43 @@ fn decode_admitted_reply(
     Some((receipt, record))
 }
 
+/// Builds the typed rejection for a restore reply whose body does not bind
+/// the admitted request.
+fn invalid_restore(detail: &str) -> PortFailure {
+    PortFailure::TransportBindingRejected {
+        reason: format!("kernel restore body is not the admitted answer: {detail}"),
+    }
+}
+
+/// Decodes one restore reply and checks it against the admitted request.
+///
+/// Mirrors `decode_stored_response` binding semantics (request/digest joins
+/// against the exact sent envelope) without tool bindings: the digest must
+/// bind the canonical reply bytes, and the reply must validate. Session and
+/// fence echo equality against the live binding is the composition's
+/// authority check, not transport's.
+fn decode_restore_reply(
+    record: &AdmittedReplyView,
+) -> Result<ReactiveRestoreReply, PortFailure> {
+    let body = record.result_response.clone().ok_or_else(|| {
+        invalid_restore("a received restore must carry its bounded body")
+    })?;
+    let digest = record
+        .result_digest
+        .clone()
+        .ok_or_else(|| invalid_restore("a received restore must carry its digest"))?;
+    let bytes = canonical_json_bytes(&body).map_err(|_| invalid_restore("uncanonicalizable"))?;
+    if sha256_hex(&bytes) != digest {
+        return Err(invalid_restore("digest does not bind the exact body"));
+    }
+    let reply: ReactiveRestoreReply =
+        serde_json::from_value(body).map_err(|_| invalid_restore("body is not a restore reply"))?;
+    reply
+        .validate()
+        .map_err(|error| invalid_restore(&error.to_string()))?;
+    Ok(reply)
+}
+
 /// Builds the typed rejection for a result-bearing reply whose body does not
 /// bind the admitted request.
 fn invalid_result(detail: &str) -> PortFailure {
@@ -890,6 +952,55 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             },
             None => self.probe_confirms_parent(&facts, &session, &parent, &envelope, now_ms),
         }
+    }
+
+    fn restore_reactive_state(
+        &mut self,
+        query: &ReactiveRestoreQuery,
+    ) -> Result<ReactiveRestoreReply, PortFailure> {
+        query.validate().map_err(|error| PortFailure::TransportBindingRejected {
+            reason: format!("restore query invalid: {error}"),
+        })?;
+        let now_ms = unix_ms()?;
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+        // Caller-text confusion checks against Kernel-issued facts: the query
+        // must name the live attach session and fence, never another binding.
+        if query.session_id != session {
+            return Err(PortFailure::TransportBindingRejected {
+                reason: "restore session does not match the live attach session".to_owned(),
+            });
+        }
+        if query.state_fence != facts.state_fence {
+            return Err(PortFailure::FenceMismatch);
+        }
+        let payload_digest = query.canonical_digest().map_err(|_| request_failure())?;
+        let correlation = restore_correlation(&session, &facts.state_fence);
+        let deadline = now_ms.saturating_add(DEFAULT_DEADLINE_PREFERENCE_MS);
+        if deadline == 0 {
+            return Err(request_failure());
+        }
+        let envelope =
+            build_restore_envelope(&correlation, &facts, &session, &payload_digest, deadline)?;
+        let mut frame =
+            host_request_frame_for_envelope(REACTIVE_RESTORE_OPERATION, &envelope, &facts)?;
+        let query_value = serde_json::to_value(query).map_err(|_| request_failure())?;
+        let ProtocolPayload::Json(payload) = &mut frame.payload else {
+            return Err(request_failure());
+        };
+        payload["restore"] = query_value;
+        frame.validate().map_err(|_| request_failure())?;
+        let reply = self.exchange(&frame).map_err(|_| request_failure())?;
+        let (_, record) = decode_admitted_reply(&reply, &envelope).ok_or_else(|| {
+            PortFailure::TransportBindingRejected {
+                reason: "restore reply is not the admitted answer".to_owned(),
+            }
+        })?;
+        decode_restore_reply(&record)
     }
 }
 

@@ -60,6 +60,10 @@ eliot-evidence.workspace = true
 # types. Test-only; production accepts caller-supplied typed payloads.
 eliot-canonical.workspace = true
 eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", version = "0.1.0" }
+# Issue #1779 failure history: adapter tests drive the real reference
+# contour (never a fake store) through the canonical failure leg.
+# Test-only; production backends serve the same contract.
+eliot-store-memory = { path = "../../storage/eliot-store-memory", version = "0.1.0" }
 secrecy.workspace = true
 
 [lints]

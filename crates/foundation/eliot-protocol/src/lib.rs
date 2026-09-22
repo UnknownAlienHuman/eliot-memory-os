@@ -47,12 +47,20 @@ pub use reactive_context::{
 };
 
 pub mod dreamer_job;
+pub mod reactive_restore;
 pub use dreamer_job::{
     AdmissionRef, CancellationState, DURABLE_JOB_CANONICAL_ENCODING, DURABLE_JOB_CONTRACT_NAME,
     DURABLE_JOB_CONTRACT_VERSION, DurableJobError, DurableJobRecord, DurableJobRequest,
     DurableJobResponse, DurableRequestIdentity, JobCapability, JobCheckpoint, JobLease,
     JobOperation, JobOperationKind, JobOutcome, JobRole, JobState, JobSubmission, LeaseSelector,
     MutationDisposition, MutationReconciliation, OpaqueContentRef, durable_job_contract_identity,
+};
+pub use reactive_restore::{
+    MAX_RESTORE_LEDGER_BYTES, MAX_RESTORE_SNAPSHOT_BYTES, MAX_RESTORE_TEXT_BYTES,
+    MAX_RESTORE_URIS, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_CONTRACT_NAME,
+    REACTIVE_RESTORE_CONTRACT_VERSION, REACTIVE_RESTORE_OPERATION,
+    REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreError, ReactiveRestoreQuery,
+    ReactiveRestoreReply, RestoredSnapshot, restore_correlation,
 };
 
 /// Stable identity of this protocol surface.

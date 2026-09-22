@@ -2,16 +2,20 @@
 //! (issue #1779).
 //!
 //! Mirrors the reference contour's closed legs through the store-api wire
-//! contract, persisted in three tables: `automation_revision` holds one
+//! contract, persisted in five tables: `automation_revision` holds one
 //! immutable row per `(automation_id, revision)` carrying the verbatim
 //! Kernel-owned revision document; `automation_current` holds one
 //! compare-and-set pointer per automation carrying the current revision
 //! plus the closed admission state; `automation_invocation` holds one
 //! create-only row per stable occurrence identity carrying the verbatim
-//! invocation document. Revision documents stay opaque: lineage validity
-//! is Kernel-owned, and this module arbitrates keys, pointers, and
-//! immutability only. Concurrent writers arbitrate through the
-//! in-transaction compare-and-set inside the canonical transaction;
+//! invocation document; `automation_failure` holds one immutable row per
+//! `(automation_id, revision, fingerprint)` carrying the verbatim
+//! failure document with first-writer provenance; `automation_last_failure`
+//! holds one last-wins pointer per automation naming the most recently
+//! committed failure row. Revision and failure documents stay opaque:
+//! lineage validity is Kernel-owned, and this module arbitrates keys,
+//! pointers, and immutability only. Concurrent writers arbitrate through
+//! the in-transaction compare-and-set inside the canonical transaction;
 //! retries recompute from fresh rows, never from stale reads. Rows commit
 //! inside the canonical transaction beside the receipt and outbox rows,
 //! so rows, receipt, and outbox stay atomic.
@@ -93,6 +97,41 @@ pub(crate) struct AutomationInvocationWrite {
     pub task_id: Option<String>,
 }
 
+/// One computed failure-row write for the canonical transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AutomationFailureWrite {
+    /// Canonical failure key (record id).
+    pub failure_key: String,
+    /// Stable automation identity.
+    pub automation_id: String,
+    /// Immutable revision that owns the failure class.
+    pub revision: String,
+    /// Stable occurrence identity retained as history context.
+    pub occurrence_id: String,
+    /// Deterministic failure-class fingerprint.
+    pub fingerprint: String,
+    /// Verbatim canonical failure document.
+    pub failure_json: String,
+    /// First-writer operation identity.
+    pub source_operation_id: String,
+    /// Admission fence of the transition.
+    pub state_fence: StateFence,
+    /// Scope provenance from the transition envelope.
+    pub scope_id: String,
+    /// Task-binding provenance from the transition envelope, when bound.
+    pub task_id: Option<String>,
+}
+
+/// One computed last-failure-pointer write for the canonical
+/// transaction. Last write wins; no expected revision.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AutomationLastFailureWrite {
+    /// Stable automation identity (record id).
+    pub automation_id: String,
+    /// Failure key of the most recently committed failure row.
+    pub failure_key: String,
+}
+
 /// Computed automation row writes for one admitted transition.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AutomationWrites {
@@ -102,6 +141,10 @@ pub(crate) struct AutomationWrites {
     pub currents: Vec<AutomationCurrentWrite>,
     /// Invocation creates in admitted command order.
     pub invocations: Vec<AutomationInvocationWrite>,
+    /// Failure creates/converges in admitted command order.
+    pub failures: Vec<AutomationFailureWrite>,
+    /// Last-failure pointer moves in admitted command order.
+    pub last_failures: Vec<AutomationLastFailureWrite>,
 }
 
 /// Stored revision row shape as projected by reads.
@@ -143,6 +186,25 @@ pub(crate) struct StoredAutomationInvocation {
     pub state_fence: StateFence,
 }
 
+/// Stored failure row shape as projected by reads.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StoredAutomationFailure {
+    /// Stable automation identity.
+    pub automation_id: String,
+    /// Immutable revision that owns the failure class.
+    pub revision: String,
+    /// Stable occurrence identity retained as history context.
+    pub occurrence_id: String,
+    /// Deterministic failure-class fingerprint.
+    pub fingerprint: String,
+    /// Verbatim canonical failure document.
+    pub failure_json: String,
+    /// First-writer operation identity.
+    pub source_operation_id: String,
+    /// Admission fence.
+    pub state_fence: StateFence,
+}
+
 /// Ensures the automation tables exist (idempotent).
 ///
 /// Schemaless tables auto-create on write, but reads and the
@@ -154,10 +216,12 @@ async fn ensure_automation_tables(
     config: &SurrealAdapterConfig,
 ) -> Result<(), AdapterError> {
     let sql = format!(
-        "DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;",
+        "DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;",
         crate::schema::table::AUTOMATION_REVISION,
         crate::schema::table::AUTOMATION_CURRENT,
-        crate::schema::table::AUTOMATION_INVOCATION
+        crate::schema::table::AUTOMATION_INVOCATION,
+        crate::schema::table::AUTOMATION_FAILURE,
+        crate::schema::table::AUTOMATION_LAST_FAILURE
     );
     let mut response =
         client::query(db, config, "automation.ensure_tables", &sql, Map::new()).await?;
@@ -284,6 +348,23 @@ impl PrepareContext<'_> {
                     revision,
                     occurrence_id,
                     invocation_json,
+                )
+                .await
+            }
+            DecodedAutomationMutation::Failure {
+                automation_id,
+                revision,
+                occurrence_id,
+                failure,
+                failure_json,
+            } => {
+                self.apply_failure(
+                    writes,
+                    automation_id,
+                    revision,
+                    occurrence_id,
+                    failure.fingerprint,
+                    failure_json,
                 )
                 .await
             }
@@ -419,6 +500,50 @@ impl PrepareContext<'_> {
         });
         Ok(())
     }
+
+    /// Failure leg: immutable failure row plus last-failure pointer move;
+    /// the named revision must exist. Repeats of one failure class
+    /// converge on the existing row (the pointer still moves to it);
+    /// divergent documents fail closed.
+    async fn apply_failure(
+        &self,
+        writes: &mut AutomationWrites,
+        automation_id: String,
+        revision: String,
+        occurrence_id: String,
+        fingerprint: String,
+        failure_json: String,
+    ) -> Result<(), AdapterError> {
+        require_revision_row(self.db, self.config, &automation_id, &revision).await?;
+        let failure_key =
+            eliot_store_api::automation_failure_key(&automation_id, &revision, &fingerprint);
+        match read_failure_row(self.db, self.config, &failure_key).await? {
+            None => {
+                let (state_fence, scope_id, task_id) = self.provenance();
+                writes.failures.push(AutomationFailureWrite {
+                    failure_key: failure_key.clone(),
+                    automation_id: automation_id.clone(),
+                    revision,
+                    occurrence_id,
+                    fingerprint,
+                    failure_json,
+                    source_operation_id: self.transition.identity.operation_id.to_string(),
+                    state_fence,
+                    scope_id,
+                    task_id,
+                });
+            }
+            Some(row) if row.failure_json != failure_json => {
+                return Err(AdapterError::Store(StoreError::IdentityConflict));
+            }
+            Some(_) => {}
+        }
+        writes.last_failures.push(AutomationLastFailureWrite {
+            automation_id,
+            failure_key,
+        });
+        Ok(())
+    }
 }
 
 /// Reads one revision row by its halves.
@@ -509,6 +634,69 @@ async fn read_invocation_row(
     row.as_ref().map(decode_invocation_row).transpose()
 }
 
+/// Reads one failure row by its canonical failure key.
+async fn read_failure_row(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    failure_key: &str,
+) -> Result<Option<StoredAutomationFailure>, AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert(
+        "automation_table".to_owned(),
+        json!(crate::schema::table::AUTOMATION_FAILURE),
+    );
+    bindings.insert("automation_key".to_owned(), json!(failure_key));
+    let statement = "SELECT * FROM ONLY type::record($automation_table, $automation_key);";
+    let mut response =
+        client::query(db, config, "automation.read_failure", statement, bindings).await?;
+    let errors = response.take_errors();
+    if missing_automation_table(&errors) {
+        return Ok(None);
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let row: Option<Value> = response.take(0)?;
+    row.as_ref().map(decode_failure_row).transpose()
+}
+
+/// Reads one last-failure pointer by automation identity.
+async fn read_last_failure_row(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    automation_id: &str,
+) -> Result<Option<String>, AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert(
+        "automation_table".to_owned(),
+        json!(crate::schema::table::AUTOMATION_LAST_FAILURE),
+    );
+    bindings.insert("automation_key".to_owned(), json!(automation_id));
+    let statement = "SELECT * FROM ONLY type::record($automation_table, $automation_key);";
+    let mut response = client::query(
+        db,
+        config,
+        "automation.read_last_failure",
+        statement,
+        bindings,
+    )
+    .await?;
+    let errors = response.take_errors();
+    if missing_automation_table(&errors) {
+        return Ok(None);
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let row: Option<Value> = response.take(0)?;
+    Ok(row
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("failure_key"))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
+}
+
 /// Reports whether provider errors prove only that an automation table
 /// has no rows yet (fresh database, no migration): a missing table
 /// carries no rows, so empty is exact truth here rather than an
@@ -519,7 +707,9 @@ pub(crate) fn missing_automation_table(errors: &[String]) -> bool {
             error.contains("does not exist")
                 && (error.contains(schema::table::AUTOMATION_REVISION)
                     || error.contains(schema::table::AUTOMATION_CURRENT)
-                    || error.contains(schema::table::AUTOMATION_INVOCATION))
+                    || error.contains(schema::table::AUTOMATION_INVOCATION)
+                    || error.contains(schema::table::AUTOMATION_FAILURE)
+                    || error.contains(schema::table::AUTOMATION_LAST_FAILURE))
         })
 }
 
@@ -658,6 +848,24 @@ fn decode_invocation_row(value: &Value) -> Result<StoredAutomationInvocation, Ad
     })
 }
 
+fn decode_failure_row(value: &Value) -> Result<StoredAutomationFailure, AdapterError> {
+    let object = value
+        .as_object()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.row",
+            reason: "automation row must be an object",
+        }))?;
+    Ok(StoredAutomationFailure {
+        automation_id: text_row_field(object, "automation_id")?,
+        revision: text_row_field(object, "revision")?,
+        occurrence_id: text_row_field(object, "occurrence_id")?,
+        fingerprint: text_row_field(object, "fingerprint")?,
+        failure_json: text_row_field(object, "failure_json")?,
+        source_operation_id: text_row_field(object, "source_operation_id")?,
+        state_fence: fence_row_field(object)?,
+    })
+}
+
 /// Builds the canonical-transaction fragment persisting automation rows.
 ///
 /// Revision and invocation writes are create-or-converge: missing rows
@@ -682,6 +890,12 @@ pub(crate) fn automation_write_statements(
     }
     for (index, write) in writes.invocations.iter().enumerate() {
         append_invocation_statement(&mut sql, &mut bindings, index, write);
+    }
+    for (index, write) in writes.failures.iter().enumerate() {
+        append_failure_statement(&mut sql, &mut bindings, index, write);
+    }
+    for (index, write) in writes.last_failures.iter().enumerate() {
+        append_last_failure_statement(&mut sql, &mut bindings, index, write);
     }
     (sql, bindings)
 }
@@ -802,6 +1016,72 @@ fn append_invocation_statement(
     );
 }
 
+/// Appends one failure create-or-converge fragment.
+fn append_failure_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    index: usize,
+    write: &AutomationFailureWrite,
+) {
+    let suffix = format!("failure_{index}");
+    sql.push_str(
+            "LET $failure_current_{s} = (SELECT failure_json FROM ONLY type::record($failure_table_{s}, $failure_key_{s})); IF type::is_object($failure_current_{s}) { IF $failure_current_{s}.failure_json != $failure_expected_{s} { THROW 'automation_failure_conflict'; }; } ELSE { CREATE type::record($failure_table_{s}, $failure_key_{s}) CONTENT $failure_record_{s}; };"
+                .replace("{s}", &suffix)
+                .as_str(),
+        );
+    bindings.insert(
+        format!("failure_table_{suffix}"),
+        json!(schema::table::AUTOMATION_FAILURE),
+    );
+    bindings.insert(format!("failure_key_{suffix}"), json!(&write.failure_key));
+    bindings.insert(
+        format!("failure_expected_{suffix}"),
+        json!(&write.failure_json),
+    );
+    bindings.insert(
+        format!("failure_record_{suffix}"),
+        json!({
+            "automation_id": write.automation_id,
+            "revision": write.revision,
+            "occurrence_id": write.occurrence_id,
+            "fingerprint": write.fingerprint,
+            "failure_json": write.failure_json,
+            "source_operation_id": write.source_operation_id,
+            "state_fence": write.state_fence,
+            "scope_id": write.scope_id,
+            "task_id": write.task_id,
+        }),
+    );
+}
+
+/// Appends one last-failure pointer create-or-update fragment. Latest
+/// write wins; no conflict marker.
+fn append_last_failure_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    index: usize,
+    write: &AutomationLastFailureWrite,
+) {
+    let suffix = format!("last_failure_{index}");
+    sql.push_str(
+            "LET $last_current_{s} = (SELECT failure_key FROM ONLY type::record($last_table_{s}, $last_key_{s})); IF type::is_object($last_current_{s}) { UPDATE type::record($last_table_{s}, $last_key_{s}) CONTENT $last_record_{s}; } ELSE { CREATE type::record($last_table_{s}, $last_key_{s}) CONTENT $last_record_{s}; };"
+                .replace("{s}", &suffix)
+                .as_str(),
+        );
+    bindings.insert(
+        format!("last_table_{suffix}"),
+        json!(schema::table::AUTOMATION_LAST_FAILURE),
+    );
+    bindings.insert(format!("last_key_{suffix}"), json!(&write.automation_id));
+    bindings.insert(
+        format!("last_record_{suffix}"),
+        json!({
+            "automation_id": write.automation_id,
+            "failure_key": write.failure_key,
+        }),
+    );
+}
+
 /// Reads all current pointers in deterministic automation-id order.
 pub(crate) async fn read_currents_for_read(
     db: &RpcTransport,
@@ -892,6 +1172,18 @@ pub(crate) async fn read_invocations_for_read(
     rows.iter().map(decode_invocation_row).collect()
 }
 
+/// Reads the last failure row for one automation, if any.
+pub(crate) async fn read_failure_for_read(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    automation_id: &str,
+) -> Result<Option<StoredAutomationFailure>, AdapterError> {
+    let Some(failure_key) = read_last_failure_row(db, config, automation_id).await? else {
+        return Ok(None);
+    };
+    read_failure_row(db, config, &failure_key).await
+}
+
 #[cfg(test)]
 mod template_tests {
     use super::*;
@@ -947,6 +1239,22 @@ mod template_tests {
                 scope_id: "user-automation".to_owned(),
                 task_id: None,
             }],
+            failures: vec![AutomationFailureWrite {
+                failure_key: "auto-1\x1ffp-9".to_owned(),
+                automation_id: "auto-1".to_owned(),
+                revision: "r-1".to_owned(),
+                occurrence_id: "user-automation-occurrence:abc".to_owned(),
+                fingerprint: "fp-9".to_owned(),
+                failure_json: r#"{"fingerprint":"fp-9"}"#.to_owned(),
+                source_operation_id: "op-1".to_owned(),
+                state_fence: test_fence(),
+                scope_id: "user-automation".to_owned(),
+                task_id: None,
+            }],
+            last_failures: vec![AutomationLastFailureWrite {
+                automation_id: "auto-1".to_owned(),
+                failure_key: "auto-1\x1ffp-9".to_owned(),
+            }],
         }
     }
 
@@ -981,6 +1289,18 @@ mod template_tests {
             sql.contains("CREATE type::record($invoke_table_invocation_0"),
             "invocation leg creates"
         );
+        assert!(
+            sql.contains("THROW 'automation_failure_conflict'"),
+            "failure legs guard divergence"
+        );
+        assert!(
+            sql.contains("CREATE type::record($failure_table_failure_0"),
+            "failure leg creates"
+        );
+        assert!(
+            sql.contains("UPDATE type::record($last_table_last_failure_0"),
+            "last-failure pointer moves"
+        );
         for name in [
             "automation_table_revision_0",
             "automation_key_revision_0",
@@ -997,6 +1317,13 @@ mod template_tests {
             "invoke_key_invocation_0",
             "invoke_record_invocation_0",
             "invoke_expected_invocation_0",
+            "failure_table_failure_0",
+            "failure_key_failure_0",
+            "failure_record_failure_0",
+            "failure_expected_failure_0",
+            "last_table_last_failure_0",
+            "last_key_last_failure_0",
+            "last_record_last_failure_0",
         ] {
             assert!(bindings.contains_key(name), "binding travels: {name}");
         }
