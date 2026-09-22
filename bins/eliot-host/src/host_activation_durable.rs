@@ -867,7 +867,7 @@ impl HostComposition {
 
     #[cfg(windows)]
     fn require_pre_no_return_abort_eligibility(
-        &self,
+        &mut self,
         pending: &eliot_installation::PendingActivation,
     ) -> Result<(), HostError> {
         if pending.prior_active_generation.is_some() {
@@ -917,6 +917,13 @@ impl HostComposition {
                 "Host journal retains service progress for the pending activation".to_owned(),
             ));
         }
+        if state.prior_kernel_unknown {
+            return Err(HostError::RecoveryRequired(
+                "Host journal retains unknown prior Kernel authority for the pending activation"
+                    .to_owned(),
+            ));
+        }
+        self.reconcile_watchdog_start_for_abort(pending)?;
         self.jobs
             .pre_no_return_abort_liveness()
             .map_err(HostError::RecoveryRequired)
