@@ -401,21 +401,21 @@ variants = []
 role = "oracle"
 owner = "#706"
 migration = 706
-expiry = "frozen-seam-oracle; invalid-on-any-oracle-edit; alias removal tracked by #835"
+expiry = "frozen-seam-oracle; lexical duplicate scan authorized under #832 coherent join; alias removal tracked by #835"
 risk = "none"
-match_count = 68
-matched_digest = "15ab24988d24b0469f63c62c0860950189932d4b7d1cd8711744b90ac7062191"
+match_count = 69
+matched_digest = "521f1d62bca193d8383e945884f03070de3d8039b6ff08d4b6cbccf768e97b32"
 variants = []
 
 [type_row."crates/smart/eliot-context/src/lib.rs"]
-role = "duplicate"
+role = "internal"
 owner = "#832"
 migration = 832
 expiry = "donor-disposition-under-#832; invalid-on-definition-change"
-risk = "duplicate-definition"
-match_count = 15
-matched_digest = "00e4138427f35573bb5df6f08920f629c89b8cb2c435fed8c36ef980f78bc980"
-variants = ["Path", "Symbol", "Error", "Command", "Service", "TaskClass", "Concept", "Problem"]
+risk = "none"
+match_count = 46
+matched_digest = "bb13ce5a7ba203f62fd0c78b9f6ae400be9b221ada0e20df9366d7a18b6a3142"
+variants = []
 
 [type_row."crates/smart/eliot-cues/src/lib.rs"]
 role = "duplicate"
@@ -720,13 +720,13 @@ match_count = 11
 matched_digest = "3cc6054f0d8b45947527416c3ff1bd4c530695a29de4f79d595b6bd9b06d56d7"
 
 [field_row."crates/smart/eliot-context/src/lib.rs"]
-role = "duplicate"
+role = "internal"
 owner = "#832"
 migration = 832
 expiry = "donor-disposition-under-#832; invalid-on-definition-change"
-risk = "duplicate-definition"
-match_count = 1
-matched_digest = "fa63c0e734e76e9d643a9342a1964c4d9886483827b2d3369372d1dc115bf240"
+risk = "none"
+match_count = 9
+matched_digest = "3e49155d2282ecd79d0829e302aa22be1ff114c56628c0805583800263054f1a"
 
 [field_row."crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"]
 role = "current-test"
