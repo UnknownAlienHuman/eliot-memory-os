@@ -30,15 +30,17 @@
 //! [`produce_host_generation`] fails closed naming it instead of minting or
 //! converting a generation from another domain.
 //!
-//! Recipient-string note for the D2 join (M2): the recipient owner
+//! Recipient-identity contract for the D2 join (M2): the recipient owner
 //! vocabulary (`ReactiveContextRecipient`: session, opaque runtime identity,
-//! runtime generation, route) carries no single `recipient_id` string field.
-//! This producer returns the exact admitted recipient struct plus its
-//! `runtime_id`; rendering a `snapshot.recipient_id` string from route,
-//! runtime, or session text would conflate distinct fields and needs a
-//! contract decision owned by the session-envelope contract author — it is
-//! not taken here. Principal and recipient are never conflated: the snapshot
-//! carries the bridge-owned `principal_id` separately.
+//! runtime generation, route) carries no standalone `recipient_id` string,
+//! so the contract derivation reads the authoritative disclosure vocabulary:
+//! I5.26 names disclosure recipients as `recipient_principal_or_route`, and
+//! the admitted recipient carries no principal. The route
+//! fingerprint-or-identity is therefore the recipient identity text
+//! (`AdmittedDeliveryFacts.recipient_id`), cloned from the admitted struct —
+//! never parsed, hashed, or composed from other fields. Principal and
+//! recipient stay un-conflated: the snapshot carries the bridge-owned
+//! `principal_id` separately.
 //!
 //! Fence note: `entry_fence` is the Host journal `RecordFence`, not the
 //! bridge `StateFence` — distinct fenced domains, carried side by side, never
@@ -87,6 +89,13 @@ pub struct HostEnvelopeFacts {
 pub struct AdmittedDeliveryFacts {
     /// Recipient session the payload was admitted for.
     pub session: SessionId,
+    /// Recipient identity for the session envelope, under the authoritative
+    /// recipient vocabulary: I5.26 names disclosure recipients as
+    /// `recipient_principal_or_route`, and the admitted recipient carries no
+    /// principal — so the route fingerprint-or-identity
+    /// (`ReactiveContextRecipient.route`) is the recipient identity text.
+    /// Derived by clone from the admitted struct, never parsed or hashed.
+    pub recipient_id: String,
     /// Exact admitted recipient (session, opaque runtime identity, runtime
     /// generation, route).
     pub recipient: ReactiveContextRecipient,
@@ -174,6 +183,7 @@ fn admitted_facts_for_entry(entry: &ReactiveContextQueueEntry) -> AdmittedDelive
     let payload: &ReactiveContextPayload = &entry.payload;
     AdmittedDeliveryFacts {
         session: payload.recipient.session_id.clone(),
+        recipient_id: payload.recipient.route.clone(),
         recipient: payload.recipient.clone(),
         runtime_id: payload.recipient.runtime_id.clone(),
         operation_id: payload.operation_id.clone(),

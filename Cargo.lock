@@ -3201,6 +3201,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-agent-api",
  "eliot-agent-bridge-core",
+ "eliot-agent-codex",
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",

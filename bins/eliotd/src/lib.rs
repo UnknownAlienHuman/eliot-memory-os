@@ -36,6 +36,7 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod attempt_execution_chain;
 pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
