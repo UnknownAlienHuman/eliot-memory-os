@@ -86,16 +86,14 @@ fn request(command: &str) -> CommandRequest {
 fn help_and_schema_are_deterministic_projections_of_one_catalogue() {
     let catalogue = CommandCatalogue::current();
     must(catalogue.validate());
-    assert_eq!(catalogue.commands().len(), 26);
+    assert_eq!(catalogue.commands().len(), 27);
     assert_eq!(
         catalogue.commands().first().map(|spec| spec.usage),
         Some("eliot system snapshot --repo-root <ABSOLUTE> --output <ABSOLUTE>")
     );
     assert_eq!(
         catalogue.commands().last().map(|spec| spec.usage),
-        Some(
-            "eliot user-automation <create|list|status|history|pause|resume|edit|run-now|remove|inspect-last-failure>",
-        )
+        Some("pipe an admitted board-inbox command request to eliot dispatch")
     );
     assert!(
         catalogue
