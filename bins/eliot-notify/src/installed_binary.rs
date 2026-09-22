@@ -119,6 +119,35 @@ impl NotifyBinaryBinding {
     }
 }
 
+/// Builds the daemon-caller binding from the two installer-owned
+/// declaration string fields (`notify_executable`, `notify_artifact_sha256`).
+///
+/// This is the exact B3 construction entry point: the caller passes the two
+/// strings verbatim from the installer-owned registration record — the same
+/// record the fallback route reads — and receives either a binding ready for
+/// [`resolve_notify_binary`] or a fail-closed [`NotifyBinaryError`]. The
+/// executable string must be non-empty; the digest string must be exact
+/// lowercase SHA-256. Absolute-path and SID/session enforcement stay where
+/// they belong: declaration validation at parse time and
+/// `validate_pinned_artifact` at launch time. No other input shape is
+/// accepted: callers must not substitute loader paths, build outputs,
+/// environment values, or WASM-registry lookups for either field.
+///
+/// # Errors
+///
+/// Returns [`NotifyBinaryError::EmptyPath`] when the executable string is
+/// empty, or [`NotifyBinaryError::InvalidDigest`] when the digest string is
+/// malformed.
+pub fn notify_binding_from_declaration(
+    executable: &str,
+    artifact_sha256: &str,
+) -> Result<NotifyBinaryBinding, NotifyBinaryError> {
+    NotifyBinaryBinding::new(
+        PathBuf::from(executable),
+        NotifyDigest::new(artifact_sha256.to_owned())?,
+    )
+}
+
 /// A verified installed Notify binary: the bound path whose observed bytes
 /// match the registered digest.
 ///
@@ -270,6 +299,27 @@ mod tests {
         );
         assert_eq!(resolved.digest(), &NotifyDigest::of_bytes(&bytes));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn declaration_fields_construct_exact_caller_binding() {
+        let bytes = fixture_bytes();
+        let digest_hex = NotifyDigest::of_bytes(&bytes).as_str().to_owned();
+        let binding = notify_binding_from_declaration("C:\\Eliot\\eliot-notify.exe", &digest_hex)
+            .expect("declaration binding constructs");
+        assert_eq!(
+            binding.executable_path(),
+            std::path::Path::new("C:\\Eliot\\eliot-notify.exe")
+        );
+        assert_eq!(binding.artifact_digest().as_str(), digest_hex.as_str());
+        assert_eq!(
+            notify_binding_from_declaration("", &digest_hex).map(|_| ()),
+            Err(NotifyBinaryError::EmptyPath)
+        );
+        assert_eq!(
+            notify_binding_from_declaration("C:\\Eliot\\eliot-notify.exe", "NOT-HEX").map(|_| ()),
+            Err(NotifyBinaryError::InvalidDigest)
+        );
     }
 
     #[test]

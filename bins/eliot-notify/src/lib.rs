@@ -1065,7 +1065,7 @@ use fallback_verification::{
 };
 pub use installed_binary::{
     InstalledNotifyBinary, NotifyBinaryBinding, NotifyBinaryError, NotifyDigest,
-    resolve_notify_binary,
+    notify_binding_from_declaration, resolve_notify_binary,
 };
 
 /// Registers the installer-owned X-01 fallback task for the current
