@@ -177,6 +177,7 @@ members = [
   "crates/smart/eliot-learning-overlay",  # agent_order 35
   "crates/meta/eliot-learning-activation-assessment",  # agent_order 36
   "crates/meta/eliot-self-quality",  # agent_order 38
+  "crates/smart/eliot-dreamer-memory-revision",  # agent_order 79
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`

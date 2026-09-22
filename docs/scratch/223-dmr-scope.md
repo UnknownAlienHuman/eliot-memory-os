@@ -201,3 +201,57 @@ B-freeze self-query package. No `Cargo.toml`/`src/`/tests created by this scope.
   ownership + denominator_ref), `cognitive-contract-challenges.toml`
   (CC-W9-MEMORY-REVISION, CC-FAILURE-OBSERVATION-SCHEMA, CC-W9-REV12-HANDOFF),
   `eliot-memory-projection-contracts/src/record.rs` (`MemoryRole::FailureFingerprint`).
+
+## 7. Implementation addendum (real-code era, branch `work/223-dreamer-memory-revision-scope`)
+
+Scoping-only era over. Converged `164e9c8c` by local merge (`b0a9559c`, no
+conflicts), reconciled candidate B r4 (`0f3cb2cd`) by read-only checkout
+(26 files, committed `4a199f6a`, never edited afterwards).
+
+Blocked inputs implemented FIRST, owner-placed: `FailureObservation`
+(CC-FAILURE-OBSERVATION-SCHEMA) and `MemoryRevisionEvidence`
+(CC-W9-MEMORY-REVISION) live in
+`crates/foundation/eliot-observation-contracts/src/failure_observation.rs`
+(new module, wired `mod` + `pub use` in `lib.rs`). Placement: wave briefs
+name the Governor canonical observation owner as producer and no separate
+failure-observation crate, so this module is the projection-schema owner
+beside `experience_projection.rs`, reusing `ObservationScope`,
+`SourceRevisionHandle`, `CoverageEvidence`, handle, and fence vocabulary;
+live admission/enumeration stays with `eliot-observation`. A14.3 field
+shape (trigger, failed action, outcome, violated invariant, scope, reopen
+and extinction conditions), closed `FailureOmissionClass`, owner
+`Complete`-with-empty-blinds doctrine, frozen digests, `deny_unknown_fields`.
+
+Revision consumer: `crates/smart/eliot-dreamer-memory-revision/` now
+`Cargo.toml` + `src/lib.rs`. `propose()` over `FailureObservation` +
+`MemoryRevisionEvidence` refs + admitted task/safety projections +
+`SelfQueryInput`/`AcceptedSourceProjection` refs with pose-digest recheck
+and citation revalidation via owner `check_cited`; scope equality and
+`is_compatible_with` fence gates; safety-floor veto (trigger in
+`safety.negative_memory_triggers` yields `Unsupported`); same-hypothesis
+recurrence yields Mechanism Review (`Inconclusive`); `Complete` requires
+exact independently recheckable `ClosureDenominator` (sorted closure,
+verbatim exclusions, recheck digest). Output narrows only reversible
+advisory fields (no purge field exists); candidate-only, no
+compile/admit/brief/model work, no reactive D, no promotion. No parallel
+types: reuses `AcceptedSourceProjection`, `SelfQueryInput`,
+`TaskProjection`, `SafetyProjection`, foundation observation shapes.
+
+Registration: root `members` + `"crates/smart/eliot-dreamer-memory-revision",
+# agent_order 79`; `Cargo.lock` minimal delta (one `[[package]]` entry with
+exact edges, hand-applied after `cargo generate-lockfile --offline`
+re-resolved unrelated patch versions — reverted); `module.toml`
+`workspace_admission = "pending_agent_implementation_and_proof"`.
+No new third-party dependency; no `config/dependency-policy.toml` change
+(schemars/serde/serde_json/thiserror already inventoried). Sagan
+A1/engine files untouched.
+
+Gates: `cargo check --locked --offline` green for
+`eliot-observation-contracts`, `eliot-dreamer-memory-revision`,
+`eliot-epistemic-contracts` (plus `eliot-dreamer-contracts`,
+`eliot-context-contracts` as deps). Note: shared lane target dir
+(`rust-env-target`) served a stale-fresh judgment once; forced rebuild
+confirmed. `eliot-memory-projection-contracts` is a nonmember prototype —
+not checked, not in scope. No tests executed (brief). Edge proofs,
+`W9_MEMORY_QUALITY_PULSE_01`, and acceptance remain future; no product
+support claimed (`CURRENT_UNVERIFIED` at best, `NOT_EXECUTED` evidence).
