@@ -206,6 +206,15 @@ fn consume_char_or_lifetime(bytes: &[u8], index: usize, out: &mut String) -> usi
         return cursor;
     }
     let start = cursor;
+    // Double-quote character literal (`'"'`): the inner quote must not
+    // open a string, or every later quote toggles phantom string state
+    // and real string contents leak back as code.
+    if bytes.get(cursor) == Some(&b'"') && bytes.get(cursor + 1) == Some(&b'\'') {
+        for _ in index..cursor + 2 {
+            out.push(' ');
+        }
+        return cursor + 2;
+    }
     while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_') {
         cursor += 1;
     }
@@ -559,6 +568,62 @@ fn scan_files(dirs: &[&str], needle: &str) -> Result<Vec<String>, Box<dyn std::e
     hits.sort();
     hits.dedup();
     Ok(hits)
+}
+
+/// Scans stripped code for a whole-word `enum <name>` declaration.
+///
+/// String literals, comments, and longer identifiers never match: only a
+/// real enum declaration with a non-identifier boundary after the name
+/// counts. Fixture text that legitimately spells definitions (boundary
+/// oracle data, classifier unit snippets) stays invisible to duplicate
+/// detection without weakening it: a real new definition still trips it.
+fn scan_enum_definitions(    dirs: &[&str],
+    enum_name: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let root = workspace_root()?;
+    let mut hits = Vec::new();
+    for dir in dirs {
+        let candidate = root.join(dir);
+        if candidate.is_dir() {
+            collect_enum_definitions(&candidate, enum_name, &mut hits)?;
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    Ok(hits)
+}
+
+fn collect_enum_definitions(
+    root: &Path,
+    enum_name: &str,
+    hits: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = std::fs::read_dir(root).map_err(boxed)?;
+    for entry in entries {
+        let entry = entry.map_err(boxed)?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_enum_definitions(&path, enum_name, hits)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            let text = std::fs::read_to_string(&path).map_err(boxed)?;
+            let stripped = strip_code(&text);
+            let needle = format!("enum {enum_name}");
+            let declared = stripped.lines().any(|line| {
+                line.split(&needle).skip(1).any(|after| {
+                    !matches!(after.chars().next(), Some(cell) if cell.is_alphanumeric() || cell == '_')
+                })
+            });
+            if declared {
+                let relative = path
+                    .strip_prefix(workspace_root()?)
+                    .map_err(boxed)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                hits.push(relative);
+            }
+        }
+    }
+    Ok(())
 }
 
 const LEGACY_DIRS: [&str; 5] = [
@@ -1324,12 +1389,11 @@ fn case_28_new_duplicate_fails() -> TestResult {
     let def_needle = ["enum", "CueKind"].join(" ");
     let synthetic = ["pub ", &def_needle, " {\n    FilePath,\n}\n"].concat();
     assert_eq!(matched_lines(&synthetic, &def_needle).len(), 1);
-    let live = scan_files(
+    let live = scan_enum_definitions(
         &["crates/smart", "crates/foundation", "crates/eliot-types"],
-        &def_needle,
+        "CueKind",
     )?;
     let mut expected = vec![
-        "crates/smart/eliot-context/src/lib.rs".to_owned(),
         "crates/smart/eliot-cue-contracts/src/normalization.rs".to_owned(),
         "crates/smart/eliot-cues/src/lib.rs".to_owned(),
     ];
