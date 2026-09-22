@@ -812,9 +812,11 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         doctor_artifact_digest: handle("b".repeat(64)),
         testd_artifact_digest: handle("c".repeat(64)),
         native_worker_artifact_digest: handle("d".repeat(64)),
+        wasm_host_artifact_digest: handle("f".repeat(64)),
         doctor_executable_path: path(&portable, "eliot-doctor.exe"),
         testd_executable_path: path(&portable, "eliot-testd.exe"),
         native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
+        wasm_host_executable_path: path(&portable, "eliot-wasm-host.exe"),
         descriptor_digest: handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch.with_computed_digest()?;
@@ -828,6 +830,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         doctor_artifact_digest: handle("b".repeat(64)),
         testd_artifact_digest: handle("c".repeat(64)),
         native_worker_artifact_digest: handle("d".repeat(64)),
+        wasm_host_artifact_digest: handle("f".repeat(64)),
         kernel_executable_path: path(&portable, "eliot-kernel.exe"),
         store_bridge_executable_path: bridge_path,
         canonical_store_executable_path: provider_path,
@@ -835,6 +838,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         doctor_executable_path: path(&portable, "eliot-doctor.exe"),
         testd_executable_path: path(&portable, "eliot-testd.exe"),
         native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
+        wasm_host_executable_path: path(&portable, "eliot-wasm-host.exe"),
         config_path,
         dependency_closure_refs: vec![handle("evidence:dependency-closure")],
         license_refs: vec![handle("evidence:licenses")],
