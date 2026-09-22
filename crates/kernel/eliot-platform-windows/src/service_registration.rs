@@ -114,6 +114,7 @@ pub struct ServiceControlGrantReadback {
     principal_sid: String,
     access_mask: u32,
     security_descriptor_digest: String,
+    security_descriptor_group: String,
 }
 
 impl ServiceControlGrantReadback {
@@ -122,12 +123,14 @@ impl ServiceControlGrantReadback {
         principal_sid: impl Into<String>,
         access_mask: u32,
         security_descriptor_digest: impl Into<String>,
+        security_descriptor_group: impl Into<String>,
     ) -> Result<Self, WindowsAdapterError> {
         let value = Self {
             principal_service: principal_service.into(),
             principal_sid: principal_sid.into(),
             access_mask,
             security_descriptor_digest: security_descriptor_digest.into(),
+            security_descriptor_group: security_descriptor_group.into(),
         };
         value.validate()?;
         Ok(value)
@@ -158,6 +161,13 @@ impl ServiceControlGrantReadback {
         &self.security_descriptor_digest
     }
 
+    /// Returns the canonical group SID read from the same service security
+    /// descriptor handle as the owner and DACL proof.
+    #[must_use]
+    pub fn security_descriptor_group(&self) -> &str {
+        &self.security_descriptor_group
+    }
+
     /// Validates the typed readback without touching SCM.
     ///
     /// # Errors
@@ -169,6 +179,7 @@ impl ServiceControlGrantReadback {
         if self.principal_service != ELIOT_HOST_SERVICE_NAME
             || !crate::valid_service_sid_text(&self.principal_sid)
             || !crate::valid_sha256_hex(&self.security_descriptor_digest)
+            || self.security_descriptor_group != SERVICE_EXPECTED_GROUP_SID
         {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
@@ -798,24 +809,38 @@ pub enum ServiceRegistrationOutcome {
     EffectUnknown,
 }
 
-/// DACL-only security-information mask used by Host/Watchdog service read
-/// paths (standing s40, ELIOT issue #1352).
+/// DACL component of the OWNER|GROUP|DACL security-information mask used by
+/// Host/Watchdog service read paths (standing s40, ELIOT issue #1352).
 ///
 /// The value equals `DACL_SECURITY_INFORMATION` (`0x0000_0004`). Read paths
 /// must never set `SACL_SECURITY_INFORMATION` (`0x0000_0008`) and must never
 /// request `ACCESS_SYSTEM_SECURITY`: SACL `S:(AU;FA;;;WD)` is installer-owned
 /// and never opened or hashed here. The digest remains DACL-scoped; the
-/// SYSTEM-owner proof is a separate check.
+/// SYSTEM owner and group proofs are read from the same handle but remain
+/// separate typed binding fields.
 pub const SERVICE_DACL_READ_SECURITY_INFORMATION: u32 = 0x0000_0004;
 
-/// DACL-only read contour also requires `OWNER_SECURITY_INFORMATION`
-/// (`0x0000_0001`) on the same handle for the separate SYSTEM-owner proof.
-/// `READ_CONTROL` suffices; no `SeSecurityPrivilege` is required.
+/// OWNER component of the OWNER|GROUP|DACL read contour. It is queried on the
+/// same handle as the DACL and group; `READ_CONTROL` suffices and no
+/// `SeSecurityPrivilege` is required.
 pub const SERVICE_OWNER_READ_SECURITY_INFORMATION: u32 = 0x0000_0001;
+
+/// The group component is read from the same service handle as OWNER and DACL.
+/// `SACL_SECURITY_INFORMATION` remains deliberately excluded.
+pub const SERVICE_GROUP_READ_SECURITY_INFORMATION: u32 = 0x0000_0002;
 
 /// Canonical owner required by Host/Watchdog service-object readback.
 /// User-owned service objects are never accepted.
 pub const SERVICE_EXPECTED_OWNER_SID: &str = "S-1-5-18";
+
+/// Authority name used to resolve the canonical service-object group at the
+/// live Windows boundary. The resolved SID must equal the portable canonical
+/// value below before a grant can be published.
+pub const SERVICE_EXPECTED_GROUP_AUTHORITY: &str = "NT AUTHORITY\\SYSTEM";
+
+/// Canonical group required by Host/Watchdog service-object readback.
+/// Keep this tied to the same LocalSystem authority as the owner contract.
+pub const SERVICE_EXPECTED_GROUP_SID: &str = SERVICE_EXPECTED_OWNER_SID;
 
 /// Typed diagnostics carried by fail-closed `Unknown` inspections
 /// (standing s40, ELIOT issue #1352).

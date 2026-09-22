@@ -4505,7 +4505,7 @@ impl WindowsInstallationEffectPort {
                 if matches!(
                     &request.plan,
                     InstallerEffectPlan::RegisterService {
-                        role: InstallerServiceRole::Host,
+                        role: InstallerServiceRole::Host | InstallerServiceRole::Watchdog,
                         ..
                     }
                 ) && control_grant.is_none()
@@ -4568,7 +4568,7 @@ impl WindowsInstallationEffectPort {
                 if matches!(
                     &request.plan,
                     InstallerEffectPlan::RegisterService {
-                        role: InstallerServiceRole::Host,
+                        role: InstallerServiceRole::Host | InstallerServiceRole::Watchdog,
                         ..
                     }
                 ) && control_grant.is_none()
@@ -5849,7 +5849,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             return PortOutcome::Error(PortError::InvalidRequestMetadata);
         };
         // s38 (#1345): Host and Watchdog creations both require the
-        // installer-policy DACL proof before the ownership marker may be
+        // installer-policy OWNER|GROUP|DACL proof before the ownership marker may be
         // minted. Older platform builds never return a Host grant, so Host
         // creation honestly stays `Unknown` until the platform generalizes
         // the grant install/read (WRITER-A); it can never be reported
