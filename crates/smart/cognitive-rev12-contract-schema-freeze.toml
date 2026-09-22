@@ -1,8 +1,8 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r3"
-revision = 3
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r2"
-supersedes_freeze_digest = "sha256:05e96b5e1edca044ec1831853b7d5a62135a47538b4ba9c97da39fba44012fbd"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r4"
+revision = 4
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r3"
+supersedes_freeze_digest = "sha256:bfc30f19cde26efc13de7e3dfc3c326377aaa6746dc4769345bf03014c257dd5"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
@@ -585,9 +585,9 @@ denominator_note = "Policy bounds emission; it carries no denominator."
 [[frozen_type]]
 crate = "eliot-memory-projection-contracts"
 rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
-fields = ["contract_version", "binding", "allowlist", "intent_digest", "entries", "coverage"]
+fields = ["contract_version", "binding", "allowlist", "intent_digest", "policy_ceiling", "entries", "coverage"]
 scope_fence_fields = ["binding"]
-denominator_note = "SelectionCoverage{considered, selected, not_selected} counts exactly the presented records; the batch denominator is never echoed under a filtered set."
+denominator_note = "SelectionCoverage{considered, selected, not_selected} counts exactly the presented records; the batch denominator is never echoed under a filtered set. Selected additionally rechecks against the echoed policy_ceiling without the policy."
 
 [[frozen_type]]
 crate = "eliot-memory-projection-contracts"
