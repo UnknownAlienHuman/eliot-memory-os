@@ -173,25 +173,33 @@ pub struct AuthorizationExpectation<'a> {
 }
 
 /// Host-issued destination authorization after successful Kernel
-/// verification: the exact target/transaction binding plus the owner digests
-/// and registry revision every effect client retains. This is the verified
-/// projection — never a second issuance.
+/// verification: the exact target/transaction binding plus the owner digests,
+/// registry revision, source installation, and approved generation every
+/// effect client retains. This is the verified projection — never a second
+/// issuance. `source_installation_id` and `approved_generation` are bound
+/// here (never discarded): continuity against the first-journaled binding
+/// is enforced at resume and cutover, so a swapped authorization binding a
+/// different installation or generation refuses.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedDestinationBinding {
     manifest_digest: String,
     roots_digest: String,
     registry_revision: u64,
+    source_installation_id: String,
+    approved_generation: String,
 }
 
 impl VerifiedDestinationBinding {
     /// Canonical binding digest identifying this exact verified destination
-    /// for effect receipts.
+    /// for effect receipts and journal comparisons.
     pub fn binding_digest(&self) -> String {
         let bytes = canonical_json_bytes(&(
             DESTINATION_AUTHORIZATION_WIRE,
             self.manifest_digest.as_str(),
             self.roots_digest.as_str(),
             self.registry_revision,
+            self.source_installation_id.as_str(),
+            self.approved_generation.as_str(),
         ))
         .unwrap_or_default();
         sha256_hex(&bytes)
@@ -211,6 +219,16 @@ impl VerifiedDestinationBinding {
     pub fn registry_revision(&self) -> u64 {
         self.registry_revision
     }
+
+    /// Owner-observed source installation identity bound by this verification.
+    pub fn source_installation_id(&self) -> &str {
+        &self.source_installation_id
+    }
+
+    /// Active approved generation identity bound by this verification.
+    pub fn approved_generation(&self) -> &str {
+        &self.approved_generation
+    }
 }
 
 fn is_hex64(value: &str) -> bool {
@@ -227,13 +245,22 @@ fn auth_text<'a>(auth: &'a serde_json::Value, field: &'static str) -> Result<&'a
         .ok_or(BackupError::PlanMismatch)
 }
 
+fn auth_identity(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
 /// Verifies Host-issued destination authorization bytes before any effect.
 ///
 /// Checks wire/issuer identity, exact target/transaction binding against
 /// `expectation`, digest shapes, work-root containment (the bound root must
-/// canonicalize-equal the Kernel's own root), and manifest agreement with
-/// the archive. Any refusal fails closed with the exact binding error —
-/// never a default success, never a self-authorized write.
+/// canonicalize-equal the Kernel's own root), manifest agreement with
+/// the archive, and the owner-observed source installation and approved
+/// generation identities (bound into the verification, never discarded).
+/// Any refusal fails closed with the exact binding error — never a default
+/// success, never a self-authorized write. The wire/issuer literals are
+/// non-authoritative hints only: authority comes from the ORS-journaled
+/// binding plus agreement with independently observed evidence, established
+/// by the caller after this shape/binding filter passes.
 pub fn verify_destination_authorization(
     auth_json: &[u8],
     expectation: &AuthorizationExpectation<'_>,
@@ -254,7 +281,10 @@ pub fn verify_destination_authorization(
     {
         return Err(BackupError::PlanMismatch);
     }
-    let _source = auth_text(&auth, "source_installation_id")?;
+    let source_installation_id = auth_text(&auth, "source_installation_id")?;
+    if !auth_identity(source_installation_id) {
+        return Err(BackupError::PlanMismatch);
+    }
     let manifest_digest = auth_text(&auth, "manifest_digest")?;
     let roots_digest = auth_text(&auth, "roots_digest")?;
     if !is_hex64(manifest_digest) || !is_hex64(roots_digest) {
@@ -264,7 +294,10 @@ pub fn verify_destination_authorization(
         .get("registry_revision")
         .and_then(serde_json::Value::as_u64)
         .ok_or(BackupError::PlanMismatch)?;
-    let _generation = auth_text(&auth, "approved_generation")?;
+    let approved_generation = auth_text(&auth, "approved_generation")?;
+    if !auth_identity(approved_generation) {
+        return Err(BackupError::PlanMismatch);
+    }
     let bound_root = auth_text(&auth, "kernel_work_root")?;
     let own_root = std::fs::canonicalize(expectation.kernel_work_root)
         .map_err(|error| BackupError::Target(error.to_string()))?;
@@ -286,6 +319,8 @@ pub fn verify_destination_authorization(
         manifest_digest: manifest_digest.to_owned(),
         roots_digest: roots_digest.to_owned(),
         registry_revision,
+        source_installation_id: source_installation_id.to_owned(),
+        approved_generation: approved_generation.to_owned(),
     })
 }
 

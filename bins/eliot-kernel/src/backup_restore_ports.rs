@@ -61,8 +61,9 @@ use eliot_backup::{
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ors::{
     JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES, MAX_JOURNAL_PAYLOAD_BYTES,
-    RESTORE_JOURNAL_RECORD_SCHEMA, OrsError, RedbRecoveryStore, RestoreJournalArchiveClass,
-    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding,
+    RESTORE_JOURNAL_RECORD_SCHEMA, OperationIdentity, OrsError, RedbRecoveryStore,
+    RestoreJournalArchiveClass, RestoreJournalOperation, RestoreJournalResult,
+    RestoreJournalStreamBinding, SupervisionLeaseSnapshot,
 };
 
 /// Stable identity of the restore-journal stream namespace for admission
@@ -190,6 +191,9 @@ pub enum KernelRestoreError {
     /// Cutover requires a separate Human/System Owner authorization, which
     /// was absent. Rehearsal never activates or retires.
     CutoverNotAuthorized,
+    /// The lease-owner terminal commit failed or did not verify: no
+    /// lease-owner-committed ticket, no cutover.
+    LeaseTerminal(String),
     /// The journaled restore engine reported a typed failure.
     TargetFailed(BackupError),
 }
@@ -231,6 +235,9 @@ impl std::fmt::Display for KernelRestoreError {
                 formatter,
                 "cutover requires a separate Human/System Owner authorization"
             ),
+            Self::LeaseTerminal(detail) => {
+                write!(formatter, "lease terminal commit failed: {detail}")
+            }
             Self::TargetFailed(error) => write!(formatter, "restore target failed: {error}"),
         }
     }
@@ -345,7 +352,9 @@ fn kernel_to_backup(error: KernelRestoreError) -> BackupError {    match error {
             BackupError::RestoreJournalMismatch
         }
         KernelRestoreError::JournalCorrupt => BackupError::RestoreJournalCorrupt,
-        KernelRestoreError::JournalIo(detail) => BackupError::Target(detail),
+        KernelRestoreError::JournalIo(detail) | KernelRestoreError::LeaseTerminal(detail) => {
+            BackupError::Target(detail)
+        }
         KernelRestoreError::InvalidInput { field, reason } => {
             BackupError::InvalidField { field, reason }
         }
@@ -684,6 +693,57 @@ impl KernelRestoreJournal {
     ) -> Result<Option<RestoreJournalStreamBinding>, BackupError> {
         self.store
             .load_restore_journal_binding(stream)
+            .map_err(map_ors_to_backup)
+    }
+
+    /// Verifies one just-appended decision row by live ORS readback and
+    /// returns the durably confirmed payload.
+    ///
+    /// Reloads the bounded durable page and requires a row carrying the
+    /// exact appended `(sequence, digest)` plus byte-identical payload.
+    /// This proves the payload the caller holds is the payload the
+    /// single-writer stream durably recorded — handle memory alone never
+    /// suffices. The returned bytes are the readback value: callers
+    /// re-verify FROM them, never from a transport hint. Any mismatch is
+    /// corruption, never a re-append: the caller reconciles by identity
+    /// instead of writing again.
+    pub(crate) fn verify_journaled_head(
+        &self,
+        expected_sequence: u64,
+        expected_digest: &str,
+        expected_payload: &str,
+    ) -> Result<String, BackupError> {
+        let stream = self
+            .bound
+            .as_ref()
+            .map(|bound| bound.stream.clone())
+            .ok_or(BackupError::RestoreJournalRequired)?;
+        let rows = self
+            .store
+            .load_restore_journal_stream(&stream, MAX_JOURNAL_PAGE_ENTRIES)
+            .map_err(map_ors_to_backup)?;
+        rows.into_iter()
+            .find_map(|row| {
+                (row.sequence == expected_sequence
+                    && row.digest().is_ok_and(|digest| digest == expected_digest)
+                    && row.payload == expected_payload)
+                    .then(|| row.payload.clone())
+            })
+            .ok_or(BackupError::RestoreJournalCorrupt)
+    }
+
+    /// Reads the current authoritative committed lease projection from the
+    /// ORS owner (owner evidence for ticket-commit verification).
+    ///
+    /// Returns the lease snapshot the owner durably holds, or `None` when
+    /// no committed projection exists. Callers cross-check it against the
+    /// commit-returned snapshot instead of trusting return values alone.
+    pub(crate) fn read_lease_head(
+        &self,
+        lease_id: &OperationIdentity,
+    ) -> Result<Option<SupervisionLeaseSnapshot>, BackupError> {
+        self.store
+            .load_current_supervision_lease(lease_id)
             .map_err(map_ors_to_backup)
     }
 

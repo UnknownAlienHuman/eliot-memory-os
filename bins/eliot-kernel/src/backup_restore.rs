@@ -63,24 +63,6 @@
 //! refuses with the exact missing owner before any effect — rehearsal
 //! without Host admission is refused, not staged.
 //!
-//! ```text
-//! prepare/finalize ......... kernel-restore-owner (destination staging,
-//!                              fence gate, observed evidence);
-//! purge .................... purge owner (`apply_purge_ledger`, staged
-//!                              purge-first before any import);
-//! canonical/receipt/
-//! projection/rebuild/verify . canonical owner (`import_*`, chain + count
-//!                              verification over observed destination state);
-//! sealed blobs ............. blob owner (`DestinationRestoreAdapter::
-//!                              restore_blob_sealed` with backup-bound
-//!                              restoration receipts, the admitted key
-//!                              manifest, and the destination scope;
-//!                              re-sealed bytes staged, never plaintext);
-//! ORS suspension ........... ORS owner (`suspended_recovery_entries`,
-//!                              persisted as suspended evidence, never
-//!                              runnable);
-//! ```
-//!
 //! Effects whose bindings are absent refuse fail-closed with the exact
 //! responsible capability; reconciliation answers from persisted identity
 //! receipts (`Applied` on exact transaction/phase/input match, `NotApplied`
@@ -105,15 +87,19 @@ use eliot_backup::{
     RestoreArchiveDispositionKind, RestoreContext, RestoreEffectReceipt, RestoreEvidence,
     RestoreHistoricalAuthority, RestoreIntent, RestoreObligationState, RestoreOwnerObligation,
     RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation, RestoreStep, RestoreTarget,
+    RestoreTransaction,
     RestoredFence, RestoredSealedBlob, WrappedKeyManifest, authorize_cutover,
     suspended_recovery_entries,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreObligations, RestoreProvenance};
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseOperation};
+use eliot_runtime_contracts::LeaseState;
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 use serde::Serialize;
 
+use super::KernelSupervisionLeaseAuthority;
 use super::backup_restore_ports::{
     DestinationManifestEvidence, KernelIsolatedDestination, KernelRestoreError, KernelRestoreJournal,
     check_kernel_effect_fence,
@@ -202,6 +188,32 @@ pub struct KernelRestoreOutcome {
 pub struct KernelBackupRestore {
     journal: KernelRestoreJournal,
     work_root: PathBuf,
+}
+
+/// Lease-owner-committed terminal ticket proof recorded in the cutover
+/// decision (F2 repair): the ticket the cutover path committed through the
+/// supervision-lease authority, verified by owner validation plus live ORS
+/// readback. The shape-only cutover receipt never authorizes alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LeaseTerminalProof {
+    ticket_id: String,
+    lease_id: String,
+    lease_revision: u64,
+    lease_receipt_sha256: String,
+}
+
+/// Caller-supplied cutover authority bundle: the separate Human/System
+/// Owner authorization plus the lease-owner terminal ticket that alone
+/// satisfies the lease leg. The shape-only authorization never suffices;
+/// no ticket means no cutover, failed closed with the exact missing
+/// artifact before any effect.
+#[derive(Clone, Copy, Debug)]
+pub struct CutoverAuthority<'a> {
+    /// Separate cutover authorization bound to this exact plan and bundle.
+    pub authorization: Option<&'a CutoverAuthorization>,
+    /// Lease-owner terminal ticket with genuine predecessor proof.
+    pub lease_terminal:
+        Option<(&'a KernelSupervisionLeaseAuthority, &'a SupervisionLeaseCommitTicket)>,
 }
 
 impl KernelBackupRestore {
@@ -298,10 +310,16 @@ impl KernelBackupRestore {
             .bind_plan_stream(&plan, bundle, kernel_fence)?;
         let destination = KernelIsolatedDestination::open(&self.work_root, &target.target_id)?;
         // #962 issuer gate: the Host-authorized preparation flow pinned the
-        // destination authorization before restore; every effect below binds
-        // its verification. Absence refuses with the exact missing owner.
-        let verified =
-            self.verify_destination_binding(&destination, &plan, bundle, manifest_evidence.as_ref())?;
+        // destination authorization before restore; it is verified,
+        // ORS-journaled, and re-verified from live readback here, and every
+        // effect below binds the readback value. Absence refuses with the
+        // exact missing owner.
+        let (verified, authorization_digest) = self.verify_destination_binding(
+            &destination,
+            &plan,
+            bundle,
+            manifest_evidence.as_ref(),
+        )?;
         let receipts = match keys {
             Some(manifest) => BlobOwnerClient::issue_receipts(
                 bundle.manifest.backup_id.as_str(),
@@ -318,7 +336,10 @@ impl KernelBackupRestore {
             blob_scope,
             receipts,
             manifest_evidence,
-            verified,
+            VerifiedDestination {
+                binding: verified,
+                authorization_digest,
+            },
         );
         let receipt = plan
             .execute_with_journal(bundle, &mut target_impl, &mut self.journal)
@@ -378,23 +399,35 @@ impl KernelBackupRestore {
         Ok(())
     }
 
-    /// Reads the Host-issued destination authorization pinned by the
-    /// Host-authorized preparation flow and verifies it for this exact
-    /// plan, bundle, and work root.
+    /// Verifies the Host-issued destination authorization for this exact
+    /// plan, bundle, and work root, then pins it into the single-writer ORS
+    /// stream with exact-predecessor journaling and live readback.
     ///
-    /// Wire/issuer identity, exact target/transaction binding, digest
-    /// shapes, work-root containment, and manifest agreement are all
-    /// re-proven through the #962 verifier. When owner-approved manifest
-    /// evidence is supplied, its projection must agree with the issuer
-    /// bytes. Any refusal fails closed with the exact missing owner before
-    /// any effect; cutover re-verifies freshness through this same gate.
+    /// Authority path (F1 repair): the pinned file is a transport hint
+    /// only. Shape/binding/containment/archive checks filter the hint;
+    /// owner-approved manifest evidence is REQUIRED — absence refuses with
+    /// the exact missing owner, since a lone file is forgeable — and must
+    /// agree with the issuer bytes; the verified bytes are then journaled
+    /// through the admitted owner journal port and re-verified FROM the
+    /// live ORS readback, so effects bind the readback value, never the raw
+    /// file hint. `source_installation_id` and `approved_generation` ride
+    /// inside the verified binding, the journal payload, and the
+    /// destination pin, and continuity against the first-journaled binding
+    /// is enforced at resume and cutover. Any refusal fails closed before
+    /// any effect.
     fn verify_destination_binding(
-        &self,
+        &mut self,
         destination: &KernelIsolatedDestination,
         plan: &RestorePlan,
         bundle: &BackupBundle,
         manifest_evidence: Option<&DestinationManifestEvidence>,
-    ) -> Result<VerifiedDestinationBinding, KernelRestoreError> {
+    ) -> Result<(VerifiedDestinationBinding, String), KernelRestoreError> {
+        // Without the trusted in-process projection the pinned file stands
+        // alone: refuse with the exact missing owner instead of authorizing
+        // from file bytes.
+        let manifest_evidence = manifest_evidence.ok_or(KernelRestoreError::CapabilityMissing {
+            capability: super::backup_owner_clients::DESTINATION_AUTHORIZATION_ISSUER,
+        })?;
         let transaction = plan
             .transaction()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
@@ -403,36 +436,99 @@ impl KernelBackupRestore {
             .iter()
             .find(|artifact| artifact.kind == "config")
             .map(|artifact| artifact.sha256.as_str());
-        let auth_bytes = destination.read_destination_authorization()?;
-        let verified = verify_destination_authorization(
-            &auth_bytes,
-            &AuthorizationExpectation {
-                target_id: plan.target.target_id.as_str(),
-                transaction_id: transaction.transaction_id.as_str(),
-                expected_manifest_digest,
-                kernel_work_root: &self.work_root,
-            },
-        )
-        .map_err(KernelRestoreError::TargetFailed)?;
-        if let Some(evidence) = manifest_evidence {
-            evidence.validate()?;
-            if evidence.manifest_digest != verified.manifest_digest()
-                || evidence.roots_digest != verified.roots_digest()
-                || evidence.registry_revision != verified.registry_revision()
-            {
-                return Err(KernelRestoreError::DestinationInvalid(
-                    "destination admission drifted from the Host-issued authorization".to_owned(),
-                ));
-            }
+        let expectation = AuthorizationExpectation {
+            target_id: plan.target.target_id.as_str(),
+            transaction_id: transaction.transaction_id.as_str(),
+            expected_manifest_digest,
+            kernel_work_root: &self.work_root,
+        };
+        let hint = destination.read_destination_authorization()?;
+        let filed = verify_destination_authorization(&hint, &expectation)
+            .map_err(KernelRestoreError::TargetFailed)?;
+        self.check_manifest_evidence(bundle, manifest_evidence)?;
+        if manifest_evidence.manifest_digest != filed.manifest_digest()
+            || manifest_evidence.roots_digest != filed.roots_digest()
+            || manifest_evidence.registry_revision != filed.registry_revision()
+        {
+            return Err(KernelRestoreError::DestinationInvalid(
+                "destination admission drifted from the Host-issued authorization".to_owned(),
+            ));
         }
-        Ok(verified)
+        // Pin the verified bytes into the single-writer stream with exact
+        // predecessor journaling, then prove them by live ORS readback.
+        let payload = String::from_utf8(hint).map_err(|_| {
+            KernelRestoreError::TargetFailed(BackupError::Serialization(
+                "destination authorization is not UTF-8".to_owned(),
+            ))
+        })?;
+        let authorization_digest = sha256_hex(payload.as_bytes());
+        let request_bytes = canonical_json_bytes(&(
+            transaction.transaction_id.as_str(),
+            plan.target.target_id.as_str(),
+            authorization_digest.as_str(),
+        ))
+        .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let (sequence, digest) = self
+            .journal
+            .append_decision_row(
+                format!("destination-authorization-{authorization_digest}"),
+                sha256_hex(&request_bytes),
+                payload.clone(),
+            )
+            .map_err(KernelRestoreError::TargetFailed)?;
+        let confirmed = self
+            .journal
+            .verify_journaled_head(sequence, &digest, &payload)
+            .map_err(KernelRestoreError::TargetFailed)?;
+        // Re-verify FROM the ORS-journaled bytes and require identity with
+        // the file-filtered value: the durable bytes are the verified bytes.
+        let verified = verify_destination_authorization(confirmed.as_bytes(), &expectation)
+            .map_err(KernelRestoreError::TargetFailed)?;
+        if verified.binding_digest() != filed.binding_digest() {
+            return Err(KernelRestoreError::JournalCorrupt);
+        }
+        // Continuity: a previously pinned binding (resume/cutover) must
+        // equal this observation — transaction, target, digest,
+        // installation, and generation.
+        if let Some(pinned) = Self::read_optional_pin(destination)?
+            && (pinned.transaction_id != transaction.transaction_id
+                || pinned.target_id != plan.target.target_id
+                || pinned.authorization_digest != authorization_digest
+                || pinned.source_installation_id != verified.source_installation_id()
+                || pinned.approved_generation != verified.approved_generation())
+        {
+            return Err(KernelRestoreError::DestinationInvalid(
+                "destination authorization drifted from the pinned admission".to_owned(),
+            ));
+        }
+        Ok((verified, authorization_digest))
+    }
+
+    /// Reads a previously pinned destination admission, if any.
+    ///
+    /// Absence means first observation (no continuity to enforce);
+    /// present-but-unparseable bytes are corruption, never a pass.
+    fn read_optional_pin(
+        destination: &KernelIsolatedDestination,
+    ) -> Result<Option<PinnedDestinationAdmission>, KernelRestoreError> {
+        match std::fs::read(destination.root().join(DESTINATION_ADMISSION_FILE)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(KernelRestoreError::DestinationInvalid(error.to_string())),
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|_| {
+                    KernelRestoreError::DestinationInvalid(
+                        "pinned destination admission is corrupt".to_owned(),
+                    )
+                })
+                .map(Some),
+        }
     }
 
     /// Validates cutover inputs without effects: separate cutover
-    /// authorization, receipt/plan/target binding, observed evidence with
-    /// its complete validation denominator (any applicable unresolved
-    /// effect, missing receipt, or unknown reconciliation without its
-    /// complete current denominator refuses qualification).
+    /// authorization, receipt/plan/target binding, and observed evidence
+    /// plan validation. The obligation denominator (including the
+    /// lease-terminal override) is checked separately after the ticket
+    /// commit, so the lease leg can be satisfied by the committed ticket.
     fn check_cutover_inputs(
         plan: &RestorePlan,
         bundle: &BackupBundle,
@@ -458,86 +554,20 @@ impl KernelBackupRestore {
         evidence
             .validate_against_plan(plan, bundle)
             .map_err(KernelRestoreError::TargetFailed)?;
-        require_cutover_obligations(&evidence.obligations, bundle)
-            .map_err(KernelRestoreError::TargetFailed)?;
         Ok(())
     }
 
-    /// Loads the pinned destination admission and re-proves the Host-issued
-    /// authorization for cutover: readback reconciliation with owner
-    /// evidence gates the decision; any drift refuses instead of cutting
-    /// over.
-    fn load_verified_destination_admission(
+    /// Cross-checks the cutover stream binding against live owner state:
+    /// pinned transaction/target identity, re-validated restored fence,
+    /// and the ORS owner's durably held stream binding. A rotated
+    /// authority or drifted archive refuses instead of continuing.
+    /// Returns the accepted transaction for downstream bindings.
+    fn check_cutover_stream_binding(
         &self,
-        destination: &KernelIsolatedDestination,
         plan: &RestorePlan,
         bundle: &BackupBundle,
-    ) -> Result<PinnedDestinationAdmission, KernelRestoreError> {
-        let admission_bytes = std::fs::read(destination.root().join(DESTINATION_ADMISSION_FILE))
-            .map_err(|_| {
-                KernelRestoreError::DestinationInvalid(
-                    "no owner-approved destination admission pinned".to_owned(),
-                )
-            })?;
-        let pinned: PinnedDestinationAdmission =
-            serde_json::from_slice(&admission_bytes).map_err(|_| {
-                KernelRestoreError::DestinationInvalid(
-                    "pinned destination admission is corrupt".to_owned(),
-                )
-            })?;
-        self.verify_destination_binding(destination, plan, bundle, Some(&pinned.evidence))?;
-        Ok(pinned)
-    }
-
-    /// Validates the #961 cutover path for one completed isolated restore:
-    /// owner-approved isolated destination, separate cutover authority,
-    /// epoch lineage strictly newer than every observed value, and a
-    /// complete validation denominator in the observed evidence.
-    ///
-    /// Consumes only authenticated evidence: the accepted owner
-    /// authorization (bound to this exact plan and bundle), the completed
-    /// restore receipt (bound to this exact plan, bundle, and target), the
-    /// observed restore evidence (validated, plan-bound, and obligation
-    /// complete — any applicable unresolved effect, missing receipt, or
-    /// unknown reconciliation without its complete current denominator
-    /// refuses cutover qualification; suspension is not resolution), the
-    /// pinned destination admission (owner-approved manifest evidence bound
-    /// at prepare — absent without Host admission, and cutover refuses
-    /// without it), the ORS owner's durably held stream binding
-    /// (destination and transaction cross-check — a rotated authority or
-    /// drifted archive refuses instead of continuing), and the freshly
-    /// re-validated restored fence (lineage advance re-proven here with no
-    /// caller arithmetic on epochs). The accepted [`authorize_cutover`](eliot_backup::authorize_cutover)
-    /// mints the receipt; a degraded archive keeps its `canonical_only`
-    /// marking and is never upgraded. The decision is journaled to the
-    /// bound ORS stream with the exact observed predecessor, preserving
-    /// intent-before-effect ordering for cutover too.
-    ///
-    /// This path performs NO activation, retirement, route/process mutation,
-    /// or live-authority invalidation: cutover execution belongs to the
-    /// installer/Hume owner (#961), whose files are untouched here.
-    /// Rehearsal is safe by construction — there is simply no effect to
-    /// rehearse beyond validation and journaling the decision.
-    pub fn request_cutover(
-        &mut self,
-        plan: &RestorePlan,
-        bundle: &BackupBundle,
-        receipt: &RestoreReceipt,
-        evidence: Option<&RestoreEvidence>,
-        destination: &KernelIsolatedDestination,
-        auth: Option<&CutoverAuthorization>,
-    ) -> Result<CutoverReceipt, KernelRestoreError> {
-        Self::check_cutover_inputs(plan, bundle, receipt, evidence, auth)?;
-        let auth = auth.ok_or(KernelRestoreError::CutoverNotAuthorized)?;
-        if destination.label() != plan.target.target_id
-            || !destination.root().starts_with(&self.work_root)
-        {
-            return Err(KernelRestoreError::DestinationInvalid(
-                "cutover destination is not the plan-admitted isolated root".to_owned(),
-            ));
-        }
-        let pinned =
-            self.load_verified_destination_admission(destination, plan, bundle)?;
+        pinned: &PinnedDestinationAdmission,
+    ) -> Result<RestoreTransaction, KernelRestoreError> {
         let transaction = plan
             .transaction()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
@@ -564,6 +594,164 @@ impl KernelBackupRestore {
         {
             return Err(KernelRestoreError::JournalBindingConflict);
         }
+        Ok(transaction)
+    }
+
+    /// Loads the pinned destination admission and re-proves the Host-issued
+    /// authorization for cutover: readback reconciliation with owner
+    /// evidence gates the decision; any drift refuses instead of cutting
+    /// over.
+    fn load_verified_destination_admission(
+        &mut self,
+        destination: &KernelIsolatedDestination,
+        plan: &RestorePlan,
+        bundle: &BackupBundle,
+    ) -> Result<PinnedDestinationAdmission, KernelRestoreError> {
+        let admission_bytes = std::fs::read(destination.root().join(DESTINATION_ADMISSION_FILE))
+            .map_err(|_| {
+                KernelRestoreError::DestinationInvalid(
+                    "no owner-approved destination admission pinned".to_owned(),
+                )
+            })?;
+        let pinned: PinnedDestinationAdmission =
+            serde_json::from_slice(&admission_bytes).map_err(|_| {
+                KernelRestoreError::DestinationInvalid(
+                    "pinned destination admission is corrupt".to_owned(),
+                )
+            })?;
+        self.verify_destination_binding(destination, plan, bundle, Some(&pinned.evidence))?;
+        Ok(pinned)
+    }
+
+    /// Commits one terminal ticket through the lease owner and verifies the
+    /// commit by owner validation plus live ORS readback.
+    ///
+    /// The authority enforces genuine predecessor proof, trust anchor, and
+    /// signer internally; this path additionally requires a terminal
+    /// operation up front, owner-validates the returned snapshot, binds it
+    /// to the ticket (lease, operation), requires the lease to have left
+    /// `Active`, and requires the durably held projection to equal the
+    /// commit observation. Any refusal fails closed with the exact cause —
+    /// never a shape-only acceptance.
+    fn commit_lease_terminal(
+        authority: &KernelSupervisionLeaseAuthority,
+        ticket: &SupervisionLeaseCommitTicket,
+        journal: &KernelRestoreJournal,
+    ) -> Result<LeaseTerminalProof, KernelRestoreError> {
+        if matches!(
+            ticket.operation,
+            SupervisionLeaseOperation::Commit | SupervisionLeaseOperation::Renew
+        ) {
+            return Err(KernelRestoreError::LeaseTerminal(
+                "terminal commit requires a terminal operation".to_owned(),
+            ));
+        }
+        let snapshot = authority
+            .commit_terminal(ticket)
+            .map_err(|error| KernelRestoreError::LeaseTerminal(error.to_string()))?;
+        snapshot
+            .validate()
+            .map_err(|error| KernelRestoreError::LeaseTerminal(error.to_string()))?;
+        if snapshot.record.lease_id.as_str() != ticket.lease_id.as_str()
+            || snapshot.record.operation != ticket.operation
+            || snapshot.receipt.lease_id.as_str() != ticket.lease_id.as_str()
+        {
+            return Err(KernelRestoreError::LeaseTerminal(
+                "committed lease snapshot does not bind the terminal ticket".to_owned(),
+            ));
+        }
+        if snapshot.record.state == LeaseState::Active {
+            return Err(KernelRestoreError::LeaseTerminal(
+                "lease terminal commit did not leave active state".to_owned(),
+            ));
+        }
+        let current = journal
+            .read_lease_head(&ticket.lease_id)
+            .map_err(KernelRestoreError::TargetFailed)?
+            .ok_or_else(|| {
+                KernelRestoreError::LeaseTerminal(
+                    "no committed lease projection after terminal commit".to_owned(),
+                )
+            })?;
+        if current.record.lease_id.as_str() != snapshot.record.lease_id.as_str()
+            || current.record.revision != snapshot.record.revision
+            || current.receipt.receipt_sha256 != snapshot.receipt.receipt_sha256
+        {
+            return Err(KernelRestoreError::JournalCorrupt);
+        }
+        Ok(LeaseTerminalProof {
+            ticket_id: ticket.ticket_id.as_str().to_owned(),
+            lease_id: ticket.lease_id.as_str().to_owned(),
+            lease_revision: snapshot.record.revision,
+            lease_receipt_sha256: snapshot.receipt.receipt_sha256.clone(),
+        })
+    }
+/// Validates the #961 cutover path for one completed isolated restore:
+    /// owner-approved isolated destination, separate cutover authority,
+    /// epoch lineage strictly newer than every observed value, and a
+    /// complete validation denominator in the observed evidence.
+    ///
+    /// Consumes only authenticated evidence: the accepted owner
+    /// authorization (bound to this exact plan and bundle), the completed
+    /// restore receipt (bound to this exact plan, bundle, and target), the
+    /// observed restore evidence (validated, plan-bound, and obligation
+    /// complete — any applicable unresolved effect, missing receipt, or
+    /// unknown reconciliation without its complete current denominator
+    /// refuses cutover qualification; suspension is not resolution), the
+    /// pinned destination admission (owner-approved manifest evidence bound
+    /// at prepare — absent without Host admission, and cutover refuses
+    /// without it), the ORS owner's durably held stream binding
+    /// (destination and transaction cross-check — a rotated authority or
+    /// drifted archive refuses instead of continuing), and the freshly
+    /// re-validated restored fence (lineage advance re-proven here with no
+    /// caller arithmetic on epochs). The accepted [`authorize_cutover`](eliot_backup::authorize_cutover)
+    /// mints the receipt; a degraded archive keeps its `canonical_only`
+    /// marking and is never upgraded. The decision is journaled to the
+    /// bound ORS stream with the exact observed predecessor, preserving
+    /// intent-before-effect ordering for cutover too.
+    ///
+    /// This path performs NO activation, retirement, route/process mutation,
+    /// or non-lease live-authority invalidation: runtime/session/route/
+    /// user-broker invalidation and cutover execution belong to the
+    /// installer/Hume owner (#961), whose files are untouched here. The
+    /// lease leg alone executes here through a caller-supplied terminal
+    /// ticket (F2 repair): without a lease-owner-committed ticket there is
+    /// no cutover. A committed ticket without a journaled decision still
+    /// leaves cutover unperformed — retry then requires a fresh ticket from
+    /// current lease state, never a replay of the consumed one. Rehearsal
+    /// is safe by construction — there is simply no effect to rehearse
+    /// beyond validation, ticket commit, and journaling the decision.
+    pub fn request_cutover(
+        &mut self,
+        plan: &RestorePlan,
+        bundle: &BackupBundle,
+        receipt: &RestoreReceipt,
+        evidence: Option<&RestoreEvidence>,
+        destination: &KernelIsolatedDestination,
+        authority: &CutoverAuthority<'_>,
+    ) -> Result<CutoverReceipt, KernelRestoreError> {
+        let CutoverAuthority {
+            authorization: auth,
+            lease_terminal,
+        } = *authority;
+        Self::check_cutover_inputs(plan, bundle, receipt, evidence, auth)?;
+        let auth = auth.ok_or(KernelRestoreError::CutoverNotAuthorized)?;
+        // F2: no lease-owner-committed terminal ticket → no cutover. The
+        // shape-only cutover receipt never authorizes alone.
+        let (lease_authority, lease_ticket) =
+            lease_terminal.ok_or(KernelRestoreError::CapabilityMissing {
+                capability: "lease-terminal-ticket",
+            })?;
+        if destination.label() != plan.target.target_id
+            || !destination.root().starts_with(&self.work_root)
+        {
+            return Err(KernelRestoreError::DestinationInvalid(
+                "cutover destination is not the plan-admitted isolated root".to_owned(),
+            ));
+        }
+        let pinned =
+            self.load_verified_destination_admission(destination, plan, bundle)?;
+        let transaction = self.check_cutover_stream_binding(plan, bundle, &pinned)?;
         let carrier = IsolatedRestorePlan {
             plan: plan.clone(),
             suspended_entries: suspended_entries(bundle)?,
@@ -577,6 +765,17 @@ impl KernelBackupRestore {
         cutover
             .validate()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        // F2: drive the real lease-owner terminal path with genuine
+        // predecessor proof; verify by owner validation plus live ORS
+        // readback. Only a committed ticket satisfies the lease leg of the
+        // denominator below — the shape-only receipt never does.
+        let lease_proof =
+            Self::commit_lease_terminal(lease_authority, lease_ticket, &self.journal)?;
+        let evidence = evidence.ok_or(KernelRestoreError::OwnerEvidenceInvalid(
+            "no observed restore evidence".to_owned(),
+        ))?;
+        require_cutover_obligations(&evidence.obligations, bundle, Some(&lease_proof))
+            .map_err(KernelRestoreError::TargetFailed)?;
         let decision = ObservedCutoverDecision {
             plan_id: plan.plan_id.clone(),
             bundle_sha256: plan.bundle_sha256.clone(),
@@ -586,6 +785,11 @@ impl KernelBackupRestore {
             manifest_digest: pinned.evidence.manifest_digest.clone(),
             roots_digest: pinned.evidence.roots_digest.clone(),
             registry_revision: pinned.evidence.registry_revision,
+            lease_ticket_id: lease_proof.ticket_id.clone(),
+            lease_id: lease_proof.lease_id.clone(),
+            lease_revision: lease_proof.lease_revision,
+            lease_receipt_sha256: lease_proof.lease_receipt_sha256.clone(),
+            authorization_digest: pinned.authorization_digest.clone(),
             new_authority_epoch: cutover.new_authority_epoch.clone(),
             new_resource_generation: cutover.new_resource_generation,
             canonical_only: cutover.canonical_only,
@@ -640,9 +844,17 @@ fn suspended_entries(
 /// unresolved work passes only through a satisfied reconciliation
 /// obligation backed by its complete current denominator, which only the
 /// exact reconciliation owner can issue.
+///
+/// The lease leg is additionally satisfied by a lease-owner-committed
+/// terminal ticket (F2 repair): the finalize-built evidence cannot know the
+/// ticket the cutover path commits, so a verified commit recorded in the
+/// decision satisfies the leg. Without one, the evidence leg applies
+/// unchanged — and since finalize never marks it satisfied, cutover
+/// refuses with the exact lease owner.
 fn require_cutover_obligations(
     obligations: &RestoreObligations,
     bundle: &BackupBundle,
+    lease_terminal: Option<&LeaseTerminalProof>,
 ) -> Result<(), BackupError> {
     fn require(
         capability: &'static str,
@@ -656,7 +868,7 @@ fn require_cutover_obligations(
             _ => Err(BackupError::RestoreCapabilityUnsupported { capability }),
         }
     }
-    let list: [(&RestoreOwnerObligation, &'static str, bool); 13] = [
+    let list: [(&RestoreOwnerObligation, &'static str, bool); 12] = [
         (&obligations.purge, owners::PURGE, true),
         (
             &obligations.canonical_validation,
@@ -691,7 +903,6 @@ fn require_cutover_obligations(
         ),
         (&obligations.runtime_invalidation, owners::RUNTIME, true),
         (&obligations.session_invalidation, owners::SESSION, true),
-        (&obligations.lease_invalidation, owners::LEASE, true),
         (&obligations.route_invalidation, owners::ROUTE, true),
         (
             &obligations.user_broker_invalidation,
@@ -701,6 +912,11 @@ fn require_cutover_obligations(
     ];
     for (obligation, capability, applicable) in list {
         require(capability, obligation, applicable)?;
+    }
+    // Lease leg: a lease-owner-committed terminal ticket recorded in this
+    // decision satisfies it; otherwise the evidence leg applies unchanged.
+    if lease_terminal.is_none() {
+        require(owners::LEASE, &obligations.lease_invalidation, true)?;
     }
     Ok(())
 }
@@ -718,9 +934,11 @@ fn read_resumed_evidence(root: &std::path::Path) -> Option<RestoreEvidence> {
 }
 
 /// Kernel-observed cutover decision journaled to the bound ORS stream: the
-/// exact validated authorization, bound plan/archive/destination, and the
-/// new lineage the accepted cutover function minted. Observation of a
-/// validated decision, never an activation.
+/// exact validated authorization, bound plan/archive/destination, the
+/// lease-owner-committed terminal ticket the lease leg was satisfied by,
+/// the journaled destination authorization digest, and the new lineage the
+/// accepted cutover function minted. Observation of a validated decision,
+/// never an activation.
 #[derive(Serialize)]
 struct ObservedCutoverDecision {
     plan_id: String,
@@ -731,20 +949,32 @@ struct ObservedCutoverDecision {
     manifest_digest: String,
     roots_digest: String,
     registry_revision: u64,
+    lease_ticket_id: String,
+    lease_id: String,
+    lease_revision: u64,
+    lease_receipt_sha256: String,
+    authorization_digest: String,
     new_authority_epoch: EpochId,
     new_resource_generation: ResourceGeneration,
     canonical_only: bool,
 }
 
 /// Pinned destination admission: the owner-approved manifest evidence bound
-/// to one restore transaction and target. Written once at prepare,
-/// re-verified before later effects and at cutover; any drift refuses.
+/// to one restore transaction and target, plus the first-journaled
+/// destination authorization binding. Written once at prepare, re-verified
+/// before later effects and at cutover; any drift refuses. The
+/// authorization digest/installation/generation pin the first observation
+/// for resume/cutover continuity: a swapped authorization binding a
+/// different installation, generation, or digest refuses.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PinnedDestinationAdmission {
     transaction_id: String,
     target_id: String,
     evidence: DestinationManifestEvidence,
+    authorization_digest: String,
+    source_installation_id: String,
+    approved_generation: String,
 }
 
 /// Admission file name inside the isolated destination.
@@ -778,6 +1008,15 @@ enum ObservedEffect {
     Undecidable,
 }
 
+/// Journaled destination authorization traveling with the restore target:
+/// the verified binding plus the ORS-journaled payload digest pinned at
+/// prepare for resume/cutover continuity. The two travel as one concept so
+/// no effect can bind a verification without its journal proof.
+struct VerifiedDestination {
+    binding: VerifiedDestinationBinding,
+    authorization_digest: String,
+}
+
 /// Kernel restore target over the accepted effect seam.
 ///
 /// Every applicable phase re-checks the Kernel effect fence before touching
@@ -792,7 +1031,7 @@ struct KernelRestoreTarget<'a> {
     blob_scope: Option<&'a DestinationScope>,
     receipts: Vec<BlobRestorationReceipt>,
     manifest_evidence: Option<DestinationManifestEvidence>,
-    verified: VerifiedDestinationBinding,
+    verified: VerifiedDestination,
     calls: Vec<String>,
     final_evidence: Option<RestoreEvidence>,
 }
@@ -805,7 +1044,7 @@ impl<'a> KernelRestoreTarget<'a> {
         blob_scope: Option<&'a DestinationScope>,
         receipts: Vec<BlobRestorationReceipt>,
         manifest_evidence: Option<DestinationManifestEvidence>,
-        verified: VerifiedDestinationBinding,
+        verified: VerifiedDestination,
     ) -> Self {
         Self {
             root: destination.root().to_path_buf(),
@@ -992,6 +1231,9 @@ impl<'a> KernelRestoreTarget<'a> {
                 transaction_id: intent.transaction_id.clone(),
                 target_id: plan.target.target_id.clone(),
                 evidence,
+                authorization_digest: self.verified.authorization_digest.clone(),
+                source_installation_id: self.verified.binding.source_installation_id().to_owned(),
+                approved_generation: self.verified.binding.approved_generation().to_owned(),
             };
             let bytes = canonical_json_bytes(&pinned)
                 .map_err(|error| BackupError::Serialization(error.to_string()))?;
@@ -1026,11 +1268,11 @@ impl<'a> KernelRestoreTarget<'a> {
             self.receipts.clone(),
             self.keys,
             self.blob_scope,
-            &self.verified,
+            &self.verified.binding,
         )?;
         let adapter = DestinationRestoreAdapter::bind(self.root.as_path())?;
         let restored: RestoredSealedBlob =
-            client.restore_blob(&self.verified, &adapter, blob)?;
+            client.restore_blob(&self.verified.binding, &adapter, blob)?;
         self.write_file(&format!("blobs/{hash}"), &restored.resealed_bytes)?;
         let observed = ObservedBlobRestore {
             resealed_sha256: restored.resealed_sha256.clone(),
@@ -1455,7 +1697,7 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     }
 
     fn apply_purge_ledger(&mut self, entries: &[PurgeLedgerEntry]) -> Result<(), BackupError> {
-        PurgeOwnerClient::bind(entries, &self.verified).validate_entries()?;
+        PurgeOwnerClient::bind(entries, &self.verified.binding).validate_entries()?;
         let bytes = canonical_json_bytes(&entries)
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         self.write_file("purge_ledger.json", &bytes)?;

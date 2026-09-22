@@ -66,7 +66,7 @@ pub use backup_owner_clients::{
     DESTINATION_AUTHORIZATION_WIRE, PURGE_MEMBER_SUPPRESSION, STORE_IMPORT_CHANNEL,
     verify_destination_authorization,
 };
-pub use backup_restore::{KernelBackupRestore, KernelRestoreOutcome, phase_owner};
+pub use backup_restore::{CutoverAuthority, KernelBackupRestore, KernelRestoreOutcome, phase_owner};
 pub use backup_restore_ports::{
     DestinationManifestEvidence, KernelIsolatedDestination, KernelRestoreError, KernelRestoreJournal,
     RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_KEEP_RESOLVED,
@@ -297,8 +297,9 @@ use eliot_ors::{
     OperationIdentity, OperationalRecoveryStore, RedbRecoveryStore, SupervisionLeaseOperation,
     SupervisionLeasePrepareRequest, SupervisionLeaseSnapshot,
 };
+pub use eliot_ors::SupervisionLeaseCommitTicket;
 #[cfg(test)]
-pub use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseStageReceipt};
+pub use eliot_ors::SupervisionLeaseStageReceipt;
 #[cfg(test)]
 use eliot_platform::ClockObservation;
 #[cfg(windows)]
