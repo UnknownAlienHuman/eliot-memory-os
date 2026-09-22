@@ -10,6 +10,7 @@
 
 mod bridge_admission;
 mod input;
+mod owner_retention;
 mod owner_supply;
 mod plan;
 mod result;
@@ -25,6 +26,10 @@ pub use input::{
     AttentionDisclosureRule, ReactiveCueActivation, ReactiveCueActivationParts,
     ReactiveDeliveryPolicy, ReactiveDeliveryPolicyParts, ReactiveTargetBinding,
     produce_reactive_cue_activation, produce_reactive_delivery_policy,
+};
+pub use owner_retention::{
+    MAX_RETAINED_PROJECTION_SETS, ReactiveOwnerRetention, RestoredOwnerSnapshots,
+    ingest_restored_projection_set,
 };
 pub use owner_supply::{
     MAX_OWNER_SNAPSHOT_BYTES, OwnerProjectionBytes, OwnerProjectionSet, OwnerSupplyError,

@@ -48,6 +48,13 @@
 //! snapshot identities per I07-18 plus serving reads), owned by the
 //! Store/Kernel restore path and the daemon central export — reported to the
 //! manager as the exact blocker, not rerouted silently.
+//!
+//! Read-path discipline: the decoders below are the ingestion edge ONLY.
+//! Validated sets are retained by
+//! [`crate::owner_retention::ReactiveOwnerRetention`] keyed by
+//! (session, fence), and feed drivers read from retention — never from fresh
+//! caller bytes. [`OwnerProjectionSet`] fields are private so only
+//! [`read_owner_projection_set`] can construct a set.
 
 use eliot_context_contracts::{
     ContextPlanningView, CriticalAttentionProjection, IntegrationCoverageProfile,
@@ -89,23 +96,59 @@ pub struct OwnerProjectionBytes<'a> {
 }
 
 /// Six validated owner projections coherent under one fence.
+///
+/// Constructible only via [`read_owner_projection_set`]: field privacy plus
+/// the retention read path below guarantee no literal-assembled set ever
+/// reaches planning. The validated set is retained by
+/// [`crate::owner_retention::ReactiveOwnerRetention`] keyed by
+/// (session, fence); feed drivers read from retention, never from fresh
+/// caller bytes.
 #[derive(Clone, Debug)]
 pub struct OwnerProjectionSet {
     /// Supplied planning view closure.
-    pub view: ContextPlanningView,
+    view: ContextPlanningView,
     /// Supplied cue activation joined to `view`.
-    pub cue_activation: ReactiveCueActivation,
+    cue_activation: ReactiveCueActivation,
     /// Supplied session delivery snapshot.
-    pub session: SessionDeliverySnapshot,
+    session: SessionDeliverySnapshot,
     /// Supplied critical attention projection.
-    pub attention: CriticalAttentionProjection,
+    attention: CriticalAttentionProjection,
     /// Supplied integration coverage profile.
-    pub coverage: IntegrationCoverageProfile,
+    coverage: IntegrationCoverageProfile,
     /// Supplied delivery policy.
-    pub policy: ReactiveDeliveryPolicy,
+    policy: ReactiveDeliveryPolicy,
 }
 
 impl OwnerProjectionSet {
+    /// Borrow the supplied planning view closure.
+    pub fn view(&self) -> &ContextPlanningView {
+        &self.view
+    }
+
+    /// Borrow the supplied cue activation joined to the view.
+    pub fn cue_activation(&self) -> &ReactiveCueActivation {
+        &self.cue_activation
+    }
+
+    /// Borrow the supplied session delivery snapshot.
+    pub fn session(&self) -> &SessionDeliverySnapshot {
+        &self.session
+    }
+
+    /// Borrow the supplied critical attention projection.
+    pub fn attention(&self) -> &CriticalAttentionProjection {
+        &self.attention
+    }
+
+    /// Borrow the supplied integration coverage profile.
+    pub fn coverage(&self) -> &IntegrationCoverageProfile {
+        &self.coverage
+    }
+
+    /// Borrow the supplied delivery policy.
+    pub fn policy(&self) -> &ReactiveDeliveryPolicy {
+        &self.policy
+    }
     /// Borrow the set as feed inputs for one settled-plan evaluation.
     pub fn feed_inputs(&self) -> SettledPlanFeedInputs<'_> {
         SettledPlanFeedInputs {
@@ -254,6 +297,8 @@ pub enum OwnerSupplyError {
         /// Exact disagreeing field.
         field: &'static str,
     },
+    /// The process-scoped projection retention is full.
+    RetentionFull,
 }
 
 impl std::fmt::Display for OwnerSupplyError {
@@ -279,6 +324,10 @@ impl std::fmt::Display for OwnerSupplyError {
             Self::BindingMismatch { projection, field } => write!(
                 formatter,
                 "owner supply conflicted: {projection}.{field} disagrees"
+            ),
+            Self::RetentionFull => write!(
+                formatter,
+                "owner supply rejected: projection retention is full"
             ),
         }
     }

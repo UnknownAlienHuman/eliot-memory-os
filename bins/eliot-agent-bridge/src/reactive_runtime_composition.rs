@@ -28,15 +28,16 @@
 //! restore ever lands.
 
 use eliot_agent_bridge_core::{AttachBinding, BridgeError, ResourceUri};
-use eliot_contracts::{ResourceGeneration, StateFence};
+use eliot_contracts::{ResourceGeneration, SessionId, StateFence};
 use eliot_integration_coverage::GovernorCoverageDerivation;
 use eliot_mcp::{KernelHostRequestPort, PortFailure};
 use eliot_protocol::{
     MAX_RESTORE_URIS, ReactiveRestoreQuery, ReactiveRestoreReply, RestoredSnapshot,
 };
 use eliot_reactive_context_plan::{
-    LiveActivationBindings, OwnerProjectionBytes, OwnerSupplyError, SettledPlanFeedError,
-    SettledPlanFeedInputs, drive_live_feed, read_owner_projection_set,
+    LiveActivationBindings, OwnerProjectionBytes, OwnerSupplyError, ReactiveOwnerRetention,
+    RestoredOwnerSnapshots, SettledPlanFeedError, SettledPlanFeedInputs, drive_live_feed,
+    ingest_restored_projection_set,
 };
 use std::fmt;
 
@@ -614,26 +615,72 @@ pub fn drive_owner_projections_to_ledger(
         .map_err(OwnerProjectionFeedError::Admission)
 }
 
-/// Supply the six owner projections from owner-issued snapshot bytes bound
-/// to the explicit fence, then drive one feed evaluation into the live
-/// ledger.
+/// Supply the six owner projections from a restore-shaped snapshot delivery,
+/// retain them, then drive one feed evaluation into the live ledger.
 ///
-/// The bytes are the owners' immutable canonical snapshots served through
-/// the durable restore path; the fence is the live fence echoed by the
-/// caller from the runner's own attach binding (never caller text). Each
-/// projection is decoded, intrinsically validated, and coherence-checked
-/// before the existing feed/transport runs. Absent or unreadable owner
-/// state fails closed here — never a fabricated projection, never a silent
-/// drop.
+/// Ingestion edge: the live session and fence come from the runner's own
+/// attach binding (never caller text); the reply echo and six snapshot
+/// slots come from the serving restore leg. The set is validated, retained
+/// under the live key, and re-read from retention before the existing
+/// feed/transport runs — the drive below consumes retained state, never
+/// fresh caller bytes. Absent, foreign-session, or unreadable owner state
+/// fails closed here: never a fabricated projection, never a silent drop.
 pub fn supply_and_drive_owner_projections(
     runner: &mut BridgeRunner,
     derivation: &GovernorCoverageDerivation,
     admission: &mut SettledPlanAdmission,
     bindings: &LiveActivationBindings,
-    fence: &StateFence,
+    retention: &mut ReactiveOwnerRetention,
+    reply_session: &str,
+    reply_revision: Option<u64>,
     snapshots: &OwnerProjectionBytes<'_>,
 ) -> Result<FeedAdmissionOutcome, OwnerProjectionFeedError> {
-    let owned =
-        read_owner_projection_set(fence, snapshots).map_err(OwnerProjectionFeedError::Supply)?;
-    drive_owner_projections_to_ledger(runner, derivation, admission, bindings, owned.feed_inputs())
+    let view = runner
+        .attach_view()
+        .ok_or(PlanAdmissionError::NotAttached)
+        .map_err(OwnerProjectionFeedError::Admission)?;
+    let live_session = view.binding().session_id().as_str().to_owned();
+    let live_fence = live_state_fence(view.binding())
+        .map_err(|_| OwnerProjectionFeedError::Supply(OwnerSupplyError::InvalidFence))?;
+    ingest_restored_projection_set(
+        retention,
+        &live_session,
+        &live_fence,
+        &RestoredOwnerSnapshots {
+            reply_session,
+            reply_revision,
+            projections: *snapshots,
+        },
+    )
+    .map_err(OwnerProjectionFeedError::Supply)?;
+    let session_id = SessionId::new(live_session.as_str()).map_err(|_| {
+        OwnerProjectionFeedError::Supply(OwnerSupplyError::Invalid {
+            projection: "retention",
+            detail: "live session identity is invalid".to_owned(),
+        })
+    })?;
+    let stored = retention
+        .read(&session_id, &live_fence)
+        .map_err(OwnerProjectionFeedError::Supply)?;
+    drive_owner_projections_to_ledger(runner, derivation, admission, bindings, stored.feed_inputs())
+}
+
+/// Drive one feed evaluation from the retained projection set for exactly
+/// the live (session, fence) key.
+///
+/// Pure read path: no bytes are decoded here. Unknown sessions or rotated
+/// fences fail closed via the retention read.
+pub fn drive_retained_projection_set(
+    runner: &mut BridgeRunner,
+    derivation: &GovernorCoverageDerivation,
+    admission: &mut SettledPlanAdmission,
+    bindings: &LiveActivationBindings,
+    retention: &ReactiveOwnerRetention,
+    session_id: &SessionId,
+    fence: &StateFence,
+) -> Result<FeedAdmissionOutcome, OwnerProjectionFeedError> {
+    let stored = retention
+        .read(session_id, fence)
+        .map_err(OwnerProjectionFeedError::Supply)?;
+    drive_owner_projections_to_ledger(runner, derivation, admission, bindings, stored.feed_inputs())
 }

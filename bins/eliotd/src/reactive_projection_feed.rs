@@ -33,12 +33,13 @@
 //! dependency wiring and typed outcome projection only. Deterministic
 //! selection, validation, and digest logic live in the owner crates.
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{SessionId, StateFence};
 use eliot_governor::CompositionReadiness;
 use eliot_reactive_context_plan::{
     BridgeAdmissionError, LiveActivationBindings, NoInjectionDisposition, OwnerProjectionBytes,
-    OwnerSupplyError, ReactiveContextPlanningError, SettledPlanFeed, SettledPlanFeedError,
-    SettledPlanFeedInputs, SettledPlanFeedOutcome, drive_live_feed, read_owner_projection_set,
+    OwnerSupplyError, ReactiveContextPlanningError, ReactiveOwnerRetention, RestoredOwnerSnapshots,
+    SettledPlanFeed, SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
+    drive_live_feed, ingest_restored_projection_set,
 };
 use thiserror::Error;
 
@@ -136,27 +137,81 @@ pub fn drive_daemon_reactive_feed(
     }
 }
 
-/// Drive one daemon-side feed evaluation from owner-issued snapshot bytes.
+/// Drive one daemon-side feed evaluation from a restore-shaped snapshot delivery.
 ///
-/// Reads the coherent fence-bound projection set first — any absent,
-/// oversize, undecodable, invalid, or mismatched owner withholds the whole
-/// evaluation — then runs the readiness-gated daemon feed. Bytes are the
-/// owners' canonical snapshots served through the durable restore path; the
-/// fence is the live Governor fence observed by the daemon central export,
-/// which threads the owners' snapshots.
+/// Ingestion edge: the set is validated, retained under the live
+/// (session, fence) key, and re-read from retention before the
+/// readiness-gated daemon feed runs — the drive below consumes retained
+/// state, never fresh caller bytes. Bytes are the owners' canonical
+/// snapshots served through the durable restore path; the live session and
+/// fence are observed by the daemon central export, which threads the
+/// owners' snapshots. Any absent, foreign-session, oversize, undecodable,
+/// invalid, or mismatched leg withholds the whole evaluation.
 pub fn drive_daemon_supplied_feed(
     readiness: CompositionReadiness,
     bindings: &LiveActivationBindings,
+    retention: &mut ReactiveOwnerRetention,
+    live_session: &str,
     fence: &StateFence,
+    reply_session: &str,
+    reply_revision: Option<u64>,
     snapshots: &OwnerProjectionBytes<'_>,
 ) -> Result<DaemonReactiveFeedOutcome, DaemonReactiveFeedError> {
-    let owned =
-        read_owner_projection_set(fence, snapshots).map_err(DaemonReactiveFeedError::Supply)?;
+    if readiness != CompositionReadiness::Ready {
+        return Err(DaemonReactiveFeedError::NotReady);
+    }
+    ingest_restored_projection_set(
+        retention,
+        live_session,
+        fence,
+        &RestoredOwnerSnapshots {
+            reply_session,
+            reply_revision,
+            projections: *snapshots,
+        },
+    )
+    .map_err(DaemonReactiveFeedError::Supply)?;
+    let session_id = SessionId::new(live_session).map_err(|_| {
+        DaemonReactiveFeedError::Supply(OwnerSupplyError::Invalid {
+            projection: "retention",
+            detail: "live session identity is invalid".to_owned(),
+        })
+    })?;
+    let stored = retention
+        .read(&session_id, fence)
+        .map_err(DaemonReactiveFeedError::Supply)?;
     drive_daemon_reactive_feed(
         readiness,
         DaemonReactiveFeedInputs {
             bindings,
-            projections: owned.feed_inputs(),
+            projections: stored.feed_inputs(),
+        },
+    )
+}
+
+/// Drive one daemon-side feed evaluation from the retained projection set
+/// for exactly the live (session, fence) key.
+///
+/// Pure read path: no bytes are decoded here. Unknown sessions or rotated
+/// fences fail closed via the retention read.
+pub fn drive_daemon_retained_feed(
+    readiness: CompositionReadiness,
+    bindings: &LiveActivationBindings,
+    retention: &ReactiveOwnerRetention,
+    session_id: &SessionId,
+    fence: &StateFence,
+) -> Result<DaemonReactiveFeedOutcome, DaemonReactiveFeedError> {
+    if readiness != CompositionReadiness::Ready {
+        return Err(DaemonReactiveFeedError::NotReady);
+    }
+    let stored = retention
+        .read(session_id, fence)
+        .map_err(DaemonReactiveFeedError::Supply)?;
+    drive_daemon_reactive_feed(
+        readiness,
+        DaemonReactiveFeedInputs {
+            bindings,
+            projections: stored.feed_inputs(),
         },
     )
 }
