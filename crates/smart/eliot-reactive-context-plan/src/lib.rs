@@ -10,6 +10,7 @@
 
 mod bridge_admission;
 mod input;
+mod owner_supply;
 mod plan;
 mod result;
 mod settled_plan_feed;
@@ -24,6 +25,13 @@ pub use input::{
     AttentionDisclosureRule, ReactiveCueActivation, ReactiveCueActivationParts,
     ReactiveDeliveryPolicy, ReactiveDeliveryPolicyParts, ReactiveTargetBinding,
     produce_reactive_cue_activation, produce_reactive_delivery_policy,
+};
+pub use owner_supply::{
+    MAX_OWNER_SNAPSHOT_BYTES, OwnerProjectionBytes, OwnerProjectionSet, OwnerSupplyError,
+    read_owner_projection_set, supply_context_planning_view,
+    supply_critical_attention_projection, supply_integration_coverage_profile,
+    supply_reactive_cue_activation, supply_reactive_delivery_policy,
+    supply_session_delivery_snapshot,
 };
 pub use plan::plan_pending_context_injection;
 pub use result::{

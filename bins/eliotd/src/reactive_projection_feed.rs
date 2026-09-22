@@ -33,19 +33,25 @@
 //! dependency wiring and typed outcome projection only. Deterministic
 //! selection, validation, and digest logic live in the owner crates.
 
+use eliot_contracts::StateFence;
 use eliot_governor::CompositionReadiness;
 use eliot_reactive_context_plan::{
-    BridgeAdmissionError, LiveActivationBindings, NoInjectionDisposition, ReactiveContextPlanningError,
-    SettledPlanFeed, SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
-    drive_live_feed,
+    BridgeAdmissionError, LiveActivationBindings, NoInjectionDisposition, OwnerProjectionBytes,
+    OwnerSupplyError, ReactiveContextPlanningError, SettledPlanFeed, SettledPlanFeedError,
+    SettledPlanFeedInputs, SettledPlanFeedOutcome, drive_live_feed, read_owner_projection_set,
 };
 use thiserror::Error;
 
 /// Borrowed owner projections plus the live activation they must be current for.
 ///
-/// The daemon central export (B2-owned integrator) supplies the live
-/// projections from their owners; this feed performs exactly one evaluation
-/// over them. `Copy` because the struct is only borrowed owner references.
+/// The daemon central export threads the owners' canonical snapshots (served
+/// through the durable restore path) into one read-set evaluation; this feed
+/// performs exactly one evaluation over them. `Copy` because the struct is
+/// only borrowed owner references.
+///
+/// Live snapshot publication (typed snapshot reads per projection keyed by
+/// session/fence) is the reported ownership blocker: until it exists, bytes
+/// arrive via the restore path and any absent owner withholds the feed.
 #[derive(Clone, Copy, Debug)]
 pub struct DaemonReactiveFeedInputs<'a> {
     /// Live activation the projections must be planned under, projected by
@@ -90,6 +96,11 @@ pub enum DaemonReactiveFeedError {
     /// A settled plan item is unusable as a bridge instruction.
     #[error("settled plan defect: {0}")]
     Producer(BridgeAdmissionError),
+    /// An owner snapshot could not be supplied (absent, oversize,
+    /// undecodable, invalid, or fence/binding-mismatched). Nothing was
+    /// planned or admitted.
+    #[error("owner supply withheld: {0}")]
+    Supply(OwnerSupplyError),
 }
 
 fn map_feed_error(error: SettledPlanFeedError) -> DaemonReactiveFeedError {
@@ -123,4 +134,29 @@ pub fn drive_daemon_reactive_feed(
             Ok(DaemonReactiveFeedOutcome::NoSettledPlan(disposition))
         }
     }
+}
+
+/// Drive one daemon-side feed evaluation from owner-issued snapshot bytes.
+///
+/// Reads the coherent fence-bound projection set first — any absent,
+/// oversize, undecodable, invalid, or mismatched owner withholds the whole
+/// evaluation — then runs the readiness-gated daemon feed. Bytes are the
+/// owners' canonical snapshots served through the durable restore path; the
+/// fence is the live Governor fence observed by the daemon central export,
+/// which threads the owners' snapshots.
+pub fn drive_daemon_supplied_feed(
+    readiness: CompositionReadiness,
+    bindings: &LiveActivationBindings,
+    fence: &StateFence,
+    snapshots: &OwnerProjectionBytes<'_>,
+) -> Result<DaemonReactiveFeedOutcome, DaemonReactiveFeedError> {
+    let owned =
+        read_owner_projection_set(fence, snapshots).map_err(DaemonReactiveFeedError::Supply)?;
+    drive_daemon_reactive_feed(
+        readiness,
+        DaemonReactiveFeedInputs {
+            bindings,
+            projections: owned.feed_inputs(),
+        },
+    )
 }

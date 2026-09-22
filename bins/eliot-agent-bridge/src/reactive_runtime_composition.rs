@@ -35,7 +35,8 @@ use eliot_protocol::{
     MAX_RESTORE_URIS, ReactiveRestoreQuery, ReactiveRestoreReply, RestoredSnapshot,
 };
 use eliot_reactive_context_plan::{
-    LiveActivationBindings, SettledPlanFeedError, SettledPlanFeedInputs, drive_live_feed,
+    LiveActivationBindings, OwnerProjectionBytes, OwnerSupplyError, SettledPlanFeedError,
+    SettledPlanFeedInputs, drive_live_feed, read_owner_projection_set,
 };
 use std::fmt;
 
@@ -550,6 +551,10 @@ pub enum OwnerProjectionFeedError {
     Producer(String),
     /// Admission into the live ledger failed (session, attach, or bridge).
     Admission(PlanAdmissionError),
+    /// An owner snapshot could not be supplied (absent, oversize,
+    /// undecodable, invalid, or fence/binding-mismatched). Nothing was
+    /// planned or admitted.
+    Supply(OwnerSupplyError),
 }
 
 impl fmt::Display for OwnerProjectionFeedError {
@@ -562,6 +567,7 @@ impl fmt::Display for OwnerProjectionFeedError {
             Self::Planning(detail) => write!(formatter, "owner feed planning: {detail}"),
             Self::Producer(detail) => write!(formatter, "owner feed producer: {detail}"),
             Self::Admission(error) => write!(formatter, "owner feed admission: {error}"),
+            Self::Supply(error) => write!(formatter, "owner feed supply: {error}"),
         }
     }
 }
@@ -606,4 +612,28 @@ pub fn drive_owner_projections_to_ledger(
     })?;
     admit_producer_feed(admission, runner, derivation, outcome)
         .map_err(OwnerProjectionFeedError::Admission)
+}
+
+/// Supply the six owner projections from owner-issued snapshot bytes bound
+/// to the explicit fence, then drive one feed evaluation into the live
+/// ledger.
+///
+/// The bytes are the owners' immutable canonical snapshots served through
+/// the durable restore path; the fence is the live fence echoed by the
+/// caller from the runner's own attach binding (never caller text). Each
+/// projection is decoded, intrinsically validated, and coherence-checked
+/// before the existing feed/transport runs. Absent or unreadable owner
+/// state fails closed here — never a fabricated projection, never a silent
+/// drop.
+pub fn supply_and_drive_owner_projections(
+    runner: &mut BridgeRunner,
+    derivation: &GovernorCoverageDerivation,
+    admission: &mut SettledPlanAdmission,
+    bindings: &LiveActivationBindings,
+    fence: &StateFence,
+    snapshots: &OwnerProjectionBytes<'_>,
+) -> Result<FeedAdmissionOutcome, OwnerProjectionFeedError> {
+    let owned =
+        read_owner_projection_set(fence, snapshots).map_err(OwnerProjectionFeedError::Supply)?;
+    drive_owner_projections_to_ledger(runner, derivation, admission, bindings, owned.feed_inputs())
 }
