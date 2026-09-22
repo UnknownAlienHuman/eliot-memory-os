@@ -14,22 +14,22 @@ hot_path = false
 lifecycle_owner = "smart.experience.projection"
 loc_soft_ceiling = 10000
 loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
-product_objective = "System experience evidence travels as an immutable handle-bound projection view with an explicit denominator, never as a second experience bank."
-causal_property = "immutable System Experience projection"
-old_failure_or_missing_capability = "Self-quality evidence arrives as prose or a revived second experience store instead of bounded handle refs with fence, scope, and denominator (CC-W9-COGNITIVE-QUALITY)."
-discriminator = "every view carries exact evidence handles, one fence, one scope, and a declared/observed/omitted denominator; the typed bank/journal projections stay NOT_FROZEN and are never invented here"
-primary_responsibility = "Assemble one immutable ExperienceProjectionView from Governor-owned experience evidence handles under one scope and fence."
+product_objective = "Governor-owned observation records travel as a validated immutable slice with owner gaps and coverage provenance, never as a completeness claim."
+causal_property = "immutable System Experience journal slice"
+old_failure_or_missing_capability = "Self-quality evidence arrives as prose, bare handle refs, or vector-length completeness instead of owner-validated records with typed gaps and coverage provenance (CC-W9-COGNITIVE-QUALITY)."
+discriminator = "every record validates with the owner validate(); gaps are owner CoverageGap records; the denominator is exactly the supplied set and completeness is never claimed"
+primary_responsibility = "Assemble one immutable ExperienceJournalSlice from owner-typed SystemObservationJournalRecords with supplied-set accounting."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["Governor-owned experience evidence handles (observation journal, experience bank, agent feedback)"]
-outputs = ["ExperienceProjectionView"]
-depends_on = ["eliot-contracts", "eliot-receipts"]
-providers = ["Governor/Memory OS canonical read owner (handle supply only)"]
+inputs = ["owner-typed SystemObservationJournalRecords by value (foundation observation-contracts owner)"]
+outputs = ["ExperienceJournalSlice"]
+depends_on = ["eliot-observation-contracts", "eliot-contracts"]
+providers = ["Governor observation owner (record supply only)"]
 consumers = ["eliot-cognitive-quality self-quality view (candidate only)"]
-non_goals = ["experience bank ownership", "relation store", "lifecycle transitions", "typed journal/bank/feedback projection schemas", "support/influence promotion", "aggregate score"]
-invariants = ["refs only: no record body is carried or rewritten", "one scope and one fence govern a view", "declared/observed/omitted denominator is exact", "typed bank/journal/feedback projections stay NOT_FROZEN"]
-failure_behavior = "Reject denominator contradiction, duplicate handles, blank omission reasons, and invalid identity shape explicitly."
-proof_surface = ["denominator contradiction", "duplicate handles", "omission accounting", "wire roundtrip"]
+non_goals = ["experience bank ownership", "relation store", "lifecycle transitions", "owner completeness enumeration", "vector-length completeness", "free-form omission reasons", "support/influence promotion", "aggregate score"]
+invariants = ["owner records only: every record validates with the owner validate()", "gaps are owner CoverageGap records, never invented reason strings", "supplied always equals records.len(); completeness over the owner journal is never claimed", "no caller-supplied scope/fence; scope/fence/revision stay with owner records", "typed bank/journal/feedback completeness proofs stay with their owners"]
+failure_behavior = "Reject owner-invalid records, version drift, and supplied/carried count mismatch explicitly. Completeness use requires owner revalidation."
+proof_surface = ["gap-record assembly", "ordinary-record-without-event rejection", "count mismatch", "wire roundtrip"]
 proof_ceiling = "PACKAGE_PROOF_ONLY"
 product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
 replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
@@ -37,17 +37,21 @@ merge_rejoin_condition = "merge back when no independent consumer, proof, depend
 split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
 
 [[donor]]
+path = "crates/foundation/eliot-observation-contracts/src/lib.rs"
+disposition = "owner contracts reused: SystemObservationJournalRecord validate(), CoverageGap typed omissions, CoverageEvidence denominator_source_ref provenance, CONTRACT_VERSION 1.0.0"
+
+[[donor]]
 path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
-disposition = "frozen upstream surface: StateFence scope/fence bindings, denominator doctrine; typed SystemObservationJournal/EliotSystemExperienceBank/AgentFeedbackReceipt projections recorded NOT_FROZEN"
+disposition = "wave authority: supplied-set denominator doctrine; typed journal/bank/feedback completeness proofs recorded NOT_FROZEN and stayed with their owners"
 
 [[donor]]
 path = "crates/smart/eliot-system-experience"
 disposition = "RETIRED_DUPLICATE: reuse bounded read/projection mechanics by reference only; no second self-memory owner, relation store, or lifecycle transition path"
 
 [agent_task]
-objective = "Assemble an immutable handle-bound experience projection view with an exact denominator."
+objective = "Assemble an immutable validated slice over owner-typed journal records with supplied-set accounting."
 write_scope = ["crates/smart/eliot-experience-projection/**"]
-deliverables = ["evidence-ref and view contracts", "denominator accounting", "consumer compile fixtures"]
+deliverables = ["journal-slice contract", "owner validation reuse", "consumer compile fixtures"]
 acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
 forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification", "second experience bank or lifecycle ownership"]
 stop_condition = "Stop and return ContractChallenge when the work needs another owner, store access, model work or hidden state."

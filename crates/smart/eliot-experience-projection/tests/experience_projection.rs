@@ -1,182 +1,118 @@
-//! Package fixtures for the immutable experience projection view.
+//! Package fixtures for the owner-typed experience journal slice.
+//!
+//! Fixtures use owner-typed records only: `CoverageGap`-kind records (all
+//! scalar fields) assemble, while an ordinary record without its required
+//! event is rejected by the owner's own `validate()`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::num::NonZeroU64;
-
-use eliot_contracts::{ArtifactId, EpochId, EpochLineageId, ResourceGeneration, StateFence};
-use eliot_experience_projection::{
-    ExperienceError, ExperienceEvidenceKind, ExperienceEvidenceRef, ExperienceOmission,
-    ExperienceProjectionView,
+use eliot_experience_projection::{ExperienceError, ExperienceJournalSlice};
+use eliot_observation_contracts::{
+    CoverageGap, GapDisposition, ObservationRecordKind, SystemObservationJournalRecord,
 };
-use eliot_receipts::WorkScopeId;
 
-fn scope() -> WorkScopeId {
-    WorkScopeId::new("scope-exp").expect("fixture scope")
-}
-
-fn aid(value: &str) -> ArtifactId {
-    ArtifactId::new(value).expect("fixture artifact")
-}
-
-fn fence() -> StateFence {
-    StateFence::new(
-        EpochId::new(
-            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("fixture lineage"),
-            NonZeroU64::new(1).expect("non-zero"),
-        )
-        .expect("fixture epoch"),
-        ResourceGeneration::genesis(),
-    )
-}
-
-fn evidence(handle: &str, kind: ExperienceEvidenceKind) -> ExperienceEvidenceRef {
-    ExperienceEvidenceRef {
-        handle: aid(handle),
-        kind,
+fn gap_record(id: &str) -> SystemObservationJournalRecord {
+    SystemObservationJournalRecord {
+        record_id: id.to_owned(),
+        kind: ObservationRecordKind::CoverageGap,
+        event: None,
+        coverage_gap: Some(CoverageGap {
+            gap_id: format!("{id}-gap"),
+            obligation_profile_ref: "obligation-profile-1".to_owned(),
+            reason_ref: "producer-offline".to_owned(),
+            affected_interval: None,
+            disposition: GapDisposition::Continue,
+            protected: false,
+            evidence_refs: vec![],
+        }),
+        journal_control_event: false,
+        parent_record_id: None,
     }
 }
 
-fn omission(handle: &str) -> ExperienceOmission {
-    ExperienceOmission {
-        handle: aid(handle),
-        reason: "superseded-before-count".to_owned(),
+fn eventless_audit(id: &str) -> SystemObservationJournalRecord {
+    SystemObservationJournalRecord {
+        record_id: id.to_owned(),
+        kind: ObservationRecordKind::Audit,
+        event: None,
+        coverage_gap: None,
+        journal_control_event: false,
+        parent_record_id: None,
     }
 }
 
-fn view() -> ExperienceProjectionView {
-    ExperienceProjectionView::assemble(
-        scope(),
-        fence(),
-        vec![
-            evidence("exp-1", ExperienceEvidenceKind::SystemObservation),
-            evidence("exp-2", ExperienceEvidenceKind::ExperienceBankRecord),
-            evidence("exp-3", ExperienceEvidenceKind::AgentFeedback),
-        ],
-        4,
-        vec![omission("exp-9")],
-    )
-    .expect("fixture view")
+fn slice() -> ExperienceJournalSlice {
+    ExperienceJournalSlice::assemble(vec![gap_record("rec-1"), gap_record("rec-2")])
+        .expect("fixture slice")
 }
 
 #[test]
-fn valid_view_assembles_with_exact_denominator() {
-    let assembled = view();
-    assembled.validate().expect("valid view");
-    assert_eq!(assembled.refs.len(), 3);
-    assert_eq!(assembled.omissions.len(), 1);
-    assert_eq!(assembled.declared_total, 4);
+fn gap_records_assemble_with_supplied_set_accounting() {
+    let made = slice();
+    made.validate().expect("valid slice");
+    assert_eq!(made.supplied, 2);
+    assert_eq!(made.records.len(), 2);
+    assert_eq!(made.gaps().len(), 2);
+    assert_eq!(made.gaps()[0].gap_id, "rec-1-gap");
 }
 
 #[test]
-fn handles_of_filters_by_family_in_supply_order() {
-    let assembled = view();
-    let bank: Vec<&str> = assembled
-        .handles_of(ExperienceEvidenceKind::ExperienceBankRecord)
-        .iter()
-        .map(|handle| handle.as_str())
-        .collect();
-    assert_eq!(bank, vec!["exp-2"]);
-    assert!(
-        assembled
-            .handles_of(ExperienceEvidenceKind::SystemObservation)
-            .iter()
-            .any(|handle| handle.as_str() == "exp-1")
+fn records_of_filters_by_owner_family() {
+    let made = slice();
+    assert_eq!(
+        made.records_of(ObservationRecordKind::CoverageGap).len(),
+        2
     );
+    assert!(made.records_of(ObservationRecordKind::Audit).is_empty());
 }
 
 #[test]
-fn denominator_contradiction_fails_closed() {
-    let error = ExperienceProjectionView::assemble(
-        scope(),
-        fence(),
-        vec![evidence("exp-1", ExperienceEvidenceKind::SystemObservation)],
-        9,
-        vec![],
-    )
-    .expect_err("contradicted denominator must fail");
-    assert!(matches!(
-        error,
-        ExperienceError::DenominatorContradiction { .. }
-    ));
+fn gap_only_slice_names_no_coverage_refs() {
+    let made = slice();
+    assert!(made.denominator_source_refs().is_empty());
 }
 
 #[test]
-fn duplicate_handles_are_rejected() {
-    let error = ExperienceProjectionView::assemble(
-        scope(),
-        fence(),
-        vec![
-            evidence("exp-1", ExperienceEvidenceKind::SystemObservation),
-            evidence("exp-1", ExperienceEvidenceKind::AgentFeedback),
-        ],
-        2,
-        vec![],
-    )
-    .expect_err("duplicates must fail");
-    assert!(matches!(error, ExperienceError::DuplicateHandle { .. }));
+fn ordinary_record_without_event_is_rejected_by_the_owner() {
+    let error = ExperienceJournalSlice::assemble(vec![eventless_audit("rec-9")])
+        .expect_err("eventless ordinary record must fail");
+    assert!(matches!(error, ExperienceError::Upstream(_)));
 }
 
 #[test]
-fn duplicate_ref_and_omission_handles_are_rejected() {
-    let error = ExperienceProjectionView::assemble(
-        scope(),
-        fence(),
-        vec![evidence("exp-1", ExperienceEvidenceKind::SystemObservation)],
-        2,
-        vec![omission("exp-1")],
-    )
-    .expect_err("ref/omission collision must fail");
-    assert!(matches!(error, ExperienceError::DuplicateHandle { .. }));
+fn count_mismatch_is_rejected() {
+    let mut made = slice();
+    made.supplied = 9;
+    let error = made.validate().expect_err("count mismatch must fail");
+    assert!(matches!(error, ExperienceError::CountMismatch { .. }));
 }
 
 #[test]
-fn blank_omission_reason_is_rejected() {
-    let error = ExperienceProjectionView::assemble(
-        scope(),
-        fence(),
-        vec![evidence("exp-1", ExperienceEvidenceKind::SystemObservation)],
-        2,
-        vec![ExperienceOmission {
-            handle: aid("exp-9"),
-            reason: String::new(),
-        }],
-    )
-    .expect_err("blank reason must fail");
-    assert!(matches!(error, ExperienceError::InvalidField { .. }));
-}
-
-#[test]
-fn oversized_scope_is_rejected() {
-    let wide = "s".repeat(300);
-    let error = ExperienceProjectionView::assemble(
-        WorkScopeId::new(wide).expect("wide scope text"),
-        fence(),
-        vec![],
-        0,
-        vec![],
-    )
-    .expect_err("oversized scope must fail");
-    assert!(matches!(error, ExperienceError::Bounds { .. }));
+fn version_drift_is_rejected() {
+    let mut made = slice();
+    made.contract_version = eliot_contracts::ContractVersion::new(9, 9, 9);
+    let error = made.validate().expect_err("drift must fail");
+    assert!(matches!(error, ExperienceError::VersionMismatch));
 }
 
 #[test]
 fn unknown_wire_fields_are_rejected() {
     let json = serde_json::json!({
-        "handle": "exp-1",
-        "kind": "SYSTEM_OBSERVATION",
-        "captured_at": "2026-09-22"
+        "contract_version": {"major": 1, "minor": 0, "patch": 0},
+        "records": [],
+        "supplied": 0,
+        "declared_total": 0
     });
-    let error = serde_json::from_value::<ExperienceEvidenceRef>(json)
+    let error = serde_json::from_value::<ExperienceJournalSlice>(json)
         .expect_err("unknown field must fail");
-    assert!(error.to_string().contains("captured_at"));
+    assert!(error.to_string().contains("declared_total"));
 }
 
 #[test]
-fn view_roundtrips_over_the_wire() {
-    let assembled = view();
-    let wire = serde_json::to_string(&assembled).expect("serialize view");
-    let back: ExperienceProjectionView =
-        serde_json::from_str(&wire).expect("deserialize view");
-    assert_eq!(assembled, back);
+fn slice_roundtrips_over_the_wire() {
+    let made = slice();
+    let wire = serde_json::to_string(&made).expect("serialize slice");
+    let back: ExperienceJournalSlice =
+        serde_json::from_str(&wire).expect("deserialize slice");
+    assert_eq!(made, back);
 }

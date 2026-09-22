@@ -1,10 +1,15 @@
-//! Package fixtures for the epistemic Context provider contribution.
+//! Package fixtures for the envelope-bound epistemic Context contribution.
+//!
+//! The contribution under test takes only the admitted position. Every
+//! negative case derives from one valid contribution by tampering exactly
+//! one echoed field.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
+use eliot_context_contracts::ProviderId;
 use eliot_contracts::{
     ArtifactId, ContractVersion, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId,
     StateFence,
@@ -14,14 +19,9 @@ use eliot_epistemic_contracts::{
     AdmittedReceipt, AdmittedReceiptParams, CONTRACT_VERSION, ClaimId, CurrentEpistemicPosition,
     Currentness, PositionId, PositionRevision,
 };
-use eliot_receipts::WorkScopeId;
 
 fn hex64() -> String {
     "0123456789abcdef".repeat(4)
-}
-
-fn scope() -> WorkScopeId {
-    WorkScopeId::new("scope-epictx").expect("fixture scope")
 }
 
 fn fence() -> StateFence {
@@ -62,99 +62,81 @@ fn position(currentness: Currentness) -> CurrentEpistemicPosition {
     let supersession = match currentness {
         Currentness::Current => BTreeSet::new(),
         Currentness::Superseded => {
-            BTreeSet::from([
-                ArtifactId::new("pos-2").expect("fixture supersession"),
-            ])
+            BTreeSet::from([ArtifactId::new("pos-2").expect("fixture supersession")])
         }
     };
     CurrentEpistemicPosition::new(receipt(), currentness, supersession, claim())
         .expect("fixture position")
 }
 
+fn contribution() -> EpistemicContextContribution {
+    EpistemicContextContribution::from_position(&position(Currentness::Current))
+        .expect("fixture contribution")
+}
+
 #[test]
-fn from_position_echoes_digest_and_claim() {
+fn from_position_echoes_the_admission_envelope() {
     let admitted = position(Currentness::Current);
-    let contribution =
-        EpistemicContextContribution::from_position(&admitted, scope(), fence())
-            .expect("valid contribution");
-    assert_eq!(contribution.position_digest, admitted.digest);
-    assert_eq!(contribution.claim, admitted.claim);
+    let made = EpistemicContextContribution::from_position(&admitted).expect("valid contribution");
+    assert_eq!(made.position_digest, admitted.digest);
+    assert_eq!(made.claim, admitted.claim);
+    assert_eq!(made.admission_scope, admitted.admission.scope);
+    assert_eq!(made.admission_fence, admitted.admission.fence);
+    assert_eq!(made.admission_revision, admitted.admission.revision);
+    assert_eq!(made.coverage_digest, admitted.admission.coverage_digest);
     assert_eq!(
-        contribution.provider.as_str(),
+        made.provider.as_str(),
         eliot_epistemic_context_provider::PROVIDER_LABEL
     );
-    assert_eq!(contribution.contract_version, CONTRACT_VERSION);
-    contribution.validate().expect("contribution validates");
+    assert_eq!(made.contract_version, CONTRACT_VERSION);
+    made.validate().expect("contribution validates");
 }
 
 #[test]
 fn superseded_position_contributes_nothing() {
     let admitted = position(Currentness::Superseded);
-    let error = EpistemicContextContribution::from_position(&admitted, scope(), fence())
+    let error = EpistemicContextContribution::from_position(&admitted)
         .expect_err("superseded must fail");
     assert!(matches!(error, ContributionError::SupersededPosition));
 }
 
 #[test]
-fn superseded_parts_contribute_nothing() {
-    let error = EpistemicContextContribution::from_parts(
-        hex64(),
-        claim(),
-        Currentness::Superseded,
-        scope(),
-        fence(),
-    )
-    .expect_err("superseded parts must fail");
-    assert!(matches!(error, ContributionError::SupersededPosition));
-}
-
-#[test]
-fn malformed_digest_is_rejected() {
-    let error = EpistemicContextContribution::from_parts(
-        "not-a-digest".to_owned(),
-        claim(),
-        Currentness::Current,
-        scope(),
-        fence(),
-    )
-    .expect_err("malformed digest must fail");
-    assert!(matches!(error, ContributionError::InvalidField { .. }));
-}
-
-#[test]
-fn uppercase_digest_is_rejected() {
-    let error = EpistemicContextContribution::from_parts(
-        "0123456789ABCDEF".repeat(4),
-        claim(),
-        Currentness::Current,
-        scope(),
-        fence(),
-    )
-    .expect_err("uppercase digest must fail");
+fn foreign_provider_identity_is_rejected() {
+    let mut made = contribution();
+    made.provider = ProviderId::new("other.provider").expect("foreign provider");
+    let error = made.validate().expect_err("foreign provider must fail");
     assert!(matches!(error, ContributionError::InvalidField { .. }));
 }
 
 #[test]
 fn version_drift_is_rejected() {
-    let mut contribution =
-        EpistemicContextContribution::from_position(&position(Currentness::Current), scope(), fence())
-            .expect("valid contribution");
-    contribution.contract_version = ContractVersion::new(9, 9, 9);
-    let error = contribution.validate().expect_err("drift must fail");
+    let mut made = contribution();
+    made.contract_version = ContractVersion::new(9, 9, 9);
+    let error = made.validate().expect_err("drift must fail");
     assert!(matches!(error, ContributionError::VersionMismatch));
 }
 
 #[test]
-fn oversized_scope_is_rejected() {
-    let wide = "s".repeat(300);
-    let error = EpistemicContextContribution::from_parts(
-        hex64(),
-        claim(),
-        Currentness::Current,
-        WorkScopeId::new(wide).expect("wide scope text"),
-        fence(),
-    )
-    .expect_err("oversized scope must fail");
+fn tampered_digest_is_rejected() {
+    let mut made = contribution();
+    made.position_digest = "not-a-digest".to_owned();
+    let error = made.validate().expect_err("tampered digest must fail");
+    assert!(matches!(error, ContributionError::InvalidField { .. }));
+}
+
+#[test]
+fn tampered_coverage_digest_is_rejected() {
+    let mut made = contribution();
+    made.coverage_digest = "not-a-digest".to_owned();
+    let error = made.validate().expect_err("tampered coverage must fail");
+    assert!(matches!(error, ContributionError::InvalidField { .. }));
+}
+
+#[test]
+fn tampered_scope_is_rejected() {
+    let mut made = contribution();
+    made.admission_scope = "   ".to_owned();
+    let error = made.validate().expect_err("tampered scope must fail");
     assert!(matches!(error, ContributionError::InvalidField { .. }));
 }
 
@@ -165,8 +147,8 @@ fn unknown_wire_fields_are_rejected() {
         "provider": "smart.epistemic.context-provider",
         "position_digest": hex64(),
         "claim": "claim-1",
-        "scope_id": "scope-epictx",
-        "state_fence": {
+        "admission_scope": "scope-epi",
+        "admission_fence": {
             "authority_epoch": {
                 "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
                 "sequence": 1
@@ -176,6 +158,8 @@ fn unknown_wire_fields_are_rejected() {
             "policy_revision": null,
             "integration_revision": null
         },
+        "admission_revision": "rev-1",
+        "coverage_digest": hex64(),
         "support_score": 0.97
     });
     let error = serde_json::from_value::<EpistemicContextContribution>(json)
@@ -185,11 +169,9 @@ fn unknown_wire_fields_are_rejected() {
 
 #[test]
 fn contribution_roundtrips_over_the_wire() {
-    let contribution =
-        EpistemicContextContribution::from_position(&position(Currentness::Current), scope(), fence())
-            .expect("valid contribution");
-    let wire = serde_json::to_string(&contribution).expect("serialize contribution");
+    let made = contribution();
+    let wire = serde_json::to_string(&made).expect("serialize contribution");
     let back: EpistemicContextContribution =
         serde_json::from_str(&wire).expect("deserialize contribution");
-    assert_eq!(contribution, back);
+    assert_eq!(made, back);
 }

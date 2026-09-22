@@ -1,27 +1,26 @@
-//! Epistemic Context provider contribution (#223).
+//! Epistemic Context provider contribution (#223, review repair).
 //!
-//! [`EpistemicContextContribution`] carries the admitted
-//! [`CurrentEpistemicPosition`] into context candidates as a typed read-only
-//! envelope: the shared [`ProviderId`], the position digest and [`ClaimId`]
-//! echoed exactly, one scope, and one carried [`StateFence`]. The constructor
-//! rejects superseded positions and never resolves, acquires, ranks, stores,
-//! or applies anything.
+//! [`EpistemicContextContribution`] is a thin read-only envelope over one
+//! admitted [`CurrentEpistemicPosition`]: the shared [`ProviderId`], the
+//! position digest and [`ClaimId`] echoed exactly, and the admission
+//! envelope's scope, fence, source revision, and coverage digest echoed
+//! exactly. The constructor takes only the admitted position, so scope,
+//! fence, revision, and coverage provenance cannot be supplied
+//! independently, and there is no synthetic construction path. A later
+//! consumer gate recovers the full provenance relationship from the echoed
+//! envelope fields. Superseded positions contribute nothing.
 //!
-//! Fence compatibility is gated at the consumer edge, not inferred here.
 //! The owner-neutral `ProviderContribution` stays `NOT_FROZEN` in
 //! `crates/smart/cognitive-rev12-contract-schema-freeze.toml`
 //! (CC-PROVIDER-CONTRIBUTION-SCHEMA): this envelope is the package's own
-//! output protocol over frozen shared types, not a parallel contribution
-//! schema.
+//! output protocol over frozen shared types, bound to a validated admission,
+//! not a parallel contribution schema and not a W9 unblock.
 
 #![forbid(unsafe_code)]
 
 use eliot_context_contracts::ProviderId;
 use eliot_contracts::{ContractVersion, StateFence};
-use eliot_epistemic_contracts::{
-    CONTRACT_VERSION, ClaimId, CurrentEpistemicPosition, Currentness,
-};
-use eliot_receipts::WorkScopeId;
+use eliot_epistemic_contracts::{CONTRACT_VERSION, ClaimId, CurrentEpistemicPosition, Currentness};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -32,8 +31,6 @@ use thiserror::Error;
 pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22";
 /// Stable provider label carried by every contribution from this package.
 pub const PROVIDER_LABEL: &str = "smart.epistemic.context-provider";
-/// Maximum Unicode scalar values accepted for one scope identity.
-pub const MAX_SCOPE_CHARS: usize = 256;
 
 /// Contribution failure: every case fails closed with its reason.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -47,7 +44,7 @@ pub enum ContributionError {
     /// The contribution version drifted from the frozen contract version.
     #[error("epistemic context contribution: version drift")]
     VersionMismatch,
-    /// A digest, scope, or fence shape is invalid.
+    /// A digest, scope, revision, provider, or fence shape is invalid.
     #[error("epistemic context contribution: invalid field {field}: {reason}")]
     InvalidField {
         /// Field at fault.
@@ -71,11 +68,23 @@ fn digest(value: &str, field: &'static str) -> Result<(), ContributionError> {
     Ok(())
 }
 
+fn nonblank(value: &str, field: &'static str) -> Result<(), ContributionError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(ContributionError::InvalidField {
+            field,
+            reason: "must be non-blank and free of control characters",
+        });
+    }
+    Ok(())
+}
+
 /// Read-only Context provider contribution of an admitted position.
 ///
-/// The digest and claim identify the exact admitted view this contribution
-/// reads; they prove nothing beyond it. `state_fence` is carried for the
-/// consumer edge to gate; this package infers no compatibility.
+/// Every envelope-bound field echoes the admitted position exactly: the
+/// digest and claim identify the view, while the admission scope, fence,
+/// source revision, and coverage digest recover the provenance relationship
+/// a consumer gate needs. Nothing here resolves, acquires, ranks, stores, or
+/// applies, and fence compatibility is gated at the consumer edge.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EpistemicContextContribution {
@@ -87,45 +96,26 @@ pub struct EpistemicContextContribution {
     pub position_digest: String,
     /// Governed claim identity of the admitted position, echoed exactly.
     pub claim: ClaimId,
-    /// Exact work scope the contribution is offered under.
-    pub scope_id: WorkScopeId,
-    /// Fence carried for the consumer edge to gate.
-    pub state_fence: StateFence,
+    /// Scope echoed from the admission envelope.
+    pub admission_scope: String,
+    /// Fence echoed from the admission envelope.
+    pub admission_fence: StateFence,
+    /// Source revision echoed from the admission envelope.
+    pub admission_revision: String,
+    /// Coverage denominator digest echoed from the admission envelope.
+    pub coverage_digest: String,
 }
 
 impl EpistemicContextContribution {
-    /// Contribute the admitted position under one scope and fence.
+    /// Contribute the admitted position.
     ///
-    /// Rejects superseded positions: only a current position contributes.
+    /// Scope, fence, revision, and coverage provenance are read from the
+    /// position's admission envelope, never supplied by the caller. Only a
+    /// current position contributes.
     pub fn from_position(
         position: &CurrentEpistemicPosition,
-        scope_id: WorkScopeId,
-        state_fence: StateFence,
     ) -> Result<Self, ContributionError> {
         if position.currentness != Currentness::Current {
-            return Err(ContributionError::SupersededPosition);
-        }
-        Self::from_parts(
-            position.digest.clone(),
-            position.claim.clone(),
-            position.currentness,
-            scope_id,
-            state_fence,
-        )
-    }
-
-    /// Contribute from explicit admitted evidence fields.
-    ///
-    /// Exists so the echo/validation rules stay testable without an
-    /// admission envelope; the envelope path is [`from_position`].
-    pub fn from_parts(
-        position_digest: String,
-        claim: ClaimId,
-        currentness: Currentness,
-        scope_id: WorkScopeId,
-        state_fence: StateFence,
-    ) -> Result<Self, ContributionError> {
-        if currentness != Currentness::Current {
             return Err(ContributionError::SupersededPosition);
         }
         let contribution = Self {
@@ -136,39 +126,43 @@ impl EpistemicContextContribution {
                     reason: "provider label is invalid",
                 }
             })?,
-            position_digest,
-            claim,
-            scope_id,
-            state_fence,
+            position_digest: position.digest.clone(),
+            claim: position.claim.clone(),
+            admission_scope: position.admission.scope.clone(),
+            admission_fence: position.admission.fence.clone(),
+            admission_revision: position.admission.revision.clone(),
+            coverage_digest: position.admission.coverage_digest.clone(),
         };
         contribution.validate()?;
         Ok(contribution)
     }
 
-    /// Validate version, digest, claim, scope, and fence shape.
+    /// Validate version, provider identity, digest, claim, and every echoed
+    /// envelope field.
     pub fn validate(&self) -> Result<(), ContributionError> {
         if self.contract_version != CONTRACT_VERSION {
             return Err(ContributionError::VersionMismatch);
         }
+        if self.provider.as_str() != PROVIDER_LABEL {
+            return Err(ContributionError::InvalidField {
+                field: "contribution.provider",
+                reason: "provider identity is not this package",
+            });
+        }
         digest(&self.position_digest, "contribution.position_digest")?;
-        if self.claim.as_str().trim().is_empty() {
-            return Err(ContributionError::InvalidField {
-                field: "contribution.claim",
-                reason: "must be non-blank",
-            });
-        }
-        if self.scope_id.as_str().chars().count() > MAX_SCOPE_CHARS {
-            return Err(ContributionError::InvalidField {
-                field: "contribution.scope_id",
-                reason: "scope identity exceeds 256 characters",
-            });
-        }
-        self.state_fence
+        nonblank(self.claim.as_str(), "contribution.claim")?;
+        nonblank(&self.admission_scope, "contribution.admission_scope")?;
+        self.admission_fence
             .validate()
             .map_err(|_| ContributionError::InvalidField {
-                field: "contribution.state_fence",
+                field: "contribution.admission_fence",
                 reason: "fence interval is invalid",
             })?;
+        nonblank(
+            &self.admission_revision,
+            "contribution.admission_revision",
+        )?;
+        digest(&self.coverage_digest, "contribution.coverage_digest")?;
         Ok(())
     }
 }

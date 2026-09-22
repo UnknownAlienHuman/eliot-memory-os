@@ -14,22 +14,22 @@ hot_path = false
 lifecycle_owner = "smart.dreamer.self_query"
 loc_soft_ceiling = 10000
 loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
-product_objective = "A Dreamer self-query binds one question to one fence with evidence refs by handle, so brief handlers consume exact inputs instead of prose."
-causal_property = "bounded Dreamer self-query over refs by handle"
-old_failure_or_missing_capability = "Self-queries recompile context, rerun admission, or read arbitrary prose instead of binding one question to one fence with handle refs (CC-006)."
-discriminator = "posing validates the subject, scope, fence, and ref bounds and freezes a canonical request digest; the package never compiles, admits, or briefs"
-primary_responsibility = "Pose one validated SelfQueryRequest and freeze its canonical digest for downstream brief handlers."
+product_objective = "A Dreamer self-query over the existing A-03 owner input freezes the owner digest the A-08 brief projectors consume, with no parallel request surface."
+causal_property = "bounded Dreamer self-query pose over the owner contract"
+old_failure_or_missing_capability = "Self-queries recompile context, rerun admission, or invent a parallel request type instead of using the existing SelfQueryInput owner contract (CC-006)."
+discriminator = "posing runs the owner validate() and freezes the owner input_digest(); no local subject/request/candidate types exist and no compilation, admission, briefing, or model work occurs"
+primary_responsibility = "Pose one validated SelfQueryInput and freeze its owner digest into a SelfQueryPoseReceipt for the brief projectors."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["question and task family", "scope and StateFence", "ActiveUnderstandingView handle", "accepted-source and evidence handles"]
-outputs = ["SelfQueryCandidate"]
-depends_on = ["eliot-contracts", "eliot-receipts"]
-providers = ["eliot-context-assembly (view handle supply only)", "accepted-source projection owner (handle supply only)"]
+inputs = ["eliot_dreamer_contracts::self_query::SelfQueryInput by reference (A-03 owner, PR #1060)"]
+outputs = ["SelfQueryPoseReceipt"]
+depends_on = ["eliot-dreamer-contracts"]
+providers = ["A-03 self-query contract owner (input supply only)"]
 consumers = ["eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief"]
-non_goals = ["second ContextCompiler invocation", "second admission pass", "mutable UnderstandingState", "ArchitectureBrief/ImplementationBrief authorship", "model route calls", "support/truth promotion"]
-invariants = ["one question, one task family, one fence per request", "refs by handle only; no prose bodies", "canonical request digest frozen at pose time", "no compilation, admission, briefing, or model work"]
-failure_behavior = "Reject blank or oversized subjects, invalid scope/fence, and over-bound ref lists explicitly."
-proof_surface = ["digest determinism", "subject bounds", "ref bounds", "fence/scope shape", "wire roundtrip"]
+non_goals = ["second ContextCompiler invocation", "second admission pass", "mutable UnderstandingState", "ArchitectureBrief/ImplementationBrief authorship", "parallel request/candidate types", "model route calls", "support/truth promotion", "standalone accepted-source projection schema"]
+invariants = ["no local request types: the owner input is the only request surface", "owner validate() runs before any digest freezes", "digest is the owner's input_digest(), never a local hash of local fields", "no compilation, admission, briefing, or model work"]
+failure_behavior = "Return the owner's own rejection for invalid input; reject malformed receipt digests explicitly. Pose acceptance with an owner-valid fixture executes at package proof."
+proof_surface = ["owner rejection passthrough", "receipt digest shape", "wire roundtrip"]
 proof_ceiling = "PACKAGE_PROOF_ONLY"
 product_pulse = "D3A_SELF_QUERY_EDGE_01"
 replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
@@ -38,7 +38,15 @@ split_trigger = "a second causal responsibility, mutable owner, independent proo
 
 [[donor]]
 path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
-disposition = "frozen upstream surface: StateFence scope/fence bindings, ActiveUnderstandingView by handle; accepted-source projection recorded NOT_FROZEN (CC-006)"
+disposition = "wave authority: accepted-source projection recorded NOT_FROZEN (CC-006); no parallel request surface"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-contracts/src/self_query/input.rs"
+disposition = "owner contract reused: SelfQueryInput validate() plus input_digest(); A-03 owner per merged PR #1060"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-architecture-brief/src/projection.rs"
+disposition = "consumer pattern reused: validate-then-digest prefix shared with project_architecture_brief; no projection logic copied"
 
 [agent_task]
 objective = "Pose a validated fence-bound self-query and freeze its canonical digest."
