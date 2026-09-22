@@ -17,10 +17,12 @@
 //! admission withholds it (see `caller::verify_receipt_for_admission`).
 
 use super::{
-    GoverningSourceSet, IdentityEvidence, PrivacyProfile, ResolutionAuthentication,
+    GoverningSourceSet, IdentityEvidence, PrivacyProfile, ResolutionAuthentication, ScopeBinding,
     ScopeBindingDisposition, ScopeBindingGuard, ScopeFingerprint, WorkScopeBindingOwner,
-    WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, text,
+    WorkScopeBindingSnapshot, WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt,
+    binding_matches_descriptor, text,
 };
+use super::{IdentityLegOutcome, identity_legs};
 use eliot_contracts::StateFence;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -121,4 +123,50 @@ pub fn issuance_refusal(error: &WorkScopeError) -> Option<IssuanceRefusal> {
         WorkScopeError::PrivacyDenied => Some(IssuanceRefusal::SourceClosureFailed),
         _ => None,
     }
+}
+
+/// Admits the initial binding for a newly resolved scope (bootstrap seam).
+///
+/// Used when no retained owner exists yet: the bootstrap caller describes the
+/// observed scope as `descriptor`, proposes the binding it actually read as
+/// `binding`, and supplies the current observation as `observed` with the
+/// source closure that authenticates it. Admission requires the binding to
+/// describe the descriptor, the identity legs between binding and observation
+/// to be clear, and a fresh `MATCHED` guard check before the owner is
+/// minted. Anything else fails without creating an owner.
+///
+/// # Errors
+///
+/// Returns an error when inputs are malformed, the binding does not describe
+/// the descriptor, the observation disagrees, the fence is invalid, or source
+/// closure does not match.
+pub fn admit_initial_binding(
+    descriptor: &WorkScopeDescriptor,
+    owner_revision: u64,
+    fence: &StateFence,
+    binding: &ScopeBinding,
+    observed: &ScopeBinding,
+    sources: &GoverningSourceSet,
+    privacy: &PrivacyProfile,
+) -> Result<WorkScopeBindingOwner, WorkScopeError> {
+    descriptor.validate()?;
+    binding.validate()?;
+    observed.validate()?;
+    if !binding_matches_descriptor(binding, descriptor) {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    if identity_legs(binding, observed) != IdentityLegOutcome::IdentityClear {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    let receipt = ScopeBindingGuard.check(binding, observed, sources, privacy);
+    if receipt.disposition != ScopeBindingDisposition::Matched {
+        return Err(WorkScopeError::BindingReceiptNotMatched);
+    }
+    let snapshot = WorkScopeBindingSnapshot::new(
+        fence.clone(),
+        owner_revision,
+        observed.clone(),
+        receipt,
+    )?;
+    WorkScopeBindingOwner::new(snapshot)
 }
