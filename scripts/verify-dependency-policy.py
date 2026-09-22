@@ -1093,14 +1093,22 @@ def _verified_private_executable(payload: bytes, label: str):
                 os.close(verify_fd)
 
 
-def _run_verified_executable(payload: bytes, args: list[str], root: Path, label: str) -> subprocess.CompletedProcess:
+def _run_verified_executable(
+    payload: bytes,
+    args: list[str],
+    root: Path,
+    label: str,
+    *,
+    text: bool = True,
+    timeout: float = 30,
+) -> subprocess.CompletedProcess:
     with _verified_private_executable(payload, label) as private_path:
         return subprocess.run(
             [str(private_path), *args],
             cwd=str(root),
             capture_output=True,
-            text=True,
-            timeout=30,
+            text=text,
+            timeout=timeout,
             check=False,
         )
 
@@ -2773,6 +2781,8 @@ def run_cargo_deny(
             policy_args,
             root,
             "cargo-deny scanner",
+            text=False,
+            timeout=180,
         )
     except subprocess.TimeoutExpired:
         findings.append(Finding("DEP-001", "deny.toml", 1, "cargo-deny execution timed out after 180s"))
