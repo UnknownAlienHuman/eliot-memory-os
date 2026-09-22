@@ -1018,6 +1018,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-cognitive-quality"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-learning-contracts",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-config"
 version = "0.1.0"
 dependencies = [
@@ -2376,6 +2391,36 @@ dependencies = [
  "eliot-memory-curation-contracts",
  "eliot-receipts",
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-memory-projection-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-memory-quality"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-learning-contracts",
+ "eliot-memory-projection-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
