@@ -1431,6 +1431,25 @@ impl KernelComposition {
             ));
         }
         validate_store_session_fence(session, &operation.request.state_fence)?;
+        // Authority-history reads are Kernel-owned fence state (`#2100`):
+        // serve durable closure-fence history from the retained ORS instead
+        // of forwarding to the store bridge. The store catalogue truthfully
+        // still lists the operation unsupported because the store never
+        // serves it; every other named read forwards unchanged below.
+        if operation.request.operation
+            == eliot_store_api::NamedReadOperation::GetAuthorityRevocationHistory
+        {
+            return match eliot_kernel_service::serve_authority_revocation_history(
+                self.p07_ors.as_ref(),
+                &operation.request,
+            ) {
+                Ok(response) => Ok(store_named_response(&response)),
+                Err(error) => Ok(Self::store_error_response_text(
+                    "store_named",
+                    &error.to_string(),
+                )),
+            };
+        }
         let gateway = self.retained_store_gateway()?;
         match gateway.execute_named(operation.request).await {
             Ok(response) => Ok(store_named_response(&response)),

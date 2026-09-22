@@ -50,9 +50,10 @@ use crate::grant_activation_port::GrantActivationPort;
 /// manifest or the ORS revision watermark read before startup): the restored
 /// graph revision must equal it exactly. A zero revision, an absent
 /// revocation history, an invalid snapshot, admitted material that disagrees
-/// with the graph, an empty root set, a revision disagreement, or a stale
-/// presentation against the durable watermark all refuse before any port is
-/// built.
+/// with the graph, an empty root set, a revision disagreement, a stale
+/// presentation against the durable watermark, or admitted bytes that
+/// disagree with an already-committed durable row all refuse before any
+/// port is built.
 ///
 /// # Errors
 ///
@@ -66,6 +67,7 @@ pub fn bind_canonical_owner(
     expected_revision: u64,
     store: Arc<dyn OperationalRecoveryStore>,
 ) -> Result<BoundCanonicalOwner, KernelError> {
+    verify_bundle_provenance(&restore, &store)?;
     let (source, roots) = checked_source(restore, expected_revision)?;
     advance_revision_watermark(&store, &roots, expected_revision)?;
     let source_handle: GovernorClosureSourceHandle = Arc::new(source);
@@ -123,8 +125,9 @@ impl BoundCanonicalOwner {
     /// The expected revision must be nonzero and must not move backwards
     /// from the current binding; the restore is validated on a shadow copy
     /// first, so a stale or disagreeing presentation refuses before the live
-    /// source is touched. The durable per-root watermark advances
-    /// atomically with the swap.
+    /// source is touched. Admitted bytes are provenance-checked against
+    /// durable readback exactly like at bind time. The durable per-root
+    /// watermark advances atomically with the swap.
     ///
     /// # Errors
     ///
@@ -142,6 +145,7 @@ impl BoundCanonicalOwner {
                 reason: "owner refresh must not move the bound revision backwards",
             });
         }
+        verify_bundle_provenance(&restore, store)?;
         let (checked, roots) = checked_source(restore.clone(), expected_revision)?;
         drop(checked);
         advance_revision_watermark(store, &roots, expected_revision)?;
@@ -220,6 +224,70 @@ fn checked_source(
         validate_id(root, "restore.root.authority_root_ref")?;
     }
     Ok((source, roots))
+}
+
+/// Proves admitted-byte provenance against durable ORS readback before
+/// the bundle becomes the trust anchor.
+///
+/// For every admitted grant member, root, and introduction that already
+/// has a committed durable row, the presented bytes must agree byte-exactly
+/// with the stored row: the row is the canonical provenance (committed
+/// through the fenced port path with its own read-back), and disagreeing
+/// bytes under a committed identity are a forgery or a fork, never a
+/// refresh. Identities with no row yet are allowed through: their
+/// provenance is established at commit time with exact read-back. Fenced
+/// rows with identical bytes stay proven — fence evidence, not conflict.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] when presented bytes disagree
+/// with an already-committed durable row.
+fn verify_bundle_provenance(
+    restore: &GovernorClosureRestore,
+    store: &Arc<dyn OperationalRecoveryStore>,
+) -> Result<(), KernelError> {
+    for member in restore
+        .members
+        .iter()
+        .map(|member| (&member.intent, member.durable_record.record()))
+        .chain(
+            restore
+                .roots
+                .iter()
+                .map(|root| (&root.intent, root.durable_record.record())),
+        )
+    {
+        let (intent, record) = member;
+        let subject = eliot_ors::OperationIdentity::new(&intent.grant_id)
+            .map_err(KernelError::RecoveryState)?;
+        if let Some(existing) = store
+            .load_capability_grant(&subject)
+            .map_err(KernelError::RecoveryState)?
+        {
+            if existing.record() != record {
+                return Err(KernelError::InvalidField {
+                    field: "restore.durable_record",
+                    reason: "admitted bytes disagree with the committed durable row",
+                });
+            }
+        }
+    }
+    for hydration in &restore.introductions {
+        let subject = eliot_ors::OperationIdentity::new(&hydration.intent.introduction_id)
+            .map_err(KernelError::RecoveryState)?;
+        if let Some(existing) = store
+            .load_capability_introduction(&subject)
+            .map_err(KernelError::RecoveryState)?
+        {
+            if existing.record() != hydration.durable_record.record() {
+                return Err(KernelError::InvalidField {
+                    field: "restore.durable_record",
+                    reason: "admitted bytes disagree with the committed durable row",
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Advances the durable per-root revision watermark and refuses a stale

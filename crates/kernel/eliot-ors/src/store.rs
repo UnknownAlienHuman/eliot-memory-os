@@ -368,7 +368,18 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         subject_id: &crate::OperationIdentity,
     ) -> Result<Option<CapabilityIntroductionProjection>, OrsError>;
-    fn logical_snapshot(&self, request: OrsSnapshotRequest)
+    /// Scans committed grant-closure rows in operation-order after the
+    /// given order, bounded by one recovery page (issues #2100/#686).
+    ///
+    /// The Kernel-side history projector pages this scan to serve the
+    /// canonical revocation-history read from durable closure commits;
+    /// callers filter by lineage root and fence. An over-bound limit
+    /// refuses instead of truncating a history view.
+    fn scan_grant_closures(
+        &self,
+        after_order: u64,
+        limit: u16,
+    ) -> Result<Vec<GrantClosureProjection>, OrsError>;    fn logical_snapshot(&self, request: OrsSnapshotRequest)
     -> Result<OrsSnapshotReceipt, OrsError>;
     fn scan_pending(
         &self,
@@ -6724,6 +6735,48 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             record.operation_order,
             GrantClosureCommitReceipt::from_receipt(receipt),
         )))
+    }
+
+    fn scan_grant_closures(
+        &self,
+        after_order: u64,
+        limit: u16,
+    ) -> Result<Vec<GrantClosureProjection>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+        let mut rows: Vec<(u64, DurableGrantClosureRecord)> = Vec::new();
+        for row in current.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let record: DurableGrantClosureRecord =
+                decode_named(value.value(), "grant_closure")?;
+            let expected = format!("grant_closure:{}", record.commit.operation_id.as_str());
+            if key.value() != expected.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "grant_closure",
+                    reason: "grant-closure key drifts from its committed operation identity"
+                        .to_owned(),
+                });
+            }
+            if record.operation_order > after_order {
+                rows.push((record.operation_order, record));
+            }
+        }
+        rows.sort_by_key(|(order, _)| *order);
+        rows.truncate(usize::from(limit));
+        let mut projections = Vec::with_capacity(rows.len());
+        for (_, record) in rows {
+            let receipt = Self::closure_receipt_for(&record)?;
+            projections.push(GrantClosureProjection::from_store(
+                record.commit,
+                record.phase,
+                record.operation_order,
+                GrantClosureCommitReceipt::from_receipt(receipt),
+            ));
+        }
+        Ok(projections)
     }
 
     fn note_grant_graph_revision(
