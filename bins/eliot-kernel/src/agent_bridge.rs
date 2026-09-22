@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use super::{
     AGENT_BRIDGE_ACTIVATION_WINDOW_MS, ActivationDecisionDisposition, ActivationResultDisposition,
-    AgentActivationPending, AgentActivationResultPhase, AgentActivationResultRecord,
-    AgentBridgeHandshake, AgentBridgeProfile, KernelBuildError, KernelComposition,
-    activation_deadline_expired, classify_activation_decision, classify_activation_result,
-    load_agent_bridge_declaration, sha256_json, unix_ms,
+    AgentActivationPending, AgentActivationPendingState, AgentActivationResultPhase,
+    AgentActivationResultRecord, AgentBridgeHandshake, AgentBridgeProfile, KernelBuildError,
+    KernelComposition, activation_deadline_expired, classify_activation_decision,
+    classify_activation_result, load_agent_bridge_declaration, sha256_json, unix_ms,
 };
 use eliot_ipc::{
     PeerIdentity, ServerFirstConnection, Session, TransportError,
@@ -906,9 +906,15 @@ impl KernelComposition {
     /// replay is idempotent, and a changed result supersedes only a
     /// still-open `NotReady` deferral that meets the due-time plus
     /// changed-revision gate. Anything else is an identity conflict.
+    ///
+    /// The caller holds `agent_activation_pending` for the whole operation.
+    /// That lock is the existing Kernel owner for the canonical-v2 pending
+    /// ledger and therefore also serializes this compatibility leg with the
+    /// raw P-04 submission path before either path can write its result.
     #[cfg(windows)]
     fn submit_against_retained_result(
         &self,
+        pending: &mut AgentActivationPendingState,
         entry_ticket: Option<AgentActivationResolutionTicket>,
         retained: &AgentActivationResultRecord,
         incoming: AgentActivationResolutionResult,
@@ -940,32 +946,58 @@ impl KernelComposition {
             .validate_against(&entry_ticket)
             .map_err(|_| TransportError::SessionFenced)?;
         self.validate_result_bridge_leg(&entry_ticket)?;
+        if !pending.entries.contains_key(&ticket_id)
+            || pending
+                .results
+                .get(&ticket_id)
+                .is_some_and(|record| record.result.result_sha256 != retained.result.result_sha256)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
         let phase = Self::result_phase_for_disposition(&incoming.disposition);
         let retained_durably =
             self.retain_activation_result_durably(&entry_ticket, &incoming, phase)?;
         let ack = AgentActivationResultAck::accepted(&incoming)
             .map_err(|_| TransportError::SessionFenced)?;
-        {
-            let mut pending = self
-                .agent_activation_pending
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            if !pending.entries.contains_key(&ticket_id)
-                || pending.results.get(&ticket_id).is_none_or(|record| {
-                    record.result.result_sha256 != retained.result.result_sha256
-                })
-            {
-                return Err(TransportError::IdentityConflict);
-            }
-            pending.retain_activation_result(AgentActivationResultRecord {
-                result: incoming,
-                phase,
-                ticket_connection: entry_ticket.connection_id.clone(),
-                retention_order: retained_durably.retention_order,
-            });
-        }
+        pending.retain_activation_result(AgentActivationResultRecord {
+            result: incoming,
+            phase,
+            ticket_connection: entry_ticket.connection_id.clone(),
+            retention_order: retained_durably.retention_order,
+        });
         self.agent_activation_changed.notify_waiters();
         Ok(ack)
+    }
+
+    /// Returns one ticket's retained identity across both in-process result
+    /// representations while the caller holds the pending-state mutex.
+    ///
+    /// `pending.results` is the canonical-v2 envelope ledger and
+    /// `agent_activation_results` is the raw P-04 compatibility ledger. They
+    /// may contain the same exact result, but a changed same-ticket result is
+    /// never resolved by preferring one representation. The check happens
+    /// before the caller can reach durable retention, making the existing
+    /// Kernel owner the cross-representation CAS guard.
+    #[cfg(windows)]
+    fn retained_activation_result_for_ticket(
+        &self,
+        pending: &AgentActivationPendingState,
+        ticket_id: &str,
+    ) -> Result<Option<AgentActivationResultRecord>, TransportError> {
+        let canonical = pending.results.get(ticket_id).cloned();
+        let raw = self
+            .agent_activation_results
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .get(ticket_id)
+            .cloned();
+        match (canonical, raw) {
+            (Some(canonical), Some(raw)) if canonical.result != raw.result => {
+                Err(TransportError::IdentityConflict)
+            }
+            (Some(canonical), _) => Ok(Some(canonical)),
+            (None, raw) => Ok(raw),
+        }
     }
 
     /// Accepts one v2 semantic result for its exact pending ticket. This is
@@ -993,32 +1025,29 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         let incoming = submit.result;
         let ticket_id = incoming.ticket_id.clone();
-        let (entry_ticket, pending_retained) = {
-            let pending = self
-                .agent_activation_pending
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let entry_ticket = pending
-                .entries
-                .get(&ticket_id)
-                .map(|entry| entry.ticket.clone());
-            let retained = pending.results.get(&ticket_id).cloned();
-            (entry_ticket, retained)
-        };
+        // This is the one cross-representation admission guard. Keep the
+        // existing Kernel owner locked through the identity check, durable
+        // retention, and canonical-v2 ledger update so the raw P-04 path
+        // cannot pass its own check and write a different result in between.
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let entry_ticket = pending
+            .entries
+            .get(&ticket_id)
+            .map(|entry| entry.ticket.clone());
         // Restart rehydrates the durable result ledger, while pending tickets
-        // remain fresh-process state. Classify that retained identity before
-        // requiring a live pending entry or consulting the deadline.
-        let retained = match pending_retained {
-            Some(retained) => Some(retained),
-            None => self
-                .agent_activation_results
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?
-                .get(&ticket_id)
-                .cloned(),
-        };
+        // remain fresh-process state. Classify both retained representations
+        // before requiring a live pending entry or consulting the deadline.
+        let retained = self.retained_activation_result_for_ticket(&pending, &ticket_id)?;
         if let Some(retained) = retained {
-            return self.submit_against_retained_result(entry_ticket, &retained, incoming);
+            return self.submit_against_retained_result(
+                &mut pending,
+                entry_ticket,
+                &retained,
+                incoming,
+            );
         }
         // Fresh commit: the bridge leg must still be open.
         let Some(entry_ticket) = entry_ticket else {
@@ -1035,28 +1064,22 @@ impl KernelComposition {
         if activation_deadline_expired(unix_ms(), entry_ticket.kernel_deadline_unix_ms) {
             return Err(TransportError::Timeout);
         }
+        if !pending.entries.contains_key(&ticket_id) || pending.results.contains_key(&ticket_id) {
+            return Err(TransportError::IdentityConflict);
+        }
         let phase = Self::result_phase_for_disposition(&incoming.disposition);
         let retained_durably =
             self.retain_activation_result_durably(&entry_ticket, &incoming, phase)?;
         let ack = AgentActivationResultAck::accepted(&incoming)
             .map_err(|_| TransportError::SessionFenced)?;
-        {
-            let mut pending = self
-                .agent_activation_pending
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            if !pending.entries.contains_key(&ticket_id) || pending.results.contains_key(&ticket_id)
-            {
-                return Err(TransportError::IdentityConflict);
-            }
-            pending.fifo.retain(|queued_id| queued_id != &ticket_id);
-            pending.retain_activation_result(AgentActivationResultRecord {
-                result: incoming,
-                phase,
-                ticket_connection: entry_ticket.connection_id.clone(),
-                retention_order: retained_durably.retention_order,
-            });
-        }
+        pending.fifo.retain(|queued_id| queued_id != &ticket_id);
+        pending.retain_activation_result(AgentActivationResultRecord {
+            result: incoming,
+            phase,
+            ticket_connection: entry_ticket.connection_id.clone(),
+            retention_order: retained_durably.retention_order,
+        });
+        drop(pending);
         self.agent_activation_changed.notify_waiters();
         Ok(ack)
     }
@@ -1132,26 +1155,28 @@ impl KernelComposition {
         result
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
+        // Hold the same Kernel owner guard used by the canonical-v2 submit
+        // path. The raw P-04 compatibility result must win or fail against
+        // both representations before ORS or either in-memory ledger writes.
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         // The durable result ledger is rehydrated before any fresh pending
         // tickets are admitted. Classify replay/conflict first so a retained
         // terminal negative cannot be laundered into Timeout after restart.
-        let existing = self
-            .agent_activation_results
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .get(&result.ticket_id)
-            .map(|record| record.result.clone());
-        match Self::classify_activation_result_for_entry(existing.as_ref(), &result) {
+        let retained = self.retained_activation_result_for_ticket(&pending, &result.ticket_id)?;
+        match Self::classify_activation_result_for_entry(
+            retained.as_ref().map(|record| &record.result),
+            &result,
+        ) {
             ActivationDecisionDisposition::ExactReplay => return Ok(()),
             ActivationDecisionDisposition::Conflict => {
                 return Err(TransportError::IdentityConflict);
             }
             ActivationDecisionDisposition::Commit => {}
         }
-        let entry_ticket = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
+        let entry_ticket = pending
             .entries
             .get(&result.ticket_id)
             .map(|entry| entry.ticket.clone())
@@ -1159,7 +1184,10 @@ impl KernelComposition {
         result
             .validate_against(&entry_ticket)
             .map_err(|_| TransportError::SessionFenced)?;
-        match Self::classify_activation_result_for_entry(existing.as_ref(), &result) {
+        match Self::classify_activation_result_for_entry(
+            retained.as_ref().map(|record| &record.result),
+            &result,
+        ) {
             ActivationDecisionDisposition::ExactReplay => return Ok(()),
             ActivationDecisionDisposition::Conflict => {
                 return Err(TransportError::IdentityConflict);
@@ -1169,16 +1197,12 @@ impl KernelComposition {
         if activation_deadline_expired(unix_ms(), entry_ticket.kernel_deadline_unix_ms) {
             return Err(TransportError::Timeout);
         }
-        let phase = Self::result_phase_for_disposition(&result.disposition);
-        self.retain_activation_result_durably(&entry_ticket, &result, phase)?;
         let ticket_id = entry_ticket.ticket_id.clone();
-        let mut pending = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
         if !pending.entries.contains_key(&ticket_id) {
             return Err(TransportError::IdentityConflict);
         }
+        let phase = Self::result_phase_for_disposition(&result.disposition);
+        self.retain_activation_result_durably(&entry_ticket, &result, phase)?;
         pending.fifo.retain(|queued_id| queued_id != &ticket_id);
         drop(pending);
         drop(result);
