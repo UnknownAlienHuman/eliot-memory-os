@@ -377,7 +377,7 @@ impl DaemonComposition {
             QueueLimits::default(),
         )?;
         let reactive_feed_source = Arc::new(reactive_feed::GovernorReactiveFeedSource::new(
-            governor.reactive_projection_owner(),
+            governor.reactive_owner_suppliers(),
         ));
         Ok(Self {
             governor,
@@ -581,10 +581,13 @@ impl DaemonComposition {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
-        let snapshot = self
+        let Some(snapshot) = self
             .governor
-            .read_unique_agent_activation(now)
-            .map_err(DaemonError::Composition)?;
+            .prepare_reactive_feed_tick(now)
+            .map_err(DaemonError::Composition)?
+        else {
+            return Ok(None);
+        };
         match reactive_feed::drive_daemon_feed_from_source(
             &snapshot,
             &self.governor.owners().observation,

@@ -25,12 +25,11 @@
 //! ```
 //!
 //! The runtime source is deliberately owner-shaped: each six-input method is
-//! called for the fresh authenticated activation, and the returned values are
-//! validated before the planner runs. Current main has no registered source
-//! for those typed projections yet; the scheduler therefore reports an
-//! explicit unconfigured state and never fills the gap with an empty view,
-//! policy, receipt, or queue. A3's Kernel/resource expansion and the A4
-//! owning lanes can register their concrete source through the public seam.
+//! read for the fresh authenticated activation, and the returned values are
+//! validated before the planner runs. Governor registers one supplier set at
+//! composition startup; until the owning lanes install all six typed values,
+//! the scheduler reports an explicit withheld state and never fills the gap
+//! with an empty view, policy, receipt, or queue.
 
 #![allow(clippy::result_large_err)]
 
@@ -42,7 +41,7 @@ use eliot_context_contracts::{
 };
 use eliot_contracts::{ArtifactId, SessionId};
 use eliot_governor::{
-    GovernorActivationSnapshot, GovernorReactiveProjectionOwner, ReactiveObservationCueProjection,
+    GovernorActivationSnapshot, GovernorReactiveOwnerSuppliers, ReactiveObservationCueProjection,
     ReactiveOwnerProjection, ReactiveOwnerProjectionError, ReactiveOwnerSource,
     project_reactive_owner_from_sources,
 };
@@ -202,13 +201,13 @@ pub enum ReactiveFeedOwnerAvailability {
 /// owner validates the same activation on every read. This adapter retains no
 /// queue, source history, planner state, or receipt authority.
 pub struct GovernorReactiveFeedSource {
-    owner: Arc<GovernorReactiveProjectionOwner>,
+    owner: Arc<GovernorReactiveOwnerSuppliers>,
 }
 
 impl GovernorReactiveFeedSource {
     /// Installs the read-only adapter over the Governor owner.
     #[must_use]
-    pub fn new(owner: Arc<GovernorReactiveProjectionOwner>) -> Self {
+    pub fn new(owner: Arc<GovernorReactiveOwnerSuppliers>) -> Self {
         Self { owner }
     }
 }
@@ -218,7 +217,7 @@ impl ReactiveFeedOwnerSource for GovernorReactiveFeedSource {
         &self,
         activation: &GovernorActivationSnapshot,
     ) -> ReactiveFeedOwnerAvailability {
-        match self.owner.is_published_for(activation) {
+        match self.owner.is_ready_for(activation) {
             Ok(true) => ReactiveFeedOwnerAvailability::Ready,
             Ok(false) => ReactiveFeedOwnerAvailability::Withheld {
                 projection: "six_owner_projections",

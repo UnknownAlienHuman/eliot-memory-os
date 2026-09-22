@@ -56,6 +56,7 @@ mod owner_projection_refresh;
 mod reactive_admission;
 mod reactive_projections;
 mod reactive_owner_projection;
+mod reactive_owner_suppliers;
 mod skill_lifecycle;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
@@ -98,6 +99,7 @@ pub use reactive_admission::{
 pub use reactive_projections::{
     GovernorReactiveProjectionOwner, GovernorReactiveProjectionSet, ReactiveProjectionError,
 };
+pub use reactive_owner_suppliers::GovernorReactiveOwnerSuppliers;
 pub use reactive_owner_projection::{
     MAX_REACTIVE_OWNER_RECORDS, ReactiveCueBindingOwner, ReactiveOwnerProjection,
     ReactiveOwnerProjectionError, ReactiveObservationCueProjection, ReactiveOwnerSource,

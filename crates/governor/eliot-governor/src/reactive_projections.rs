@@ -52,7 +52,7 @@ pub struct GovernorReactiveProjectionSet {
 }
 
 impl GovernorReactiveProjectionSet {
-    fn validate_against(
+    pub(crate) fn validate_against(
         &self,
         activation: &GovernorActivationSnapshot,
     ) -> Result<(), ReactiveProjectionError> {
@@ -85,7 +85,7 @@ fn stale_projection(projection: &'static str, field: &'static str) -> ReactivePr
     ReactiveProjectionError::StaleProjection { projection, field }
 }
 
-fn validate_context_view(
+pub(crate) fn validate_context_view(
     view: &ContextPlanningView,
     activation: &GovernorActivationSnapshot,
 ) -> Result<(), ReactiveProjectionError> {
@@ -104,7 +104,7 @@ fn validate_context_view(
     Ok(())
 }
 
-fn validate_cue_activation(
+pub(crate) fn validate_cue_activation(
     cue: &ReactiveCueActivation,
     view: &ContextPlanningView,
     activation: &GovernorActivationSnapshot,
@@ -117,7 +117,7 @@ fn validate_cue_activation(
     Ok(())
 }
 
-fn validate_session_delivery(
+pub(crate) fn validate_session_delivery(
     session: &SessionDeliverySnapshot,
     activation: &GovernorActivationSnapshot,
 ) -> Result<(), ReactiveProjectionError> {
@@ -142,7 +142,7 @@ fn validate_session_delivery(
     Ok(())
 }
 
-fn validate_critical_attention(
+pub(crate) fn validate_critical_attention(
     attention: &CriticalAttentionProjection,
     activation: &GovernorActivationSnapshot,
 ) -> Result<(), ReactiveProjectionError> {
@@ -161,7 +161,7 @@ fn validate_critical_attention(
     Ok(())
 }
 
-fn validate_integration_coverage(
+pub(crate) fn validate_integration_coverage(
     coverage: &ReactiveIntegrationCoverageProfile,
     activation: &GovernorActivationSnapshot,
 ) -> Result<(), ReactiveProjectionError> {
@@ -174,7 +174,7 @@ fn validate_integration_coverage(
     Ok(())
 }
 
-fn validate_delivery_policy(
+pub(crate) fn validate_delivery_policy(
     policy: &ReactiveDeliveryPolicy,
     activation: &GovernorActivationSnapshot,
 ) -> Result<(), ReactiveProjectionError> {
@@ -198,7 +198,7 @@ pub(crate) struct ReactiveAcceptedEvidence {
 }
 
 impl ReactiveAcceptedEvidence {
-    fn validate_against(
+    pub(crate) fn validate_against(
         &self,
         activation: &GovernorActivationSnapshot,
     ) -> Result<(), ReactiveProjectionError> {
@@ -221,6 +221,19 @@ impl ReactiveAcceptedEvidence {
             return Err(ReactiveProjectionError::EvidenceUnavailable);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_accepted_evidence(
+    activation: &GovernorActivationSnapshot,
+) -> ReactiveAcceptedEvidence {
+    ReactiveAcceptedEvidence {
+        task_id: activation.task_id.clone(),
+        scope_id: activation.work_scope_id.clone(),
+        state_fence: activation.state_fence.clone(),
+        record_count: 1,
+        digest: "0".repeat(64),
     }
 }
 

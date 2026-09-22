@@ -21,8 +21,9 @@ use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::reactive_owner_projection::ReactiveOwnerSource;
+use crate::reactive_owner_suppliers::GovernorReactiveOwnerSuppliers;
 use crate::reactive_projections::{
-    GovernorReactiveProjectionOwner, accepted_evidence_for, validate_owner_sources,
+    ReactiveProjectionError, accepted_evidence_for, validate_owner_sources,
 };
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
@@ -1658,7 +1659,7 @@ pub struct GovernorComposition<P: ?Sized> {
     /// Fence-keyed read projection for the reactive planning inputs. The
     /// projection owner is separate from the observation journal and owns no
     /// queue, receipt, or canonical write path.
-    reactive_projection: Arc<GovernorReactiveProjectionOwner>,
+    reactive_suppliers: Arc<GovernorReactiveOwnerSuppliers>,
     snapshot: KernelGenerationSnapshot,
     recovery: GovernorRecoverySnapshot,
     service_observations: Vec<KernelServiceRecovery>,
@@ -1727,8 +1728,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             snapshot.protected_snapshot_digest.clone(),
             &recovery,
         )?;
-        let reactive_projection = Arc::new(
-            GovernorReactiveProjectionOwner::new(state_fence.clone())
+        let reactive_suppliers = Arc::new(
+            GovernorReactiveOwnerSuppliers::new(state_fence.clone())
                 .map_err(|error| CompositionError::Owner(error.to_string()))?,
         );
         Ok(Self {
@@ -1736,7 +1737,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             authority_activation,
             governor,
             owners,
-            reactive_projection,
+            reactive_suppliers,
             snapshot,
             recovery,
             service_observations,
@@ -1751,11 +1752,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self.owners
     }
 
-    /// Returns the one read-only reactive projection owner used by the daemon
+    /// Returns the one read-only reactive supplier set used by the daemon
     /// scheduler. The handle carries no mutable authority outside Governor.
     #[must_use]
-    pub fn reactive_projection_owner(&self) -> Arc<GovernorReactiveProjectionOwner> {
-        Arc::clone(&self.reactive_projection)
+    pub fn reactive_owner_suppliers(&self) -> Arc<GovernorReactiveOwnerSuppliers> {
+        Arc::clone(&self.reactive_suppliers)
     }
 
     /// Publishes the retained A15 context view from its semantic owner.
@@ -1769,8 +1770,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         view: ContextPlanningView,
     ) -> Result<(), CompositionError> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
-        self.reactive_projection
-            .publish_context_view(activation, evidence, view)
+        self.reactive_suppliers
+            .install_context_view(activation, evidence, view)
             .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
@@ -1781,8 +1782,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         cue: ReactiveCueActivation,
     ) -> Result<(), CompositionError> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
-        self.reactive_projection
-            .publish_cue_activation(activation, evidence, cue)
+        self.reactive_suppliers
+            .install_cue_activation(activation, evidence, cue)
             .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
@@ -1794,8 +1795,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         session: SessionDeliverySnapshot,
     ) -> Result<(), CompositionError> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
-        self.reactive_projection
-            .publish_session_delivery(activation, evidence, session)
+        self.reactive_suppliers
+            .install_session_delivery(activation, evidence, session)
             .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
@@ -1806,8 +1807,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         attention: CriticalAttentionProjection,
     ) -> Result<(), CompositionError> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
-        self.reactive_projection
-            .publish_critical_attention(activation, evidence, attention)
+        self.reactive_suppliers
+            .install_critical_attention(activation, evidence, attention)
             .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
@@ -1819,8 +1820,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         coverage: ReactiveIntegrationCoverageProfile,
     ) -> Result<(), CompositionError> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
-        self.reactive_projection
-            .publish_integration_coverage(activation, evidence, coverage)
+        self.reactive_suppliers
+            .install_integration_coverage(activation, evidence, coverage)
             .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
@@ -1847,8 +1848,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "reactive delivery policy is not bound to the admitted Policy owner".to_owned(),
             ));
         }
-        self.reactive_projection
-            .publish_delivery_policy(activation, evidence, policy)
+        self.reactive_suppliers
+            .install_delivery_policy(activation, evidence, policy)
             .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
@@ -1862,8 +1863,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let (activation, evidence) = self.reactive_publication_binding(now)?;
         validate_owner_sources(&self.owners.observation, &activation, &sources)
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
-        self.reactive_projection
-            .publish_owner_sources(activation, evidence, sources)
+        self.reactive_suppliers
+            .install_owner_sources(activation, evidence, sources)
             .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
@@ -1881,6 +1882,25 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let evidence = accepted_evidence_for(&self.owners.observation, &activation)
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
         Ok((activation, evidence))
+    }
+
+    /// Prepares the one reactive scheduler tick against the current
+    /// activation and accepted observation evidence. Missing accepted evidence
+    /// withholds the tick; it never creates a synthetic owner binding.
+    pub fn prepare_reactive_feed_tick(
+        &self,
+        now: u64,
+    ) -> Result<Option<GovernorActivationSnapshot>, CompositionError> {
+        let activation = self.read_unique_agent_activation(now)?;
+        let evidence = match accepted_evidence_for(&self.owners.observation, &activation) {
+            Ok(evidence) => evidence,
+            Err(ReactiveProjectionError::EvidenceUnavailable) => return Ok(None),
+            Err(error) => return Err(CompositionError::Owner(error.to_string())),
+        };
+        self.reactive_suppliers
+            .prepare_tick(activation.clone(), evidence)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        Ok(Some(activation))
     }
 
     /// Returns the authenticated Kernel snapshot admitted at construction.
@@ -2422,7 +2442,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             protected_snapshot_digest.clone(),
             &recovery,
         )?;
-        self.reactive_projection
+        self.reactive_suppliers
             .reset(state_fence.clone())
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
         self.owners = owners;
