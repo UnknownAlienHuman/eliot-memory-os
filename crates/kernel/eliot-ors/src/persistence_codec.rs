@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::DurableGrantClosureRecord;
+use super::DurableGrantGraphRevision;
 use super::DurableInboxRecord;
 use super::DurableOperationalRecord;
 use super::DurableSupervisionLeaseResult;
@@ -94,6 +96,51 @@ impl PersistedValue for ScopeReservationHead {
             || self.last_terminal_sequence > self.last_reserved_sequence
         {
             return Err(OrsError::OrderingHeadMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl PersistedValue for DurableGrantClosureRecord {
+    const RECORD_TYPE: &'static str = "grant_closure";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.commit.validate()?;
+        if self.operation_order == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_closure",
+                reason: "operation order is zero".to_owned(),
+            });
+        }
+        let expected = match self.commit.state {
+            crate::GrantClosureState::Active => OperationalPhase::Active,
+            crate::GrantClosureState::Fenced => OperationalPhase::Fenced,
+        };
+        if self.phase != expected {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_closure",
+                reason: "closure phase disagrees with its committed state".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl PersistedValue for DurableGrantGraphRevision {
+    const RECORD_TYPE: &'static str = "grant_graph_revision";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        if self.revision == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_graph_revision",
+                reason: "revision watermark is zero".to_owned(),
+            });
+        }
+        if self.operation_order == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_graph_revision",
+                reason: "operation order is zero".to_owned(),
+            });
         }
         Ok(())
     }

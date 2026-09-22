@@ -43,22 +43,36 @@
 //!
 //! - the complete closure enumeration always comes from the injected Governor
 //!   boundary ([`RootGrantHydrationSource::enumerate_grant_closure`]), never
-//!   from the caller and never from process memory alone. A caller-supplied
-//!   affected list, an empty-closure default, or an incomplete enumeration
-//!   cannot commit a revocation receipt;
-//! - one exact graph revision binds the whole closure. A revision older than
-//!   the greatest revision observed for the lineage root fails closed as
-//!   stale; the ORS per-row `Active`-to-`Fenced` transition is the durable
-//!   compare-and-swap (exact replay returns the same receipt, a changed opaque
-//!   payload under one record identity is [`KernelError::IdempotencyConflict`]
-//!   at ORS, a fence from any other phase is refused);
+//!   from the caller and never from process memory alone. Activation fetches
+//!   the owner enumeration and requires byte equality with the presented one;
+//!   revocation derives its fence set from the owner enumeration. A
+//!   caller-supplied affected list, an empty-closure default, or an
+//!   incomplete enumeration cannot commit a receipt;
+//! - the thin P07 revocation never falls back to root-only fencing on a
+//!   missing or singleton owner answer: a bound enumeration always takes the
+//!   closure gate (a singleton is the owner's leaf attestation), and without
+//!   the owner the port fences only when its own live lineage proves no live
+//!   descendants, refusing otherwise;
+//! - one exact graph revision binds the whole closure, enforced durably: the
+//!   per-root revision watermark in ORS advances atomically with the stale
+//!   check, so a superseded presentation fails closed even across restarts.
+//!   The ORS per-row `Active`-to-`Fenced` transition stays the member-level
+//!   compare-and-swap (exact replay returns the same receipt, a changed
+//!   opaque payload under one record identity is
+//!   [`KernelError::IdempotencyConflict`] at ORS, a fence from any other
+//!   phase is refused);
+//! - activation never resurrects: a `Fenced` or `Released` durable member row
+//!   refuses before any mutation, on every activation path including the
+//!   legacy single-root one;
 //! - revocation commits one ORS fence per affected member with an exact
-//!   read-back, fences the live ledger members and dependent introductions,
-//!   and records one [`GrantClosureReceipt`] with the complete affected set
-//!   plus the owner-declared alternate-path survivors. Restart rehydrates the
-//!   same receipt and disposition by re-presentation through the owner
-//!   enumeration; a missing, mixed-phase, or disagreeing ORS row stays
-//!   fail-closed instead of restoring descendant authority.
+//!   read-back, then commits one durable closure row binding the operation,
+//!   revision, digest, complete affected set, survivors, and receipt. A
+//!   member already fenced under a previous closure with identical authority
+//!   bytes is reconfirmed, never recommitted, so a fresh operation identity
+//!   (new snapshot or epoch) re-confirms the fence instead of forking one.
+//!   Restart rehydrates the same receipt and disposition by re-presentation
+//!   through the owner enumeration; a missing, mixed-phase, or disagreeing
+//!   ORS row stays fail-closed instead of restoring descendant authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -67,8 +81,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_ors::{
     CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
-    OperationIdentity, OperationalPhase, OperationalRecordInput, OperationalRecoveryStore,
-    StateFenceSnapshot,
+    GrantClosureCommit, GrantClosurePreserved, GrantClosureState, OpaqueLabel, OperationIdentity,
+    OperationalPhase, OperationalRecordInput, OperationalRecoveryStore, StateFenceSnapshot,
 };
 use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
 use eliot_runtime_contracts::{
@@ -1347,15 +1361,20 @@ impl GrantActivationPort {
     /// Activates one owner-enumerated grant closure and returns one receipt
     /// per member in enumeration order.
     ///
-    /// The enumeration must come from the injected Governor owner bound in
-    /// this intent: every member is validated (identities, exact shared
-    /// revision, binding, fence, epoch, ceilings, expiry, opaque record
-    /// agreement, parent-before-child order) before any mutation, then each
-    /// member follows the single-root durable gate (ORS commit, exact
-    /// read-back, live installation). Exact replay under one operation
-    /// identity returns the same receipts; a changed payload under one
-    /// identity, a stale revision, or a duplicate grant identity fails before
-    /// any mutation.
+    /// The presented enumeration must equal the injected Governor owner's
+    /// enumeration for the closure root: the owner attests the exact closure
+    /// the durable graph admitted, and caller material alone never commits.
+    /// Every member is validated (identities, exact shared revision, binding,
+    /// fence, epoch, ceilings, expiry, opaque record agreement,
+    /// parent-before-child order) before any mutation; a `Fenced` or
+    /// `Released` durable row refuses, because restore never reactivates a
+    /// path. Each member then follows the single-root durable gate (ORS
+    /// commit, exact read-back), the per-root revision watermark advances
+    /// atomically with the stale check, and one closure row binds the
+    /// operation, revision, digest, and receipt before live installation.
+    /// Exact replay under one operation identity returns the same receipts;
+    /// a changed payload under one identity, a stale revision, or a
+    /// duplicate grant identity fails before any mutation.
     ///
     /// # Errors
     ///
@@ -1380,6 +1399,12 @@ impl GrantActivationPort {
         })?;
         validate_id(&request.operation_id, "operation_id")?;
         validate_closure_enumeration(&request.enumeration, active_epoch)?;
+        if !request.enumeration.preserved.is_empty() {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.preserved",
+                reason: "an activation closure fences nothing to survive",
+            });
+        }
         let digest = closure_activation_digest(&request.operation_id, &request.enumeration)?;
 
         let mut ledger = self.lock_ledger();
@@ -1398,12 +1423,62 @@ impl GrantActivationPort {
             }
             IntentResolve::New => {}
         }
+        // Owner attestation, after the idempotency gate so a changed payload
+        // under one identity keeps its typed conflict: the presented closure
+        // must equal the Governor enumeration for the closure root.
+        // Structural checks reject malformed material, but only the owner
+        // proves the durable graph selected this exact closure at this
+        // revision. A caller that can present acceptable ORS inputs cannot
+        // drive an activation the owner never admitted. Exact replay returns
+        // above without re-fetching: the owner attested the same bytes at
+        // first commit.
+        let closure_root = closure_root_grant(&request.enumeration)?;
+        let owner_enumeration = boundary
+            .hydration
+            .enumerate_grant_closure(&closure_root)?;
+        validate_closure_enumeration(&owner_enumeration, active_epoch).map_err(|_| {
+            KernelError::RecoveryUnavailable(
+                "closure owner enumeration failed validation".to_owned(),
+            )
+        })?;
+        if owner_enumeration != request.enumeration {
+            return Err(KernelError::InvalidField {
+                field: "enumeration",
+                reason: "the presented closure disagrees with the owner enumeration",
+            });
+        }
         check_revision(
             &ledger,
             &request.enumeration.authority_root_ref,
             request.enumeration.grant_graph_revision,
         )?;
         validate_closure_activation_members(&request.enumeration, &ledger)?;
+        // Restore never reactivates: a `Fenced` or `Released` durable row
+        // refuses before any mutation, and any other existing row must carry
+        // the exact presented input.
+        for member in &request.enumeration.members {
+            match check_activation_row(
+                boundary,
+                &member.intent.grant_id,
+                member.durable_record.record(),
+            )? {
+                ActivationRow::Fenced => {
+                    return Err(KernelError::InvalidField {
+                        field: "grant_id",
+                        reason: "grant identity is fenced; restore never reactivates a path",
+                    });
+                }
+                ActivationRow::Absent | ActivationRow::Active | ActivationRow::Applying => {}
+            }
+        }
+        // Durable revision gate: the watermark advance is atomic with the
+        // stale check, so a re-presented revision after a crash proceeds
+        // while any lower revision fails closed even across restarts.
+        check_closure_watermark(
+            boundary,
+            &request.enumeration.authority_root_ref,
+            request.enumeration.grant_graph_revision,
+        )?;
 
         // Durable linearization, member by member in parent-before-child
         // order: each ORS commit is atomic with an exact read-back, and a
@@ -1439,6 +1514,22 @@ impl GrantActivationPort {
             read_back.push(projection);
         }
         debug_assert_eq!(read_back.len(), request.enumeration.members.len());
+        // The closure row makes the operation, revision, digest, and receipt
+        // durable as one committed object: a crash before the ledger insert
+        // replays here instead of losing the closure identity.
+        ensure_closure_row(
+            boundary,
+            &closure_commit_for(
+                &request.operation_id,
+                &closure_root,
+                &request.enumeration.authority_root_ref,
+                request.enumeration.grant_graph_revision,
+                &digest,
+                &closure_affected_set(&request.enumeration),
+                &[],
+                GrantClosureState::Active,
+            )?,
+        )?;
 
         let mut receipts = Vec::with_capacity(request.enumeration.members.len());
         for member in &request.enumeration.members {
@@ -1508,11 +1599,17 @@ impl GrantActivationPort {
     /// The fence set is derived from the live lineage plus the injected
     /// Governor enumeration, which must agree exactly: every recorded live
     /// descendant of the target is either fenced or owner-declared preserved,
-    /// and every fenced member carries a durable ORS row. Each member follows
-    /// the single-root durable fence gate (ORS `Active`-to-`Fenced`
-    /// compare-and-swap with exact read-back); dependent introductions are
-    /// fenced live. Exact replay returns the same receipt; a changed payload
-    /// under one identity or a stale revision fails before any mutation.
+    /// and every fenced member carries a durable ORS row. Each unfenced
+    /// member follows the single-root durable fence gate (ORS `Active`-to-
+    /// `Fenced` compare-and-swap with exact read-back); a member already
+    /// fenced under a previous closure with identical authority bytes is
+    /// reconfirmed, never recommitted, so a fresh operation identity
+    /// re-confirms the fence. The durable revision watermark advances
+    /// atomically with the stale check, and one closure row binds the
+    /// operation, revision, digest, affected set, survivors, and receipt
+    /// before anything is installed live. Dependent introductions are fenced
+    /// live. Exact replay returns the same receipt; a changed payload under
+    /// one identity or a stale revision fails before any mutation.
     ///
     /// Without the durable boundary this stays ledger-only: the fence set is
     /// the recorded live descendant closure and no alternate-path survivor
@@ -1545,11 +1642,15 @@ impl GrantActivationPort {
     ///
     /// The caller re-presents the closure intent; the port re-enumerates
     /// through the injected Governor owner and requires the owner
-    /// enumeration to equal the presented one, every member ORS row to read
-    /// back `Active` with exact record agreement, and every member gate to
-    /// hold at the observation time. Only then is live state plus the
-    /// original disposition installed. A missing, non-`Active`, incomplete,
-    /// or disagreeing row stays fail-closed and admits nothing.
+    /// enumeration to equal the presented one, every member ORS row to agree
+    /// with its enumerated input (`Applying` rows are promoted through the
+    /// exact pending-to-active transition; `Fenced` rows refuse, because
+    /// recovery never resurrects revoked authority), and every member gate
+    /// to hold at the observation time. The durable revision watermark and
+    /// the closure row are re-verified (or completed when the crash landed
+    /// between the member commits and the closure commit) before live state
+    /// plus the original disposition is installed. A missing, incomplete, or
+    /// disagreeing row stays fail-closed and admits nothing.
     ///
     /// # Errors
     ///
@@ -1573,37 +1674,15 @@ impl GrantActivationPort {
         })?;
         validate_id(&request.operation_id, "operation_id")?;
         validate_closure_enumeration(&request.enumeration, active_epoch)?;
-        let root_grant_id = closure_root_grant(&request.enumeration)?;
-        let owner_enumeration = boundary.hydration.enumerate_grant_closure(&root_grant_id)?;
-        validate_closure_enumeration(&owner_enumeration, active_epoch)?;
-        if owner_enumeration != request.enumeration {
-            return Err(KernelError::RecoveryUnavailable(
-                "closure recovery enumeration disagrees with the presented closure".to_owned(),
-            ));
+        if !request.enumeration.preserved.is_empty() {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.preserved",
+                reason: "an activation closure fences nothing to survive",
+            });
         }
-        for member in &request.enumeration.members {
-            let subject = OperationIdentity::new(&member.intent.grant_id)
-                .map_err(KernelError::RecoveryState)?;
-            let projection = boundary
-                .store
-                .load_capability_grant(&subject)
-                .map_err(|error| map_ors_recovery_error(&error))?
-                .ok_or_else(|| {
-                    KernelError::RecoveryUnavailable(
-                        "closure member projection is absent during recovery".to_owned(),
-                    )
-                })?;
-            if projection.phase() != OperationalPhase::Active
-                || projection.record() != member.durable_record.record()
-            {
-                return Err(KernelError::RecoveryUnavailable(
-                    "closure member recovery ORS row disagreed".to_owned(),
-                ));
-            }
-        }
+        let digest = closure_activation_digest(&request.operation_id, &request.enumeration)?;
 
         let mut ledger = self.lock_ledger();
-        let digest = closure_activation_digest(&request.operation_id, &request.enumeration)?;
         match ledger.resolve(&request.operation_id, &digest) {
             IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
             IntentResolve::Replay(_) => {
@@ -1619,6 +1698,71 @@ impl GrantActivationPort {
             }
             IntentResolve::New => {}
         }
+        // Owner attestation after the idempotency gate, mirroring activation:
+        // the re-presented closure must equal the current owner enumeration.
+        let root_grant_id = closure_root_grant(&request.enumeration)?;
+        let owner_enumeration = boundary.hydration.enumerate_grant_closure(&root_grant_id)?;
+        validate_closure_enumeration(&owner_enumeration, active_epoch).map_err(|_| {
+            KernelError::RecoveryUnavailable(
+                "closure owner enumeration failed validation".to_owned(),
+            )
+        })?;
+        if owner_enumeration != request.enumeration {
+            return Err(KernelError::InvalidField {
+                field: "enumeration",
+                reason: "the presented closure disagrees with the owner enumeration",
+            });
+        }
+        // Every member row must agree with its enumerated input. An
+        // `Applying` row is promoted through the exact pending-to-active
+        // transition (the declared crash protocol); a `Fenced` or `Released`
+        // row refuses, because recovery must never resurrect revoked
+        // authority; any other phase or absence stays fail-closed.
+        for member in &request.enumeration.members {
+            match check_activation_row(
+                boundary,
+                &member.intent.grant_id,
+                member.durable_record.record(),
+            )? {
+                ActivationRow::Absent => {
+                    return Err(KernelError::RecoveryUnavailable(
+                        "closure member projection is absent during recovery".to_owned(),
+                    ));
+                }
+                ActivationRow::Fenced => {
+                    return Err(KernelError::RecoveryUnavailable(
+                        "closure member is fenced; recovery never reactivates a path".to_owned(),
+                    ));
+                }
+                ActivationRow::Active => {}
+                ActivationRow::Applying => {
+                    let durable_receipt = boundary
+                        .store
+                        .activate_capability_grant(member.durable_record.clone())
+                        .map_err(|error| map_ors_recovery_error(&error))?;
+                    let subject = OperationIdentity::new(&member.intent.grant_id)
+                        .map_err(KernelError::RecoveryState)?;
+                    let projection = boundary
+                        .store
+                        .load_capability_grant(&subject)
+                        .map_err(|error| map_ors_recovery_error(&error))?
+                        .ok_or_else(|| {
+                            KernelError::RecoveryUnavailable(
+                                "closure member projection disappeared during recovery".to_owned(),
+                            )
+                        })?;
+                    if projection.phase() != OperationalPhase::Active
+                        || projection.record() != member.durable_record.record()
+                        || projection.receipt() != durable_receipt.receipt()
+                    {
+                        return Err(KernelError::RecoveryUnavailable(
+                            "closure member recovery ORS receipt/read-back disagreed".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+
         check_revision(
             &ledger,
             &request.enumeration.authority_root_ref,
@@ -1631,6 +1775,27 @@ impl GrantActivationPort {
         for member in &request.enumeration.members {
             check_expiry(member.intent.issued_at_ms, member.intent.expires_at_ms, now_ms)?;
         }
+        check_closure_watermark(
+            boundary,
+            &request.enumeration.authority_root_ref,
+            request.enumeration.grant_graph_revision,
+        )?;
+        // A crash between the member commits and the closure commit completes
+        // here: the row is committed (or replayed when already present) before
+        // any live state is installed.
+        ensure_closure_row(
+            boundary,
+            &closure_commit_for(
+                &request.operation_id,
+                &root_grant_id,
+                &request.enumeration.authority_root_ref,
+                request.enumeration.grant_graph_revision,
+                &digest,
+                &closure_affected_set(&request.enumeration),
+                &[],
+                GrantClosureState::Active,
+            )?,
+        )?;
 
         let mut receipts = Vec::with_capacity(request.enumeration.members.len());
         for member in &request.enumeration.members {
@@ -1804,10 +1969,19 @@ impl GrantActivationPort {
         // Durable linearization: one ORS `Active`-to-`Fenced`
         // compare-and-swap per affected member with an exact read-back. A
         // crash between members is recovered by exact re-presentation (an
-        // already-`Fenced` member replays its receipt; nothing is installed
-        // live until every read-back agrees).
+        // already-`Fenced` member replays its receipt; a reconfirmed member
+        // is skipped because its fence already covers the exact authority;
+        // nothing is installed live until every read-back agrees).
         if let Some(boundary) = boundary {
+            check_closure_watermark(
+                boundary,
+                &request.authority_root_ref,
+                request.grant_graph_revision,
+            )?;
             for member in &derived.members {
+                if member.reconfirmed {
+                    continue;
+                }
                 let revocation_record =
                     closure_member_revocation(&member.activation_input, &request.operation_id)?;
                 let durable_receipt = boundary
@@ -1834,6 +2008,23 @@ impl GrantActivationPort {
                     ));
                 }
             }
+            // The closure row makes the operation, revision, digest, and
+            // receipt durable as one committed object: a crash before the
+            // ledger insert replays here instead of losing the closure
+            // identity.
+            ensure_closure_row(
+                boundary,
+                &closure_commit_for(
+                    &request.operation_id,
+                    &request.grant_id,
+                    &request.authority_root_ref,
+                    request.grant_graph_revision,
+                    &digest,
+                    &derived.affected,
+                    &derived.preserved,
+                    GrantClosureState::Fenced,
+                )?,
+            )?;
         }
 
         fence_live_closure_members(&mut ledger, &derived.affected);
@@ -1918,6 +2109,12 @@ impl GrantActivationPort {
             hydration.observed_at_ms,
         )
         .map_err(|error| map_thin_error(&error))?;
+        // Durable revision gate (`#2100`): the same per-root watermark the
+        // closure paths enforce. A stale presentation fails closed here
+        // instead of committing under a superseded revision.
+        // Restore never reactivates: refuse a `Fenced` or `Released` durable
+        // row before any mutation.
+        check_root_activation_durability(boundary, &hydration)?;
         let pending = PendingActivation {
             operation_id: operation_id.clone(),
             digest: digest.clone(),
@@ -2028,6 +2225,15 @@ impl GrantActivationPort {
         if let Some(hydration) = hydration.as_ref() {
             validate_root_intent_for_revocation(&hydration.intent, &ledger, active_epoch)
                 .map_err(|error| map_thin_error(&error))?;
+            // Durable revision gate (`#2100`): shared with the closure paths
+            // so a superseded single-root presentation cannot commit under a
+            // newer observed revision.
+            check_closure_watermark(
+                boundary,
+                &hydration.intent.authority_root_ref,
+                hydration.intent.grant_graph_revision,
+            )
+            .map_err(|error| map_thin_error(&error))?;
         }
         let pending_key = hydration
             .as_ref()
@@ -2800,6 +3006,9 @@ fn validate_closure_activation_members(
 struct ClosureFenceMember {
     grant_id: String,
     activation_input: OperationalRecordInput,
+    /// A `Fenced` row already covers the same authority under a different
+    /// closure operation: the fence is reconfirmed, never recommitted.
+    reconfirmed: bool,
 }
 
 /// Read-only fence derivation for one closure revocation: the complete
@@ -2916,18 +3125,31 @@ fn derive_closure_fence(
             })?;
         let revocation_record =
             closure_member_revocation(member.durable_record.record(), &request.operation_id)?;
-        match projection.phase() {
+        let reconfirmed = match projection.phase() {
             OperationalPhase::Active => {
                 if projection.record() != member.durable_record.record() {
                     return Err(KernelError::RecoveryUnavailable(
                         "closure member ORS row disagrees with its enumerated input".to_owned(),
                     ));
                 }
+                false
             }
             OperationalPhase::Fenced => {
-                if projection.record() != revocation_record.record() {
+                if projection.record() == revocation_record.record() {
+                    false
+                } else if activation_bytes_equal(
+                    projection.record(),
+                    member.durable_record.record(),
+                ) {
+                    // A previous closure already fenced the exact authority:
+                    // reconfirm it under this operation instead of forking a
+                    // second fence. A fence over different authority stays
+                    // fail-closed.
+                    true
+                } else {
                     return Err(KernelError::RecoveryUnavailable(
-                        "closure member fence evidence disagrees with the derived revocation".to_owned(),
+                        "closure member fence evidence disagrees with the derived revocation"
+                            .to_owned(),
                     ));
                 }
             }
@@ -2936,10 +3158,11 @@ fn derive_closure_fence(
                     "closure member ORS row is not fenceable".to_owned(),
                 ));
             }
-        }
+        };
         members.push(ClosureFenceMember {
             grant_id: member.intent.grant_id.clone(),
             activation_input: member.durable_record.record().clone(),
+            reconfirmed,
         });
     }
     Ok(DerivedClosureFence {
@@ -3000,6 +3223,232 @@ fn closure_member_revocation(
         OperationIdentity::new(closure_member_revocation_id(operation_id, &grant_id))
             .map_err(KernelError::RecoveryState)?;
     CapabilityGrantRevocation::new(input).map_err(KernelError::RecoveryState)
+}
+
+/// Compares two opaque activation inputs field by field except the mutable
+/// record identity: the same subject, epoch lineage, fence, payload bytes,
+/// and times is the same fenced authority, even when a previous closure
+/// operation fenced it first.
+fn activation_bytes_equal(
+    stored: &OperationalRecordInput,
+    expected: &OperationalRecordInput,
+) -> bool {
+    stored.subject_id == expected.subject_id
+        && stored.authority_epoch == expected.authority_epoch
+        && stored.state_fence == expected.state_fence
+        && stored.payload == expected.payload
+        && stored.payload_sha256 == expected.payload_sha256
+        && stored.payload_length == expected.payload_length
+        && stored.created_at_ms == expected.created_at_ms
+        && stored.cleanup_after_ms == expected.cleanup_after_ms
+}
+
+/// Durable shape of one member row that may still be activated.
+enum ActivationRow {
+    Absent,
+    Active,
+    Applying,
+    /// A `Fenced` or `Released` row: restore never reactivates it. The
+    /// caller decides the refusal kind (fresh activation rejects the
+    /// re-presented identity; recovery refuses the resurrection).
+    Fenced,
+}
+
+/// Durable pre-check before any activation commit: any existing row must
+/// carry the exact presented input, and a `Fenced` or `Released` row is
+/// reported (never reactivated) instead of overwritten.
+fn check_activation_row(
+    boundary: &DurableRootGrantBoundary,
+    grant_id: &str,
+    record: &OperationalRecordInput,
+) -> Result<ActivationRow, KernelError> {
+    let subject =
+        OperationIdentity::new(grant_id).map_err(KernelError::RecoveryState)?;
+    let existing = boundary
+        .store
+        .load_capability_grant(&subject)
+        .map_err(|error| map_ors_recovery_error(&error))?;
+    let Some(existing) = existing else {
+        return Ok(ActivationRow::Absent);
+    };
+    match existing.phase() {
+        OperationalPhase::Fenced | OperationalPhase::Released => Ok(ActivationRow::Fenced),
+        OperationalPhase::Applying | OperationalPhase::Active => {
+            if existing.record() != record {
+                return Err(KernelError::InvalidField {
+                    field: "grant_id",
+                    reason: "grant identity is already recorded under a different input",
+                });
+            }
+            if existing.phase() == OperationalPhase::Applying {
+                Ok(ActivationRow::Applying)
+            } else {
+                Ok(ActivationRow::Active)
+            }
+        }
+        _ => Err(KernelError::RecoveryUnavailable(
+            "closure member ORS row is not activatable".to_owned(),
+        )),
+    }
+}
+
+/// Durable revision gate: advances the per-root watermark and refuses when a
+/// newer revision already moved it further. The returned-watermark check
+/// makes the stale refusal atomic with the advance: a re-presented revision
+/// after a crash proceeds, while any lower revision fails closed even across
+/// restarts.
+fn check_closure_watermark(
+    boundary: &DurableRootGrantBoundary,
+    authority_root_ref: &str,
+    grant_graph_revision: u64,
+) -> Result<(), KernelError> {
+    let root =
+        OpaqueLabel::new(authority_root_ref).map_err(KernelError::RecoveryState)?;
+    let stored = boundary
+        .store
+        .note_grant_graph_revision(&root, grant_graph_revision)
+        .map_err(|error| map_ors_recovery_error(&error))?;
+    if stored != grant_graph_revision {
+        return Err(KernelError::InvalidField {
+            field: "grant_graph_revision",
+            reason: "stale grant-graph revision",
+        });
+    }
+    Ok(())
+}
+
+/// Builds the durable closure commit from validated request material and the
+/// derived fence. Every identity is already validated port-side; ORS
+/// revalidates shape on commit.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the closure commit binds every validated closure coordinate explicitly"
+)]
+fn closure_commit_for(
+    operation_id: &str,
+    target_grant_id: &str,
+    authority_root_ref: &str,
+    grant_graph_revision: u64,
+    digest: &str,
+    affected: &[String],
+    preserved: &[GrantClosureSurvivor],
+    state: GrantClosureState,
+) -> Result<GrantClosureCommit, KernelError> {
+    let affected = affected
+        .iter()
+        .map(|grant_id| OperationIdentity::new(grant_id).map_err(KernelError::RecoveryState))
+        .collect::<Result<Vec<_>, _>>()?;
+    let preserved = preserved
+        .iter()
+        .map(|survivor| {
+            Ok::<_, KernelError>(GrantClosurePreserved {
+                grant_id: OperationIdentity::new(&survivor.grant_id)
+                    .map_err(KernelError::RecoveryState)?,
+                covering_grant_id: OperationIdentity::new(&survivor.covering_grant_id)
+                    .map_err(KernelError::RecoveryState)?,
+                covering_root: OpaqueLabel::new(&survivor.covering_root_ref)
+                    .map_err(KernelError::RecoveryState)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GrantClosureCommit {
+        operation_id: OperationIdentity::new(operation_id).map_err(KernelError::RecoveryState)?,
+        target_id: OperationIdentity::new(target_grant_id).map_err(KernelError::RecoveryState)?,
+        authority_root: OpaqueLabel::new(authority_root_ref).map_err(KernelError::RecoveryState)?,
+        revision: grant_graph_revision,
+        digest: digest.to_owned(),
+        affected,
+        preserved,
+        state,
+    })
+}
+
+/// Commits one closure row and verifies the exact read-back: the stored row
+/// must reproduce the presented commit. A present row with the same commit
+/// is an exact replay (crash between commit and install); a present row with
+/// different content stays fail-closed instead of overwriting.
+fn ensure_closure_row(
+    boundary: &DurableRootGrantBoundary,
+    commit: &GrantClosureCommit,
+) -> Result<(), KernelError> {
+    if let Some(existing) = boundary
+        .store
+        .load_grant_closure(&commit.operation_id)
+        .map_err(|error| map_ors_recovery_error(&error))?
+    {
+        if existing.commit() != commit {
+            return Err(KernelError::RecoveryUnavailable(
+                "durable closure row disagrees with the presented closure".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let receipt = boundary
+        .store
+        .commit_grant_closure(commit.clone())
+        .map_err(|error| map_ors_recovery_error(&error))?;
+    let projection = boundary
+        .store
+        .load_grant_closure(&commit.operation_id)
+        .map_err(|error| map_ors_recovery_error(&error))?
+        .ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "durable closure row disappeared during commit".to_owned(),
+            )
+        })?;
+    if projection.commit() != commit || projection.receipt() != &receipt {
+        return Err(KernelError::RecoveryUnavailable(
+            "durable closure receipt/read-back disagreed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reports whether any recorded live grant descends from the target
+/// through parent links. Used by the thin revocation dispatch to refuse a
+/// root-only fence it cannot prove complete: fencing the root while a live
+/// descendant stays active is the opposite of fail-closed revocation.
+fn has_live_descendants(ledger: &PortLedger, grant_id: &str) -> bool {
+    let mut frontier = vec![grant_id.to_owned()];
+    let mut seen = BTreeSet::new();
+    while let Some(current) = frontier.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        for (candidate_id, candidate) in &ledger.grants {
+            if candidate.parent_grant_id.as_deref() == Some(current.as_str()) {
+                if candidate.status == LiveStatus::Active {
+                    return true;
+                }
+                frontier.push(candidate_id.clone());
+            }
+        }
+    }
+    false
+}
+
+/// Durable pre-commit gates for the single-root activation path: the
+/// per-root revision watermark and the restore-never-reactivates row check
+/// (`#2100`). Both fail closed before the pending entry is staged.
+fn check_root_activation_durability(
+    boundary: &DurableRootGrantBoundary,
+    hydration: &RootGrantHydration,
+) -> Result<(), eliot_authority::P07PortError> {
+    check_closure_watermark(
+        boundary,
+        &hydration.intent.authority_root_ref,
+        hydration.intent.grant_graph_revision,
+    )
+    .map_err(|error| map_thin_error(&error))?;
+    match check_activation_row(
+        boundary,
+        &hydration.intent.grant_id,
+        hydration.durable_record.record(),
+    ) {
+        Ok(ActivationRow::Fenced) => Err(eliot_authority::P07PortError::InvalidBinding),
+        Ok(_) => Ok(()),
+        Err(error) => Err(map_thin_error(&error)),
+    }
 }
 
 /// Fences every affected member in live state plus every dependent
@@ -3851,25 +4300,29 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         use eliot_authority::P07PortError;
         let active_epoch = request.binding.authority_epoch.clone();
         if let Some(boundary) = self.durable_boundary() {
-            // Multi-descendant probe: when the injected Governor owner
-            // declares a complete closure beyond the target itself, the thin
-            // revocation follows the durable closure gate (exact revision,
-            // per-member ORS compare-and-swap with read-back, closure
-            // receipt). A missing enumeration owner keeps the audited
-            // single-root path byte-for-byte; any other owner refusal fails
-            // closed without touching live state.
+            // Owner-governed dispatch: when the Governor enumeration owner
+            // is bound, its enumeration always governs — a singleton is the
+            // owner's leaf attestation, never a license for root-only
+            // fencing, so every bound enumeration takes the closure gate.
+            // Without the owner, the port fences the single root only when
+            // its own live lineage proves no live descendants; otherwise it
+            // refuses instead of leaving descendant authority active behind
+            // a root fence.
             match boundary.hydration.enumerate_grant_closure(request.grant_id.as_str()) {
-                Err(KernelError::DependencyUnavailable(_)) => {}
+                Err(KernelError::DependencyUnavailable(_)) => {
+                    let ledger = self.lock_ledger();
+                    if has_live_descendants(&ledger, request.grant_id.as_str()) {
+                        return Err(P07PortError::Unavailable);
+                    }
+                }
                 Err(error) => return Err(map_thin_error(&error)),
                 Ok(enumeration) => {
-                    if enumeration.members.len() > 1 {
-                        return self.revoke_grant_closure_durable_thin(
-                            request,
-                            &active_epoch,
-                            boundary,
-                            &enumeration,
-                        );
-                    }
+                    return self.revoke_grant_closure_durable_thin(
+                        request,
+                        &active_epoch,
+                        boundary,
+                        &enumeration,
+                    );
                 }
             }
             return self.revoke_root_grant_durable(request, &active_epoch, boundary);
@@ -5565,6 +6018,185 @@ mod tests {
 
         drop(port);
         drop(store);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the repair-path proof keeps mismatch, resurrection, reconfirmation, and watermark in one restart sequence"
+    )]
+    fn closure_repair_paths_reject_and_reconfirm() -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::Arc;
+
+        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let binding = restart_test_binding(&epoch)?;
+        let path = std::env::temp_dir().join(format!(
+            "eliot-kernel-grant-closure-repair-{}-{}.redb",
+            std::process::id(),
+            epoch.sequence
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
+        let hydration_source = Arc::new(TestClosureHydration {
+            enumeration: Mutex::new(chain_enumeration(&epoch, &binding, 5, Vec::new())?),
+        });
+        let port =
+            GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
+        let chain_root_label = eliot_ors::OpaqueLabel::new("root-chain")?;
+
+        // A presented closure the owner never admitted cannot activate, and
+        // commits nothing durably.
+        let mut foreign = chain_enumeration(&epoch, &binding, 5, Vec::new())?;
+        foreign.members[0].intent.snapshot_id = "snap-foreign".to_owned();
+        assert!(matches!(
+            port.activate_grant_closure(
+                &GrantClosureActivationIntent {
+                    operation_id: "op-repair-foreign".to_owned(),
+                    enumeration: foreign,
+                },
+                &epoch,
+            ),
+            Err(KernelError::InvalidField { .. })
+        ));
+        assert!(port.disposition("op-repair-foreign").is_none());
+        let chain_root = eliot_ors::OperationIdentity::new("grant-chain-root")?;
+        assert!(store.load_capability_grant(&chain_root)?.is_none());
+        assert!(store.load_grant_graph_revision(&chain_root_label)?.is_none());
+
+        // Owner-attested activation commits members, watermark, and row.
+        let activation = GrantClosureActivationIntent {
+            operation_id: "op-repair-activate".to_owned(),
+            enumeration: chain_enumeration(&epoch, &binding, 5, Vec::new())?,
+        };
+        let receipts = port.activate_grant_closure(&activation, &epoch)?;
+        assert_eq!(receipts.len(), 4);
+        assert_eq!(
+            store.load_grant_graph_revision(&chain_root_label)?,
+            Some(5)
+        );
+
+        // Revocation at the advanced revision fences every member.
+        hydration_source.replace(chain_enumeration(&epoch, &binding, 6, Vec::new())?);
+        let revocation = chain_revocation_intent(&binding, "op-repair-revoke-1", 6);
+        let fenced = port.revoke_grant_closure(&revocation, &epoch)?;
+        assert_eq!(fenced.affected_grants.len(), 4);
+        let revoke_op_1 = eliot_ors::OperationIdentity::new("op-repair-revoke-1")?;
+        let row_1 = store
+            .load_grant_closure(&revoke_op_1)?
+            .ok_or("revocation closure row missing")?;
+        assert_eq!(row_1.commit().revision, 6);
+        assert!(matches!(
+            row_1.commit().state,
+            eliot_ors::GrantClosureState::Fenced
+        ));
+
+        drop(port);
+        drop(store);
+
+        // After restart, re-presenting the same members under a fresh
+        // activation identity refuses instead of resurrecting fenced rows.
+        let reopened = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
+        let restarted = GrantActivationPort::with_durable_root_grant(
+            hydration_source.clone(),
+            reopened.clone(),
+        );
+        let resurrection = GrantClosureActivationIntent {
+            operation_id: "op-repair-resurrect".to_owned(),
+            enumeration: chain_enumeration(&epoch, &binding, 6, Vec::new())?,
+        };
+        assert!(matches!(
+            restarted.activate_grant_closure(&resurrection, &epoch),
+            Err(KernelError::InvalidField { .. })
+        ));
+        assert!(restarted.disposition("op-repair-resurrect").is_none());
+        // The durable rows are still fenced: nothing was resurrected and no
+        // live authority was installed for the refused identity.
+        for member in &resurrection.enumeration.members {
+            let subject = eliot_ors::OperationIdentity::new(&member.intent.grant_id)?;
+            let projection = reopened
+                .load_capability_grant(&subject)?
+                .ok_or("member row missing after refused resurrection")?;
+            assert_eq!(projection.phase(), OperationalPhase::Fenced);
+            assert!(!restarted.grant_revoked(&member.intent.grant_id));
+        }
+
+        // A fresh revocation identity reconfirms the fenced members instead
+        // of forking a second fence: the member rows keep their original
+        // revocation record identities while a new closure row commits.
+        let reconfirm = chain_revocation_intent(&binding, "op-repair-revoke-2", 6);
+        let reconfirmed = restarted.revoke_grant_closure(&reconfirm, &epoch)?;
+        assert_eq!(reconfirmed.affected_grants, fenced.affected_grants);
+        for grant_id in &reconfirmed.affected_grants {
+            let subject = eliot_ors::OperationIdentity::new(grant_id)?;
+            let projection = reopened
+                .load_capability_grant(&subject)?
+                .ok_or("reconfirmed member row missing")?;
+            assert_eq!(projection.phase(), OperationalPhase::Fenced);
+            let expected_record = closure_member_revocation_id("op-repair-revoke-1", grant_id);
+            assert_eq!(
+                projection.record().record_id.as_str(),
+                expected_record.as_str()
+            );
+        }
+        let revoke_op_2 = eliot_ors::OperationIdentity::new("op-repair-revoke-2")?;
+        assert!(
+            reopened
+                .load_grant_closure(&revoke_op_2)?
+                .is_some_and(|row| row.commit().revision == 6)
+        );
+
+        drop(restarted);
+        drop(reopened);
+
+        // After a second restart the durable watermark still refuses a
+        // superseded revision first presented as new, even though the fresh
+        // process has no in-memory watermark yet.
+        let stale_store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
+        let stale_port = GrantActivationPort::with_durable_root_grant(
+            hydration_source.clone(),
+            stale_store.clone(),
+        );
+        assert_eq!(stale_port.grant_graph_revision("root-chain"), None);
+        let stale_member = closure_member_fixture(
+            &epoch,
+            &binding,
+            "op-stale-act",
+            "grant-stale",
+            None,
+            "root-chain",
+            4,
+        )?;
+        let stale_enumeration = GrantClosureEnumeration {
+            authority_root_ref: "root-chain".to_owned(),
+            grant_graph_revision: 4,
+            members: vec![stale_member],
+            preserved: Vec::new(),
+        };
+        hydration_source.replace(stale_enumeration.clone());
+        assert!(matches!(
+            stale_port.activate_grant_closure(
+                &GrantClosureActivationIntent {
+                    operation_id: "op-repair-stale".to_owned(),
+                    enumeration: stale_enumeration,
+                },
+                &epoch,
+            ),
+            Err(KernelError::InvalidField { .. })
+        ));
+        assert_eq!(
+            stale_store.load_grant_graph_revision(&chain_root_label)?,
+            Some(6)
+        );
+        assert!(
+            stale_store
+                .load_capability_grant(&eliot_ors::OperationIdentity::new("grant-stale")?)?
+                .is_none()
+        );
+
+        drop(stale_port);
+        drop(stale_store);
         let _ = std::fs::remove_file(&path);
         Ok(())
     }

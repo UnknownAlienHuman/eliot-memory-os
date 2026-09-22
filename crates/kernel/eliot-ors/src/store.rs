@@ -19,8 +19,8 @@ use persistence_codec::{decode, decode_named, encode};
 #[path = "store/persistence_models.rs"]
 mod persistence_models;
 use persistence_models::{
-    DurableInboxRecord, DurableOperationalRecord, DurableSupervisionLeaseResult, OperationalKind,
-    ScopeReservationHead,
+    DurableGrantClosureRecord, DurableGrantGraphRevision, DurableInboxRecord,
+    DurableOperationalRecord, DurableSupervisionLeaseResult, OperationalKind, ScopeReservationHead,
 };
 
 mod recovery_projection;
@@ -38,7 +38,8 @@ use crate::{
     CapabilityIntroductionActivation, CapabilityIntroductionFence, CapabilityIntroductionReceipt,
     DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
     EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
-    GenerationTransition, GenerationTransitionReceipt, HostRequestRecord, HostRequestState,
+    GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit, GrantClosureCommitReceipt,
+    GrantClosureProjection, HostRequestRecord, HostRequestState,
     JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
     NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
     OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
@@ -117,6 +118,16 @@ const DOCTOR_BUDGETS: TableDefinition<&str, &str> = TableDefinition::new("ors_do
 /// operation/checkpoint identity; retained until explicit disposition.
 const RECOVERY_PROBLEMS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_recovery_problems_v1");
+/// Durable grant-closure rows: one committed closure operation identity with
+/// its exact commit bytes, phase, and order (issue #2100). Keyed by the
+/// closure operation identity; rows never transition.
+const GRANT_CLOSURE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_grant_closure_current_v1");
+/// Durable grant-graph revision watermarks: the greatest graph revision
+/// observed for one lineage root (issue #2100). Keyed by the authority root;
+/// the stored revision only moves forward.
+const GRANT_GRAPH_REVISION_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_grant_graph_revision_current_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
@@ -299,6 +310,44 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         subject_id: &crate::OperationIdentity,
     ) -> Result<Option<CapabilityGrantProjection>, OrsError>;
+    /// Commits one grant-closure row binding a closure operation identity to
+    /// its target, lineage root, exact graph revision, canonical digest,
+    /// complete affected set, and survivor set (issue #2100).
+    ///
+    /// An exact recommit under one operation identity returns the durable
+    /// receipt unchanged; any changed content under one identity fails with
+    /// [`OrsError::DuplicateConflict`] and never overwrites. The row never
+    /// transitions: activation closures commit `Active`, revocation closures
+    /// commit `Fenced`.
+    fn commit_grant_closure(
+        &self,
+        closure: GrantClosureCommit,
+    ) -> Result<GrantClosureCommitReceipt, OrsError>;
+    /// Reads one committed grant-closure row after validating its key,
+    /// content, phase, and store-issued receipt. The returned value is
+    /// operational evidence only; it grants no capability.
+    fn load_grant_closure(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<GrantClosureProjection>, OrsError>;
+    /// Advances the durable grant-graph revision watermark for one lineage
+    /// root and returns the stored revision (issue #2100).
+    ///
+    /// The stored revision is the maximum of the retained value and the
+    /// presented revision: it only moves forward. A nonzero revision is
+    /// required. Callers compare the returned value with the presented
+    /// revision to detect a stale presentation atomically.
+    fn note_grant_graph_revision(
+        &self,
+        authority_root: &OpaqueLabel,
+        revision: u64,
+    ) -> Result<u64, OrsError>;
+    /// Reads the durable grant-graph revision watermark for one lineage
+    /// root, if any.
+    fn load_grant_graph_revision(
+        &self,
+        authority_root: &OpaqueLabel,
+    ) -> Result<Option<u64>, OrsError>;
     fn activate_capability_introduction(
         &self,
         activation: CapabilityIntroductionActivation,
@@ -4693,6 +4742,8 @@ impl RedbRecoveryStore {
             drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
             drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
             drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
+            drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
+            drop(write.open_table(GRANT_GRAPH_REVISION_CURRENT).map_err(storage)?);
             if initialize_resolution_schema {
                 let mut meta = write.open_table(META).map_err(storage)?;
                 meta.insert(
@@ -5288,6 +5339,25 @@ impl RedbRecoveryStore {
         OperationalMutationReceipt::issue(
             record.input.record_id.clone(),
             record.input.subject_id.clone(),
+            record.operation_order,
+            record.phase,
+            crate::model::sha256_hex(encoded.as_bytes()),
+        )
+    }
+
+    /// Issues the store receipt bound to one durable grant-closure row.
+    ///
+    /// The receipt binds the closure operation identity, the target grant
+    /// identity, the monotonic row order, the committed phase, and the digest
+    /// of the exact stored bytes. Recomputing it from the stored row makes an
+    /// exact recommit return the identical receipt.
+    fn closure_receipt_for(
+        record: &DurableGrantClosureRecord,
+    ) -> Result<OperationalMutationReceipt, OrsError> {
+        let encoded = encode(record)?;
+        OperationalMutationReceipt::issue(
+            record.commit.operation_id.clone(),
+            record.commit.target_id.clone(),
             record.operation_order,
             record.phase,
             crate::model::sha256_hex(encoded.as_bytes()),
@@ -6566,6 +6636,159 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             record.operation_order,
             receipt,
         )))
+    }
+
+    fn commit_grant_closure(
+        &self,
+        closure: GrantClosureCommit,
+    ) -> Result<GrantClosureCommitReceipt, OrsError> {
+        closure.validate()?;
+        let phase = closure.state.phase();
+        let key = format!("grant_closure:{}", closure.operation_id.as_str());
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            current
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode_named::<DurableGrantClosureRecord>(value.value(), "grant_closure"))
+                .transpose()?
+        };
+        if let Some(existing) = existing {
+            if existing.commit.operation_id.as_str() != closure.operation_id.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "grant_closure",
+                    reason: "current grant-closure key or operation identity mismatch".to_owned(),
+                });
+            }
+            if existing.commit == closure && existing.phase == phase {
+                return Ok(GrantClosureCommitReceipt::from_receipt(Self::closure_receipt_for(
+                    &existing,
+                )?));
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+        let operation_order = Self::next_operational_order(&write)?;
+        let record = DurableGrantClosureRecord {
+            commit: closure,
+            phase,
+            operation_order,
+        };
+        let encoded = encode(&record)?;
+        {
+            let mut current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            current.insert(key.as_str(), encoded.as_str()).map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(GrantClosureCommitReceipt::from_receipt(
+            Self::closure_receipt_for(&record)?,
+        ))
+    }
+
+    fn load_grant_closure(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<GrantClosureProjection>, OrsError> {
+        let key = format!("grant_closure:{}", operation_id.as_str());
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let record: DurableGrantClosureRecord =
+            decode_named(value.value(), "grant_closure")?;
+        if record.commit.operation_id.as_str() != operation_id.as_str() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_closure",
+                reason: "current grant-closure key or operation identity mismatch".to_owned(),
+            });
+        }
+        let receipt = Self::closure_receipt_for(&record)?;
+        Ok(Some(GrantClosureProjection::from_store(
+            record.commit,
+            record.phase,
+            record.operation_order,
+            GrantClosureCommitReceipt::from_receipt(receipt),
+        )))
+    }
+
+    fn note_grant_graph_revision(
+        &self,
+        authority_root: &OpaqueLabel,
+        revision: u64,
+    ) -> Result<u64, OrsError> {
+        if revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_revision",
+                reason: "must be greater than zero",
+            });
+        }
+        let key = format!("grant_graph_revision:{}", authority_root.as_str());
+        let write = self.database.begin_write().map_err(storage)?;
+        let retained = {
+            let current = write
+                .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                .map_err(storage)?;
+            current
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<DurableGrantGraphRevision>(value.value(), "grant_graph_revision")
+                })
+                .transpose()?
+        };
+        if let Some(retained) = retained.as_ref()
+            && retained.root.as_str() != authority_root.as_str()
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_graph_revision",
+                reason: "current revision key or lineage root mismatch".to_owned(),
+            });
+        }
+        let retained_revision = retained.as_ref().map_or(0, |row| row.revision);
+        let stored = retained_revision.max(revision);
+        if retained_revision != stored {
+            let operation_order = Self::next_operational_order(&write)?;
+            let row = DurableGrantGraphRevision {
+                root: authority_root.clone(),
+                revision: stored,
+                operation_order,
+            };
+            let encoded = encode(&row)?;
+            {
+                let mut current = write
+                    .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                    .map_err(storage)?;
+                current
+                    .insert(key.as_str(), encoded.as_str())
+                    .map_err(storage)?;
+            }
+            write.commit().map_err(storage)?;
+        }
+        Ok(stored)
+    }
+
+    fn load_grant_graph_revision(
+        &self,
+        authority_root: &OpaqueLabel,
+    ) -> Result<Option<u64>, OrsError> {
+        let key = format!("grant_graph_revision:{}", authority_root.as_str());
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read
+            .open_table(GRANT_GRAPH_REVISION_CURRENT)
+            .map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let row: DurableGrantGraphRevision =
+            decode_named(value.value(), "grant_graph_revision")?;
+        if row.root.as_str() != authority_root.as_str() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_graph_revision",
+                reason: "current revision key or lineage root mismatch".to_owned(),
+            });
+        }
+        Ok(Some(row.revision))
     }
 
     fn activate_capability_introduction(
