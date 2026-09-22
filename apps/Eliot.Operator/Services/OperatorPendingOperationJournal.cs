@@ -41,13 +41,16 @@ public sealed class OperatorPendingOperationJournal : IDisposable
     ];
 
     // The named mutex is the cross-process writer lease. The process gate also
-    // covers accidental second journal objects in one UI process; a per-instance
-    // lock alone would still allow two stale arrays to replace one another.
+    // serializes the live owner, while the registry below rejects a second
+    // journal object before Mutex recursion can make it look like an owner.
     private static readonly ConcurrentDictionary<string, object> ProcessGates = new(
+        StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, byte> LiveProcessOwners = new(
         StringComparer.OrdinalIgnoreCase);
 
     private readonly string? _path;
     private readonly object _gate;
+    private readonly string? _processOwnerKey;
     private readonly Mutex? _writerMutex;
     private readonly string? _writerUnavailableReason;
     private bool _writerOwned;
@@ -55,12 +58,16 @@ public sealed class OperatorPendingOperationJournal : IDisposable
 
     private OperatorPendingOperationJournal(
         string? path,
+        string? processOwnerKey,
         Mutex? writerMutex,
         bool writerOwned,
         string? writerUnavailableReason)
     {
         _path = path;
-        _gate = ProcessGates.GetOrAdd(path ?? "<unavailable>", static _ => new object());
+        _gate = ProcessGates.GetOrAdd(
+            processOwnerKey ?? path ?? "<unavailable>",
+            static _ => new object());
+        _processOwnerKey = processOwnerKey;
         _writerMutex = writerMutex;
         _writerOwned = writerOwned;
         _writerUnavailableReason = writerUnavailableReason;
@@ -73,6 +80,7 @@ public sealed class OperatorPendingOperationJournal : IDisposable
         {
             return new OperatorPendingOperationJournal(
                 path: null,
+                processOwnerKey: null,
                 writerMutex: null,
                 writerOwned: false,
                 writerUnavailableReason:
@@ -84,11 +92,22 @@ public sealed class OperatorPendingOperationJournal : IDisposable
             "Eliot",
             "Operator",
             "pending-operations.json");
+        var processOwnerKey = CanonicalizePath(path);
+        if (!LiveProcessOwners.TryAdd(processOwnerKey, 0))
+        {
+            return new OperatorPendingOperationJournal(
+                path,
+                processOwnerKey: null,
+                writerMutex: null,
+                writerOwned: false,
+                writerUnavailableReason:
+                    "another Eliot Operator journal object already owns this user-local path in this process; this instance is read-only");
+        }
 
         Mutex? mutex = null;
         try
         {
-            mutex = new Mutex(initiallyOwned: false, BuildWriterMutexName(path));
+            mutex = new Mutex(initiallyOwned: false, BuildWriterMutexName(processOwnerKey));
             bool acquired;
             try
             {
@@ -105,8 +124,10 @@ public sealed class OperatorPendingOperationJournal : IDisposable
             if (!acquired)
             {
                 mutex.Dispose();
+                ReleaseProcessOwner(processOwnerKey);
                 return new OperatorPendingOperationJournal(
                     path,
+                    processOwnerKey: null,
                     writerMutex: null,
                     writerOwned: false,
                     writerUnavailableReason:
@@ -115,6 +136,7 @@ public sealed class OperatorPendingOperationJournal : IDisposable
 
             return new OperatorPendingOperationJournal(
                 path,
+                processOwnerKey,
                 mutex,
                 writerOwned: true,
                 writerUnavailableReason: null);
@@ -124,23 +146,40 @@ public sealed class OperatorPendingOperationJournal : IDisposable
             or IOException
             or ArgumentException
             or NotSupportedException
+            or System.Threading.WaitHandleCannotBeOpenedException
             or System.Security.SecurityException)
         {
             mutex?.Dispose();
+            ReleaseProcessOwner(processOwnerKey);
             return new OperatorPendingOperationJournal(
                 path,
+                processOwnerKey: null,
                 writerMutex: null,
                 writerOwned: false,
                 writerUnavailableReason:
                     "the user-local pending-operation writer lease could not be established; operator mutations are disabled");
         }
+        catch
+        {
+            mutex?.Dispose();
+            ReleaseProcessOwner(processOwnerKey);
+            throw;
+        }
     }
+
+    private static string CanonicalizePath(string path) =>
+        Path.GetFullPath(path).ToUpperInvariant();
 
     private static string BuildWriterMutexName(string path)
     {
-        var canonicalPath = Path.GetFullPath(path).ToUpperInvariant();
-        var identity = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonicalPath)));
+        var identity = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path)));
         return $"Global\\Eliot.Operator.PendingOperationJournal.{identity}";
+    }
+
+    private static void ReleaseProcessOwner(string processOwnerKey)
+    {
+        ((ICollection<KeyValuePair<string, byte>>)LiveProcessOwners)
+            .Remove(new KeyValuePair<string, byte>(processOwnerKey, 0));
     }
 
     /// Loads records that survived a process boundary. Any non-terminal
@@ -308,11 +347,12 @@ public sealed class OperatorPendingOperationJournal : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            if (!_writerOwned || _writerMutex is null) return;
-
             try
             {
-                _writerMutex.ReleaseMutex();
+                if (_writerOwned && _writerMutex is not null)
+                {
+                    _writerMutex.ReleaseMutex();
+                }
             }
             catch (ApplicationException)
             {
@@ -322,7 +362,11 @@ public sealed class OperatorPendingOperationJournal : IDisposable
             finally
             {
                 _writerOwned = false;
-                _writerMutex.Dispose();
+                _writerMutex?.Dispose();
+                if (_processOwnerKey is not null)
+                {
+                    ReleaseProcessOwner(_processOwnerKey);
+                }
             }
         }
     }
