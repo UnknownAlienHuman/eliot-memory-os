@@ -11,16 +11,17 @@
 use std::collections::BTreeMap;
 
 use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft};
-use eliot_contracts::{OperationId, StateFence, TaskId, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{canonical_json_bytes, sha256_hex, OperationId, StateFence, TaskId};
 use eliot_finish::{
     FinishAdmission, FinishAttempt, FinishClosureIntent, FinishContext, FinishDecisionReceipt,
     FinishError, FinishService, TaskLifecycleState,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
-    EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    generated_operation_manifests, operation_manifest_set_digest, EffectClass,
+    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     OperationManifestDigest, ScopeId, SecurityContext, StoreFailure, TransitionClass, WriteReceipt,
-    WriteReceiptStatus, generated_operation_manifests, operation_manifest_set_digest,
+    WriteReceiptStatus,
 };
 use eliot_task::{TaskLifecycleOwner, TaskRecord, TaskState};
 use thiserror::Error;
