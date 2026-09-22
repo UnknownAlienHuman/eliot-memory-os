@@ -47,6 +47,7 @@ use eliot_store_api::{
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
+pub use crate::client::session_pool::{PoolAdmission, PoolOccupancy, SessionRole};
 
 /// Server identity proved by the last ownership-verified authentication on
 /// the live provider transport (issue #1932).
@@ -317,6 +318,56 @@ impl SurrealStoreAdapter {
     /// Returns the installed execution generation, if any.
     pub(crate) fn execution_handle(&self) -> Option<std::sync::Arc<WriteExecution>> {
         self.execution.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Live session-pool occupancy snapshot (issue #2030, 994/14 follow-up
+    /// binding).
+    ///
+    /// Read-only point observation across the read, normal-write, and
+    /// protected health/admin lanes; totals are the fixed construction
+    /// bounds. Observing never checks anything out and never waits.
+    /// `None` while the transport is not connected.
+    #[must_use]
+    pub fn pool_occupancy(&self) -> Option<PoolOccupancy> {
+        let transport = self.client.get()?.as_ref().ok()?;
+        Some(transport.session_pool().occupancy())
+    }
+
+    /// Non-blocking pool admission verdict for one role (issue #2030, 994/14
+    /// follow-up binding).
+    ///
+    /// Callers that must shed load instead of queueing behind a lane use
+    /// this entrypoint; a saturated verdict never borrows capacity from
+    /// another role. `None` while the transport is not connected.
+    #[must_use]
+    pub fn pool_admission(&self, role: SessionRole) -> Option<PoolAdmission> {
+        let transport = self.client.get()?.as_ref().ok()?;
+        Some(transport.session_pool().admission(role))
+    }
+
+    /// Point execution-capacity snapshot of the installed generation (issue
+    /// #2030, 994/14 follow-up binding). `None` when no execution generation
+    /// is installed. Read-only; see [`WriteExecution::capacity`].
+    #[must_use]
+    pub fn execution_capacity(&self) -> Option<ExecutionCapacity> {
+        Some(self.execution_handle()?.capacity())
+    }
+
+    /// Point scheduler occupancy snapshot of the installed generation (issue
+    /// #2030, 994/14 follow-up binding). `None` when no execution generation
+    /// is installed. Read-only; see [`WriteExecution::scheduler_occupancy`].
+    #[must_use]
+    pub fn scheduler_occupancy(&self) -> Option<SchedulerOccupancy> {
+        Some(self.execution_handle()?.scheduler_occupancy())
+    }
+
+    /// Non-blocking scheduler admission verdict of the installed generation
+    /// (issue #2030, 994/14 follow-up binding). `None` when no execution
+    /// generation is installed. Read-only; see
+    /// [`WriteExecution::scheduler_admission`].
+    #[must_use]
+    pub fn scheduler_admission(&self) -> Option<SchedulerAdmission> {
+        Some(self.execution_handle()?.scheduler_admission())
     }
 
     /// Installs one execution generation; refuses when one is present.

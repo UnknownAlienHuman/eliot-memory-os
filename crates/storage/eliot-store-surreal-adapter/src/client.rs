@@ -262,9 +262,9 @@ impl RpcTransport {
     }
 
     /// Returns the fixed bounded session set under this transport's provider
-    /// generation. Test/diagnostic evidence until the scheduler (#988) and
-    /// runtime (#993) children consume it for role dispatch.
-    #[cfg(test)]
+    /// generation. Production observation entrypoint for the #2030
+    /// occupancy/admission queries (994/14 follow-up binding); read-only
+    /// snapshots never check anything out.
     pub(crate) fn session_pool(&self) -> &SessionPool {
         &self.pool
     }
