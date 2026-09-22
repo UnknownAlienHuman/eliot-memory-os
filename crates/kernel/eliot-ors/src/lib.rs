@@ -11,6 +11,7 @@ mod cutover_ownership;
 mod doctor;
 mod model;
 mod reservation_model;
+mod restore_journal;
 mod snapshot_model;
 mod status;
 mod status_projection;
@@ -32,6 +33,12 @@ pub use model::*;
 pub use reservation_model::{
     ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
     ScopeReservationRequest, WriterReservationToken,
+};
+pub use restore_journal::{
+    JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES, MAX_JOURNAL_PAYLOAD_BYTES,
+    RESTORE_JOURNAL_RECORD_SCHEMA, RESTORE_JOURNAL_SCHEMA_VERSION, RestoreJournalAppendReceipt,
+    RestoreJournalArchiveClass, RestoreJournalEntry, RestoreJournalOperation, RestoreJournalResult,
+    RestoreJournalStreamBinding,
 };
 pub use snapshot_model::{OrsSnapshotReceipt, OrsSnapshotRequest};
 pub use status::{
