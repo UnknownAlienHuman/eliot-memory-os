@@ -17,6 +17,7 @@ use eliot_contracts::sha256_hex;
 use eliot_installation::InstallationError;
 use eliot_installation::InstallationTransactionStore;
 use eliot_installation::{CandidateManifest, InstallerServiceRole};
+use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_runtime_contracts::{HealthDimension, SupervisionLeaseVerifier};
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,12 @@ use watchdog_live::{inspect_watchdog_live, watchdog_gap};
 mod readiness_projection;
 pub use readiness_projection::ReadinessContour;
 use readiness_projection::inspect_readiness_from_host_state;
+
+mod runtime_health_status;
+pub use runtime_health_status::{
+    CapabilityCurrentness, RUNTIME_HEALTH_STATUS_CONTRACT, RUNTIME_HEALTH_STATUS_VERSION,
+    RuntimeHealthProjectionError, RuntimeHealthStatusProjection, project_runtime_health,
+};
 
 mod capability_cell_readback;
 pub use capability_cell_readback::{
@@ -133,6 +140,11 @@ pub struct RuntimeStatusReport {
     pub transaction_stage: TransactionStageContour,
     pub services: ServiceContours,
     pub readiness: ReadinessContour,
+    /// Optional authenticated Kernel-owned health projection.  It is absent
+    /// when the caller did not supply the owner evidence; it is never inferred
+    /// from the filesystem or from the process contour below.
+    #[serde(default)]
+    pub runtime_health: Option<RuntimeHealthStatusProjection>,
     pub recovery_command: String,
     pub gaps: Vec<String>,
     pub components: ComponentStatuses,
@@ -1731,6 +1743,7 @@ pub fn collect_status_with_observers(
             watchdog_service_registration: watchdog_service,
         },
         readiness,
+        runtime_health: None,
         recovery_command,
         gaps,
         components,
@@ -1752,6 +1765,24 @@ pub fn collect_status(
         None,
         Some(&eliotd_observer),
     )
+}
+
+/// Collects the normal read-only status report and attaches one validated
+/// Kernel-owned health carrier for the operator-visible runtime-health edge.
+///
+/// The evidence must come from the authenticated Kernel control path.  This
+/// facade does not discover, synthesize or refresh health evidence itself.
+pub fn collect_status_with_kernel_health(
+    host_state_root: &Path,
+    deadline: Instant,
+    runtime_health: &KernelRuntimeHealthEvidence,
+) -> Result<RuntimeStatusReport, StatusError> {
+    let mut report = collect_status(host_state_root, deadline)?;
+    report.runtime_health = Some(
+        project_runtime_health(runtime_health)
+            .map_err(|error| StatusError::Invalid(error.to_string()))?,
+    );
+    Ok(report)
 }
 
 // Journal inspection is kept as one ordered no-fallback boundary so retained
