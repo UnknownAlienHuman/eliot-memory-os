@@ -1,0 +1,39 @@
+[package]
+name = "eliot-memory-quality"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Pure Smart consumer assessing memory ecology and gravity over bounded owner projections (CC-008)"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "IMPLEMENTED_PROTOTYPE"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.memory.ecology"
+source_layer = "C1"
+runtime_layer = "R5"
+runtime_bundle = "eliotd"
+agent_order = 76
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-memory-projection-contracts = { path = "../../foundation/eliot-memory-projection-contracts", version = "0.1.0" }
+eliot-context-contracts = { path = "../eliot-context-contracts", version = "0.1.0" }
+eliot-learning-contracts = { path = "../eliot-learning-contracts", version = "0.1.0" }
+schemars = "1.2.1"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts", version = "0.1.0" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
+serde_json = "1.0.150"
+
+[lints]
+workspace = true
