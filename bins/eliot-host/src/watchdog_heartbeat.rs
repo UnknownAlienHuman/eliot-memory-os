@@ -1440,6 +1440,13 @@ pub(crate) fn remove_start_artifacts_exact(
     let _lock = TransportDescriptorLock::acquire(host_state_root)?;
     let descriptor_path = host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
     let current = HeartbeatTransportDescriptor::load(host_state_root)?;
+    let observation_path = host_state_root.join(HOST_HEARTBEAT_OBSERVATION_FILE_NAME);
+    let observation = load_persisted_heartbeat_observation_strict(host_state_root)?;
+
+    // Validate the complete owned set before deleting either artifact.  The
+    // descriptor is the durable recovery anchor; a malformed or substituted
+    // observation must therefore leave it intact for recovery rather than
+    // turning the later validation error into evidence loss.
     if let Some(current) = current.as_ref() {
         if !same_heartbeat_instance(current, issued) {
             return Err(HostError::RecoveryRequired(
@@ -1465,12 +1472,9 @@ pub(crate) fn remove_start_artifacts_exact(
             }
             None => {}
         }
-        std::fs::remove_file(&descriptor_path)
-            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
     }
 
-    let observation_path = host_state_root.join(HOST_HEARTBEAT_OBSERVATION_FILE_NAME);
-    if let Some(observation) = load_persisted_heartbeat_observation_strict(host_state_root)? {
+    if let Some(observation) = observation.as_ref() {
         if observation.pipe_name != issued.pipe_name
             || observation.service_instance_guid != issued.service_instance_guid
         {
@@ -1491,8 +1495,25 @@ pub(crate) fn remove_start_artifacts_exact(
             ));
         }
         require_heartbeat_peer_stopped(pid, start_100ns)?;
-        std::fs::remove_file(&observation_path)
-            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    }
+
+    // Remove the audit observation first and the descriptor last.  If the
+    // second OS delete is uncertain, the descriptor remains as a durable,
+    // operation-bound recovery anchor and the caller retains its recovery
+    // carrier because this function returns an error.
+    if observation.is_some() {
+        std::fs::remove_file(&observation_path).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "heartbeat observation removal outcome is unknown; durable recovery remains required: {error}"
+            ))
+        })?;
+    }
+    if current.is_some() {
+        std::fs::remove_file(&descriptor_path).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "heartbeat descriptor removal outcome is unknown; durable recovery remains required: {error}"
+            ))
+        })?;
     }
 
     for (path, name) in [
