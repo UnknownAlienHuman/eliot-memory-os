@@ -553,4 +553,16 @@ impl CriticalAttentionProjection {
         }
         Ok(())
     }
+
+    /// Seal an owner-assembled projection for production issue.
+    ///
+    /// Computes the immutable projection digest from the retained members
+    /// (overwriting any caller-supplied digest text, which is never
+    /// authority) and validates the sealed value. A digest mutated after
+    /// sealing fails `validate` with `DigestMismatch`.
+    pub fn seal(mut value: Self) -> Result<Self, ReactiveInputError> {
+        value.projection_digest = value.canonical_digest()?;
+        value.validate()?;
+        Ok(value)
+    }
 }
