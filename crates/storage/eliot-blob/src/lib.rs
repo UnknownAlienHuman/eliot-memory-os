@@ -44,10 +44,14 @@ pub use eliot_blob_api::{
     PublishState,
 };
 pub mod demand;
+pub mod key_ports;
 pub use demand::{
     ApprovedBlobView, BlobGenerationProbe, BlobProbeError, StoreBlobDemand,
     classify_capture_payload, garbage_collection_demand, probe_blob_generation,
     staged_recovery_demand,
+};
+pub use key_ports::{
+    DpapiUserAeadPort, DpapiUserKeyPort, KEY_PORT_ALGORITHM, KEY_PORT_VERSION,
 };
 use eliot_blob_api::{
     BlobCasCapability, BlobCasDurability, BlobCasFailure, BlobCasOutcome, BlobCasReceipt,

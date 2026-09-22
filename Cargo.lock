@@ -827,6 +827,7 @@ dependencies = [
  "blake3",
  "eliot-blob-api",
  "eliot-platform",
+ "eliot-platform-windows",
  "eliot-receipts",
  "eliot-security-contracts",
  "serde",
