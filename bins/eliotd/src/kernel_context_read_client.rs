@@ -118,13 +118,15 @@ impl KernelContextReadClient {
     /// Checks the T11.1–T11.3 execute capability before any transport is touched:
     /// `GetEvidencePack` (scope-bound, structurally valid),
     /// `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, `position`
-    /// Subject required, structurally valid), or one of the four task-bound
-    /// reconstruction reads (scope-bound, `ExactFence`, currently no
-    /// parameters: this pre-transport gate is deliberately stricter than the
-    /// store catalogue, which declares bounded exact selectors for these
-    /// reads — parameter-carrying requests fail here until a follow-up
-    /// threads the closed selectors, and parameter-free requests fail
-    /// downstream at the catalogue; either way no unvalidated read crosses).
+    /// Subject required, structurally valid), `GetUnderstandingProjectionInputs`
+    /// (scope-bound, `ExactFence`, exact `selector` + `max_records` closed
+    /// selectors), or one of the three remaining task-bound reconstruction
+    /// reads (scope-bound, `ExactFence`, currently no parameters: this
+    /// pre-transport gate is deliberately stricter than the store catalogue,
+    /// which declares bounded exact selectors for these reads —
+    /// parameter-carrying requests fail here until a follow-up threads the
+    /// closed selectors, and parameter-free requests fail downstream at the
+    /// catalogue; either way no unvalidated read crosses).
     fn check_execute_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
         match request.operation {
             NamedReadOperation::GetEvidencePack => {
@@ -431,6 +433,10 @@ impl KernelContextReadClient {
             && !request.parameters.is_empty()
         {
             Self::check_capability_evidence_selectors(request)?;
+        } else if request.operation == NamedReadOperation::GetUnderstandingProjectionInputs
+            && !request.parameters.is_empty()
+        {
+            Self::check_understanding_inputs_selectors(request)?;
         } else if !request.parameters.is_empty() {
             return Err(StoreError::InvalidField {
                 field: "operation.parameter",
@@ -467,6 +473,56 @@ impl KernelContextReadClient {
             return Err(StoreError::InvalidField {
                 field: "operation.parameter",
                 reason: "skill_id must be a non-blank string",
+            });
+        }
+        let bound_raw = request
+            .parameters
+            .get("max_records")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(SELECTOR_ERROR)?;
+        let bound: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        })?;
+        if bound == 0 {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be a positive decimal bound",
+            });
+        }
+        if bound > EVIDENCE_PACK_MAX_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        Ok(())
+    }
+
+    /// Checks the closed `GetUnderstandingProjectionInputs` selectors before
+    /// any transport: exactly `selector` (non-blank, no control characters)
+    /// plus `max_records` (positive decimal within `EVIDENCE_PACK_MAX_RECORDS`,
+    /// the bound both production adapters enforce for this operation),
+    /// mirroring the store catalogue declaration and the memory/Surreal
+    /// handler bounds. Any other key, blank selector, or out-of-range bound
+    /// fails closed here before transport.
+    fn check_understanding_inputs_selectors(request: &NamedReadRequest) -> Result<(), StoreError> {
+        const SELECTOR_ERROR: StoreError = StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "GetUnderstandingProjectionInputs declares exactly selector and max_records",
+        };
+        if request.parameters.len() != 2
+            || !request.parameters.contains_key("selector")
+            || !request.parameters.contains_key("max_records")
+        {
+            return Err(SELECTOR_ERROR);
+        }
+        let selector = request
+            .parameters
+            .get("selector")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(SELECTOR_ERROR)?;
+        if selector.trim().is_empty() || selector.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "selector must be a non-blank string",
             });
         }
         let bound_raw = request
@@ -617,9 +673,11 @@ impl CanonicalReadClient for KernelContextReadClient {
     ///
     /// Fresh capability per call: the operation must be `GetEvidencePack`
     /// (scope-bound), `GetCurrentEpistemicPosition` (scope-bound,
-    /// `ExactFence`, `position` Subject required), or one of the four
-    /// task-bound reconstruction reads (scope-bound, `ExactFence`, no
-    /// parameters), the request must validate, and its fence must equal the
+    /// `ExactFence`, `position` Subject required),
+    /// `GetUnderstandingProjectionInputs` (scope-bound, `ExactFence`, exact
+    /// `selector` + `max_records` closed selectors), or one of the three
+    /// remaining task-bound reconstruction reads (scope-bound, `ExactFence`,
+    /// no parameters), the request must validate, and its fence must equal the
     /// currently admitted snapshot fence — otherwise this fails closed before
     /// transport. The response validates exactly and must echo the requested
     /// operation and fence. Consistency (stable / exact re-read, churn
@@ -659,10 +717,11 @@ impl CanonicalReadClient for KernelContextReadClient {
 /// surfaces as an exact fence mismatch instead of silent divergence.
 ///
 /// Planning of evidence/position selectors stays with the daemon runtime
-/// planners; this borrow plans only the four parameter-free reconstruction
-/// reads (which do not satisfy the store catalogue's bounded exact selectors
-/// yet — see [`KernelContextReadClient`]'s capability gate) and validates
-/// their responses against the borrow-time fence. The borrow-time pin is a
+/// planners; this borrow plans only the three parameter-free reconstruction
+/// reads plus the understanding-inputs read once its closed selectors are
+/// threaded (parameter-free plans do not satisfy the store catalogue's
+/// bounded exact selectors — see [`KernelContextReadClient`]'s capability
+/// gate) and validates their responses against the borrow-time fence. The borrow-time pin is a
 /// [`KernelContextReadClient::execute_named`]'s call-time fence check: a
 /// response matching neither fails closed, so a previous generation is never
 /// served as current. No `composition.rs` change is involved: this uses only

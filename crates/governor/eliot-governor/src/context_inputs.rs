@@ -44,8 +44,9 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::RequestMetadata;
-use eliot_context_candidates::ProjectionState;
+use eliot_contracts::{RequestMetadata, StateFence};
+use eliot_context_candidates::{CueInput, ProjectionState};
+use eliot_cue_contracts::{ActivationRequest, ActivationResult};
 use eliot_read::{
     BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
     ReadApi, ReadError, RequiredAssurance, StateRequest, TimeScope,
@@ -113,10 +114,11 @@ pub enum ContextInputsError {
 /// (`task_id`+`max_records` for `GetTaskState`, optional
 /// `problem_id`+`max_records` for `GetAttentionAndProblems`,
 /// `selector`+`max_records` for `GetUnderstandingProjectionInputs`,
-/// `skill_id`+`max_records` for `GetCapabilityEvidenceState`); this
-/// reconstruction currently acquires those roles with no parameters, so
-/// against the real catalogue they resolve to per-role `Unavailable`
-/// (fail-closed) until a follow-up threads the closed selectors. Cue and
+/// `skill_id`+`max_records` for `GetCapabilityEvidenceState`); the
+/// understanding-projection roles (`GetUnderstandingProjectionInputs`) use
+/// the optional [`Self::understanding_selector`] plus
+/// [`Self::understanding_max_records`] closed selectors when present and no
+/// parameters otherwise. Cue and
 /// negative-memory roles share the one understanding-projection acquisition;
 /// only the candidate-stage interpretation differs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -132,6 +134,19 @@ pub struct ContextReconstructionRequest {
     pub evidence_subject: String,
     /// Explicit evidence bound (`1..=EVIDENCE_PACK_MAX_RECORDS`).
     pub evidence_max_records: u32,
+    /// Exact understanding-projection selector for the cue-activation and
+    /// negative-memory roles (`GetUnderstandingProjectionInputs`).
+    ///
+    /// `None` preserves the parameter-free acquisition (per-role
+    /// `Unavailable` against the real catalogue); `Some` threads the closed
+    /// selectors and requires [`Self::understanding_max_records`].
+    pub understanding_selector: Option<String>,
+    /// Explicit understanding-projection bound
+    /// (`1..=EVIDENCE_PACK_MAX_RECORDS`, the ceiling both production
+    /// adapters enforce for this operation).
+    ///
+    /// Required exactly when [`Self::understanding_selector`] is present.
+    pub understanding_max_records: Option<u32>,
 }
 
 impl ContextReconstructionRequest {
@@ -162,6 +177,27 @@ impl ContextReconstructionRequest {
             return Err(ContextInputsError::RequestInvalid(format!(
                 "evidence_max_records must be within 1..={EVIDENCE_PACK_MAX_RECORDS}"
             )));
+        }
+        match (&self.understanding_selector, self.understanding_max_records) {
+            (None, None) => {}
+            (Some(selector), Some(max_records)) => {
+                if selector.trim().is_empty() || selector.chars().any(char::is_control) {
+                    return Err(ContextInputsError::RequestInvalid(
+                        "understanding_selector must be non-blank text".to_owned(),
+                    ));
+                }
+                if max_records == 0 || max_records > EVIDENCE_PACK_MAX_RECORDS {
+                    return Err(ContextInputsError::RequestInvalid(format!(
+                        "understanding_max_records must be within 1..={EVIDENCE_PACK_MAX_RECORDS}"
+                    )));
+                }
+            }
+            _ => {
+                return Err(ContextInputsError::RequestInvalid(
+                    "understanding_selector and understanding_max_records must be supplied together"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -264,6 +300,171 @@ impl SevenRoleInputs {
     pub fn has_unsupported_distinct_from_empty(&self) -> bool {
         !self.unsupported_role_names().is_empty()
     }
+}
+
+/// A caller-supplied cue activation pair proven current for the live
+/// seven-role closure, plus its candidate-stage projection.
+///
+/// The pair arrives as caller data and is never owner proof by itself: the
+/// binder admits it only through the cue owner's exact admission
+/// ([`ActivationResult::validate_against`](eliot_cue_contracts::ActivationResult::validate_against))
+/// and currency against the live closure (request fence, per-seed scope, cue
+/// role operation, and — when the role carries a payload — the envelope
+/// scope/fence/selector). `candidate_input` is `Some` exactly when the
+/// proven result carries no hits, the one case where an empty measurement
+/// set stays usable downstream (`take_measurement` fails a hit without its
+/// owner measurement, so a hit-bearing result names the measurement-owner
+/// gap via `hit_count` instead of fabricating measurements here).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundCuePair {
+    /// Proven activation request, echoed unchanged.
+    pub request: ActivationRequest,
+    /// Proven activation result, echoed unchanged.
+    pub result: ActivationResult,
+    /// Candidate-stage input (`result` plus no measurements): `Some` only
+    /// for a hitless proven result; `None` reports the measurement-owner
+    /// gap for a hit-bearing result without failing the proven pair.
+    pub candidate_input: Option<CueInput>,
+    /// Admitted direct plus derived hits (`saturating`).
+    pub hit_count: usize,
+}
+
+/// Fail-closed errors for cue-pair binding.
+///
+/// A malformed or unadmitted pair is `InvalidPair`; a well-formed pair that
+/// disagrees with the live closure is `NotCurrent`. Neither degrades into
+/// the other, and neither invents a result.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CuePairBindError {
+    /// The caller pair fails the cue owner's exact admission.
+    #[error("cue pair fails owner admission: {0}")]
+    InvalidPair(String),
+    /// The admitted pair disagrees with the live seven-role closure.
+    #[error("cue pair is not current for the live closure: {0}")]
+    NotCurrent(String),
+}
+
+/// Binds one caller-supplied cue activation pair to the live seven-role
+/// closure (T11.4 cue binder, CPU-side only).
+///
+/// The caller holds the pair from the cue evaluation owner (or a recorded
+/// admitted evaluation); this function proves it current here: owner
+/// admission over the exact pair, cue role operation identity, request fence
+/// against the live fence, every seed scope against the live scope, and —
+/// for a `Complete` role — the envelope scope/fence/selector against the
+/// live closure and the requested selectors. A `KnownEmpty` upstream with a
+/// hit-bearing pair fails closed (stale or foreign pair, never silent
+/// absorption); degraded roles without a payload bind on fence, scope, and
+/// admission alone. Holds no state; measurement supply stays with the
+/// measurement owner.
+pub fn bind_cue_pair_to_roles(
+    seven: &SevenRoleInputs,
+    request: &ContextReconstructionRequest,
+    candidate_request: ActivationRequest,
+    candidate_result: ActivationResult,
+) -> Result<BoundCuePair, CuePairBindError> {
+    candidate_result
+        .validate_against(&candidate_request)
+        .map_err(|error| CuePairBindError::InvalidPair(error.to_string()))?;
+    if seven.cue.operation != NamedReadOperation::GetUnderstandingProjectionInputs {
+        return Err(CuePairBindError::NotCurrent(
+            "cue role operation is not GetUnderstandingProjectionInputs".to_owned(),
+        ));
+    }
+    if candidate_request.state_fence != seven.state_fence {
+        return Err(CuePairBindError::NotCurrent(
+            "request fence differs from the live closure fence".to_owned(),
+        ));
+    }
+    for seed in &candidate_request.seeds {
+        if seed.observed.context.scope_id.as_str() != seven.scope_id.as_str() {
+            return Err(CuePairBindError::NotCurrent(
+                "seed scope differs from the live closure scope".to_owned(),
+            ));
+        }
+    }
+    match &seven.cue.state {
+        ProjectionState::KnownEmpty => {
+            if !candidate_result.direct.is_empty() || !candidate_result.derived.is_empty() {
+                return Err(CuePairBindError::NotCurrent(
+                    "cue upstream is authoritatively empty but the pair carries hits".to_owned(),
+                ));
+            }
+        }
+        ProjectionState::Complete => {
+            let payload = seven.cue.payload.as_ref().ok_or_else(|| {
+                CuePairBindError::NotCurrent("complete cue role carries no payload".to_owned())
+            })?;
+            check_envelope_currency(payload, request, seven)?;
+        }
+        // Degraded or unreadable roles carry no payload to check: the pair
+        // stands on fence, scope, and owner admission alone, and the role
+        // disposition still reports the upstream gap downstream.
+        _ => {}
+    }
+    let hit_count = candidate_result
+        .direct
+        .len()
+        .saturating_add(candidate_result.derived.len());
+    let candidate_input = if hit_count == 0 {
+        Some(CueInput {
+            result: candidate_result.clone(),
+            measurements: Vec::new(),
+        })
+    } else {
+        None
+    };
+    Ok(BoundCuePair {
+        request: candidate_request,
+        result: candidate_result,
+        candidate_input,
+        hit_count,
+    })
+}
+
+/// Checks one complete cue payload envelope against the live closure.
+///
+/// The envelope is navigated by field, never redefined here: `selector` and
+/// `scope_id` compare as text against the live scope and the requested
+/// selectors, and `provenance.state_fence` decodes through the owner
+/// [`StateFence`] type. A field that is absent or misshapen fails closed;
+/// the store version is not pinned (shape-gated, version-agnostic).
+fn check_envelope_currency(
+    payload: &Value,
+    request: &ContextReconstructionRequest,
+    seven: &SevenRoleInputs,
+) -> Result<(), CuePairBindError> {
+    let refused = |detail: &str| CuePairBindError::NotCurrent(detail.to_owned());
+    let selector = payload
+        .get("selector")
+        .and_then(Value::as_str)
+        .ok_or_else(|| refused("cue payload has no selector"))?;
+    let scope = payload
+        .get("scope_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| refused("cue payload has no scope_id"))?;
+    let fence_value = payload
+        .get("provenance")
+        .and_then(|provenance| provenance.get("state_fence"))
+        .ok_or_else(|| refused("cue payload has no provenance fence"))?;
+    let fence: StateFence =
+        serde_json::from_value(fence_value.clone()).map_err(|_| refused("cue payload provenance fence is not a state fence"))?;
+    if scope != seven.scope_id.as_str() {
+        return Err(refused("cue payload scope differs from the live closure scope"));
+    }
+    if fence != seven.state_fence {
+        return Err(refused(
+            "cue payload fence differs from the live closure fence",
+        ));
+    }
+    if let Some(expected) = request.understanding_selector.as_deref()
+        && selector != expected
+    {
+        return Err(refused(
+            "cue payload selector differs from the requested selectors",
+        ));
+    }
+    Ok(())
 }
 
 /// Borrow of the read owner; there is no separate context-input state owner.
@@ -419,6 +620,33 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         request: &ContextReconstructionRequest,
     ) -> Result<RoleAcquisition, ContextInputsError> {
         let operation = NamedReadOperation::GetUnderstandingProjectionInputs;
+        let parameters = match (
+            request.understanding_selector.clone(),
+            request.understanding_max_records,
+        ) {
+            (Some(selector), Some(max_records)) => NamedParameters::from_map(BTreeMap::from([
+                ("selector".to_owned(), Value::String(selector)),
+                (
+                    "max_records".to_owned(),
+                    Value::String(max_records.to_string()),
+                ),
+            ]))
+            .map_err(|error| {
+                ContextInputsError::RequestRejected(bounded_reason(
+                    "invalid understanding selectors",
+                    error,
+                ))
+            })?,
+            // Selector-less acquisition keeps the established parameter-free
+            // shape: the catalogue resolves it to per-role `Unavailable`,
+            // never to an inferred selector.
+            (None, None) => NamedParameters::new(),
+            _ => {
+                return Err(ContextInputsError::RequestRejected(
+                    "understanding selectors must be supplied together".to_owned(),
+                ));
+            }
+        };
         match self
             .reads
             .query(
@@ -429,7 +657,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
-                    parameters: NamedParameters::new(),
+                    parameters,
                     provenance_handles: Vec::new(),
                 },
             )
@@ -914,6 +1142,8 @@ mod reconstruction_tests {
             epistemic_position: "position-a".to_owned(),
             evidence_subject: "subject-a".to_owned(),
             evidence_max_records: 8,
+            understanding_selector: None,
+            understanding_max_records: None,
         })
     }
 

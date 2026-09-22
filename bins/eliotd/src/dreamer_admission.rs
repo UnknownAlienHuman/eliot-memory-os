@@ -333,6 +333,7 @@ mod tests {
         AuthorityBinding, EffectClass, OperationBinding, ProofCeiling, RequestBinding,
         WorkScopeBinding, WorkScopeId,
     };
+    use eliot_store_api::RevisionKey;
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
     use std::sync::Mutex;
@@ -562,8 +563,9 @@ mod tests {
             &self,
             _ctx: &RequestMetadata,
             _scope: ScopeId,
-            _packet_ref: Option<String>,
-            _material_refs: Vec<String>,
+            _selector: String,
+            _max_records: u32,
+            _dependency_revisions: BTreeMap<RevisionKey, u64>,
         ) -> Result<QueryResult, ReadError> {
             Err(ReadError::Store(
                 eliot_store_api::StoreError::Unavailable.into(),

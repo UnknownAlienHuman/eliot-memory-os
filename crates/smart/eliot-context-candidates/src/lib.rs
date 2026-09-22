@@ -44,7 +44,7 @@ pub mod vocabulary;
 
 pub use derive::{
     assurance_member_id, attention_member_id, conflict_member_id, derived_member_id,
-    direct_member_id, envelope_member_id, epistemic_member_id,
+    direct_member_id, envelope_member_id, epistemic_member_id, measure_cue_members,
 };
 pub use eliot_context_contracts::ContextError;
 pub use inputs::{

@@ -38,15 +38,22 @@ mod capability_evidence;
 mod composition;
 mod context_inputs;
 mod cue_composition;
+mod cue_evaluation;
 mod epistemic_composition;
 pub use context_inputs::{
-    ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
-    ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
-    ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME, RoleAcquisition, SevenRoleInputs,
+    BoundCuePair, ContextInputsError, ContextReconstructionRequest, CuePairBindError,
+    GovernorContextInputs, ROLE_AFFORDANCES, ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION,
+    ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME,
+    RoleAcquisition, SevenRoleInputs, bind_cue_pair_to_roles,
 };
 pub use cue_composition::{
     CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
+};
+pub use cue_evaluation::{
+    AdmittedCueObservation, CueAdmissionError, CueEvaluationError, CuePairError, DrivenSeeds,
+    LiveCueEvaluation, LiveCuePair, SeedDriveError, SeedExclusion, admit_cue_observations,
+    drive_live_cue_pair, drive_observation_seeds, evaluate_live_cue_pair,
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 mod controlboard_projection;

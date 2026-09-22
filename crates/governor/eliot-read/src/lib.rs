@@ -817,21 +817,25 @@ pub trait LocalReadPort {
         subject: String,
         max_records: u32,
     ) -> Result<QueryResult, ReadError>;
-    /// Answers one projection-inputs read (port-shape only until storage
-    /// activates the operation).
+    /// Answers one projection-inputs read through the real gateway.
     ///
-    /// Validates `packet_ref` / `material_refs` and the facade request shape
-    /// (`ContextReconstruction` intent + `GetUnderstandingProjectionInputs`),
-    /// then fails closed with a typed `Unavailable` store error until MGR04
-    /// (#19) activates the catalogue row, parameter schema, and adapter
-    /// handlers. Never a stub, never canned data, never `Ok`-empty
-    /// masquerading as success.
+    /// Validates the closed selectors (exact `selector` text plus the
+    /// explicit `max_records` bound, per the declared store catalogue) and
+    /// the facade request shape (`ContextReconstruction` intent +
+    /// `GetUnderstandingProjectionInputs` under `ExactFence` with
+    /// caller-supplied dependency revisions), then executes the named read
+    /// through [`ReadApi::query`]. The exact payload/provenance returns on
+    /// success; a malformed selector/bound, a fence mismatch, or a genuine
+    /// gateway failure (including a store generation without the activated
+    /// handler) fails closed. Never a stub, never canned data, never
+    /// `Ok`-empty masquerading as success.
     async fn projection_inputs(
         &self,
         ctx: &RequestMetadata,
         scope: ScopeId,
-        packet_ref: Option<String>,
-        material_refs: Vec<String>,
+        selector: String,
+        max_records: u32,
+        dependency_revisions: BTreeMap<RevisionKey, u64>,
     ) -> Result<QueryResult, ReadError>;
 }
 
@@ -880,24 +884,20 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
         &self,
         ctx: &RequestMetadata,
         scope: ScopeId,
-        packet_ref: Option<String>,
-        material_refs: Vec<String>,
+        selector: String,
+        max_records: u32,
+        dependency_revisions: BTreeMap<RevisionKey, u64>,
     ) -> Result<QueryResult, ReadError> {
         ctx.validate().map_err(|error| ReadError::InvalidField {
             field: "request_metadata".to_owned(),
             reason: error.to_string(),
         })?;
-        if let Some(ref packet) = packet_ref {
-            text(packet, "packet.packet_ref")?;
-        }
-        {
-            let mut seen = BTreeSet::new();
-            for material in &material_refs {
-                text(material, "packet.material_refs")?;
-                if !seen.insert(material.clone()) {
-                    return Err(ReadError::DuplicateField("packet.material_refs".to_owned()));
-                }
-            }
+        text(&selector, "selector")?;
+        if max_records == 0 {
+            return Err(ReadError::InvalidField {
+                field: "max_records".to_owned(),
+                reason: "must be a positive decimal bound".to_owned(),
+            });
         }
         let intent = QueryIntent {
             mode: QueryMode::ContextReconstruction,
@@ -906,24 +906,29 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
             freshness_policy: FreshnessPolicy::ProjectionInputsOnly,
             required_assurance: RequiredAssurance::ReconstructionInputs,
         };
-        // Facade-valid shape today (scope-bound, admitted intent/operation).
-        // `packet_ref` / `material_refs` are validated above but map to no
-        // selector yet: no `packet_ref` / `material_refs` parameter mapping
-        // exists until MGR04 (#19) declares the storage schema, so no
-        // selectors cross and no free text enters the request.
+        // Closed selectors from the declared store catalogue: the exact
+        // `selector` plus the explicit `max_records` decimal bound. The
+        // catalogue and the memory/Surreal adapters re-validate on their
+        // leg (shape, bound ceiling, scope declaration); a handler or
+        // ceiling failure there surfaces as the genuine gateway error.
+        let parameters = NamedParameters::from_map(BTreeMap::from([
+            ("selector".to_owned(), Value::String(selector)),
+            (
+                "max_records".to_owned(),
+                Value::String(max_records.to_string()),
+            ),
+        ]))?;
         let request = QueryRequest {
             intent,
             operation: NamedReadOperation::GetUnderstandingProjectionInputs,
             scope_id: Some(scope),
-            consistency: ReadConsistency::Eventual,
-            dependency_revisions: BTreeMap::new(),
-            parameters: NamedParameters::new(),
+            consistency: ReadConsistency::ExactFence,
+            dependency_revisions,
+            parameters,
             provenance_handles: Vec::new(),
         };
         request.validate()?;
-        // Storage has no catalogue row, parameter schema, or adapter handler
-        // for this operation on base: fail closed, never `Ok`-empty.
-        Err(ReadError::Store(StoreReadFailure::Unavailable))
+        ReadApi::query(self, ctx, request).await
     }
 }
 
@@ -1942,12 +1947,13 @@ mod evidence_pack_read_tests {
     }
 
     #[test]
-    fn local_port_refuses_wrong_fence_over_bound_and_unactivated_projection()
+    fn local_port_refuses_wrong_fence_over_bound_and_unhandled_projection()
     -> Result<(), Box<dyn std::error::Error>> {
         // HANDOFF-LRR-GOV fail-closed cut: a wrong fence or an over-bound
-        // request never returns success, and projection inputs stay
-        // `Unavailable` (never `Ok`-empty, never canned) until MGR04 (#19)
-        // activates the storage operation.
+        // request never returns success, and projection inputs through a
+        // store without the activated handler surface the genuine gateway
+        // failure (never `Ok`-empty, never canned, never a facade-synthesized
+        // `Unavailable` standing in for the store's own answer).
         let fence = fence()?;
         let ctx = metadata(&fence)?;
         let service = ReadService::new(EvidenceTableClient::new(fence.clone()));
@@ -1976,9 +1982,19 @@ mod evidence_pack_read_tests {
             .is_err()
         );
 
-        match block_on(service.projection_inputs(&ctx, scope, None, Vec::new())) {
-            Err(ReadError::Store(StoreReadFailure::Unavailable)) => {}
-            other => panic!("projection inputs must fail closed Unavailable, observed: {other:?}"),
+        let mut dependencies = BTreeMap::new();
+        dependencies.insert(RevisionKey::new("scope:scope-evidence")?, 1);
+        match block_on(service.projection_inputs(
+            &ctx,
+            scope,
+            "selector-alpha".to_owned(),
+            8,
+            dependencies,
+        )) {
+            Err(ReadError::Store(StoreReadFailure::UnknownOperation)) => {}
+            other => {
+                panic!("projection inputs must surface the genuine gateway failure, observed: {other:?}")
+            }
         }
         Ok(())
     }

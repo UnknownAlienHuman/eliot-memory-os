@@ -414,7 +414,8 @@ mod tests {
         BranchEnvironmentScope, FreshnessPolicy, ProvenanceDisposition, QueryIntent, QueryMode,
         QueryResult, ReadProvenance, RequiredAssurance, TimeScope,
     };
-    use eliot_store_api::{NamedReadOperation, ReadConsistency};
+    use eliot_store_api::{NamedReadOperation, ReadConsistency, RevisionKey};
+    use std::collections::BTreeMap;
     use std::num::NonZeroU64;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -629,8 +630,9 @@ mod tests {
             &self,
             _ctx: &RequestMetadata,
             _scope: ScopeId,
-            _packet_ref: Option<String>,
-            _material_refs: Vec<String>,
+            _selector: String,
+            _max_records: u32,
+            _dependency_revisions: BTreeMap<RevisionKey, u64>,
         ) -> Result<eliot_read::QueryResult, ReadError> {
             Err(ReadError::Store(
                 eliot_store_api::StoreError::Unavailable.into(),

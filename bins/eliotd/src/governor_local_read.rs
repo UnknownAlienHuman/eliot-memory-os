@@ -21,16 +21,18 @@
 //! [`LocalReadPort::evidence_query`]) and returns the exact evidence record.
 //!
 //! Query is fully live (`Verification` + `GetEvidencePack`); projection
-//! inputs stay port-shape fail-closed `Unavailable` until MGR04 (#19)
-//! activates the storage operation.
+//! inputs are fully live through the closed `selector` + `max_records`
+//! catalogue selectors (`ContextReconstruction` +
+//! `GetUnderstandingProjectionInputs` under `ExactFence`).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_governor::KernelPortError;
 use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt};
 use eliot_read::{LocalReadPort, QueryResult, ReadError, ReadService, StoreReadFailure};
-use eliot_store_api::ScopeId;
+use eliot_store_api::{RevisionKey, ScopeId};
 
 use super::{DaemonComposition, DaemonKernelClient, KernelContextReadClient};
 
@@ -99,24 +101,28 @@ pub async fn answer_evidence_query(
         .await
 }
 
-/// Answers one Governor projection-inputs read (port-shape only).
+/// Answers one Governor projection-inputs read through the real gateway.
 ///
-/// Validates `packet_ref` / `material_refs` and the facade request shape,
-/// then fails closed with a typed `Unavailable` store error until MGR04
-/// (#19) activates the storage operation. Never `Ok`-empty, never canned.
+/// Threads the closed selectors (exact `selector` plus the explicit
+/// `max_records` bound, per the declared store catalogue) and the
+/// caller-supplied `ExactFence` dependency revisions into the
+/// [`LocalReadPort::projection_inputs`] gateway call. Returns the exact
+/// payload/provenance on success; a malformed selector/bound, a wrong fence,
+/// or a genuine gateway failure fails closed. Never `Ok`-empty, never canned.
 pub async fn answer_projection_inputs(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     ctx: &RequestMetadata,
     scope: ScopeId,
-    packet_ref: Option<String>,
-    material_refs: Vec<String>,
+    selector: String,
+    max_records: u32,
+    dependency_revisions: BTreeMap<RevisionKey, u64>,
 ) -> Result<QueryResult, ReadError> {
     let client = composition
         .context_read_client(kernel)
         .map_err(|_| ReadError::Store(StoreReadFailure::Unavailable))?;
     let service = ReadService::new(client);
     service
-        .projection_inputs(ctx, scope, packet_ref, material_refs)
+        .projection_inputs(ctx, scope, selector, max_records, dependency_revisions)
         .await
 }
