@@ -141,6 +141,13 @@ pub mod reactive_restore_serve;
 mod runtime_identity;
 mod shutdown_drain;
 mod startup_coordinator;
+mod wasm_runtime_port_grant;
+pub use wasm_runtime_port_grant::{
+    HandlerSession, KernelObservedGrantFacts, WASM_GRANT_REQUEST_WIRE_ID,
+    WASM_GRANT_REQUEST_WIRE_VERSION, WASM_PORT_GRANT_OPERATION, WASM_PORT_GRANT_WIRE_ID,
+    WASM_PORT_GRANT_WIRE_VERSION, WasmGrantError, WasmGrantExpectation, WasmGrantRequest,
+    WasmPortGrant, handle_wasm_port_grant, issue_wasm_port_grant, validate_wasm_port_grant,
+};
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;

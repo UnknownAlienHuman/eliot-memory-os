@@ -25,6 +25,12 @@ mod artifact_preflight;
 mod child_engine;
 mod cli_contract;
 mod contour;
+mod dispatch_authority;
+mod dispatch_drive;
+mod dispatch_material;
+mod grant_authorization;
+mod grant_client;
+mod grant_launch;
 mod guest_exec;
 mod installed_binary;
 mod shadow;
@@ -37,7 +43,9 @@ pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
 pub use child_engine::{ISOLATED_CHILD_IMPLEMENTATION_ID, IsolatedChildEngine};
-pub use cli_contract::{CliConfig, CliError, GuestExecArgs, Profile, Transport, parse_args};
+pub use cli_contract::{
+    CliConfig, CliError, GrantLaunchArgs, GuestExecArgs, Profile, Transport, parse_args,
+};
 pub use contour::{
     AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, Contour, ContourGateError,
     FS_CAPABILITY, GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY,
@@ -45,18 +53,45 @@ pub use contour::{
     STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
     authorize_host_call, check_activation_imports, check_admitted_request,
 };
+pub use dispatch_authority::{
+    DispatchAuthorityError, ValidatedDispatchGrant, WASM_DISPATCH_AUTHORITY_PREFIX,
+    WASM_DISPATCH_DERIVATION_DOMAIN, WASM_LAUNCH_GRANT_HEAD, WASM_VALIDATION_REVISION,
+    WasmDispatchAuthority,
+};
+pub use dispatch_drive::{DispatchDriveResponse, DriveError, drive_dispatch};
+pub use dispatch_material::{
+    DISPATCH_MATERIAL_MAX_BYTES, MaterialError, ValidatedDispatchMaterial, ValidatedGuestCeilings,
+    WASM_DISPATCH_MATERIAL_WIRE_ID, WASM_DISPATCH_MATERIAL_WIRE_VERSION,
+    WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
+    WASM_HOST_MATERIAL_FILE_NAME, admitted_material_path, read_dispatch_material,
+    read_dispatch_material_from,
+};
+pub use grant_authorization::{
+    AuthorizedGrant, authorize_grant, authorize_grant_against_descriptor,
+};
+pub use grant_client::{
+    AcceptedGrant, GrantChannel, GrantClientBundle, GrantClientError, accept_grant,
+    build_grant_bundle, request_grant,
+};
+#[cfg(windows)]
+pub use grant_client::{GRANT_ISSUE_OPERATION, request_grant_via_transport};
+pub use grant_launch::{
+    GRANT_CONNECT_TIMEOUT_MAX_MS, GRANT_DESCRIPTOR_MAX_BYTES, GrantLaunchError, GrantLaunchReceipt,
+    grant_engine_binding, run_grant_launch,
+};
 pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
     GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,
     validate_request,
 };
 pub use installed_binary::{
-    InstalledBinary, InstalledBinaryError, WasmHostBinaryBinding, resolve_installed_binary,
+    InstalledBinary, InstalledBinaryError, WasmHostBinaryBinding,
+    binding_from_installation_records, binding_from_launch_descriptor, resolve_installed_binary,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
     LEGACY_EXPORT, LEGACY_WORLD, TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld,
-    export_matches_interface, typed_wit_digest,
+    export_matches_interface, typed_wit_bytes, typed_wit_digest,
 };
 pub use typed_execution::{
     ExecutionMode, TypedDescriptor, TypedExecutionError, TypedReceipt, default_experimental_limits,
@@ -114,6 +149,12 @@ impl WasmHostRunner {
     /// slot with the provider-specific adapter: either the in-process
     /// Wasmtime provider or the isolated-child engine (never both — pairing
     /// them would execute the guest twice).
+    ///
+    /// Test-only callers, explicitly: every current caller is a proof
+    /// harness seating a composed engine. Production dispatch (the admitted
+    /// request loop over a future grant transport) will construct the child
+    /// engine here once the transport lands; until then this stays the
+    /// proof-composition entry, not a live dispatch path.
     pub fn with_wasmtime_engine(
         profile: Profile,
         runtime: Runtime,
