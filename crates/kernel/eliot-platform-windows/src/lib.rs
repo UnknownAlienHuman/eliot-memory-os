@@ -4091,6 +4091,7 @@ fn service_registration_mutation_access(request: &ServiceRegistrationRequest) ->
 struct ServiceSecurityBinding {
     protected_dacl: bool,
     dacl_matches: bool,
+    owner_sid: String,
     group_sid: String,
 }
 
@@ -4237,6 +4238,7 @@ fn read_service_security_binding(
     Ok(ServiceSecurityBinding {
         protected_dacl,
         dacl_matches,
+        owner_sid: owner_text,
         group_sid: group_text,
     })
 }
@@ -4282,6 +4284,7 @@ fn read_host_service_control_grant(
         host_service_sid,
         crate::service_registration::ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
         digest,
+        binding.owner_sid,
         binding.group_sid,
     )
     .map(Some)
@@ -4369,6 +4372,7 @@ fn read_watchdog_host_control_grant(
         host_service_sid,
         ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
         digest,
+        binding.owner_sid,
         binding.group_sid,
     )
     .map(Some)

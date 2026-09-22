@@ -302,17 +302,21 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// Version 22 separates filesystem and Credential Manager create dispositions
 /// and requires the keyed non-secret credential creation proof. Version 23
 /// adds the optional, digest-bound agent-bridge source materialization plan.
+/// Version 24 binds the SCM grant OWNER|GROUP proof from the same live handle
+/// into the durable registration receipt and its canonical marker digest.
 /// Older wires cannot be interpreted as this effect set.
 /// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(23, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(24, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
 /// Registry wire version 12 binds the provisioned supervision authority into
 /// pending Phase-B receipts and committed/rebound live bindings. Version 15
 /// binds each Watchdog approval to the exact installer-read SCM control grant.
+/// Version 16 carries the complete OWNER|GROUP|DACL proof in every durable
+/// service-control grant receipt.
 /// Older projections are never defaulted into current authority.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(15, 0, 0);
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(16, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -6488,7 +6492,9 @@ fn root_mismatch(reason: &str) -> InstallationEffectObservation {
     }
 }
 
-const SERVICE_MARKER_VERSION: u32 = 2;
+// The path namespace stays stable so an older marker is observed and rejected
+// during reconciliation instead of being bypassed by a new marker path.
+const SERVICE_MARKER_VERSION: u32 = 3;
 const SERVICE_MARKER_LIMIT: u64 = 16 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -6739,7 +6745,7 @@ fn service_matching_observation(
         .map_or("none", PlatformHandle::as_str);
     let evidence = PlatformHandle::new(sha256_hex(
         format!(
-            "service-matching-v2\0{}\0{}\0{}\0{}\0{}",
+            "service-matching-v3\0{}\0{}\0{}\0{}\0{}",
             request.effect_id.as_str(),
             request.plan_digest.as_str(),
             configuration_digest,
@@ -6751,7 +6757,7 @@ fn service_matching_observation(
     .map_err(|_| PortError::InvalidRequestMetadata)?;
     let postcondition_digest = PlatformHandle::new(sha256_hex(
         format!(
-            "service-postcondition-v2\0{}\0{}\0{}\0{}",
+            "service-postcondition-v3\0{}\0{}\0{}\0{}",
             request.effect_id.as_str(),
             configuration_digest,
             marker_digest.as_str(),

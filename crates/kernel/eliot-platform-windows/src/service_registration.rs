@@ -107,13 +107,17 @@ pub const ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK: u32 =
 /// privileged installer: the `EliotHost` self-grant on the canonical
 /// `EliotHost` registration, or the `EliotHost` service-SID grant on the
 /// canonical `EliotWatchdog` registration. Both carry the deterministic Host
-/// SID as principal and differ only in mask/descriptor digest.
+/// SID as principal and differ only in mask/descriptor digest. The owner and
+/// group are retained from the same security descriptor handle as the DACL;
+/// they are part of the durable installer binding even though the DACL digest
+/// itself remains DACL-scoped.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceControlGrantReadback {
     principal_service: String,
     principal_sid: String,
     access_mask: u32,
     security_descriptor_digest: String,
+    security_descriptor_owner: String,
     security_descriptor_group: String,
 }
 
@@ -123,6 +127,7 @@ impl ServiceControlGrantReadback {
         principal_sid: impl Into<String>,
         access_mask: u32,
         security_descriptor_digest: impl Into<String>,
+        security_descriptor_owner: impl Into<String>,
         security_descriptor_group: impl Into<String>,
     ) -> Result<Self, WindowsAdapterError> {
         let value = Self {
@@ -130,6 +135,7 @@ impl ServiceControlGrantReadback {
             principal_sid: principal_sid.into(),
             access_mask,
             security_descriptor_digest: security_descriptor_digest.into(),
+            security_descriptor_owner: security_descriptor_owner.into(),
             security_descriptor_group: security_descriptor_group.into(),
         };
         value.validate()?;
@@ -161,6 +167,13 @@ impl ServiceControlGrantReadback {
         &self.security_descriptor_digest
     }
 
+    /// Returns the canonical owner SID read from the same service security
+    /// descriptor handle as the group and DACL proof.
+    #[must_use]
+    pub fn security_descriptor_owner(&self) -> &str {
+        &self.security_descriptor_owner
+    }
+
     /// Returns the canonical group SID read from the same service security
     /// descriptor handle as the owner and DACL proof.
     #[must_use]
@@ -179,6 +192,7 @@ impl ServiceControlGrantReadback {
         if self.principal_service != ELIOT_HOST_SERVICE_NAME
             || !crate::valid_service_sid_text(&self.principal_sid)
             || !crate::valid_sha256_hex(&self.security_descriptor_digest)
+            || self.security_descriptor_owner != SERVICE_EXPECTED_OWNER_SID
             || self.security_descriptor_group != SERVICE_EXPECTED_GROUP_SID
         {
             return Err(WindowsAdapterError::IdentityMismatch);

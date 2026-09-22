@@ -1261,7 +1261,7 @@ fn v21_and_missing_secret_proof_require_explicit_migration() {
     assert!(matches!(
         validate_installation_transaction_json(&legacy_bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("21.0.0") && reason.contains("23.0.0")
+            if reason.contains("21.0.0") && reason.contains("24.0.0")
     ));
 
     let mut missing = serde_json::to_value(&transaction).unwrap_or_else(|_| unreachable!());
@@ -1279,7 +1279,7 @@ fn v21_and_missing_secret_proof_require_explicit_migration() {
     assert!(matches!(
         validate_installation_transaction_json(&missing_bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("creation proof") && reason.contains("v23")
+            if reason.contains("creation proof") && reason.contains("v24")
     ));
 }
 
@@ -1289,6 +1289,8 @@ fn test_watchdog_control_grant() -> InstallerServiceControlGrantReceipt {
         principal_service: test_handle(ELIOT_HOST_SERVICE_NAME),
         principal_sid: test_handle(principal_sid),
         access_mask: ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+        security_descriptor_owner: test_handle("S-1-5-18"),
+        security_descriptor_group: test_handle("S-1-5-18"),
         security_descriptor_digest: test_handle(must(watchdog_service_security_descriptor_digest(
             principal_sid,
         ))),
@@ -1312,6 +1314,8 @@ fn test_host_service_control_grant() -> InstallerServiceControlGrantReceipt {
         principal_service: test_handle(ELIOT_HOST_SERVICE_NAME),
         principal_sid: test_handle(principal_sid),
         access_mask: ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+        security_descriptor_owner: test_handle("S-1-5-18"),
+        security_descriptor_group: test_handle("S-1-5-18"),
         security_descriptor_digest: test_handle(must(host_service_security_descriptor_digest(
             principal_sid,
         ))),
@@ -5382,7 +5386,7 @@ fn pre_v7_transaction_json_requires_explicit_migration() {
 }
 
 #[test]
-fn v8_transaction_json_requires_explicit_migration_to_v23() {
+fn v8_transaction_json_requires_explicit_migration_to_v24() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -5396,7 +5400,7 @@ fn v8_transaction_json_requires_explicit_migration_to_v23() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("requires explicit migration to 23.0.0")
+            if reason.contains("requires explicit migration to 24.0.0")
     ));
 }
 
@@ -5445,7 +5449,7 @@ fn v9_transaction_json_requires_explicit_migration_without_start_synthesis() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("wire 9.0.0 requires explicit migration to 23.0.0")
+            if reason.contains("wire 9.0.0 requires explicit migration to 24.0.0")
     ));
 }
 
@@ -5465,7 +5469,7 @@ fn v4_transaction_json_requires_explicit_migration_without_defaults() {
 }
 
 #[test]
-fn v10_transaction_json_requires_explicit_migration_to_v23() {
+fn v10_transaction_json_requires_explicit_migration_to_v24() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -5491,12 +5495,12 @@ fn v10_transaction_json_requires_explicit_migration_to_v23() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 10.0.0 requires explicit migration to 23.0.0")
+            if reason.contains("wire 10.0.0 requires explicit migration to 24.0.0")
     ));
 }
 
 #[test]
-fn v13_transaction_json_requires_explicit_migration_to_v23() {
+fn v13_transaction_json_requires_explicit_migration_to_v24() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -5507,12 +5511,12 @@ fn v13_transaction_json_requires_explicit_migration_to_v23() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 13.0.0 requires explicit migration to 23.0.0")
+            if reason.contains("wire 13.0.0 requires explicit migration to 24.0.0")
     ));
 }
 
 #[test]
-fn v14_transaction_json_requires_explicit_migration_to_v23() {
+fn v14_transaction_json_requires_explicit_migration_to_v24() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -5523,36 +5527,36 @@ fn v14_transaction_json_requires_explicit_migration_to_v23() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 14.0.0 requires explicit migration to 23.0.0")
+            if reason.contains("wire 14.0.0 requires explicit migration to 24.0.0")
     ));
 }
 
 #[test]
-fn v15_transaction_json_requires_explicit_migration_to_v23() {
+fn v15_transaction_json_requires_explicit_migration_to_v24() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(15, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 15.0.0 requires explicit migration to 23.0.0")
+            if reason.contains("wire 15.0.0 requires explicit migration to 24.0.0")
     ));
 }
 
 #[test]
-fn v16_transaction_json_requires_explicit_migration_to_v23() {
+fn v16_transaction_json_requires_explicit_migration_to_v24() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(16, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 16.0.0") && reason.contains("23.0.0")
+            if reason.contains("wire 16.0.0") && reason.contains("24.0.0")
     ));
 }
 
 #[test]
-fn v17_transaction_json_requires_explicit_migration_to_v23() {
+fn v17_transaction_json_requires_explicit_migration_to_v24() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(17, 0, 0)));
     for progress in legacy["effect_progress"]
@@ -5568,12 +5572,12 @@ fn v17_transaction_json_requires_explicit_migration_to_v23() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 17.0.0") && reason.contains("23.0.0")
+            if reason.contains("wire 17.0.0") && reason.contains("24.0.0")
     ));
 }
 
 #[test]
-fn v18_transaction_json_requires_explicit_migration_to_v23() {
+fn v18_transaction_json_requires_explicit_migration_to_v24() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(18, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
@@ -5583,19 +5587,19 @@ fn v18_transaction_json_requires_explicit_migration_to_v23() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("wire 18.0.0") && reason.contains("23.0.0")
+            if reason.contains("wire 18.0.0") && reason.contains("24.0.0")
     ));
 }
 
 #[test]
-fn v20_transaction_json_requires_explicit_migration_to_v23() {
+fn v20_transaction_json_requires_explicit_migration_to_v24() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(20, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 20.0.0") && reason.contains("23.0.0")
+            if reason.contains("wire 20.0.0") && reason.contains("24.0.0")
     ));
 }
 
@@ -5610,7 +5614,7 @@ fn v22_transaction_json_is_rejected_before_payload_authority() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 22.0.0") && reason.contains("23.0.0")
+            if reason.contains("wire 22.0.0") && reason.contains("24.0.0")
     ));
 }
 
@@ -5637,7 +5641,7 @@ fn current_transaction_missing_nonce_or_deadline_is_corrupt_not_synthesized() {
 
 #[cfg(windows)]
 #[test]
-fn current_v23_ownership_members_are_mandatory_and_never_synthesized() {
+fn current_v24_ownership_members_are_mandatory_and_never_synthesized() {
     for field in [
         "reference",
         "create_disposition",
@@ -5662,7 +5666,7 @@ fn current_v23_ownership_members_are_mandatory_and_never_synthesized() {
         ownership.remove(field);
         let bytes = must(serde_json::to_vec(&value));
         let error = decode_installation_transaction_json(&bytes)
-            .expect_err("missing current-v23 ownership member must reject the record");
+            .expect_err("missing current-v24 ownership member must reject the record");
         assert!(
             matches!(
                 error,

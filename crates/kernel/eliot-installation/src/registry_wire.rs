@@ -499,9 +499,25 @@ fn current_registry_wire_missing_field(value: &serde_json::Value) -> bool {
         .and_then(serde_json::Value::as_array)
         .is_none_or(|approvals| {
             approvals.iter().any(|approval| {
-                approval
-                    .as_object()
-                    .is_none_or(|approval| !approval.contains_key("service_control_grant"))
+                let Some(approval) = approval.as_object() else {
+                    return true;
+                };
+                let Some(grant) = approval
+                    .get("service_control_grant")
+                    .and_then(serde_json::Value::as_object)
+                else {
+                    return true;
+                };
+                [
+                    "principal_service",
+                    "principal_sid",
+                    "access_mask",
+                    "security_descriptor_owner",
+                    "security_descriptor_group",
+                    "security_descriptor_digest",
+                ]
+                .iter()
+                .any(|field| !grant.contains_key(*field))
             })
         });
     let pending_bridge_field_missing = value
@@ -539,8 +555,8 @@ pub(super) fn decode_registry_bytes(
         .and_then(|version| version.get("major"))
         .and_then(serde_json::Value::as_u64);
     if declared_major == Some(10) {
-        return Err(InstallationError::MigrationRequired {
-            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v14; nested authority is never synthesized or adopted"
+            return Err(InstallationError::MigrationRequired {
+                reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v16; nested authority is never synthesized or adopted"
                 .to_owned(),
         });
     }
