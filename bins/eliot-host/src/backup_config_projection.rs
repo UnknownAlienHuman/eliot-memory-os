@@ -130,7 +130,7 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), ProjectionError>
 }
 
 fn check_identity(value: &str, field: &'static str) -> Result<(), ProjectionError> {
-    if value.is_empty() || value.len() > MAX_IDENTITY_LEN || value.chars().any(|c| c.is_control()) {
+    if value.is_empty() || value.len() > MAX_IDENTITY_LEN || value.chars().any(char::is_control) {
         return Err(ProjectionError::InvalidIdentity { field });
     }
     Ok(())

@@ -212,7 +212,7 @@ pub trait PreparationJournal {
 }
 
 fn check_identity(value: &str, field: &'static str) -> Result<(), PreparationError> {
-    if value.is_empty() || value.len() > MAX_IDENTITY_LEN || value.chars().any(|c| c.is_control()) {
+    if value.is_empty() || value.len() > MAX_IDENTITY_LEN || value.chars().any(char::is_control) {
         return Err(PreparationError::InvalidRequest {
             field,
             reason: "bounded printable text required".to_owned(),
@@ -616,8 +616,7 @@ pub fn reconcile_preparation<J: PreparationJournal>(
         let root_absent = intent
             .get("root")
             .and_then(|value| value.as_str())
-            .map(|root| !Path::new(root).exists())
-            .unwrap_or(true);
+            .is_none_or(|root| !Path::new(root).exists());
         if root_absent {
             return Ok(ReconcileDisposition::Absent);
         }

@@ -78,6 +78,76 @@ fn binding_row_key(stream: &str) -> String {
     format!("binding{KEY_SEP}{stream}")
 }
 
+/// Outcome of scanning one stream: an identical persisted operation to replay,
+/// if any, plus the current head `(sequence, digest)` for predecessor compare.
+struct JournalScan {
+    replay: Option<RestoreJournalEntry>,
+    head: Option<(u64, String)>,
+}
+
+/// Scans one stream for an identical operation or the current head.
+///
+/// Pure read over the open intents table: replays (never duplicates) an
+/// identical operation, rejects a changed payload under the same operation
+/// identity, and enforces monotone sequences. The caller performs the
+/// predecessor compare and the append inside the same write transaction.
+fn scan_journal_stream(
+    intents: &redb::Table<'_, &str, &str>,
+    stream: &str,
+    operation: &RestoreJournalOperation,
+    payload_sha256: &str,
+    payload: &str,
+) -> Result<JournalScan, OrsError> {
+    let mut head: Option<(u64, String)> = None;
+    let mut replay: Option<RestoreJournalEntry> = None;
+    let prefix = format!("{stream}{KEY_SEP}");
+    let mut scanned = 0_usize;
+    for entry in intents.iter().map_err(storage)? {
+        let (key, value) = entry.map_err(storage)?;
+        let (entry_stream, _) = split_key(key.value()).ok_or(integrity(
+            "restore_journal_entry",
+            "malformed journal row key",
+        ))?;
+        if entry_stream != stream {
+            continue;
+        }
+        if !key.value().starts_with(&prefix) {
+            continue;
+        }
+        scanned += 1;
+        if scanned > MAX_JOURNAL_PAGE_ENTRIES * 16 {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let stored: RestoreJournalEntry = decode_named(value.value(), "restore_journal_entry")?;
+        stored.validate()?;
+        if stored.operation.transaction_id == operation.transaction_id
+            && stored.operation.phase_operation == operation.phase_operation
+            && stored.operation.request_digest == operation.request_digest
+            && stored.operation.body_digest == operation.body_digest
+        {
+            if stored.payload_sha256 != payload_sha256 || stored.payload != payload {
+                return Err(integrity(
+                    "restore_journal_entry",
+                    "changed payload under the same journal operation identity",
+                ));
+            }
+            replay = Some(stored);
+            break;
+        }
+        let digest = stored.digest()?;
+        match &head {
+            Some((sequence, _)) if stored.sequence <= *sequence => {
+                return Err(integrity(
+                    "restore_journal_entry",
+                    "journal sequence is not monotone",
+                ));
+            }
+            _ => head = Some((stored.sequence, digest)),
+        }
+    }
+    Ok(JournalScan { replay, head })
+}
+
 impl RedbRecoveryStore {
     /// Binds one stream to its exact restore context, durably and idempotently.
     ///
@@ -216,59 +286,12 @@ impl RedbRecoveryStore {
         let write = self.database.begin_write().map_err(storage)?;
         let receipt = {
             let mut intents = write.open_table(RESTORE_JOURNAL_INTENTS).map_err(storage)?;
-            let mut head: Option<(u64, String)> = None;
-            let mut replay: Option<RestoreJournalEntry> = None;
-            let prefix = format!("{stream}{KEY_SEP}");
-            let mut scanned = 0_usize;
-            for entry in intents.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let (entry_stream, _) = split_key(key.value()).ok_or(integrity(
-                    "restore_journal_entry",
-                    "malformed journal row key",
-                ))?;
-                if entry_stream != stream {
-                    continue;
-                }
-                if !key.value().starts_with(&prefix) {
-                    continue;
-                }
-                scanned += 1;
-                if scanned > MAX_JOURNAL_PAGE_ENTRIES * 16 {
-                    return Err(OrsError::ProjectionLimitExceeded);
-                }
-                let stored: RestoreJournalEntry =
-                    decode_named(value.value(), "restore_journal_entry")?;
-                stored.validate()?;
-                if stored.operation.transaction_id == operation.transaction_id
-                    && stored.operation.phase_operation == operation.phase_operation
-                    && stored.operation.request_digest == operation.request_digest
-                    && stored.operation.body_digest == operation.body_digest
-                {
-                    if stored.payload_sha256 != payload_sha256 || stored.payload != payload {
-                        return Err(integrity(
-                            "restore_journal_entry",
-                            "changed payload under the same journal operation identity",
-                        ));
-                    }
-                    replay = Some(stored);
-                    break;
-                }
-                let digest = stored.digest()?;
-                match &head {
-                    Some((sequence, _)) if stored.sequence <= *sequence => {
-                        return Err(integrity(
-                            "restore_journal_entry",
-                            "journal sequence is not monotone",
-                        ));
-                    }
-                    _ => head = Some((stored.sequence, digest)),
-                }
-            }
-            if let Some(existing) = replay {
+            let scan = scan_journal_stream(&intents, stream, operation, payload_sha256, payload)?;
+            if let Some(existing) = scan.replay {
                 let digest = existing.digest()?;
                 (existing.sequence, digest, true)
             } else {
-                match (&operation.expected_predecessor, &head) {
+                match (&operation.expected_predecessor, &scan.head) {
                     (None, None) => {}
                     (Some(expected), Some((sequence, digest)))
                         if expected.sequence == *sequence && expected.digest == *digest => {}
@@ -279,7 +302,7 @@ impl RedbRecoveryStore {
                         ));
                     }
                 }
-                let sequence = head.map_or(0, |(sequence, _)| sequence + 1);
+                let sequence = scan.head.map_or(0, |(sequence, _)| sequence + 1);
                 let stored = RestoreJournalEntry {
                     operation: operation.clone(),
                     sequence,

@@ -408,7 +408,7 @@ fn alias_substitution_refused_identity_pinned() {
     std::fs::create_dir_all(&prepared.root).expect("recreate");
     match reconcile_preparation(&journal, "op-958-alias").expect("reconcile") {
         ReconcileDisposition::Uncertain { reason } => {
-            assert!(reason.contains("identity changed"), "names cause: {reason}")
+            assert!(reason.contains("identity changed"), "names cause: {reason}");
         }
         other => panic!("expected Uncertain, got {other:?}"),
     }
@@ -708,7 +708,7 @@ fn real_windows_isolated_preparation_and_cleanup() {
     assert!(!prepared.root_identity.identity.is_empty());
     match reconcile_preparation(&journal, "op-958-real").expect("reconcile") {
         ReconcileDisposition::Current(current) => {
-            assert_eq!(current.root_identity, prepared.root_identity)
+            assert_eq!(current.root_identity, prepared.root_identity);
         }
         other => panic!("expected Current, got {other:?}"),
     }
@@ -734,9 +734,6 @@ fn real_windows_isolated_preparation_and_cleanup() {
 // WORK_UNIT_CASE: 958/18
 #[test]
 fn source_api_guard_excludes_installer_registry_restore_cutover() {
-    let (source_root, _) = source_tree("18");
-    // Recursive listing before and after: preparation adds exactly one
-    // destination directory under the staging parent, nothing in source.
     fn listing(root: &Path) -> Vec<String> {
         let mut entries = Vec::new();
         for entry in walkdir_like(root) {
@@ -759,6 +756,9 @@ fn source_api_guard_excludes_installer_registry_restore_cutover() {
         }
         out
     }
+    let (source_root, _) = source_tree("18");
+    // Recursive listing before and after: preparation adds exactly one
+    // destination directory under the staging parent, nothing in source.
     let parent = isolated_root("18", "staging");
     let source_before = listing(&source_root);
     let mut journal = MemJournal::default();
