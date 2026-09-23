@@ -4,8 +4,9 @@
 //! [`skill_tool_kind`](eliot_agent_bridge_core::skill_transport::skill_tool_kind))
 //! locally through the composition-held Skill driver instead of forwarding
 //! them on the Kernel `local_read` leg (which serves store reads only).
-//! Intake pairs decode to the wire intake and drive install→receipt;
-//! display pairs decode to the wire display request and drive ack→display.
+//! Intake pairs decode to the wire intake and refuse pending the async
+//! canonical acceptance drive (issue #1191, J3); display pairs decode to
+//! the wire display request and drive ack→display.
 //! Every claimed pair settles through a result body — including refusals,
 //! which persist as typed refusal outcomes — so no skill pair can poison the
 //! poller into a crash loop. Only transport and submit-leg failures fail the
@@ -126,18 +127,35 @@ fn drive_inject(composition: &DaemonComposition, arguments: &Value) -> SkillResu
             )));
         }
     };
-    // The injector request borrows the decoded payload; the composition
-    // entry below takes it by value.
-    match composition.skill_inject_hotset(build_inject_request(&payload)) {
-        Ok((_, receipt)) => SkillResultEnvelope::receipt(receipt),
-        Err(error) => SkillResultEnvelope::refused(&error),
-    }
+    // Fail-closed pending the async acceptance drive (issue #1191, J3): the
+    // v2 intake carries its accepted candidate and decodes structurally
+    // above, but without the canonical committed-row lookup no procedure
+    // authority is established here — a wire-claimed Accepted stamp with no
+    // owner backing cannot bind material, provisional or otherwise. The
+    // intake remains a reversible candidate until the acceptance drive
+    // (committed lifecycle row + owner rehydration) lands with the poller
+    // join. The composition below is therefore unreachable from this drive
+    // until that join; it stays for the pending adoption.
+    let _ = (composition, &payload);
+    SkillResultEnvelope::refused(&eliot_skill::SkillError::InvalidField {
+        field: "procedure.acceptance",
+        reason: "candidate intake requires the async canonical acceptance drive, pending the poller join",
+    })
 }
 
+/// Builds the injector request behind one decoded intake.
+///
+/// Pending the async acceptance drive (issue #1191, J3): the sync drive
+/// above refuses candidate intakes before composing, so no live caller
+/// reaches this constructor today. It stays — carrying the decoded
+/// candidate into the injector request — for the pending adoption, which
+/// binds the presented procedure to its committed row before driving.
+#[allow(dead_code)]
 fn build_inject_request(
     payload: &eliot_agent_bridge_core::SkillIntakePayload,
 ) -> crate::SkillHotsetRequest<'_> {
     crate::SkillHotsetRequest {
+        candidate: &payload.candidate,
         package: &payload.package,
         inputs: &payload.inputs,
         context: &payload.context,
@@ -273,7 +291,7 @@ mod tests {
                 session_id: Some("kernel-session-1".to_owned()),
                 task_id: None,
                 work_scope_id: None,
-                payload_schema_id: "eliot.skill.transport/v1".to_owned(),
+                payload_schema_id: "eliot.skill.transport/v2".to_owned(),
                 payload_sha256: "d".repeat(64),
             },
             state_fence: fence(),

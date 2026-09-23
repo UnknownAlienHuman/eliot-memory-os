@@ -87,10 +87,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use eliot_contracts::StateFence;
 use eliot_skill::{
     ActivatedSkillDisplay, CanonicalToolSource, CatalogueInstallContext, HotsetDeliveryAck,
-    HotsetDeliveryReceipt, KnownTools, MaterializationInputs, MaterializationScope, PromotionGate,
-    ReadinessClaims, SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi,
-    SkillLifecycleView, SkillPackage, ToolAliasTable, VersionBoundTools,
-    activation::detect_dependency_staleness,
+    HotsetDeliveryReceipt, KnownTools, MaterializationInputs, MaterializationScope,
+    PortableSkillPackageCandidate, PromotionGate, ReadinessClaims, SkillCandidate, SkillCatalogue,
+    SkillError, SkillLifecycleApi, SkillLifecycleView, SkillPackage, ToolAliasTable,
+    VersionBoundTools, activation::detect_dependency_staleness,
 };
 
 /// Shared handle to the composition-owned Governor Skill catalogue.
@@ -158,11 +158,12 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// returns the installed Skill identity.
     ///
     /// This is the production population caller the runtime composition
-    /// drives: the Governor owner hands over a validated package claim, its
-    /// actual materialization inputs, and the explicit install context, and
-    /// the shared handle records the projected entry under the tool-owner
-    /// existence check. Synchronous: the guard is taken and dropped in a
-    /// closed scope and never crosses an await.
+    /// drives: the Governor owner hands over the accepted candidate, a
+    /// validated package claim, its actual materialization inputs, and the
+    /// explicit install context, and the shared handle records the projected
+    /// entry under the tool-owner existence check after the candidate
+    /// binding. Synchronous: the guard is taken and dropped in a closed
+    /// scope and never crosses an await.
     ///
     /// No in-tree production flow drives the runtime population path yet:
     /// the composition seam
@@ -173,13 +174,14 @@ impl<T> ForwardingSkillLifecycle<T> {
     #[allow(dead_code)]
     pub(crate) fn install_package(
         &self,
+        candidate: &PortableSkillPackageCandidate,
         package: &eliot_skill::SkillPackage,
         inputs: &eliot_skill::MaterializationInputs,
         context: &eliot_skill::CatalogueInstallContext,
         tools: &dyn KnownTools,
     ) -> Result<String, SkillError> {
         let mut catalogue = self.lock_catalogue();
-        eliot_skill::install_package(&mut catalogue, package, inputs, context, tools)
+        eliot_skill::install_package(&mut catalogue, candidate, package, inputs, context, tools)
     }
 
     /// Installs one canonical package source under the versioned canonical
@@ -189,9 +191,10 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// tool owner supplies its [`CanonicalToolSource`] registry view: the
     /// source reports the definition version it binds, `admitted_version`
     /// carries the version the Governor composition admits, and any drift
-    /// fails closed before the shared handle is touched. The Skill-owned
-    /// alias table resolves provider renames to canonical names first.
-    /// Synchronous: the guard is taken and dropped in a closed scope.
+    /// fails closed before the shared handle is touched. The accepted
+    /// candidate the package materializes binds at the Skill boundary. The
+    /// Skill-owned alias table resolves provider renames to canonical names
+    /// first. Synchronous: the guard is taken and dropped in a closed scope.
     ///
     /// No in-tree Governor driver calls the versioned population path yet;
     /// the composition seam
@@ -201,6 +204,7 @@ impl<T> ForwardingSkillLifecycle<T> {
     #[allow(dead_code)]
     pub(crate) fn install_package_versioned(
         &self,
+        candidate: &PortableSkillPackageCandidate,
         package: &eliot_skill::SkillPackage,
         inputs: &eliot_skill::MaterializationInputs,
         context: &eliot_skill::CatalogueInstallContext,
@@ -221,6 +225,7 @@ impl<T> ForwardingSkillLifecycle<T> {
         let mut catalogue = self.lock_catalogue();
         eliot_skill::install_package_versioned(
             &mut catalogue,
+            candidate,
             package,
             inputs,
             context,
@@ -267,6 +272,7 @@ impl<T> ForwardingSkillLifecycle<T> {
     ) -> Result<(String, HotsetDeliveryReceipt), SkillError> {
         check_delivery_fence(&act.scope.work_scope.state_fence, admitted_fence)?;
         let skill_id = self.install_package_versioned(
+            act.candidate,
             act.package,
             act.inputs,
             act.context,
@@ -321,6 +327,7 @@ impl<T> ForwardingSkillLifecycle<T> {
         admitted_fence: &StateFence,
     ) -> Result<(String, HotsetDeliveryReceipt), SkillError> {
         let act = VersionedDeliveryAct {
+            candidate: request.candidate,
             package: request.package,
             inputs: request.inputs,
             context: request.context,
@@ -361,6 +368,7 @@ impl<T> ForwardingSkillLifecycle<T> {
     ) -> Result<(String, HotsetDeliveryReceipt), SkillError> {
         let admitted = payload.context.admitted_definition_version.clone();
         let request = SkillHotsetRequest {
+            candidate: &payload.candidate,
             package: &payload.package,
             inputs: &payload.inputs,
             context: &payload.context,
@@ -635,6 +643,7 @@ impl<T> ForwardingSkillLifecycle<T> {
 /// live admission. Assembled into a [`VersionedDeliveryAct`] by
 /// [`ForwardingSkillLifecycle::inject_hotset`].
 pub struct SkillHotsetRequest<'a> {
+    pub candidate: &'a PortableSkillPackageCandidate,
     pub package: &'a SkillPackage,
     pub inputs: &'a MaterializationInputs,
     pub context: &'a CatalogueInstallContext,
@@ -647,13 +656,14 @@ pub struct SkillHotsetRequest<'a> {
 /// Inputs for one composed versioned delivery act
 /// ([`ForwardingSkillLifecycle::run_install_to_receipt`]).
 ///
-/// Bundles the install boundary (canonical package source, actual inputs,
-/// Governor install context, versioned tool source plus alias table and the
-/// admitted definition version) with the temporal delivery boundary
-/// (provider readiness claims, materialization scope, Hotset identity,
-/// injector approval handle) so the composition drives the whole act in one
-/// call.
+/// Bundles the install boundary (accepted candidate, canonical package
+/// source, actual inputs, Governor install context, versioned tool source
+/// plus alias table and the admitted definition version) with the temporal
+/// delivery boundary (provider readiness claims, materialization scope,
+/// Hotset identity, injector approval handle) so the composition drives the
+/// whole act in one call.
 pub struct VersionedDeliveryAct<'a> {
+    pub candidate: &'a PortableSkillPackageCandidate,
     pub package: &'a eliot_skill::SkillPackage,
     pub inputs: &'a eliot_skill::MaterializationInputs,
     pub context: &'a eliot_skill::CatalogueInstallContext,
@@ -1507,6 +1517,7 @@ mod tests {
     fn versioned_delivery_path_installs_issues_acks_and_displays() {
         let (forwarding, calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let context = install_context();
         let readiness = available_readiness();
         let fence = fence();
@@ -1516,6 +1527,7 @@ mod tests {
         let (skill_id, receipt) = forwarding
             .run_install_to_receipt(
                 VersionedDeliveryAct {
+                    candidate: &candidate,
                     package: &package,
                     inputs: &inputs,
                     context: &context,
@@ -1564,6 +1576,7 @@ mod tests {
     fn versioned_display_driver_acks_under_the_live_source() {
         let (forwarding, calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let context = install_context();
         let readiness = available_readiness();
         let fence = fence();
@@ -1573,6 +1586,7 @@ mod tests {
         let (skill_id, receipt) = forwarding
             .run_install_to_receipt(
                 VersionedDeliveryAct {
+                    candidate: &candidate,
                     package: &package,
                     inputs: &inputs,
                     context: &context,
@@ -1617,6 +1631,7 @@ mod tests {
     fn versioned_display_refuses_definition_drift_before_display() {
         let (forwarding, calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let context = install_context();
         let readiness = available_readiness();
         let fence = fence();
@@ -1626,6 +1641,7 @@ mod tests {
         let (skill_id, receipt) = forwarding
             .run_install_to_receipt(
                 VersionedDeliveryAct {
+                    candidate: &candidate,
                     package: &package,
                     inputs: &inputs,
                     context: &context,
@@ -1688,8 +1704,10 @@ mod tests {
     fn versioned_install_refuses_drifted_source_before_touching_catalogue() {
         let (forwarding, calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let aliases = ToolAliasTable::new();
         let refused = forwarding.install_package_versioned(
+            &candidate,
             &package,
             &inputs,
             &install_context(),
@@ -1713,9 +1731,11 @@ mod tests {
         // drives the full gate order to a provisional receipt, with the
         // Governor owner untouched.
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let fence = fence();
         let payload = eliot_agent_bridge_core::SkillIntakePayload {
             contract_version: eliot_agent_bridge_core::SKILL_TRANSPORT_VERSION,
+            candidate,
             package,
             inputs,
             context: install_context(),
@@ -1746,6 +1766,7 @@ mod tests {
         // entry marks stale, and the display refuses with the stale status.
         let (forwarding, calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let context = install_context();
         let readiness = available_readiness();
         let fence = fence();
@@ -1755,6 +1776,7 @@ mod tests {
         let (skill_id, receipt) = forwarding
             .run_install_to_receipt(
                 VersionedDeliveryAct {
+                    candidate: &candidate,
                     package: &package,
                     inputs: &inputs,
                     context: &context,
@@ -1805,10 +1827,12 @@ mod tests {
         // never admitted it.
         let (forwarding, calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let mut context = install_context();
         context.admitted_definition_version = "9.9.9".to_owned();
         let aliases = ToolAliasTable::new();
         let refused = forwarding.install_package_versioned(
+            &candidate,
             &package,
             &inputs,
             &context,
@@ -1829,12 +1853,14 @@ mod tests {
     fn versioned_install_refuses_tools_absent_from_the_source() {
         let (forwarding, _calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let aliases = ToolAliasTable::new();
         let unknown = VersionedSource {
             version: "1.2.0".to_owned(),
             known: Vec::new(),
         };
         let refused = forwarding.install_package_versioned(
+            &candidate,
             &package,
             &inputs,
             &install_context(),
@@ -1854,6 +1880,7 @@ mod tests {
     fn unavailable_readiness_blocks_receipt_but_keeps_the_install() {
         let (forwarding, _calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let aliases = ToolAliasTable::new();
         let mut readiness = available_readiness();
         readiness.tools[0].availability = Availability::Unavailable {
@@ -1865,6 +1892,7 @@ mod tests {
         let scope_fence = fence();
         let refused = forwarding.run_install_to_receipt(
             VersionedDeliveryAct {
+                candidate: &candidate,
                 package: &package,
                 inputs: &inputs,
                 context: &install_context(),
@@ -1891,6 +1919,7 @@ mod tests {
     fn sealed_omission_blocks_receipt_but_keeps_the_install() {
         let (forwarding, _calls) = versioned_forwarder();
         let (mut package, inputs) = package_source();
+        let candidate = fixture_candidate();
         package.state = eliot_skill::SkillState {
             freshness: eliot_skill::FreshnessState::Stale {
                 reason: "tool-def-1 moved".to_owned(),
@@ -1907,6 +1936,7 @@ mod tests {
         let scope_fence = fence();
         let refused = forwarding.run_install_to_receipt(
             VersionedDeliveryAct {
+                candidate: &candidate,
                 package: &package,
                 inputs: &inputs,
                 context: &install_context(),
@@ -1936,12 +1966,14 @@ mod tests {
     fn composed_delivery_refuses_a_blank_approval_handle() {
         let (forwarding, _calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let aliases = ToolAliasTable::new();
         let readiness = available_readiness();
         let source = canonical_source("1.2.0");
         let scope_fence = fence();
         let refused = forwarding.run_install_to_receipt(
             VersionedDeliveryAct {
+                candidate: &candidate,
                 package: &package,
                 inputs: &inputs,
                 context: &install_context(),
@@ -1965,6 +1997,7 @@ mod tests {
     fn stale_scope_fence_refuses_issuance_before_touching_the_catalogue() {
         let (forwarding, calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let context = install_context();
         let readiness = available_readiness();
         let claimed = fence();
@@ -1980,6 +2013,7 @@ mod tests {
         );
         let refused = forwarding.run_install_to_receipt(
             VersionedDeliveryAct {
+                candidate: &candidate,
                 package: &package,
                 inputs: &inputs,
                 context: &context,
@@ -2007,6 +2041,7 @@ mod tests {
         // receipt, with the Governor owner untouched.
         let (forwarding, calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let context = install_context();
         let readiness = available_readiness();
         let fence = fence();
@@ -2016,6 +2051,7 @@ mod tests {
         let (skill_id, receipt) = forwarding
             .inject_hotset(
                 SkillHotsetRequest {
+                    candidate: &candidate,
                     package: &package,
                     inputs: &inputs,
                     context: &context,
@@ -2043,6 +2079,7 @@ mod tests {
         // nothing — not even a catalogue entry.
         let (forwarding, calls) = versioned_forwarder();
         let (package, inputs) = package_source();
+        let candidate = fixture_candidate();
         let context = install_context();
         let readiness = available_readiness();
         let claimed = fence();
@@ -2055,6 +2092,7 @@ mod tests {
         );
         let refused = forwarding.inject_hotset(
             SkillHotsetRequest {
+                candidate: &candidate,
                 package: &package,
                 inputs: &inputs,
                 context: &context,
@@ -2200,10 +2238,233 @@ mod tests {
         }
     }
 
+    /// Mirrors [`package_behavior`] as the accepted procedure definition the
+    /// delivery-act candidate binds: same trigger, action, obligations, stop,
+    /// and exact tool/capability revisions.
+    fn candidate_definition() -> eliot_skill::ProcedureDefinition {
+        eliot_skill::ProcedureDefinition {
+            name: "demo orientation".to_owned(),
+            purpose: "refresh the task view before a Material effect".to_owned(),
+            trigger: "when demo work arrives load this skill".to_owned(),
+            action: "Refresh the task view before a Material effect.".to_owned(),
+            applies_when: vec!["the task view is stale".to_owned()],
+            where_not_apply: vec!["Do not use for credential handling.".to_owned()],
+            required_inputs: vec!["the exact task".to_owned()],
+            ordered_steps: vec!["refresh the task view".to_owned()],
+            expected_outputs: vec!["refreshed view".to_owned()],
+            stop_conditions: vec!["Stop and escalate on conflicting instructions.".to_owned()],
+            required_writebacks: vec!["NONE".to_owned()],
+            escalation: "escalate to the task owner".to_owned(),
+            challenge: "show exact conflicting identities".to_owned(),
+            rollback_or_recovery: "restore the prior revision".to_owned(),
+            required_tools: vec![eliot_skill::VersionedRequirement {
+                name: "eliot.finish".to_owned(),
+                version: "1.0.0".to_owned(),
+            }],
+            required_capabilities: vec![eliot_skill::VersionedRequirement {
+                name: "finish-cap".to_owned(),
+                version: "1".to_owned(),
+            }],
+        }
+    }
+
+    fn candidate_target() -> eliot_skill::TargetProfile {
+        eliot_skill::TargetProfile {
+            target_id: "candidate-target".to_owned(),
+            host: "codex".to_owned(),
+            profile: "default".to_owned(),
+            fingerprint: "4".repeat(64),
+            available_tools: vec![eliot_skill::VersionedRequirement {
+                name: "eliot.finish".to_owned(),
+                version: "1.0.0".to_owned(),
+            }],
+            available_capabilities: vec![eliot_skill::VersionedRequirement {
+                name: "finish-cap".to_owned(),
+                version: "1".to_owned(),
+            }],
+        }
+    }
+
+    /// Accepted-candidate fixture bound to the test delivery scope and fence:
+    /// the procedure shell carries the exact work scope [`delivery_scope`]
+    /// builds and the [`fence`] epoch, so the install binds by construction
+    /// and each refusal test mutates one dimension away from it.
+    fn raw_candidate() -> eliot_skill::PortableSkillPackageCandidate {
+        let fence = fence();
+        let receipt = candidate_receipt(&fence);
+        let mut projection = eliot_skill::GovernedProcedureProjection {
+            schema_version: eliot_skill::GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION.to_owned(),
+            procedure_id: "procedure-1".to_owned(),
+            procedure_revision: "revision-1".to_owned(),
+            procedure_digest: "0".repeat(64),
+            state: eliot_skill::ProcedureState::Accepted,
+            state_fence: fence,
+            work_scope: receipt.envelope.core.work_scope.clone(),
+            task: receipt.envelope.core.task.clone().expect("task binding"),
+            acceptance_receipt: receipt,
+            definition: candidate_definition(),
+            evidence: eliot_skill::ProcedureEvidence {
+                source_refs: vec!["source-1".to_owned()],
+                receipt_refs: vec!["receipt-evidence-1".to_owned()],
+                applicability_refs: vec!["applicability-1".to_owned()],
+                counterexample_refs: vec!["counterexample-1".to_owned()],
+                negative_trigger_refs: vec!["negative-trigger-1".to_owned()],
+                verifier_artifact_refs: vec!["verifier-artifact-1".to_owned()],
+                rollback_artifact_ref: "rollback-artifact-1".to_owned(),
+            },
+            verifier: eliot_skill::ProcedureVerifier {
+                verifier_ref: "procedure-verifier".to_owned(),
+                verifier_revision: "1.0.0".to_owned(),
+                artifact_refs: vec!["verifier-artifact-1".to_owned()],
+            },
+            safety_privacy_disclosure: eliot_skill::SafetyPrivacyDisclosure {
+                safety_owner_ref: "safety-owner".to_owned(),
+                safety_evidence_refs: vec!["safety-1".to_owned()],
+                privacy_owner_ref: "privacy-owner".to_owned(),
+                privacy_evidence_refs: vec!["privacy-1".to_owned()],
+                disclosure_owner_ref: "disclosure-owner".to_owned(),
+                disclosure_evidence_refs: vec!["disclosure-1".to_owned()],
+            },
+            assets: vec![eliot_skill::InertAsset {
+                asset_ref: "asset-1".to_owned(),
+                sha256: eliot_receipts::sha256_hex(b"asset"),
+                role: "reference".to_owned(),
+                executable: false,
+            }],
+        };
+        projection.procedure_digest = projection.expected_digest().expect("procedure digest");
+        let projected = eliot_skill::project_governed_procedure_to_portable_skill_candidates(
+            &projection,
+            &[candidate_target()],
+        )
+        .expect("projection");
+        assert_eq!(projected.candidates.len(), 1);
+        projected.candidates[0].clone()
+    }
+
+    /// Stamped install candidate: the producer binds the exact materialized
+    /// digests, so the delivery act never sees an unstamped claim. Identity
+    /// is deterministic, matching the raw candidate the package derives
+    /// from above.
+    fn fixture_candidate() -> eliot_skill::PortableSkillPackageCandidate {
+        let (package, inputs) = package_source();
+        eliot_skill::stamp_materialization_digests(&raw_candidate(), &package, &inputs)
+            .expect("fixture stamps")
+    }
+
+    fn candidate_receipt(fence: &StateFence) -> eliot_skill::ReceiptClaim {
+        let request_id = eliot_contracts::RequestId::new("request-1").expect("request id");
+        let task_id = eliot_contracts::TaskId::new("task-1").expect("task id");
+        let metadata = eliot_receipts::RequestMetadata {
+            request_id: request_id.clone(),
+            session_id: Some(eliot_contracts::SessionId::new("session-1").expect("session id")),
+            task_id: Some(task_id),
+            product_id: ProductId::new("test-product").expect("product id"),
+            source_id: eliot_contracts::SourceId::new("source-1").expect("source id"),
+            state_fence: fence.clone(),
+            clock: eliot_contracts::ClockReading {
+                valid_time_ms: Some(10),
+                known_time_ms: Some(11),
+                transaction_sequence: Some(eliot_contracts::TransactionSequence::genesis()),
+                monotonic_ns: Some(12),
+            },
+        };
+        let verifier_artifact_id =
+            eliot_contracts::ArtifactId::new("verifier-artifact-1").expect("artifact id");
+        let rollback_artifact_id =
+            eliot_contracts::ArtifactId::new("rollback-artifact-1").expect("artifact id");
+        let core = eliot_receipts::ReceiptCore {
+            contract: eliot_receipts::contract_identity().expect("receipt contract"),
+            kind: eliot_receipts::ReceiptKind::Verification,
+            work_scope: eliot_receipts::WorkScopeBinding {
+                scope_id: eliot_receipts::WorkScopeId::new("workscope-1")
+                    .expect("valid test scope"),
+                product_id: ProductId::new("test-product").expect("test product"),
+                resource_generation: ResourceGeneration::new(1).expect("test generation"),
+                state_fence: fence.clone(),
+            },
+            task: Some(eliot_receipts::TaskBinding {
+                task_id: eliot_contracts::TaskId::new("task-1").expect("task id"),
+                task_revision: eliot_contracts::TaskRevision::genesis(),
+                state_fence: fence.clone(),
+            }),
+            session: Some(eliot_receipts::SessionBinding {
+                session_id: eliot_contracts::SessionId::new("session-1").expect("session id"),
+                authority_epoch: fence.authority_epoch.clone(),
+                state_fence: fence.clone(),
+            }),
+            causal: eliot_receipts::CausalBinding {
+                state_fence: fence.clone(),
+                transaction_sequence: eliot_contracts::TransactionSequence::genesis(),
+                parent_receipt_id: None,
+                predecessor_receipt_ids: Vec::new(),
+            },
+            request: eliot_receipts::RequestBinding {
+                metadata,
+                state_fence: fence.clone(),
+            },
+            operation: eliot_receipts::OperationBinding {
+                operation_id: eliot_contracts::OperationId::new("operation-1")
+                    .expect("operation id"),
+                request_id,
+                idempotency_key: "accept-procedure".to_owned(),
+                operation_kind: "procedure.accept".to_owned(),
+                effect: eliot_receipts::EffectClass::Read,
+                state_fence: fence.clone(),
+            },
+            authority: eliot_receipts::AuthorityBinding {
+                authority_id: eliot_contracts::ContractId::new("authority-1")
+                    .expect("authority id"),
+                authority_owner: "governor.skill".to_owned(),
+                authority_epoch: fence.authority_epoch.clone(),
+                state_fence: fence.clone(),
+                allowed_effect: eliot_receipts::EffectClass::Read,
+                proof_ceiling: eliot_receipts::ProofCeiling::ScopedVerification,
+            },
+            artifacts: vec![
+                eliot_receipts::ArtifactBinding {
+                    artifact_id: verifier_artifact_id.clone(),
+                    sha256: eliot_receipts::sha256_hex(b"accepted-procedure"),
+                    role: eliot_receipts::ReceiptKind::Artifact,
+                    source_revision: Some("revision-1".to_owned()),
+                },
+                eliot_receipts::ArtifactBinding {
+                    artifact_id: rollback_artifact_id,
+                    sha256: eliot_receipts::sha256_hex(b"rollback-procedure"),
+                    role: eliot_receipts::ReceiptKind::Artifact,
+                    source_revision: Some("revision-1".to_owned()),
+                },
+            ],
+            verifier: Some(eliot_receipts::VerifierBinding {
+                verifier_id: eliot_contracts::ContractId::new("procedure-verifier")
+                    .expect("verifier id"),
+                verifier_revision: eliot_contracts::ContractVersion::new(1, 0, 0),
+                artifact_ids: vec![verifier_artifact_id],
+                proof_ceiling: eliot_receipts::ProofCeiling::ScopedVerification,
+                state_fence: fence.clone(),
+            }),
+            problem: None,
+            coordination: None,
+            disposition: eliot_receipts::ReceiptDisposition::Success {
+                proof: eliot_receipts::ProofCeiling::ScopedVerification,
+            },
+        };
+        let envelope = eliot_receipts::ReceiptEnvelope::issue(core).expect("accepted receipt");
+        eliot_skill::ReceiptClaim {
+            evidence_ref: "receipt-evidence-1".to_owned(),
+            envelope,
+        }
+    }
+
     fn package_source() -> (
         eliot_skill::SkillPackage,
         eliot_skill::MaterializationInputs,
     ) {
+        // Behavior and host are the accepted candidate's own: the mapper
+        // derives them from the definition and target below, so the binding
+        // the delivery act enforces holds by construction here. The stamped
+        // install candidate comes from `fixture_candidate`.
+        let candidate = raw_candidate();
         let inputs = package_inputs();
         let rule: eliot_skill::AdvisoryRuleClaim = serde_json::from_value(serde_json::json!({
             "rule_ref": { "rule_id": "rule-demo-1", "revision": 1 }
@@ -2217,24 +2478,8 @@ mod tests {
             )
             .expect("valid test registration"),
             digests: eliot_skill::PackageDigests::derive(&inputs).expect("valid test inputs"),
-            host: eliot_skill::HostProfile {
-                host: "codex".to_owned(),
-                profile: "default".to_owned(),
-                required_tools: vec![eliot_skill::VersionedRequirement {
-                    name: "eliot.finish".to_owned(),
-                    version: "1.0.0".to_owned(),
-                }],
-                required_capabilities: vec![eliot_skill::VersionedRequirement {
-                    name: "finish-cap".to_owned(),
-                    version: "1".to_owned(),
-                }],
-                limits: eliot_skill::HostLimits {
-                    max_description_chars: 500,
-                    max_actions: 1,
-                    max_expansion_handles: 2,
-                },
-            },
-            behavior: package_behavior(),
+            host: candidate.host.clone(),
+            behavior: candidate.behavior.clone(),
             counters: eliot_skill::SkillCounters::default(),
             state: eliot_skill::SkillState {
                 freshness: eliot_skill::FreshnessState::Current,
@@ -2285,8 +2530,14 @@ mod tests {
         };
         let forwarding = ForwardingSkillLifecycle::new(inner);
         let (package, inputs) = package_source();
-        let installed =
-            forwarding.install_package(&package, &inputs, &install_context(), &InstallTools);
+        let candidate = fixture_candidate();
+        let installed = forwarding.install_package(
+            &candidate,
+            &package,
+            &inputs,
+            &install_context(),
+            &InstallTools,
+        );
         assert_eq!(installed.expect("package install"), "skill-demo");
         let handle = forwarding.catalogue.clone();
         (forwarding, calls, handle)
