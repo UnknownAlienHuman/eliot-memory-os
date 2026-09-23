@@ -55,12 +55,13 @@ use eliot_backup::{
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ors::{
-    JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES, MAX_JOURNAL_PAYLOAD_BYTES, MAX_RECOVERY_PAGE,
-    OperationalControlProjection, OperationalRecoveryStore, RecoveryCursor,
-    RESTORE_JOURNAL_RECORD_SCHEMA, OperationIdentity, OrsError, RedbRecoveryStore,
-    RestoreJournalArchiveClass, RestoreJournalOperation, RestoreJournalResult,
-    RestoreJournalStreamBinding, SessionBindingReceipt, SessionDetach, SupervisionLeaseSnapshot,
-    UserBrokerFence, UserBrokerRegistrationReceipt,
+    CapabilityIntroductionProjection, JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES,
+    MAX_JOURNAL_PAYLOAD_BYTES, MAX_RECOVERY_PAGE, OperationalControlProjection,
+    OperationalPhase, OperationalRecoveryStore, RecoveryCursor, RESTORE_JOURNAL_RECORD_SCHEMA,
+    OperationIdentity, OrsError, RedbRecoveryStore, RestoreJournalArchiveClass,
+    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding,
+    SessionBindingReceipt, SessionDetach, SupervisionLeaseSnapshot, UserBrokerFence,
+    UserBrokerRegistrationReceipt,
 };
 
 /// Stable identity of the restore-journal stream namespace for admission
@@ -928,6 +929,63 @@ impl KernelRestoreJournal {
                     .then(|| row.payload.clone())
             })
             .ok_or(BackupError::RestoreJournalCorrupt)
+    }
+
+    /// Verifies console-presented capability introductions against live
+    /// owner/ORS readback (F-AUR-1).
+    ///
+    /// For every presented row, reloads the current introduction row from
+    /// the operational ORS owner by subject identity and requires: the row
+    /// exists (a presented row the owner does not hold refuses); the live
+    /// phase is `Fenced` and matches the presented phase (a live `Active`
+    /// row means prior authority is still live and refuses); the subject
+    /// identity matches; the live fence snapshot equals the presented one;
+    /// and the live operation order is at least the presented order (the
+    /// presented readback may lag a same-phase advance, never lead it).
+    /// An empty presented list verifies vacuously: a restore with no
+    /// capability introductions has nothing to compare. The loader validates
+    /// opaque record, key, kind, subject, phase, and store-issued receipt
+    /// internally, so only owner-issued rows can satisfy this gate — caller
+    /// bytes alone never suffice.
+    pub fn verify_introductions_fenced(
+        &self,
+        presented: &[CapabilityIntroductionProjection],
+    ) -> Result<(), KernelRestoreError> {
+        use eliot_ors::OperationalRecoveryStore as _;
+        for introduction in presented {
+            if introduction.phase() != OperationalPhase::Fenced {
+                return Err(KernelRestoreError::OwnerEvidenceInvalid(
+                    "presented introduction is not fenced".to_owned(),
+                ));
+            }
+            let subject = introduction.record().subject_id.clone();
+            let live =
+                self.store
+                    .load_capability_introduction(&subject)
+                    .map_err(map_ors_to_kernel)?
+                    .ok_or(KernelRestoreError::OwnerEvidenceInvalid(
+                        "presented introduction has no owner row".to_owned(),
+                    ))?;
+            if live.phase() != OperationalPhase::Fenced {
+                return Err(KernelRestoreError::OwnerEvidenceInvalid(
+                    "live introduction authority is still active".to_owned(),
+                ));
+            }
+            if live.phase() != introduction.phase()
+                || live.record().subject_id != subject
+                || live.record().state_fence != introduction.record().state_fence
+            {
+                return Err(KernelRestoreError::OwnerEvidenceInvalid(
+                    "live introduction diverges from the presented row".to_owned(),
+                ));
+            }
+            if live.operation_order() < introduction.operation_order() {
+                return Err(KernelRestoreError::OwnerEvidenceInvalid(
+                    "presented introduction order leads the live owner row".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Reads the current authoritative committed lease projection from the

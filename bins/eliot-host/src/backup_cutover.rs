@@ -498,6 +498,16 @@ pub fn validate_cutover_request(
     {
         return Err(CutoverError::PriorAuthorityStillActive);
     }
+    // F-AUR-1 architectural split (documented, not a relabel): the shape
+    // check above rejects malformed evidence early, but console-presented
+    // rows are NEVER trusted from spelling. The authoritative live compare
+    // (subject identity, fence snapshot, operation order, Fenced phase
+    // against owner/ORS readback) runs kernel-side in the restore dispatch
+    // (`KernelRestoreJournal::verify_introductions_fenced`, called by
+    // `drive_production_restore` after mint and before any effect); cutover
+    // additionally requires the restore receipt chain binding that verified
+    // restore. A rest presented here without that chain fails below at the
+    // receipt/denominator gates.
     if !evidence.destination_ready {
         return Err(CutoverError::AuthorityOrReadinessMissing);
     }
