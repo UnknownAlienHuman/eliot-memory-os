@@ -1,0 +1,8 @@
+{
+  "transaction_id": "tx-957-fixture",
+  "source_archive_id": "archive-957-fixture",
+  "archive_class": "full_recovery",
+  "destination_ref": "dest-957-fixture",
+  "writer_id": "writer-957-fixture",
+  "writer_fence_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+}
