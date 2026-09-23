@@ -1,0 +1,31 @@
+[package]
+name = "eliot-dreamer-memory-revision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Advisory negative-memory extinction candidates over exact failure fingerprints with closure denominators (#223)"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "IMPLEMENTED_PROTOTYPE"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.dreamer.memory_revision"
+freeze_ref = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+source_layer = "C1"
+agent_order = 79
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-context-contracts = { path = "../eliot-context-contracts", version = "0.1.0" }
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts", version = "0.1.0" }
+eliot-observation-contracts.workspace = true
+schemars = { version = "1.2.1", features = ["derive"] }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
