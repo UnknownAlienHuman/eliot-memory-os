@@ -665,15 +665,20 @@ pub fn execute_cutover(
     // ORS owner through the authenticated Kernel front door, then require
     // exact subject-set equality with the presented set — any omitted live
     // subject or surprise presented subject (including an unjustified empty
-    // list against live rows) refuses. Per subject, in row-lifecycle order:
-    // live+Fenced/presented+Fenced requires byte-exact fence and order
-    // (fenced rows are immutable); live+Fenced/presented+Active allows a
-    // legitimate fencing race (live order at least presented order);
-    // live+Active of any presentation refuses (prior authority still live);
-    // and every live row must read Fenced for cutover (no live authority
-    // may survive retirement). Single-installation deployment is the
-    // documented scope premise: one operational store holds one
-    // installation's rows.
+    // list against live rows) refuses. Scope derivation: one operational
+    // store holds one installation's rows (source and destination are exact
+    // different installation/store identities per #952/#961; Kernel-owned
+    // ORS is per-installation per I1.2/I05.2), so full enumeration IS the
+    // operation scope — no cross-installation rows can occur, and lineage
+    // namespaces are deliberately not compared across the disjoint ORS
+    // opaque-label / contract-UUID domains (I6.10). Per subject, in
+    // row-lifecycle order: live+Fenced/presented+Fenced requires byte-exact
+    // fence and order (fenced rows are immutable); live+Fenced/presented+
+    // Active allows a legitimate fencing race (live order at least presented
+    // order); live+Active of any presentation refuses (prior authority still
+    // live); and every live row must read Fenced for cutover (no live
+    // authority may survive retirement, joining the barrier-proven lease
+    // quiescence and the registry CAS).
     let presented = &validated.evidence.fenced_introductions;
     // B1 bound discipline: the owner refuses limits above
     // `MAX_RECOVERY_PAGE`, so the query carries exactly that bound (never

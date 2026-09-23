@@ -2093,6 +2093,21 @@ impl CapabilityIntroductionProjection {
 /// Verifies a presented capability-introduction set against the live
 /// owner-enumerated set (issues #959/#960/#962/#975 cutover completeness).
 ///
+/// Scope derivation (canonical, not global-table overreach): one
+/// operational store holds one installation's rows (source and destination
+/// are exact different installation/store identities per #952/#961, and the
+/// Kernel-owned ORS is per-installation per I1.2/I05.2) — so the live
+/// full enumeration IS the operation scope; no cross-installation rows can
+/// occur. Lineage-namespace comparison across ORS opaque labels and
+/// contract UUIDs is deliberately NOT used for scoping: the namespaces are
+/// disjoint by design (I6.10 exact-match would be violated by equating
+/// them). Quiescence chain: cutover requires barrier-proven lease
+/// quiescence plus registry CAS plus this gate, so no live session can
+/// exercise an introduction the gate passes; stale rows of dead epochs
+/// either read Fenced (harmless, must still be presented exactly) or
+/// Active (refused — surfacing prior-retirement debt, never silently
+/// dropped).
+///
 /// Exact subject-set equality first: any omitted live subject or surprise
 /// presented subject refuses — an empty presented list passes only against
 /// a genuinely empty live set, so unjustified emptiness can never verify.
