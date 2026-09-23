@@ -1140,6 +1140,29 @@ impl EvalMeasurementService {
     }
 
     pub fn measure(_case: &EvalCase, spec: &EvalMeasurementSpec) -> EvalMeasurementResult {
+        // Structural self-check with a real observation (issue #1922):
+        // MustBlockAction carries the action under test in
+        // `expected_ref` (see the `block()` fixture constructor) and the
+        // runner owns the production block gate, so the measurement
+        // observes the gate's actual decision instead of matching a
+        // declaration. Every other kind lacks a reachable runtime input
+        // (no artifact, registry, or suite/manifest in scope) and stays
+        // honestly NotYetImplemented; the integrity gate below keeps the
+        // case NYI regardless until measured validity exists.
+        if spec.kind == EvalMeasurementKind::MustBlockAction {
+            if let Some(action) = spec.expected_ref.as_deref() {
+                let blocked = EvalRunnerService::mutation_attempt_blocked(action);
+                return EvalMeasurementResult {
+                    measurement_id: spec.measurement_id.clone(),
+                    passed: blocked,
+                    observed: format!(
+                        "structural self-check: runner gate {} action {action:?}",
+                        if blocked { "blocked" } else { "permitted" },
+                    ),
+                    evidence_refs: Vec::new(),
+                };
+            }
+        }
         let (passed, observed, evidence_refs) = match spec.kind {
             EvalMeasurementKind::MustIncludeEvidence
             | EvalMeasurementKind::MustExcludeEvidence
@@ -1416,7 +1439,30 @@ impl EvalComparisonService {
             })
             .map(|result| result.eval_case_id.to_string())
             .collect::<Vec<_>>();
-        let verdict = comparison_verdict(&family_deltas, candidate_run.status);
+        let verdict = {
+            // Automatic stale invalidation (issue #1922): a candidate run
+            // whose retained fingerprint sets predate current evaluator
+            // identity — or predate retention entirely (unknown
+            // provenance is non-evidence per contract) — cannot support a
+            // fresh comparison verdict, so the comparison is Inconclusive
+            // and gates block it unless they allow inconclusive. Fresh
+            // runs always carry current fingerprints and flow unchanged;
+            // the baseline side carries no retained fingerprints (scores,
+            // verdict, and git/manifest lineage only), so baseline-side
+            // staleness remains a documented future interface.
+            let current = current_eval_fingerprints();
+            let stale_inputs = candidate_run.case_results.iter().any(|result| {
+                match &result.integrity_fingerprints {
+                    None => true,
+                    Some(recorded) => recorded.is_stale_against(&current),
+                }
+            });
+            if stale_inputs {
+                EvalComparisonVerdict::Inconclusive
+            } else {
+                comparison_verdict(&family_deltas, candidate_run.status)
+            }
+        };
         EvalCandidateComparison {
             comparison_id: format!("eval-comparison-{}", WriteId::new_v7()),
             suite_id: suite.eval_suite_id.to_string(),
