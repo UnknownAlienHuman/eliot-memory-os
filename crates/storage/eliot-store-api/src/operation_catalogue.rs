@@ -407,10 +407,14 @@ struct ActivatedMutationDescriptor {
 /// `CommitExperienceBank` and `CommitAgentFeedback` persist `Candidate`
 /// through the `CaptureCandidate` family (issue #223: Store-owned durable
 /// experience-bank/feedback rows with the closed experience typed
-/// contract). All fifteen address no scope, mirroring the scope-free read
+/// contract). All sixteen address no scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 15] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 16] = [
+/// snapshots with the closed reactive typed contract); `ApplyUserAutomationState`
+/// persists `ReversibleMutation` through the `UserAutomation` family (issue
+/// #1779: Store-owned durable operator-automation persistence with the closed
+/// automation typed contract); `CommitExperienceBank` and `CommitAgentFeedback`
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -501,6 +505,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 15] = [
         maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordRestoreCoordination,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
 ];
 
 fn read_entry_spec(descriptor: &ActivatedReadDescriptor) -> OperationManifestSpec {
@@ -565,7 +575,8 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
 /// Declaration order is the canonical order: the seventeen activated reads, the
-/// fifteen activated mutations, then the genesis bootstrap entry. Generation is
+/// Declaration order is the canonical order: the seventeen activated reads, the
+/// sixteen activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -821,6 +832,10 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::CommitAgentFeedback => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::validate_experience_mutation_params(command.operation, &command.parameters)?;
+            }
+            NamedMutationOperation::RecordRestoreCoordination => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::validate_coordination_mutation_params(&command.parameters)?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
