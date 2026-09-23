@@ -79,6 +79,27 @@ pub enum NotifyFallbackEnsure {
     },
 }
 
+impl NotifyFallbackEnsure {
+    /// Diagnostic projection of the outcome for the broker `Ready` channel
+    /// (I11.7: failed delivery remains visible). Carries only the stable
+    /// state and, when deferred, the stable reason code — never task names,
+    /// digests, paths, or payloads.
+    #[must_use]
+    pub fn status_value(&self) -> serde_json::Value {
+        match self {
+            Self::Registered { .. } => {
+                serde_json::json!({"state": "registered"})
+            }
+            Self::SkippedNoDeclaration => {
+                serde_json::json!({"state": "skipped_no_declaration"})
+            }
+            Self::Deferred { reason } => {
+                serde_json::json!({"state": "deferred", "reason": reason})
+            }
+        }
+    }
+}
+
 /// Ensures fallback registration through the injected effect seam.
 ///
 /// Absence skips explicitly; registration failure defers with a stable code.
