@@ -1293,16 +1293,19 @@ async fn verify_destination_record(
 ///
 /// Explicit deployment-owner entrypoint, never implicit: it connects the
 /// dedicated destination session on the same provider generation, then
-/// either provisions an empty destination (admitted v2 baseline, shared
-/// fence at genesis sequences, fenced non-serving admission record) in
-/// one atomic transaction, or verifies an already-provisioned destination
-/// and creates a missing admission record under the fence guard. Identity
-/// mismatch replays; anything else conflicts. The serving database can
-/// never be provisioned as a destination. Domain tables owned by other
-/// lanes (notification, automation, reactive, erasure) are not claimed
-/// here: restores touching tables the destination lacks refuse per member
-/// at classify time, so deployment provisions those through their owners
-/// first.
+/// either provisions an empty destination (admitted v2 baseline, the
+/// owner-approved domain tables, shared fence at genesis sequences,
+/// fenced non-serving admission record) in one atomic transaction, or
+/// verifies an already-provisioned destination, creates a missing
+/// admission record under the fence guard, and brings wholly-absent
+/// domain blocks to the full table set. Identity mismatch replays;
+/// anything else conflicts. The serving database can never be
+/// provisioned as a destination. Domain tables apply verbatim from the
+/// schema owners' additive DDL consts (erasure #1712, notification #1780,
+/// reactive #1941 C4, automation #1779) without reinterpreting their
+/// semantics; automation failure tables have no owner DDL anywhere
+/// in-tree and stay fail-closed per member until the #1779 owner
+/// provides it.
 pub(crate) async fn provision_restore_destination(
     adapter: &crate::SurrealStoreAdapter,
     dest_store_id: &str,
@@ -1338,6 +1341,25 @@ pub(crate) async fn provision_restore_destination(
         }));
     }
     state_fence.validate().map_err(StoreError::Foundation)?;
+    // Domain tables are applied verbatim from the owner-approved additive
+    // DDL below; a non-additive domain body refuses before any provider
+    // I/O, mirroring the migration handlers' destructive-statement guard.
+    for ddl in [
+        schema::ERASURE_TABLES_DDL,
+        schema::NOTIFICATION_TABLES_DDL,
+        schema::REACTIVE_TABLES_DDL,
+        schema::AUTOMATION_TABLES_DDL,
+    ] {
+        let lowered = ddl.trim().to_ascii_lowercase();
+        if lowered.contains("drop ")
+            || lowered.contains("delete ")
+            || lowered.contains("remove ")
+        {
+            return Err(AdapterError::Config(
+                "destination domain DDL is not additive".to_owned(),
+            ));
+        }
+    }
     let db = super::client(adapter).await?;
     super::ensure_ready(adapter, db).await?;
     let prose_pinned = super::backup_snapshot::provider_prose_pinned(adapter);
@@ -1398,7 +1420,12 @@ pub(crate) async fn provision_restore_destination(
                 cutover_authority,
                 prose_pinned,
             )
-            .await
+            .await?;
+            // A destination provisioned before domain tables were covered
+            // is brought to the full table set without touching rows:
+            // wholly-absent blocks apply atomically, partial blocks
+            // refuse for deployment reconciliation.
+            ensure_domain_tables(&dest, prose_pinned).await
         }
     }
 }
@@ -1491,6 +1518,20 @@ async fn provision_empty_destination(
     sql.push_str(schema::SCHEMA_DDL_V2.trim());
     sql.push(' ');
     sql.push_str(schema::RESTORE_DESTINATION_DDL.trim());
+    sql.push(' ');
+    // Destination-domain tables applied verbatim from the owner-approved
+    // additive DDL (erasure #1712, notification #1780, reactive #1941 C4,
+    // automation #1779): the destination becomes a superset of every
+    // provisionable live table, so restores never meet a missing domain
+    // table the source capture contains. Automation failure tables have
+    // no owner DDL and stay fail-closed per member.
+    sql.push_str(schema::ERASURE_TABLES_DDL.trim());
+    sql.push(' ');
+    sql.push_str(schema::NOTIFICATION_TABLES_DDL.trim());
+    sql.push(' ');
+    sql.push_str(schema::REACTIVE_TABLES_DDL.trim());
+    sql.push(' ');
+    sql.push_str(schema::AUTOMATION_TABLES_DDL.trim());
     sql.push(' ');
     sql.push_str(schema::TX_CREATE_FENCE);
     sql.push(' ');
@@ -1626,6 +1667,126 @@ async fn ensure_destination_record(
         }
         Err(_) => Err(AdapterError::PartialOutcome),
     }
+}
+
+/// Ensures the destination-domain tables on an already-provisioned
+/// destination without touching rows.
+///
+/// Each owner block (erasure, notification, reactive, automation) is
+/// probed table by table: a wholly-absent block applies atomically from
+/// the owner-approved additive DDL, a complete block is left alone, and a
+/// partially-applied block refuses with `MigrationRequired` so deployment
+/// reconciles it explicitly instead of the restore path guessing.
+/// Automation failure tables have no owner DDL and are never invented
+/// here; members naming them stay fail-closed per member at classify
+/// time.
+async fn ensure_domain_tables(
+    dest: &RestoreDestinationTransport,
+    prose_pinned: bool,
+) -> Result<(), AdapterError> {
+    ensure_domain_block(
+        dest,
+        &[schema::table::ERASURE_INTENT, schema::table::ERASURE_OUTCOME],
+        schema::ERASURE_TABLES_DDL,
+        prose_pinned,
+    )
+    .await?;
+    ensure_domain_block(
+        dest,
+        &[schema::table::NOTIFICATION_RECORD],
+        schema::NOTIFICATION_TABLES_DDL,
+        prose_pinned,
+    )
+    .await?;
+    ensure_domain_block(
+        dest,
+        &[
+            schema::table::REACTIVE_SESSION,
+            schema::table::RESOURCE_SNAPSHOT,
+        ],
+        schema::REACTIVE_TABLES_DDL,
+        prose_pinned,
+    )
+    .await?;
+    ensure_domain_block(
+        dest,
+        &[
+            schema::table::AUTOMATION_REVISION,
+            schema::table::AUTOMATION_CURRENT,
+            schema::table::AUTOMATION_INVOCATION,
+        ],
+        schema::AUTOMATION_TABLES_DDL,
+        prose_pinned,
+    )
+    .await
+}
+
+/// Probes one destination table: present (even when empty) or absent. An
+/// unprovisioned table refuses nothing by itself here — the caller
+/// decides per block. Any other error class keeps the reconciling
+/// disposition.
+async fn probe_destination_table(
+    dest: &RestoreDestinationTransport,
+    table: &str,
+    prose_pinned: bool,
+) -> Result<bool, AdapterError> {
+    // Table names are closed crate constants at every call site, mirroring
+    // the established capture-query pattern; the statement carries no
+    // caller content.
+    let mut response = dest
+        .query(
+            "backup.restore",
+            &format!("SELECT VALUE id FROM {table} LIMIT 1;"),
+            Map::new(),
+        )
+        .await?;
+    let errors = response.take_errors();
+    if errors.is_empty() {
+        return Ok(true);
+    }
+    if prose_pinned
+        && errors.iter().all(|error| {
+            super::backup_snapshot::is_absent_table_pinned(error, table, prose_pinned)
+        })
+    {
+        return Ok(false);
+    }
+    Err(AdapterError::PartialOutcome)
+}
+
+/// Applies one wholly-absent owner block atomically, or leaves a
+/// complete block alone. Partial application refuses: the block's tables
+/// are always written together, so a partial set means out-of-band
+/// interference the restore path must not paper over.
+async fn ensure_domain_block(
+    dest: &RestoreDestinationTransport,
+    tables: &[&str],
+    ddl: &str,
+    prose_pinned: bool,
+) -> Result<(), AdapterError> {
+    let mut absent = 0_usize;
+    for table in tables {
+        if !probe_destination_table(dest, table, prose_pinned).await? {
+            absent += 1;
+        }
+    }
+    if absent == 0 {
+        return Ok(());
+    }
+    if absent != tables.len() {
+        return Err(AdapterError::MigrationRequired);
+    }
+    let mut sql = String::from(schema::TX_BEGIN);
+    sql.push_str(ddl.trim());
+    sql.push(' ');
+    sql.push_str(schema::TX_COMMIT);
+    let mut response = dest
+        .query_write("backup.restore", &sql, Map::new())
+        .await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    Ok(())
 }
 
 /// Verifies restored records stayed connected to the destination heads

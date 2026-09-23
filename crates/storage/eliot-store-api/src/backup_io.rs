@@ -475,6 +475,18 @@ pub const RESTORE_OPERATION_CLASS: &str = "backup.restore";
 /// repeats the digest in the restore receipt. The bridge never mints,
 /// widens, or reinterprets this admission: without it the restore is not
 /// admitted at all.
+///
+/// Minter gap (exact): the Governor-side minter (#959/#960) does not
+/// exist yet, so no caller can honestly produce this admission today and
+/// no restore can be admitted. What this contract verifies: closed shape,
+/// fixed class markers, identity/destination/fence/denominator/snapshot
+/// cross-bindings against the request and scope, and equality of the
+/// recomputed decision digest. What it cannot supply: the admission
+/// itself — minting stays with the Governor owner and must arrive through
+/// it, never through session capability, reserved-write relabeling, or a
+/// caller-fabricated digest (a self-consistent fabrication passes shape
+/// only and proves no admission). Verification here is deliberately not
+/// weakened to fake admittability.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreRestoreAdmission {
