@@ -772,7 +772,21 @@ impl CanonicalStoreImportClient {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         admission: &KernelRestoreAdmission,
         decision: &CoordinationDecision,
+        journal: &KernelRestoreJournal,
+        introductions: &[CapabilityIntroductionProjection],
     ) -> Result<(WriteReceipt, String), OwnerChannelError> {
+        self.gate(verified)?;
+        // F-AUR-1 commit-level gate (not relabelable, not bypassable by
+        // calling this method directly): the console-presented
+        // introductions are compared against live owner/ORS readback by
+        // the journal owner HERE, before any row commits — so every
+        // committed coordination row implies verified introductions, and
+        // the cutover-side receipt binding below rests on that invariant,
+        // not on receipt shape alone.
+        journal
+            .verify_introductions_fenced(introductions)
+            .map_err(super::backup_restore_ports::kernel_to_backup)
+            .map_err(OwnerChannelError::Backup)?;
         self.gate(verified)?;
         transition
             .validate()

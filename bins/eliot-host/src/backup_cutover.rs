@@ -511,17 +511,16 @@ pub fn validate_cutover_request(
     {
         return Err(CutoverError::PriorAuthorityStillActive);
     }
-    // F-AUR-1 cutover-side binding (no relabel bypass): the presented
-    // introductions above are shape-checked only. The authoritative live
-    // compare ran kernel-side at restore time
-    // (`KernelRestoreJournal::verify_introductions_fenced`, mandatory in
-    // the gated restore dispatch before any effect), and coordination rows
-    // commit only through that gated dispatch. This gate therefore requires
-    // the bridge-issued coordination receipt bound to THIS restore: a
-    // structurally valid, committed receipt whose operation identity, row
-    // key, and fence all match. Only the canonical store bridge can mint
-    // such a receipt, so its presence proves the introductions passed the
-    // live gate; console bytes alone never suffice.
+    // F-AUR-1 cutover-side binding (enforced invariant, not relabeling):
+    // the presented introductions above are shape-checked only, but the
+    // coordination receipt below is sound evidence because EVERY committed
+    // coordination row passes the journal-owner live readback INSIDE
+    // `commit_coordination_row` (subject/fence/order/phase vs owner/ORS,
+    // unconditional — no direct-commit bypass exists: the single call site
+    // threads the presented list). A structurally valid, committed receipt
+    // bound to this restore identity/row-key/fence therefore proves its
+    // introductions passed the live gate. Only the canonical store bridge
+    // can mint such a receipt; console bytes alone never suffice.
     evidence
         .coordination_receipt
         .validate()

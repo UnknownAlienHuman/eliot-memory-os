@@ -219,6 +219,8 @@ pub async fn drive_production_restore(
             coord_orderings,
             &admission,
             &decision,
+            journal,
+            &introductions,
         )
         .await?;
     let mut outcomes = Vec::with_capacity(imports.len());
