@@ -17,8 +17,8 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_influence::{
-    decide, revoke, InfluenceDisposition, InfluenceEdge, InfluenceLevel, InfluencePolicy,
-    InfluenceReason, InfluenceRequest, ProvenanceRecord, RevocationRequest,
+    InfluenceDisposition, InfluenceEdge, InfluenceLevel, InfluencePolicy, InfluenceReason,
+    InfluenceRequest, ProvenanceRecord, RevocationRequest, decide, revoke,
 };
 use eliot_security_contracts::{
     CompetenceLevel, EffectCeiling, EpistemicUse, FreshnessStatus, IndependenceLevel,
