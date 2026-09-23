@@ -216,9 +216,9 @@ const _: () = assert!(
 /// Reads beyond the bound fail closed with
 /// [`StoreError::PayloadTooLarge`](crate::StoreError) instead of
 /// truncating silently: a truncated audit range cannot prove journal
-/// completeness, so partial success is never reported. Multi-page
-/// enumeration is follow-up work, like the memory provider single-read
-/// contract.
+/// completeness, so partial success is never reported. Larger journals
+/// page forward with the opaque `cursor` selector (fence-bound,
+/// owner-verified); the bound applies per page, unchanged.
 pub const MAX_AUDIT_RANGE_RECORDS: u32 = 32;
 
 /// Compile-time guard for the bound above: the worst case (every
