@@ -19,7 +19,8 @@ use super::{
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
     AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, ContractId,
     DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
-    GenerationRoute, GenerationRouter, HealthVector, IpcImplementation, KernelBuildError,
+    GenerationRoute, GenerationRouter, HealthVector, IpcImplementation, KernelBackupRestore,
+    KernelBuildError,
     KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
     KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
     ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
@@ -1081,6 +1082,12 @@ impl KernelComposition {
                 })?
                 .note_blob_degraded();
         }
+        // Issue #960: hold the Kernel-owned production restore adapter on
+        // the composition. The adapter binds the work root only; the durable
+        // journal is injected per execution by production composition (#962),
+        // so no second database is opened here and unrelated Kernel work is
+        // unaffected while no restore executes.
+        let backup_restore = KernelBackupRestore::bind(work_root.clone());
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.
@@ -1128,6 +1135,7 @@ impl KernelComposition {
             approved_config_hash,
             canonical_store_claimed: AtomicBool::new(false),
             blob_store: Mutex::new(blob_store),
+            backup_restore,
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]

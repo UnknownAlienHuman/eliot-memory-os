@@ -18,15 +18,13 @@ use eliot_backup::{
     RestoreStep, WrappedKeyEntry, WrappedKeyManifest,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
-use eliot_kernel::backup_restore::{
+use eliot_kernel::{
     BlobOwnerClient, CanonicalOwnerClient, InvalidationKind, InvalidationOwnerClient,
-    KernelBackupRestore, PurgeOwnerClient, phase_owner,
-};
-use eliot_kernel::backup_restore_ports::{
+    KernelBackupRestore, PinnedDestinationAdmission, PurgeOwnerClient,
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
-    KernelRestoreError, PinnedDestinationAdmission, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel,
-    check_kernel_effect_fence, require_production_admitted,
+    KernelRestoreError, RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_OWNER_LABEL,
+    RestorePorts, backup_to_kernel, check_kernel_effect_fence, phase_owner,
+    require_production_admitted,
 };
 
 const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
