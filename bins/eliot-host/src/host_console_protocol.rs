@@ -12,6 +12,7 @@
 
 use std::io::{self, Write};
 
+use eliot_host::backup_cutover::{CutoverRequest, IsolatedRecoveryEvidence};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -19,6 +20,24 @@ use serde::{Deserialize, Serialize};
 pub(super) enum Request {
     Status,
     Stop,
+    /// Admitted installation post-restore cutover (#961, M2 integration).
+    ///
+    /// Every typed value is re-validated by owner calls in the cutover
+    /// contour (envelope/receipt digests, restore/validation receipts,
+    /// introduction fencing, registry predecessor/approval); the envelope
+    /// shape itself grants no authority. The retirement fence is carried as
+    /// exact fields and built into the real `GenerationRetirementFence` at
+    /// the dispatch site — never a second fence owner.
+    CutoverAdmitted {
+        request: CutoverRequest,
+        evidence: IsolatedRecoveryEvidence,
+        fence_activation_id: eliot_platform::PlatformHandle,
+        fence_activation_current: eliot_contracts::EpochId,
+        fence_activation_parent: Option<eliot_contracts::EpochId>,
+        fence_state_fence: eliot_contracts::StateFence,
+        prior_host: eliot_host_state::HostInstallationEpoch,
+        retirement_authorization: eliot_platform::PlatformHandle,
+    },
 }
 
 #[derive(Serialize)]
@@ -34,6 +53,11 @@ pub(super) enum Response {
         managed_dependencies: usize,
     },
     Stopped,
+    CutoverCommitted {
+        disposition: String,
+        operation_id: String,
+        evidence_refs: Vec<String>,
+    },
     Error {
         error: String,
     },

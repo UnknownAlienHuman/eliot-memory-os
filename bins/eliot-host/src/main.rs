@@ -455,10 +455,9 @@ fn open_host(launch_options: HostLaunchOptions) -> Result<HostComposition, HostE
 /// barrier plus installation CAS, accept the new generation through the
 /// existing acceptance contours, then retire the prior generation holding
 /// the issued barrier and reconcile from owner receipts on unknown outcome.
-/// Dispatch wiring (console `Request` variant) is root-serialized; this
-/// contour lands first and is not yet called from `dispatch`.
+/// Dispatch wiring (console `Request::CutoverAdmitted` below) calls this
+/// contour; it is reachable from the real operator entry point.
 #[cfg(windows)]
-#[allow(dead_code, reason = "admitted-cutover dispatch serialized by root")]
 fn admitted_installation_cutover(
     host: &mut HostComposition,
     request: eliot_host::backup_cutover::CutoverRequest,
@@ -547,6 +546,76 @@ fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
             },
             true,
         ),
+        Ok(Request::CutoverAdmitted {
+            request,
+            evidence,
+            fence_activation_id,
+            fence_activation_current,
+            fence_activation_parent,
+            fence_state_fence,
+            prior_host,
+            retirement_authorization,
+        }) => {
+            // #961 admitted cutover reaches the placed contour from this
+            // real operator entry point. The retirement fence is built
+            // from exact envelope fields (pub struct, pub fields); every
+            // authority check runs inside the contour and the barrier.
+            let retirement = eliot_host::GenerationRetirementFence {
+                activation_id: fence_activation_id,
+                activation_generation: eliot_host_state::EpochTransition {
+                    current: fence_activation_current,
+                    parent: fence_activation_parent,
+                },
+                state_fence: fence_state_fence,
+            };
+            let activation_id = retirement.activation_id.clone();
+            let activation_generation = retirement.activation_generation.clone();
+            match admitted_installation_cutover(
+                host,
+                request,
+                evidence,
+                &retirement,
+                &activation_id,
+                &activation_generation,
+                &prior_host,
+                &retirement_authorization,
+            ) {
+                Ok(outcome) => {
+                    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                        "cutover_committed",
+                    );
+                    (
+                        Response::CutoverCommitted {
+                            disposition: format!("{:?}", outcome.disposition),
+                            operation_id: outcome
+                                .operation
+                                .operation_id
+                                .as_str()
+                                .to_owned(),
+                            evidence_refs: outcome
+                                .evidence_refs
+                                .iter()
+                                .map(|handle| handle.as_str().to_owned())
+                                .collect(),
+                        },
+                        false,
+                    )
+                }
+                Err(error) => {
+                    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                        "cutover_failed",
+                    );
+                    (
+                        Response::Error {
+                            error: error.to_string(),
+                        },
+                        false,
+                    )
+                }
+            }
+        }
         Err(error) => {
             // F-LOG-HOST-7 B9: malformed input keeps Error plus stay-in-loop;
             // the raw line is never logged (user content, I15.4/I07.20).
