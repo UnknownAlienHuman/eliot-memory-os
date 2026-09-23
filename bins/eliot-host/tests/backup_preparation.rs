@@ -17,15 +17,15 @@ use std::path::{Path, PathBuf};
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_host::backup_config_projection::{
-    describe_audit_fence, project_backup_config, AuditFenceNote, AuthoritySnapshot,
-    BackupConfigRequest, ProjectionError,
+    AuditFenceNote, AuthoritySnapshot, BackupConfigRequest, ProjectionError, describe_audit_fence,
+    project_backup_config,
 };
 use eliot_host::backup_preparation::{
-    cancel_preparation, cleanup_preparations, derive_destination_epoch, derive_destination_id,
-    prepare_isolated_destination, reconcile_preparation, BackupCallerAuth, CleanupReport,
-    DelegatedPreparation, DestinationAdmission, OwnerEvidence, PreparationClass, PreparationError,
-    PreparationJournal, PreparedDestination, PresentedPreparationRequest, ReconcileDisposition,
-    RootIdentity,
+    BackupCallerAuth, CleanupReport, DelegatedPreparation, DestinationAdmission, OwnerEvidence,
+    PreparationClass, PreparationError, PreparationJournal, PreparedDestination,
+    PresentedPreparationRequest, ReconcileDisposition, RootIdentity, cancel_preparation,
+    cleanup_preparations, derive_destination_epoch, derive_destination_id,
+    prepare_isolated_destination, reconcile_preparation,
 };
 use serde_json::Value;
 
@@ -522,7 +522,7 @@ fn arbitrary_path_build_profile_and_generation_rejected() {
 // WORK_UNIT_CASE: 958/8
 #[test]
 fn alias_substitution_refused_and_identity_pinned() {
-    use eliot_host::backup_preparation::{is_reparse_attributes, REPARSE_POINT_ATTRIBUTE};
+    use eliot_host::backup_preparation::{REPARSE_POINT_ATTRIBUTE, is_reparse_attributes};
 
     // The reparse-point decision bit itself is pinned on every platform: the
     // exact OS attribute refuses, anything else passes to remaining checks.
