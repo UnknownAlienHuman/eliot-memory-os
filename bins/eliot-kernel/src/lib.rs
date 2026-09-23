@@ -615,6 +615,16 @@ impl KernelComposition {
     pub fn backup_restore(&self) -> &KernelBackupRestore {
         &self.backup_restore
     }
+
+    /// Returns the retained operational ORS handle (issue #960 H5 dispatch).
+    ///
+    /// Cloned from the assembly store so owner operations never reopen the
+    /// database file or invent a second recovery store. The journal owner
+    /// binds restore streams against this exact handle.
+    #[must_use]
+    pub(crate) fn ors_store(&self) -> &Arc<RedbRecoveryStore> {
+        &self.p07_ors
+    }
 }
 
 #[cfg(windows)]
