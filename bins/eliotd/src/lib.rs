@@ -62,6 +62,7 @@ mod kernel_recovery_client;
 mod kernel_transition_client;
 pub mod notification_board_attach;
 mod observation_adapters;
+mod owner_feed;
 mod process_origin;
 mod route_receipts;
 mod skill_bridge_adapter;
@@ -164,6 +165,7 @@ pub use experience_runtime::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
 pub use process_origin::{
     CapabilityEvidenceSource, Generation, OperationDisposition,
     OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant,

@@ -643,6 +643,15 @@ async fn run_loop(
     // off until the next tick, while a claimed pair forwards through the
     // Kernel `local_read` leg and submits its result body before idling.
     let mut local_read_flight = LocalReadFlight::Idle;
+    // #2100: O1 owner-feed trigger state. The runtime retains one trigger
+    // across passes so an unchanged provider performs no IO, while a
+    // revision advance or a recovery re-presentation republishes through the
+    // full read->publish->readback exchange. Degradation never fails the
+    // loop: pending grants stay pending until a later pass binds them.
+    let mut owner_feed = eliotd::OwnerFeedTrigger::new();
+    // Recovery re-presentation at loop start: rebind the Kernel P-07 owner
+    // from live Governor state before any activation work is claimed.
+    sync_owner_feed(&kernel, &composition, &mut owner_feed).await;
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
@@ -726,6 +735,10 @@ async fn run_loop(
                 KernelTransitionPort::health(&*kernel)
                     .await
                     .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
+                // #2100: revision-advance trigger for the Kernel P-07 owner
+                // feed. Unchanged providers perform no IO here; an advanced
+                // provider republishes with readback proof.
+                sync_owner_feed(&kernel, &composition, &mut owner_feed).await;
             }
         }
     }
@@ -839,6 +852,39 @@ async fn drain_activation_on_shutdown(
             } else {
                 Ok(RunLoopExit::Shutdown)
             }
+        }
+    }
+}
+
+/// Runs one O1 owner-feed synchronization pass (issue #2100) and records
+/// its outcome.
+///
+/// A proven publish emits the bound revision for diagnostics; an unchanged
+/// provider stays silent; a degraded pass emits an error record and the loop
+/// continues, retrying on a later tick. The feed never gates readiness and
+/// never fails the daemon: an unbound Kernel owner only leaves grants
+/// pending, exactly like an absent P-07 port.
+async fn sync_owner_feed(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &Arc<DaemonComposition>,
+    trigger: &mut eliotd::OwnerFeedTrigger,
+) {
+    match eliotd::maintain_owner_feed(composition, kernel, trigger).await {
+        Ok(Some(revision)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.owner_feed_published",
+                revision = revision,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "owner-feed",
+                &error.to_string(),
+            )
+            .emit();
         }
     }
 }
