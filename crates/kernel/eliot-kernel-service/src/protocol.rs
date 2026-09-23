@@ -3113,36 +3113,27 @@ impl IntroductionRow {
     }
 }
 
-/// Authenticated read-only query for capability-introduction rows.
-/// The subject list identifies the exact ORS introduction rows whose
-/// readback closes the cutover prior-authority proof; subjects are not
-/// caller-authored authority claims.
+/// Authenticated read-only query for the complete current
+/// capability-introduction set (cutover completeness, issue #961).
+///
+/// An empty response is honest only when the owner holds zero rows.
+/// Callers compare the returned set for exact subject-set equality
+/// against presented evidence; partial views must never verify.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntroductionReadbackQuery {
-    /// Complete fence the rows must agree with.
-    pub state_fence: StateFence,
-    /// Exact subject identities to read (non-empty, deduplicated by caller).
-    pub subjects: Vec<String>,
+    /// Maximum rows to return; over-bound tables refuse explicitly.
+    pub max_rows: u16,
 }
 
 impl IntroductionReadbackQuery {
     /// Validates the query shape without performing any read.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
-        self.state_fence
-            .validate()
-            .map_err(|_| KernelServiceError::InvalidField {
-                field: "introduction_readback.state_fence",
-                reason: "must be valid",
-            })?;
-        if self.subjects.is_empty() {
+        if self.max_rows == 0 {
             return Err(KernelServiceError::InvalidField {
-                field: "introduction_readback.subjects",
-                reason: "at least one subject is required",
+                field: "introduction_readback.max_rows",
+                reason: "at least one row must be readable",
             });
-        }
-        for subject in &self.subjects {
-            validate_text(subject, "introduction_readback.subject")?;
         }
         Ok(())
     }

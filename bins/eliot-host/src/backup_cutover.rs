@@ -660,34 +660,65 @@ pub fn execute_cutover(
         Some(active) if *active == validated.request.expected_predecessor => {}
         Some(_) | None => return Err(CutoverError::ExpectedPredecessorConflict),
     }
-    // F-AUR-1 live owner readback (not shape trust): reload every presented
-    // introduction from the canonical ORS owner through the authenticated
-    // Kernel front door and compare subject, fence, order, and phase before
-    // the barrier below. An empty presented list verifies vacuously.
+    // F-AUR-1 live owner readback with exact-set completeness (not shape
+    // trust): reload the COMPLETE live introduction set from the canonical
+    // ORS owner through the authenticated Kernel front door, then require
+    // exact subject-set equality with the presented set — any omitted live
+    // subject or surprise presented subject (including an unjustified empty
+    // list against live rows) refuses. Per subject, in row-lifecycle order:
+    // live+Fenced/presented+Fenced requires byte-exact fence and order
+    // (fenced rows are immutable); live+Fenced/presented+Active allows a
+    // legitimate fencing race (live order at least presented order);
+    // live+Active of any presentation refuses (prior authority still live);
+    // and every live row must read Fenced for cutover (no live authority
+    // may survive retirement). Single-installation deployment is the
+    // documented scope premise: one operational store holds one
+    // installation's rows.
     let presented = &validated.evidence.fenced_introductions;
-    if !presented.is_empty() {
-        let subjects: Vec<String> = presented
+    let live = super::introduction_readback::read_live_introductions(
+        host,
+        &validated.request.activation_fence,
+        u16::MAX,
+    )
+    .map_err(|_| CutoverError::AuthorityOrReadinessMissing)?;
+    {
+        let mut presented_subjects: Vec<&str> = presented
             .iter()
-            .map(|introduction| introduction.record().subject_id.as_str().to_owned())
+            .map(|introduction| introduction.record().subject_id.as_str())
             .collect();
-        let live = super::introduction_readback::read_live_introductions(
-            host,
-            &validated.request.activation_fence,
-            &subjects,
-        )
-        .map_err(|_| CutoverError::AuthorityOrReadinessMissing)?;
-        for introduction in presented {
-            let subject = introduction.record().subject_id.as_str();
-            let current = live.iter().find(|row| row.subject_id == subject).ok_or(
-                CutoverError::PriorAuthorityStillActive,
-            )?;
-            if current.phase != "FENCED"
-                || introduction.phase() != OperationalPhase::Fenced
-                || current.fence_digest != introduction.record().state_fence.sha256
-                || current.operation_order < introduction.operation_order()
-            {
-                return Err(CutoverError::PriorAuthorityStillActive);
+        presented_subjects.sort_unstable();
+        let mut live_subjects: Vec<&str> = live
+            .iter()
+            .map(|row| row.subject_id.as_str())
+            .collect();
+        live_subjects.sort_unstable();
+        if presented_subjects != live_subjects {
+            return Err(CutoverError::PriorAuthorityStillActive);
+        }
+    }
+    for introduction in presented {
+        let subject = introduction.record().subject_id.as_str();
+        let current = live
+            .iter()
+            .find(|row| row.subject_id == subject)
+            .ok_or(CutoverError::PriorAuthorityStillActive)?;
+        if current.phase != "FENCED" {
+            return Err(CutoverError::PriorAuthorityStillActive);
+        }
+        match introduction.phase() {
+            OperationalPhase::Fenced => {
+                if current.fence_digest != introduction.record().state_fence.sha256
+                    || current.operation_order != introduction.operation_order()
+                {
+                    return Err(CutoverError::PriorAuthorityStillActive);
+                }
             }
+            OperationalPhase::Active => {
+                if current.operation_order < introduction.operation_order() {
+                    return Err(CutoverError::PriorAuthorityStillActive);
+                }
+            }
+            _ => return Err(CutoverError::PriorAuthorityStillActive),
         }
     }
     if retirement.activation_id != *activation_id {

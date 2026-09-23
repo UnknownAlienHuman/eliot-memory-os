@@ -80,7 +80,7 @@ use std::sync::Arc;
 use eliot_backup::{
     BackupBlob, BackupBundle, BackupError, BlobRestorationReceipt, CanonicalRecord, CutoverReceipt,
     DestinationRestoreAdapter, DestinationScope, OrsSnapshotFence, RestoreContext,
-    RestoreHistoricalAuthority, RestorePlan, RestoredSealedBlob, WrappedKeyManifest,
+    RestoreHistoricalAuthority, RestoredSealedBlob, WrappedKeyManifest,
     issue_restoration_receipts, suspended_recovery_entries, verify_key_coverage,
 };
 use eliot_contracts::{OperationId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
@@ -777,15 +777,18 @@ impl CanonicalStoreImportClient {
     ) -> Result<(WriteReceipt, String), OwnerChannelError> {
         self.gate(verified)?;
         // F-AUR-1 commit-level gate (not relabelable, not bypassable by
-        // calling this method directly): the console-presented
-        // introductions are compared against live owner/ORS readback by
-        // the journal owner HERE, before any row commits — so every
-        // committed coordination row implies verified introductions, and
-        // the cutover-side receipt binding below rests on that invariant,
-        // not on receipt shape alone.
-        journal
-            .verify_introductions_fenced(introductions)
-            .map_err(super::backup_restore_ports::kernel_to_backup)
+        // calling this method directly): the presented set must EXACTLY
+        // equal the live owner-enumerated set — any omitted live subject
+        // or surprise presented subject (including an unjustified empty
+        // list against a non-empty live set) refuses. Per-row lifecycle
+        // rules follow the owner state machine; see
+        // `eliot_ors::verify_introduction_set`.
+        let live = journal
+            .scan_live_introductions(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(super::backup_restore_ports::map_ors_to_backup)
+            .map_err(OwnerChannelError::Backup)?;
+        eliot_ors::verify_introduction_set(introductions, &live, false)
+            .map_err(super::backup_restore_ports::map_ors_to_backup)
             .map_err(OwnerChannelError::Backup)?;
         self.gate(verified)?;
         transition
