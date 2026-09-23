@@ -304,6 +304,7 @@ def main() -> int:
         subject: str,
         expected: str | None = None,
         expected_bytes: int | None = None,
+        accept: str = "application/octet-stream",
     ) -> None:
         _, relative = safe_local_path(root, raw_path)
         try:
@@ -311,7 +312,7 @@ def main() -> int:
         except RuntimeError as exc:
             if "not a regular file" not in str(exc) or _validate_components(root, _relative_path(raw_path)).exists():
                 raise
-            payload = fetch(url)
+            payload = fetch(url, accept=accept)
             materialized = materialize(root, raw_path, payload, expected)
             relative = materialized["relative_path"]
             reused = False
@@ -381,11 +382,13 @@ def main() -> int:
         candidate["release_metadata_path"],
         url_for_release(candidate_tag),
         f"surrealdb.release-metadata.{candidate_tag}",
+        accept="application/vnd.github+json",
     )
     fetch_to(
         candidate["source_tag_ref_path"],
         url_for_tag(candidate_tag),
         f"surrealdb.tag-ref.{candidate_tag}",
+        accept="application/vnd.github+json",
     )
     fetch_to(
         evidence["source_archive_path"],
@@ -397,6 +400,7 @@ def main() -> int:
         evidence["source_tag_ref_path"],
         url_for_tag(old_tag),
         f"surrealdb.tag-ref.{old_tag}",
+        accept="application/vnd.github+json",
     )
 
     query = json.loads(surreal["advisory_query"])
@@ -446,17 +450,19 @@ def main() -> int:
     candidate_query_bytes = (
         json.dumps(candidate_query, separators=(",", ":"), ensure_ascii=False) + "\r\n"
     ).encode("utf-8")
+    candidate_query_expected_sha256 = sha256_bytes(candidate_query_bytes)
     candidate_query_record = materialize(
         root,
         candidate["advisory_query_path"],
         candidate_query_bytes,
+        candidate_query_expected_sha256,
         replace_existing=True,
     )
     records.append({
         "subject": f"osv.query.surrealdb.release-candidate.{candidate_tag}",
         "url": OSV_ENDPOINT,
         "request": True,
-        "expected_sha256": candidate_query_record["sha256"],
+        "expected_sha256": candidate_query_expected_sha256,
         "expected_bytes": candidate_query_record["bytes"],
         **candidate_query_record,
     })

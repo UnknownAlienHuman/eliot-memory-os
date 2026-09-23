@@ -1334,6 +1334,9 @@ def _validate_provisioning_receipt(
             retrieved_at = response_record.get("retrieved_at_utc")
             max_age_hours = candidate.get("advisory_max_age_hours")
             refresh_status = "verified"
+            if query_record.get("request") is not True:
+                refresh_status = "findings"
+                findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV query was not recorded as a provisioner request"))
             if response_record.get("fetched") is not True or response_record.get("request") is not False:
                 refresh_status = "findings"
                 findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV response was not fetched by the provisioner"))
@@ -1345,7 +1348,7 @@ def _validate_provisioning_receipt(
                 if parsed_retrieved_at.tzinfo is None:
                     raise ValueError("timestamp has no timezone")
                 age_seconds = (datetime.now(timezone.utc) - parsed_retrieved_at.astimezone(timezone.utc)).total_seconds()
-                if age_seconds < -300 or age_seconds > int(max_age_hours) * 3600:
+                if age_seconds < 0 or age_seconds > int(max_age_hours) * 3600:
                     refresh_status = "stale"
                     findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV response is outside its locked freshness window"))
             except (TypeError, ValueError) as exc:
@@ -1799,6 +1802,10 @@ def _validate_patched_candidate(
 
     candidate_config_valid = len(findings) == candidate_config_start
     artifact_execution_valid = candidate_config_valid
+    version_probe: dict = {
+        "status": "not_executed",
+        "reason": "candidate artifact is absent or failed byte-and-PE validation",
+    }
     artifact_path, artifact_bytes = _read_external_evidence_file(
         root, candidate.get("artifact_path"), "SurrealDB patched candidate artifact", findings
     )
@@ -1830,11 +1837,26 @@ def _validate_patched_candidate(
                 )
                 combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
                 observed_candidate_version = _extract_external_version(combined)
-                if proc.returncode != 0 or observed_candidate_version != str(candidate.get("version")):
+                probe_verified = proc.returncode == 0 and observed_candidate_version == str(candidate.get("version"))
+                version_probe = {
+                    "status": "verified" if probe_verified else "failed",
+                    "execution": "verified_private_copy",
+                    "command": ["version"],
+                    "exit_code": proc.returncode,
+                    "expected_version": str(candidate.get("version")),
+                    "observed_version": observed_candidate_version,
+                }
+                if not probe_verified:
                     artifact_execution_valid = False
                     findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate version probe does not match the pinned release"))
             except (OSError, subprocess.TimeoutExpired) as exc:
                 artifact_execution_valid = False
+                version_probe = {
+                    "status": "failed",
+                    "execution": "verified_private_copy",
+                    "command": ["version"],
+                    "error": str(exc),
+                }
                 findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb patched candidate version probe failed: {exc}"))
         elif artifact_execution_valid and artifact_path is not None:
             version_probe = {"status": "not_executed", "reason": "selected-release evidence mode is byte-and-metadata only"}
