@@ -17,18 +17,19 @@
 use super::{
     AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityEpoch,
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
-    AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, ContractId,
-    DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
-    GenerationRoute, GenerationRouter, HealthVector, IpcImplementation, KernelBuildError,
-    KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
-    KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
-    ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
-    OrsGenerationCoordinator, PROTOCOL_VERSION, PreparedAuthorityMaterial,
-    ProcessAuthorityHandoffDescriptor, ProcessDispatchAuthorityController,
-    ProcessExecutionAuthorityConfig, ProcessExecutionGateway, RedbRecoveryStore, RouteScope,
-    Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy, StartupCoordinator, StateFence,
-    UserOwnedPathLease, UserOwnedRootLease, WindowsDispatchSnapshotCodec, WindowsPlatform,
-    is_lower_sha256, sha256_hex, sha256_json, unix_ms,
+    AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner,
+    ContractId, DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
+    GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector, IpcImplementation,
+    KernelBuildError, KernelComposition, KernelConfig, KernelDispatchKey, KernelError,
+    KernelPathAdmission, KernelService, KernelStoreRebindProductionBoundary,
+    KernelSupervisionLeaseAuthority, ModuleGeneration, ModuleGenerationState,
+    OperationalRecoveryStore, OrsError, OrsGenerationCoordinator, PROTOCOL_VERSION,
+    PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
+    ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
+    RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
+    StartupCoordinator, StateFence, UserOwnedPathLease, UserOwnedRootLease,
+    WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
+    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -290,8 +291,230 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Ors(error.to_string()))
                 .map_err(&terminal)?,
         );
-        Self::assemble_with_process_authority(config, authority_config, ors, platform)
+        Self::assemble_with_process_authority(config, authority_config, ors, platform, None)
             .map_err(&terminal)
+    }
+
+    /// Builds a production composition with an externally supplied process
+    /// authority key, opaque snapshot codec, durable replay binding, and the
+    /// canonical Governor owner bundle for the P-07 port (`#2100`).
+    ///
+    /// The owner bundle carries the Governor restore plus the exact expected
+    /// graph revision; the composition binds the port through
+    /// [`Self::bind_p07_owner`] during assembly and fails the build when the
+    /// bundle disagrees. Missing bindings are never replaced by a default or
+    /// in-memory issuer.
+    pub fn new_with_process_authority_and_owner(
+        config: KernelConfig,
+        authority_config: ProcessExecutionAuthorityConfig,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<Self, KernelBuildError> {
+        // F-LOG-KERNEL-2 (#899): process-authority build boundary.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.process_authority_build_started",
+        );
+        let terminal = |error: KernelBuildError| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.build_failed",
+            );
+            observe_terminal_error(kernel_build_error_code(&error));
+            error
+        };
+        let work_root = config.work_root.clone();
+        let platform = Arc::new(
+            WindowsPlatform::new(work_root.clone())
+                .map_err(KernelBuildError::Platform)
+                .map_err(&terminal)?,
+        );
+        let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
+        let ors = Arc::new(
+            RedbRecoveryStore::open(&ors_path)
+                .map_err(|error| KernelBuildError::Ors(error.to_string()))
+                .map_err(&terminal)?,
+        );
+        Self::assemble_with_process_authority(
+            config,
+            authority_config,
+            ors,
+            platform,
+            Some((restore, expected_revision)),
+        )
+        .map_err(&terminal)
+    }
+
+    /// Binds the canonical Governor closure owner to the P-07 port (`#2100`).
+    ///
+    /// The Governor feed publishes the restore bundle plus the exact
+    /// expected graph revision; this method binds the port through the
+    /// canonical bootstrap against the retained ORS handle and retains the
+    /// binding. A zero or disagreeing revision, an empty admitted root set,
+    /// or a stale presentation against the durable watermark fails closed
+    /// without installing any owner. Binding requires no retained owner:
+    /// rotation goes through refresh or recover, never a silent
+    /// replacement. Returns the bound revision.
+    pub fn bind_p07_owner(
+        &self,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, KernelBuildError> {
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.p07_owner_bind_started",
+        );
+        if self
+            .p07_owner
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+            .is_some()
+        {
+            return Err(KernelBuildError::Service(
+                "P-07 owner bind requires no retained owner".to_owned(),
+            ));
+        }
+        let digest = owner_bundle_digest(&restore)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let store: Arc<dyn OperationalRecoveryStore> =
+            Arc::clone(&self.p07_ors) as Arc<dyn OperationalRecoveryStore>;
+        let bound = bind_canonical_owner(restore, expected_revision, store).inspect_err(|_| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.p07_owner_bind_failed",
+            );
+        })
+        .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let revision = bound.bound_revision();
+        self.p07_owner
+            .lock()
+            .map_err(|_| {
+                KernelBuildError::Service("P-07 owner lock poisoned".to_owned())
+            })?
+            .replace(bound);
+        self.p07_owner_digest
+            .lock()
+            .map_err(|_| {
+                KernelBuildError::Service("P-07 owner lock poisoned".to_owned())
+            })?
+            .replace(digest);
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.p07_owner_bound",
+        );
+        Ok(revision)
+    }
+
+    /// Refreshes the retained P-07 owner from newer durable Governor state.
+    ///
+    /// The expected revision must not move backwards; the admitted state
+    /// swaps atomically and the durable per-root watermark advances with
+    /// the swap. Refuses when no owner is bound — bind first. A
+    /// same-revision presentation carrying different bytes refuses as well:
+    /// the digest agreement below proves rotation, not silent replacement.
+    pub fn refresh_p07_owner(
+        &self,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, KernelBuildError> {
+        let store: Arc<dyn OperationalRecoveryStore> =
+            Arc::clone(&self.p07_ors) as Arc<dyn OperationalRecoveryStore>;
+        let mut guard = self
+            .p07_owner
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?;
+        let Some(bound) = guard.as_mut() else {
+            return Err(KernelBuildError::Service(
+                "P-07 owner refresh requires a bound owner".to_owned(),
+            ));
+        };
+        let digest = owner_bundle_digest(&restore)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        self.check_owner_digest_agreement(expected_revision, &digest)?;
+        bound
+            .refresh(restore, expected_revision, &store)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let revision = bound.bound_revision();
+        self.p07_owner_digest
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+            .replace(digest);
+        Ok(revision)
+    }
+
+    /// Rebinds the P-07 owner after a restart: binds when no owner is
+    /// retained, refreshes when one is. Restart rehydration never invents
+    /// owner state — the Governor feed re-presents the bundle and the same
+    /// exact-revision gates apply as at bind time.
+    pub fn recover_p07_owner(
+        &self,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, KernelBuildError> {
+        let bound = self
+            .p07_owner
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+            .is_some();
+        if bound {
+            self.refresh_p07_owner(restore, expected_revision)
+        } else {
+            self.bind_p07_owner(restore, expected_revision)
+        }
+    }
+
+    /// Returns the bound P-07 owner revision, if an owner is retained.
+    #[must_use]
+    pub fn p07_owner_revision(&self) -> Option<u64> {
+        self.p07_owner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(BoundCanonicalOwner::bound_revision))
+    }
+
+    /// Returns the owner readback triple for reconcile queries: whether an
+    /// owner is bound, its exact revision, and the canonical digest of the
+    /// bound bundle bytes. The Governor feed compares all three against
+    /// what it served before claiming a publish committed.
+    #[must_use]
+    pub fn p07_owner_readback(&self) -> (bool, Option<u64>, Option<String>) {
+        let owner = self.p07_owner.lock().ok();
+        let digest = self.p07_owner_digest.lock().ok();
+        match (owner, digest) {
+            (Some(owner), Some(digest)) => {
+                let record = owner.as_ref().map(BoundCanonicalOwner::bound_revision);
+                let proof = digest.as_ref().cloned();
+                (record.is_some(), record, proof)
+            }
+            _ => (false, None, None),
+        }
+    }
+
+    /// Refuses a same-revision presentation carrying different bytes.
+    ///
+    /// Rotation is proven by revision advance or exact-digest equality;
+    /// a matching revision with a disagreeing digest is a conflicting
+    /// presentation, never a silent replacement. Unbound compositions
+    /// have nothing to disagree with and pass through to bind.
+    fn check_owner_digest_agreement(
+        &self,
+        expected_revision: u64,
+        digest: &str,
+    ) -> Result<(), KernelBuildError> {
+        let (bound, revision, retained) = self.p07_owner_readback();
+        if bound
+            && revision == Some(expected_revision)
+            && retained.as_deref() != Some(digest)
+        {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.p07_owner_digest_conflict",
+            );
+            return Err(KernelBuildError::Core(
+                "same-revision owner bundle digest disagreement".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn assemble_with_process_authority(
@@ -299,6 +522,7 @@ impl KernelComposition {
         authority_config: ProcessExecutionAuthorityConfig,
         ors: Arc<RedbRecoveryStore>,
         platform: Arc<WindowsPlatform>,
+        owner: Option<(GovernorClosureRestore, u64)>,
     ) -> Result<Self, KernelBuildError> {
         let authority_store: Arc<dyn OperationalRecoveryStore> = ors.clone();
         let controller = Arc::new(Mutex::new(
@@ -311,13 +535,24 @@ impl KernelComposition {
             )
             .map_err(|error| KernelBuildError::Core(error.to_string()))?,
         ));
-        Self::assemble_with_process_controller(
+        let composition = Self::assemble_with_process_controller(
             config,
             controller,
             authority_config.snapshot_binding,
             ors,
             platform,
-        )
+        )?;
+        if let Some((restore, expected_revision)) = owner {
+            composition
+                .bind_p07_owner(restore, expected_revision)
+                .inspect_err(|_| {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.p07_owner_bind_failed",
+                    );
+                })?;
+        }
+        Ok(composition)
     }
 
     fn assemble_with_process_controller(
@@ -1090,6 +1325,9 @@ impl KernelComposition {
         );
         observe_entrypoint(EntrypointStage::Composition);
         Ok(Self {
+            p07_owner: Mutex::new(None),
+            p07_owner_digest: Mutex::new(None),
+            p07_ors: Arc::clone(&ors),
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,
             runtime,
