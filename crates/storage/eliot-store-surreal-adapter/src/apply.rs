@@ -39,6 +39,7 @@ mod receipt_reconciliation;
 mod recovery;
 mod schema_contract;
 pub(crate) mod surreal_automation;
+pub(crate) mod surreal_experience;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 use atomic_write::{TxLane, to_value, write_transaction};
@@ -1081,6 +1082,10 @@ async fn apply_with_retry(
         // beside the reactive legs under the same discipline.
         let automation_writes =
             surreal_automation::prepare_automation_writes(db, &adapter.config, &transition).await?;
+        // Issue #223: admitted experience bank/feedback legs compute their
+        // row writes beside the automation legs under the same discipline.
+        let experience_writes =
+            surreal_experience::prepare_experience_writes(db, &adapter.config, &transition).await?;
 
         let first_attempt = semantic_plan.is_none();
         let plan = if let Some(semantic) = &semantic_plan {
@@ -1122,6 +1127,7 @@ async fn apply_with_retry(
             &notification_writes,
             &reactive_writes,
             &automation_writes,
+            &experience_writes,
         )
         .await
         {
@@ -2597,6 +2603,7 @@ mod concurrent_allocation_tests {
                 &[],
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
+                &surreal_experience::ExperienceWrites::default(),
             )
             .await
             .expect("first writer commits");
@@ -2619,6 +2626,7 @@ mod concurrent_allocation_tests {
                 &[],
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
+                &surreal_experience::ExperienceWrites::default(),
             )
             .await
             {
@@ -2664,6 +2672,7 @@ mod concurrent_allocation_tests {
                 &[],
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
+                &surreal_experience::ExperienceWrites::default(),
             )
             .await
             .expect("bounded retry commits");

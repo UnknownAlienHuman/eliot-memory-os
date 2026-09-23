@@ -372,6 +372,12 @@ async fn named_read_payload(
         NamedReadOperation::GetUserAutomationState => {
             automation_state_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetExperienceBankRange => {
+            experience_bank_range_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetAgentFeedbackRange => {
+            experience_feedback_range_payload(db, &adapter.config, query, state_fence).await
+        }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
@@ -1938,6 +1944,130 @@ async fn automation_failure_payload(
     Ok(json!({
         "failure": failure,
         "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Reads bank rows and projects the bounded same-fence, same-scope
+/// record set (issue #223).
+///
+/// Parameters are re-validated here (membership and shape via the
+/// catalogue gate upstream; value rules here) so a misrouted query fails
+/// closed without touching state. Scope arrives through the typed
+/// `scope_id` request field; rows project verbatim record documents plus
+/// presented digests in key order with an explicit truncation marker.
+async fn experience_bank_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetExperienceBankRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded = eliot_store_api::validate_experience_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "experience range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let rows = super::surreal_experience::read_bank_for_read(
+        db,
+        config,
+        scope_id.as_str(),
+        limit.saturating_add(1),
+    )
+    .await?;
+    let mut records = Vec::new();
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        if records.len() > limit {
+            break;
+        }
+        records.push(json!({
+            "handle": row.handle,
+            "revision": row.revision,
+            "record_json": row.record_json,
+            "record_digest": row.record_digest,
+        }));
+    }
+    let mut truncated = false;
+    if records.len() > limit {
+        records.pop();
+        truncated = true;
+    }
+    let matched_total = projection_len(records.len())?;
+    Ok(json!({
+        "records": records,
+        "matched_total": matched_total,
+        "truncated": truncated,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Reads feedback rows and projects the bounded same-fence, same-scope
+/// record set (issue #223). Same scope-gated rule as the bank range.
+async fn experience_feedback_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetAgentFeedbackRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded = eliot_store_api::validate_experience_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "experience range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let rows = super::surreal_experience::read_feedback_for_read(
+        db,
+        config,
+        scope_id.as_str(),
+        limit.saturating_add(1),
+    )
+    .await?;
+    let mut records = Vec::new();
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        if records.len() > limit {
+            break;
+        }
+        records.push(json!({
+            "handle": row.handle,
+            "revision": row.revision,
+            "record_json": row.record_json,
+            "record_digest": row.record_digest,
+        }));
+    }
+    let mut truncated = false;
+    if records.len() > limit {
+        records.pop();
+        truncated = true;
+    }
+    let matched_total = projection_len(records.len())?;
+    Ok(json!({
+        "records": records,
+        "matched_total": matched_total,
+        "truncated": truncated,
         "state_fence": state_fence,
     }))
 }
