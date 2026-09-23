@@ -78,13 +78,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eliot_backup::{
-    BackupBlob, BackupError, BlobRestorationReceipt, CanonicalRecord, CutoverReceipt,
-    DestinationRestoreAdapter, DestinationScope, OrsSnapshotFence, RestoreHistoricalAuthority,
-    RestoredSealedBlob, WrappedKeyManifest, issue_restoration_receipts, suspended_recovery_entries,
-    verify_key_coverage,
+    BackupBlob, BackupBundle, BackupError, BlobRestorationReceipt, CanonicalRecord, CutoverReceipt,
+    DestinationRestoreAdapter, DestinationScope, OrsSnapshotFence, RestoreContext,
+    RestoreHistoricalAuthority, RestorePlan, RestoredSealedBlob, WrappedKeyManifest,
+    issue_restoration_receipts, suspended_recovery_entries, verify_key_coverage,
 };
 use eliot_contracts::{OperationId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_ors::{SessionBindingReceipt, SessionDetach, UserBrokerFence, UserBrokerRegistrationReceipt};
+use eliot_ors::{
+    CapabilityIntroductionProjection, SessionBindingReceipt, SessionDetach, UserBrokerFence,
+    UserBrokerRegistrationReceipt,
+};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{
     OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, TransitionClass,
@@ -101,8 +104,17 @@ use super::backup_coordination::{
     COORD_PARAM_FENCE_DIGEST, COORD_PARAM_OPERATION_ID, COORD_PARAM_PAYLOAD_DIGEST,
     CoordinationDecision,
 };
-use super::backup_restore_admission::{KernelRestoreAdmission, require_restore_transition_class};
-use super::backup_restore_ports::KernelRestoreJournal;
+use super::backup_restore::KernelBackupRestore;
+use super::backup_restore_admission::{
+    KernelRestoreAdmission, RestoreProvisioningProof, require_restore_transition_class,
+};
+use super::backup_restore_driver::{
+    CoordinationCommit, ProductionRestoreCall, ProductionRestoreOutcome, RestoreImport,
+    drive_production,
+};
+use super::backup_restore_ports::{
+    KernelIsolatedDestination, KernelRestoreJournal, RestorePorts,
+};
 use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseSnapshot};
 
 /// Wire identity of the Host-issued restore destination authorization.
@@ -1192,6 +1204,68 @@ impl KernelComposition {
         Ok(BackupOwnerChannels {
             store_gateway: gateway,
         })
+    }
+
+    /// Dispatches one production restore from composition-held owners plus
+    /// operator-supplied archive/target/authorization (H5 operator dispatch,
+    /// issues #960/#962/#963).
+    ///
+    /// Assembly order with real owner calls only: bind the journal against
+    /// the retained operational store (no reopen, no second writer);
+    /// inject owner channels from retained composition state; validate and
+    /// compile the operator archive; verify destination authorization;
+    /// open the constructed destination under the adapter work root bound
+    /// to the plan target; then delegate to [`drive_production`], which
+    /// mints, live-verifies introductions, decides, commits, imports, and
+    /// reconciles. The Governor-built coordination commit, restore-class
+    /// imports, provisioning attestations, live fence, and admitted ports
+    /// arrive as params from their owning lanes — this dispatch never
+    /// synthesizes, defaults, or re-spells them. Any refusal fails closed
+    /// with the exact owner cause before any effect.
+    pub async fn dispatch_production_restore(
+        self: &Arc<Self>,
+        bundle: &BackupBundle,
+        target: RestoreContext,
+        ports: &RestorePorts<'_>,
+        destination_authorization: &[u8],
+        authorization: AuthorizationExpectation<'_>,
+        live_fence: &StateFence,
+        provisioning: RestoreProvisioningProof,
+        coordination: CoordinationCommit,
+        imports: Vec<RestoreImport>,
+        introductions: Vec<CapabilityIntroductionProjection>,
+    ) -> Result<ProductionRestoreOutcome, OwnerChannelError> {
+        ports.validate().map_err(|error| {
+            OwnerChannelError::Backup(BackupError::Target(error.to_string()))
+        })?;
+        let journal =
+            KernelRestoreJournal::bind_owner(Arc::clone(self.ors_store())).map_err(|error| {
+                OwnerChannelError::Backup(BackupError::Target(error.to_string()))
+            })?;
+        let channels = self.backup_owner_channels(&self.backup_restore().work_root().to_path_buf())?;
+        let plan = KernelBackupRestore::compile_plan(bundle, target).map_err(|error| {
+            OwnerChannelError::Backup(BackupError::Target(error.to_string()))
+        })?;
+        let destination =
+            KernelIsolatedDestination::open(self.backup_restore().work_root(), &plan.target.target_id)
+                .map_err(|error| {
+                    OwnerChannelError::Backup(BackupError::Target(error.to_string()))
+                })?;
+        drive_production(ProductionRestoreCall {
+            journal: &journal,
+            channels: &channels,
+            destination_authorization,
+            authorization,
+            plan: &plan,
+            bundle,
+            destination: &destination,
+            live_fence,
+            provisioning,
+            coordination,
+            imports,
+            introductions,
+        })
+        .await
     }
 }
 
