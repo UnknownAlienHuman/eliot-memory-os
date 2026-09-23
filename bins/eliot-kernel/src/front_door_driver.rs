@@ -330,6 +330,14 @@ async fn serve_connection(
                             &session, request_id, &identity, &operation, payload,
                         )
                         .await?
+                } else if operation
+                    == eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION
+                {
+                    kernel
+                        .execute_testd_owner_submit(
+                            &session, request_id, &identity, &operation, payload,
+                        )
+                        .await?
                 } else {
                     kernel
                         .execute_testd_request(&session, request_id, &operation, payload)
