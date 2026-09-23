@@ -1,0 +1,1 @@
+{"degraded_reason":"snapshot-gap","fixture":"isolated-recovery-evidence-degraded","is_degraded":true,"is_isolated":true,"issue":961,"note":"fixed owner receipt shape for unit dev; live Windows proof deferred (T19 TEST-PHASE)","recovery_digest":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","verified":false}
