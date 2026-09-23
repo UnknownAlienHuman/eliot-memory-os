@@ -77,10 +77,11 @@ pub const MAX_RECORD_SOURCE_ID_CHARS: usize = 256;
 /// Closed named store operation for bank-record commit (declaration only).
 ///
 /// The store bridge (#19 lane) registers this name; the manifest binds
-/// [`COMMIT_TRANSITION_CLASS`] with [`COMMIT_MAX_EFFECT`].
-pub const BANK_COMMIT_OPERATION: &str = "ExperienceBankCommit";
+/// [`COMMIT_TRANSITION_CLASS`] with [`COMMIT_MAX_EFFECT`]. Spelling follows
+/// the verb-first store taxonomy (`CaptureObservation`, `AppendAuditEvent`).
+pub const BANK_COMMIT_OPERATION: &str = "CommitExperienceBank";
 /// Closed named store operation for feedback-record commit (declaration only).
-pub const FEEDBACK_COMMIT_OPERATION: &str = "AgentFeedbackCommit";
+pub const FEEDBACK_COMMIT_OPERATION: &str = "CommitAgentFeedback";
 /// Transition class both commit operations are declared under.
 pub const COMMIT_TRANSITION_CLASS: &str = "capture_candidate";
 /// Maximum epistemic/control effect of either commit operation.
@@ -202,6 +203,12 @@ impl ExperienceBankRecord {
     /// preimage, and freeze the owner digest. The digest and byte length
     /// are computed here, never caller-supplied, so downstream
     /// [`SourceRevisionHandle`] cursors are owner-issued.
+    ///
+    /// Shape-vs-durable split (review F1): this admits the record *shape*.
+    /// Durable existence is NOT established here; it is gated on the #19
+    /// commit path and re-checked on every read by [`resolve_bank_ref`]
+    /// against owner-issued snapshots. A shape-valid record with zero
+    /// durable rows behind it resolves to nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn admit(
         handle: ArtifactId,
@@ -357,7 +364,10 @@ impl ExperienceBankRecord {
     /// admitted record: identity, owner revision, content digest over the
     /// complete admitted bytes, and measured length. Only the admitting
     /// owner calls this; projection lanes receive the cursor, never mint
-    /// it.
+    /// it. The cursor is shape-bound (see the shape-vs-durable split on
+    /// [`ExperienceBankRecord::admit`]): it proves the bytes the owner
+    /// admitted, not that rows are durable — durability is re-proved by
+    /// [`resolve_bank_ref`] on read-back.
     pub fn revision_cursor(
         &self,
         source_id: &str,
@@ -423,6 +433,10 @@ impl AgentFeedbackRecord {
     /// Admit a feedback record: validate origin/consent/bindings, measure
     /// the canonical preimage, and freeze the owner digest. Consent is
     /// required and explicit: an empty `consent_ref` fails closed.
+    ///
+    /// Shape-vs-durable split: as on [`ExperienceBankRecord::admit`], this
+    /// admits the shape only; durable existence is gated on the #19 commit
+    /// path and re-checked by [`resolve_feedback_ref`] on read-back.
     #[allow(clippy::too_many_arguments)]
     pub fn admit(
         handle: ArtifactId,
@@ -537,7 +551,9 @@ impl AgentFeedbackRecord {
     }
 
     /// Mint the owner-issued [`SourceRevisionHandle`] cursor for this
-    /// admitted record. Only the admitting owner calls this.
+    /// admitted record. Only the admitting owner calls this. Shape-bound
+    /// (see [`ExperienceBankRecord::admit`]): durability is re-proved by
+    /// [`resolve_feedback_ref`] on read-back.
     pub fn revision_cursor(
         &self,
         source_id: &str,
@@ -595,7 +611,154 @@ impl RetentionHold {
     }
 }
 
-/// Closed read posture for one retention-gated experience record.
+/// Owner-issued retention schedule binding policy refs to a fence (B223 join).
+///
+/// The schedule is versioned Governor configuration: `schedule_revision`
+/// strictly increases per `schedule_id`, and `known_policy_refs` is the
+/// exact closed set the schedule attests at `fence`. Replacing the former
+/// caller-asserted `policy_known: bool` (review F4), knowledge is now an
+/// owner attestation carrying schedule/revision/fence identity, so
+/// [`resolve_retention_read`] can distinguish owner-attested from
+/// caller-asserted knowledge and can verify the schedule was in force at
+/// the record's fence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionSchedule {
+    /// Contract version this schedule was written against.
+    pub contract_version: ContractVersion,
+    /// Stable schedule identity (one Governor configuration stream).
+    pub schedule_id: String,
+    /// Owner schedule revision; strictly increasing per schedule.
+    pub schedule_revision: u64,
+    /// Fence this schedule is in force at, carried for edge gating.
+    pub fence: StateFence,
+    /// Exact closed policy refs attested by this schedule revision.
+    pub known_policy_refs: Vec<String>,
+    /// Frozen digest over the schedule shape, excluding this field.
+    pub digest: String,
+}
+
+impl RetentionSchedule {
+    /// Issue a schedule revision: validate bindings and freeze the owner
+    /// digest. Only the schedule owner (Governor configuration) calls this.
+    pub fn issue(
+        schedule_id: String,
+        schedule_revision: u64,
+        fence: StateFence,
+        known_policy_refs: Vec<String>,
+    ) -> Result<Self, ObservationError> {
+        bounded_text(
+            &schedule_id,
+            "retention_schedule.schedule_id",
+            MAX_CONSENT_REF_CHARS,
+        )?;
+        fence_shape(&fence, "retention_schedule.fence")?;
+        if known_policy_refs.len() > MAX_BANK_SOURCE_REFS {
+            return Err(ObservationError::InvalidField {
+                field: "retention_schedule.known_policy_refs",
+                reason: "exceeds bounded length",
+            });
+        }
+        let mut seen: Vec<&str> = Vec::with_capacity(known_policy_refs.len());
+        for policy in &known_policy_refs {
+            bounded_text(
+                policy,
+                "retention_schedule.known_policy_refs",
+                MAX_CONSENT_REF_CHARS,
+            )?;
+            if seen.contains(&policy.as_str()) {
+                return Err(ObservationError::Duplicate {
+                    field: "retention_schedule.known_policy_refs",
+                    value: policy.clone(),
+                });
+            }
+            seen.push(policy);
+        }
+        let mut schedule = Self {
+            contract_version: EXPERIENCE_RECORD_CONTRACT_VERSION,
+            schedule_id,
+            schedule_revision,
+            fence,
+            known_policy_refs,
+            digest: String::new(),
+        };
+        let preimage = canonical_json_bytes(&(
+            &schedule.contract_version,
+            &schedule.schedule_id,
+            schedule.schedule_revision,
+            &schedule.fence,
+            &schedule.known_policy_refs,
+        ))
+        .map_err(|_| ObservationError::InvalidField {
+            field: "retention_schedule.digest",
+            reason: "schedule is not canonically encodable",
+        })?;
+        if preimage.is_empty() {
+            return Err(ObservationError::InvalidField {
+                field: "retention_schedule.digest",
+                reason: "schedule preimage must be non-empty",
+            });
+        }
+        schedule.digest = sha256_hex(&preimage);
+        schedule.validate()?;
+        Ok(schedule)
+    }
+
+    /// Validate bindings and the frozen digest.
+    pub fn validate(&self) -> Result<(), ObservationError> {
+        if self.contract_version != EXPERIENCE_RECORD_CONTRACT_VERSION {
+            return Err(ObservationError::InvalidField {
+                field: "retention_schedule.contract_version",
+                reason: "unsupported contract version",
+            });
+        }
+        bounded_text(
+            &self.schedule_id,
+            "retention_schedule.schedule_id",
+            MAX_CONSENT_REF_CHARS,
+        )?;
+        fence_shape(&self.fence, "retention_schedule.fence")?;
+        if self.known_policy_refs.len() > MAX_BANK_SOURCE_REFS {
+            return Err(ObservationError::InvalidField {
+                field: "retention_schedule.known_policy_refs",
+                reason: "exceeds bounded length",
+            });
+        }
+        for policy in &self.known_policy_refs {
+            bounded_text(
+                policy,
+                "retention_schedule.known_policy_refs",
+                MAX_CONSENT_REF_CHARS,
+            )?;
+        }
+        digest_shape(&self.digest, "retention_schedule.digest")?;
+        let preimage = canonical_json_bytes(&(
+            &self.contract_version,
+            &self.schedule_id,
+            self.schedule_revision,
+            &self.fence,
+            &self.known_policy_refs,
+        ))
+        .map_err(|_| ObservationError::InvalidField {
+            field: "retention_schedule.digest",
+            reason: "schedule is not canonically encodable",
+        })?;
+        if self.digest != sha256_hex(&preimage) {
+            return Err(ObservationError::InvalidField {
+                field: "retention_schedule.digest",
+                reason: "does not match schedule preimage",
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether this schedule attests the given policy ref.
+    pub fn knows(&self, policy_ref: &str) -> bool {
+        self.known_policy_refs
+            .iter()
+            .any(|known| known == policy_ref)
+    }
+}
 ///
 /// `UnknownPolicy` is the honest posture for an unknown or stale
 /// `retention_policy_ref`: an explicit gap, never a fabricated default.
@@ -628,21 +791,32 @@ pub enum ExperienceRetentionReadPosture {
     },
 }
 
-/// Resolve the read posture for one retention-gated record.
+/// Resolve the read posture for one retention-gated record against an
+/// owner-issued schedule.
 ///
-/// `policy_known` is attested by the retention-schedule owner (the
-/// Governor-published schedule in force at the governing fence), not
-/// inferred here. Unknown or stale refs resolve to `UnknownPolicy`; known
-/// refs under a caller-supplied hold resolve to `RetentionBlocked` with
-/// only carried refs; known refs with no hold resolve to `Readable`. No
-/// expiry, permission, or erasure schedule is fabricated on any path.
+/// Owner checks (review F4 join): the schedule validates (identity,
+/// revision, frozen digest); the schedule fence must be compatible with
+/// the record fence or the schedule was not in force at the record —
+/// explicit `UnknownPolicy` gap; the record's policy ref must be attested
+/// by `schedule.knows`, else `UnknownPolicy`. Known refs under a
+/// caller-supplied hold resolve to `RetentionBlocked` with only carried
+/// refs; known refs with no hold resolve to `Readable`. No expiry,
+/// permission, or erasure schedule is fabricated on any path.
 pub fn resolve_retention_read(
     retention: &PrivacyRetentionDisclosure,
-    policy_known: bool,
+    schedule: &RetentionSchedule,
+    record_fence: &StateFence,
     hold: Option<&RetentionHold>,
 ) -> Result<ExperienceRetentionReadPosture, ObservationError> {
     retention.validate()?;
-    if !policy_known {
+    schedule.validate()?;
+    fence_shape(record_fence, "retention_read.record_fence")?;
+    if !schedule.fence.is_compatible_with(record_fence) {
+        return Ok(ExperienceRetentionReadPosture::UnknownPolicy {
+            retention_policy_ref: retention.retention_policy_ref.clone(),
+        });
+    }
+    if !schedule.knows(&retention.retention_policy_ref) {
         return Ok(ExperienceRetentionReadPosture::UnknownPolicy {
             retention_policy_ref: retention.retention_policy_ref.clone(),
         });
@@ -660,6 +834,102 @@ pub fn resolve_retention_read(
             policy_ref: retention.retention_policy_ref.clone(),
         }),
     }
+}
+
+/// Resolve one opaque bank ref against an owner-issued record snapshot.
+///
+/// Canonical-ref join (reviews F1/F5): the handle must exist in the
+/// snapshot; the cursor revision must equal the record's owner revision;
+/// the cursor digest and length must equal the record's admitted digest
+/// and measured preimage length; the scope echo must match. Any drift —
+/// unknown handle, stale revision, rewritten digest, or scope mismatch —
+/// fails closed. Durable existence behind the snapshot is the #19 read
+/// path's gate: this resolver proves the ref resolves within the snapshot
+/// the owner issued, never that rows are durable.
+pub fn resolve_bank_ref<'a>(
+    snapshot: &'a [ExperienceBankRecord],
+    reference: &ExperienceRecordRef,
+) -> Result<&'a ExperienceBankRecord, ObservationError> {
+    reference.validate()?;
+    let Some(record) = snapshot
+        .iter()
+        .find(|record| record.handle == reference.handle)
+    else {
+        return Err(ObservationError::InvalidField {
+            field: "experience_ref.handle",
+            reason: "ref handle is not in the owner snapshot",
+        });
+    };
+    record.validate()?;
+    if reference.revision.revision != record.bank_revision.to_string() {
+        return Err(ObservationError::InvalidField {
+            field: "experience_ref.revision",
+            reason: "ref revision does not match the admitted record revision",
+        });
+    }
+    if reference.revision.content_sha256 != record.digest {
+        return Err(ObservationError::InvalidField {
+            field: "experience_ref.revision",
+            reason: "ref digest does not match the admitted record digest",
+        });
+    }
+    if reference.revision.byte_length != record.byte_length {
+        return Err(ObservationError::InvalidField {
+            field: "experience_ref.revision",
+            reason: "ref length does not match the admitted record length",
+        });
+    }
+    if reference.scope != record.scope {
+        return Err(ObservationError::InvalidField {
+            field: "experience_ref.scope",
+            reason: "ref scope does not match the admitted record scope",
+        });
+    }
+    Ok(record)
+}
+
+/// Resolve one opaque feedback ref against an owner-issued record
+/// snapshot. Same canonical-ref rule as [`resolve_bank_ref`].
+pub fn resolve_feedback_ref<'a>(
+    snapshot: &'a [AgentFeedbackRecord],
+    reference: &ExperienceRecordRef,
+) -> Result<&'a AgentFeedbackRecord, ObservationError> {
+    reference.validate()?;
+    let Some(record) = snapshot
+        .iter()
+        .find(|record| record.handle == reference.handle)
+    else {
+        return Err(ObservationError::InvalidField {
+            field: "experience_ref.handle",
+            reason: "ref handle is not in the owner snapshot",
+        });
+    };
+    record.validate()?;
+    if reference.revision.revision != record.feedback_revision.to_string() {
+        return Err(ObservationError::InvalidField {
+            field: "experience_ref.revision",
+            reason: "ref revision does not match the admitted record revision",
+        });
+    }
+    if reference.revision.content_sha256 != record.digest {
+        return Err(ObservationError::InvalidField {
+            field: "experience_ref.revision",
+            reason: "ref digest does not match the admitted record digest",
+        });
+    }
+    if reference.revision.byte_length != record.byte_length {
+        return Err(ObservationError::InvalidField {
+            field: "experience_ref.revision",
+            reason: "ref length does not match the admitted record length",
+        });
+    }
+    if reference.scope != record.scope {
+        return Err(ObservationError::InvalidField {
+            field: "experience_ref.scope",
+            reason: "ref scope does not match the admitted record scope",
+        });
+    }
+    Ok(record)
 }
 
 /// Build the opaque [`ExperienceRecordRef`] for one admitted bank record.
@@ -703,4 +973,95 @@ pub fn feedback_record_ref(
     };
     reference.validate()?;
     Ok(reference)
+}
+
+/// Canonical commit parameters for one admitted experience record.
+///
+/// Closed parameter schema for the [`BANK_COMMIT_OPERATION`] /
+/// [`FEEDBACK_COMMIT_OPERATION`] named operations (transition class
+/// [`COMMIT_TRANSITION_CLASS`], ceiling [`COMMIT_MAX_EFFECT`]). Every
+/// field binds admitted content: the record digest and owner revision,
+/// canonical digests of the exact scope and fence the record was admitted
+/// under, and a deterministic idempotency key (`bank:{handle}:{revision}`
+/// or `feedback:{handle}:{revision}`). The store bridge (#19 lane)
+/// registers these names and executes the transition; this shape only
+/// declares what the Governor commit producer must supply, byte for byte.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExperienceCommitParameters {
+    /// Closed operation name: exactly [`BANK_COMMIT_OPERATION`] or
+    /// [`FEEDBACK_COMMIT_OPERATION`].
+    pub operation: String,
+    /// Digest of the complete admitted record bytes (the record digest).
+    pub record_digest: String,
+    /// Owner revision of the admitted record.
+    pub record_revision: u64,
+    /// Digest over the canonical bytes of the admission scope.
+    pub scope_digest: String,
+    /// Digest over the canonical bytes of the admission fence.
+    pub fence_digest: String,
+    /// Deterministic idempotency key for the commit.
+    pub idempotency_key: String,
+}
+
+impl ExperienceCommitParameters {
+    /// Build commit parameters for one admitted bank record. All digests
+    /// are recomputed from the record here, never caller-supplied.
+    pub fn for_bank(record: &ExperienceBankRecord) -> Result<Self, ObservationError> {
+        record.validate()?;
+        Ok(Self {
+            operation: BANK_COMMIT_OPERATION.to_owned(),
+            record_digest: record.digest.clone(),
+            record_revision: record.bank_revision,
+            scope_digest: canonical_shape_digest(&record.scope, "commit.scope")?,
+            fence_digest: canonical_shape_digest(&record.fence, "commit.fence")?,
+            idempotency_key: format!("bank:{}:{}", record.handle.as_str(), record.bank_revision),
+        })
+    }
+
+    /// Build commit parameters for one admitted feedback record. Same
+    /// recompute rule as [`for_bank`](Self::for_bank).
+    pub fn for_feedback(record: &AgentFeedbackRecord) -> Result<Self, ObservationError> {
+        record.validate()?;
+        Ok(Self {
+            operation: FEEDBACK_COMMIT_OPERATION.to_owned(),
+            record_digest: record.digest.clone(),
+            record_revision: record.feedback_revision,
+            scope_digest: canonical_shape_digest(&record.scope, "commit.scope")?,
+            fence_digest: canonical_shape_digest(&record.fence, "commit.fence")?,
+            idempotency_key: format!(
+                "feedback:{}:{}",
+                record.handle.as_str(),
+                record.feedback_revision
+            ),
+        })
+    }
+
+    /// Validate the closed parameter shape: known operation, digest
+    /// shapes, and a non-blank idempotency key.
+    pub fn validate(&self) -> Result<(), ObservationError> {
+        if self.operation != BANK_COMMIT_OPERATION && self.operation != FEEDBACK_COMMIT_OPERATION {
+            return Err(ObservationError::InvalidField {
+                field: "commit.operation",
+                reason: "unknown experience commit operation",
+            });
+        }
+        digest_shape(&self.record_digest, "commit.record_digest")?;
+        digest_shape(&self.scope_digest, "commit.scope_digest")?;
+        digest_shape(&self.fence_digest, "commit.fence_digest")?;
+        text(&self.idempotency_key, "commit.idempotency_key")
+    }
+}
+
+/// Digest over the canonical bytes of one scope or fence shape.
+fn canonical_shape_digest<T: Serialize>(
+    shape: &T,
+    field: &'static str,
+) -> Result<String, ObservationError> {
+    canonical_json_bytes(shape)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| ObservationError::InvalidField {
+            field,
+            reason: "shape is not canonically encodable",
+        })
 }

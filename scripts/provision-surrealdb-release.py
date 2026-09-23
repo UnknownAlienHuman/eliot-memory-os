@@ -2,9 +2,10 @@
 """Materialize the pinned SurrealDB evidence into project-local ignored state.
 
 This command never writes the shared C:\\Tools installation. It downloads the
-official release/source/tag and OSV snapshot selected by the tracked policy,
-refuses an existing byte mismatch, and leaves the verifier to validate PE,
-source-tree, tag, and advisory bindings.
+official release/source/tag and OSV snapshots selected by the tracked policy.
+The selected-candidate OSV response is fetched on every invocation so a release
+receipt can bind a fresh query to its exact response bytes. The verifier checks
+the PE, source-tree, tag, and advisory bindings.
 """
 
 from __future__ import annotations
@@ -30,6 +31,10 @@ REPARSE_POINT = 0x400
 
 def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def _path_identity(stat_result: os.stat_result) -> tuple[object, ...]:
@@ -303,6 +308,7 @@ def main() -> int:
         subject: str,
         expected: str | None = None,
         expected_bytes: int | None = None,
+        accept: str = "application/octet-stream",
     ) -> None:
         _, relative = safe_local_path(root, raw_path)
         try:
@@ -310,7 +316,7 @@ def main() -> int:
         except RuntimeError as exc:
             if "not a regular file" not in str(exc) or _validate_components(root, _relative_path(raw_path)).exists():
                 raise
-            payload = fetch(url)
+            payload = fetch(url, accept=accept)
             materialized = materialize(root, raw_path, payload, expected)
             relative = materialized["relative_path"]
             reused = False
@@ -344,6 +350,20 @@ def main() -> int:
     candidate_asset = f"{OFFICIAL_REPOSITORY}/releases/download/{candidate_tag}/surreal-{candidate_tag}.windows-amd64.exe"
     require_canonical(candidate["release_asset"], candidate_asset, "candidate release_asset")
     require_canonical(surreal["advisory_source"], OSV_ENDPOINT, "advisory_source")
+    if (
+        candidate.get("advisory_package") != "surrealdb"
+        or candidate.get("advisory_ecosystem") != "crates.io"
+        or candidate.get("advisory_scope") != "rust-crate"
+        or not isinstance(candidate.get("advisory_max_age_hours"), int)
+        or isinstance(candidate.get("advisory_max_age_hours"), bool)
+        or candidate["advisory_max_age_hours"] <= 0
+    ):
+        raise RuntimeError("candidate OSV scope and freshness policy are not canonical")
+    if (
+        candidate.get("advisory_query_path") == surreal.get("advisory_query_path")
+        or candidate.get("advisory_response_path") == surreal.get("advisory_response_path")
+    ):
+        raise RuntimeError("candidate OSV evidence must be separate from the installed-version snapshot")
     old_tag = evidence["source_tag"]
     old_version = surreal["version"]
     require_canonical(surreal["release_source"], f"{OFFICIAL_REPOSITORY}/releases/tag/{old_tag}", "installed release_source")
@@ -366,11 +386,13 @@ def main() -> int:
         candidate["release_metadata_path"],
         url_for_release(candidate_tag),
         f"surrealdb.release-metadata.{candidate_tag}",
+        accept="application/vnd.github+json",
     )
     fetch_to(
         candidate["source_tag_ref_path"],
         url_for_tag(candidate_tag),
         f"surrealdb.tag-ref.{candidate_tag}",
+        accept="application/vnd.github+json",
     )
     fetch_to(
         evidence["source_archive_path"],
@@ -382,6 +404,7 @@ def main() -> int:
         evidence["source_tag_ref_path"],
         url_for_tag(old_tag),
         f"surrealdb.tag-ref.{old_tag}",
+        accept="application/vnd.github+json",
     )
 
     query = json.loads(surreal["advisory_query"])
@@ -397,28 +420,103 @@ def main() -> int:
         **query_record,
     })
     try:
-        _, response_relative, response_bytes = read_local(root, surreal["advisory_response_path"])
-        response_reused = True
+        _, _, source_response_bytes = read_local(root, surreal["advisory_response_path"])
     except RuntimeError as exc:
         if "not a regular file" not in str(exc) or _validate_components(root, _relative_path(surreal["advisory_response_path"])).exists():
             raise
-        response_bytes = fetch(OSV_ENDPOINT, data=query_bytes, accept="application/json")
-        response_record = materialize(root, surreal["advisory_response_path"], response_bytes, surreal["advisory_response_digest"])
-        response_relative = response_record["relative_path"]
-        response_reused = False
-    if response_reused:
-        response_sha = sha256_bytes(response_bytes)
-        if response_sha != str(surreal["advisory_response_digest"]).lower():
-            raise RuntimeError(f"existing bytes for {response_relative} have SHA-256 {response_sha}, expected {surreal['advisory_response_digest']}")
-        response_record = {"path": response_relative, "relative_path": response_relative, "bytes": len(response_bytes), "sha256": response_sha}
+        source_response_bytes = fetch(OSV_ENDPOINT, data=query_bytes, accept="application/json")
+    try:
+        response_data = json.loads(source_response_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"installed SurrealDB OSV response is not valid JSON: {exc}") from exc
+    if not isinstance(response_data, dict) or not isinstance(response_data.get("vulns"), list):
+        raise RuntimeError("installed SurrealDB OSV response must contain a vulns array")
+    response_bytes = canonical_json_bytes(response_data)
+    response_record = materialize(
+        root,
+        surreal["advisory_response_path"],
+        response_bytes,
+        surreal["advisory_response_digest"],
+        replace_existing=source_response_bytes != response_bytes,
+    )
     records.append({
         "subject": "osv.response.surrealdb",
         "url": OSV_ENDPOINT,
         "request": False,
-        "reused": response_reused,
         "expected_sha256": str(surreal["advisory_response_digest"]).lower(),
         "expected_bytes": None,
         **response_record,
+    })
+
+    candidate_query = {
+        "package": {
+            "ecosystem": candidate["advisory_ecosystem"],
+            "name": candidate["advisory_package"],
+        },
+        "version": candidate_version,
+    }
+    candidate_query_bytes = (
+        json.dumps(candidate_query, separators=(",", ":"), ensure_ascii=False) + "\r\n"
+    ).encode("utf-8")
+    candidate_query_expected_sha256 = sha256_bytes(candidate_query_bytes)
+    candidate_query_record = materialize(
+        root,
+        candidate["advisory_query_path"],
+        candidate_query_bytes,
+        candidate_query_expected_sha256,
+        replace_existing=True,
+    )
+    records.append({
+        "subject": f"osv.query.surrealdb.release-candidate.{candidate_tag}",
+        "url": OSV_ENDPOINT,
+        "request": True,
+        "expected_sha256": candidate_query_expected_sha256,
+        "expected_bytes": candidate_query_record["bytes"],
+        **candidate_query_record,
+    })
+
+    candidate_response_bytes = fetch(
+        OSV_ENDPOINT,
+        data=candidate_query_bytes,
+        accept="application/json",
+    )
+    try:
+        candidate_response_data = json.loads(candidate_response_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"candidate OSV response is not valid JSON: {exc}") from exc
+    if not isinstance(candidate_response_data, dict):
+        raise RuntimeError("candidate OSV response must be a JSON object")
+    unexpected_response_fields = set(candidate_response_data) - {"vulns", "next_page_token"}
+    if unexpected_response_fields:
+        raise RuntimeError(
+            "candidate OSV response contains unsupported fields: "
+            + ", ".join(sorted(str(field) for field in unexpected_response_fields))
+        )
+    candidate_vulnerabilities = candidate_response_data.get("vulns", [])
+    if not isinstance(candidate_vulnerabilities, list):
+        raise RuntimeError("candidate OSV response vulns field must be an array when present")
+    if "next_page_token" in candidate_response_data:
+        next_page_token = candidate_response_data["next_page_token"]
+        if not isinstance(next_page_token, str):
+            raise RuntimeError("candidate OSV response next_page_token must be a string when present")
+        if next_page_token:
+            raise RuntimeError("candidate OSV response is paginated and cannot establish a complete advisory result")
+    candidate_retrieved_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    candidate_response_record = materialize(
+        root,
+        candidate["advisory_response_path"],
+        candidate_response_bytes,
+        replace_existing=True,
+    )
+    records.append({
+        "subject": f"osv.response.surrealdb.release-candidate.{candidate_tag}",
+        "url": OSV_ENDPOINT,
+        "request": False,
+        "fetched": True,
+        "retrieved_at_utc": candidate_retrieved_at,
+        "expected_sha256": None,
+        "expected_bytes": None,
+        **candidate_response_record,
     })
 
     receipt = {

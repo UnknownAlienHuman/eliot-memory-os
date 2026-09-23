@@ -4,20 +4,19 @@
 
 The catalog keeps the installed `3.1.4` observation separate from the project-local patched candidate. `patched_candidate` binds the official `3.2.0` Windows x64 artifact and its source/advisory evidence. A real staging run with `-UseProjectLocalSurreal` invokes `scripts/provision-surrealdb-release.py`, consumes `.eliot/dependency-policy/surrealdb/v3.2.0/surreal-v3.2.0.windows-amd64.exe`, and copies that verified byte set to `runtime/surreal.exe`; it never changes the shared `C:\Tools\SurrealDB` installation.
 
-Use `-PlanOnly` to inspect paths and contents without building or writing a bundle. Every real staging run requires `-OperatorSource <published-directory>` containing `Eliot.Operator.exe`; the script refuses a Governor-only package and refuses to overwrite an existing versioned bundle.
+After the Windows release build, the builder refreshes the candidate's exact-version OSV response and consumes `.eliot/dependency-policy/surrealdb/v3.2.0/selected-release-policy-receipt.json`. The unsigned bundle carries `runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json`, `runtime/SURREALDB_RELEASE_OSV_QUERY.json`, and `runtime/SURREALDB_RELEASE_OSV_RESPONSE.json`; `-VerifyBundle` rechecks their hashes and joins against the selected artifact, release catalogue, and staged provisioner receipt. The receipt leaves `release_admission` as `INCOMPLETE` while applicability of crates.io advisory records to the distributed binary remains unestablished. The installed `3.1.4` advisory findings remain part of the separate `current-advisories` result.
+
+Use `-PlanOnly` to inspect paths and contents without building or writing a bundle. For a builder-owned Operator build, pass `-BuildOperator`: the release builder runs the pinned WinUI project through locked `dotnet publish`, and the project's `AfterTargets=Publish` target writes `OPERATOR_BUILD_RECEIPT.json` from the successful publish inputs and actual output files. The builder consumes that same invocation-bound receipt when staging and independently verifies its source, tool, protocol, executable, and publish-file hashes. Alternatively, `-OperatorSource <published-directory>` accepts only a directory carrying the same source-bound receipt. The script refuses a Governor-only package and refuses to overwrite an existing versioned bundle.
 
 The Codex marketplace declares `eliot-governor` as `INSTALLED_BY_DEFAULT`. Its sole MCP server is `eliot`, resolves `bin/eliot-governor.exe` relative to the plugin root, and starts the `codex_controller` profile for every project. The plugin command deliberately omits `--host`; live session binding remains the authority for host identity. Codex discovers `hooks/hooks.json` by convention, so the plugin manifest does not carry the unsupported `hooks` field.
 
 The tracked and released `plugin.json` is cache-neutral: its version is the base SemVer, currently `0.1.0`, with no `+codex` build metadata. `PlanOnly` reports this as `codex_plugin_base_version`, and `RELEASE.json` records the same value. The installer must not rewrite either source or release payload. It materializes only its ELIOT-owned personal-plugin copy as `<base-version>+codex.<deterministic-content-token>` before invoking the Codex plugin lifecycle. The token is stable for the complete Codex cache contract and changes when the bundled Governor, MCP, hooks, skills, or plugin metadata change. Codex executes the SHA-256-verified Governor inside that immutable cache, so a binary-only update receives a new add-only version. A timestamp-only token is reserved for manual local-development iteration.
 
 ```powershell
-$operatorPublish = Join-Path $env:LOCALAPPDATA 'Eliot\build\operator-publish'
 $releaseRoot = Join-Path $env:LOCALAPPDATA 'Eliot\packages'
-dotnet publish apps/Eliot.Operator/Eliot.Operator.csproj -c Release -r win-x64 `
-  --self-contained false -o $operatorPublish
 powershell -NoProfile -ExecutionPolicy Bypass `
   -File scripts/build-eliot-windows-x64-release.ps1 `
-  -Version 0.1.0-rc1 -OutputRoot $releaseRoot -OperatorSource $operatorPublish `
+  -Version 0.1.0-rc1 -OutputRoot $releaseRoot -BuildOperator `
   -UseProjectLocalSurreal
 ```
 
