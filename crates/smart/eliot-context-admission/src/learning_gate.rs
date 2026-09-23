@@ -41,7 +41,7 @@ use eliot_improvement::{
     CarriageMark, PresentedLearning, bounds_to_context_error, check_governed_carriage,
 };
 
-use crate::admit_context;
+use crate::admit_context_inner;
 
 /// One learning-marked atom with its compilation identity, for screening.
 pub struct LearningSubject<'a> {
@@ -156,7 +156,7 @@ pub fn screen_admission_input_learning(
 /// Governed retrieval entrypoint: run the owner-bound carriage gate
 /// (ticket re-verification, overlay liveness, backlog backing, cross-task
 /// admission) plus the per-mark screen, then the unchanged
-/// [`admit_context`] decision.
+/// [`admit_context_inner`] decision.
 ///
 /// Inputs without learning marks and without tickets are decided exactly
 /// as before; any marked or ticketed input passes the full gate, and any
@@ -192,5 +192,5 @@ pub fn admit_context_with_learning(
             .map_err(bounds_to_context_error)?;
     }
     screen_admission_input_learning(input, presented.verified, presented.now_unix_secs)?;
-    admit_context(input)
+    admit_context_inner(input)
 }
