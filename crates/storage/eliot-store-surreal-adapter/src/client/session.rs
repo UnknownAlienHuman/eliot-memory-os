@@ -84,6 +84,66 @@ impl RpcSession {
         owner.record_authenticated_version(version);
         Ok(session)
     }
+
+    /// Establishes one authenticated session against the same provider
+    /// generation but a different database (issues #952/#975 R1).
+    ///
+    /// The isolated restore destination is a genuinely separate store
+    /// identity (different `SurrealDB` database) served by the same
+    /// provider process: no second provider is started, adopted, or killed
+    /// here. The returned session selects exactly the given database at
+    /// authentication and is never shared with serving traffic, so the
+    /// destination stays fenced from ordinary serving and effects. Callers
+    /// must refuse the serving database name before connecting.
+    pub(super) async fn connect_with_database(
+        owner: &Arc<ProviderOwner>,
+        deadline: Instant,
+        namespace: &str,
+        database: &str,
+    ) -> Result<Self, AdapterError> {
+        let mut child = owner.provider_child.lock().await;
+        let before = validate_child_process(
+            &owner.config,
+            &owner.process_lease,
+            &mut child,
+            owner.provider_process_id,
+        )?;
+        require_unchanged_identity(
+            &owner.provider_process_identity,
+            &before,
+            "session connection precheck",
+        )?;
+        let (socket, before_auth) = connect_started_provider(
+            &owner.config,
+            &owner.process_lease,
+            &mut child,
+            owner.provider_process_id,
+            &before,
+            deadline,
+        )
+        .await?;
+        drop(child);
+        let session = Self {
+            socket: Mutex::new(socket),
+            request_timeout: millis(owner.config.query_timeout_ms),
+            owner: Arc::downgrade(owner),
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let version = timeout(
+            remaining,
+            authenticate_provider_with_database(&session, &owner.config, namespace, database),
+        )
+        .await
+        .map_err(|_| AdapterError::ProviderUnavailable)??;
+        owner.validate_owned().await?;
+        require_unchanged_identity(
+            &before_auth,
+            &owner.provider_process_identity,
+            "authentication",
+        )?;
+        owner.record_authenticated_version(version);
+        Ok(session)
+    }
     async fn signin(&self, username: &str, password: &SecretString) -> Result<(), AdapterError> {
         self.request(
             "auth.signin",
@@ -233,6 +293,27 @@ pub(super) async fn authenticate_provider<T: ProviderAuthentication>(
     transport: &T,
     config: &SurrealAdapterConfig,
 ) -> Result<super::rpc_parse::ProviderVersion, AdapterError> {
+    authenticate_provider_with_database(
+        transport,
+        config,
+        &config.namespace,
+        &config.database,
+    )
+    .await
+}
+
+/// Authenticates one session against an explicit namespace/database while
+/// keeping every other policy (pinned major gate before credentials,
+/// credential handling, identity checks at the call site) identical to
+/// [`authenticate_provider`]. The destination-restore path uses this to
+/// select the admitted isolated destination database on the same provider
+/// generation; serving sessions keep the config-bound entry above.
+pub(super) async fn authenticate_provider_with_database<T: ProviderAuthentication>(
+    transport: &T,
+    config: &SurrealAdapterConfig,
+    namespace: &str,
+    database: &str,
+) -> Result<super::rpc_parse::ProviderVersion, AdapterError> {
     let version = provider_version_from_rpc(&transport.version().await?)?;
     if version.major != config.expected_provider_major {
         return Err(AdapterError::Config(format!(
@@ -242,7 +323,7 @@ pub(super) async fn authenticate_provider<T: ProviderAuthentication>(
     }
     transport.signin(&config.username, &config.password).await?;
     transport
-        .select_namespace_database(&config.namespace, &config.database)
+        .select_namespace_database(namespace, database)
         .await?;
     Ok(version)
 }

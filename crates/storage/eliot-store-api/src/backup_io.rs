@@ -18,10 +18,14 @@ use eliot_contracts::{ContractVersion, OperationId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{OperationIdentity, OrderingHead, RevisionHead, StoreError};
+use crate::{OperationIdentity, OrderingHead, RevisionHead, StoreError, TransitionClass};
 
 /// Contract revision of the store backup port surface.
-pub const STORE_BACKUP_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+///
+/// 1.1.0: isolated restore carries the Governor-minted restore admission
+/// (issues #952/#975 R2/R3) and completion receipts repeat the admission
+/// decision digest.
+pub const STORE_BACKUP_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
 /// Largest member population admitted in one backup page.
 pub const MAX_STORE_BACKUP_PAGE_MEMBERS: usize = 256;
 /// Largest residency disposition set admitted on one completion receipt.
@@ -386,6 +390,14 @@ pub struct StoreBackupCompletionReceipt {
     pub ordering_heads: Vec<OrderingHead>,
     /// Whether the capture closed over a partial denominator.
     pub partial: bool,
+    /// Governor admission decision digest repeated from the restore
+    /// admission (issues #952/#975 R2). `None` on capture receipts, which
+    /// are not admitted restores; `Some` on every restore receipt, so the
+    /// committed receipt repeats the exact admitted decision digest it
+    /// executed under. `Option` with a serde default keeps previously
+    /// completed capture receipts readable.
+    #[serde(default)]
+    pub admission_decision_digest: Option<String>,
 }
 
 impl StoreBackupCompletionReceipt {
@@ -396,6 +408,9 @@ impl StoreBackupCompletionReceipt {
             .map_err(StoreError::Foundation)?;
         validate_digest(&self.consistency_point, "backup.consistency_point")?;
         validate_digest(&self.snapshot_digest, "backup.snapshot_digest")?;
+        if let Some(digest) = &self.admission_decision_digest {
+            validate_digest(digest, "backup.admission_decision_digest")?;
+        }
         validate_digest(
             &self.scope_residency_digest,
             "backup.scope_residency_digest",
@@ -438,6 +453,126 @@ impl StoreBackupCompletionReceipt {
     }
 }
 
+/// Admitted restore operation class marker (issues #952/#975 R3).
+///
+/// The single operation class the Governor admits for isolated restore. It
+/// is carried per operation on [`StoreRestoreAdmission`], never granted
+/// through a normal-write capability, and never reinterpreted from a
+/// reserved request: a restore without exactly this class refuses before
+/// any provider I/O.
+pub const RESTORE_OPERATION_CLASS: &str = "backup.restore";
+
+/// Governor-minted restore admission carried by one isolated restore
+/// (issues #952/#975 R2/R3).
+///
+/// This is the operation-class admission the restore executes under: it
+/// binds the stable restore identity, the fixed `RecoverySchema`
+/// transition class, the fixed [`RESTORE_OPERATION_CLASS`], the admitted
+/// isolated destination, the shared fence, the capture denominator, and
+/// the source snapshot. The Governor owner mints it during semantic
+/// admission; the store bridge recomputes [`Self::decision_digest`] and
+/// refuses any mismatch, then executes exactly the admitted plan and
+/// repeats the digest in the restore receipt. The bridge never mints,
+/// widens, or reinterprets this admission: without it the restore is not
+/// admitted at all.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreRestoreAdmission {
+    /// Stable restore operation identity; must equal the request identity.
+    pub identity: OperationIdentity,
+    /// Transition class the restore executes under; must be `RecoverySchema`.
+    pub transition_class: TransitionClass,
+    /// Admitted operation class; must be [`RESTORE_OPERATION_CLASS`].
+    pub operation_class: String,
+    /// Admitted isolated destination installation; must equal the scope dest.
+    pub dest_installation_id: String,
+    /// Admitted isolated destination store; must equal the scope dest and
+    /// must differ from both the capture source and the serving store.
+    pub dest_store_id: String,
+    /// Fence both endpoints share; must equal the scope fence.
+    pub state_fence: StateFence,
+    /// Capture denominator digest; must equal the scope denominator.
+    pub residency_denominator_digest: String,
+    /// Source snapshot digest; must equal the request source digest.
+    pub source_snapshot_digest: String,
+    /// Governor-minted decision digest over every field above, recomputed
+    /// by [`Self::decision_digest`] and compared for equality downstream.
+    pub admission_decision_digest: String,
+}
+
+impl StoreRestoreAdmission {
+    /// Recomputes the admission decision digest over the bound fields.
+    ///
+    /// Pure over closed inputs: the Governor mints with this same function
+    /// and the store bridge re-derives it, so equal bytes under different
+    /// bindings stay distinct and no digest is ever accepted from a caller
+    /// without recomputation.
+    pub fn decision_digest(&self) -> Result<String, StoreError> {
+        use eliot_contracts::{canonical_json_bytes, sha256_hex};
+        let fence_bytes = canonical_json_bytes(&self.state_fence)
+            .map_err(|_| StoreError::InvalidField {
+                field: "backup.admission_decision_digest",
+                reason: "fence bytes are not canonical",
+            })?;
+        let mut material = Vec::with_capacity(fence_bytes.len() + 256);
+        material.extend_from_slice(b"backup-restore-admission:v1\n");
+        material.extend_from_slice(self.identity.operation_id.to_string().as_bytes());
+        material.push(b'\n');
+        material.extend_from_slice(self.identity.idempotency_key.as_bytes());
+        material.push(b'\n');
+        material.extend_from_slice(self.identity.canonical_request_hash.as_bytes());
+        material.push(b'\n');
+        material.extend_from_slice(b"recovery_schema\n");
+        material.extend_from_slice(self.operation_class.as_bytes());
+        material.push(b'\n');
+        material.extend_from_slice(self.dest_installation_id.as_bytes());
+        material.push(b'\n');
+        material.extend_from_slice(self.dest_store_id.as_bytes());
+        material.push(b'\n');
+        material.extend_from_slice(&fence_bytes);
+        material.push(b'\n');
+        material.extend_from_slice(self.residency_denominator_digest.as_bytes());
+        material.push(b'\n');
+        material.extend_from_slice(self.source_snapshot_digest.as_bytes());
+        Ok(sha256_hex(&material))
+    }
+
+    /// Validates the closed restore admission without granting authority.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.identity.validate()?;
+        if self.transition_class != TransitionClass::RecoverySchema {
+            return Err(StoreError::InvalidField {
+                field: "backup.transition_class",
+                reason: "isolated restore executes only under RecoverySchema",
+            });
+        }
+        if self.operation_class != RESTORE_OPERATION_CLASS {
+            return Err(StoreError::InvalidField {
+                field: "backup.operation_class",
+                reason: "isolated restore requires the admitted restore operation class",
+            });
+        }
+        validate_text(&self.dest_installation_id, "backup.dest_installation_id")?;
+        validate_text(&self.dest_store_id, "backup.dest_store_id")?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        validate_digest(
+            &self.residency_denominator_digest,
+            "backup.residency_denominator_digest",
+        )?;
+        validate_digest(
+            &self.source_snapshot_digest,
+            "backup.source_snapshot_digest",
+        )?;
+        let recomputed = self.decision_digest()?;
+        if recomputed != self.admission_decision_digest {
+            return Err(StoreError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
 /// Request restoring validated canonical records into an admitted isolated
 /// destination (issue #950).
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -451,6 +586,10 @@ pub struct StoreIsolatedRestoreRequest {
     pub source_snapshot_digest: String,
     /// Admitted isolated destination scope; differs from the source.
     pub scope: StoreBackupScope,
+    /// Governor-minted restore admission this execution runs under. The
+    /// restore is not admitted without it: session capability alone never
+    /// authorizes a restore.
+    pub admission: StoreRestoreAdmission,
     /// Expected member population from the source receipt.
     pub expected_member_count: u64,
     /// Maximum members applied per batch.
@@ -462,10 +601,29 @@ impl StoreIsolatedRestoreRequest {
     pub fn validate(&self) -> Result<(), StoreError> {
         self.identity.validate()?;
         self.scope.validate()?;
+        self.admission.validate()?;
         validate_digest(
             &self.source_snapshot_digest,
             "backup.source_snapshot_digest",
         )?;
+        if self.admission.identity != self.identity {
+            return Err(StoreError::IdentityConflict);
+        }
+        if self.admission.dest_installation_id != self.scope.dest_installation_id
+            || self.admission.dest_store_id != self.scope.dest_store_id
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        if self.admission.state_fence != self.scope.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        if self.admission.residency_denominator_digest != self.scope.residency_denominator_digest
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        if self.admission.source_snapshot_digest != self.source_snapshot_digest {
+            return Err(StoreError::IdentityConflict);
+        }
         if self.max_members_per_batch == 0
             || usize::try_from(self.max_members_per_batch).unwrap_or(usize::MAX)
                 > MAX_STORE_BACKUP_PAGE_MEMBERS

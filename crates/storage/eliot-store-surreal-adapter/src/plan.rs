@@ -815,6 +815,62 @@ fn ensure_unique_ordering_scopes(scopes: &[OrderingScopeId]) -> Result<(), Store
     Ok(())
 }
 
+/// Admits one frozen derived row for verbatim restore replay (issues
+/// #952/#975 R4).
+///
+/// Owner statement from the projection derivation owner: this module is
+/// the accepted pure projection path — [`projection_records`] and
+/// [`outbox_records`] derive every queryable projection and outbox body
+/// from admitted transition intents. Re-deriving frozen derived rows
+/// inside the restore would require re-running semantic admission, which
+/// the bridge is forbidden to invent (I1.8, A12.3). Verbatim replay of
+/// the frozen derived bytes is therefore the accepted restore path,
+/// exactly when all of the following hold:
+///
+/// ```text
+/// the row was frozen under a completed capture receipt (provenance);
+/// the frozen bytes re-hash to the frozen content digest (integrity);
+/// the row validates through the owner types below (owner-built shape);
+/// purge-suppressed and non-pending outbox members are excluded upstream
+///   (no resurrection, no effect revival);
+/// the replay lands only in the admitted isolated destination under the
+///   admitted restore identity (isolation);
+/// destination head readback afterwards verifies coverage (verification,
+///   never the justification itself).
+/// ```
+///
+/// Anything else refuses with `InvalidProjection`: unverified derived
+/// data can never grant completion. Unknown member tables are not derived
+/// data and are refused here; the restore classifies them before any
+/// write.
+pub(crate) fn admit_frozen_derived_replay(
+    member_table: &str,
+    member_json: &str,
+    content_digest: &str,
+) -> Result<(), StoreError> {
+    if sha256_hex(member_json.as_bytes()) != content_digest {
+        return Err(StoreError::InvalidProjection);
+    }
+    let row: Value =
+        serde_json::from_str(member_json).map_err(|_| StoreError::InvalidProjection)?;
+    let body = row.get("body").ok_or(StoreError::InvalidProjection)?;
+    if member_table == crate::schema::table::PROJECTION_RECORD {
+        let record: ProjectionPublicationRecord =
+            serde_json::from_value(body.clone()).map_err(|_| StoreError::InvalidProjection)?;
+        record
+            .validate()
+            .map_err(|_| StoreError::InvalidProjection)?;
+        Ok(())
+    } else if member_table == crate::schema::table::OUTBOX_EVENT {
+        let intent: OutboxIntent =
+            serde_json::from_value(body.clone()).map_err(|_| StoreError::InvalidProjection)?;
+        intent.validate().map_err(|_| StoreError::InvalidProjection)?;
+        Ok(())
+    } else {
+        Err(StoreError::InvalidProjection)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -89,6 +89,16 @@ pub(crate) mod table {
     /// the exact member/byte denominators. Written once at `Begin`
     /// alongside the frozen members; never mutated afterwards.
     pub(crate) const BACKUP_RESIDENCY: &str = "backup_residency";
+    /// Admitted isolated restore destination record (issues #952/#975 R1).
+    /// Exactly one row (`restore_destination:current`) per destination
+    /// database, written once by explicit deployment provisioning. It
+    /// names the admitted destination installation/store identity, the
+    /// shared fence, and the separate cutover authority, and marks the
+    /// destination fenced from serving and effects. Restore refuses an
+    /// absent record (unprovisioned destination), an identity/fence
+    /// mismatch, or a serving-marked destination; only separate cutover
+    /// authority may change serving state, never the restore path.
+    pub(crate) const RESTORE_DESTINATION: &str = "restore_destination";
 }
 
 /// Record key of the single canonical fence/sequence row.
@@ -352,6 +362,24 @@ DEFINE INDEX backup_residency_key ON backup_residency FIELDS operation_id, resid
 
 /// Migration identity of the additive backup-tables delta.
 pub(crate) const MIGRATION_ID_BACKUP_TABLES: &str = "eliot.store.surreal.schema.backup_tables";
+
+/// Restore-destination admission record (issues #952/#975 R1). Applied to
+/// the destination database only, by the explicit deployment provisioning
+/// entrypoint — never implicitly, never to the serving database. The
+/// single `restore_destination:current` row gates every restore into that
+/// database.
+pub(crate) const RESTORE_DESTINATION_DDL: &str = r"
+DEFINE TABLE restore_destination SCHEMALESS;
+DEFINE FIELD dest_store_id ON restore_destination TYPE string;
+DEFINE FIELD dest_installation_id ON restore_destination TYPE string;
+DEFINE FIELD state_fence ON restore_destination TYPE object;
+DEFINE FIELD serving ON restore_destination TYPE bool;
+DEFINE FIELD cutover_authority ON restore_destination TYPE string;
+DEFINE INDEX restore_destination_current ON restore_destination FIELDS dest_store_id UNIQUE;
+";
+
+/// Record key of the single restore-destination admission row.
+pub(crate) const RESTORE_DESTINATION_KEY: &str = "current";
 
 pub(crate) const SCHEMA_DDL_V2: &str = r"
 DEFINE TABLE schema_meta SCHEMALESS;

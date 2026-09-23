@@ -506,6 +506,40 @@ impl StoreComposition {
             .map_err(map_adapter_error)
     }
 
+    /// Provisions one isolated restore destination database (issues
+    /// #952/#975 R1). This is the deployment caller for the adapter's
+    /// explicit destination provisioning: normal Store startup never calls
+    /// this method; portable development opts into the separate
+    /// schema-initialization path, and production deployment invokes the
+    /// admitted provisioning explicitly through this same composition
+    /// seam. The destination is a different store identity on the same
+    /// provider generation, fenced from serving and effects until separate
+    /// cutover authority accepts it. Provisioning is idempotent: an
+    /// identically admitted destination replays instead of duplicating
+    /// state, and the serving database can never be provisioned as a
+    /// destination.
+    pub async fn provision_restore_destination(
+        &self,
+        dest_store_id: &str,
+        dest_installation_id: &str,
+        cutover_authority: &str,
+        observed_clock: &ClockObservation,
+    ) -> Result<(), StoreCompositionError> {
+        if self.schema_bootstrap_binding.profile != InstallationProfile::PortableDev {
+            return Err(StoreCompositionError::Store(StoreError::Unavailable));
+        }
+        self.store
+            .provision_restore_destination(
+                dest_store_id,
+                dest_installation_id,
+                &self.state_fence,
+                cutover_authority,
+                observed_clock,
+            )
+            .await
+            .map_err(map_adapter_error)
+    }
+
     /// Executes one explicitly bound `SystemService` schema bootstrap command.
     ///
     /// This is intentionally a Store-local seam for the future transaction-
@@ -740,11 +774,12 @@ impl StoreComposition {
     /// Restores validated canonical records into the admitted isolated
     /// destination only (issue #975).
     ///
-    /// Same live-backend contract as [`Self::backup_begin`]: validated
-    /// and destination-pinned here, delegated exactly once to the #952
-    /// restore backend, then verified connected through the canonical
-    /// head owner route below. This method can never activate the
-    /// installation, unblock effects, or retire the source.
+    /// Validated and destination-pinned here, delegated exactly once to
+    /// the #952 restore backend, then verified connected through the
+    /// destination head route below. Same-store destinations refuse before
+    /// dispatch; the backend refuses them again at connect time. This
+    /// method can never activate the installation, unblock effects, or
+    /// retire the source: cutover is separate authority.
     pub async fn backup_isolated_restore(
         &self,
         request: StoreIsolatedRestoreRequest,
@@ -753,8 +788,15 @@ impl StoreComposition {
         if request.scope.state_fence != self.state_fence {
             return Err(StoreError::FenceMismatch);
         }
+        if request.scope.dest_store_id == self.store.config().database {
+            return Err(StoreError::InvalidField {
+                field: "backup.destination",
+                reason: "restore destination must differ from the serving store",
+            });
+        }
+        let dest_store_id = request.scope.dest_store_id.clone();
         let receipt = CanonicalBackupPorts::backup_isolated_restore(&self.store, request).await?;
-        self.verify_restore_heads(&receipt).await?;
+        self.verify_restore_heads(&dest_store_id, &receipt).await?;
         Ok(receipt)
     }
 
@@ -800,43 +842,27 @@ impl StoreComposition {
         CanonicalBackupPorts::backup_reconcile(&self.store, request).await
     }
 
-    /// Verifies restored records stayed connected to the canonical heads
+    /// Verifies restored records stayed connected to the destination heads
     /// (issue #952).
     ///
-    /// This is the composition-side half of the derived-projection
-    /// transition owner route: after the adapter replays validated rows,
-    /// every revision scope and ordering scope named by the restore
-    /// receipt must read back covered by the live heads under the receipt
-    /// fence. A scope behind its restored revision, a foreign fence, or a
-    /// missing head refuses with `InvalidProjection` instead of reporting
-    /// a ready restore over disconnected records. Unverified derived data
-    /// can never grant completion; the failure preserves the durable
-    /// restore evidence for exact reconciliation.
+    /// Destination-scoped readback check: after the adapter replays
+    /// validated rows into the isolated destination, every revision scope
+    /// and ordering scope named by the restore receipt must read back
+    /// covered by the *destination* heads under the receipt fence — never
+    /// the serving heads. A scope behind its restored revision, a foreign
+    /// fence, or a missing head refuses with `InvalidProjection` instead
+    /// of reporting a ready restore over disconnected records. This check
+    /// verifies coverage after the fact; it is not the rebuild path.
+    /// Unverified derived data can never grant completion; the failure
+    /// preserves the durable restore evidence for exact reconciliation.
     async fn verify_restore_heads(
         &self,
+        dest_store_id: &str,
         receipt: &StoreBackupCompletionReceipt,
     ) -> Result<(), StoreError> {
-        for head in &receipt.revision_heads {
-            let live =
-                CanonicalStoreClient::revision_heads(&self.store, vec![head.key.clone()]).await?;
-            let Some(current) = live.first() else {
-                return Err(StoreError::InvalidProjection);
-            };
-            if current.state_fence != receipt.state_fence || current.revision < head.revision {
-                return Err(StoreError::InvalidProjection);
-            }
-        }
-        for head in &receipt.ordering_heads {
-            let live =
-                CanonicalStoreClient::ordering_heads(&self.store, vec![head.scope.clone()]).await?;
-            let Some(current) = live.first() else {
-                return Err(StoreError::InvalidProjection);
-            };
-            if current.state_fence != receipt.state_fence || current.sequence < head.sequence {
-                return Err(StoreError::InvalidProjection);
-            }
-        }
-        Ok(())
+        self.store
+            .read_restore_destination_heads(dest_store_id, receipt)
+            .await
     }
 
     /// Reconciles a possibly ambiguous write by exact operation identity.

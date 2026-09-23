@@ -71,6 +71,7 @@ pub(crate) async fn initialize_genesis(
 
 pub(crate) use backup_restore::{
     backup_isolated_restore, backup_provisioned, backup_reconcile, backup_status, backup_validate,
+    provision_restore_destination, read_restore_destination_heads,
 };
 pub(crate) use backup_snapshot::{backup_begin, backup_end, backup_page};
 #[cfg(test)]
@@ -100,7 +101,11 @@ use schema_contract::{
     validate_schema_meta_record, validate_v1_pin,
 };
 
-fn is_admitted_migration(migration: &CompiledMigration) -> bool {
+/// Reports whether one compiled migration is exactly an admitted plan.
+/// `pub(super)`-visible so the restore-destination provisioning path
+/// (issues #952/#975 R1) gates on the identical admission check instead
+/// of duplicating the security gate.
+pub(super) fn is_admitted_migration(migration: &CompiledMigration) -> bool {
     if !validate_v1_pin() {
         return false;
     }

@@ -64,6 +64,115 @@ pub(crate) struct RpcResults {
     errors: Vec<String>,
 }
 
+/// Dedicated transport for one admitted isolated restore destination
+/// (issues #952/#975 R1).
+///
+/// One authenticated session against the same provider process and
+/// generation, selecting exactly the destination database. It is never
+/// pooled with serving traffic and never binds the serving database, so
+/// restored rows land only in the fenced destination and serving reads
+/// and writes cannot observe or touch them. One restore flow owns its
+/// destination transport for the duration of the flow; concurrent restores
+/// arbitrate through the destination fence compare-and-set plus
+/// converge-or-conflict classification, never through a shared session.
+pub(crate) struct RestoreDestinationTransport {
+    session: RpcSession,
+    database: String,
+}
+
+impl fmt::Debug for RestoreDestinationTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RestoreDestinationTransport")
+            .field("database", &self.database)
+            .field("session", &"private")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Connects the dedicated destination transport for one restore flow.
+///
+/// Refuses the serving database name and blank/control names before any
+/// provider I/O: a destination that is not a genuinely different store
+/// identity is never connected. No provider process is started here; the
+/// session joins the existing provider generation owned by `provider`.
+pub(crate) async fn connect_restore_destination(
+    provider: &Arc<ProviderOwner>,
+    config: &SurrealAdapterConfig,
+    dest_database: &str,
+) -> Result<RestoreDestinationTransport, AdapterError> {
+    if dest_database.trim().is_empty() || dest_database.chars().any(char::is_control) {
+        return Err(AdapterError::Store(eliot_store_api::StoreError::InvalidField {
+            field: "backup.destination",
+            reason: "restore destination database name is not admitted",
+        }));
+    }
+    if dest_database == config.database {
+        return Err(AdapterError::Store(eliot_store_api::StoreError::InvalidField {
+            field: "backup.destination",
+            reason: "restore destination must be a different store identity than the serving store",
+        }));
+    }
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(config.connect_timeout_ms.max(1));
+    let session =
+        RpcSession::connect_with_database(provider, deadline, &config.namespace, dest_database)
+            .await?;
+    Ok(RestoreDestinationTransport {
+        session,
+        database: dest_database.to_owned(),
+    })
+}
+
+impl RestoreDestinationTransport {
+    /// Destination database this transport is bound to.
+    pub(crate) fn database(&self) -> &str {
+        &self.database
+    }
+
+    async fn request(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: serde_json::Map<String, Value>,
+    ) -> Result<RpcResults, AdapterError> {
+        let (statement, bindings, prefix_len) = json_codec::encode_bindings(statement, bindings)?;
+        let value = self
+            .session
+            .request(operation, "query", json!([statement, Value::Object(bindings)]))
+            .await?;
+        let mut results = RpcResults::from_value(&value)?;
+        if results.values.len() < prefix_len {
+            return Err(AdapterError::Serialization(
+                "RPC query omitted binding decode results".to_owned(),
+            ));
+        }
+        results.values.drain(..prefix_len);
+        Ok(results)
+    }
+
+    /// Executes one closed named read against the destination database.
+    pub(crate) async fn query(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: serde_json::Map<String, Value>,
+    ) -> Result<RpcResults, AdapterError> {
+        self.request(operation, statement, bindings).await
+    }
+
+    /// Executes one closed atomic transaction against the destination
+    /// database. The destination session is owned by this restore flow, so
+    /// no serving lane is consumed and no serving session ever observes
+    /// destination state.
+    pub(crate) async fn query_write(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: serde_json::Map<String, Value>,
+    ) -> Result<RpcResults, AdapterError> {
+        self.request(operation, statement, bindings).await
+    }
+}
 /// Dispatches one closed S-03 operation over the authenticated transport.
 /// `config` remains an explicit argument at this seam so timeout and
 /// credential policy cannot accidentally be supplied by a call-site value;
@@ -613,6 +722,13 @@ mod tests {
         assert_eq!(
             admitted,
             [
+                "backup.begin",
+                "backup.end",
+                "backup.page",
+                "backup.reconcile",
+                "backup.restore",
+                "backup.status",
+                "backup.validate",
                 "read.all_ordering_heads",
                 "read.all_revision_heads",
                 "read.authority_records",

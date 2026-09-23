@@ -1192,6 +1192,8 @@ fn build_completion_receipt(
         revision_heads: Vec::new(),
         ordering_heads: Vec::new(),
         partial: false,
+        // Capture receipts are not admitted restores: no admission digest.
+        admission_decision_digest: None,
     };
     receipt.validate().map_err(AdapterError::Store)?;
     Ok(receipt)

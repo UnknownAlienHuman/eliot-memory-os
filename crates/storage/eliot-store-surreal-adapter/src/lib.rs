@@ -603,6 +603,46 @@ impl SurrealStoreAdapter {
     pub async fn backup_provisioned(&self) -> bool {
         apply::backup_provisioned(self).await
     }
+
+    /// Provisions one isolated restore destination database (issues
+    /// #952/#975 R1).
+    ///
+    /// Explicit deployment-owner entrypoint, never implicit: the
+    /// destination is a different store identity on the same provider
+    /// generation, provisioned with the admitted baseline, the shared
+    /// fence, and a fenced non-serving admission record naming the
+    /// separate cutover authority. The serving database can never be
+    /// provisioned as a destination.
+    pub async fn provision_restore_destination(
+        &self,
+        dest_store_id: &str,
+        dest_installation_id: &str,
+        state_fence: &StateFence,
+        cutover_authority: &str,
+        observed_clock: &ClockObservation,
+    ) -> Result<(), AdapterError> {
+        apply::provision_restore_destination(
+            self,
+            dest_store_id,
+            dest_installation_id,
+            state_fence,
+            cutover_authority,
+            observed_clock,
+        )
+        .await
+    }
+
+    /// Verifies restored records stayed connected to the destination
+    /// heads. See [`apply::read_restore_destination_heads`].
+    pub async fn read_restore_destination_heads(
+        &self,
+        dest_store_id: &str,
+        receipt: &StoreBackupCompletionReceipt,
+    ) -> Result<(), StoreError> {
+        apply::read_restore_destination_heads(self, dest_store_id, receipt)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
 }
 
 impl CanonicalStoreClient for SurrealStoreAdapter {
