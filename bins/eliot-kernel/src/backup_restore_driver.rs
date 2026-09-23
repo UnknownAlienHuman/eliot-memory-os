@@ -124,12 +124,22 @@ pub struct RestoreImportOutcome {
 
 /// Observed outcome of one production restore composition: the
 /// coordination receipt and row key plus every import outcome.
+///
+/// The minted admission and coordination decision travel with the
+/// outcome (both `Clone`): the #963 caller needs their bound fields to
+/// assemble the Store-side request mapping (identity, target,
+/// provisioning, fence, digests) without re-deriving or re-spelling
+/// anything the minter already bound.
 #[derive(Clone, Debug)]
 pub struct ProductionRestoreOutcome {
     /// Committed coordination receipt (bridge anchor).
     pub coordination_receipt: WriteReceipt,
     /// Row key the bridge re-fetches (restore operation identity).
     pub coordination_row_key: String,
+    /// Minted admission all effects below executed under.
+    pub admission: KernelRestoreAdmission,
+    /// Coordination decision the row committed.
+    pub decision: CoordinationDecision,
     /// Per-import outcomes in execution order.
     pub imports: Vec<RestoreImportOutcome>,
 }
@@ -221,6 +231,8 @@ pub async fn drive_production_restore(
     Ok(ProductionRestoreOutcome {
         coordination_receipt,
         coordination_row_key,
+        admission,
+        decision,
         imports: outcomes,
     })
 }
