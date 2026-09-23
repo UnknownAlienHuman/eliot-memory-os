@@ -2012,7 +2012,11 @@ function Test-ReleaseBundle([string]$Path) {
         if ($null -eq $candidateResponse -or $candidateResponse -isnot [pscustomobject]) {
             throw 'staged candidate OSV response must be a JSON object'
         }
-        $candidateResponseFields = @($candidateResponse.PSObject.Properties.Name)
+        $candidateResponseFields = @(
+            $candidateResponse.PSObject.Properties |
+                Where-Object { $_.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty } |
+                ForEach-Object { [string]$_.Name }
+        )
         $unsupportedCandidateResponseFields = @($candidateResponseFields | Where-Object { $_ -cnotin @('vulns', 'next_page_token') })
         if ($unsupportedCandidateResponseFields.Count -gt 0) {
             throw 'staged candidate OSV response contains unsupported fields'
