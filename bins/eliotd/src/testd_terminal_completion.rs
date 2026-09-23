@@ -1,8 +1,8 @@
-//! Authenticated TestD terminal handoff into the canonical Governor owner.
+//! Authenticated `TestD` terminal handoff into the canonical Governor owner.
 //!
-//! The TestD transport carries only a durable job id and finish-receipt
+//! The `TestD` transport carries only a durable job id and finish-receipt
 //! digest. This module rehydrates request identity, operation, task revision,
-//! and the exact pre-dispatch canonical verifier plan from the TestD owner,
+//! and the exact pre-dispatch canonical verifier plan from the `TestD` owner,
 //! then re-reads the current Governor plan before publishing.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,11 +13,13 @@ use eliot_instrument_api::InstrumentInvocation;
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    TestJob, TestdStore, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
+    JobState as TestdJobState, TestJob, TestdPendingVerifierDispatch, TestdStore,
+    TestdTerminalCompletionEvidence, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
     verification_receipt_sha256,
 };
 
-use crate::{DaemonComposition, DaemonError};
+use crate::daemon_kernel_client::TESTD_OWNER_POLL_LIMIT;
+use crate::{DaemonComposition, DaemonError, DaemonKernelClient};
 
 fn completion_error(error: impl std::fmt::Display) -> DaemonError {
     DaemonError::Lifecycle(format!("TestD terminal completion: {error}"))
@@ -33,8 +35,8 @@ fn unix_ms() -> u64 {
 
 impl DaemonComposition {
     /// Captures the current canonical verifier plan with its admitted owner
-    /// identity. Call this before inserting/dispatching the productive TestD
-    /// job; the returned binding is persisted in the durable TestD row.
+    /// identity. Call this before inserting/dispatching the productive `TestD`
+    /// job; the returned binding is persisted in the durable `TestD` row.
     pub fn testd_verifier_dispatch_binding(
         &self,
         identity: &RequestIdentity,
@@ -112,8 +114,8 @@ impl DaemonComposition {
     }
 
     /// Persists the admitted identity and current canonical verifier plan in
-    /// the durable TestD row before Kernel launch. The invocation and process
-    /// operation are rehydrated from the submitted TestD owner row; productive
+    /// the durable `TestD` row before Kernel launch. The invocation and process
+    /// operation are rehydrated from the submitted `TestD` owner row; productive
     /// claims remain ineligible until this write commits.
     pub fn persist_testd_verifier_dispatch_before_launch(
         &self,
@@ -157,8 +159,8 @@ impl DaemonComposition {
             .map_err(completion_error)
     }
 
-    /// Consumes one pending authenticated TestD notification. The returned
-    /// receipt is the canonical WriteReceipt from Governor; the durable TestD
+    /// Consumes one pending authenticated `TestD` notification. The returned
+    /// receipt is the canonical `WriteReceipt` from Governor; the durable `TestD`
     /// row is updated only after that commit has been observed.
     pub async fn publish_testd_terminal_completion(
         &self,
@@ -265,7 +267,7 @@ impl DaemonComposition {
         Ok(committed)
     }
 
-    /// Drains one bounded batch from the durable TestD terminal owner. The
+    /// Drains one bounded batch from the durable `TestD` terminal owner. The
     /// daemon reactive-feed owner calls this API; each item is rehydrated and
     /// committed independently before its canonical receipt is recorded.
     pub async fn publish_pending_testd_terminal_completions(
@@ -285,6 +287,212 @@ impl DaemonComposition {
         }
         Ok(committed)
     }
+
+    /// Drives one bounded `TestD` owner step through the authenticated Kernel
+    /// owner routes only. This is the production caller of the Governor
+    /// finish path for productive verifier evidence:
+    ///
+    /// ```text
+    /// query pending verifier dispatches (owner poll)
+    /// -> compute the canonical plan binding from the Governor read
+    /// -> persist the binding through the owner bind leg
+    /// -> query pending terminal evidence (owner poll)
+    /// -> publish the verifier-execution fact (rehydrate -> canonical write)
+    /// -> submit the finish candidate draft (rehydrate -> FinishService::evaluate -> persisted decision)
+    /// -> acknowledge the terminal with the committed verifier-execution receipt (owner ack leg)
+    /// ```
+    ///
+    /// The daemon never opens the `TestD` database: every row arrives through
+    /// the Kernel owner polls above. The candidate draft carries only the
+    /// terminal job identity and the evidence-led candidate outcome; the
+    /// Governor rehydrates canonical evidence and derives the decision, so
+    /// worker success never becomes a Task outcome here. One poisoned row
+    /// is recorded as a diagnostic and skipped — it never fails the daemon
+    /// closed, and a fence-moved row simply rejects owner-side on the next
+    /// poll. Transport failures abort the step so the supervisor restarts
+    /// the daemon onto a fresh handshake.
+    pub async fn drive_testd_owner_finish_once(
+        &mut self,
+        kernel: &DaemonKernelClient,
+    ) -> Result<TestdOwnerDrainOutcome, DaemonError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(completion_error(
+                "TestD owner drain needs a Ready Governor composition",
+            ));
+        }
+        let mut outcome = TestdOwnerDrainOutcome::default();
+        let pending = kernel
+            .query_testd_pending_dispatches_async(TESTD_OWNER_POLL_LIMIT)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        for entry in &pending {
+            match self.bind_one_testd_dispatch(kernel, entry).await {
+                Ok(()) => outcome.dispatch_bindings_persisted += 1,
+                Err(error) => {
+                    outcome.rows_skipped += 1;
+                    emit_drain_skip(&entry.job.job_id, &error);
+                }
+            }
+        }
+        let terminals = kernel
+            .query_testd_terminal_evidence_async(TESTD_OWNER_POLL_LIMIT)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        for evidence in &terminals {
+            match self.drain_one_testd_terminal(kernel, evidence).await {
+                Ok(()) => {
+                    outcome.terminals_drained += 1;
+                    outcome.finish_decisions_persisted += 1;
+                    outcome.terminals_acked += 1;
+                }
+                Err(error) => {
+                    outcome.rows_skipped += 1;
+                    emit_drain_skip(&evidence.job.job_id, &error);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Binds one pending productive dispatch: the canonical plan binding is
+    /// computed from the current Governor read and persisted owner-side
+    /// against the exact admitted identity.
+    async fn bind_one_testd_dispatch(
+        &self,
+        kernel: &DaemonKernelClient,
+        entry: &TestdPendingVerifierDispatch,
+    ) -> Result<(), DaemonError> {
+        let identity = &entry.request_identity;
+        let job = &entry.job;
+        let task_id = identity
+            .request
+            .metadata
+            .task_id
+            .clone()
+            .ok_or_else(|| completion_error("pending dispatch has no admitted task id"))?;
+        let task_revision = identity
+            .request
+            .state_fence
+            .task_revision
+            .as_ref()
+            .map(|revision| revision.value())
+            .ok_or_else(|| completion_error("pending dispatch has no task revision fence"))?;
+        let operation_id =
+            OperationId::new(job.process.operation_id.clone()).map_err(completion_error)?;
+        let binding = self.testd_verifier_dispatch_binding(
+            identity,
+            &operation_id,
+            &task_id,
+            task_revision,
+            &job.invocation,
+        )?;
+        kernel
+            .acknowledge_testd_verifier_dispatch_async(&job.job_id, binding)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Drains one terminal evidence row: publishes the verifier-execution
+    /// fact, submits the evidence-led finish candidate through the Governor
+    /// production caller, then acknowledges the terminal owner-side.
+    async fn drain_one_testd_terminal(
+        &mut self,
+        kernel: &DaemonKernelClient,
+        evidence: &TestdTerminalCompletionEvidence,
+    ) -> Result<(), DaemonError> {
+        let identity = &evidence.request_identity;
+        let job = &evidence.job;
+        let committed = self
+            .governor
+            .publish_testd_verifier_execution_fact_from_evidence(evidence)
+            .await
+            .map_err(DaemonError::Finish)?
+            .ok_or_else(|| {
+                completion_error("Governor reported a verifier fact without its committed receipt")
+            })?;
+        let draft = finish_draft_from_testd_terminal_evidence(job, identity)?;
+        let operation_id = OperationId::new(format!("testd-owner-finish-{}", job.job_id))
+            .map_err(completion_error)?;
+        let _decision = self.finish_attempt(identity, operation_id, draft).await?;
+        kernel
+            .acknowledge_testd_terminal_completion_async(&job.job_id, committed)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Outcome of one bounded `TestD` owner drain step. Every counter names work
+/// the Kernel owner committed; skipped rows were recorded as diagnostics.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TestdOwnerDrainOutcome {
+    /// Verifier-dispatch bindings persisted through the owner bind leg.
+    pub dispatch_bindings_persisted: usize,
+    /// Terminal rows whose verifier fact, finish decision, and ack all
+    /// committed.
+    pub terminals_drained: usize,
+    /// Finish decisions persisted through `FinishService::evaluate`.
+    pub finish_decisions_persisted: usize,
+    /// Terminal receipts acknowledged owner-side.
+    pub terminals_acked: usize,
+    /// Rows recorded as diagnostics and skipped this step.
+    pub rows_skipped: usize,
+}
+
+/// Builds the evidence-led finish candidate for one terminal `TestD` row.
+/// The requested outcome reports the terminal job state; it never promotes
+/// worker success into a Task outcome — the Governor rehydrates canonical
+/// evidence and derives the decision, and a candidate never asserts a
+/// verifier run.
+fn finish_draft_from_testd_terminal_evidence(
+    job: &TestJob,
+    identity: &RequestIdentity,
+) -> Result<eliot_governor::FinishAttemptDraft, DaemonError> {
+    let task_id = identity
+        .request
+        .metadata
+        .task_id
+        .clone()
+        .ok_or_else(|| completion_error("terminal evidence has no admitted task id"))?;
+    let expected_task_revision = identity
+        .request
+        .state_fence
+        .task_revision
+        .as_ref()
+        .map(|revision| revision.value())
+        .ok_or_else(|| completion_error("terminal evidence has no task revision fence"))?;
+    let requested_outcome = match job.state {
+        TestdJobState::Succeeded => eliot_governor::RequestedFinishOutcome::CompleteCandidate,
+        TestdJobState::Failed => eliot_governor::RequestedFinishOutcome::FailedVerification,
+        TestdJobState::Cancelled => eliot_governor::RequestedFinishOutcome::Cancelled,
+        _ => {
+            return Err(completion_error(
+                "terminal evidence is not a settled terminal job",
+            ));
+        }
+    };
+    Ok(eliot_governor::FinishAttemptDraft {
+        task_id: task_id.as_str().to_owned(),
+        expected_task_revision,
+        requested_outcome,
+        artifact_refs: vec![job.job_id.clone(), job.process.operation_id.clone()],
+        observation_refs: Vec::new(),
+        // Verifier ownership remains in the canonical evidence projection;
+        // a TestD terminal candidate cannot assert a verifier run.
+        verifier_run_refs: Vec::new(),
+        remaining_unknowns_declared_by_caller: Vec::new(),
+        rationale_candidate: format!("testd-owner-terminal:{}", job.job_id),
+    })
+}
+
+fn emit_drain_skip(job_id: &str, error: &DaemonError) {
+    let _ = crate::diagnostics::ErrorRecord::of(
+        crate::diagnostics::OwningComponent::DaemonRuntime,
+        "testd-owner-drain-skip",
+        &format!("job {job_id}: {error}"),
+    )
+    .emit();
 }
 
 fn validate_committed_receipt(

@@ -28,21 +28,33 @@ pub(crate) const WIRE_VERSION: u16 = 1;
 pub(crate) const OWNER_SUBMIT_OPERATION: &str = eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION;
 /// Authenticated daemon operation: list queued productive jobs that still
 /// need their canonical verifier binding.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 pub(crate) const OWNER_PENDING_DISPATCHES_OPERATION: &str =
     "eliot.kernel.testd-owner-pending-dispatches";
 /// Authenticated daemon operation: persist one verifier-dispatch binding
 /// against the exact admitted identity retained at job admission.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 pub(crate) const OWNER_BIND_DISPATCH_OPERATION: &str = "eliot.kernel.testd-owner-bind-dispatch";
 /// Authenticated daemon operation: list terminal productive jobs that still
 /// need their canonical verifier-execution `WriteReceipt`.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 pub(crate) const OWNER_PENDING_TERMINALS_OPERATION: &str =
     "eliot.kernel.testd-owner-pending-terminals";
 /// Authenticated daemon operation: record one committed canonical
 /// `WriteReceipt` against its terminal owner row.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 pub(crate) const OWNER_ACK_TERMINAL_OPERATION: &str = "eliot.kernel.testd-owner-ack-terminal";
 /// Wire revision shared by every `TestD` owner operation.
 pub(crate) const OWNER_WIRE_VERSION: u16 = eliot_testd_core::TESTD_OWNER_WIRE_VERSION;
@@ -147,7 +159,10 @@ fn validate_digest(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 fn validate_owner_wire(wire_id: &str, wire_version: u16, operation: &str) -> Result<(), String> {
     if wire_id != operation || wire_version != OWNER_WIRE_VERSION {
         return Err("unsupported TestD owner wire".to_owned());
@@ -155,7 +170,10 @@ fn validate_owner_wire(wire_id: &str, wire_version: u16, operation: &str) -> Res
     Ok(())
 }
 
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 fn validate_job_id(job_id: &str) -> Result<(), String> {
     if job_id.trim().is_empty() || job_id.chars().any(char::is_control) {
         return Err("invalid TestD owner job id".to_owned());
@@ -163,7 +181,10 @@ fn validate_job_id(job_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 fn validate_limit(limit: u16, field: &'static str) -> Result<usize, String> {
     if limit == 0 || limit > 64 {
         return Err(format!("{field} must be between one and 64"));
@@ -171,7 +192,10 @@ fn validate_limit(limit: u16, field: &'static str) -> Result<usize, String> {
     Ok(usize::from(limit))
 }
 
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -183,7 +207,10 @@ fn now_ms() -> u64 {
 /// Daemon request: bounded pending verifier-dispatch poll. The response
 /// carries the full durable job plus the exact admitted frame identity; the
 /// daemon computes the canonical plan binding from its Governor read.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OwnerPendingDispatchesRequest {
@@ -193,7 +220,10 @@ pub(crate) struct OwnerPendingDispatchesRequest {
 }
 
 impl OwnerPendingDispatchesRequest {
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn validate(&self) -> Result<usize, String> {
         validate_owner_wire(
             &self.wire_id,
@@ -207,7 +237,10 @@ impl OwnerPendingDispatchesRequest {
 /// Daemon request: persist one verifier-dispatch binding. The binding must
 /// reuse the exact admitted identity the Kernel retained at job admission;
 /// the digest binds the wire, job, and binding bytes.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OwnerBindDispatchRequest {
@@ -219,7 +252,10 @@ pub(crate) struct OwnerBindDispatchRequest {
 }
 
 impl OwnerBindDispatchRequest {
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn validate(&self) -> Result<(), String> {
         validate_owner_wire(
             &self.wire_id,
@@ -235,7 +271,10 @@ impl OwnerBindDispatchRequest {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn binding_sha256(&self) -> Result<String, String> {
         let bytes = canonical_json_bytes(&self.binding).map_err(|error| error.to_string())?;
         Ok(sha256_hex(&bytes))
@@ -264,7 +303,10 @@ impl OwnerBindDispatchRequest {
 /// Daemon request: bounded pending terminal-evidence poll. Each entry is a
 /// complete identity-joined productive terminal row still missing its
 /// canonical `WriteReceipt`; worker exit alone never appears here.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OwnerPendingTerminalsRequest {
@@ -274,7 +316,10 @@ pub(crate) struct OwnerPendingTerminalsRequest {
 }
 
 impl OwnerPendingTerminalsRequest {
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn validate(&self) -> Result<usize, String> {
         validate_owner_wire(
             &self.wire_id,
@@ -289,7 +334,10 @@ impl OwnerPendingTerminalsRequest {
 /// terminal owner row. The receipt must be the exact canonical bytes whose
 /// digest the terminal publication advertises; the digest binds the wire,
 /// job, and receipt bytes.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OwnerAcknowledgeTerminalRequest {
@@ -301,7 +349,10 @@ pub(crate) struct OwnerAcknowledgeTerminalRequest {
 }
 
 impl OwnerAcknowledgeTerminalRequest {
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn validate(&self) -> Result<(), String> {
         validate_owner_wire(
             &self.wire_id,
@@ -318,13 +369,19 @@ impl OwnerAcknowledgeTerminalRequest {
         Ok(())
     }
 
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn receipt_sha256(&self) -> Result<String, String> {
         let bytes = canonical_json_bytes(&self.receipt).map_err(|error| error.to_string())?;
         Ok(sha256_hex(&bytes))
     }
 
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn receipt_json(&self) -> Result<String, String> {
         let bytes = canonical_json_bytes(&self.receipt).map_err(|error| error.to_string())?;
         String::from_utf8(bytes).map_err(|error| error.to_string())
@@ -351,7 +408,10 @@ impl OwnerAcknowledgeTerminalRequest {
 }
 
 /// Daemon response: bounded identity-joined pending verifier dispatches.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OwnerPendingDispatchesResponse {
@@ -359,7 +419,10 @@ pub(crate) struct OwnerPendingDispatchesResponse {
 }
 
 /// Daemon response: persisted verifier-dispatch binding receipt.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OwnerBindDispatchResponse {
@@ -368,7 +431,10 @@ pub(crate) struct OwnerBindDispatchResponse {
 }
 
 /// Daemon response: bounded identity-joined terminal evidence rows.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OwnerPendingTerminalsResponse {
@@ -376,7 +442,10 @@ pub(crate) struct OwnerPendingTerminalsResponse {
 }
 
 /// Daemon response: recorded terminal receipt.
-#[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+#[allow(
+    dead_code,
+    reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OwnerAcknowledgeTerminalResponse {
@@ -408,7 +477,10 @@ impl KernelComposition {
 
     /// Serves one authenticated daemon pending-dispatch poll from the
     /// Kernel-owned `TestD` store.
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn testd_owner_pending_dispatches_operation(
         &self,
         session: &Session,
@@ -429,13 +501,17 @@ impl KernelComposition {
         let pending = store
             .pending_verifier_dispatches(limit)
             .map_err(|_| TransportError::SessionFenced)?;
-        serde_json::to_value(OwnerPendingDispatchesResponse { pending })
-            .map_err(|_| TransportError::SessionFenced)
+        let value = serde_json::to_value(OwnerPendingDispatchesResponse { pending })
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({ "kind": "testd_owner_pending_dispatches", "value": value }))
     }
 
     /// Persists one daemon-computed verifier-dispatch binding against the
     /// exact admitted identity retained at job admission.
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn testd_owner_bind_dispatch_operation(
         &self,
         session: &Session,
@@ -463,17 +539,21 @@ impl KernelComposition {
         let job = store
             .bind_verifier_dispatch_for_admitted_identity(&request.job_id, request.binding, now)
             .map_err(|_| TransportError::SessionFenced)?;
-        serde_json::to_value(OwnerBindDispatchResponse {
+        let value = serde_json::to_value(OwnerBindDispatchResponse {
             job_id: job.job_id,
             binding_sha256,
         })
-        .map_err(|_| TransportError::SessionFenced)
+        .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({ "kind": "testd_owner_bind_dispatch", "value": value }))
     }
 
     /// Serves one authenticated daemon pending-terminal poll from the
     /// Kernel-owned `TestD` store. Only complete identity-joined terminal
     /// rows are returned; worker exit alone never qualifies.
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn testd_owner_pending_terminals_operation(
         &self,
         session: &Session,
@@ -494,14 +574,18 @@ impl KernelComposition {
         let evidence = store
             .pending_terminal_completion_evidence(limit)
             .map_err(|_| TransportError::SessionFenced)?;
-        serde_json::to_value(OwnerPendingTerminalsResponse { evidence })
-            .map_err(|_| TransportError::SessionFenced)
+        let value = serde_json::to_value(OwnerPendingTerminalsResponse { evidence })
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({ "kind": "testd_owner_pending_terminals", "value": value }))
     }
 
     /// Records one committed canonical `WriteReceipt` against its terminal
     /// owner row. The receipt must be the exact canonical bytes advertised
     /// by the terminal publication; anything else fails closed.
-    #[allow(dead_code, reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)")]
+    #[allow(
+        dead_code,
+        reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
+    )]
     pub(crate) fn testd_owner_ack_terminal_operation(
         &self,
         session: &Session,
@@ -544,10 +628,11 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)?;
         let receipt: WriteReceipt =
             serde_json::from_str(committed).map_err(|_| TransportError::SessionFenced)?;
-        serde_json::to_value(OwnerAcknowledgeTerminalResponse {
+        let value = serde_json::to_value(OwnerAcknowledgeTerminalResponse {
             job_id: job.job_id,
             receipt,
         })
-        .map_err(|_| TransportError::SessionFenced)
+        .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({ "kind": "testd_owner_ack_terminal", "value": value }))
     }
 }

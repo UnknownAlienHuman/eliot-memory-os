@@ -25,7 +25,10 @@ use eliot_store_api::{
     WriteReceiptStatus, generated_operation_manifests, operation_manifest_set_digest,
 };
 use eliot_task::{TaskCommand, TaskLifecycleOwner, TaskRecord, TaskState};
-use eliot_testd_core::TestdStore;
+use eliot_testd_core::{
+    JobState as TestdJobState, TestdStore, TestdTerminalCompletionEvidence,
+    verification_receipt_sha256,
+};
 use thiserror::Error;
 
 use crate::{
@@ -417,9 +420,127 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             deadline_unix_ms: identity.deadline_unix_ms,
             cancellation_id: identity.cancellation_id.clone(),
         };
+        self.commit_verifier_execution_fact(task_id, &fence, fact, fact_identity, fact_operation)
+            .await
+    }
+
+    /// Rehydrates and publishes the verifier-execution owner from complete
+    /// identity-joined terminal evidence supplied by the Kernel owner route.
+    ///
+    /// This is the daemon-side entry: the caller gives the exact evidence
+    /// projection the Kernel owner just enumerated (durable job plus the
+    /// admitted frame identity). The row, receipt, run, canonical task,
+    /// current plan, and fence are all re-validated and joined here; a
+    /// caller-held `TestJob` or verdict that disagrees with the admitted
+    /// binding cannot become canonical proof. The daemon never opens the
+    /// `TestD` database.
+    pub async fn publish_testd_verifier_execution_fact_from_evidence(
+        &self,
+        evidence: &TestdTerminalCompletionEvidence,
+    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+        let identity = &evidence.request_identity;
+        let job = &evidence.job;
+        validate_identity(identity)?;
+        let fence = identity.request.metadata.state_fence.clone();
+        if self.canonical.state_fence() != &fence {
+            return Err(FinishError::FenceMismatch.into());
+        }
+        let (task_id, task_revision) = evidence_task_binding(identity)?;
+        if !matches!(
+            job.state,
+            TestdJobState::Succeeded | TestdJobState::Failed | TestdJobState::Cancelled
+        ) || job.lease.is_some()
+        {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                "verifier fact evidence is not a settled terminal job".to_owned(),
+            )));
+        }
+        let binding = job.verifier_dispatch.as_ref().ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(
+                "verifier fact evidence has no admitted verifier binding".to_owned(),
+            ))
+        })?;
+        binding.validate_for_job(job).map_err(|error| {
+            FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                "verifier fact evidence binding does not match its job: {error}"
+            )))
+        })?;
+        if binding.request_identity != *identity {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                "verifier fact evidence identity differs from its admitted binding".to_owned(),
+            )));
+        }
+        let receipt = job.verification_receipt.as_ref().ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(
+                "verifier fact evidence has no full verification receipt".to_owned(),
+            ))
+        })?;
+        verification_receipt_sha256(receipt).map_err(|error| {
+            FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                "verifier fact evidence receipt is undecodable: {error}"
+            )))
+        })?;
+        let task = self.task.task(&task_id).ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                "canonical task {} is absent",
+                task_id.as_str()
+            )))
+        })?;
+        if task.revision != task_revision || task.state_fence != fence {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                "canonical task owner is stale for verifier fact publication".to_owned(),
+            )));
+        }
+        let plan = self.canonical.read_current_plan(&fence)?;
+        if plan.task_id != task_id {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                "canonical verifier plan is task-mismatched".to_owned(),
+            )));
+        }
+        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(
+                "canonical plan has no verifier binding".to_owned(),
+            ))
+        })?;
+        let run = evaluate_testd_verification_current(job, receipt, verifier_plan)?;
+        let fact = CanonicalVerifierExecutionFact::from_testd(
+            &task_id,
+            task_revision,
+            &plan,
+            &fence,
+            job,
+            receipt,
+            run,
+        )?;
+        let operation_id = OperationId::new(job.process.operation_id.clone())
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+        let fact_operation = OperationId::new(format!("{operation_id}/verifier-execution"))
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+        let fact_identity = RequestIdentity {
+            request: identity.request.clone(),
+            idempotency_key: format!("{}:verifier-execution", identity.idempotency_key),
+            deadline_unix_ms: identity.deadline_unix_ms,
+            cancellation_id: identity.cancellation_id.clone(),
+        };
+        self.commit_verifier_execution_fact(&task_id, &fence, fact, fact_identity, fact_operation)
+            .await
+    }
+
+    /// Commits one derived verifier-execution fact through the canonical
+    /// owner CAS and returns the committed `WriteReceipt`. An identical
+    /// current owner image is a readback no-op that returns the retained
+    /// receipt instead of minting a second fact.
+    async fn commit_verifier_execution_fact(
+        &self,
+        task_id: &TaskId,
+        fence: &StateFence,
+        fact: CanonicalVerifierExecutionFact,
+        fact_identity: RequestIdentity,
+        fact_operation: OperationId,
+    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
         if self
             .canonical
-            .read_verifier_execution_fact(&fence)
+            .read_verifier_execution_fact(fence)
             .ok()
             .is_some_and(|existing| existing == fact)
         {
@@ -436,7 +557,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             check_finish_receipt(
                 &committed,
                 &fact_operation,
-                &fence,
+                fence,
                 &fact_identity.idempotency_key,
             )?;
             return Ok(Some(committed));
@@ -472,7 +593,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         check_finish_receipt(
             &committed,
             &fact_operation,
-            &fence,
+            fence,
             &fact_identity.idempotency_key,
         )?;
         Ok(Some(committed))
@@ -707,6 +828,28 @@ fn validate_identity(identity: &RequestIdentity) -> Result<(), FinishAttemptErro
         return Err(FinishError::FenceMismatch.into());
     }
     Ok(())
+}
+
+/// Extracts the admitted task binding carried by terminal evidence: the
+/// task id from request metadata and the revision from the state fence.
+fn evidence_task_binding(identity: &RequestIdentity) -> Result<(TaskId, u64), FinishAttemptError> {
+    let task_id = identity.request.metadata.task_id.clone().ok_or_else(|| {
+        FinishAttemptError::Serialization(
+            "verifier fact evidence carries no admitted task id".to_owned(),
+        )
+    })?;
+    let task_revision = identity
+        .request
+        .state_fence
+        .task_revision
+        .as_ref()
+        .map(|revision| revision.value())
+        .ok_or_else(|| {
+            FinishAttemptError::Serialization(
+                "verifier fact evidence is missing its task revision fence".to_owned(),
+            )
+        })?;
+    Ok((task_id, task_revision))
 }
 
 fn validate_task(
