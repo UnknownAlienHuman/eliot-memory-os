@@ -291,58 +291,8 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Ors(error.to_string()))
                 .map_err(&terminal)?,
         );
-        Self::assemble_with_process_authority(config, authority_config, ors, platform, None)
+        Self::assemble_with_process_authority(config, authority_config, ors, platform)
             .map_err(&terminal)
-    }
-
-    /// Builds a production composition with an externally supplied process
-    /// authority key, opaque snapshot codec, durable replay binding, and the
-    /// canonical Governor owner bundle for the P-07 port (`#2100`).
-    ///
-    /// The owner bundle carries the Governor restore plus the exact expected
-    /// graph revision; the composition binds the port through
-    /// [`Self::bind_p07_owner`] during assembly and fails the build when the
-    /// bundle disagrees. Missing bindings are never replaced by a default or
-    /// in-memory issuer.
-    pub fn new_with_process_authority_and_owner(
-        config: KernelConfig,
-        authority_config: ProcessExecutionAuthorityConfig,
-        restore: GovernorClosureRestore,
-        expected_revision: u64,
-    ) -> Result<Self, KernelBuildError> {
-        // F-LOG-KERNEL-2 (#899): process-authority build boundary.
-        observe_entrypoint_with_detail(
-            EntrypointStage::Composition,
-            "kernel.composition.process_authority_build_started",
-        );
-        let terminal = |error: KernelBuildError| {
-            observe_entrypoint_with_detail(
-                EntrypointStage::Composition,
-                "kernel.composition.build_failed",
-            );
-            observe_terminal_error(kernel_build_error_code(&error));
-            error
-        };
-        let work_root = config.work_root.clone();
-        let platform = Arc::new(
-            WindowsPlatform::new(work_root.clone())
-                .map_err(KernelBuildError::Platform)
-                .map_err(&terminal)?,
-        );
-        let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
-        let ors = Arc::new(
-            RedbRecoveryStore::open(&ors_path)
-                .map_err(|error| KernelBuildError::Ors(error.to_string()))
-                .map_err(&terminal)?,
-        );
-        Self::assemble_with_process_authority(
-            config,
-            authority_config,
-            ors,
-            platform,
-            Some((restore, expected_revision)),
-        )
-        .map_err(&terminal)
     }
 
     /// Binds the canonical Governor closure owner to the P-07 port (`#2100`).
@@ -522,7 +472,6 @@ impl KernelComposition {
         authority_config: ProcessExecutionAuthorityConfig,
         ors: Arc<RedbRecoveryStore>,
         platform: Arc<WindowsPlatform>,
-        owner: Option<(GovernorClosureRestore, u64)>,
     ) -> Result<Self, KernelBuildError> {
         let authority_store: Arc<dyn OperationalRecoveryStore> = ors.clone();
         let controller = Arc::new(Mutex::new(
@@ -535,24 +484,13 @@ impl KernelComposition {
             )
             .map_err(|error| KernelBuildError::Core(error.to_string()))?,
         ));
-        let composition = Self::assemble_with_process_controller(
+        Self::assemble_with_process_controller(
             config,
             controller,
             authority_config.snapshot_binding,
             ors,
             platform,
-        )?;
-        if let Some((restore, expected_revision)) = owner {
-            composition
-                .bind_p07_owner(restore, expected_revision)
-                .inspect_err(|_| {
-                    observe_entrypoint_with_detail(
-                        EntrypointStage::Composition,
-                        "kernel.composition.p07_owner_bind_failed",
-                    );
-                })?;
-        }
-        Ok(composition)
+        )
     }
 
     fn assemble_with_process_controller(

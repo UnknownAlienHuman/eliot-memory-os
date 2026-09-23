@@ -425,3 +425,200 @@ impl RootGrantHydrationSource for GovernorClosureSource {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_authority::{GrantGraphRecoverySnapshot, GrantRecoveryRecord, GrantStatus};
+    use eliot_contracts::{ContractId, EpochLineageId, ResourceGeneration, StateFence};
+    use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
+    use std::num::NonZeroU64;
+
+    use crate::grant_activation_port::GrantActivationIntent;
+
+    fn test_authority_epoch() -> Result<eliot_contracts::EpochId, KernelError> {
+        let lineage_id =
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").map_err(|_| {
+                KernelError::InvalidField {
+                    field: "lineage_id",
+                    reason: "must be a canonical UUID lineage",
+                }
+            })?;
+        let sequence = NonZeroU64::new(7).ok_or(KernelError::InvalidField {
+            field: "sequence",
+            reason: "must be greater than zero",
+        })?;
+        eliot_contracts::EpochId::new(lineage_id, sequence).map_err(|_| KernelError::InvalidField {
+            field: "epoch_id",
+            reason: "invalid canonical epoch",
+        })
+    }
+
+    fn test_binding(epoch: &eliot_contracts::EpochId) -> Result<AuthorityBinding, KernelError> {
+        let fence =
+            StateFence::new(epoch.clone(), ResourceGeneration::new(1).map_err(|_| {
+                KernelError::InvalidField {
+                    field: "generation",
+                    reason: "test generation must validate",
+                }
+            })?);
+        Ok(AuthorityBinding {
+            authority_id: ContractId::new("authority:test").map_err(|_| KernelError::InvalidField {
+                field: "authority_id",
+                reason: "test authority id must validate",
+            })?,
+            authority_owner: "test-owner".to_owned(),
+            authority_epoch: epoch.clone(),
+            state_fence: fence,
+            allowed_effect: EffectClass::ExternalEffect,
+            proof_ceiling: ProofCeiling::ObservedExternalEffect,
+        })
+    }
+
+    fn recovery_snapshot(
+        binding: &AuthorityBinding,
+    ) -> Result<GrantGraphRecoverySnapshot, KernelError> {
+        Ok(GrantGraphRecoverySnapshot {
+            schema: eliot_authority::GRANT_GRAPH_RECOVERY_SCHEMA.to_owned(),
+            version: eliot_authority::GRANT_GRAPH_RECOVERY_VERSION,
+            revision: 5,
+            grants: vec![GrantRecoveryRecord {
+                grant_id: "grant-test-root".to_owned(),
+                parent_grant_id: None,
+                authority_root_ref: "root-test".to_owned(),
+                issuer: "governor".to_owned(),
+                holder: "holder-1".to_owned(),
+                allowed_operations: vec!["op.read".to_owned()],
+                allowed_resources: vec!["res:1".to_owned()],
+                max_effect: EffectClass::Read,
+                inherited_source_ceiling: None,
+                binding: binding.clone(),
+                issued_at: 1,
+                expires_at: 10_000,
+                max_uses: 1,
+                status: GrantStatus::Active,
+            }],
+            revoked: Vec::new(),
+        })
+    }
+
+    fn root_hydration(
+        epoch: &eliot_contracts::EpochId,
+        binding: &AuthorityBinding,
+    ) -> Result<RootGrantHydration, KernelError> {
+        let intent = GrantActivationIntent {
+            operation_id: "op-test-root".to_owned(),
+            grant_id: "grant-test-root".to_owned(),
+            parent_grant_id: None,
+            authority_root_ref: "root-test".to_owned(),
+            snapshot_id: "snap-1".to_owned(),
+            grant_graph_revision: 5,
+            holder_principal: "holder-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            binding: binding.clone(),
+            allowed_effect: EffectClass::Read,
+            proof_ceiling: ProofCeiling::ScopedVerification,
+            issued_at_ms: 1_000,
+            expires_at_ms: Some(10_000),
+            receipt_obligations: vec!["obligation-1".to_owned()],
+        };
+        let authority_epoch = eliot_ors::EpochLineage {
+            current: eliot_ors::EpochIdentity {
+                lineage_id: eliot_ors::OpaqueLabel::new(epoch.lineage_id.as_str())
+                    .map_err(KernelError::RecoveryState)?,
+                epoch: epoch.sequence.get(),
+            },
+            predecessor: None,
+        };
+        let state_fence =
+            eliot_ors::StateFenceSnapshot::capture(&binding.state_fence, epoch.sequence.get())
+                .map_err(KernelError::RecoveryState)?;
+        let input = eliot_ors::OperationalRecordInput::encrypted(
+            eliot_ors::OperationalRecordContext {
+                record_id: eliot_ors::OperationIdentity::new("op-test-root")
+                    .map_err(KernelError::RecoveryState)?,
+                subject_id: eliot_ors::OperationIdentity::new("grant-test-root")
+                    .map_err(KernelError::RecoveryState)?,
+                authority_epoch,
+                state_fence,
+                created_at_ms: 1_000,
+                cleanup_after_ms: None,
+            },
+            eliot_platform::SecretReference::new("test-provider", "closure-test-key").map_err(
+                |_error| KernelError::InvalidField {
+                    field: "test_secret_reference",
+                    reason: "fixture reference must validate",
+                },
+            )?,
+            b"opaque-test-root-record".to_vec(),
+        )
+        .map_err(KernelError::RecoveryState)?;
+        let durable_record =
+            eliot_ors::CapabilityGrantActivation::new(input).map_err(KernelError::RecoveryState)?;
+        Ok(RootGrantHydration {
+            intent,
+            durable_record,
+            observed_at_ms: 1_000,
+        })
+    }
+
+    fn restore_bundle() -> Result<GovernorClosureRestore, KernelError> {
+        let epoch = test_authority_epoch()?;
+        let binding = test_binding(&epoch)?;
+        let hydration = root_hydration(&epoch, &binding)?;
+        let member = GrantClosureMember {
+            intent: hydration.intent.clone(),
+            durable_record: hydration.durable_record.clone(),
+            observed_at_ms: 1_000,
+        };
+        Ok(GovernorClosureRestore {
+            graph_snapshot: recovery_snapshot(&binding)?,
+            revocation_history: Some(eliot_authority::RevocationHistoryEvidence {
+                state_fence: binding.state_fence.clone(),
+                source_revision: 5,
+                closures: Vec::new(),
+            }),
+            members: vec![member],
+            roots: vec![hydration],
+            introductions: Vec::new(),
+            preserved: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn restore_serves_owner_enumeration_from_durable_state() -> Result<(), KernelError> {
+        let source = GovernorClosureSource::restore(restore_bundle()?)?;
+        let enumeration = source.enumerate_grant_closure("grant-test-root")?;
+        assert_eq!(enumeration.authority_root_ref, "root-test");
+        assert_eq!(enumeration.grant_graph_revision, 5);
+        assert_eq!(enumeration.members.len(), 1);
+        assert_eq!(enumeration.members[0].intent.grant_id, "grant-test-root");
+        assert!(enumeration.preserved.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_refuses_absent_revocation_history() {
+        let mut bundle = restore_bundle().expect("fixture restore must build");
+        bundle.revocation_history = None;
+        assert!(matches!(
+            GovernorClosureSource::restore(bundle),
+            Err(KernelError::RecoveryUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn owner_reports_unknown_grant_without_fence() -> Result<(), KernelError> {
+        let source = GovernorClosureSource::restore(restore_bundle()?)?;
+        assert!(matches!(
+            source.enumerate_grant_closure("grant-ghost"),
+            Err(KernelError::RecoveryUnavailable(_))
+        ));
+        assert!(matches!(
+            source.enumerate_grant_closure(""),
+            Err(KernelError::InvalidField { .. })
+        ));
+        Ok(())
+    }
+}

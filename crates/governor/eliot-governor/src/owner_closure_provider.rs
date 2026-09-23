@@ -1012,3 +1012,279 @@ struct AdmittedHydrationsSnapshot {
     preserved: Vec<(String, Vec<GrantClosureSurvivor>)>,
 }
 
+#[cfg(test)]
+mod owner_closure_provider_tests {
+    #![allow(clippy::expect_used)]
+    use std::num::NonZeroU64;
+
+    use super::*;
+    use eliot_authority::{
+        AuthoritySet, CapabilityGrant, EffectAuthorizer, GrantGraph, GrantId, GrantStatus,
+        LogicalTime, PrincipalRef,
+    };
+    use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration};
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_fence() -> StateFence {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("lineage"),
+            NonZeroU64::new(1).expect("sequence"),
+        )
+        .expect("epoch");
+        StateFence::new(epoch, ResourceGeneration::new(1).expect("generation"))
+    }
+
+    fn binding(fence: &StateFence) -> AuthorityBinding {
+        AuthorityBinding {
+            authority_id: ContractId::new("authority:test").expect("contract"),
+            authority_owner: "G-01".to_owned(),
+            authority_epoch: fence.authority_epoch.clone(),
+            state_fence: fence.clone(),
+            allowed_effect: EffectClass::ExternalEffect,
+            proof_ceiling: ProofCeiling::ObservedExternalEffect,
+        }
+    }
+
+    fn grant_entry(
+        fence: &StateFence,
+        grant_id: &str,
+        parent: Option<&str>,
+    ) -> CapabilityGrant {
+        CapabilityGrant {
+            grant_id: GrantId::new(grant_id).expect("id"),
+            parent_grant_id: parent.map(|id| GrantId::new(id).expect("parent")),
+            authority_root_ref: "root:alpha".to_owned(),
+            issuer: PrincipalRef::new("principal:issuer").expect("issuer"),
+            holder: PrincipalRef::new("principal:holder").expect("holder"),
+            authority: AuthoritySet::new(
+                ["op.read".to_owned()],
+                ["res:1".to_owned()],
+                EffectClass::Read,
+            )
+            .expect("authority"),
+            inherited_source_ceiling: None,
+            binding: binding(fence),
+            issued_at: LogicalTime::new(1),
+            expires_at: LogicalTime::new(10),
+            max_uses: 2,
+            status: GrantStatus::Active,
+        }
+    }
+
+    fn owner_snapshot(fence: &StateFence) -> AuthorityOwnerSnapshot {
+        let graph = GrantGraph::from_grants(
+            [
+                grant_entry(fence, "grant:origin", None),
+                grant_entry(fence, "grant:child", Some("grant:origin")),
+            ],
+            7,
+        )
+        .expect("graph");
+        let effect_authorizer = EffectAuthorizer::default().snapshot().expect("authorizer");
+        AuthorityOwnerSnapshot::new(
+            fence.clone(),
+            graph.recovery_snapshot().expect("snapshot"),
+            effect_authorizer,
+        )
+        .expect("owner snapshot")
+    }
+
+    fn history(fence: &StateFence) -> RevocationHistoryEvidence {
+        RevocationHistoryEvidence {
+            state_fence: fence.clone(),
+            source_revision: 7,
+            closures: Vec::new(),
+        }
+    }
+
+    fn secret() -> SecretReference {
+        SecretReference::new("test-provider", "test-key").expect("secret reference")
+    }
+
+    fn provider() -> Result<OwnerClosureProvider, CompositionError> {
+        let fence = test_fence();
+        OwnerClosureProvider::restore(owner_snapshot(&fence), Some(history(&fence)), &fence)
+    }
+
+    fn grant_params(
+        fence: &StateFence,
+        operation_id: &str,
+        grant_id: &str,
+        parent: Option<&str>,
+    ) -> GrantAdmissionParams {
+        GrantAdmissionParams {
+            operation_id: operation_id.to_owned(),
+            grant_id: grant_id.to_owned(),
+            parent_grant_id: parent.map(str::to_owned),
+            authority_root_ref: "root:alpha".to_owned(),
+            snapshot_id: "snap-1".to_owned(),
+            holder_principal: "principal:holder".to_owned(),
+            session_id: "session-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            binding: binding(fence),
+            allowed_effect: EffectClass::Read,
+            proof_ceiling: ProofCeiling::ScopedVerification,
+            issued_at_ms: 1_000,
+            expires_at_ms: Some(10_000),
+            receipt_obligations: vec!["obligation-1".to_owned()],
+        }
+    }
+
+    #[test]
+    fn restore_serves_exact_revision_and_subtree_closure() -> Result<(), CompositionError> {
+        let provider = provider()?;
+        assert_eq!(provider.revision(), 7);
+        assert_eq!(provider.authority_roots(), vec!["root:alpha".to_owned()]);
+        let closure = provider.delegated_closure("grant:origin")?;
+        assert_eq!(closure.revision, 7);
+        assert_eq!(closure.members.len(), 2);
+        assert_eq!(closure.members[0].grant_id.as_str(), "grant:origin");
+        let leaf = provider.delegated_closure("grant:child")?;
+        assert_eq!(leaf.members.len(), 1);
+        assert!(provider.delegated_closure("grant:ghost").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_refuses_absent_history() {
+        let fence = test_fence();
+        assert!(
+            OwnerClosureProvider::restore(owner_snapshot(&fence), None, &fence).is_err()
+        );
+    }
+
+    #[test]
+    fn admit_serve_round_trip_covers_grants_and_introductions() -> Result<(), CompositionError> {
+        let fence = test_fence();
+        let mut provider = provider()?;
+        assert!(provider.serve_restore().is_err());
+        provider.admit_grant_root(
+            &grant_params(&fence, "op-admit-origin", "grant:origin", None),
+            &secret(),
+            1_000,
+        )?;
+        provider.admit_grant_member(
+            &grant_params(&fence, "op-admit-child", "grant:child", Some("grant:origin")),
+            &secret(),
+            1_000,
+        )?;
+        provider.admit_introduction(
+            &IntroductionAdmissionParams {
+                operation_id: "op-admit-intro".to_owned(),
+                introduction_id: "intro:1".to_owned(),
+                authority_root_ref: "root:alpha".to_owned(),
+                snapshot_id: "snap-1".to_owned(),
+                supporting_grant_ids: vec!["grant:origin".to_owned(), "grant:child".to_owned()],
+                resource_handle: "handle-1".to_owned(),
+                facet_manifest_ref: "facet-1".to_owned(),
+                holder_principal: "principal:holder".to_owned(),
+                session_id: "session-1".to_owned(),
+                scope_id: "scope-1".to_owned(),
+                binding: binding(&fence),
+                allowed_effect: EffectClass::Read,
+                proof_ceiling: ProofCeiling::ScopedVerification,
+                issued_at_ms: 1_000,
+                expires_at_ms: None,
+                receipt_obligations: Vec::new(),
+            },
+            &secret(),
+            1_000,
+        )?;
+        provider.admit_preserved(PreservedAdmission {
+            target_grant_id: "grant:origin".to_owned(),
+            grant_id: "grant:child".to_owned(),
+            covering_grant_id: "grant:origin".to_owned(),
+            covering_root_ref: "root:alpha".to_owned(),
+        })?;
+        let restore = provider.serve_restore()?;
+        assert_eq!(restore.members.len(), 1);
+        assert_eq!(restore.roots.len(), 1);
+        assert_eq!(restore.introductions.len(), 1);
+        assert_eq!(restore.preserved.len(), 1);
+        assert!(restore.revocation_history.is_some());
+        // The sealed opaque record carries the admitted identity contour.
+        assert_eq!(
+            restore.members[0].durable_record.record().subject_id.as_str(),
+            "grant:child"
+        );
+        assert_eq!(
+            restore.introductions[0]
+                .durable_record
+                .record()
+                .subject_id
+                .as_str(),
+            "intro:1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admit_refuses_unknown_and_cross_parent_lineage() -> Result<(), CompositionError> {
+        let fence = test_fence();
+        let mut provider = provider()?;
+        assert!(
+            provider
+                .admit_grant_member(
+                    &grant_params(&fence, "op-ghost", "grant:ghost", Some("grant:origin")),
+                    &secret(),
+                    1_000,
+                )
+                .is_err()
+        );
+        assert!(
+            provider
+                .admit_grant_member(
+                    &grant_params(&fence, "op-cross", "grant:child", Some("grant:child")),
+                    &secret(),
+                    1_000,
+                )
+                .is_err()
+        );
+        assert!(
+            provider
+                .admit_grant_root(
+                    &grant_params(&fence, "op-root", "grant:child", Some("grant:origin")),
+                    &secret(),
+                    1_000,
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registry_snapshot_round_trip_and_tamper_refusal() -> Result<(), CompositionError> {
+        let fence = test_fence();
+        let mut provider = provider()?;
+        provider.admit_grant_root(
+            &grant_params(&fence, "op-admit-origin", "grant:origin", None),
+            &secret(),
+            1_000,
+        )?;
+        let bytes = provider.export_registry()?;
+        let fence2 = test_fence();
+        let mut fresh =
+            OwnerClosureProvider::restore(owner_snapshot(&fence2), Some(history(&fence2)), &fence2)?;
+        assert!(fresh.serve_restore().is_err());
+        fresh.import_registry(&bytes)?;
+        assert_eq!(fresh.serve_restore()?.roots.len(), 1);
+        let mut tampered = bytes.clone();
+        tampered[10] ^= 0xFF;
+        assert!(fresh.import_registry(&tampered).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_rejects_stale_revision() -> Result<(), CompositionError> {
+        let fence = test_fence();
+        let mut provider = provider()?;
+        assert!(
+            provider
+                .refresh(owner_snapshot(&fence), Some(history(&fence)), 6)
+                .is_err()
+        );
+        assert_eq!(provider.revision(), 7);
+        Ok(())
+    }
+}
