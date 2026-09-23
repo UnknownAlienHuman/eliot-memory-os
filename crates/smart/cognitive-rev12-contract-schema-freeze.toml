@@ -422,6 +422,31 @@ fields = ["contract_version", "projection_id", "family", "scope", "fence", "sour
 scope_fence_fields = ["scope", "fence"]
 denominator_note = "Opaque feedback refs; no feedback receipt type exists upstream so bodies cannot travel. Same completeness rule as the journal envelope."
 
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::FailureOmissionClass"
+fields = ["JournalBlind", "SupersededRevision", "PrivacyWithheld", "ExpiredCursor", "UnadmittedSource"]
+denominator_note = "Closed omission classes for failure-observation reads. Free-form reason strings cannot cross this boundary; operational context travels in the bounded note."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::FailureOmission"
+fields = ["handle", "class", "note"]
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::FailureObservation"
+fields = ["contract_version", "observation_id", "fingerprint", "trigger", "failed_action", "outcome", "violated_invariant", "scope", "state_fence", "journal_refs", "journal_revision", "coverage", "reopen_condition", "extinction_condition", "omissions", "digest"]
+scope_fence_fields = ["scope", "state_fence"]
+denominator_note = "Owner coverage Complete posture with empty blind intervals required for downstream Complete verdicts; anything else is an explicit partial read. Digest recomputed from fields on every validation."
+
+[[frozen_type]]
+crate = "eliot-observation-contracts"
+rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+fields = ["contract_version", "evidence_id", "observation_ref", "evidence_refs", "evidence_revision", "scope", "state_fence", "coverage", "same_hypothesis_recurrence", "prior_attempts", "omissions", "digest"]
+scope_fence_fields = ["scope", "state_fence"]
+denominator_note = "Post-dating evidence refs bearing on one observation; same-hypothesis recurrence yields Mechanism Review rather than equivalent retry. Same Complete-posture rule as the observation."
+
 [[bound]]
 crate = "eliot-observation-contracts"
 name = "MAX_PROJECTION_MEMBERS"
@@ -442,6 +467,18 @@ value = 256
 crate = "eliot-observation-contracts"
 name = "MAX_SOURCE_REVISION_CHARS"
 value = 256
+[[bound]]
+crate = "eliot-observation-contracts"
+name = "MAX_OBSERVATION_REFS"
+value = 256
+[[bound]]
+crate = "eliot-observation-contracts"
+name = "MAX_OBSERVATION_OMISSIONS"
+value = 64
+[[bound]]
+crate = "eliot-observation-contracts"
+name = "MAX_OBSERVATION_TEXT"
+value = 1024
 
 [[version_rule]]
 id = "VR-EXACT-CONTRACT-VERSION"
@@ -549,8 +586,7 @@ consumer_of_freeze = true
 order = 79
 crate = "eliot-dreamer-memory-revision"
 functional_cell = "smart.dreamer.memory_revision"
-frozen_inputs = ["admitted task/safety projections by handle"]
-blocked_inputs = ["FailureObservation (NOT_FROZEN)", "MemoryRevisionEvidence (NOT_FROZEN)"]
+frozen_inputs = ["admitted task/safety projections by handle", "FailureObservation by handle", "MemoryRevisionEvidence by handle"]
 consumer_of_freeze = true
 
 [[cell_binding]]
@@ -627,6 +663,18 @@ closed_by = "eliot-epistemic-contracts contribution.rs (ProviderContribution::co
 note = "Owner-neutral envelope with whole-envelope-or-error denominator semantics. The rev12 closed seven-class provider enum stays open below; it is a separate consumer-side set, not this envelope."
 
 [[challenge_closure]]
+challenge = "CC-FAILURE-OBSERVATION-SCHEMA"
+status = "CLOSED_BY_OWNER_CONTRACT"
+closed_by = "eliot-observation-contracts failure_observation.rs (FailureObservation/FailureOmission with frozen digests recomputed from fields, closed FailureOmissionClass, Complete-posture coverage rule)"
+note = "Owner-neutral failure memory with trigger/action/outcome/invariant, scope, fence, journal refs, revision cursor, coverage, reopen/extinction conditions, and explicit omissions. Distinct from the MCP surface FailureObservation DTO (rejected below) and the dreamer-contracts FailureObservationState enum (different type and role)."
+
+[[challenge_closure]]
+challenge = "CC-W9-MEMORY-REVISION"
+status = "CLOSED_BY_OWNER_CONTRACT"
+closed_by = "eliot-observation-contracts failure_observation.rs (MemoryRevisionEvidence with post-dating refs, recurrence flag, frozen digest; same Complete-posture rule)"
+note = "Revision-evidence refs bearing on one observation; same-hypothesis recurrence routes to Mechanism Review. The DMR propose consumer itself stays with its owner lane; this closure covers the contract shapes only."
+
+[[challenge_closure]]
 challenge = "CC-W9-UNDERSTANDING"
 status = "CLOSED_BY_OWNER_CONTRACT"
 closed_by = "eliot-dreamer-contracts self_query/accepted.rs (AcceptedSourceProjection::project/validate/check_cited with frozen digest and exact-triple currency)"
@@ -670,17 +718,9 @@ name = "MemoryContextProjectionRequest"
 challenge = "CC-MEMORY-PROJECTION-SCHEMA"
 reason = "No field-complete owner-neutral definition exists. The Governor ProjectionRequest is the provider intake port, not this consumer request shape."
 [[not_frozen]]
-name = "FailureObservation (owner-neutral)"
-challenge = "CC-FAILURE-OBSERVATION-SCHEMA"
-reason = "No versioned owner-neutral observation contract with denominator, fence, scope, and omission semantics exists."
-[[not_frozen]]
 name = "rev12 closed seven-class provider enum"
 challenge = "CC-PROVIDER-CONTRIBUTION-SCHEMA"
 reason = "Current ProviderRole is a provider/semantic-role slot struct; the exact rev12 closed seven-class set is not closed in source."
-[[not_frozen]]
-name = "MemoryRevisionEvidence"
-challenge = "CC-W9-MEMORY-REVISION"
-reason = "No owner-neutral revision-evidence refs contract exists."
 [[not_frozen]]
 name = "Skill-execution / tool-definition / durable-job typed evidence projections for cognitive-quality assessment"
 challenge = "CC-W9-COGNITIVE-QUALITY"
