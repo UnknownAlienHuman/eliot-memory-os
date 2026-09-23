@@ -810,6 +810,33 @@ async fn run_loop(
                                     ..
                                 } => {}
                             }
+                            // O1 experience audit scheduling (issue #223,
+                            // B-terminal): one evaluation per activation
+                            // completion over live fence currency plus the
+                            // exact missing audit inputs. The B-consumer
+                            // entry (run_experience_quality_event) is
+                            // branch-only and not authorized for import, so
+                            // no call is wired yet; this evaluation runs
+                            // live (reads fences, reports pending) and
+                            // never fails the activation loop.
+                            match eliotd::experience_audit::evaluate_experience_audit(
+                                kernel.as_ref(),
+                                composition.as_ref(),
+                            ) {
+                                eliotd::experience_audit::ExperienceAuditOutcome::Failed(
+                                    error,
+                                ) => {
+                                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                        "experience-audit",
+                                        &error.to_string(),
+                                    )
+                                    .emit();
+                                }
+                                eliotd::experience_audit::ExperienceAuditOutcome::Pending {
+                                    ..
+                                } => {}
+                            }
                             flight = ActivationFlight::Idle;
                         }
                         Err(ActivationDispatchError::Hard(error)) => return Err(error),

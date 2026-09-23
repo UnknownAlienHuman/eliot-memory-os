@@ -49,6 +49,7 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+pub mod experience_audit;
 mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
