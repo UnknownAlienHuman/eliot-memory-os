@@ -1228,7 +1228,13 @@ pub fn drive_scope_attach_trigger(
         ingress.owner_revision,
     ) {
         Ok((receipt, owner)) => {
-            tracing::info!("scope attach admitted with owner-issued receipt");
+            tracing::info!(
+                receipt = %crate::diagnostics::sanitize_identity(&receipt.receipt_ref),
+                scope = %crate::diagnostics::sanitize_identity(&receipt.scope_ref),
+                kind = ?receipt.kind,
+                fence_generation = live_fence.resource_generation.value(),
+                "scope attach admitted with owner-issued receipt",
+            );
             ScopeAttachDriveOutcome::Attached { receipt, owner }
         }
         Err(error) => ScopeAttachDriveOutcome::Failed(ExecutionChainError::SupplierReadRejected {
