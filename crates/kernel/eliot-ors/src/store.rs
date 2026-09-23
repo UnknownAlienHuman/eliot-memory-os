@@ -368,18 +368,28 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         subject_id: &crate::OperationIdentity,
     ) -> Result<Option<CapabilityIntroductionProjection>, OrsError>;
-    /// Scans committed grant-closure rows in operation-order after the
-    /// given order, bounded by one recovery page (issues #2100/#686).
+    /// Scans one bounded page of committed grant-closure rows for one
+    /// lineage selector in operation order (issues #2100/#686).
     ///
-    /// The Kernel-side history projector pages this scan to serve the
-    /// canonical revocation-history read from durable closure commits;
-    /// callers filter by lineage root and fence. An over-bound limit
-    /// refuses instead of truncating a history view.
-    fn scan_grant_closures(
+    /// `lineage` names a lineage root or one closure target grant.
+    /// Selection happens inside the store before any bound applies:
+    /// unrelated rows never count against `limit` and total table size
+    /// never refuses a requested view. Returned rows satisfy
+    /// `operation_order > after_order` in increasing operation order, up
+    /// to `limit` rows; the caller pages until an empty page. The second
+    /// tuple element is the durable per-root revision watermark read
+    /// under the SAME read snapshot as the rows, so one page is
+    /// self-consistent: a watermark change across pages proves a
+    /// concurrent mutation and the projector refuses instead of serving
+    /// a torn view. One selector resolving to more than one lineage root
+    /// refuses with [`OrsError::IntegrityProblem`].
+    fn scan_grant_closures_for_lineage(
         &self,
+        lineage: &OpaqueLabel,
         after_order: u64,
         limit: u16,
-    ) -> Result<Vec<GrantClosureProjection>, OrsError>;    fn logical_snapshot(&self, request: OrsSnapshotRequest)
+    ) -> Result<(Vec<GrantClosureProjection>, Option<u64>), OrsError>;
+    fn logical_snapshot(&self, request: OrsSnapshotRequest)
     -> Result<OrsSnapshotReceipt, OrsError>;
     fn scan_pending(
         &self,
@@ -5387,6 +5397,34 @@ impl RedbRecoveryStore {
         )
     }
 
+    /// Reads the durable grant-graph revision watermark for one lineage
+    /// root label under an already-open read snapshot.
+    ///
+    /// Sharing the caller's snapshot keeps selected closure rows and
+    /// their revision mutually consistent; opening a second snapshot
+    /// here would admit a torn rows-plus-watermark view.
+    fn grant_graph_revision_in(
+        read: &redb::ReadTransaction,
+        authority_root: &str,
+    ) -> Result<Option<u64>, OrsError> {
+        let key = format!("grant_graph_revision:{authority_root}");
+        let current = read
+            .open_table(GRANT_GRAPH_REVISION_CURRENT)
+            .map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let row: DurableGrantGraphRevision =
+            decode_named(value.value(), "grant_graph_revision")?;
+        if row.root.as_str() != authority_root {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_graph_revision",
+                reason: "current revision key or lineage root mismatch".to_owned(),
+            });
+        }
+        Ok(Some(row.revision))
+    }
+
     fn persist_operational_record(
         write: &redb::WriteTransaction,
         key: &str,
@@ -6737,17 +6775,24 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )))
     }
 
-    fn scan_grant_closures(
+    fn scan_grant_closures_for_lineage(
         &self,
+        lineage: &OpaqueLabel,
         after_order: u64,
         limit: u16,
-    ) -> Result<Vec<GrantClosureProjection>, OrsError> {
+    ) -> Result<(Vec<GrantClosureProjection>, Option<u64>), OrsError> {
         if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
             return Err(OrsError::InvalidCursorLimit);
         }
+        // One durable read snapshot covers both the selected rows and the
+        // per-root revision watermark, so a returned page is
+        // self-consistent. Selection filters by lineage before any bound
+        // applies: unrelated rows never refuse a requested view, and
+        // paging follows operation order through `after_order`.
         let read = self.database.begin_read().map_err(storage)?;
         let current = read.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
         let mut rows: Vec<(u64, DurableGrantClosureRecord)> = Vec::new();
+        let mut resolved_root: Option<String> = None;
         for row in current.iter().map_err(storage)? {
             let (key, value) = row.map_err(storage)?;
             let record: DurableGrantClosureRecord =
@@ -6760,12 +6805,38 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                         .to_owned(),
                 });
             }
-            if record.operation_order > after_order {
-                rows.push((record.operation_order, record));
+            let commit = &record.commit;
+            if commit.authority_root.as_str() != lineage.as_str()
+                && commit.target_id.as_str() != lineage.as_str()
+            {
+                continue;
             }
+            if record.operation_order <= after_order {
+                continue;
+            }
+            match resolved_root.as_deref() {
+                Some(known) if known != commit.authority_root.as_str() => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "grant_closure",
+                        reason: "one lineage selector resolves to more than one lineage root"
+                            .to_owned(),
+                    });
+                }
+                Some(_) => {}
+                None => resolved_root = Some(commit.authority_root.as_str().to_owned()),
+            }
+            rows.push((record.operation_order, record));
         }
         rows.sort_by_key(|(order, _)| *order);
         rows.truncate(usize::from(limit));
+        // The watermark resolves to the matched lineage root when rows
+        // matched, else to the selector itself; both reads share the
+        // snapshot opened above.
+        let watermark_root: &str = match resolved_root.as_deref() {
+            Some(root) => root,
+            None => lineage.as_str(),
+        };
+        let watermark = Self::grant_graph_revision_in(&read, watermark_root)?;
         let mut projections = Vec::with_capacity(rows.len());
         for (_, record) in rows {
             let receipt = Self::closure_receipt_for(&record)?;
@@ -6776,7 +6847,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 GrantClosureCommitReceipt::from_receipt(receipt),
             ));
         }
-        Ok(projections)
+        Ok((projections, watermark))
     }
 
     fn note_grant_graph_revision(
@@ -6839,23 +6910,8 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         &self,
         authority_root: &OpaqueLabel,
     ) -> Result<Option<u64>, OrsError> {
-        let key = format!("grant_graph_revision:{}", authority_root.as_str());
         let read = self.database.begin_read().map_err(storage)?;
-        let current = read
-            .open_table(GRANT_GRAPH_REVISION_CURRENT)
-            .map_err(storage)?;
-        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
-            return Ok(None);
-        };
-        let row: DurableGrantGraphRevision =
-            decode_named(value.value(), "grant_graph_revision")?;
-        if row.root.as_str() != authority_root.as_str() {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "grant_graph_revision",
-                reason: "current revision key or lineage root mismatch".to_owned(),
-            });
-        }
-        Ok(Some(row.revision))
+        Self::grant_graph_revision_in(&read, authority_root.as_str())
     }
 
     fn activate_capability_introduction(

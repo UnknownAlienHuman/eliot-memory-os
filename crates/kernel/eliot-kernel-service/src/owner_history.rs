@@ -20,10 +20,12 @@
 //!   revoked source lineage — never an invented cause;
 //! - the affected set comes verbatim from the committed closure row (the
 //!   complete denominator, never re-derived);
-//! - the served revision is the durable per-root watermark; a closure newer
-//!   than the watermark refuses instead of serving a partial view, and a
-//!   matched set larger than the request bound refuses instead of
-//!   truncating (overflow is never partial);
+//! - the served revision is the durable per-root watermark read under the
+//!   same snapshot as the served rows; a closure newer than the watermark
+//!   refuses instead of serving a partial view, a watermark change across
+//!   pages refuses instead of serving a torn view, and a matched set
+//!   larger than the request bound refuses instead of truncating
+//!   (overflow is never partial);
 //! - an empty matched set with a present watermark attests zero recorded
 //!   revocations at that revision; a missing watermark refuses because
 //!   absence of history is not evidence.
@@ -41,19 +43,28 @@ use eliot_security_contracts::RevocationReason;
 /// state.
 ///
 /// `origin_ref` names a lineage root or one closure target grant;
-/// `max_records` bounds the served closures; the request fence is echoed
-/// as the response fence after the dispatch site proves session agreement
-/// (this function re-checks fence equality itself, so it never depends on
-/// call order).
+/// `max_records` bounds the served closures. Session agreement is proven
+/// by the dispatch site on the actual call path
+/// (`validate_store_session_fence` in
+/// `bins/eliot-kernel/src/daemon_request_dispatch.rs` compares the
+/// admitted request fence against the live
+/// `session.module_generation.state_fence` before serving here), so this
+/// projector requires that proof as a precondition instead of comparing
+/// the request against itself. The admitted fence is echoed verbatim
+/// into the response; the Governor feed caller re-checks it against its
+/// expected fence on decode.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::InvalidField`] for a malformed selector,
 /// [`StoreError::PayloadTooLarge`] for an over-bound request or an
-/// overflowing matched set, [`StoreError::FenceMismatch`] for a fencing
-/// disagreement, [`StoreError::InvalidProjection`] for incoherent durable
-/// rows, [`StoreError::ReceiptNotFound`] when no history exists for the
-/// origin, and [`StoreError::UnknownOperation`] for any other operation.
+/// overflowing matched set, [`StoreError::InvalidProjection`] for
+/// incoherent durable rows, [`StoreError::ReceiptNotFound`] when no
+/// history exists for the origin, [`StoreError::Unavailable`] for a
+/// concurrent mutation that moves the per-root watermark mid-read, and
+/// [`StoreError::UnknownOperation`] for any other operation. Fencing
+/// disagreement never reaches this projector: the dispatch site refuses
+/// it before the call.
 #[allow(
     clippy::too_many_lines,
     reason = "the history projector keeps selectors, scan, filter, currency, overflow, and envelope in one audited sequence"
@@ -104,19 +115,32 @@ pub fn serve_authority_revocation_history(
     if max_records > REVOCATION_HISTORY_MAX_RECORDS {
         return Err(StoreError::PayloadTooLarge);
     }
-    if request.state_fence != *fence {
-        return Err(StoreError::FenceMismatch);
-    }
-    // Page every durable closure row; the matched set below is filtered by
-    // exact origin agreement, so paging never truncates the served view:
-    // overflow against max_records refuses instead.
+    // Rows page per lineage from the store in operation order; every page
+    // carries the per-root revision watermark read under the same durable
+    // snapshot as its rows, so one page is self-consistent. A watermark
+    // change across pages proves a concurrent mutation during the bounded
+    // read and refuses instead of serving a torn view; unrelated rows
+    // never count against the page bound, so an unrelated lineage can
+    // never disable this view.
+    let lineage = OpaqueLabel::new(origin_ref).map_err(|_| StoreError::InvalidField {
+        field: "operation.parameter",
+        reason: "origin_ref must be a bounded non-blank string",
+    })?;
     let mut after_order = 0u64;
     let mut matched: Vec<RecordedRevocation> = Vec::new();
     let mut resolved_root: Option<String> = None;
+    let mut baseline_revision: Option<Option<u64>> = None;
     loop {
-        let page = store
-            .scan_grant_closures(after_order, eliot_ors::MAX_RECOVERY_PAGE)
+        let (page, watermark) = store
+            .scan_grant_closures_for_lineage(&lineage, after_order, eliot_ors::MAX_RECOVERY_PAGE)
             .map_err(|_| StoreError::Unavailable)?;
+        match baseline_revision {
+            Some(baseline) if baseline != watermark => {
+                return Err(StoreError::Unavailable);
+            }
+            Some(_) => {}
+            None => baseline_revision = Some(watermark),
+        }
         if page.is_empty() {
             break;
         }
@@ -159,23 +183,18 @@ pub fn serve_authority_revocation_history(
             matched.push(record);
         }
     }
-    let Some(root) = resolved_root else {
-        // No fenced closure names this origin. A present watermark attests
-        // zero recorded revocations at its revision; a missing watermark
-        // refuses because absence of history is not evidence.
-        let label =
-            OpaqueLabel::new(origin_ref).map_err(|_| StoreError::InvalidField {
-                field: "operation.parameter",
-                reason: "origin_ref must be a bounded non-blank string",
-            })?;
-        let Some(watermark) = store
-            .load_grant_graph_revision(&label)
-            .map_err(|_| StoreError::Unavailable)?
-        else {
-            return Err(StoreError::ReceiptNotFound);
-        };
-        return history_response(fence, origin_ref, watermark, Vec::new());
+    // The rows and the watermark below share the snapshots that served
+    // the pages: an empty matched set with a present watermark attests
+    // zero recorded revocations at its revision; a missing watermark
+    // refuses because absence of history is not evidence.
+    let Some(watermark) = baseline_revision.flatten() else {
+        return Err(StoreError::ReceiptNotFound);
     };
+    if matched.is_empty() {
+        // No fenced closure names this origin (`resolved_root` is set on
+        // every pushed match, so an empty set means none matched).
+        return history_response(fence, origin_ref, watermark, Vec::new());
+    }
     if matched.len() > usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)? {
         return Err(StoreError::PayloadTooLarge);
     }
@@ -183,14 +202,6 @@ pub fn serve_authority_revocation_history(
     // Currency: every served closure must sit at or below the durable
     // per-root watermark; a newer row refuses instead of serving a view
     // whose revision cannot name it.
-    let label = OpaqueLabel::new(root.as_str()).map_err(|_| StoreError::InvalidField {
-        field: "operation.parameter",
-        reason: "origin root must be a bounded non-blank string",
-    })?;
-    let watermark = store
-        .load_grant_graph_revision(&label)
-        .map_err(|_| StoreError::Unavailable)?
-        .ok_or(StoreError::ReceiptNotFound)?;
     for record in &matched {
         if record.revision == 0 || record.revision > watermark {
             return Err(StoreError::InvalidProjection);
