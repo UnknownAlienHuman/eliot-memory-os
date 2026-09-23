@@ -76,6 +76,14 @@ proof ceilings:
    content-addressed canonical receipt. Proof ceiling:
    `DEPENDENCY_ADMISSION_AND_ADVISORY_EVIDENCE_CANDIDATE`.
 
+The Review profile's final cargo-deny gate delegates to this verifier profile.
+It uses the configured version-and-digest-pinned Windows executable through
+the verifier's private-copy runner. The verifier may locate a candidate via
+PATH, but PATH resolution alone is never trusted: it validates the configured
+version, executable SHA-256 and Windows PE identity, then executes only the
+digest-matched bytes through a verified private copy. The summary takes scanner
+identity only from that profile's source/profile-bound receipt.
+
 For a Windows release selecting the project-local SurrealDB candidate, the
 provisioner keeps the installed-version OSV evidence separate and fetches a
 fresh query/result for the exact selected candidate version. After the Windows
@@ -111,11 +119,80 @@ Every direct third-party dependency must record a current consumer, capability
 owner, justification, enabled features, public-contract exposure boundary, and
 removal/rollback plan.
 
+The verifier constructs the receipt denominator from observed source inputs and
+lock data, then reconciles direct roots against the policy inventory in both
+directions. Rust receipts enumerate every Cargo.lock package identity, source,
+checksum when present, and locked dependency edges. They also retain each
+observed Cargo manifest edge with its consumer package, declaration kind,
+target condition, alias, requested version/features, optionality, and whether
+the target is an internal workspace package. Explicit internal-edge
+dispositions bind the owner, reason, feature profile, exposure boundary, and
+removal plan for selected production edges; they remain separate from the
+third-party inventory. Receipt input digests include every Cargo.toml scanned
+for these edges, so the manifest declarations that produce the denominator are
+bound alongside Cargo.lock. Unused workspace dependency definitions do not
+become direct roots by themselves.
+
+Each observed Rust edge also carries resolver-binding status. A manifest
+outside the root workspace is not attributed a lock identity merely because
+the root Cargo.lock contains a package with the same name. Until resolver
+metadata binds that manifest's alias, dependency kind, target condition and
+requested version to an exact locked package, the edge remains
+`source_only_incomplete` and the Rust denominator remains incomplete. The
+current verifier does not yet produce a resolver-backed identity for any
+non-member workspace edge; it counts every observed non-member edge as
+incomplete, including an edge with a missing or malformed identity record. The
+current ten non-member manifests each declare an independent `[workspace]` and
+have no adjacent checked-in `Cargo.lock`, so the root lock cannot provide the
+missing resolver binding. Any standalone lockfile later observed for such a
+workspace is included in the receipt's input digests, but its presence alone
+is not treated as a resolved edge. The remaining resolver boundary is to join
+each declaration's manifest, alias, dependency kind, target condition and
+requested version to an exact locked package identity from resolver metadata
+before clearing that incomplete state.
+
+The current-main #2393 source adds three governed production edges from
+`eliot-governor` to `eliot-kernel-core`, `eliot-ors`, and `eliot-platform`.
+Their explicit dispositions describe the owner-closure provider and its public
+type exposure. The two `eliot-wasm-host` edges to `eliot-contracts` and
+`eliot-platform` are also present in current source and have explicit
+dispositions; those rows do not establish that the separate WASM invocation
+path is complete. Other observed internal edges remain in the source-derived
+receipt denominator even when they do not have a selected-edge disposition.
+The current-main #2395 merge also adds the observed internal edges
+`eliot-host` → `eliot-notify` and the `eliot` CLI → `eliot-host`. The verifier
+records both in the source-derived denominator; their presence does not make
+them selected disposition rows. The disposition ledger remains selective by
+contract and covers only explicitly selected production edges.
+
+NuGet receipts enumerate
+each target-specific package instance with its resolved version and SHA-512
+content hash, and bind direct project PackageReference entries to the configured
+lock target and inventory versions. Python receipts enumerate every exact
+package pin and its SHA-256 hashes, identify direct roots from the lock's -r
+provenance, and reconcile those roots and versions with the inventory.
+
+The Node denominator follows the production surface named by the bridge
+contract, resolves and digests its local import graph, and records observed
+external module imports. An empty package set is complete only when that graph
+has no external imports and the configured integration package root contains no
+package-manager manifest or lock. An unbound external import or newly present
+package-manager file yields incomplete evidence until it is explicitly locked
+and supported by policy.
+
 ## Pinned scanner identity and canonical receipts
 
-Scanner execution is pinned to an exact toolchain identity (`cargo-deny 0.20.2`
-with executable digest). Policy execution produces a canonical receipt
-(`.eliot/dependency-policy-receipt.json` or release artifact) that binds:
+Scanner execution is trusted only at the configured toolchain identity
+(cargo-deny 0.20.2 plus executable digest). When `--receipt-out` is supplied,
+the verifier writes a canonical receipt to the caller-selected path, for
+example `.eliot/dependency-policy-receipt.json` or a release artifact.
+The Review configuration requires exactly one each of `advisories`, `bans`,
+`licenses` and `sources`; missing, duplicate or additional check names are
+rejected before scanner execution.
+The Review wrapper
+uses a GUID-named temporary receipt only to pass scanner identity to its
+summary and deletes that file before exit; it is not retained as a canonical
+artifact. A failed cleanup is reported as a harness failure. The receipt binds:
 
 - Git source commit SHA;
 - input manifest and lockfile SHA-256 digests;
