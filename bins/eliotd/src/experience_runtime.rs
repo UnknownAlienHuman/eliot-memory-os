@@ -38,7 +38,7 @@ use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness};
 use eliot_experience_provider::{
     BankShapeInputs, ExperienceView, FeedbackShapeInputs, JournalShapeOutput, ProduceJournalInputs,
     ProviderError, RetentionContext, SelfQualityInputs, SelfQualityRecheckInputs, WithheldMember,
-    assess_and_recheck, produce_journal_read, produce_self_quality,
+    assess_and_recheck, produce_journal_read,
 };
 use eliot_learning_contracts::HarnessActivationReceiptCandidate;
 use eliot_observation::{
@@ -49,8 +49,7 @@ use eliot_observation::{
     },
 };
 use eliot_observation_contracts::{
-    BankProjection, FeedbackProjection, JournalProjection, ObservationScope, ProjectionCoverage,
-    ProjectionOmission, RetentionHold, RetentionSchedule,
+    ObservationScope, ProjectionCoverage, ProjectionOmission, RetentionHold, RetentionSchedule,
 };
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
@@ -175,10 +174,8 @@ pub async fn read_current_position(
 pub struct ExperienceJournalDriverInputs<'a> {
     /// Stable identity minted by the caller for the projection envelope.
     pub projection_id: ArtifactId,
-    /// Read scope governing the projection and the bridge read.
+    /// Read scope governing the projection (consumer-owned filtering).
     pub scope: ObservationScope,
-    /// Store scope the audit range is read in.
-    pub scope_id: ScopeId,
     /// Read consistency for the bridge fetch.
     pub consistency: ReadConsistency,
     /// Record ids read from the live journal at call time for binding.
@@ -214,76 +211,12 @@ pub async fn produce_journal_projection(
             projection_id: inputs.projection_id.clone(),
             scope: inputs.scope.clone(),
             fence: ctx.state_fence.clone(),
-            scope_id: inputs.scope_id.clone(),
             consistency: inputs.consistency.clone(),
             admitted_record_ids: inputs.admitted_record_ids,
             minimum_revisions: inputs.minimum_revisions,
         },
     )
     .await
-    .map_err(ExperienceDriverError::Provider)
-}
-
-/// Self-quality assessment inputs: owner envelopes plus edge inputs.
-pub struct ExperienceQualityDriverInputs<'a> {
-    /// Assessment identity minted by the caller.
-    pub assessment_id: ArtifactId,
-    /// Work scope governing the assessment.
-    pub assessment_scope: WorkScopeId,
-    /// Store scope the position read runs in.
-    pub scope_id: ScopeId,
-    /// Exact position subject the bridge read selects.
-    pub position_subject: String,
-    /// Owner journal envelope, when journal evidence is cited.
-    pub journal: Option<&'a JournalProjection>,
-    /// Owner bank envelope, when bank evidence is cited.
-    pub bank: Option<&'a BankProjection>,
-    /// Owner feedback envelope, when feedback is cited.
-    pub feedback: Option<&'a FeedbackProjection>,
-    /// Per-attempt receipt candidates (at least one; edge-supplied).
-    pub receipts: &'a [HarnessActivationReceiptCandidate],
-    /// Obligation-profile handles cited by handle only (edge-supplied).
-    pub obligation_handles: &'a [ArtifactId],
-}
-
-/// Terminal self-quality invocation with a true bridge-read position.
-///
-/// Reads the TRUE admitted edge position through the real bridge client,
-/// then invokes the Smart consumer
-/// ([`produce_self_quality`](eliot_experience_provider::produce_self_quality))
-/// over the supplied owner envelopes plus edge receipts and obligation
-/// handles. Journal-only assessment stays valid while bank/feedback
-/// supply pends; per-attempt receipts remain edge-supplied because no
-/// live harness receipt flow exists in-repo (the sole existing-owner
-/// producer is the meta activation assessment over live learning-plane
-/// inputs, which have no live supplier either). No finding, verdict,
-/// score, or completeness posture is emitted: the candidate freezes the
-/// assessed closure for Governor/Human review.
-pub async fn assess_experience_quality(
-    composition: &DaemonComposition,
-    kernel: &Arc<DaemonKernelClient>,
-    ctx: &RequestMetadata,
-    inputs: &ExperienceQualityDriverInputs<'_>,
-) -> Result<QualityAssessmentCandidate, ExperienceDriverError> {
-    let position = read_current_position(
-        composition,
-        kernel,
-        ctx,
-        inputs.scope_id.clone(),
-        inputs.position_subject.clone(),
-    )
-    .await?;
-    produce_self_quality(&SelfQualityInputs {
-        assessment_id: inputs.assessment_id.clone(),
-        scope: inputs.assessment_scope.clone(),
-        fence: ctx.state_fence.clone(),
-        journal: inputs.journal,
-        bank: inputs.bank,
-        feedback: inputs.feedback,
-        position: &position,
-        receipts: inputs.receipts,
-        obligation_handles: inputs.obligation_handles,
-    })
     .map_err(ExperienceDriverError::Provider)
 }
 

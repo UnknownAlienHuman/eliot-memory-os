@@ -108,7 +108,7 @@ use eliot_observation_contracts::{
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
     CanonicalReadClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
-    RevisionHead, RevisionKey, ScopeId, StoreError,
+    RevisionHead, RevisionKey, StoreError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,7 @@ pub enum ProviderError {
 /// Plan one closed audit-range read (pure, no I/O).
 ///
 /// Builds the existing `GetAuditRange` catalogue read with no parameters
+/// and no scope (scope-free row: scope filtering stays consumer-owned)
 /// and validates it. This is the single request-shape implementation the
 /// bridge fetch below and the daemon registration planner both resolve:
 /// the O1 planner region delegates here so only one shape exists. The
@@ -188,12 +189,11 @@ pub enum ProviderError {
 /// handlers stay with the store lane.
 pub fn plan_audit_range_request(
     fence: &StateFence,
-    scope_id: &ScopeId,
     consistency: ReadConsistency,
 ) -> Result<NamedReadRequest, ProviderError> {
     let request = NamedReadRequest {
         operation: NamedReadOperation::GetAuditRange,
-        scope_id: Some(scope_id.clone()),
+        scope_id: None,
         consistency,
         state_fence: fence.clone(),
         parameters: BTreeMap::new(),
@@ -210,11 +210,10 @@ pub fn plan_audit_range_request(
 /// other store failure travels as [`ProviderError::Bridge`].
 pub async fn fetch_audit_range<C: CanonicalReadClient + ?Sized>(
     client: &C,
-    scope_id: ScopeId,
     fence: &StateFence,
     consistency: ReadConsistency,
 ) -> Result<NamedReadResponse, ProviderError> {
-    let request = plan_audit_range_request(fence, &scope_id, consistency)?;
+    let request = plan_audit_range_request(fence, consistency)?;
     let response = match client.execute_named(request).await {
         Err(StoreError::Unavailable) => {
             return Err(ProviderError::BridgeUnavailable);
@@ -440,8 +439,6 @@ pub struct ProduceJournalInputs<'a> {
     pub scope: ObservationScope,
     /// Fence the bridge read runs under, carried for edge gating.
     pub fence: StateFence,
-    /// Store scope the audit range is read in.
-    pub scope_id: ScopeId,
     /// Read consistency for the bridge fetch.
     pub consistency: ReadConsistency,
     /// Record ids read from the live journal at call time for binding.
@@ -452,7 +449,7 @@ pub struct ProduceJournalInputs<'a> {
 
 /// Composed producer-to-provider-to-consumer call in production types.
 ///
-/// Fetches the scoped audit range through the caller-supplied bridge
+/// Fetches the scope-free audit range through the caller-supplied bridge
 /// client, shapes the admitted V1 envelopes into the frozen owner
 /// projection, assembles the Smart view, and revalidates both. The caller
 /// supplies the bridge client and the live admitted-handle set; the only
@@ -464,13 +461,7 @@ pub async fn produce_journal_read<C: CanonicalReadClient + ?Sized>(
     client: &C,
     inputs: &ProduceJournalInputs<'_>,
 ) -> Result<JournalShapeOutput, ProviderError> {
-    let response = fetch_audit_range(
-        client,
-        inputs.scope_id.clone(),
-        &inputs.fence,
-        inputs.consistency.clone(),
-    )
-    .await?;
+    let response = fetch_audit_range(client, &inputs.fence, inputs.consistency.clone()).await?;
     shape_journal_read(&JournalShapeInputs {
         projection_id: inputs.projection_id.clone(),
         scope: inputs.scope.clone(),
