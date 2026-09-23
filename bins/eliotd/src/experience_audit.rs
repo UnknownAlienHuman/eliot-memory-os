@@ -98,13 +98,13 @@ pub fn evaluate_experience_audit(
         },
         MissingOwner {
             owner: "bank durable supply",
-            artifact: "bank documents plus read context",
-            absent_read: "no durable bank read payload; bank durable supply stays canonical-owner side, no fake refs or receipts",
+            artifact: "durable range payload plus read context",
+            absent_read: "no verbatim bank range payload (records array); bank durable supply stays canonical-owner side, consumed via bank_records_from_range_payload plus supply_bank_projection_from_store when it lands — no fake refs or receipts",
         },
         MissingOwner {
             owner: "feedback durable supply",
-            artifact: "feedback documents plus read context",
-            absent_read: "no durable feedback read payload; feedback durable supply stays canonical-owner side, no fake refs or receipts",
+            artifact: "durable range payload plus read context",
+            absent_read: "no verbatim feedback range payload; feedback durable supply stays canonical-owner side, consumed via feedback_records_from_range_payload plus supply_feedback_projection_from_store when it lands — no fake refs or receipts",
         },
         MissingOwner {
             owner: "retention schedule owner",
