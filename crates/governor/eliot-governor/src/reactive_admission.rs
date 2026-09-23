@@ -30,7 +30,8 @@
 //! planned under. Scope/status/governance strings pass through untouched —
 //! the bridge records them verbatim and this module never reads them.
 
-use eliot_contracts::StateFence;
+use eliot_context_admission::SuppliedWarning;
+use eliot_contracts::{ArtifactId, StateFence};
 use eliot_integration_coverage::{EventCompleteness, GovernanceProfile};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -175,6 +176,92 @@ pub fn assess_reactive_risk(
         profile_fingerprint: profile.fingerprint.clone(),
         fence: fence.clone(),
         critical,
+    })
+}
+
+/// Governor risk attestation bound to one admission material.
+///
+/// This is the typed atom join key between Governor risk and the admission
+/// trace: `atom_id` is the stable identity of the evaluated candidate, and
+/// `assessment` is the owner-state attestation (tier, profile
+/// revision/fingerprint, echoed fence, criticality bit) evaluated under
+/// [`assess_reactive_risk`]. Provenance travels with the binding — profile
+/// revision and fingerprint name the exact GovernanceProfile derivation,
+/// the echoed fence names the evaluation posture — while atom-to-source
+/// resolution stays with the admission join, which owns the candidates.
+/// The binding carries no warning text and decides no admission outcome.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AtomRiskBinding {
+    /// Stable identity of the risk-assessed material.
+    pub atom_id: ArtifactId,
+    /// Owner-state risk attestation for this material.
+    pub assessment: ReactiveRiskAssessment,
+}
+
+/// Binds one Governor risk attestation to one admission material.
+///
+/// Pure threading of [`assess_reactive_risk`] over owner state with the
+/// atom join key attached: the same evidence set is required and the same
+/// withholds apply (`MissingGovernanceProfile`, `UnverifiedProfile`,
+/// `StaleEvidence`, `InvalidFence`) — a bound material is never a guessed
+/// tier. No reads, no clock, no I/O, no minted state beyond the binding.
+///
+/// # Errors
+///
+/// Returns [`ReactiveAdmissionError`] on any missing/invalid evidence, with
+/// exactly the [`assess_reactive_risk`] semantics above.
+pub fn bind_atom_risk(
+    profile: Option<&GovernanceProfile>,
+    critical: bool,
+    fence: &StateFence,
+    atom_id: ArtifactId,
+) -> Result<AtomRiskBinding, ReactiveAdmissionError> {
+    Ok(AtomRiskBinding {
+        atom_id,
+        assessment: assess_reactive_risk(profile, critical, fence)?,
+    })
+}
+
+/// Mints owner warning evidence from one bound risk attestation.
+///
+/// ## Contract decision (explicit, for root review)
+///
+/// I12.26 names `include_with_warning` for framing, staleness-bound, or
+/// contradiction risk staying below suppression, but defines no
+/// tier-to-warning mapping — so this owner states its mapping openly
+/// instead of hiding a quotient:
+///
+/// - `Low` mints nothing (`None`): its documented meaning is a normal item
+///   under a complete, fresh, fully authorizing posture, which carries
+///   nothing below suppression to report.
+/// - `Elevated`, `High`, and `Severe` mint exactly one warning whose
+///   content is attested facts only — the tier's canonical spelling, the
+///   profile revision, and the fence epoch text — with no freeform prose
+///   and no outcome directive.
+/// - Withholds never reach this function: [`bind_atom_risk`] propagates
+///   them as `Err`, so a minted warning always trails a real assessment.
+///
+/// The admission classifier consumes the text opaquely through its
+/// unchanged `include_with_warning` arm and binds it into the trace
+/// handle; no tier maps to any admission outcome here. If root rejects
+/// the Low/non-Low line, the single arm to revise is the `match` below —
+/// the classifier, the trace shape, and the join need no change.
+#[must_use]
+pub fn mint_atom_warning(binding: &AtomRiskBinding) -> Option<SuppliedWarning> {
+    let tier = match binding.assessment.tier {
+        ReactiveRiskTier::Low => return None,
+        ReactiveRiskTier::Elevated => "ELEVATED",
+        ReactiveRiskTier::High => "HIGH",
+        ReactiveRiskTier::Severe => "SEVERE",
+    };
+    Some(SuppliedWarning {
+        atom_id: binding.atom_id.clone(),
+        text: format!(
+            "governor-risk:{tier} profile-rev:{} fence:{}",
+            binding.assessment.profile_revision,
+            binding.assessment.fence_epoch_text(),
+        ),
     })
 }
 

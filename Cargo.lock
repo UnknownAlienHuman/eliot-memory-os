@@ -1850,6 +1850,7 @@ dependencies = [
  "eliot-canonical",
  "eliot-change-monitor",
  "eliot-config",
+ "eliot-context-admission",
  "eliot-context-candidates",
  "eliot-contracts",
  "eliot-coordination",
@@ -3147,8 +3148,8 @@ dependencies = [
 name = "eliot-understanding-assessment"
 version = "0.1.0"
 dependencies = [
- "eliot-context-contracts",
  "eliot-contracts",
+ "eliot-context-contracts",
  "eliot-dreamer-contracts",
  "eliot-epistemic-contracts",
  "eliot-observation-contracts",

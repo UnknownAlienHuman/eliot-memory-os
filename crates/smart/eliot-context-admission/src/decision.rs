@@ -375,15 +375,17 @@ pub fn check_retrieval_freshness(input: &AdmissionInput) -> Result<(), Retrieval
 ///
 /// For every candidate whose source owner carries a plan-supplied
 /// `expected_revision`, the candidate's actual source revision must match
-/// it. A mismatch on a mandatory (floor) candidate yields
-/// [`RetrievalStaleness::StaleProjection`]; on an optional candidate it
-/// yields [`RetrievalStaleness::ProbeRequired`]. Sources without a plan
-/// entry, and entries without an expectation, carry no revision opinion:
-/// the plan owner scoped expectations to listed sources only. The outcome
-/// is deterministic and independent of candidate order: floor mismatches
-/// report before optional ones. This check performs no selection, ranking,
-/// or mutation; the runtime join runs it beside plan validation before
-/// admission firing.
+/// it — but only under a matching State Fence: fence-disagreeing
+/// candidates defer to the fence arm (`PacketRefreshRequired`) and take no
+/// revision verdict here. A revision mismatch on a mandatory (floor)
+/// candidate yields [`RetrievalStaleness::StaleProjection`]; on an optional
+/// candidate it yields [`RetrievalStaleness::ProbeRequired`]. Sources
+/// without a plan entry, and entries without an expectation, carry no
+/// revision opinion: the plan owner scoped expectations to listed sources
+/// only. The outcome is deterministic and independent of candidate order:
+/// floor mismatches report before optional ones. This check performs no
+/// selection, ranking, or mutation; the runtime join runs it beside plan
+/// validation before admission firing.
 pub fn check_plan_revisions(
     plan: &RetrievalPlan,
     input: &AdmissionInput,
@@ -397,6 +399,14 @@ pub fn check_plan_revisions(
         .collect();
     let mut optional_mismatch = false;
     for candidate in &input.candidates.candidates {
+        // Fence disagreement is owned by the fence arm
+        // (`check_retrieval_freshness` → `PacketRefreshRequired`):
+        // revision expectations bind only under a matching fence, so a
+        // cross-fence closure always routes to packet refresh rather than
+        // to a stale/probe verdict here.
+        if !fences_match_exact(&input.binding.state_fence, &candidate.binding.state_fence) {
+            continue;
+        }
         let Some(entry) = plan
             .source_projection_fences
             .iter()

@@ -91,7 +91,8 @@ pub use observation_reconciliation::{
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use reactive_admission::{
-    ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier, assess_reactive_risk,
+    AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
+    assess_reactive_risk, bind_atom_risk, mint_atom_warning,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
