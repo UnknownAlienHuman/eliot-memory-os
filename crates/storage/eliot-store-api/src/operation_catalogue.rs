@@ -220,8 +220,12 @@ const _: () = assert!(
 /// [`StoreError::PayloadTooLarge`](crate::StoreError) instead of
 /// truncating silently: a truncated audit range cannot prove journal
 /// completeness, so partial success is never reported. Larger journals
-/// page forward with the opaque `cursor` selector (fence-bound,
-/// owner-verified); the bound applies per page, unchanged.
+/// page forward with the opaque `cursor` selector, bound to the read
+/// fence plus the current revision-head set and verified per page; the
+/// bound applies per page, unchanged. Any commit advancing any head
+/// invalidates outstanding cursors (restart enumeration); append-only
+/// captures never disturb already-returned ordinals, so restarts are
+/// wasteful but never wrong.
 pub const MAX_AUDIT_RANGE_RECORDS: u32 = 32;
 
 /// Compile-time guard for the bound above: the worst case (every
@@ -265,9 +269,9 @@ struct ActivatedReadDescriptor {
 /// `GetResourceSnapshot` addresses no scope and selects through the
 /// declared exact `uri` parameter; `GetAuditRange` addresses no scope
 /// (issue #223: fence-gated journal-global scan; scope filtering lives
-/// consumer-side per I12-26, mirroring the established in-catalogue
-/// scope-free reads where the Governor facade requires a caller scope
-/// while catalogue rows stay scope-free).
+/// consumer-side per I12-26, mirroring the `GetMailbox` split where the
+/// Governor facade requires a caller scope while catalogue rows stay
+/// scope-free).
 const ACTIVATED_READS: [ActivatedReadDescriptor; 17] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
