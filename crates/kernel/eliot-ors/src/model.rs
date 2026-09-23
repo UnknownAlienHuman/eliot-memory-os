@@ -2096,21 +2096,20 @@ impl CapabilityIntroductionProjection {
 /// Exact subject-set equality first: any omitted live subject or surprise
 /// presented subject refuses — an empty presented list passes only against
 /// a genuinely empty live set, so unjustified emptiness can never verify.
-/// Then, per subject in lifecycle order:
-/// - live `Fenced` + presented `Fenced`: requires byte-exact subject,
-///   fence snapshot, and operation order (fenced rows are immutable: the
-///   row lifecycle admits no transition out of `Fenced`, so any drift is
-///   an anomaly, never a legitimate advance);
-/// - live `Fenced` + presented `Active`: requires subject equality and
-///   live order at least the presented order (a legitimate fencing race
-///   between the presented read and this check ends in the desired state;
-///   the fence snapshot may legitimately rebind at fencing time);
-/// - live `Active` (whatever presented): refuses — prior authority is
-///   still live.
-/// When `require_all_fenced` is set (cutover), a live `Active` row refuses
-/// even on exact match; without it (restore replay), exact `Active` rows
-/// pass. `ReconciliationMismatch` covers binding failures;
-/// `IntegrityProblem` covers live-authority-still-active rows.
+/// Then, per subject, the presented/live phase pair binds (binding checks
+/// run in both modes — the fenced-only flag gates live-Active acceptance,
+/// never presented binding):
+/// - Fenced/Fenced: byte-exact fence snapshot and operation order (fenced
+///   rows are immutable: no transition out of `Fenced` exists, so drift
+///   is an anomaly, never a legitimate advance);
+/// - Active/Fenced: legitimate fencing race (live order at least presented
+///   order; the fence snapshot may legitimately rebind at fencing time);
+/// - Active/Active: exact field equality — legitimate only before fencing,
+///   so it passes solely when `require_all_fenced` is false (restore
+///   replay); a Fenced claim against live `Active` rows is resurrection or
+///   fraud and refuses in both modes.
+/// `ReconciliationMismatch` covers binding failures; `IntegrityProblem`
+/// covers live-authority-still-active rows.
 pub fn verify_introduction_set(
     presented: &[CapabilityIntroductionProjection],
     live: &[CapabilityIntroductionProjection],
@@ -2135,26 +2134,40 @@ pub fn verify_introduction_set(
             .iter()
             .find(|row| row.record().subject_id.as_str() == subject)
             .ok_or(OrsError::ReconciliationMismatch)?;
-        if current.phase() != OperationalPhase::Fenced {
-            return Err(OrsError::IntegrityProblem {
-                record_type: "capability_introduction",
-                reason: "live introduction authority is still active".to_owned(),
-            });
-        }
-        if require_all_fenced {
-            continue;
-        }
-        match introduction.phase() {
-            OperationalPhase::Fenced => {
+        // Per-pair lifecycle binding (both modes — the fenced-only flag
+        // gates live-Active acceptance, never presented binding):
+        // - Fenced/Fenced: byte-exact fence snapshot and order (fenced
+        //   rows are immutable: no transition out of `Fenced` exists, so
+        //   any drift is an anomaly, never a legitimate advance);
+        // - Active/Fenced: legitimate fencing race between the presented
+        //   read and this check (live order at least presented order; the
+        //   fence snapshot may legitimately rebind at fencing time);
+        // - Active/Active: exact field equality — legitimate only before
+        //   fencing (restore replay), so it passes solely when the caller
+        //   did not require all-fenced; a Fenced-claim against live
+        //   Active rows is resurrection or fraud and refuses in both modes.
+        match (introduction.phase(), current.phase()) {
+            (OperationalPhase::Fenced, OperationalPhase::Fenced) => {
                 if current.record().state_fence != introduction.record().state_fence
                     || current.operation_order() != introduction.operation_order()
                 {
                     return Err(OrsError::ReconciliationMismatch);
                 }
             }
-            OperationalPhase::Active => {
+            (OperationalPhase::Active, OperationalPhase::Fenced) => {
                 if current.operation_order() < introduction.operation_order() {
                     return Err(OrsError::ReconciliationMismatch);
+                }
+            }
+            (OperationalPhase::Active, OperationalPhase::Active) => {
+                if require_all_fenced
+                    || current.record().state_fence != introduction.record().state_fence
+                    || current.operation_order() != introduction.operation_order()
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "capability_introduction",
+                        reason: "live introduction authority is still active".to_owned(),
+                    });
                 }
             }
             _ => return Err(OrsError::ReconciliationMismatch),
