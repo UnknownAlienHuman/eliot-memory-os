@@ -76,6 +76,12 @@ proof ceilings:
    content-addressed canonical receipt. Proof ceiling:
    `DEPENDENCY_ADMISSION_AND_ADVISORY_EVIDENCE_CANDIDATE`.
 
+The Review profile's final cargo-deny gate delegates to this verifier profile.
+It uses the configured version-and-digest-pinned Windows executable through
+the verifier's private-copy runner; Review does not probe or execute an
+ambient `cargo deny` binary from `PATH`. The summary takes the observed scanner
+identity from that profile's receipt.
+
 For a Windows release selecting the project-local SurrealDB candidate, the
 provisioner keeps the installed-version OSV evidence separate and fetches a
 fresh query/result for the exact selected candidate version. After the Windows
@@ -110,6 +116,53 @@ canonical manifest at `config/dependency-policy.toml`:
 Every direct third-party dependency must record a current consumer, capability
 owner, justification, enabled features, public-contract exposure boundary, and
 removal/rollback plan.
+
+The verifier constructs the receipt denominator from observed source inputs and
+lock data, then reconciles direct roots against the policy inventory in both
+directions. Rust receipts enumerate every Cargo.lock package identity, source,
+checksum when present, and locked dependency edges. They also retain each
+observed Cargo manifest edge with its consumer package, declaration kind,
+target condition, alias, requested version/features, optionality, and whether
+the target is an internal workspace package. Explicit internal-edge
+dispositions bind the owner, reason, feature profile, exposure boundary, and
+removal plan for selected production edges; they remain separate from the
+third-party inventory. Receipt input digests include every Cargo.toml scanned
+for these edges, so the manifest declarations that produce the denominator are
+bound alongside Cargo.lock. Unused workspace dependency definitions do not
+become direct roots by themselves.
+
+Each observed Rust edge also carries resolver-binding status. A manifest
+outside the root workspace is not attributed a lock identity merely because
+the root Cargo.lock contains a package with the same name. Until resolver
+metadata binds that manifest's alias, dependency kind, target condition and
+requested version to an exact locked package, the edge remains
+`source_only_incomplete` and the Rust denominator remains incomplete. Any
+standalone lockfile observed for such a workspace is included in the receipt's
+input digests, but its presence alone is not treated as a resolved edge.
+
+The current-main #2393 source adds three governed production edges from
+`eliot-governor` to `eliot-kernel-core`, `eliot-ors`, and `eliot-platform`.
+Their explicit dispositions describe the owner-closure provider and its public
+type exposure. The two `eliot-wasm-host` edges to `eliot-contracts` and
+`eliot-platform` are also present in current source and have explicit
+dispositions; those rows do not establish that the separate WASM invocation
+path is complete. Other observed internal edges remain in the source-derived
+receipt denominator even when they do not have a selected-edge disposition.
+
+NuGet receipts enumerate
+each target-specific package instance with its resolved version and SHA-512
+content hash, and bind direct project PackageReference entries to the configured
+lock target and inventory versions. Python receipts enumerate every exact
+package pin and its SHA-256 hashes, identify direct roots from the lock's -r
+provenance, and reconcile those roots and versions with the inventory.
+
+The Node denominator follows the production surface named by the bridge
+contract, resolves and digests its local import graph, and records observed
+external module imports. An empty package set is complete only when that graph
+has no external imports and the configured integration package root contains no
+package-manager manifest or lock. An unbound external import or newly present
+package-manager file yields incomplete evidence until it is explicitly locked
+and supported by policy.
 
 ## Pinned scanner identity and canonical receipts
 

@@ -35,6 +35,9 @@ $codeNavigation = Join-Path $PSScriptRoot 'code_navigation.py'
 $docsClosureAudit = Join-Path $PSScriptRoot 'docs_closure_audit.py'
 $standaloneCrates = Join-Path $PSScriptRoot 'verify-standalone-crates.py'
 $dependencyPolicyVerifier = Join-Path $PSScriptRoot 'verify-dependency-policy.py'
+$dependencyPolicyReceiptPath = Join-Path $repoRoot (
+    Join-Path '.eliot' ('dependency-policy-run-{0}.json' -f [Guid]::NewGuid().ToString('N'))
+)
 
 # Sole ordered gate-definition owner (issue #750). Wrappers (Justfile, CI)
 # select a closed profile only; they must not duplicate these commands.
@@ -57,7 +60,7 @@ $allGates = @(
     [pscustomobject]@{ Name = 'core-daemon-inventory'; Profiles = @('Quick', 'Review'); Command = { python $coreDaemonInventoryVerifier --root $repoRoot } },
     [pscustomobject]@{ Name = 'normative-pair'; Profiles = @('Quick', 'Review'); Command = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'verify-normative.ps1') } },
     [pscustomobject]@{ Name = 'dependency-policy-self-test'; Profiles = @('Quick', 'Review'); Command = { python $dependencyPolicyVerifier --self-test } },
-    [pscustomobject]@{ Name = 'dependency-policy-offline'; Profiles = @('Quick', 'Review'); Command = { python $dependencyPolicyVerifier --root $repoRoot --profile offline-source } },
+    [pscustomobject]@{ Name = 'dependency-policy-offline'; Profiles = @('Quick', 'Review'); Command = { python $dependencyPolicyVerifier --root $repoRoot --profile offline-source --receipt-out $dependencyPolicyReceiptPath } },
     [pscustomobject]@{ Name = 'architecture-boundaries-self-test'; Profiles = @('Quick', 'Review'); Command = { python $architectureAudit --self-test } },
     [pscustomobject]@{ Name = 'architecture-boundaries'; Profiles = @('Quick', 'Review'); Command = { python $architectureAudit --root $repoRoot } },
     [pscustomobject]@{ Name = 'agent-guardrails-self-test'; Profiles = @('Quick', 'Review'); Command = { python $guardrailVerifier --self-test } },
@@ -117,7 +120,10 @@ $allGates = @(
     [pscustomobject]@{ Name = 'cargo-check-workspace'; Profiles = @('Quick', 'Review'); Command = { cargo check --locked --workspace --all-targets } },
     [pscustomobject]@{ Name = 'cargo-clippy-workspace'; Profiles = @('Review'); Command = { cargo clippy --locked --workspace --all-targets -- -D warnings } },
     [pscustomobject]@{ Name = 'cargo-test-workspace'; Profiles = @('Review'); Command = { cargo test --locked --workspace } },
-    [pscustomobject]@{ Name = 'cargo-deny'; Profiles = @('Review'); Command = { cargo deny check } }
+    [pscustomobject]@{ Name = 'cargo-deny'; Profiles = @('Review'); Command = {
+        # Review's "cargo deny check" contract is executed by the pinned private-copy runner.
+        python $dependencyPolicyVerifier --root $repoRoot --profile current-advisories --receipt-out $dependencyPolicyReceiptPath
+    } }
 )
 
 $profileExplicit = $PSBoundParameters.ContainsKey('Profile')
@@ -155,8 +161,9 @@ if ($selectedGates.Count -eq 0) {
 $script:verifyMetadataJson = ''
 $workspaceMembers = 'unproven'
 
-# Source/tool identities bound into the summary. Best-effort probes: an
-# unavailable probe is recorded as such and never fabricates an identity.
+# Source/tool identities bound into the summary. Git, cargo and Python
+# best-effort probes never fabricate an identity; cargo-deny comes from the
+# digest-pinned verifier receipt below.
 $sourceSha = 'unknown'
 try {
     $sourceSha = ((git rev-parse HEAD) | Out-String).Trim()
@@ -178,13 +185,7 @@ try {
 } catch {
     $pythonIdentity = 'unavailable'
 }
-$denyIdentity = 'unavailable'
-try {
-    $denyIdentity = ((cargo deny --version) | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($denyIdentity)) { $denyIdentity = 'unavailable' }
-} catch {
-    $denyIdentity = 'unavailable'
-}
+$denyIdentity = 'unverified-by-pinned-policy-runner'
 
 $results = @()
 $harnessState = 'pass'
@@ -271,6 +272,33 @@ try {
     }
 } finally {
     Pop-Location
+}
+
+# Report only the scanner identity observed by the digest-pinned policy runner.
+# This deliberately performs no cargo-deny PATH lookup or version execution.
+try {
+    if (Test-Path -LiteralPath $dependencyPolicyReceiptPath -PathType Leaf) {
+        $dependencyReceipt = Get-Content -LiteralPath $dependencyPolicyReceiptPath -Raw | ConvertFrom-Json
+        $receiptProperties = @($dependencyReceipt.PSObject.Properties.Name)
+        $scannerReceipt = if ($receiptProperties -contains 'scanner') { $dependencyReceipt.scanner } else { $null }
+        $scannerProperties = if ($null -ne $scannerReceipt) { @($scannerReceipt.PSObject.Properties.Name) } else { @() }
+        $expectedReceiptProfile = if ($Profile -eq 'Review') { 'current-advisories' } else { 'offline-source' }
+        $observedDenyVersion = if ($scannerProperties -contains 'observed_version') { [string]$scannerReceipt.observed_version } else { '' }
+        $observedDenyDigest = if ($scannerProperties -contains 'observed_executable_sha256') { [string]$scannerReceipt.observed_executable_sha256 } else { '' }
+        $receiptSource = if ($receiptProperties -contains 'source_sha') { [string]$dependencyReceipt.source_sha } else { '' }
+        if (
+            $receiptSource -eq $sourceSha -and
+            $dependencyReceipt.profile -eq $expectedReceiptProfile -and
+            $scannerProperties -contains 'identity_verified' -and
+            $scannerReceipt.identity_verified -eq $true -and
+            -not [string]::IsNullOrWhiteSpace($observedDenyVersion) -and
+            $observedDenyDigest -match '^[0-9a-fA-F]{64}$'
+        ) {
+            $denyIdentity = "$observedDenyVersion sha256:$observedDenyDigest"
+        }
+    }
+} catch {
+    $denyIdentity = 'unverified-by-pinned-policy-runner'
 }
 
 $passedCount = @($results | Where-Object { $_.State -eq 'pass' }).Count
