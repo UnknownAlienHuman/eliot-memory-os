@@ -42,6 +42,10 @@
     "source_tag_ref_path": ".eliot/dependency-policy/surrealdb/v3.2.0/github-tag-v3.2.0.json",
     "release_metadata_path": ".eliot/dependency-policy/surrealdb/v3.2.0/github-release-v3.2.0.json",
     "advisory_query_path": ".eliot/dependency-policy/surrealdb/v3.2.0/osv-query.json",
-    "advisory_response_path": ".eliot/dependency-policy/surrealdb/v3.2.0/osv-response.json"
+    "advisory_response_path": ".eliot/dependency-policy/surrealdb/v3.2.0/osv-response.json",
+    "advisory_package": "surrealdb",
+    "advisory_ecosystem": "crates.io",
+    "advisory_scope": "rust-crate",
+    "advisory_max_age_hours": 24
   }
 }

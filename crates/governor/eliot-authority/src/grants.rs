@@ -402,6 +402,36 @@ impl EffectiveCapabilitySnapshot {
     }
 }
 
+/// One delegated member reference in a Governor-enumerated closure.
+///
+/// Identity and parent linkage only: semantic intents, opaque records, and
+/// fence contours are served by the hydration layer from canonical state, not
+/// by the pure graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureMemberRef {
+    /// Enumerated grant identity.
+    pub grant_id: GrantId,
+    /// Delegating parent identity. `None` only for the closure target when
+    /// the target is itself an authority root.
+    pub parent_grant_id: Option<GrantId>,
+}
+
+/// Owner-enumerated descendant closure of one grant at one graph revision.
+///
+/// Returned by [`GrantGraph::delegated_closure`]: the complete affected set
+/// the Kernel fences for a delegation revocation, with the revision it was
+/// read at. Survivor paths on independent authority lines are declared by
+/// the hydration layer, never inferred here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureDelegation {
+    /// Lineage domain shared by every member.
+    pub authority_root_ref: String,
+    /// Graph revision the closure was enumerated at.
+    pub revision: u64,
+    /// Closure members in parent-before-child order, target first.
+    pub members: Vec<GrantClosureMemberRef>,
+}
+
 /// `ELIOT_ARCH_OWNER`: ARCH-AUTH-01
 /// Pure grant-lineage evaluator.
 #[derive(Clone, Debug)]
@@ -574,6 +604,73 @@ impl GrantGraph {
             .checked_add(1)
             .ok_or(AuthorityError::InvalidField("grant_graph_revision"))?;
         Ok(())
+    }
+
+    /// Enumerates the exact descendant closure of one grant at the current
+    /// graph revision: the target plus every transitive child on the same
+    /// authority root, in parent-before-child order with the target first.
+    ///
+    /// This is the Governor-side lineage primitive behind durable closure
+    /// revocation (`#2100`): the graph owner declares the complete affected
+    /// set so the Kernel never fences from caller material or process memory
+    /// alone. Lineage that crosses roots is never followed. The traversal is
+    /// defended with a visited set, so it terminates even on a graph that
+    /// was not validated at construction. Revoked grants are still listed:
+    /// revocation status is enforcement state, not lineage shape, and the
+    /// caller decides the fence disposition.
+    ///
+    /// Alternate-path survival is not decided here: grants on independent
+    /// authority paths are separate graph entries, and the surviving-path
+    /// declaration belongs to the hydration layer that serves the full
+    /// closure evidence.
+    pub fn delegated_closure(
+        &self,
+        grant_id: &GrantId,
+    ) -> Result<GrantClosureDelegation, AuthorityError> {
+        let target = self
+            .grants
+            .get(grant_id)
+            .ok_or_else(|| AuthorityError::MissingParent(grant_id.clone()))?;
+        let authority_root_ref = target.authority_root_ref.clone();
+        let mut members = vec![GrantClosureMemberRef {
+            grant_id: target.grant_id.clone(),
+            parent_grant_id: target.parent_grant_id.clone(),
+        }];
+        let mut seen = BTreeSet::new();
+        seen.insert(target.grant_id.clone());
+        let mut frontier = vec![target.grant_id.clone()];
+        while let Some(current) = frontier.pop() {
+            // Grant-id order keeps the enumeration deterministic across
+            // restarts and owners.
+            let mut children: Vec<&CapabilityGrant> = self
+                .grants
+                .values()
+                .filter(|grant| {
+                    grant.parent_grant_id.as_ref() == Some(&current)
+                        && grant.authority_root_ref == authority_root_ref
+                })
+                .collect();
+            children.sort_by(|left, right| left.grant_id.cmp(&right.grant_id));
+            for child in children {
+                if !seen.insert(child.grant_id.clone()) {
+                    continue;
+                }
+                frontier.push(child.grant_id.clone());
+                members.push(GrantClosureMemberRef {
+                    grant_id: child.grant_id.clone(),
+                    parent_grant_id: child.parent_grant_id.clone(),
+                });
+            }
+        }
+        // Discovery order is already parent-before-child: a child is
+        // recorded only when its parent is popped. Siblings pop in reverse
+        // grant-id order from the stack, which is still deterministic across
+        // restarts and owners.
+        Ok(GrantClosureDelegation {
+            authority_root_ref,
+            revision: self.revision,
+            members,
+        })
     }
 
     pub fn snapshot(

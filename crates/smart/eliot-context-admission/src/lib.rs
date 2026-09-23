@@ -7,6 +7,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod closure;
+pub mod decision;
+
+pub use closure::{ClosureParts, assemble_closure};
+
+pub use decision::{
+    ClassifiedAdmission, ClassificationEvidence, MaterialRankTrace, RetrievalAdmissionDecision,
+    RetrievalStaleness, SuppliedWarning, check_plan_revisions, check_retrieval_freshness,
+    classify_admission, derive_candidate_warnings, derive_input_warnings,
+    trace_material, trace_material_with_warnings,
+};
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use eliot_context_contracts::{
@@ -27,6 +39,19 @@ const UNKNOWN_AVAILABILITY_CONSTRAINT: &str =
 /// or non-recoverable reason. No source is fetched and no representation is
 /// generated here.
 pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
+    // I12.26 stale-projection fence arm, enforced before exact cue firing: a
+    // candidate closure compiled under another fence must refresh the packet
+    // and can never silently admit. Today's boundary refusal for exactly this
+    // case is `InvalidFence`, so the mapping is exact rather than a new
+    // meaning. Floor/optional staleness keeps flowing through the existing
+    // typed incomplete/omission paths below; erroring there would change the
+    // boundary contract those paths own.
+    if matches!(
+        check_retrieval_freshness(input),
+        Err(RetrievalStaleness::PacketRefreshRequired)
+    ) {
+        return Err(ContextError::InvalidFence);
+    }
     validate_admission_contract(input)?;
     let input_digest = input.canonical_digest()?;
     let profile_digest = input.measurement_profile.canonical_digest()?;
@@ -99,6 +124,94 @@ pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextE
 fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextError> {
     input.validate_additive_measurements()?;
     validate_selection_contract(input)
+}
+
+/// Admit one immutable candidate set and return the per-material rank traces.
+///
+/// This is the live runtime entrypoint combining [`admit_context`] with
+/// [`trace_material`]: the caller receives the admission result together
+/// with exactly one handle-bound [`MaterialRankTrace`] per evaluated
+/// candidate, carrying the typed six-outcome slot, the freshness signal,
+/// and the explicit suppression evidence. The traces re-validate the result
+/// against the input closure fail-closed, so the pair always corresponds;
+/// no separate join by the caller can drift.
+///
+/// ## Runtime join contract (M2/O1 daemon feed callee)
+///
+/// This entrypoint is the sole supplier-side callee the daemon retrieval
+/// drive joins against; the drive builds nothing admission-side and mints
+/// no identities. Caller obligations, in order:
+///
+/// 1. Resolve both suppliers from their owners only: the retrieval plan
+///    through the retrieval-plan compiler
+///    (`eliot-reactive-context-plan` compiler) and the [`AdmissionInput`]
+///    through the closure assembler ([`assemble_closure`]). Absent
+///    suppliers idle with a named pending outcome; they are never
+///    fabricated at the call site.
+/// 2. Validate the plan fail-closed through its canonical digest, then run
+///    the plan-against-input revision comparison
+///    ([`check_plan_revisions`]) before calling: every fence-matching
+///    candidate source needs a plan expectation with the actual revision,
+///    or the drive probes (optional) or stales (floor) instead of
+///    admitting; a refused plan or an unresolvable closure never reaches
+///    selection.
+/// 3. Call exactly once per changed supplier bundle and bind the returned
+///    pair verbatim: the result and selection digests, the decision
+///    anchor, and every trace handle with its staleness obligation.
+/// 4. Map `Err(`[`ContextError::InvalidFence`])` to the packet-refresh arm
+///    ([`RetrievalStaleness::PacketRefreshRequired`]); it names a closure
+///    compiled under another fence and can never admit. Every other
+///    boundary refusal is named by its refusing stage, never coerced into
+///    an admission outcome.
+/// 5. Read per-material staleness only from
+///    [`MaterialRankTrace::staleness`], capacity pressure only from
+///    [`MaterialRankTrace::capacity_constrained`], suppression text only
+///    from [`MaterialRankTrace::suppression_reason`], and owner warning
+///    text only from [`MaterialRankTrace::warning`]; none of these signals
+///    reclassifies the trace outcome, which [`classify_admission`] alone
+///    determines.
+/// 6. To admit with owner warning evidence, derive it with
+///    [`derive_input_warnings`] (candidate-owned epistemic qualifications
+///    under the canonical candidate coherence rule) and join through
+///    [`admit_context_traced_with_warnings`], optionally with additional
+///    owner-minted [`SuppliedWarning`] records (projection owners and
+///    successors); warning text is never synthesized at the call site,
+///    and Governor risk tiers never authorise warnings.
+///
+/// Supplier anchors (this crate): fence arm in [`admit_context`], the
+/// trichotomy gate in [`check_retrieval_freshness`], the plan revision
+/// comparison in [`check_plan_revisions`], the total classifier in
+/// [`classify_admission`], and the trace joins in [`trace_material`] and
+/// [`trace_material_with_warnings`]. No daemon retrieval drive exists in
+/// this candidate. Consumption (`bins/eliotd` drive, tick, supplier
+/// injection) is M2/O1-owned through root; the O1 caller record is
+/// `532a2b4e` (`bins/eliotd/src/attempt_execution_chain.rs` poll docs).
+/// Decided contract: unresolved revision compares reject
+/// (`StaleProjection` floor, `ProbeRequired` optional) with fence-mismatch
+/// priority to the refresh arm; the runtime consumer is pending.
+pub fn admit_context_traced(
+    input: &AdmissionInput,
+) -> Result<(AdmissionResult, Vec<MaterialRankTrace>), ContextError> {
+    let result = admit_context(input)?;
+    let traces = trace_material(input, &result)?;
+    Ok((result, traces))
+}
+
+/// Admit with owner-issued warning evidence and return rank traces.
+///
+/// Same join as [`admit_context_traced`], except the caller additionally
+/// threads owner-minted [`SuppliedWarning`] records; admitted candidates
+/// carrying non-blank warning evidence classify to
+/// `include_with_warning` through the unchanged [`classify_admission`]
+/// arm, and the text is bound into the trace handle. See the join
+/// contract on [`admit_context_traced`]; all obligations apply unchanged.
+pub fn admit_context_traced_with_warnings(
+    input: &AdmissionInput,
+    warnings: &[SuppliedWarning],
+) -> Result<(AdmissionResult, Vec<MaterialRankTrace>), ContextError> {
+    let result = admit_context(input)?;
+    let traces = trace_material_with_warnings(input, &result, warnings)?;
+    Ok((result, traces))
 }
 
 fn build_omissions(

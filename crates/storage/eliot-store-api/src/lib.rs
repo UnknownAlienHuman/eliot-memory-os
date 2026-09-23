@@ -33,6 +33,7 @@ use thiserror::Error;
 mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
+pub mod experience_store;
 mod notification_state;
 mod payload_authority;
 mod reactive_state;
@@ -159,6 +160,22 @@ pub use erasure_admission::{
     encode_erasure_surfaces,
 };
 
+pub use experience_store::{
+    DecodedExperienceMutation, DecodedExperienceRead, EXPERIENCE_BANK_MUTATION_NAME,
+    EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_MUTATION_NAME, EXPERIENCE_FEEDBACK_READ_NAME,
+    EXPERIENCE_PAGE_MATCHED_TOTAL, EXPERIENCE_PAGE_RECORDS, EXPERIENCE_PAGE_STATE_FENCE,
+    EXPERIENCE_PAGE_TRUNCATED, EXPERIENCE_PARAM_FENCE_DIGEST, EXPERIENCE_PARAM_IDEMPOTENCY_KEY,
+    EXPERIENCE_PARAM_MAX_RECORDS, EXPERIENCE_PARAM_RECORD_DIGEST, EXPERIENCE_PARAM_RECORD_JSON,
+    EXPERIENCE_PARAM_RECORD_REVISION, EXPERIENCE_PARAM_SCOPE_DIGEST, EXPERIENCE_STORE_SCHEMA_V1,
+    ExperienceContractError, ExperienceRangePage, MAX_EXPERIENCE_HANDLE_BYTES,
+    MAX_EXPERIENCE_IDEMPOTENCY_BYTES, MAX_EXPERIENCE_PAGE_RECORDS,
+    MAX_EXPERIENCE_RECORD_JSON_BYTES, audit_envelope_candidate, decode_experience_mutation,
+    experience_bank_commit_params, experience_bank_mutation_request, experience_bank_read_request,
+    experience_feedback_commit_params, experience_feedback_mutation_request,
+    experience_feedback_read_request, validate_experience_mutation_params,
+    validate_experience_read_params,
+};
+
 pub use write_admission::{
     MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, ReservedScopeBinding,
     ReservedWriteRequest, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
@@ -167,10 +184,10 @@ pub use write_admission::{
 
 pub use operation_catalogue::{
     ACTIVATED_READ_OWNING_SECTION, EVIDENCE_PACK_MAX_RECORDS, GENESIS_OWNING_SECTION,
-    MINIMUM_COMPATIBLE_VERSION, OPERATION_CATALOGUE_PROFILE, OperationKind, READ_MAX_INPUT_BYTES,
-    READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS, SCOPE_KIND_NONE, SCOPE_KIND_SCOPE,
-    SINGLE_MANIFEST_OWNING_SECTION, activated_read_operations, generated_operation_manifests,
-    operation_manifest_set_digest,
+    MAX_AUDIT_RANGE_RECORDS, MINIMUM_COMPATIBLE_VERSION, OPERATION_CATALOGUE_PROFILE,
+    OperationKind, READ_MAX_INPUT_BYTES, READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS, SCOPE_KIND_NONE,
+    SCOPE_KIND_SCOPE, SINGLE_MANIFEST_OWNING_SECTION, activated_read_operations,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 
 pub use operation_parameters::{
@@ -765,6 +782,16 @@ pub enum NamedReadOperation {
     GetResourceSnapshot,
     /// Canonical user-automation read (issue #1779).
     GetUserAutomationState,
+    /// Canonical experience-bank range read (issue #223).
+    ///
+    /// Durable same-scope bank-record rows with owner revisions, driven
+    /// only through the closed experience legs under the held transaction
+    /// lock. The read projects verbatim record documents; digest
+    /// re-proof stays Governor-owned at the read edge.
+    GetExperienceBankRange,
+    /// Canonical agent-feedback range read (issue #223). Same durable
+    /// rule as the bank range read.
+    GetAgentFeedbackRange,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -830,6 +857,19 @@ pub enum NamedMutationOperation {
     /// persists documents verbatim and arbitrates keys and pointers; it
     /// never derives lineage, transitions, or invocation semantics.
     ApplyUserAutomationState,
+    /// Canonical experience-bank commit (issue #223).
+    ///
+    /// Durable bank-record persistence only: the prepared transition must
+    /// carry [`TransitionClass::CaptureCandidate`], the declared
+    /// candidate-only effect ceiling, and the closed experience typed
+    /// parameters (verbatim record document, presented digests, owner
+    /// revision, idempotency key). The store bridge persists the document
+    /// verbatim, arbitrates handle/revision keys with convergent replay,
+    /// and never derives lineage, support, or influence.
+    CommitExperienceBank,
+    /// Canonical agent-feedback commit (issue #223). Same durable rule
+    /// as the bank commit leg.
+    CommitAgentFeedback,
 }
 
 impl NamedMutationOperation {
@@ -849,6 +889,9 @@ impl NamedMutationOperation {
                 TransitionClass::ReactiveState
             }
             Self::ApplyUserAutomationState => TransitionClass::UserAutomation,
+            Self::CommitExperienceBank | Self::CommitAgentFeedback => {
+                TransitionClass::CaptureCandidate
+            }
         }
     }
 }

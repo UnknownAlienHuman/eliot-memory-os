@@ -7,6 +7,7 @@ param(
     [string]$SurrealSha256,
     [string]$SurrealVersion,
     [switch]$UseProjectLocalSurreal,
+    [switch]$BuildOperator,
     [switch]$SkipBuild,
     [switch]$PlanOnly,
     [Alias('VerifyBundle')]
@@ -78,6 +79,77 @@ $runtimeArtifactDefinitions = @(
         relative_path = 'runtime/eliot-wasm-host.exe'
     }
 )
+
+function Invoke-CapturedNativeProcess([string]$FilePath, [string[]]$ArgumentList, [string]$WorkingDirectory, [string]$Purpose) {
+    $logRoot = Join-Path $env:TEMP 'eliot-release-native-process-logs'
+    $runDirectory = Join-Path $logRoot ([guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
+    $safePurpose = [regex]::Replace($Purpose, '[^A-Za-z0-9._-]', '-')
+    $stdoutPath = Join-Path $runDirectory "$safePurpose.stdout.log"
+    $stderrPath = Join-Path $runDirectory "$safePurpose.stderr.log"
+
+    $quotedArguments = foreach ($argument in $ArgumentList) {
+        $value = [string]$argument
+        $builder = [System.Text.StringBuilder]::new()
+        [void]$builder.Append([char]34)
+        $backslashes = 0
+        foreach ($character in $value.ToCharArray()) {
+            if ($character -eq [char]92) {
+                $backslashes++
+                continue
+            }
+            if ($character -eq [char]34) {
+                if ($backslashes -gt 0) {
+                    [void]$builder.Append([char]92, (2 * $backslashes) + 1)
+                }
+                else {
+                    [void]$builder.Append([char]92)
+                }
+                [void]$builder.Append([char]34)
+            }
+            else {
+                if ($backslashes -gt 0) {
+                    [void]$builder.Append([char]92, $backslashes)
+                }
+                [void]$builder.Append($character)
+            }
+            $backslashes = 0
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append([char]92, 2 * $backslashes)
+        }
+        [void]$builder.Append([char]34)
+        $builder.ToString()
+    }
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = $quotedArguments -join ' '
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "failed to start native process for ${Purpose}: $FilePath"
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    [System.IO.File]::WriteAllText($stdoutPath, $stdout, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($stderrPath, $stderr, [System.Text.UTF8Encoding]::new($false))
+    [pscustomobject]@{
+        exit_code = $process.ExitCode
+        stdout = $stdout
+        stderr = $stderr
+        stdout_path = $stdoutPath
+        stderr_path = $stderrPath
+    }
+}
 
 function Get-RuntimeArtifactDefinitions {
     return @($runtimeArtifactDefinitions | ForEach-Object {
@@ -336,6 +408,11 @@ function Get-VerifiedSurrealCatalog([string]$Repo, [string]$SourceCommit) {
         [string]$candidate.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         [string]$candidate.provisioning -cne 'project_local_provisioner' -or
         [string]$candidate.artifact_path -notlike '.eliot/dependency-policy/surrealdb/*' -or
+        [string]$candidate.advisory_package -cne 'surrealdb' -or
+        [string]$candidate.advisory_ecosystem -cne 'crates.io' -or
+        [string]$candidate.advisory_scope -cne 'rust-crate' -or
+        $candidate.advisory_max_age_hours -is [bool] -or
+        [string]$candidate.advisory_max_age_hours -notmatch '^[1-9][0-9]*$' -or
         [int64]$candidate.artifact_size -le 0) {
         throw 'tracked SurrealDB artifact catalog is missing its project-local 3.2.0 candidate binding'
     }
@@ -422,10 +499,10 @@ function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]
             throw "project-local SurrealDB provisioner is missing: $provisionerPath"
         }
         $python = Get-PinnedCommandFile 'python' 'SurrealDB project-local provisioner'
-        $provisionOutput = & $python.FullName $provisionerPath '--root' $Repo 2>&1 | Out-String
-        $provisionExitCode = $LASTEXITCODE
-        if ($provisionExitCode -ne 0) {
-            throw "project-local SurrealDB provisioner failed with exit code ${provisionExitCode}: $provisionOutput"
+        $provisionExecution = Invoke-CapturedNativeProcess $python.FullName @($provisionerPath, '--root', $Repo) $Repo 'surrealdb-provisioner'
+        Write-Host "PROVISIONER_EXIT_CODE=$($provisionExecution.exit_code) STDOUT_LOG=$($provisionExecution.stdout_path) STDERR_LOG=$($provisionExecution.stderr_path)"
+        if ($provisionExecution.exit_code -ne 0) {
+            throw "project-local SurrealDB provisioner failed with exit code $($provisionExecution.exit_code). Full stderr:`n$($provisionExecution.stderr)`nFull logs: $($provisionExecution.stdout_path) ; $($provisionExecution.stderr_path)"
         }
     }
     if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
@@ -489,6 +566,84 @@ function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]
         bytes = $artifactEvidence.length
         signature_policy = 'pre-release-unsigned'
         signature_evidence = 'not-issued'
+    }
+}
+
+function Get-SelectedSurrealReleasePolicyReceipt([string]$Repo, [object]$Catalog, [object]$SurrealArtifact, [string]$SourceCommit) {
+    if ([string]$SurrealArtifact.source -cne 'project-local-provisioner') {
+        throw 'selected-release dependency policy receipt is required only for the locked project-local candidate'
+    }
+    $artifactRelative = Assert-SafeRelativePath ([string]$SurrealArtifact.project_local_input_path) 'selected SurrealDB artifact'
+    $candidateDirectory = Split-Path -Parent $artifactRelative.Replace('/', '\')
+    $candidateDirectory = $candidateDirectory.Replace('\', '/').TrimEnd('/')
+    if (-not $candidateDirectory.StartsWith('.eliot/dependency-policy/surrealdb/', [System.StringComparison]::Ordinal)) {
+        throw 'selected SurrealDB receipt directory is outside the project-local dependency evidence root'
+    }
+    $relative = Assert-SafeRelativePath "$candidateDirectory/selected-release-policy-receipt.json" 'selected-release dependency policy receipt'
+    $receiptPath = [System.IO.Path]::GetFullPath((Join-Path $Repo $relative.Replace('/', '\')))
+    $verifierPath = [System.IO.Path]::GetFullPath((Join-Path $Repo 'scripts\verify-dependency-policy.py'))
+    if (-not (Test-Path -LiteralPath $verifierPath -PathType Leaf)) {
+        throw 'selected-release dependency policy verifier is missing'
+    }
+    $python = Get-PinnedCommandFile 'python' 'selected-release dependency policy verifier'
+    $verifyArguments = @(
+        $verifierPath,
+        '--root', $Repo,
+        '--selected-release-policy-receipt-out', $receiptPath,
+        '--selected-artifact-path', [string]$SurrealArtifact.project_local_input_path,
+        '--selected-artifact-sha256', [string]$SurrealArtifact.sha256,
+        '--selected-artifact-version', [string]$SurrealArtifact.version,
+        '--selected-catalog-sha256', [string]$Catalog.sha256,
+        '--selected-provisioning-receipt-sha256', [string]$SurrealArtifact.provisioning_receipt_sha256
+    )
+    $verifyExecution = Invoke-CapturedNativeProcess $python.FullName $verifyArguments $Repo 'selected-release-policy-receipt'
+    if ($verifyExecution.exit_code -ne 0) {
+        throw "selected-release dependency policy receipt failed with exit code $($verifyExecution.exit_code). Full stderr:`n$($verifyExecution.stderr)`nFull logs: $($verifyExecution.stdout_path) ; $($verifyExecution.stderr_path)"
+    }
+    $receiptEvidence = Read-VerifiedResidentFile $receiptPath 'selected-release dependency policy receipt'
+    try {
+        $receipt = [System.Text.Encoding]::UTF8.GetString($receiptEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+    }
+    catch {
+        throw 'selected-release dependency policy receipt is not valid JSON'
+    }
+    if ([string]$receipt.schema -cne 'eliot.selected-release-dependency-policy.v1' -or
+        [string]$receipt.binding_status -cne 'EVIDENCE_VERIFIED' -or
+        [string]$receipt.candidate_advisory_status -cne 'no_known_vulnerabilities' -or
+        [string]$receipt.release_admission -cne 'INCOMPLETE' -or
+        [string]$receipt.source_commit -cne $SourceCommit -or
+        [string]$receipt.selected_artifact.path -cne [string]$SurrealArtifact.project_local_input_path -or
+        [string]$receipt.selected_artifact.version -cne [string]$SurrealArtifact.version -or
+        [string]$receipt.selected_artifact.source_tag -cne [string]$Catalog.patched_candidate.source_tag -or
+        [string]$receipt.selected_artifact.release_asset -cne [string]$Catalog.patched_candidate.release_asset -or
+        [string]$receipt.selected_artifact.architecture -cne [string]$SurrealArtifact.architecture -or
+        [string]$receipt.selected_artifact.pe_machine -cne [string]$SurrealArtifact.pe_machine -or
+        [string]$receipt.selected_artifact.sha256 -cne [string]$SurrealArtifact.sha256 -or
+        [int64]$receipt.selected_artifact.bytes -ne [int64]$SurrealArtifact.bytes -or
+        [string]$receipt.catalogue.path -cne [string]$Catalog.relative_path -or
+        [string]$receipt.catalogue.sha256 -cne [string]$Catalog.sha256 -or
+        [string]$receipt.provisioning.path -cne [string]$SurrealArtifact.provisioning_receipt_input_path -or
+        [string]$receipt.provisioning.sha256 -cne [string]$SurrealArtifact.provisioning_receipt_sha256 -or
+        [string]$receipt.provisioning.status -cne 'verified' -or
+        [string]$receipt.advisory_snapshot.evidence_status -cne 'verified' -or
+        [string]$receipt.advisory_snapshot.source -cne 'https://api.osv.dev/v1/query' -or
+        [string]$receipt.advisory_snapshot.version -cne [string]$SurrealArtifact.version -or
+        [string]$receipt.advisory_snapshot.package -cne 'surrealdb' -or
+        [string]$receipt.advisory_snapshot.ecosystem -cne 'crates.io' -or
+        [string]$receipt.advisory_snapshot.distributed_binary_applicability -cne 'unestablished' -or
+        @($receipt.advisory_snapshot.advisory_ids).Count -ne 0) {
+        throw 'selected-release dependency policy receipt does not bind the consumed artifact, current advisory snapshot, catalogue, provisioner and source commit'
+    }
+    [pscustomobject]@{
+        path = $receiptPath
+        relative_path = $relative
+        sha256 = $receiptEvidence.sha256
+        bytes = $receiptEvidence.length
+        query_path = [string]$receipt.advisory_snapshot.query.path
+        query_sha256 = [string]$receipt.advisory_snapshot.query.sha256
+        response_path = [string]$receipt.advisory_snapshot.response.path
+        response_sha256 = [string]$receipt.advisory_snapshot.response.sha256
+        receipt = $receipt
     }
 }
 
@@ -631,19 +786,22 @@ function Copy-TrackedTree([string]$Repo, [string]$SourceCommit, [string]$Source,
     }
 }
 
-function Copy-OperatorPayload([string]$Source, [string]$Destination) {
+function Get-OperatorPayloadInventory([string]$Source) {
     $resolved = (Resolve-Path -LiteralPath $Source).Path
     $allowedExtensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($extension in @('.dll', '.exe', '.html', '.json', '.mui', '.png', '.pri', '.winmd', '.xbf')) {
         [void]$allowedExtensions.Add($extension)
     }
-    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    $inventory = @()
     foreach ($item in Get-ChildItem -LiteralPath $resolved -Force -Recurse) {
-        $relative = $item.FullName.Substring($resolved.Length).TrimStart([char]'\').Replace('\', '/')
+        $relative = $item.FullName.Substring($resolved.Length).TrimStart([char[]]@('\', '/')).Replace('\', '/')
         if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "Operator payload contains a reparse point: $relative"
         }
         if (-not ($item -is [System.IO.FileInfo])) {
+            continue
+        }
+        if ($relative -ceq 'OPERATOR_BUILD_RECEIPT.json') {
             continue
         }
         if ($item.Extension -ieq '.pdb') {
@@ -653,9 +811,29 @@ function Copy-OperatorPayload([string]$Source, [string]$Destination) {
             throw "Operator payload contains an unapproved file type: $relative"
         }
         Assert-NoSecretFile $item "operator/$relative"
+        $inventory += [pscustomobject]@{
+            path = $relative
+            full_path = $item.FullName
+            sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            bytes = [int64]$item.Length
+        }
+    }
+    return @($inventory | Sort-Object -Property path -CaseSensitive)
+}
+
+function Copy-OperatorPayload([string]$Source, [string]$Destination) {
+    $inventory = @(Get-OperatorPayloadInventory $Source)
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    foreach ($entry in $inventory) {
+        $relative = [string]$entry.path
         $target = Join-Path $Destination $relative.Replace('/', '\')
         New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
-        Copy-Item -LiteralPath $item.FullName -Destination $target
+        Copy-Item -LiteralPath ([string]$entry.full_path) -Destination $target
+        $copiedHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
+        $copiedLength = (Get-Item -LiteralPath $target).Length
+        if ($copiedHash -cne [string]$entry.sha256 -or $copiedLength -ne [int64]$entry.bytes) {
+            throw "Operator payload changed while being copied: $relative"
+        }
     }
 }
 
@@ -1060,31 +1238,53 @@ function Get-ToolchainBuildReceipt([string]$Repo, [string]$SourceCommit, [object
     }
 }
 
-function Get-VerifiedOperatorBuildReceipt([string]$Repo, [string]$SourceCommit, [string]$OperatorSource) {
+function Get-VerifiedOperatorBuildReceipt([string]$Repo, [string]$SourceCommit, [string]$OperatorSource, [string]$ExpectedInvocationId) {
     $resolved = (Resolve-Path -LiteralPath $OperatorSource).Path
     $receiptPath = Join-Path $resolved 'OPERATOR_BUILD_RECEIPT.json'
     if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
         throw "OperatorSource does not carry its locked build receipt: $receiptPath"
     }
-    $exePath = Join-Path $resolved 'Eliot.Operator.exe'
-    if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
-        throw "OperatorSource does not contain Eliot.Operator.exe: $resolved"
+    $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+    if ([string]$receipt.schema -cne 'eliot-operator-build-receipt-v2' -or
+        [string]$receipt.source_commit -cne $SourceCommit -or
+        [string]$receipt.build.result -cne 'succeeded' -or
+        [string]$receipt.build.target -cne 'Publish' -or
+        $receipt.restore_locked_mode -ne $true -or
+        $receipt.build.restore_locked_mode -ne $true) {
+        throw 'Operator build receipt does not prove a successful locked Publish for the release source commit'
     }
+    $receiptInvocationId = [string]$receipt.invocation_id
+    $parsedInvocationId = [guid]::Empty
+    if (-not [guid]::TryParseExact($receiptInvocationId, 'D', [ref]$parsedInvocationId) -or
+        $parsedInvocationId.ToString('D') -cne $receiptInvocationId -or
+        [string]$receipt.build.invocation_id -cne $receiptInvocationId -or
+        ($ExpectedInvocationId -and $receiptInvocationId -cne $ExpectedInvocationId)) {
+        throw 'Operator build receipt invocation identity is malformed or differs from the release builder invocation'
+    }
+
     $csprojRel = 'apps/Eliot.Operator/Eliot.Operator.csproj'
     $lockRel = 'apps/Eliot.Operator/packages.lock.json'
     $contractsRel = 'apps/Eliot.Operator/Protocol/OperatorContracts.cs'
-    foreach ($rel in @($csprojRel, $lockRel, $contractsRel)) {
+    $producerRel = 'scripts/write-operator-build-receipt.ps1'
+    $csprojPath = Join-Path $Repo $csprojRel
+    $lockPath = Join-Path $Repo $lockRel
+    $contractsPath = Join-Path $Repo $contractsRel
+    foreach ($rel in @($csprojRel, $lockRel, $contractsRel, $producerRel)) {
         $pinnedFile = Get-Item -LiteralPath (Join-Path $Repo $rel) -ErrorAction Stop
         Assert-TrackedSourceFile $pinnedFile $rel
         if ((Get-FilteredFileHash $Repo $rel $pinnedFile.FullName) -ne (Get-GitBlobHash $Repo $SourceCommit $rel)) {
-            throw "pinned Operator input differs from source commit: $rel"
+            throw "pinned Operator build input differs from source commit: $rel"
         }
     }
-    $csprojXml = [xml](Get-Content -LiteralPath (Join-Path $Repo $csprojRel) -Raw)
+    $csprojXml = [xml](Get-Content -LiteralPath $csprojPath -Raw)
     $propertyGroups = @($csprojXml.Project.PropertyGroup)
     $pinnedFramework = @($propertyGroups | ForEach-Object { [string]$_.TargetFramework } | Where-Object { $_ }) | Select-Object -First 1
     $pinnedRid = @($propertyGroups | ForEach-Object { [string]$_.RuntimeIdentifier } | Where-Object { $_ }) | Select-Object -First 1
     $pinnedPlatform = @($propertyGroups | ForEach-Object { [string]$_.PlatformTarget } | Where-Object { $_ }) | Select-Object -First 1
+    $pinnedSelfContained = @($propertyGroups | ForEach-Object { [string]$_.SelfContained } | Where-Object { $_ }) | Select-Object -First 1
+    $pinnedAppSdkSelfContained = @($propertyGroups | ForEach-Object { [string]$_.WindowsAppSDKSelfContained } | Where-Object { $_ }) | Select-Object -First 1
+    $pinnedUseWinUI = @($propertyGroups | ForEach-Object { [string]$_.UseWinUI } | Where-Object { $_ }) | Select-Object -First 1
+    $pinnedPackageType = @($propertyGroups | ForEach-Object { [string]$_.WindowsPackageType } | Where-Object { $_ }) | Select-Object -First 1
     $pinnedAppSdk = $null
     foreach ($group in @($csprojXml.Project.ItemGroup)) {
         foreach ($reference in @($group.PackageReference)) {
@@ -1093,85 +1293,127 @@ function Get-VerifiedOperatorBuildReceipt([string]$Repo, [string]$SourceCommit, 
             }
         }
     }
-    if ([string]::IsNullOrWhiteSpace($pinnedFramework) -or [string]::IsNullOrWhiteSpace($pinnedRid) -or
-        [string]::IsNullOrWhiteSpace($pinnedPlatform) -or [string]::IsNullOrWhiteSpace($pinnedAppSdk)) {
-        throw 'pinned Operator project does not declare its framework/runtime/platform/AppSDK identity'
-    }
-    $contractsText = Get-Content -LiteralPath (Join-Path $Repo $contractsRel) -Raw
-    $pinnedSchema = ([regex]::Match($contractsText, 'SchemaVersion =\s*"([^"]+)"')).Groups[1].Value
-    $pinnedProtocol = ([regex]::Match($contractsText, 'IpcProtocolVersion =\s*"([^"]+)"')).Groups[1].Value
-    $pinnedContractHash = ([regex]::Match($contractsText, 'PinnedContractHash =\s*"([0-9a-f]{64})"')).Groups[1].Value
-    if ([string]::IsNullOrWhiteSpace($pinnedSchema) -or [string]::IsNullOrWhiteSpace($pinnedProtocol) -or
-        [string]$pinnedContractHash -notmatch '^[0-9a-f]{64}$') {
-        throw 'failed to read the pinned Operator protocol contract'
-    }
-    $pinnedLockHash = (Get-FileHash -LiteralPath (Join-Path $Repo $lockRel) -Algorithm SHA256).Hash.ToLowerInvariant()
-    $pinnedCsprojHash = (Get-FileHash -LiteralPath (Join-Path $Repo $csprojRel) -Algorithm SHA256).Hash.ToLowerInvariant()
-    $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
-    if ([string]$receipt.schema -cne 'eliot-operator-build-receipt-v1') {
-        throw 'Operator build receipt is missing its canonical schema'
-    }
-    if ([string]$receipt.source_commit -cne $SourceCommit) {
-        throw 'Operator build receipt is not bound to the release source commit'
-    }
     if ([string]$receipt.target_framework -cne $pinnedFramework -or
         [string]$receipt.runtime_identifier -cne $pinnedRid -or
         [string]$receipt.platform -cne $pinnedPlatform -or
         [string]$receipt.configuration -cne 'Release' -or
-        [string]$receipt.windows_app_sdk_version -cne $pinnedAppSdk) {
-        throw 'Operator build receipt does not match the pinned Operator project identity'
+        [string]$receipt.windows_app_sdk_version -cne $pinnedAppSdk -or
+        [string]$receipt.build.target_framework -cne $pinnedFramework -or
+        [string]$receipt.build.runtime_identifier -cne $pinnedRid -or
+        [string]$receipt.build.platform -cne $pinnedPlatform -or
+        [string]$receipt.build.configuration -cne 'Release' -or
+        $receipt.build.self_contained -ne ($pinnedSelfContained -ieq 'true') -or
+        $receipt.build.windows_app_sdk_self_contained -ne ($pinnedAppSdkSelfContained -ieq 'true') -or
+        $receipt.build.use_winui -ne ($pinnedUseWinUI -ieq 'true') -or
+        [string]$receipt.build.windows_package_type -cne $pinnedPackageType) {
+        throw 'Operator build receipt does not match the pinned WinUI project and publish properties'
     }
-    if ($receipt.restore_locked_mode -ne $true) {
-        throw 'Operator build receipt must attest a locked NuGet restore'
+    $pinnedSchema = ([regex]::Match((Get-Content -LiteralPath $contractsPath -Raw), 'SchemaVersion =\s*"([^"]+)"')).Groups[1].Value
+    $contractsText = Get-Content -LiteralPath $contractsPath -Raw
+    $pinnedProtocol = ([regex]::Match($contractsText, 'IpcProtocolVersion =\s*"([^"]+)"')).Groups[1].Value
+    $pinnedContractHash = ([regex]::Match($contractsText, 'PinnedContractHash =\s*"([0-9a-f]{64})"')).Groups[1].Value
+    if (-not $pinnedSchema -or -not $pinnedProtocol -or $pinnedContractHash -notmatch '^[0-9a-f]{64}$') {
+        throw 'failed to read the pinned Operator protocol contract'
     }
+
+    $pinnedLockHash = (Get-FileHash -LiteralPath $lockPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $pinnedCsprojHash = (Get-FileHash -LiteralPath $csprojPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $pinnedContractsHash = (Get-FileHash -LiteralPath $contractsPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ([string]$receipt.packages_lock_sha256 -cne $pinnedLockHash -or
-        [string]$receipt.csproj_sha256 -cne $pinnedCsprojHash) {
-        throw 'Operator build receipt does not bind the pinned NuGet lock and project bytes'
-    }
-    if ([string]$receipt.contracts.schema_version -cne $pinnedSchema -or
+        [string]$receipt.csproj_sha256 -cne $pinnedCsprojHash -or
+        [string]$receipt.contracts.sha256 -cne $pinnedContractsHash -or
+        [string]$receipt.contracts.path -cne $contractsRel -or
+        [string]$receipt.contracts.schema_version -cne $pinnedSchema -or
         [string]$receipt.contracts.ipc_protocol_version -cne $pinnedProtocol -or
         [string]$receipt.contracts.contract_hash -cne $pinnedContractHash) {
-        throw 'Operator build receipt does not bind the pinned Operator protocol contract'
+        throw 'Operator build receipt does not bind the pinned lock, project and protocol contract bytes'
     }
-    if ([string]$receipt.artifact.path -cne 'Eliot.Operator.exe' -or
-        [string]$receipt.artifact.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        [int64]$receipt.artifact.bytes -le 0) {
-        throw 'Operator build receipt is missing its canonical artifact binding'
+    foreach ($expectedInput in @(
+            @{ path = $csprojRel; sha256 = $pinnedCsprojHash },
+            @{ path = $lockRel; sha256 = $pinnedLockHash },
+            @{ path = $contractsRel; sha256 = $pinnedContractsHash }
+        )) {
+        $matchingInputs = @($receipt.source_inputs | Where-Object { [string]$_.path -ceq [string]$expectedInput.path })
+        if ($matchingInputs.Count -ne 1 -or [string]$matchingInputs[0].sha256 -cne [string]$expectedInput.sha256) {
+            throw "Operator build receipt source_inputs do not bind $($expectedInput.path)"
+        }
     }
-    $exeFile = Get-Item -LiteralPath $exePath
-    Assert-NoSecretFile $exeFile 'operator/Eliot.Operator.exe'
+    $producerPath = Join-Path $Repo $producerRel
+    $producerSha256 = (Get-FileHash -LiteralPath $producerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ([string]$receipt.producer.path -cne $producerRel -or
+        [string]$receipt.producer.sha256 -cne $producerSha256) {
+        throw 'Operator build receipt does not bind the tracked WinUI publish receipt producer'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$receipt.sdk.dotnet_path) -or
+        [string]$receipt.sdk.dotnet_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]::IsNullOrWhiteSpace([string]$receipt.sdk.dotnet_sdk) -or
+        [string]::IsNullOrWhiteSpace([string]$receipt.sdk.msbuild_version)) {
+        throw 'Operator build receipt is missing the observed dotnet executable and SDK identity'
+    }
+
+    $inventory = @(Get-OperatorPayloadInventory $resolved)
+    $declaredInventory = @($receipt.artifacts.files)
+    if ($declaredInventory.Count -ne $inventory.Count -or $inventory.Count -eq 0) {
+        throw 'Operator build receipt published-file inventory does not match the actual payload membership'
+    }
+    $seenPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($declaredFile in $declaredInventory) {
+        $relative = Assert-SafeRelativePath ([string]$declaredFile.path) 'Operator build receipt artifact'
+        if (-not $seenPaths.Add($relative) -or
+            [string]$declaredFile.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [int64]$declaredFile.bytes -le 0) {
+            throw "Operator build receipt contains an invalid or duplicate published file: $relative"
+        }
+        $actualMatches = @($inventory | Where-Object { [string]$_.path -ceq $relative })
+        if ($actualMatches.Count -ne 1 -or
+            [string]$actualMatches[0].sha256 -cne [string]$declaredFile.sha256 -or
+            [int64]$actualMatches[0].bytes -ne [int64]$declaredFile.bytes) {
+            throw "Operator published file differs from its build receipt: $relative"
+        }
+    }
+    $exePath = Join-Path $resolved 'Eliot.Operator.exe'
+    $exeFile = Get-Item -LiteralPath $exePath -ErrorAction Stop
     [void](Assert-WindowsX64Pe $exeFile.FullName 'operator/Eliot.Operator.exe')
     $actualExeHash = (Get-FileHash -LiteralPath $exeFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actualExeHash -cne [string]$receipt.artifact.sha256 -or $exeFile.Length -ne [int64]$receipt.artifact.bytes) {
-        throw 'Operator payload does not match its locked build receipt'
+    if ([string]$receipt.artifact.path -cne 'Eliot.Operator.exe' -or
+        [string]$receipt.artifact.pe_machine -cne '8664' -or
+        [string]$receipt.artifact.sha256 -cne $actualExeHash -or
+        [int64]$receipt.artifact.bytes -ne [int64]$exeFile.Length) {
+        throw 'Operator build receipt does not bind the actual Windows x64 executable bytes'
     }
-    if ([string]::IsNullOrWhiteSpace([string]$receipt.sdk.dotnet_sdk) -or
-        [string]::IsNullOrWhiteSpace([string]$receipt.tests.suite) -or
-        [string]$receipt.tests.result -cne 'pass' -or
-        [string]$receipt.tests.source_commit -cne $SourceCommit) {
-        throw 'Operator build receipt is missing its SDK identity or passing conformance-test evidence'
+    $exeInventory = @($inventory | Where-Object { [string]$_.path -ceq 'Eliot.Operator.exe' })
+    if ($exeInventory.Count -ne 1 -or
+        [string]$exeInventory[0].sha256 -cne $actualExeHash -or
+        [int64]$exeInventory[0].bytes -ne [int64]$exeFile.Length) {
+        throw 'Operator executable is missing from the receipt-bound publish inventory'
     }
     [ordered]@{
         source = $resolved
         receipt_path = $receiptPath
         receipt_sha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        invocation_id = $receiptInvocationId
         target_framework = $pinnedFramework
         runtime_identifier = $pinnedRid
         platform = $pinnedPlatform
         windows_app_sdk_version = $pinnedAppSdk
+        restore_locked_mode = $true
         packages_lock_sha256 = $pinnedLockHash
         csproj_sha256 = $pinnedCsprojHash
+        producer_sha256 = $producerSha256
         schema_version = $pinnedSchema
         protocol_version = $pinnedProtocol
         protocol_hash = $pinnedContractHash
         exe_sha256 = $actualExeHash
         exe_bytes = $exeFile.Length
+        artifacts_file_count = $inventory.Count
         dotnet_sdk = [string]$receipt.sdk.dotnet_sdk
-        tests_suite = [string]$receipt.tests.suite
+        dotnet_path = [string]$receipt.sdk.dotnet_path
+        dotnet_sha256 = [string]$receipt.sdk.dotnet_sha256
+        msbuild_version = [string]$receipt.sdk.msbuild_version
     }
 }
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -1207,6 +1449,21 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             generation = $SourceCommit
             proof_ceiling = 'unsigned-build-evidence with project-local provisioning provenance'
             gate = $null
+        }
+        foreach ($evidenceFile in @(
+                @{ path = 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'; selection = 'candidate-specific policy receipt consumed by the Windows x64 release builder'; owner = 'scripts/verify-dependency-policy.py' },
+                @{ path = 'runtime/SURREALDB_RELEASE_OSV_QUERY.json'; selection = 'exact current OSV query for the selected SurrealDB release version'; owner = 'scripts/provision-surrealdb-release.py' },
+                @{ path = 'runtime/SURREALDB_RELEASE_OSV_RESPONSE.json'; selection = 'fresh OSV response bound to the selected SurrealDB release version'; owner = 'scripts/provision-surrealdb-release.py' }
+            )) {
+            $entries += [ordered]@{
+                path = $evidenceFile.path
+                selection = $evidenceFile.selection
+                owner = $evidenceFile.owner
+                install_destination = 'runtime/'
+                generation = $SourceCommit
+                proof_ceiling = [string]$SelectedPolicyReceipt.receipt.proof_ceiling
+                gate = $null
+            }
         }
     }
     $entries += [ordered]@{
@@ -1424,6 +1681,7 @@ function Test-ReleaseBundle([string]$Path) {
     }
 
     $release = Get-Content -LiteralPath (Join-Path $resolved 'RELEASE.json') -Raw | ConvertFrom-Json
+    $sourceBoundSurrealCatalog = Get-VerifiedSurrealCatalog $repo ([string]$release.source_commit)
     if ($release.signed -ne $false -or
         [string]$release.signature_policy -ne 'pre-release-unsigned' -or
         [string]$release.signature_evidence -ne 'not-issued' -or
@@ -1513,29 +1771,31 @@ function Test-ReleaseBundle([string]$Path) {
         throw 'RELEASE.json staged payload manifest binding differs from STAGED_PAYLOAD_MANIFEST.json'
     }
 
-    $operatorReceipt = Get-Content -LiteralPath (Join-Path $resolved 'operator/OPERATOR_BUILD_RECEIPT.json') -Raw | ConvertFrom-Json
-    if ([string]$operatorReceipt.schema -cne 'eliot-operator-build-receipt-v1' -or
-        [string]$operatorReceipt.source_commit -cne [string]$release.source_commit) {
-        throw 'bundled Operator build receipt is not bound to the release source commit'
-    }
-    $operatorExePath = Join-Path $resolved 'operator/Eliot.Operator.exe'
-    $operatorExeFile = Get-Item -LiteralPath $operatorExePath
-    if ([string]$operatorReceipt.artifact.path -cne 'Eliot.Operator.exe' -or
-        [string]$operatorReceipt.artifact.sha256 -cne (Get-FileHash -LiteralPath $operatorExePath -Algorithm SHA256).Hash.ToLowerInvariant() -or
-        [int64]$operatorReceipt.artifact.bytes -ne $operatorExeFile.Length) {
-        throw 'bundled Operator build receipt does not bind the staged Operator executable'
-    }
     $releaseOperator = $release.operator_build
-    if (-not $releaseOperator -or
-        [string]$releaseOperator.receipt_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        (Get-FileHash -LiteralPath (Join-Path $resolved 'operator/OPERATOR_BUILD_RECEIPT.json') -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$releaseOperator.receipt_sha256 -or
-        [string]$operatorReceipt.target_framework -cne [string]$releaseOperator.target_framework -or
-        [string]$operatorReceipt.runtime_identifier -cne [string]$releaseOperator.runtime_identifier -or
-        [string]$operatorReceipt.platform -cne [string]$releaseOperator.platform -or
-        [string]$operatorReceipt.windows_app_sdk_version -cne [string]$releaseOperator.windows_app_sdk_version -or
-        [string]$operatorReceipt.packages_lock_sha256 -cne [string]$releaseOperator.packages_lock_sha256 -or
-        [string]$operatorReceipt.contracts.contract_hash -cne [string]$releaseOperator.protocol_hash -or
-        [string]$operatorReceipt.tests.result -cne 'pass') {
+    if (-not $releaseOperator) {
+        throw 'RELEASE.json is missing the Operator build receipt binding'
+    }
+    $verifiedBundleOperator = Get-VerifiedOperatorBuildReceipt $repo ([string]$release.source_commit) (Join-Path $resolved 'operator') ([string]$releaseOperator.invocation_id)
+    if ([string]$releaseOperator.receipt_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$verifiedBundleOperator.receipt_sha256 -cne [string]$releaseOperator.receipt_sha256 -or
+        [string]$verifiedBundleOperator.invocation_id -cne [string]$releaseOperator.invocation_id -or
+        [string]$releaseOperator.publish_target -cne 'Publish' -or
+        [string]$releaseOperator.publish_result -cne 'succeeded' -or
+        $releaseOperator.restore_locked_mode -ne $true -or
+        [string]$verifiedBundleOperator.producer_sha256 -cne [string]$releaseOperator.producer_sha256 -or
+        [string]$verifiedBundleOperator.target_framework -cne [string]$releaseOperator.target_framework -or
+        [string]$verifiedBundleOperator.runtime_identifier -cne [string]$releaseOperator.runtime_identifier -or
+        [string]$verifiedBundleOperator.platform -cne [string]$releaseOperator.platform -or
+        [string]$verifiedBundleOperator.windows_app_sdk_version -cne [string]$releaseOperator.windows_app_sdk_version -or
+        [string]$verifiedBundleOperator.packages_lock_sha256 -cne [string]$releaseOperator.packages_lock_sha256 -or
+        [string]$verifiedBundleOperator.protocol_hash -cne [string]$releaseOperator.protocol_hash -or
+        [string]$verifiedBundleOperator.exe_sha256 -cne [string]$releaseOperator.exe_sha256 -or
+        [int64]$verifiedBundleOperator.exe_bytes -ne [int64]$releaseOperator.exe_bytes -or
+        [int]$verifiedBundleOperator.artifacts_file_count -ne [int]$releaseOperator.artifacts_file_count -or
+        [string]$verifiedBundleOperator.dotnet_path -cne [string]$releaseOperator.dotnet_path -or
+        [string]$verifiedBundleOperator.dotnet_sdk -cne [string]$releaseOperator.dotnet_sdk -or
+        [string]$verifiedBundleOperator.dotnet_sha256 -cne [string]$releaseOperator.dotnet_sha256 -or
+        [string]$verifiedBundleOperator.msbuild_version -cne [string]$releaseOperator.msbuild_version) {
         throw 'RELEASE.json Operator build binding differs from OPERATOR_BUILD_RECEIPT.json'
     }
 
@@ -1635,7 +1895,8 @@ function Test-ReleaseBundle([string]$Path) {
     }
     $catalogPath = Join-Path $resolved $surrealCatalogRelativePath
     $catalogEvidence = Read-VerifiedResidentFile $catalogPath 'bundled SurrealDB artifact catalog'
-    if ($catalogEvidence.sha256 -ne [string]$surrealEntry.catalog_sha256) {
+    if ($catalogEvidence.sha256 -ne [string]$surrealEntry.catalog_sha256 -or
+        $catalogEvidence.sha256 -ne [string]$sourceBoundSurrealCatalog.sha256) {
         throw 'bundled SurrealDB artifact catalog digest mismatch'
     }
     $catalog = [System.Text.Encoding]::UTF8.GetString($catalogEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
@@ -1683,6 +1944,150 @@ function Test-ReleaseBundle([string]$Path) {
         if ($candidateRecord.Count -ne 1) {
             throw 'staged SurrealDB provisioning receipt does not bind the consumed release asset bytes'
         }
+        $selectedPolicy = $release.selected_release_dependency_policy
+        if (-not $selectedPolicy -or
+            [string]$selectedPolicy.path -cne 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json' -or
+            [string]$selectedPolicy.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$selectedPolicy.binding_status -cne 'EVIDENCE_VERIFIED' -or
+            [string]$selectedPolicy.candidate_advisory_status -cne 'no_known_vulnerabilities' -or
+            [string]$selectedPolicy.release_admission -cne 'INCOMPLETE' -or
+            [string]$selectedPolicy.source_commit -cne [string]$release.source_commit -or
+            [string]$selectedPolicy.artifact_path -cne [string]$surrealEntry.project_local_input_path -or
+            [string]$selectedPolicy.artifact_version -cne [string]$surrealEntry.version -or
+            [string]$selectedPolicy.artifact_source_tag -cne [string]$catalogBinding.source_tag -or
+            [string]$selectedPolicy.artifact_release_asset -cne [string]$catalogBinding.release_asset -or
+            [string]$selectedPolicy.artifact_sha256 -cne [string]$surrealEntry.sha256 -or
+            [string]$selectedPolicy.catalogue_sha256 -cne [string]$surrealEntry.catalog_sha256 -or
+            [string]$selectedPolicy.provisioning_receipt_sha256 -cne [string]$surrealEntry.provisioning_receipt_sha256 -or
+            [string]$selectedPolicy.distributed_binary_applicability -cne 'unestablished') {
+            throw 'RELEASE.json is missing the exact selected-release dependency policy receipt binding'
+        }
+        $policyPath = Join-Path $resolved 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'
+        $policyEvidence = Read-VerifiedResidentFile $policyPath 'staged selected-release dependency policy receipt'
+        if ($policyEvidence.sha256 -cne [string]$selectedPolicy.sha256) {
+            throw 'staged selected-release dependency policy receipt digest differs from RELEASE.json'
+        }
+        $policyReceipt = [System.Text.Encoding]::UTF8.GetString($policyEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        if ([string]$policyReceipt.schema -cne 'eliot.selected-release-dependency-policy.v1' -or
+            [string]$policyReceipt.binding_status -cne [string]$selectedPolicy.binding_status -or
+            [string]$policyReceipt.candidate_advisory_status -cne [string]$selectedPolicy.candidate_advisory_status -or
+            [string]$policyReceipt.release_admission -cne [string]$selectedPolicy.release_admission -or
+            [string]$policyReceipt.source_commit -cne [string]$release.source_commit -or
+            [string]$policyReceipt.selected_artifact.path -cne [string]$surrealEntry.project_local_input_path -or
+            [string]$policyReceipt.selected_artifact.version -cne [string]$surrealEntry.version -or
+            [string]$policyReceipt.selected_artifact.source_tag -cne [string]$catalogBinding.source_tag -or
+            [string]$policyReceipt.selected_artifact.release_asset -cne [string]$catalogBinding.release_asset -or
+            [string]$policyReceipt.selected_artifact.source_commit -cne [string]$catalogBinding.source_commit -or
+            [string]$policyReceipt.selected_artifact.architecture -cne [string]$surrealEntry.architecture -or
+            [string]$policyReceipt.selected_artifact.pe_machine -cne [string]$surrealEntry.pe_machine -or
+            [string]$policyReceipt.selected_artifact.sha256 -cne [string]$surrealEntry.sha256 -or
+            [int64]$policyReceipt.selected_artifact.bytes -ne [int64]$surrealEntry.bytes -or
+            [string]$policyReceipt.catalogue.path -cne $surrealCatalogRelativePath -or
+            [string]$policyReceipt.catalogue.sha256 -cne [string]$surrealEntry.catalog_sha256 -or
+            [string]$policyReceipt.provisioning.path -cne [string]$surrealEntry.provisioning_receipt_input_path -or
+            [string]$policyReceipt.provisioning.sha256 -cne [string]$stagedReceiptEvidence.sha256 -or
+            [string]$policyReceipt.provisioning.status -cne 'verified' -or
+            [string]$policyReceipt.advisory_snapshot.evidence_status -cne 'verified' -or
+            [string]$policyReceipt.advisory_snapshot.source -cne 'https://api.osv.dev/v1/query' -or
+            [string]$policyReceipt.advisory_snapshot.version -cne [string]$surrealEntry.version -or
+            [string]$policyReceipt.advisory_snapshot.package -cne 'surrealdb' -or
+            [string]$policyReceipt.advisory_snapshot.ecosystem -cne 'crates.io' -or
+            [string]$policyReceipt.advisory_snapshot.scope -cne 'rust-crate' -or
+            [string]$policyReceipt.advisory_snapshot.distributed_binary_applicability -cne 'unestablished' -or
+            @($policyReceipt.advisory_snapshot.advisory_ids).Count -ne 0) {
+            throw 'selected-release policy receipt does not bind the consumed artifact, advisory scope, catalogue and provisioner receipt'
+        }
+        $queryEvidence = Read-VerifiedResidentFile (Join-Path $resolved 'runtime/SURREALDB_RELEASE_OSV_QUERY.json') 'staged selected-release OSV query'
+        $responseEvidence = Read-VerifiedResidentFile (Join-Path $resolved 'runtime/SURREALDB_RELEASE_OSV_RESPONSE.json') 'staged selected-release OSV response'
+        if ($queryEvidence.sha256 -cne [string]$policyReceipt.advisory_snapshot.query.sha256 -or
+            $responseEvidence.sha256 -cne [string]$policyReceipt.advisory_snapshot.response.sha256 -or
+            [string]$selectedPolicy.advisory_query_path -cne 'runtime/SURREALDB_RELEASE_OSV_QUERY.json' -or
+            [string]$selectedPolicy.advisory_query_sha256 -cne $queryEvidence.sha256 -or
+            [string]$selectedPolicy.advisory_response_path -cne 'runtime/SURREALDB_RELEASE_OSV_RESPONSE.json' -or
+            [string]$selectedPolicy.advisory_response_sha256 -cne $responseEvidence.sha256) {
+            throw 'staged OSV query or response bytes differ from the selected-release policy receipt'
+        }
+        $candidateQuery = [System.Text.Encoding]::UTF8.GetString($queryEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        $candidateResponse = [System.Text.Encoding]::UTF8.GetString($responseEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        if ($null -eq $candidateResponse -or $candidateResponse -isnot [pscustomobject]) {
+            throw 'staged candidate OSV response must be a JSON object'
+        }
+        $candidateResponseFields = @(
+            $candidateResponse.PSObject.Properties |
+                Where-Object { $_.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty } |
+                ForEach-Object { [string]$_.Name }
+        )
+        $unsupportedCandidateResponseFields = @($candidateResponseFields | Where-Object { $_ -cnotin @('vulns', 'next_page_token') })
+        if ($unsupportedCandidateResponseFields.Count -gt 0) {
+            throw 'staged candidate OSV response contains unsupported fields'
+        }
+        $candidateVulnerabilities = @()
+        if ($candidateResponseFields -contains 'vulns') {
+            if ($null -eq $candidateResponse.vulns -or $candidateResponse.vulns -isnot [array]) {
+                throw 'staged candidate OSV response vulns field must be an array when present'
+            }
+            $candidateVulnerabilities = @($candidateResponse.vulns)
+        }
+        if ($candidateResponseFields -contains 'next_page_token') {
+            if ($candidateResponse.next_page_token -isnot [string]) {
+                throw 'staged candidate OSV response next_page_token must be a string when present'
+            }
+            if (-not [string]::IsNullOrEmpty([string]$candidateResponse.next_page_token)) {
+                throw 'staged candidate OSV response is paginated and incomplete'
+            }
+        }
+        if ([string]$candidateQuery.package.name -cne 'surrealdb' -or
+            [string]$candidateQuery.package.ecosystem -cne 'crates.io' -or
+            [string]$candidateQuery.version -cne [string]$surrealEntry.version -or
+            $candidateVulnerabilities.Count -ne 0) {
+            throw 'staged OSV evidence does not show an empty exact-version crates.io/surrealdb query result'
+        }
+        $querySubject = "osv.query.surrealdb.release-candidate.$([string]$catalogBinding.source_tag)"
+        $responseSubject = "osv.response.surrealdb.release-candidate.$([string]$catalogBinding.source_tag)"
+        $queryRecord = @($stagedReceipt.records | Where-Object {
+                [string]$_.subject -ceq $querySubject -and
+                [string]$_.relative_path -ceq [string]$policyReceipt.advisory_snapshot.query.path -and
+                [string]$_.sha256 -ceq [string]$queryEvidence.sha256 -and
+                [string]$_.expected_sha256 -ceq [string]$queryEvidence.sha256 -and
+                $_.request -eq $true
+            })
+        $responseRecord = @($stagedReceipt.records | Where-Object {
+                [string]$_.subject -ceq $responseSubject -and
+                [string]$_.relative_path -ceq [string]$policyReceipt.advisory_snapshot.response.path -and
+                [string]$_.sha256 -ceq [string]$responseEvidence.sha256 -and
+                $_.request -eq $false -and
+                $_.fetched -eq $true -and
+                [string]$_.retrieved_at_utc -ceq [string]$policyReceipt.advisory_snapshot.response.retrieved_at_utc
+            })
+        if ($queryRecord.Count -ne 1 -or $responseRecord.Count -ne 1) {
+            throw 'staged provisioner receipt does not bind exactly the selected candidate OSV query and freshly fetched response'
+        }
+        $lockedMaximumAgeHours = 0
+        $ageText = [string]$catalogBinding.advisory_max_age_hours
+        if (-not [int]::TryParse($ageText, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$lockedMaximumAgeHours) -or
+            $lockedMaximumAgeHours -le 0 -or
+            [int]$policyReceipt.advisory_snapshot.response.maximum_age_hours -ne $lockedMaximumAgeHours) {
+            throw 'selected candidate OSV freshness window differs from the staged locked catalogue'
+        }
+        $retrievedAtText = [string]$policyReceipt.advisory_snapshot.response.retrieved_at_utc
+        $retrievedAt = [DateTimeOffset]::MinValue
+        $parseStyles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+        if (-not [DateTimeOffset]::TryParseExact(
+                $retrievedAtText,
+                "yyyy-MM-dd'T'HH:mm:ss'Z'",
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                $parseStyles,
+                [ref]$retrievedAt)) {
+            throw 'selected candidate OSV retrieval timestamp is malformed'
+        }
+        $policyAgeSeconds = ([DateTimeOffset]::UtcNow - $retrievedAt).TotalSeconds
+        $policyMaximumAgeSeconds = [double]$lockedMaximumAgeHours * 3600
+        if ($policyAgeSeconds -lt 0 -or $policyAgeSeconds -gt $policyMaximumAgeSeconds) {
+            throw 'selected candidate OSV response is in the future or outside the current locked freshness window'
+        }
+    }
+    elseif ($release.selected_release_dependency_policy) {
+        throw 'a non-project-local SurrealDB artifact cannot claim the selected-candidate dependency policy receipt'
     }
     $releaseRuntimeEntries = @($release.runtime_artifacts)
     if ([string]$release.runtime_artifact_catalog_path -ne $surrealCatalogRelativePath -or
@@ -1831,6 +2236,7 @@ if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
 }
 $surrealCatalog = Get-VerifiedSurrealCatalog $repo $sourceCommit
 $projectLocalSurreal = $null
+$selectedSurrealPolicyReceipt = $null
 if ($UseProjectLocalSurreal) {
     if ($SurrealExe -or $SurrealSha256 -or $SurrealVersion) {
         throw '-UseProjectLocalSurreal cannot be combined with -SurrealExe, -SurrealSha256, or -SurrealVersion'
@@ -1887,7 +2293,8 @@ $plan = [ordered]@{
     operator_binding = 'locked-build-receipt-required (OPERATOR_BUILD_RECEIPT.json pinned to source commit; arbitrary OperatorSource rejected)'
     output = $bundle
     governor = $governorPath
-    operator_source = $OperatorSource
+    operator_source = if ($BuildOperator) { '<generated-by-locked-winui-publish>' } else { $OperatorSource }
+    operator_build = if ($BuildOperator) { 'builder-invoked locked WinUI Publish; receipt emitted by the project AfterTargets=Publish target' } else { 'consume externally supplied receipt-bound publish directory' }
     codex_marketplace_source = (Join-Path $repo 'integrations/codex/marketplace.json')
     codex_plugin_source = $codexPluginSource
     codex_plugin_base_version = $codexPluginBaseVersion
@@ -1905,6 +2312,18 @@ $plan = [ordered]@{
         provisioner = $verifiedPinnedSurreal.provisioner
         provisioning_receipt_input_path = $verifiedPinnedSurreal.provisioning_receipt_input_path
         provisioning_receipt_sha256 = $verifiedPinnedSurreal.provisioning_receipt_sha256
+    }
+    selected_release_dependency_policy = if ($UseProjectLocalSurreal) {
+        [ordered]@{
+            status = 'NOT_GENERATED_PLAN_ONLY_OR_PRE_BUILD'
+            receipt_path = 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'
+            advisory_scope = 'crates.io/surrealdb at the exact selected candidate version'
+            distributed_binary_applicability = 'unestablished'
+            proof_ceiling = 'SELECTED_RELEASE_ARTIFACT_AND_FRESH_CRATE_ADVISORY_EVIDENCE_CANDIDATE'
+        }
+    }
+    else {
+        [ordered]@{ status = 'not-selected'; receipt_path = $null }
     }
     runtime_artifacts = @($runtimeArtifactPlan | ForEach-Object {
             [ordered]@{
@@ -1924,8 +2343,11 @@ if ($PlanOnly) {
     exit 0
 }
 
-if (-not $OperatorSource) {
-    throw 'OperatorSource is required for every staged release; use -PlanOnly to inspect without artifacts'
+if ($BuildOperator -and $OperatorSource) {
+    throw '-BuildOperator cannot be combined with -OperatorSource; the builder must own the publish output directory'
+}
+if (-not $PlanOnly -and -not $BuildOperator -and -not $OperatorSource) {
+    throw 'OperatorSource is required unless -BuildOperator is selected; use -PlanOnly to inspect without artifacts'
 }
 
 Push-Location $repo
@@ -1935,6 +2357,58 @@ try {
     $stageToolchain = Get-ToolchainBuildReceipt $repo $sourceCommit $cargoMetadata 'stage'
     if ($SkipBuild) {
         throw 'SkipBuild is not permitted for staged releases because it cannot prove Governor source provenance'
+    }
+    $operatorBuildInvocationId = $null
+    $operatorBuildTool = $null
+    if ($BuildOperator) {
+        if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            throw 'LOCALAPPDATA is required to place the builder-owned Operator publish output outside the source tree'
+        }
+        $dotnetCommand = Get-PinnedCommandFile 'dotnet' 'locked Eliot.Operator WinUI publish'
+        $powerShellCommand = Get-PinnedCommandFile 'powershell' 'Operator build receipt producer'
+        $operatorBuildInvocationId = [guid]::NewGuid().ToString('D')
+        $operatorPublishRoot = Join-Path $env:LOCALAPPDATA 'Eliot\build\operator-publish'
+        $OperatorSource = Join-Path $operatorPublishRoot $operatorBuildInvocationId
+        if (Test-Path -LiteralPath $OperatorSource) {
+            throw "builder-owned Operator publish directory already exists: $OperatorSource"
+        }
+        New-Item -ItemType Directory -Path $OperatorSource -Force | Out-Null
+        $operatorProject = Join-Path $repo 'apps/Eliot.Operator/Eliot.Operator.csproj'
+        $operatorReceiptWriter = Join-Path $repo 'scripts/write-operator-build-receipt.ps1'
+        $operatorReceiptPath = Join-Path $OperatorSource 'OPERATOR_BUILD_RECEIPT.json'
+        $operatorPublishArguments = @(
+            'publish',
+            $operatorProject,
+            '--configuration', 'Release',
+            '--runtime', 'win-x64',
+            '--output', $OperatorSource,
+            '-p:RestoreLockedMode=true',
+            "-p:OperatorBuildReceiptPath=$operatorReceiptPath",
+            "-p:OperatorBuildReceiptWriterPath=$operatorReceiptWriter",
+            "-p:OperatorBuildReceiptRepositoryRoot=$repo",
+            "-p:OperatorBuildReceiptSourceCommit=$sourceCommit",
+            "-p:OperatorBuildReceiptInvocationId=$operatorBuildInvocationId",
+            "-p:OperatorBuildReceiptDotnetPath=$($dotnetCommand.FullName)",
+            "-p:OperatorBuildReceiptPowerShellPath=$($powerShellCommand.FullName)"
+        )
+        $operatorPublish = Invoke-CapturedNativeProcess $dotnetCommand.FullName $operatorPublishArguments $repo 'operator-winui-publish'
+        Write-Host "OPERATOR_PUBLISH_EXIT_CODE=$($operatorPublish.exit_code) INVOCATION=$operatorBuildInvocationId STDOUT_LOG=$($operatorPublish.stdout_path) STDERR_LOG=$($operatorPublish.stderr_path)"
+        if ($operatorPublish.exit_code -ne 0) {
+            throw "locked Eliot.Operator WinUI publish failed with exit code $($operatorPublish.exit_code). Full stderr:`n$($operatorPublish.stderr)`nFull logs: $($operatorPublish.stdout_path) ; $($operatorPublish.stderr_path)"
+        }
+        $operatorBuildTool = [ordered]@{
+            path = [string]$dotnetCommand.FullName
+            sha256 = (Get-FileHash -LiteralPath $dotnetCommand.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            publish_exit_code = [int]$operatorPublish.exit_code
+            invocation_id = $operatorBuildInvocationId
+            stdout_log = [string]$operatorPublish.stdout_path
+            stderr_log = [string]$operatorPublish.stderr_path
+        }
+        $publishedOperator = Get-VerifiedOperatorBuildReceipt $repo $sourceCommit $OperatorSource $operatorBuildInvocationId
+        if (-not [string]::Equals([string]$publishedOperator.dotnet_path, [string]$operatorBuildTool.path, [System.StringComparison]::OrdinalIgnoreCase) -or
+            [string]$publishedOperator.dotnet_sha256 -cne [string]$operatorBuildTool.sha256) {
+            throw 'Operator publish receipt tool identity differs from the builder-invoked dotnet executable'
+        }
     }
     & $cargoInvokePath build --frozen --locked --offline --release -p eliot-app --bin eliot-governor
     if ($LASTEXITCODE -ne 0) {
@@ -1947,6 +2421,25 @@ try {
         }
     }
     $postBuildIsolation = Assert-IsolatedSourceTree $repo $sourceCommit 'post-build'
+
+    if ($UseProjectLocalSurreal) {
+        # Refresh the candidate advisory response after the complete Windows build,
+        # then produce the receipt that the staged-bundle consumer verifies.
+        $projectLocalSurreal = Get-ProjectLocalSurrealArtifact $repo $surrealCatalog $true
+        $verifiedPinnedSurreal = $projectLocalSurreal
+        $selectedSurrealPolicyReceipt = Get-SelectedSurrealReleasePolicyReceipt $repo $surrealCatalog $verifiedPinnedSurreal $sourceCommit
+        $plan.selected_release_dependency_policy = [ordered]@{
+            status = [string]$selectedSurrealPolicyReceipt.receipt.binding_status
+            candidate_advisory_status = [string]$selectedSurrealPolicyReceipt.receipt.candidate_advisory_status
+            release_admission = [string]$selectedSurrealPolicyReceipt.receipt.release_admission
+            receipt_path = 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'
+            receipt_sha256 = [string]$selectedSurrealPolicyReceipt.sha256
+            advisory_query_sha256 = [string]$selectedSurrealPolicyReceipt.query_sha256
+            advisory_response_sha256 = [string]$selectedSurrealPolicyReceipt.response_sha256
+            distributed_binary_applicability = 'unestablished'
+            proof_ceiling = [string]$selectedSurrealPolicyReceipt.receipt.proof_ceiling
+        }
+    }
 
     $governor = $governorPath
     if (-not (Test-Path -LiteralPath $governor -PathType Leaf)) {
@@ -1991,6 +2484,36 @@ try {
         if ($stagedReceiptSha256 -cne [string]$verifiedPinnedSurreal.provisioning_receipt_sha256) {
             throw 'staged SurrealDB provisioning receipt changed while being copied'
         }
+        if (-not $selectedSurrealPolicyReceipt) {
+            throw 'selected-release dependency policy receipt was not produced after the Windows build'
+        }
+        $policySourceEvidence = Read-VerifiedResidentFile $selectedSurrealPolicyReceipt.path 'selected-release dependency policy receipt for staging'
+        if ($policySourceEvidence.sha256 -cne [string]$selectedSurrealPolicyReceipt.sha256) {
+            throw 'selected-release dependency policy receipt changed after consumption'
+        }
+        $policyDestination = Join-Path $runtimeRoot 'SURREALDB_RELEASE_POLICY_RECEIPT.json'
+        $stagedPolicy = Write-VerifiedResidentFile $policyDestination $policySourceEvidence.bytes 'staged selected-release dependency policy receipt'
+        if ($stagedPolicy.sha256 -cne [string]$selectedSurrealPolicyReceipt.sha256) {
+            throw 'selected-release dependency policy receipt changed while being staged'
+        }
+        Assert-NoSecretFile (Get-Item -LiteralPath $policyDestination) 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'
+
+        foreach ($advisoryFile in @(
+                @{ source = $selectedSurrealPolicyReceipt.query_path; expected_sha256 = $selectedSurrealPolicyReceipt.query_sha256; name = 'SURREALDB_RELEASE_OSV_QUERY.json' },
+                @{ source = $selectedSurrealPolicyReceipt.response_path; expected_sha256 = $selectedSurrealPolicyReceipt.response_sha256; name = 'SURREALDB_RELEASE_OSV_RESPONSE.json' }
+            )) {
+            $sourcePath = Join-Path $repo ([string]$advisoryFile.source).Replace('/', '\')
+            $sourceEvidence = Read-VerifiedResidentFile $sourcePath "selected SurrealDB OSV evidence $($advisoryFile.name)"
+            if ($sourceEvidence.sha256 -cne [string]$advisoryFile.expected_sha256) {
+                throw "selected SurrealDB OSV evidence changed after policy verification: $($advisoryFile.name)"
+            }
+            $destination = Join-Path $runtimeRoot $advisoryFile.name
+            $stagedEvidence = Write-VerifiedResidentFile $destination $sourceEvidence.bytes "staged selected SurrealDB OSV evidence $($advisoryFile.name)"
+            if ($stagedEvidence.sha256 -cne [string]$advisoryFile.expected_sha256) {
+                throw "selected SurrealDB OSV evidence changed while being staged: $($advisoryFile.name)"
+            }
+            Assert-NoSecretFile (Get-Item -LiteralPath $destination) "runtime/$($advisoryFile.name)"
+        }
     }
     [ordered]@{
         schema = 'eliot-runtime-artifact-set-v1'
@@ -2030,10 +2553,34 @@ try {
     Copy-TrackedTree $repo $sourceCommit 'docs/operations' (Join-Path $bundle 'docs/operations')
     Copy-TrackedTree $repo $sourceCommit 'docs/release' (Join-Path $bundle 'docs/release')
 
-    $verifiedOperator = Get-VerifiedOperatorBuildReceipt $repo $sourceCommit $OperatorSource
+    $verifiedOperator = Get-VerifiedOperatorBuildReceipt $repo $sourceCommit $OperatorSource $operatorBuildInvocationId
+    if ($operatorBuildTool -and
+        (-not [string]::Equals([string]$verifiedOperator.dotnet_path, [string]$operatorBuildTool.path, [System.StringComparison]::OrdinalIgnoreCase) -or
+         [string]$verifiedOperator.dotnet_sha256 -cne [string]$operatorBuildTool.sha256 -or
+         [int]$operatorBuildTool.publish_exit_code -ne 0)) {
+        throw 'Operator build receipt tool identity differs from the actual builder-invoked dotnet Publish process'
+    }
+    $plan.operator_source = [string]$verifiedOperator.source
+    $plan.operator_build = [ordered]@{
+        status = 'VERIFIED'
+        invocation_id = [string]$verifiedOperator.invocation_id
+        receipt_path = [string]$verifiedOperator.receipt_path
+        receipt_sha256 = [string]$verifiedOperator.receipt_sha256
+        publish_target = 'Publish'
+        publish_result = 'succeeded'
+        restore_locked_mode = [bool]$verifiedOperator.restore_locked_mode
+        producer_sha256 = [string]$verifiedOperator.producer_sha256
+        exe_sha256 = [string]$verifiedOperator.exe_sha256
+        exe_bytes = [int64]$verifiedOperator.exe_bytes
+        artifacts_file_count = [int]$verifiedOperator.artifacts_file_count
+        dotnet_path = [string]$verifiedOperator.dotnet_path
+        dotnet_sha256 = [string]$verifiedOperator.dotnet_sha256
+        dotnet_sdk = [string]$verifiedOperator.dotnet_sdk
+        msbuild_version = [string]$verifiedOperator.msbuild_version
+    }
     Copy-OperatorPayload $verifiedOperator.source (Join-Path $bundle 'operator')
     Copy-Item -LiteralPath $verifiedOperator.receipt_path -Destination (Join-Path $bundle 'operator/OPERATOR_BUILD_RECEIPT.json')
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt
     $stagedPayloadManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     [ordered]@{
@@ -2068,6 +2615,30 @@ try {
                     provisioning_receipt_sha256 = $_.provisioning_receipt_sha256
                 }
             })
+        selected_release_dependency_policy = if ($selectedSurrealPolicyReceipt) {
+            [ordered]@{
+                path = 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'
+                sha256 = [string]$selectedSurrealPolicyReceipt.sha256
+                binding_status = [string]$selectedSurrealPolicyReceipt.receipt.binding_status
+                candidate_advisory_status = [string]$selectedSurrealPolicyReceipt.receipt.candidate_advisory_status
+                release_admission = [string]$selectedSurrealPolicyReceipt.receipt.release_admission
+                source_commit = [string]$selectedSurrealPolicyReceipt.receipt.source_commit
+                artifact_path = [string]$selectedSurrealPolicyReceipt.receipt.selected_artifact.path
+                artifact_version = [string]$selectedSurrealPolicyReceipt.receipt.selected_artifact.version
+                artifact_source_tag = [string]$selectedSurrealPolicyReceipt.receipt.selected_artifact.source_tag
+                artifact_release_asset = [string]$selectedSurrealPolicyReceipt.receipt.selected_artifact.release_asset
+                artifact_sha256 = [string]$selectedSurrealPolicyReceipt.receipt.selected_artifact.sha256
+                catalogue_sha256 = [string]$selectedSurrealPolicyReceipt.receipt.catalogue.sha256
+                provisioning_receipt_sha256 = [string]$selectedSurrealPolicyReceipt.receipt.provisioning.sha256
+                advisory_query_path = 'runtime/SURREALDB_RELEASE_OSV_QUERY.json'
+                advisory_query_sha256 = [string]$selectedSurrealPolicyReceipt.query_sha256
+                advisory_response_path = 'runtime/SURREALDB_RELEASE_OSV_RESPONSE.json'
+                advisory_response_sha256 = [string]$selectedSurrealPolicyReceipt.response_sha256
+                distributed_binary_applicability = 'unestablished'
+                proof_ceiling = [string]$selectedSurrealPolicyReceipt.receipt.proof_ceiling
+            }
+        }
+        else { $null }
         architecture = 'windows-x64'
         signed = $false
         signature_policy = 'pre-release-unsigned'
@@ -2088,13 +2659,21 @@ try {
             windows_app_sdk_version = $verifiedOperator.windows_app_sdk_version
             packages_lock_sha256 = $verifiedOperator.packages_lock_sha256
             csproj_sha256 = $verifiedOperator.csproj_sha256
+            invocation_id = $verifiedOperator.invocation_id
+            publish_target = 'Publish'
+            publish_result = 'succeeded'
+            restore_locked_mode = $verifiedOperator.restore_locked_mode
+            producer_sha256 = $verifiedOperator.producer_sha256
             schema_version = $verifiedOperator.schema_version
             protocol_version = $verifiedOperator.protocol_version
             protocol_hash = $verifiedOperator.protocol_hash
             exe_sha256 = $verifiedOperator.exe_sha256
             exe_bytes = $verifiedOperator.exe_bytes
+            artifacts_file_count = $verifiedOperator.artifacts_file_count
+            dotnet_path = $verifiedOperator.dotnet_path
             dotnet_sdk = $verifiedOperator.dotnet_sdk
-            tests_suite = $verifiedOperator.tests_suite
+            dotnet_sha256 = $verifiedOperator.dotnet_sha256
+            msbuild_version = $verifiedOperator.msbuild_version
         }
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'RELEASE.json') -Encoding utf8
 
