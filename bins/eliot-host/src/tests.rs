@@ -285,6 +285,8 @@ fn activate_response_uncertainty_reconciles_but_exact_rejection_does_not() -> Te
         activation_receipt: None,
         store_rebind_receipt: None,
         supervision_lease: None,
+        runtime_lease: None,
+        runtime_lease_census: None,
         error,
         payload_digest: String::new(),
     };

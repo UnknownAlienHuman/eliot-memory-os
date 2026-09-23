@@ -27,6 +27,9 @@ use persistence_models::{
 
 mod recovery_projection;
 
+#[path = "store/lease_census.rs"]
+mod lease_census;
+
 use crate::cutover_ownership::{
     GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
 };

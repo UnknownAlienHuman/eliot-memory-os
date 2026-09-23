@@ -459,7 +459,7 @@ impl KernelComposition {
                         && candidate.lineage_id == policy_epoch.lineage_id
                         && candidate.sequence.get() > policy_epoch.sequence.get()))
             };
-            if request.generation != policy.module_generation.generation
+        if request.generation != policy.module_generation.generation
                 || epoch_mismatch
                 || self
                     .kernel_artifact_sha256
@@ -499,6 +499,33 @@ impl KernelComposition {
                 let _ = error;
                 return Err(TransportError::SessionFenced);
             }
+        }
+        let _runtime_lease_gate = if matches!(
+            &request.command,
+            KernelControlCommand::ProbeReady
+                | KernelControlCommand::AcquireRuntimeLease(_)
+                | KernelControlCommand::RenewRuntimeLease(_)
+                | KernelControlCommand::RevokeRuntimeLease(_)
+                | KernelControlCommand::ExpireRuntimeLease(_)
+                | KernelControlCommand::CloseRuntimeLease(_)
+                | KernelControlCommand::ReconcileRuntimeLease(_)
+                | KernelControlCommand::ReadRuntimeLeaseCensus(_)
+                | KernelControlCommand::Degrade(_)
+                | KernelControlCommand::Drain
+                | KernelControlCommand::Stop
+                | KernelControlCommand::Fail(_)
+        ) {
+            Some(self.runtime_lease_gate.lock().await)
+        } else {
+            None
+        };
+        if matches!(&request.command, KernelControlCommand::ProbeReady)
+            && self
+                .service_state()
+                .map_err(|_| TransportError::SessionFenced)?
+                == KernelServiceState::Draining
+        {
+            return Err(TransportError::SessionFenced);
         }
         // I14.23 wake/attach race: a new activation arriving before the
         // `DrainCommit` linearization point cancels the drain and proceeds;
@@ -796,6 +823,11 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?
                     .reconcile(request.candidate.clone())
                     .map_err(|_| TransportError::SessionFenced)?,
+                KernelControlCommand::Drain
+                    if self
+                        .service_state()
+                        .map_err(|_| TransportError::SessionFenced)?
+                        == KernelServiceState::Draining => {}
                 KernelControlCommand::BootstrapStore(_)
                 | KernelControlCommand::Activate(_)
                 | KernelControlCommand::ReconcileActivation(_)
@@ -807,7 +839,8 @@ impl KernelComposition {
                 | KernelControlCommand::RevokeRuntimeLease(_)
                 | KernelControlCommand::ExpireRuntimeLease(_)
                 | KernelControlCommand::CloseRuntimeLease(_)
-                | KernelControlCommand::ReconcileRuntimeLease(_) => {}
+                | KernelControlCommand::ReconcileRuntimeLease(_)
+                | KernelControlCommand::ReadRuntimeLeaseCensus(_) => {}
                 command => {
                     self.apply_control(command.clone())
                         .map_err(|_| TransportError::SessionFenced)?;
@@ -842,6 +875,42 @@ impl KernelComposition {
             KernelControlCommand::ProbeReady => None,
             _ => None,
         };
+        let runtime_lease_census = match &request.command {
+            KernelControlCommand::ReadRuntimeLeaseCensus(query) => {
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Draining
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let supervision_lease_id = eliot_ors::OperationIdentity::new(
+                    query.supervision_lease_id.clone(),
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                let (runtime_leases, supervision_lease) = self
+                    .generation_gateway
+                    .ors
+                    .load_runtime_lease_census_by_state_fence(
+                        &query.state_fence,
+                        Some(&supervision_lease_id),
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let supervision_lease =
+                    supervision_lease.ok_or(TransportError::SessionFenced)?;
+                let census = eliot_kernel_service::RuntimeLeaseCensus {
+                    state_fence: query.state_fence.clone(),
+                    supervision_lease_id: query.supervision_lease_id.clone(),
+                    runtime_leases,
+                    supervision_lease,
+                };
+                census
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Some(census)
+            }
+            _ => None,
+        };
         let state = self
             .service_state()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -865,6 +934,7 @@ impl KernelComposition {
             store_rebind_receipt,
             supervision_lease,
             runtime_lease,
+            runtime_lease_census,
             error: None,
             payload_digest: String::new(),
         }

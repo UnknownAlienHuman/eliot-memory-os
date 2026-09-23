@@ -580,7 +580,8 @@ impl KernelService {
             | KernelControlCommand::RevokeRuntimeLease(_)
             | KernelControlCommand::ExpireRuntimeLease(_)
             | KernelControlCommand::CloseRuntimeLease(_)
-            | KernelControlCommand::ReconcileRuntimeLease(_) => {
+            | KernelControlCommand::ReconcileRuntimeLease(_)
+            | KernelControlCommand::ReadRuntimeLeaseCensus(_) => {
                 return Err(KernelServiceError::InvalidField {
                     field: "runtime_lease",
                     reason: "RuntimeLease commands require the authenticated Kernel composition boundary",

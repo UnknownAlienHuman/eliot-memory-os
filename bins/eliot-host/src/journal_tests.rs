@@ -632,6 +632,8 @@ fn probe_exchange(
         activation_receipt: None,
         store_rebind_receipt: None,
         supervision_lease: Some(supervision_lease),
+        runtime_lease: None,
+        runtime_lease_census: None,
         error: None,
         payload_digest: String::new(),
     }
