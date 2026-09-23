@@ -1777,9 +1777,10 @@ fn experience_range_payload(
 /// carries scope-free gap/control records regardless of scope, so
 /// store-level scope filtering here would silently drop records the
 /// consumer must see (F2 resolution: scope-free catalogue rows per the
-/// `GetMailbox` precedent — facade caller scope required, catalogue
-/// rows scope-free — with scope gating at the decision layer per
-/// I12-26). Fence agreement is enforced by the caller: this helper runs
+/// established in-catalogue scope-free reads (`GetNotificationState`,
+/// `GetReactiveInjectionState`, `GetResourceSnapshot`) — facade caller
+/// scope required, catalogue rows scope-free — with scope gating at the
+/// decision layer per I12-26). Fence agreement is enforced by the caller: this helper runs
 /// only after `execute_named_sync` proves the query fence equals the
 /// state fence. Reads beyond
 /// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
