@@ -35,7 +35,7 @@ use thiserror::Error;
 
 use crate::{
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
-    ReadConsistency, ScopeId, StateFence, StoreError,
+    ReadConsistency, ScopeId, StateFence, StoreError, canonical_json_bytes, sha256_hex,
 };
 
 /// Versioned wire/schema identity for canonical experience state.
@@ -66,6 +66,12 @@ pub const EXPERIENCE_PARAM_FENCE_DIGEST: &str = "fence_digest";
 pub const EXPERIENCE_PARAM_IDEMPOTENCY_KEY: &str = "idempotency_key";
 /// Decimal page-size bound (range reads, required).
 pub const EXPERIENCE_PARAM_MAX_RECORDS: &str = "max_records";
+/// Opaque audit-range continuation cursor (audit reads, optional).
+///
+/// Carried as a closed text selector so the frozen `GetAuditRange`
+/// shape stays backward compatible: requests without it read from the
+/// start with legacy fail-closed overflow. See [`audit_cursor_issue`].
+pub const AUDIT_PARAM_CURSOR: &str = "cursor";
 
 /// Maximum accepted record-handle length in bytes.
 pub const MAX_EXPERIENCE_HANDLE_BYTES: usize = 256;
@@ -549,4 +555,56 @@ pub fn audit_envelope_candidate(subject: &str) -> Option<serde_json::Value> {
     let object = value.as_object()?;
     object.get("record_id")?.as_str()?;
     Some(value)
+}
+
+/// Mints one opaque audit-range continuation cursor.
+///
+/// The cursor binds the exact query fence (digest over its canonical
+/// bytes), the next candidate ordinal, and the page bound in force:
+/// `audit:{fence_digest}:{ordinal:010}:{bound}`. Callers echo cursors;
+/// they must never construct them — only the store owner mints, and
+/// [`audit_cursor_parse`] re-verifies every field before resuming.
+pub fn audit_cursor_issue(
+    fence: &StateFence,
+    ordinal: u64,
+    bound: u32,
+) -> Result<String, StoreError> {
+    let digest = sha256_hex(
+        &canonical_json_bytes(fence)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?,
+    );
+    Ok(format!("audit:{digest}:{ordinal:010}:{bound}"))
+}
+
+/// Verifies one continuation cursor against the current read fence and
+/// returns the candidate ordinal to resume from.
+///
+/// Fails closed on any malformed cursor, on a bound that does not match
+/// the enforced page bound (a bound change invalidates old cursors
+/// instead of silently repaging), and on a fence digest that does not
+/// match the current read fence (cross-fence continuation is rejected:
+/// cursors never carry reads across a fence change).
+pub fn audit_cursor_parse(cursor: &str, fence: &StateFence) -> Result<u64, StoreError> {
+    let invalid = || StoreError::InvalidField {
+        field: "experience.cursor",
+        reason: "continuation cursor is malformed or foreign",
+    };
+    let mut parts = cursor.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("audit"), Some(digest), Some(ordinal), Some(bound), None) => {
+            let expected = sha256_hex(
+                &canonical_json_bytes(fence)
+                    .map_err(|_| invalid())?,
+            );
+            if digest != expected {
+                return Err(invalid());
+            }
+            let bound: u32 = bound.parse().map_err(|_| invalid())?;
+            if bound != crate::operation_catalogue::MAX_AUDIT_RANGE_RECORDS {
+                return Err(invalid());
+            }
+            ordinal.parse().map_err(|_| invalid())
+        }
+        _ => Err(invalid()),
+    }
 }

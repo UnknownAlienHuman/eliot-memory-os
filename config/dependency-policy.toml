@@ -1,6 +1,8 @@
 schema = "eliot.dependency-policy.v1"
 issue = 1229
-updated_at = "2026-09-22"
+updated_at = "2026-09-23"
+# Structured exceptions are package/version/advisory/target/feature scoped, owned, expiring and invalidated by drift.
+exceptions = []
 
 [scanner]
 tool = "cargo-deny"
@@ -29,6 +31,7 @@ require_hashes = true
 [ecosystems.node]
 contract = "integrations/opencode/plugin-bridge-contract.json"
 manifest = "integrations/opencode/opencode.json"
+package_root = "integrations"
 
 [external_executables.surrealdb]
 name = "surreal.exe"
@@ -429,14 +432,57 @@ version = "4.25.1"
 public_exposure = "scripts only"
 removal_plan = "manual json validation"
 
-[direct_dependencies.pyyaml]
-ecosystem = "python"
-consumer = "scripts verification"
-owner = "scripts"
-reason = "YAML parsing for GitHub workflow and config verification"
-version = "6.0.3"
-public_exposure = "scripts only"
-removal_plan = "custom YAML parser"
+[[workspace_dependency_dispositions]]
+consumer = "eliot-wasm-host"
+dependency = "eliot-contracts"
+dependency_kind = "dependencies"
+target = "all"
+owner = "bins/eliot-wasm-host"
+reason = "owner-permit issuance context for P03 parent drive"
+features = ["default"]
+public_exposure = "none"
+removal_plan = "Remove when P03 parent-drive epoch parsing and owner-fence construction no longer require eliot-contracts."
 
-# Structured exceptions are package/version/advisory/target/feature scoped, owned, expiring and invalidated by drift.
-exceptions = []
+[[workspace_dependency_dispositions]]
+consumer = "eliot-wasm-host"
+dependency = "eliot-platform"
+dependency_kind = "dependencies"
+target = "all"
+owner = "bins/eliot-wasm-host"
+reason = "owner-permit issuance context for P03 parent drive"
+features = ["default"]
+public_exposure = "none"
+removal_plan = "Remove when P03 parent-drive validation no longer carries the owner-observed ClockObservation."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-governor"
+dependency = "eliot-kernel-core"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/governor/eliot-governor"
+reason = "Restore and publish the canonical owner closure through Kernel hydration and closure contracts."
+features = ["default"]
+public_exposure = "Public owner-closure provider methods use Kernel grant, introduction, and restore contract types."
+removal_plan = "Remove when owner-closure hydration no longer consumes Kernel closure restore types and the manifest edge is deleted."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-governor"
+dependency = "eliot-ors"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/governor/eliot-governor"
+reason = "Validate and construct opaque operational-record inputs and grant/introduction activation values for owner-closure hydration."
+features = ["default"]
+public_exposure = "Opaque ORS activation values flow through owner-closure restore payloads; secret bytes are not exposed."
+removal_plan = "Remove when owner-closure hydration no longer encodes ORS grant/introduction activation records and the manifest edge is deleted."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-governor"
+dependency = "eliot-platform"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/governor/eliot-governor"
+reason = "Pass SecretReference handles to owner-closure admission while keeping secret bytes outside the provider."
+features = ["default"]
+public_exposure = "SecretReference is a public admission parameter; secret bytes are not exposed."
+removal_plan = "Remove when owner-closure admission no longer consumes eliot_platform::SecretReference and the manifest edge is deleted."
