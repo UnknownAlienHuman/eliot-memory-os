@@ -19,6 +19,7 @@ use crate::controlboard_projection::{
 };
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
+use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
@@ -2593,6 +2594,41 @@ pub async fn restore_authority_with_live_history<R: CanonicalReadClient + ?Sized
     let evidence = decode_revocation_history_evidence(&response, state_fence)?;
     AuthorityOwner::from_snapshot_with_revocation_history(snapshot, state_fence, Some(&evidence))
 }
+
+    /// Synchronizes the Kernel P-07 owner from live Governor state after
+    /// a revision advance (`#2100` owner-closure feed call).
+    ///
+    /// Binds the feed to the live composition snapshot and fence at call
+    /// time — never caller-supplied — and runs the full
+    /// read→decode→restore→publish→readback exchange through
+    /// [`synchronize_owner_feed`]. The owning daemon runtime calls this
+    /// on provider-revision advance and on recovery; a stale trigger
+    /// refuses before any publish, and no owner state installs until
+    /// the Kernel readback proves the exact published bytes.
+    pub async fn synchronize_kernel_owner<
+        R: CanonicalReadClient + ?Sized,
+        K: OwnerPublishPort + ?Sized,
+    >(
+        &self,
+        reads: &R,
+        kernel: &K,
+        origin_ref: &str,
+        max_records: u32,
+        expected_revision: u64,
+    ) -> Result<u64, CompositionError> {
+        let snapshot = self.owners.authority.snapshot()?;
+        let state_fence = self.snapshot.state_fence();
+        synchronize_owner_feed(
+            reads,
+            kernel,
+            snapshot,
+            &state_fence,
+            origin_ref,
+            max_records,
+            expected_revision,
+        )
+        .await
+    }
 
     /// Reads one coherent semantic activation from all required owner records.
     ///

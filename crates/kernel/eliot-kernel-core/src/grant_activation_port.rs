@@ -461,14 +461,17 @@ pub struct GrantClosureEnumeration {
 ///
 /// A covering path MAY live on a different lineage root than the closure:
 /// I06-15 preserves "a descendant only if another valid root path covers
-/// the exact use", and issue #2100 records "a second independent valid
-/// root path" explicitly — hence the separate `covering_root_ref`
-/// (mirrored by `GrantClosurePreserved.covering_root` in ORS). Same-root
-/// covers are the common case, not a requirement: no pin compares the
-/// covering root to the closure root. What is always required is CURRENT
-/// membership evidence — the covering grant must prove live or durable
-/// `Active` authority on the declared covering root and fence contour at
-/// the closure revision (see `prove_survivor_membership`) — never a
+/// the exact use", and issue #2100 requires that "a second independent
+/// valid root path covers an exact use" with the owner recording "that
+/// surviving path explicitly" — hence the separate `covering_root_ref`
+/// (mirrored by `GrantClosurePreserved.covering_root` in ORS). The issue
+/// restricts only cross-root *child* identities ("cross-root child
+/// identities are rejected"), never covers. Same-root covers are the
+/// common case, not a requirement: no pin compares the covering root to
+/// the closure root. What is always required is CURRENT membership
+/// evidence — the covering grant must prove live or durable `Active`
+/// authority on the declared covering root and fence contour at the
+/// closure revision (see `prove_survivor_membership`) — never a
 /// carried-over declaration.
 ///
 /// The covering path is Governor semantic evidence recorded verbatim: the
