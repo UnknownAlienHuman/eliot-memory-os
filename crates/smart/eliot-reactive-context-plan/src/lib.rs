@@ -12,6 +12,8 @@ mod bridge_admission;
 mod compiler;
 mod input;
 mod plan;
+mod reactive_owner_producers;
+mod reactive_owner_suppliers;
 mod result;
 mod retrieval_plan;
 mod settled_plan_feed;
@@ -28,6 +30,14 @@ pub use input::{
     AttentionDisclosureRule, ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTargetBinding,
 };
 pub use plan::plan_pending_context_injection;
+pub use reactive_owner_producers::{
+    produce_attention_projection, produce_coverage_profile, produce_cue_activation,
+    produce_delivery_policy, produce_planning_view, produce_session_snapshot,
+};
+pub use reactive_owner_suppliers::{
+    AssembledReactiveInputs, CueActivationSupply, OwnerAssembleError, PlanningViewSupply,
+    ReactiveMissingOwner, ReactiveOwnerSupply,
+};
 pub use result::{
     ActivationEvidenceKind, DeliveryDisposition, InertDeliveryRequest, NoInjectionDisposition,
     PendingContextInjectionPlan, PlannedAttentionBinding, PlannedContextItem, PlannedItemKind,
