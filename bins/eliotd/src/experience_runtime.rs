@@ -94,8 +94,10 @@ pub enum ExperienceDriverError {
         field: &'static str,
         reason: &'static str,
     },
-    /// Admitted commit ingress could not be derived from retained state.
-    #[error("commit ingress field {field}: {reason}")]
+    /// Admitted commit ingress could not be derived: the invocation
+    /// metadata, fence agreement, commit key, or lifecycle scope is
+    /// missing or malformed. Nothing was committed.
+    #[error("ingress field {field}: {reason}")]
     Ingress {
         field: &'static str,
         reason: &'static str,
@@ -610,14 +612,6 @@ pub async fn run_experience_quality_event(
     })
 }
 
-/// Daemon-edge commit lifecycle bound in milliseconds.
-///
-/// Bounds this run's commit lifecycle only, mirroring the Kernel-client
-/// ingress precedent (`daemon_kernel_client` 30s window). It bounds no
-/// identity and proves nothing: authority stays with admitted metadata,
-/// fence agreement, and the owner checks downstream.
-const COMMIT_INGRESS_DEADLINE_MS: u64 = 30_000;
-
 /// Terminal output bundle: durable commit receipts per family.
 pub struct ExperienceCommitOutput {
     /// Owner receipts for committed bank records, in input order.
@@ -626,24 +620,34 @@ pub struct ExperienceCommitOutput {
     pub feedback_receipts: Vec<WriteReceipt>,
 }
 
-/// Derives admitted commit ingress from retained invocation state.
+/// Derive admitted commit ingress for one record commit.
 ///
-/// Clones the validated invocation metadata (`ctx`) verbatim — the
-/// admission contour that invoked this driver — and requires its fence
-/// to equal the retained admitted Kernel fence: invocation/Kernel fence
-/// drift fails closed here, before any identity exists. The idempotency
-/// key is the owner-derived commit key for the exact record being
-/// committed (computed by `produce_bank_commit` /
-/// `produce_feedback_commit` from admitted record content, never
-/// invented); the deadline bounds this run per
-/// [`COMMIT_INGRESS_DEADLINE_MS`]; the cancellation identity binds the
-/// commit lifecycle to that same record key. Record-fence, scope, and
-/// key agreement are re-checked by the commit caller and the owner
-/// downstream; nothing here mints identity, heads, or proofs.
+/// Binds the owner-derived commit key into a [`RequestIdentity`] whose
+/// request binding clones the admitted invocation metadata verbatim
+/// (identity, session, task, product, source, fence, clock) with the
+/// fence echoed as the binding fence. The lifecycle scope
+/// (`deadline_unix_ms`, `cancellation_id`) arrives edge-supplied: no
+/// admitted source carries a commit deadline or cancellation scope, so
+/// minting either here would invent lifecycle authority — the trigger
+/// edge owns its lifecycle and passes it explicitly, exactly as it
+/// passes receipts and handles. The commit key itself is owner-derived
+/// (the `idempotency_key` the owner commit payload carries for the
+/// record), never minted: caller-supplied keys are rejected.
+///
+/// Fence agreement (admitted metadata versus the retained Kernel
+/// fence), key text, cancellation text, and the assembled identity
+/// shape all fail closed before any identity exists; the canonical
+/// owner re-validates the identity again downstream. This is the O1
+/// seam for the trigger's commit legs: O1 calls it per record with the
+/// same admitted `ctx`, the live Kernel fence, the owner-derived key,
+/// and its own lifecycle scope, then passes the identity to the
+/// canonical commit caller.
 pub fn derive_commit_ingress(
     ctx: &RequestMetadata,
     kernel_fence: &StateFence,
     commit_key: &str,
+    deadline_unix_ms: u64,
+    cancellation_id: String,
 ) -> Result<RequestIdentity, ExperienceDriverError> {
     ctx.validate().map_err(|_| ExperienceDriverError::Ingress {
         field: "request_metadata",
@@ -661,34 +665,51 @@ pub fn derive_commit_ingress(
             reason: "owner-derived commit key is blank or carries control characters",
         });
     }
-    Ok(RequestIdentity {
+    if cancellation_id.trim().is_empty() || cancellation_id.chars().any(char::is_control) {
+        return Err(ExperienceDriverError::Ingress {
+            field: "cancellation_id",
+            reason: "edge cancellation scope is blank or carries control characters",
+        });
+    }
+    let identity = RequestIdentity {
         request: RequestBinding {
             metadata: ctx.clone(),
             state_fence: ctx.state_fence.clone(),
         },
         idempotency_key: commit_key.to_owned(),
-        deadline_unix_ms: super::unix_ms().saturating_add(COMMIT_INGRESS_DEADLINE_MS),
-        cancellation_id: format!("{commit_key}:cancel"),
-    })
+        deadline_unix_ms,
+        cancellation_id,
+    };
+    identity.validate().map_err(|_| ExperienceDriverError::Ingress {
+        field: "request_identity",
+        reason: "derived ingress identity is invalid",
+    })?;
+    Ok(identity)
 }
 
 /// Terminal commit entry: admitted event records to durable rows.
 ///
-/// O1 trigger seam (transcription-ready): the O1 copy transcribes this
-/// exact entry plus [`derive_commit_ingress`] and
-/// [`ExperienceCommitOutput`]; the read entry
-/// ([`run_experience_quality_event`]) is unchanged and stays read-only.
-/// Checklist for the O1 copy:
-/// - call with the SAME decoded record slices the read entry consumed
-///   (bank/feedback range payloads already digest re-proved upstream);
-/// - pass `event.scope_id` verbatim; scope/record mismatch fails closed
-///   in the commit caller with an exact owner error;
-/// - pass edge-supplied live head expectations when held, else empty
-///   vectors (no expectations are fabricated here);
-/// - per-record receipts return in input order; a mid-batch failure
-///   returns `Err` while already-durable receipts stay durable under
-///   their deterministic idempotency keys, so retry is convergent and
-///   never double-persists.
+/// O1 trigger seam: call with the SAME decoded record slices the read
+/// entry consumed (bank/feedback range payloads already digest re-proved
+/// upstream); pass `event.scope_id` verbatim (scope/record mismatch fails
+/// closed in the commit caller with an exact owner error); pass
+/// edge-supplied live head expectations when held, else empty vectors (no
+/// expectations are fabricated here); pass the trigger-edge commit
+/// deadline (`commit_deadline_unix_ms`, the edge-owned lifecycle bound —
+/// the per-record cancellation scope derives deterministically from each
+/// owner-derived commit key as `{key}:cancel` and is shape-validated by
+/// `derive_commit_ingress`); per-record receipts return in input order —
+/// a mid-batch failure returns `Err` while already-durable receipts stay
+/// durable under their deterministic idempotency keys, so retry is
+/// convergent and never double-persists.
+///
+/// `&self` throughout: the composition borrows shared, so an
+/// `Arc`-held trigger calls this with no lock and no restructuring.
+/// Post-commit view refresh is NOT performed here by construction —
+/// the mutably-held owning context runs
+/// [`DaemonComposition::refresh_dependent_view`] on its own discipline
+/// afterwards; until then projections may lag the durable store (the
+/// receipts themselves are durable and convergent).
 ///
 /// Runs, in source terms: ledger rebuild from the admitted slices (only
 /// the greatest admitted revision per handle passes the owner
@@ -702,13 +723,14 @@ pub fn derive_commit_ingress(
 /// receipt identities, blanks dropped); nothing is inferred.
 #[allow(clippy::too_many_arguments)]
 pub async fn commit_experience_event_records(
-    composition: &mut DaemonComposition,
+    composition: &DaemonComposition,
     ctx: &RequestMetadata,
     event: &ExperienceQualityEvent<'_>,
     bank_records: &[ExperienceBankRecord],
     feedback_records: &[AgentFeedbackRecord],
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    commit_deadline_unix_ms: u64,
 ) -> Result<ExperienceCommitOutput, ExperienceDriverError> {
     ctx.validate().map_err(|_| ExperienceDriverError::Ingress {
         field: "request_metadata",
@@ -736,7 +758,13 @@ pub async fn commit_experience_event_records(
         let commit_key = produce_bank_commit(&ledger, record)
             .map_err(ExperienceDriverError::Governor)?
             .idempotency_key;
-        let identity = derive_commit_ingress(ctx, &kernel_fence, &commit_key)?;
+        let identity = derive_commit_ingress(
+            ctx,
+            &kernel_fence,
+            &commit_key,
+            commit_deadline_unix_ms,
+            format!("{commit_key}:cancel"),
+        )?;
         let receipt = composition
             .commit_experience_bank_record(
                 &identity,
@@ -756,7 +784,13 @@ pub async fn commit_experience_event_records(
         let commit_key = produce_feedback_commit(&ledger, record)
             .map_err(ExperienceDriverError::Governor)?
             .idempotency_key;
-        let identity = derive_commit_ingress(ctx, &kernel_fence, &commit_key)?;
+        let identity = derive_commit_ingress(
+            ctx,
+            &kernel_fence,
+            &commit_key,
+            commit_deadline_unix_ms,
+            format!("{commit_key}:cancel"),
+        )?;
         let receipt = composition
             .commit_experience_feedback_record(
                 &identity,

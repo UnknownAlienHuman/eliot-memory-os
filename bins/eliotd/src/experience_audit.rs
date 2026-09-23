@@ -40,11 +40,10 @@
 //! (zero revisions filtered — the owner validator rejects them) while
 //! ordering expectations pass empty until an ordering-head supplier exists
 //! (the commit checklist permits empty vectors, never fabricated ones).
-//! The commit entry fires from the same gate once M1 narrows its `&mut`
-//! borrow (CONTROL handoff): an `Arc`-held composition cannot lend `&mut`,
-//! and the underlying canonical commit is already `&self` (only the
-//! refresh/stale mark needs exclusivity). Until then the read entry —
-//! already `&self` — is the firing call.
+//! The commit entry runs `&self`-clean through narrowed forwarders with
+//! the refresh discipline separated (`refresh_dependent_view` runs on the
+//! mutably-held owning context; the Arc-held trigger re-checks fence
+//! currency after commits instead of silently skipping staleness).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -73,7 +72,7 @@ use crate::attempt_execution_chain::{
 };
 use crate::experience_runtime::{
     ExperienceBankEventInputs, ExperienceFeedbackEventInputs, ExperienceQualityEvent,
-    run_experience_quality_event,
+    commit_experience_event_records, run_experience_quality_event,
 };
 use crate::{DaemonComposition, DaemonKernelClient};
 
@@ -271,13 +270,14 @@ fn correlation_ms() -> u64 {
 /// exact absent owner and resolves to `None` until its supplier lane
 /// lands); then, on a complete resolution, scope-bound range fetch with
 /// readback verification, owner decode into the shared record slices,
-/// live revision-head expectations, event assembly, and the read entry,
-/// projecting the reviewed candidate observably. Anything missing idles
-/// as pending with exact owners. Deterministic and side-effect free
-/// except for the live owner/bridge reads plus, on a complete event, the
-/// read entry's own bridge reads; mutates nothing. The commit entry fires
-/// from the same gate once M1 narrows its `&mut` borrow (CONTROL
-/// handoff).
+/// live revision-head expectations, event assembly, the read entry, and
+/// the commit entry with the shared decoded slices, projecting the
+/// reviewed candidate plus commit receipts observably. Anything missing
+/// idles as pending with exact owners. Deterministic and side-effect
+/// free except for the live owner/bridge reads plus, on a complete
+/// event, the read entry's own bridge reads and the commit entry's
+/// canonical writes; the trigger itself mutates nothing (view refresh
+/// stays with the mutably-held owning context).
 pub async fn evaluate_experience_audit(
     kernel: &Arc<DaemonKernelClient>,
     composition: &DaemonComposition,
@@ -573,31 +573,76 @@ pub async fn evaluate_experience_audit(
     // inside the entry; nothing partial emits as complete and nothing
     // persists. The output projects observably with bounded identities;
     // failures record with identities preserved and never fail the
-    // activation loop. The commit entry
-    // (`commit_experience_event_records` with the shared decoded slices
-    // plus live revision expectations and empty ordering expectations)
-    // fires from this same gate once M1 narrows its `&mut` borrow.
-    match run_experience_quality_event(composition, kernel, &context, &event).await {
-        Ok(output) => {
-            tracing::info!(
-                assessment = %crate::diagnostics::sanitize_identity(
-                    output.candidate.assessment_id.as_str()
-                ),
-                candidate_digest = %output.candidate.digest,
-                journal_present = output.journal_view.is_some(),
-                bank_withheld = output.bank_withheld.len(),
-                feedback_withheld = output.feedback_withheld.len(),
-                bank_records = bank_records.len(),
-                feedback_records = feedback_records.len(),
-                "experience audit completed with reviewed candidate",
-            );
-            ExperienceAuditOutcome::Completed
-        }
+    // activation loop.
+    //
+    // Edge-owned commit lifecycle bound: the trigger edge owns its
+    // lifecycle scope per the ingress design (deadline/cancellation
+    // arrive explicit from the edge, never minted owner-side). The bound
+    // mirrors the established daemon Kernel-client ingress precedent
+    // (30s window): it bounds this run only, proves nothing, and carries
+    // no authority — admission stays with fence agreement plus the
+    // owner-derived commit keys and downstream owner checks.
+    const TRIGGER_COMMIT_LIFECYCLE_MS: u64 = 30_000;
+    let commit_deadline_unix_ms = correlation_ms().saturating_add(TRIGGER_COMMIT_LIFECYCLE_MS);
+    let output = match run_experience_quality_event(composition, kernel, &context, &event).await {
+        Ok(output) => output,
         Err(error) => {
-            ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+            return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
                 owner: "experience driver",
                 reason: error.to_string(),
-            })
+            });
         }
+    };
+    // Terminal commit entry: the SAME decoded record slices the read
+    // entry consumed, re-committed with live revision expectations and
+    // empty ordering expectations. Per-record receipts return in input
+    // order under deterministic idempotency keys; a mid-batch failure
+    // fails closed with identities preserved while already-durable
+    // receipts stay durable (retry is convergent, never double-persists).
+    let commit = match commit_experience_event_records(
+        composition,
+        &context,
+        &event,
+        &bank_records,
+        &feedback_records,
+        revision_expectations,
+        Vec::new(),
+        commit_deadline_unix_ms,
+    )
+    .await
+    {
+        Ok(commit) => commit,
+        Err(error) => {
+            return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                owner: "experience commit",
+                reason: error.to_string(),
+            });
+        }
+    };
+    // Post-commit fence currency: an Arc-held trigger cannot refresh the
+    // dependent view itself (no `&mut`), so staleness is handled
+    // explicitly instead of silently skipped — re-read the live fence
+    // and fail closed on drift. Committed receipts stay durable under
+    // their idempotency keys; the next tick retries convergently and the
+    // mutably-held owning context runs `refresh_dependent_view` on its
+    // own discipline.
+    let post_fence = supply_live_kernel_fence(kernel);
+    if !fences_match_exact(&post_fence, &context.state_fence) {
+        return ExperienceAuditOutcome::Failed(ExecutionChainError::StaleAdmissionFence);
     }
+    tracing::info!(
+        assessment = %crate::diagnostics::sanitize_identity(
+            output.candidate.assessment_id.as_str()
+        ),
+        candidate_digest = %output.candidate.digest,
+        journal_present = output.journal_view.is_some(),
+        bank_withheld = output.bank_withheld.len(),
+        feedback_withheld = output.feedback_withheld.len(),
+        bank_records = bank_records.len(),
+        feedback_records = feedback_records.len(),
+        bank_committed = commit.bank_receipts.len(),
+        feedback_committed = commit.feedback_receipts.len(),
+        "experience audit completed with reviewed candidate and committed records",
+    );
+    ExperienceAuditOutcome::Completed
 }

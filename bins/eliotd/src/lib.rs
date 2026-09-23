@@ -448,17 +448,18 @@ impl DaemonComposition {
     }
 
     /// Commits one ledger-sequenced experience-bank record through the
-    /// canonical Governor experience-commit caller, then publishes the
-    /// resulting owner change.
+    /// canonical Governor experience-commit caller.
     ///
-    /// Same refresh/stale discipline as
-    /// [`Self::commit_canonical_and_refresh`]: the receipt is returned
-    /// unmodified and a failed refresh marks the dependent view
-    /// stale/pending instead of hiding divergence. The identity must be
-    /// admitted ingress agreeing with the record (fence, scope,
-    /// idempotency); the owner re-validates everything downstream.
+    /// `&self`-clean commit path for `Arc`-held trigger contexts: the
+    /// receipt is returned unmodified with no view refresh performed
+    /// here. The mutably-held owning context runs
+    /// [`Self::refresh_dependent_view`] on its own discipline afterwards;
+    /// until then projections read through the composition may lag the
+    /// durable store. The identity must be admitted ingress agreeing with
+    /// the record (fence, scope, idempotency); the owner re-validates
+    /// everything downstream.
     pub async fn commit_experience_bank_record(
-        &mut self,
+        &self,
         identity: &eliot_protocol::RequestIdentity,
         ledger: &eliot_observation::bank_admission::ExperienceRevisionLedger,
         record: &eliot_observation_contracts::ExperienceBankRecord,
@@ -467,7 +468,7 @@ impl DaemonComposition {
         expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
         expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
     ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
-        let receipt = eliot_governor::commit_experience_bank(
+        Ok(eliot_governor::commit_experience_bank(
             &self.governor,
             identity,
             ledger,
@@ -478,18 +479,14 @@ impl DaemonComposition {
             expected_ordering_heads,
         )
         .await
-        .map_err(DaemonError::Composition)?;
-        if self.governor.refresh_from_kernel().is_err() {
-            self.view_stale = true;
-        }
-        Ok(receipt)
+        .map_err(DaemonError::Composition)?)
     }
 
     /// Commits one ledger-sequenced agent-feedback record through the
-    /// canonical Governor experience-commit caller. Same refresh/stale
-    /// rule as [`Self::commit_experience_bank_record`].
+    /// canonical Governor experience-commit caller. Same separated
+    /// refresh discipline as [`Self::commit_experience_bank_record`].
     pub async fn commit_experience_feedback_record(
-        &mut self,
+        &self,
         identity: &eliot_protocol::RequestIdentity,
         ledger: &eliot_observation::bank_admission::ExperienceRevisionLedger,
         record: &eliot_observation_contracts::AgentFeedbackRecord,
@@ -498,7 +495,7 @@ impl DaemonComposition {
         expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
         expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
     ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
-        let receipt = eliot_governor::commit_experience_feedback(
+        Ok(eliot_governor::commit_experience_feedback(
             &self.governor,
             identity,
             ledger,
@@ -509,11 +506,7 @@ impl DaemonComposition {
             expected_ordering_heads,
         )
         .await
-        .map_err(DaemonError::Composition)?;
-        if self.governor.refresh_from_kernel().is_err() {
-            self.view_stale = true;
-        }
-        Ok(receipt)
+        .map_err(DaemonError::Composition)?)
     }
     /// Submits one candidate finish through the Governor owner, commits the
     /// derived decision through the canonical `RecordFinishDecision` path,
@@ -571,6 +564,28 @@ impl DaemonComposition {
             })?;
         let draft = finish_draft_from_agent_api_v7(task_id, expected_task_revision, result);
         self.finish_attempt(identity, operation_id, draft).await
+    }
+
+    /// Refreshes Governor owners from the Kernel snapshot, marking the
+    /// dependent view stale/pending when the refresh fails.
+    ///
+    /// Separated refresh discipline for commit paths that cannot hold
+    /// `&mut self` at the call site (notably Arc-held trigger contexts):
+    /// those paths return durable receipts without refreshing, and the
+    /// owning context runs this call on its own mutably-held discipline
+    /// afterwards. Failure semantics match
+    /// [`Self::commit_canonical_and_refresh`]: the error is recorded in
+    /// `view_stale` (surfaced via health/status as `"stale"`), never
+    /// swallowed silently and never promoted to a write failure. Until
+    /// this runs, projections read through this composition may lag the
+    /// durable store; callers must not treat an unrefreshed view as
+    /// current.
+    pub fn refresh_dependent_view(&mut self) -> Result<(), DaemonError> {
+        if let Err(error) = self.governor.refresh_from_kernel() {
+            self.view_stale = true;
+            return Err(DaemonError::Composition(error));
+        }
+        Ok(())
     }
 
     /// Returns the admitted Kernel snapshot.
