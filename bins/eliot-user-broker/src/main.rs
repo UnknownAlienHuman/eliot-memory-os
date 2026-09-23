@@ -94,10 +94,18 @@ fn main() {
         &eliot_user_broker::LiveNotifyFallbackEffects,
     );
     let fallback_status = fallback.status_value();
+    // Normal-launch staging for the installer-published Notify declaration:
+    // best-effort and infallible by design, so staging can never fail broker
+    // startup. `Staged` means this broker verified it can name the exact
+    // installed `eliot-notify.exe` for later Kernel-approved grants;
+    // per-notification spawn stays on the `composition.launch` path.
+    let notify_launch = eliot_user_broker::stage_normal_notify_launch(&composition);
+    let notify_launch_status = notify_launch.status_value();
     let mut readiness = serde_json::to_value(composition.readiness())
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
     if let Value::Object(map) = &mut readiness {
         map.insert("notify_fallback".to_owned(), fallback_status.clone());
+        map.insert("notify_launch".to_owned(), notify_launch_status.clone());
     }
     if !write_message(&Message::Ready { readiness }) {
         return;
@@ -139,7 +147,12 @@ fn main() {
         };
         let response = match input_result {
             Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => dispatch(&mut composition, &line, &fallback_status),
+            Ok(line) => dispatch(
+                &mut composition,
+                &line,
+                &fallback_status,
+                &notify_launch_status,
+            ),
             Err(error) => Message::Error {
                 code: "INPUT_FAILURE",
                 detail: error,
@@ -225,6 +238,7 @@ fn dispatch(
     composition: &mut BrokerComposition,
     line: &str,
     fallback_status: &Value,
+    notify_launch_status: &Value,
 ) -> Message {
     let request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
@@ -274,6 +288,10 @@ fn dispatch(
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
             if let Value::Object(map) = &mut readiness {
                 map.insert("notify_fallback".to_owned(), fallback_status.clone());
+                map.insert(
+                    "notify_launch".to_owned(),
+                    notify_launch_status.clone(),
+                );
             }
             Message::Ready { readiness }
         }

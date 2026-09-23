@@ -67,6 +67,7 @@ mod supervision_lease_load;
 mod watchdog_admission;
 mod watchdog_composition;
 mod watchdog_config;
+pub mod watchdog_fallback_composition;
 mod watchdog_fallback_envelope;
 mod watchdog_publication_readback;
 mod watchdog_spool;

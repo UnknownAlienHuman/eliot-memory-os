@@ -34,12 +34,17 @@ use thiserror::Error;
 
 mod kernel_authority_port;
 mod notify_fallback_ensure;
+pub mod notify_launch_callin;
 mod operation_identity;
 mod protected_launch_config;
 use kernel_authority_port::KernelAuthorityPort;
 pub use notify_fallback_ensure::{
     LiveNotifyFallbackEffects, NotifyFallbackEffects, NotifyFallbackEnsure,
     NotifyFallbackRegistration, ensure_notify_fallback_registered,
+};
+pub use notify_launch_callin::{
+    BrokerNotifyError, NotifyLaunchStage, VerifiedLaunchRef, resolve_broker_notify_launch,
+    stage_normal_notify_launch,
 };
 use operation_identity::{IssuerHandle, OperationIdentityIssuer};
 use protected_launch_config::{
@@ -784,6 +789,45 @@ impl BrokerComposition {
         self.broker.logoff().map_err(CompositionError::Recovery)?;
         self.registration_digest = None;
         Ok(())
+    }
+
+    /// Stages broker-bound Notify normal-launch inputs for one grant.
+    ///
+    /// Thin projection over [`resolve_broker_notify_launch`]: the SID/session
+    /// pair comes from this composition's authenticated protected launch
+    /// binding (verified lease first), the declaration bytes are
+    /// caller-injected from the protected lease read at the edge, and the
+    /// Kernel challenge is this composition's Kernel-issued registration
+    /// digest from [`BrokerComposition::self_register`] — never a
+    /// caller-supplied string. Per-notification spawn stays on the
+    /// Kernel-approved [`BrokerComposition::launch`] path: the staged inputs
+    /// feed the Kernel `notify_grant` evidence join, which the central
+    /// composition maps onto `ApprovedLaunch`.
+    pub fn resolve_notify_launch(
+        &self,
+        declaration_bytes: &[u8],
+    ) -> Result<VerifiedLaunchRef, BrokerNotifyError> {
+        self.verify_launch_lease()
+            .map_err(|_| BrokerNotifyError::NotAuthenticated)?;
+        let binding = self
+            .launch_binding
+            .as_ref()
+            .ok_or(BrokerNotifyError::NotAuthenticated)?;
+        let challenge = self
+            .registration_digest
+            .as_deref()
+            .ok_or(BrokerNotifyError::NotAuthenticated)?;
+        let session_id: u32 = binding
+            .registration
+            .interactive_session_id
+            .parse()
+            .map_err(|_| BrokerNotifyError::InvalidIdentity)?;
+        resolve_broker_notify_launch(
+            declaration_bytes,
+            &binding.registration.windows_sid,
+            session_id,
+            challenge,
+        )
     }
 
     /// Heartbeats the protected registration before an admitted launch.

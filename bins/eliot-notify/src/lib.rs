@@ -1049,9 +1049,9 @@ pub fn load_kernel_verification_ports() -> Result<VerificationPorts, NotifyBuild
 }
 
 const FALLBACK_VERIFIER_RELATIVE: &str = "Eliot/notify/watchdog-verification.json";
-const FALLBACK_LEDGER_RELATIVE: &str = "Eliot/notify/watchdog-ledger.json";
+pub(crate) const FALLBACK_LEDGER_RELATIVE: &str = "Eliot/notify/watchdog-ledger.json";
 const FALLBACK_ENVELOPE_RELATIVE: &str = "Eliot/notify/watchdog-fallback-envelope.json";
-const FALLBACK_BYTES_LIMIT: u64 = 64 * 1024;
+pub(crate) const FALLBACK_BYTES_LIMIT: u64 = 64 * 1024;
 const WATCHDOG_OPERATION: &str = "watchdog_fallback_signature";
 const WATCHDOG_OWNER: &str = "X-01";
 const A08_OPERATION: &str = "a08_notification_admission";
@@ -1062,6 +1062,7 @@ const DELIVERY_OWNER: &str = "delivery-receipt-verifier";
 pub mod automation_notification_adapter;
 mod fallback_verification;
 pub mod installed_binary;
+pub mod no_session_persist;
 pub mod notify_declaration;
 pub mod notify_launch;
 pub mod operation_identity;
@@ -1082,6 +1083,23 @@ pub use notify_declaration::{
 };
 pub use notify_launch::{NotifyLaunchError, VerifiedNotifyLaunch, resolve_notify_launch_inputs};
 
+/// Records a no-session/control-loss observation, then builds the fail-closed
+/// fallback error. Adapter loss degrades delivery only; canonical state is
+/// never resolved on this path (I11.6).
+fn no_session_fallback_error(condition: &str, detail: String) -> NotifyBuildError {
+    let _outcome = crate::no_session_persist::record_no_session(condition);
+    NotifyBuildError::Fallback(detail)
+}
+
+/// Fail-closed error for an interactive SID/session mismatch against the
+/// installer declaration. The fixed message names no paths or payloads.
+fn sid_session_mismatch_error(condition: &str) -> NotifyBuildError {
+    no_session_fallback_error(
+        condition,
+        "current interactive SID/session does not match installer declaration".to_owned(),
+    )
+}
+
 /// Registers the installer-owned X-01 fallback task for the current
 /// interactive user.  The task receives no stdin and no caller-selected
 /// request; its only action is the fixed `--watchdog-fallback` launch.
@@ -1089,19 +1107,18 @@ pub fn register_watchdog_fallback_task() -> Result<WatchdogTaskRegistrationRecei
 {
     let material = load_fallback_material()?;
     #[cfg(not(windows))]
-    return Err(NotifyBuildError::Fallback(
+    return Err(no_session_fallback_error(
+        "register:no-session",
         "Watchdog Task Scheduler registration requires Windows".to_owned(),
     ));
     #[cfg(windows)]
     {
         let identity = current_process_named_pipe_expectation()
-            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+            .map_err(|error| no_session_fallback_error("register:no-session", error.to_string()))?;
         if identity.expected_sid() != material.declaration.interactive_user_sid
             || identity.expected_session_id() != material.declaration.interactive_session_id
         {
-            return Err(NotifyBuildError::Fallback(
-                "current interactive SID/session does not match installer declaration".to_owned(),
-            ));
+            return Err(sid_session_mismatch_error("register:no-session"));
         }
         let executable = PathBuf::from(&material.declaration.notify_executable);
         let executable =
@@ -1133,19 +1150,18 @@ pub fn register_watchdog_fallback_task() -> Result<WatchdogTaskRegistrationRecei
 pub fn activate_watchdog_fallback_task() -> Result<WatchdogTaskRunReceipt, NotifyBuildError> {
     let material = load_fallback_material()?;
     #[cfg(not(windows))]
-    return Err(NotifyBuildError::Fallback(
+    return Err(no_session_fallback_error(
+        "activate:no-session",
         "Watchdog Task Scheduler activation requires Windows".to_owned(),
     ));
     #[cfg(windows)]
     {
         let identity = current_process_named_pipe_expectation()
-            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+            .map_err(|error| no_session_fallback_error("activate:no-session", error.to_string()))?;
         if identity.expected_sid() != material.declaration.interactive_user_sid
             || identity.expected_session_id() != material.declaration.interactive_session_id
         {
-            return Err(NotifyBuildError::Fallback(
-                "current interactive SID/session does not match installer declaration".to_owned(),
-            ));
+            return Err(sid_session_mismatch_error("activate:no-session"));
         }
         let executable = validate_pinned_artifact(
             Path::new(&material.declaration.notify_executable),
@@ -1179,19 +1195,18 @@ pub fn load_watchdog_fallback_request()
 -> Result<(SignedWatchdogFallbackEnvelope, NotificationRequest), NotifyBuildError> {
     let material = load_fallback_material()?;
     #[cfg(not(windows))]
-    return Err(NotifyBuildError::Fallback(
+    return Err(no_session_fallback_error(
+        "load:no-session",
         "Watchdog fallback requires an interactive Windows session".to_owned(),
     ));
     #[cfg(windows)]
     {
         let identity = current_process_named_pipe_expectation()
-            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+            .map_err(|error| no_session_fallback_error("load:no-session", error.to_string()))?;
         if identity.expected_sid() != material.declaration.interactive_user_sid
             || identity.expected_session_id() != material.declaration.interactive_session_id
         {
-            return Err(NotifyBuildError::Fallback(
-                "current interactive SID/session does not match installer declaration".to_owned(),
-            ));
+            return Err(sid_session_mismatch_error("load:no-session"));
         }
         validate_pinned_artifact(
             Path::new(&material.declaration.notify_executable),
