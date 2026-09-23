@@ -77,18 +77,20 @@
 //! influence mutation, epistemic promotion, score/verdict emission, or
 //! retention-policy invention (see `resolve_retention_read`).
 //!
-//! ContractChallenge note (F2, scope-free store reads): the range
-//! handlers in both backends gate on fence only and deliberately do not
-//! filter rows by scope, because memory command rows carry scope while
-//! surreal evidence rows do not — store-level scope filtering would
-//! diverge the contours and silently drop scope-free gap/control
-//! material the consumer must see. Scope gating lives with the consumer
-//! (provider event-scope filter plus Governor envelope-scope
-//! revalidation). If a future Governor-facade rule requires store-level
-//! scope filtering, that rule and its row-shape changes belong to the
-//! facade owner (eliot-read, #1119 lineage) with a contour-parity proof
-//! across both backends — this package silently adopting or editing the
-//! facade is explicitly out of scope.
+//! F2 resolution (implemented rule, not a challenge): audit-range reads
+//! are scope-free at the store catalogue (`SCOPE_KIND_NONE`,
+//! `requires_scope_id: false`) while the Governor facade requires a
+//! caller scope (`requires_scope` arm, pre-existing) — the `GetMailbox`
+//! precedent, where the two flags answer different questions (row
+//! addressing vs caller context). I12-26 evaluates scope and fence at
+//! the retrieval decision layer, and the coordinated consumer filters
+//! by event scope itself while carrying scope-free records regardless;
+//! store-level scope filtering would diverge the memory/surreal
+//! contours (command rows carry scope, evidence rows do not) and drop
+//! records the consumer must see. Facade, catalogue, daemon plan (which
+//! always sends a scope), and provider shaping are mutually compatible
+//! as they stand — no layer changes. Bank/feedback reads stay genuinely
+//! scope-addressed and unchanged.
 
 use std::collections::BTreeMap;
 
