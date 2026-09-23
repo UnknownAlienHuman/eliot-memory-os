@@ -44,8 +44,9 @@ use eliot_learning_contracts::HarnessActivationReceiptCandidate;
 use eliot_observation::{
     GovernorObservationError,
     bank_admission::{
-        assemble_bank_projection, assemble_feedback_projection, parse_bank_record,
-        parse_feedback_record,
+        BankStoreSnapshot, ExperienceRevisionLedger, FeedbackStoreSnapshot,
+        bank_records_from_range_payload, feedback_records_from_range_payload,
+        supply_bank_projection_from_store, supply_feedback_projection_from_store,
     },
 };
 use eliot_observation_contracts::{
@@ -220,11 +221,12 @@ pub async fn produce_journal_projection(
     .map_err(ExperienceDriverError::Provider)
 }
 
-/// Bank-family event inputs: verbatim durable documents plus the read
+/// Bank-family event inputs: durable range payload plus the read
 /// context the edge owns.
 pub struct ExperienceBankEventInputs {
-    /// Verbatim record documents from the durable bank read payload.
-    pub documents: Vec<String>,
+    /// Verbatim durable range payload (`records` array of wrapper rows or
+    /// owner-held bare documents) from the bank range read.
+    pub payload: serde_json::Value,
     /// Stable identity minted by the caller for the bank envelope.
     pub projection_id: ArtifactId,
     /// Owner revision marker read at, supplied with the durable read.
@@ -240,8 +242,8 @@ pub struct ExperienceBankEventInputs {
 
 /// Feedback-family event inputs. Same durable-read rule as bank.
 pub struct ExperienceFeedbackEventInputs {
-    /// Verbatim record documents from the durable feedback read payload.
-    pub documents: Vec<String>,
+    /// Verbatim durable range payload from the feedback range read.
+    pub payload: serde_json::Value,
     /// Stable identity minted by the caller for the feedback envelope.
     pub projection_id: ArtifactId,
     /// Owner revision marker read at, supplied with the durable read.
@@ -314,17 +316,19 @@ pub struct ExperienceQualityEventOutput {
 ///
 /// Runs the full connected runtime path in source terms: TRUE position
 /// bridge read, optional journal bridge leg with live presence binding,
-/// bank/feedback document parse with digest re-proof
-/// ([`parse_bank_record`] / [`parse_feedback_record`]), owner envelope
-/// assembly ([`assemble_bank_projection`] /
-/// [`assemble_feedback_projection`]), provider view shaping with
-/// retention postures and live revalidation, then the consuming call
+/// bank/feedback range-payload consume through the owner supply drivers
+/// ([`supply_bank_projection_from_store`] /
+/// [`supply_feedback_projection_from_store`]: wrapper-aware decode with
+/// digest re-proof, retention gating, per-ref snapshot resolution),
+/// provider view shaping with retention postures and live revalidation,
+/// then the consuming call
 /// ([`assess_and_recheck`](eliot_experience_provider::assess_and_recheck)):
 /// assess over true owner envelopes plus edge receipts, immediately
-/// re-resolved against the same inputs plus edge attestation. Any drift,
-/// malformation, withheld-but-uncited material, or missing family fails
-/// closed; nothing partial is emitted as complete and nothing is
-/// persisted or submitted by this entry.
+/// re-resolved against the same inputs plus edge attestation. The ledger
+/// is ephemeral per run (rebuilt from decoded records, no durable
+/// state). Any drift, malformation, withheld-but-uncited material, or
+/// missing family fails closed; nothing partial is emitted as complete
+/// and nothing is persisted or submitted by this entry.
 #[allow(clippy::too_many_lines)]
 pub async fn run_experience_quality_event(
     composition: &DaemonComposition,
@@ -359,18 +363,21 @@ pub async fn run_experience_quality_event(
         }
         None => (None, None),
     };
-    let mut bank_records = Vec::with_capacity(event.bank.documents.len());
-    for document in &event.bank.documents {
-        bank_records.push(parse_bank_record(document)?);
-    }
-    let bank_live = assemble_bank_projection(
+    let mut ledger = ExperienceRevisionLedger::new();
+    let bank_records = bank_records_from_range_payload(&event.bank.payload)?;
+    let bank_live = supply_bank_projection_from_store(
+        &mut ledger,
+        BankStoreSnapshot {
+            records: &bank_records,
+            source_revision: event.bank.source_revision.clone(),
+            coverage: event.bank.coverage.clone(),
+            omissions: event.bank.omissions.clone(),
+        },
         event.bank.projection_id.clone(),
         event.scope.clone(),
         ctx.state_fence.clone(),
-        event.bank.source_revision.clone(),
-        &bank_records,
-        event.bank.coverage.clone(),
-        event.bank.omissions.clone(),
+        event.schedule,
+        event.holds,
     )?;
     let bank_shaped = eliot_experience_provider::shape_bank_view(
         &BankShapeInputs {
@@ -385,18 +392,20 @@ pub async fn run_experience_quality_event(
             },
         },
     )?;
-    let mut feedback_records = Vec::with_capacity(event.feedback.documents.len());
-    for document in &event.feedback.documents {
-        feedback_records.push(parse_feedback_record(document)?);
-    }
-    let feedback_live = assemble_feedback_projection(
+    let feedback_records = feedback_records_from_range_payload(&event.feedback.payload)?;
+    let feedback_live = supply_feedback_projection_from_store(
+        &mut ledger,
+        FeedbackStoreSnapshot {
+            records: &feedback_records,
+            source_revision: event.feedback.source_revision.clone(),
+            coverage: event.feedback.coverage.clone(),
+            omissions: event.feedback.omissions.clone(),
+        },
         event.feedback.projection_id.clone(),
         event.scope.clone(),
         ctx.state_fence.clone(),
-        event.feedback.source_revision.clone(),
-        &feedback_records,
-        event.feedback.coverage.clone(),
-        event.feedback.omissions.clone(),
+        event.schedule,
+        event.holds,
     )?;
     let feedback_shaped = eliot_experience_provider::shape_feedback_view(
         &FeedbackShapeInputs {
