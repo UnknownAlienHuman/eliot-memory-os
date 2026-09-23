@@ -142,6 +142,12 @@ pub enum ExecutionChainError {
     /// The admission fence is not current against the live fence.
     #[error("admission fence is not current against the live fence")]
     StaleAdmissionFence,
+    /// The retained Governor resolution fails its own integrity validation
+    /// (wire identity/version, canonical digest recompute, or disposition
+    /// shape), so no field of it may be consumed — not even its
+    /// disposition.
+    #[error("retained Governor resolution fails its integrity validation")]
+    RetainedResolutionInvalid,
     /// The adapter supplier rejected the bind inputs.
     #[error("execution-unit supplier rejected: {0}")]
     Supplier(#[from] CodexAdapterError),
@@ -836,17 +842,19 @@ pub enum GovernedDispatchOutcome {
 }
 
 /// Validate one retained Governor resolution against live owners: the
-/// resolution's own admission fence first (it may only be consumed under the
-/// exact live fence it was admitted under), then admitted session/task text
-/// into canonical types, session agreement with the live Kernel session (the
-/// daemon serves a single live owner session), then live Governor
+/// record's own integrity first (it may only be read after it re-validates),
+/// then the resolution's own admission fence (it may only be consumed under
+/// the exact live fence it was admitted under), then admitted session/task
+/// text into canonical types, session agreement with the live Kernel session
+/// (the daemon serves a single live owner session), then live Governor
 /// task-record currency (fence agreement plus owner-defined
 /// non-terminality). Task, principal, scope, and plan are observed and
 /// traced — no independent live task/principal read exists in daemon scope,
 /// so they are never asserted, only recorded. The owner's revision counter
 /// is observed only: it has no canonical text rendering in-tree, so it is
 /// never compared against owner-minted revision text. Non-Resolved
-/// dispositions carry no admission signal and pass through untouched.
+/// dispositions carry no admission signal and pass through untouched once
+/// the record itself validates.
 fn check_activation_admission(
     composition: &DaemonComposition,
     activation: Option<&AgentActivationResolutionResult>,
@@ -856,6 +864,17 @@ fn check_activation_admission(
     let Some(result) = activation else {
         return Ok(());
     };
+    // Integrity of the retained artifact before any consumption — even the
+    // disposition read below: wire identity/version, canonical digest
+    // recompute, and disposition shape. A refused record never reaches
+    // fence, triple, or task-record validation, and non-Resolved records
+    // are not exempt: corruption is reported with identities preserved,
+    // never silently passed through. Fires only on retained-memory
+    // corruption or resolver-contract drift; a freshly resolved record
+    // re-validates deterministically.
+    result
+        .validate()
+        .map_err(|_| ExecutionChainError::RetainedResolutionInvalid)?;
     let AgentActivationResolutionDisposition::Resolved { binding } = &result.disposition else {
         return Ok(());
     };
@@ -919,6 +938,19 @@ fn check_activation_admission(
 /// interface-only success. Absence of dispatchable work is a normal idle
 /// outcome, never an error, and execution-plane failures must never fail the
 /// activation loop that hosts this poll.
+///
+/// Shared revision-contract conformance (O1 binding; M1/Read bind the same
+/// disciplines on their feeds): suppliers resolve from their owners only
+/// (the six sources above; absent suppliers idle with a named decline, never
+/// fabricated at the call site); the retained record re-validates through
+/// its canonical digest before any consumption and presented bundles bind
+/// their digests through attach, admit, and the sealed verifier; exactly one
+/// acquisition runs per retained bundle (the resolution is consumed once and
+/// the coordinator bind stays idempotent under canonical-input replay); a
+/// stale fence fails closed as `Failed` without failing the loop (the next
+/// tick reclaims, which is the refresh arm); terminality and staleness are
+/// read only from owner signals (the task record's `is_active`, record and
+/// resolution fence agreement), never inferred.
 ///
 /// Unknown/replay/cancellation preservation: the poll mutates nothing
 /// itself; the coordinator bind stays idempotent under canonical-input
