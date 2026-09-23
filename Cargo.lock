@@ -1060,7 +1060,9 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-reactive-context-plan",
  "eliot-receipts",
+ "serde",
 ]
 
 [[package]]
@@ -1796,6 +1798,7 @@ dependencies = [
  "eliot-canonical",
  "eliot-change-monitor",
  "eliot-config",
+ "eliot-context-admission",
  "eliot-context-candidates",
  "eliot-contracts",
  "eliot-coordination",
