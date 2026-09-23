@@ -476,10 +476,60 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
+        self.execute_daemon_request_observed(session, request_id, operation, payload, None)
+            .await
+    }
+
+    /// Executes one daemon request with the identity admitted on the same
+    /// front-door frame.  The compatibility wrapper above remains available
+    /// to non-semantic lifecycle callers, but UserAutomation production
+    /// ingress uses this method so the route can bind owner provenance to the
+    /// authenticated request rather than to the daemon peer alone.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_daemon_request_with_identity(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        request_identity: RequestIdentity,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<Frame, TransportError> {
+        request_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if request_identity.request.metadata.request_id != request_id
+            || request_identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        self.execute_daemon_request_observed(
+            session,
+            request_id,
+            operation,
+            payload,
+            Some(request_identity),
+        )
+        .await
+    }
+
+    async fn execute_daemon_request_observed(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        operation: &str,
+        payload: serde_json::Value,
+        request_identity: Option<RequestIdentity>,
+    ) -> Result<Frame, TransportError> {
         observe_daemon_request("kernel.daemon_request_received", "attempt");
         observe_daemon_operation(trusted_daemon_operation(operation), "received");
         let result = self
-            .execute_daemon_request_inner(session, request_id, operation, &payload)
+            .execute_daemon_request_inner(
+                session,
+                request_id,
+                operation,
+                &payload,
+                request_identity.as_ref(),
+            )
             .await;
         match &result {
             Ok(_) => {
@@ -508,6 +558,7 @@ impl KernelComposition {
         request_id: RequestId,
         operation: &str,
         payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
     ) -> Result<Frame, TransportError> {
         if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER {
             return Err(TransportError::SessionFenced);
@@ -598,7 +649,11 @@ impl KernelComposition {
             }
             #[cfg(windows)]
             USER_AUTOMATION_RUNTIME_OPERATION => {
-                self.user_automation_runtime_operation(session, payload.clone())
+                self.user_automation_runtime_operation(
+                    session,
+                    payload.clone(),
+                    request_identity.ok_or(TransportError::SessionFenced)?,
+                )
                     .await
             }
             "health" => self
@@ -926,7 +981,14 @@ impl KernelComposition {
         &self,
         session: &Session,
         payload: serde_json::Value,
+        request_identity: &RequestIdentity,
     ) -> Result<serde_json::Value, TransportError> {
+        request_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if request_identity.request.state_fence != session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
         let envelope: UserAutomationRuntimeOperation =
             serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
         if envelope.operation != USER_AUTOMATION_RUNTIME_OPERATION {
@@ -940,7 +1002,7 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             };
             return self
-                .user_automation_owner_trigger_operation(session, trigger)
+                .user_automation_owner_trigger_operation(session, trigger, request_identity)
                 .await;
         };
 
@@ -1052,7 +1114,14 @@ impl KernelComposition {
         &self,
         session: &Session,
         trigger: UserAutomationDaemonTrigger,
+        request_identity: &RequestIdentity,
     ) -> Result<serde_json::Value, TransportError> {
+        request_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if request_identity.request.state_fence != session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
         validate_user_automation_trigger_text(&trigger.automation_id, "automation_id")?;
         validate_user_automation_trigger_text(&trigger.requested_revision, "requested_revision")?;
         validate_user_automation_trigger_text(&trigger.manual_nonce, "manual_nonce")?;

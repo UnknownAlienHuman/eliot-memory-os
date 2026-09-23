@@ -521,6 +521,7 @@ impl KernelComposition {
                 }
                 return Ok(KernelFrameAction::Daemon {
                     request_id,
+                    request_identity: identity.clone(),
                     operation: operation.to_owned(),
                     payload,
                 });

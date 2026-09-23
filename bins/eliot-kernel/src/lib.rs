@@ -856,6 +856,10 @@ pub enum KernelFrameAction {
     Daemon {
         /// Correlation identity to echo in the response.
         request_id: RequestId,
+        /// Identity admitted on the same daemon frame.  Semantic daemon
+        /// routes must use this server-admitted binding rather than deriving
+        /// provenance from the peer process alone.
+        request_identity: eliot_protocol::RequestIdentity,
         /// Closed operation name from the daemon application wire.
         operation: String,
         /// Bounded operation payload.

@@ -120,6 +120,13 @@ pub struct UserAutomationNamedReadProvenance {
     pub response_state_fence: StateFence,
     /// Store revision heads returned with the named response.
     pub response_revision_heads: Vec<RevisionHead>,
+    /// Digest of the complete Store payload returned for this named read.
+    ///
+    /// Revision heads and the response fence are global observations.  The
+    /// payload digest retains the target row/read projection as well, so a
+    /// current-pointer revalidation can reject a response race even when the
+    /// global head list and StateFence happen to be unchanged.
+    pub response_payload_digest: String,
 }
 
 /// Provenance for the two canonical reads needed to bind a current revision.
@@ -286,6 +293,11 @@ impl<C> CanonicalUserAutomationStore<C> {
             &current_after_response,
         )?;
 
+        let current_before_payload_digest = canonical_payload_digest(&current_response.payload)?;
+        let current_after_payload_digest = canonical_payload_digest(&current_after_response.payload)?;
+        if current_before_payload_digest != current_after_payload_digest {
+            return Err(StoreError::RevisionConflict);
+        }
         if current_response.revision_heads != history_response.revision_heads
             || current_response.revision_heads != current_after_response.revision_heads
         {
@@ -496,7 +508,15 @@ fn owner_read_provenance(
         request_state_fence: request.state_fence.clone(),
         response_state_fence: response.state_fence.clone(),
         response_revision_heads: response.revision_heads.clone(),
+        response_payload_digest: canonical_payload_digest(&response.payload)
+            .expect("validated named-read payload must be canonicalizable"),
     }
+}
+
+fn canonical_payload_digest(payload: &Value) -> Result<String, StoreError> {
+    let bytes = canonical_json_bytes(payload)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
 }
 
 /// Closed automation-state query kinds carried to the store read.
