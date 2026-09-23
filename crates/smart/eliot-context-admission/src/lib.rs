@@ -15,7 +15,8 @@ pub use closure::{ClosureParts, assemble_closure};
 pub use decision::{
     ClassifiedAdmission, ClassificationEvidence, MaterialRankTrace, RetrievalAdmissionDecision,
     RetrievalStaleness, SuppliedWarning, check_plan_revisions, check_retrieval_freshness,
-    classify_admission, trace_material, trace_material_with_warnings,
+    classify_admission, derive_candidate_warnings, derive_input_warnings,
+    trace_material, trace_material_with_warnings,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -149,8 +150,11 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///    fabricated at the call site.
 /// 2. Validate the plan fail-closed through its canonical digest, then run
 ///    the plan-against-input revision comparison
-///    ([`check_plan_revisions`]) before calling; a refused plan or a
-///    revision-mismatched closure never reaches selection.
+///    ([`check_plan_revisions`]) before calling: every fence-matching
+///    candidate source needs a plan expectation with the actual revision,
+///    or the drive probes (optional) or stales (floor) instead of
+///    admitting; a refused plan or an unresolvable closure never reaches
+///    selection.
 /// 3. Call exactly once per changed supplier bundle and bind the returned
 ///    pair verbatim: the result and selection digests, the decision
 ///    anchor, and every trace handle with its staleness obligation.
@@ -166,11 +170,13 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///    text only from [`MaterialRankTrace::warning`]; none of these signals
 ///    reclassifies the trace outcome, which [`classify_admission`] alone
 ///    determines.
-/// 6. To admit with owner warning evidence, join through
-///    [`admit_context_traced_with_warnings`] with owner-minted
-///    [`SuppliedWarning`] records (Governor risk, conflict-analysis, or
-///    projection owners); warning text is never synthesized at the call
-///    site.
+/// 6. To admit with owner warning evidence, derive it with
+///    [`derive_input_warnings`] (candidate-owned epistemic qualifications
+///    under the canonical candidate coherence rule) and join through
+///    [`admit_context_traced_with_warnings`], optionally with additional
+///    owner-minted [`SuppliedWarning`] records (projection owners and
+///    successors); warning text is never synthesized at the call site,
+///    and Governor risk tiers never authorise warnings.
 ///
 /// Supplier anchors (this crate): fence arm in [`admit_context`], the
 /// trichotomy gate in [`check_retrieval_freshness`], the plan revision

@@ -1850,7 +1850,6 @@ dependencies = [
  "eliot-canonical",
  "eliot-change-monitor",
  "eliot-config",
- "eliot-context-admission",
  "eliot-context-candidates",
  "eliot-contracts",
  "eliot-coordination",
