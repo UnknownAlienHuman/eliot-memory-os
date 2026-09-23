@@ -61,11 +61,12 @@ use eliot_store_api::{
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
 use eliot_workscope::{
-    GoverningSourceSet, GuardTrigger, GuardVerdict, IdentityEvidence, PrivacyProfile,
-    ResolutionAuthentication, ResolutionRequest, ScopeBinding, ScopeBindingDisposition,
-    ScopeBindingGuard, ScopeRelocationOrAttachReceipt, ScopeResolution, WorkScopeBindingOwner,
-    WorkScopeBindingSnapshot, WorkScopeDescriptor, WorkScopeResolutionReceipt, WorkScopeResolver,
-    admit_initial_binding, check_at_trigger, issue_resolution_receipt, rebind_with_receipt,
+    GoverningSourceSet, GuardTrigger, GuardVerdict, IdentityEvidence, ObservedScopeResources,
+    PrivacyProfile, ResolutionAuthentication, ResolutionRequest, ScopeBinding,
+    ScopeBindingDisposition, ScopeBindingGuard, ScopeRelocationOrAttachReceipt, ScopeResolution,
+    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor, WorkScopeResolutionReceipt,
+    WorkScopeResolver, admit_initial_binding, check_at_trigger, issue_resolution_receipt,
+    produce_attach_receipt, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -2875,6 +2876,74 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         WorkScopeBindingOwner::new(snapshot)
             .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Admits an observed workspace instance as an attach to the retained scope
+    /// (issue #1787).
+    ///
+    /// This is the owning thin caller for the attach trigger path: `observed`
+    /// is the live mechanical observation already derived from workspace facts
+    /// (the daemon trigger ingress observes the explicit root and derives at
+    /// the admission fence generation; the CLI scope-observe ingress derives
+    /// the same shape as evidence). The entry produces the owner-issued attach
+    /// receipt from that observation, the retained descriptor and owner, and
+    /// the explicit authorization reference, then admits it through
+    /// [`Self::admit_scope_relocation`], which rebinds with the receipt and
+    /// requires a fresh `MATCHED` source-closure check for the observed
+    /// instance. Both the receipt and the admitted owner return, so the caller
+    /// retains the authorization evidence (I4.7 commit receipt) alongside the
+    /// new binding. The prior identity stays preserved inside the receipt; the
+    /// retained binding, task state, and project memory are untouched on any
+    /// failure.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "attach admission joins the live observation, retained records, authorization, and source closure in one entry"
+    )]
+    pub fn admit_observed_scope_attach(
+        &self,
+        receipt_ref: &str,
+        observed: &ObservedScopeResources,
+        descriptor: &WorkScopeDescriptor,
+        authorizing_ref: &str,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+        owner_revision: u64,
+    ) -> Result<
+        (
+            ScopeRelocationOrAttachReceipt,
+            WorkScopeBindingOwner,
+        ),
+        CompositionError,
+    > {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; attach has no retained scope".to_owned(),
+            )
+        })?;
+        let receipt = produce_attach_receipt(
+            receipt_ref,
+            descriptor,
+            owner,
+            observed,
+            authorizing_ref,
+            &fence,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let bound = self.admit_scope_relocation(
+            &receipt,
+            privacy_class,
+            governing_source_generation,
+            sources,
+            privacy,
+            owner_revision,
+        )?;
+        Ok((receipt, bound))
     }
 
     /// Admits the initial binding for a newly resolved scope (issue #1787,
