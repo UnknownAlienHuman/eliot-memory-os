@@ -239,15 +239,14 @@ fn check_commit_freshness(
             .revision_before_after
             .iter()
             .find(|delta| delta.key == expected.key)
+            && delta.before != expected.expected_revision
         {
-            if delta.before != expected.expected_revision {
-                return Err(CompositionError::Owner(format!(
-                    "commit receipt revision is stale for {}: expected base {}, observed {}",
-                    expected.key.as_str(),
-                    expected.expected_revision,
-                    delta.before,
-                )));
-            }
+            return Err(CompositionError::Owner(format!(
+                "commit receipt revision is stale for {}: expected base {}, observed {}",
+                expected.key.as_str(),
+                expected.expected_revision,
+                delta.before,
+            )));
         }
     }
     for expected in expected_ordering_heads {
@@ -255,15 +254,14 @@ fn check_commit_freshness(
             .ordering_sequences
             .iter()
             .find(|head| head.scope == expected.scope)
+            && head.sequence <= expected.expected_sequence
         {
-            if head.sequence <= expected.expected_sequence {
-                return Err(CompositionError::Owner(format!(
-                    "commit receipt ordering is stale for {}: expected advance past {}, observed {}",
-                    expected.scope.as_str(),
-                    expected.expected_sequence,
-                    head.sequence,
-                )));
-            }
+            return Err(CompositionError::Owner(format!(
+                "commit receipt ordering is stale for {}: expected advance past {}, observed {}",
+                expected.scope.as_str(),
+                expected.expected_sequence,
+                head.sequence,
+            )));
         }
     }
     Ok(())

@@ -1042,8 +1042,8 @@ pub struct PagedExperienceConsumerBundle {
 pub fn assemble_experience_for_consumer_paged(
     ledger: &mut ExperienceRevisionLedger,
     projection_id: ArtifactId,
-    scope: ObservationScope,
-    fence: StateFence,
+    scope: &ObservationScope,
+    fence: &StateFence,
     bank: BankStoreSnapshot<'_>,
     feedback: FeedbackStoreSnapshot<'_>,
     schedule: &RetentionSchedule,
@@ -1071,8 +1071,8 @@ pub fn assemble_experience_for_consumer_paged(
         holds,
         feedback_next_cursor,
     )?;
-    revalidate_bank_projection_for_consumer(&bank.projection, &scope, &fence)?;
-    revalidate_feedback_projection_for_consumer(&feedback.projection, &scope, &fence)?;
+    revalidate_bank_projection_for_consumer(&bank.projection, scope, fence)?;
+    revalidate_feedback_projection_for_consumer(&feedback.projection, scope, fence)?;
     Ok(PagedExperienceConsumerBundle {
         bank: bank.projection,
         feedback: feedback.projection,
