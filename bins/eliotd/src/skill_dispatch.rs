@@ -28,6 +28,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::DaemonComposition;
+use super::daemon_kernel_client::DaemonKernelClient;
 ///
 /// Driver refusals (stale, drift, unavailable, fence) are NOT errors here —
 /// they persist as typed refusal outcomes through [`SkillResultEnvelope`],
@@ -143,27 +144,175 @@ fn drive_inject(composition: &DaemonComposition, arguments: &Value) -> SkillResu
     })
 }
 
-/// Builds the injector request behind one decoded intake.
+/// Serves one claimed skill pair through the canonical acceptance drive and
+/// returns its submit-leg result body.
 ///
-/// Pending the async acceptance drive (issue #1191, J3): the sync drive
-/// above refuses candidate intakes before composing, so no live caller
-/// reaches this constructor today. It stays — carrying the decoded
-/// candidate into the injector request — for the pending adoption, which
-/// binds the presented procedure to its committed row before driving.
-#[allow(dead_code)]
-fn build_inject_request(
-    payload: &eliot_agent_bridge_core::SkillIntakePayload,
-) -> crate::SkillHotsetRequest<'_> {
-    crate::SkillHotsetRequest {
-        candidate: &payload.candidate,
-        package: &payload.package,
-        inputs: &payload.inputs,
-        context: &payload.context,
-        readiness: &payload.readiness,
-        scope: &payload.scope,
-        hotset_id: payload.hotset_id.clone(),
-        approval_ref: payload.approval_ref.clone(),
+/// Pending the poller join (issue #1191, J3): same routing and body binding
+/// as [`serve_skill_pair`], but intake resolves canonical procedure
+/// acceptance over the authenticated Kernel route and drives install→receipt
+/// only for owner-accepted material. The J3 integration renames this to
+/// `serve_skill_pair` and rewires the poller to it, removing the sync
+/// refusing entry. Async only for the acceptance read; the composition drive
+/// itself stays synchronous with guards never crossing an await.
+pub async fn serve_accepted_skill_pair(
+    composition: &DaemonComposition,
+    kernel: &DaemonKernelClient,
+    envelope: &HostRequestEnvelope,
+    tool: &Value,
+    attempt: &LocalReadAttempt,
+) -> HostRequestResultBody {
+    let outcome = drive_accepted_skill_request(composition, kernel, envelope, tool).await;
+    // Body construction is total over validated inputs; a failure here is a
+    // local defect, failed closed by the caller, never a silent accept.
+    skill_result_body(envelope, attempt, &outcome)
+        .unwrap_or_else(|error| skill_refusal_body(envelope, attempt, &error.to_string()))
+}
+
+async fn drive_accepted_skill_request(
+    composition: &DaemonComposition,
+    kernel: &DaemonKernelClient,
+    envelope: &HostRequestEnvelope,
+    tool: &Value,
+) -> SkillResultEnvelope {
+    let name = tool
+        .as_object()
+        .and_then(|object| object.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let Some(kind) = skill_tool_kind(name) else {
+        return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(
+            "not a Skill tool request".to_owned(),
+        ));
+    };
+    if name != envelope.identity.capability {
+        return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(
+            "presented tool does not match the admitted capability".to_owned(),
+        ));
     }
+    let arguments = tool
+        .as_object()
+        .and_then(|object| object.get("arguments"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    match kind {
+        SkillToolKind::Inject => drive_accepted_inject(composition, kernel, &arguments).await,
+        SkillToolKind::Display => drive_display(composition, &arguments),
+    }
+}
+
+/// Drives one decoded intake through the canonical acceptance verdict.
+///
+/// Pending the poller join (issue #1191, J3): the wire intake entry decodes
+/// once here, the presented package digest resolves against the canonical
+/// committed lifecycle-policy rows, and the canonical verdict — never the
+/// wire procedure stamp — decides the drive. Accepted intakes bind their
+/// presented procedure to the committed row and drive the decoded payload
+/// plus that owner provenance into the composition; Unknown digests (absent
+/// rows, or rows superseded by a newer committed package) refuse: absence
+/// of a row proves nothing, so a wire-claimed Accepted stamp with no owner
+/// backing cannot bind material, provisional or otherwise — the intake
+/// remains a reversible candidate until governed promotion commits a row
+/// for it (I7.25).
+#[allow(dead_code)]
+async fn drive_accepted_inject(
+    composition: &DaemonComposition,
+    kernel: &DaemonKernelClient,
+    arguments: &Value,
+) -> SkillResultEnvelope {
+    let bytes = match canonical_json_bytes(&arguments).map_err(|error| error.to_string()) {
+        Ok(bytes) => bytes,
+        Err(detail) => {
+            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
+                "intake arguments fail their shape: {detail}"
+            )));
+        }
+    };
+    let payload = match eliot_agent_bridge_core::SkillIntakePayload::decode(&bytes)
+        .map_err(|error| error.to_string())
+    {
+        Ok(payload) => payload,
+        Err(detail) => {
+            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
+                "intake arguments fail their shape: {detail}"
+            )));
+        }
+    };
+    let admitted = composition.kernel_snapshot().state_fence().clone();
+    match super::skill_acceptance_read::resolve_intake_acceptance(
+        kernel,
+        &admitted,
+        &payload.package.registration.skill_id,
+        &payload.package.digests.source_digest,
+    )
+    .await
+    {
+        Ok(super::skill_acceptance_read::AcceptanceVerdict::Accepted(record)) => {
+            if let Err(error) = bind_accepted_intake(&payload, &record) {
+                return SkillResultEnvelope::refused(&error);
+            }
+            match composition.skill_ingest_accepted_intake(&payload, &record) {
+                Ok((_, receipt)) => SkillResultEnvelope::receipt(receipt),
+                Err(error) => SkillResultEnvelope::refused(&error),
+            }
+        }
+        Ok(super::skill_acceptance_read::AcceptanceVerdict::Unknown) => {
+            SkillResultEnvelope::refused(&eliot_skill::SkillError::InvalidField {
+                field: "procedure.acceptance",
+                reason: "no committed lifecycle row backs this package digest at the current revision; the intake remains a reversible candidate until governed promotion",
+            })
+        }
+        Ok(super::skill_acceptance_read::AcceptanceVerdict::Revoked(_)) => {
+            SkillResultEnvelope::refused(&eliot_skill::SkillError::InvalidField {
+                field: "procedure.acceptance",
+                reason: "canonical lifecycle revoked this package revision",
+            })
+        }
+        Err(error) => {
+            SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(error.to_string()))
+        }
+    }
+}
+
+/// Binds one presented wire intake to its canonical committed acceptance row.
+///
+/// Payload-level consistency for the Accepted drive: the presented skill and
+/// package must be exactly the row's skill and accepted package digest, the
+/// presented procedure verifier must name the row's accepting verifier, and
+/// the presented procedure stamp must agree with the row's acceptance. Every
+/// check is consistency with owner state, never authority from the wire —
+/// the row decides acceptance, and the candidate-level binding (stamped
+/// material, receipt verifier, fence, scope, task) runs inside the
+/// composition rehydration against the same row.
+///
+/// The crate error travels by value here like the Governor lifecycle API it
+/// feeds, so the size lint is allowed for this boundary function.
+#[allow(dead_code, clippy::result_large_err)]
+fn bind_accepted_intake(
+    payload: &eliot_agent_bridge_core::SkillIntakePayload,
+    record: &super::skill_acceptance_read::AcceptanceRecord,
+) -> Result<(), eliot_skill::SkillError> {
+    if payload.package.registration.skill_id != record.skill_id {
+        return Err(eliot_skill::SkillError::IdentityMismatch);
+    }
+    if payload.package.digests.source_digest != record.package_digest {
+        return Err(eliot_skill::SkillError::IdentityMismatch);
+    }
+    if payload.candidate.procedure.verifier.verifier_ref != record.verifier_ref {
+        return Err(eliot_skill::SkillError::InvalidField {
+            field: "candidate.procedure.verifier",
+            reason: "procedure verifier is not the canonically accepting verifier",
+        });
+    }
+    if !matches!(
+        payload.candidate.procedure.state,
+        eliot_skill::ProcedureState::Accepted
+    ) {
+        return Err(eliot_skill::SkillError::InvalidField {
+            field: "candidate.procedure.state",
+            reason: "committed row accepts this package but the presented procedure disagrees",
+        });
+    }
+    Ok(())
 }
 
 fn drive_display(composition: &DaemonComposition, arguments: &Value) -> SkillResultEnvelope {
