@@ -366,6 +366,22 @@ impl ContextCompiler {
         input: &ContextInput,
         recipe: &ContextRecipe,
     ) -> Result<CompiledContext, ContextError> {
+        Self::compile_with_revocation(input, recipe, &BTreeSet::new())
+    }
+
+    /// Compile a bounded view while treating `revoked_handles` as removed support.
+    ///
+    /// Behaves exactly like [`compile`](Self::compile) with an empty set,
+    /// except any candidate atom with at least one source handle in
+    /// `revoked_handles` is quarantined with reason
+    /// `revoked_source_support_removed`, regardless of budget, required, or
+    /// protected status. Quarantined atoms stay in `admissions` history and
+    /// contribute a rebuild unknown.
+    pub fn compile_with_revocation(
+        input: &ContextInput,
+        recipe: &ContextRecipe,
+        revoked_handles: &BTreeSet<ArtifactId>,
+    ) -> Result<CompiledContext, ContextError> {
         input.validate()?;
         recipe.validate()?;
         if recipe.recipe_revision != input.task_revision {
@@ -381,8 +397,24 @@ impl ContextCompiler {
         let mut admissions = Vec::with_capacity(candidates.len());
         let mut spent_total = 0_u32;
         let mut spent_roles: Vec<(ContextRole, u32)> = Vec::new();
+        let mut revoked_seen = false;
 
         for atom in candidates {
+            if !atom.source_handles.is_empty()
+                && atom
+                    .source_handles
+                    .iter()
+                    .any(|h| revoked_handles.contains(h))
+            {
+                revoked_seen = true;
+                admissions.push(AdmissionDecision {
+                    atom_id: atom.atom_id,
+                    protected: atom.protected,
+                    reason: "revoked_source_support_removed".to_owned(),
+                    disposition: AdmissionDisposition::Quarantined,
+                });
+                continue;
+            }
             let role_spent = spent_roles
                 .iter()
                 .find(|(role, _)| *role == atom.role)
@@ -428,6 +460,9 @@ impl ContextCompiler {
         }
 
         let mut unknowns = input.unknowns.clone();
+        if revoked_seen {
+            unknowns.push("revoked_support_removed_rebuild_from_clean_inputs_required".to_owned());
+        }
         if admissions
             .iter()
             .any(|item| item.disposition != AdmissionDisposition::Included)
