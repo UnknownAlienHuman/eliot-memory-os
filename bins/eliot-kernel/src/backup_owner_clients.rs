@@ -93,6 +93,7 @@ use super::{
     KernelComposition, KernelStoreGateway, KernelSupervisionLeaseAuthority,
     SupervisionLeaseAuthorityError,
 };
+use super::backup_restore_admission::{KernelRestoreAdmission, require_restore_transition_class};
 use super::backup_restore_ports::KernelRestoreJournal;
 use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseSnapshot};
 
@@ -558,6 +559,63 @@ impl CanonicalStoreImportClient {
         if transition.identity.operation_id != *operation_id {
             return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
         }
+        self.gateway
+            .apply(
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await
+            .map_err(BackupError::Target)
+            .map_err(OwnerChannelError::Backup)
+    }
+
+    /// Executes one Governor-admitted restore transition through the gateway.
+    ///
+    /// The admitted-restore wire: restore imports run only under a
+    /// Governor-minted [`KernelRestoreAdmission`] bound to this exact
+    /// transition, destination, and fence. The admission is enforced here
+    /// before any store effect — a restore-class transition without one,
+    /// an admission bound to a different transition or destination, a
+    /// fence-diverged admission, or a diverged decision digest refuses
+    /// (conflict, never retry-as-same). Ordinary canonical imports keep
+    /// using [`Self::import_transition`]; this wire never admits them.
+    pub async fn import_restore_transition(
+        &self,
+        verified: &VerifiedDestinationBinding,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        operation_id: &OperationId,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        admission: &KernelRestoreAdmission,
+    ) -> Result<WriteReceipt, OwnerChannelError> {
+        self.gate(verified)?;
+        transition
+            .validate()
+            .map_err(BackupError::Store)
+            .map_err(OwnerChannelError::Backup)?;
+        require_restore_transition_class(&transition).map_err(OwnerChannelError::Backup)?;
+        if transition.identity.operation_id != *operation_id {
+            return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
+        }
+        if admission.destination_binding_digest() != self.destination_binding_digest {
+            return Err(OwnerChannelError::Backup(BackupError::FenceMismatch {
+                subject: "destination authorization".to_owned(),
+            }));
+        }
+        if admission.identity() != &transition.identity {
+            return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
+        }
+        if admission.fence() != &transition.state_fence {
+            return Err(OwnerChannelError::Backup(BackupError::FenceMismatch {
+                subject: "restore admission fence is not current".to_owned(),
+            }));
+        }
+        admission
+            .validate()
+            .map_err(OwnerChannelError::Backup)?;
         self.gateway
             .apply(
                 context,
