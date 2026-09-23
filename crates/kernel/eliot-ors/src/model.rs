@@ -2033,6 +2033,188 @@ impl CapabilityGrantProjection {
     }
 }
 
+/// Committed lifecycle state of one durable grant-closure row.
+///
+/// A closure activates its members (`Active`) or fences them (`Revoked` is
+/// reported at the port; ORS records the fence as `Fenced`). The row never
+/// transitions: an exact recommit replays its receipt, anything else
+/// conflicts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GrantClosureState {
+    Active,
+    Fenced,
+}
+
+impl GrantClosureState {
+    pub(crate) const fn phase(self) -> OperationalPhase {
+        match self {
+            Self::Active => OperationalPhase::Active,
+            Self::Fenced => OperationalPhase::Fenced,
+        }
+    }
+}
+
+/// One owner-declared alternate-path survivor retained in a closure row.
+///
+/// The covering path is Governor semantic evidence recorded verbatim; ORS
+/// validates identity shape only and never evaluates coverage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosurePreserved {
+    pub grant_id: OperationIdentity,
+    pub covering_grant_id: OperationIdentity,
+    pub covering_root: OpaqueLabel,
+}
+
+/// Durable commit input for one grant-closure operation.
+///
+/// The row binds one closure operation identity to its target, lineage root,
+/// exact graph revision, canonical closure digest, complete affected set,
+/// and survivor set. ORS stores the bytes opaquely and enforces
+/// commit-identity CAS only: the semantic validation (enumeration ownership,
+/// revision freshness, fence agreement) belongs to the P-07 port, which
+/// reconstructs and compares the exact input on every read-back.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureCommit {
+    pub operation_id: OperationIdentity,
+    pub target_id: OperationIdentity,
+    pub authority_root: OpaqueLabel,
+    pub revision: u64,
+    pub digest: String,
+    pub affected: Vec<OperationIdentity>,
+    pub preserved: Vec<GrantClosurePreserved>,
+    /// Introductions fenced live when the closure committed, in sorted
+    /// order. They carry no supporting set here: the fence was verified
+    /// against live supporters at commit time, and this list only reinstalls
+    /// the fence after a restart so a fenced introduction can never read as
+    /// usable again.
+    pub fenced_introductions: Vec<OperationIdentity>,
+    pub state: GrantClosureState,
+}
+
+impl GrantClosureCommit {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        if self.revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_revision",
+                reason: "must be greater than zero",
+            });
+        }
+        validate_digest(&self.digest, "grant_closure_digest")?;
+        if self.affected.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_affected",
+                reason: "a committed closure affects at least its target",
+            });
+        }
+        let mut previous: Option<&str> = None;
+        for grant_id in &self.affected {
+            if let Some(previous) = previous
+                && previous >= grant_id.as_str()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "grant_closure_affected",
+                    reason: "affected grants must be sorted and unique",
+                });
+            }
+            previous = Some(grant_id.as_str());
+        }
+        if !self.affected.contains(&self.target_id) {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_target",
+                reason: "the closure target must be in the affected set",
+            });
+        }
+        let mut previous_survivor: Option<(&str, &str, &str)> = None;
+        for survivor in &self.preserved {
+            if self.affected.contains(&survivor.grant_id) {
+                return Err(OrsError::InvalidField {
+                    field: "grant_closure_preserved",
+                    reason: "a survivor must be disjoint from the affected set",
+                });
+            }
+            let key = (
+                survivor.grant_id.as_str(),
+                survivor.covering_grant_id.as_str(),
+                survivor.covering_root.as_str(),
+            );
+            if let Some(previous) = previous_survivor
+                && previous >= key
+            {
+                return Err(OrsError::InvalidField {
+                    field: "grant_closure_preserved",
+                    reason: "survivors must be sorted and unique",
+                });
+            }
+            previous_survivor = Some(key);
+        }
+        let mut previous_introduction: Option<&str> = None;
+        for introduction_id in &self.fenced_introductions {
+            if let Some(previous) = previous_introduction
+                && previous >= introduction_id.as_str()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "grant_closure_fenced_introductions",
+                    reason: "fenced introductions must be sorted and unique",
+                });
+            }
+            previous_introduction = Some(introduction_id.as_str());
+        }
+        Ok(())
+    }
+}
+
+/// Read-only projection of one committed grant-closure row in ORS.
+///
+/// The commit bytes, phase, ordering, and store-issued receipt are
+/// operational evidence only; this projection grants no capability and does
+/// not interpret the closure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GrantClosureProjection {
+    commit: GrantClosureCommit,
+    phase: OperationalPhase,
+    operation_order: u64,
+    receipt: GrantClosureCommitReceipt,
+}
+
+impl GrantClosureProjection {
+    pub(crate) fn from_store(
+        commit: GrantClosureCommit,
+        phase: OperationalPhase,
+        operation_order: u64,
+        receipt: GrantClosureCommitReceipt,
+    ) -> Self {
+        Self {
+            commit,
+            phase,
+            operation_order,
+            receipt,
+        }
+    }
+
+    /// Returns the exact committed closure input read from ORS.
+    pub const fn commit(&self) -> &GrantClosureCommit {
+        &self.commit
+    }
+
+    /// Returns the non-semantic ORS lifecycle phase.
+    pub const fn phase(&self) -> OperationalPhase {
+        self.phase
+    }
+
+    /// Returns the monotonic ORS order of this row.
+    pub const fn operation_order(&self) -> u64 {
+        self.operation_order
+    }
+
+    /// Returns the store-issued integrity receipt for this row.
+    pub const fn receipt(&self) -> &GrantClosureCommitReceipt {
+        &self.receipt
+    }
+}
+
 macro_rules! operational_receipt {
     ($name:ident) => {
         #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2062,6 +2244,7 @@ operational_receipt!(AuthoritySnapshotReceipt);
 operational_receipt!(AuthorityRevocationReceipt);
 operational_receipt!(AuthorityActivationReceipt);
 operational_receipt!(CapabilityIntroductionReceipt);
+operational_receipt!(GrantClosureCommitReceipt);
 
 /// Integrity-checked active authority snapshot read back from ORS.
 ///
