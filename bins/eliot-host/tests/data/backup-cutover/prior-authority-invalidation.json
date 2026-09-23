@@ -1,0 +1,1 @@
+{"fixture":"prior-authority-invalidation","invalidation_digest":"1111111111111111111111111111111111111111111111111111111111111111","is_invalidated":true,"issue":961,"note":"fixed owner receipt shape for unit dev; live Windows proof deferred (T19 TEST-PHASE)","prior_authority":"2222222222222222222222222222222222222222222222222222222222222222"}
