@@ -978,6 +978,71 @@ impl RedbInstallationRegistry {
         })
     }
 
+    /// Atomically commits one exact installation cutover: flips the active
+    /// generation from the expected predecessor to an already-approved
+    /// target (#961, M2 port from M2-961-cutover-20260922; no authorship
+    /// change, no duplicate owner).
+    ///
+    /// Unlike [`Self::commit_pending_activation`], cutover carries no
+    /// installer approval: the target must already be approved in the
+    /// projection (staged by the installer/preparation flow), and the caller
+    /// holds the separately-admitted cutover operation plus the Host
+    /// retirement barrier. The operation audit binding lives in the Host
+    /// journal `EpochRetirement` record; this CAS is the activation
+    /// linearization point only. Exact replay (active already equals the
+    /// approved target) succeeds without mutating; any other predecessor
+    /// mismatch is `IdentityConflict` and changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError`] when the owner capability is not live,
+    /// the generation handles are malformed, the target is not approved, or
+    /// the expected revision/predecessor disagrees with durable state.
+    pub fn commit_cutover_activation(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        expected_predecessor: &PlatformHandle,
+        target_generation: &PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        crate::handle(expected_predecessor, "cutover.expected_predecessor")?;
+        crate::handle(target_generation, "cutover.target_generation")?;
+        if expected_predecessor == target_generation {
+            return Err(InstallationError::InvalidField {
+                field: "cutover.target_generation".to_owned(),
+                reason: "cutover target must differ from the expected predecessor".to_owned(),
+            });
+        }
+        let expected_predecessor = expected_predecessor.clone();
+        let target_generation = target_generation.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            if !registry
+                .generations
+                .iter()
+                .any(|item| item.manifest.generation == target_generation)
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "cutover target generation is not approved".to_owned(),
+                ));
+            }
+            if registry.active_generation.as_ref() == Some(&target_generation) {
+                // Exact replay of an already-committed cutover: the
+                // predecessor was consumed by the first commit. Succeed
+                // without mutating; Host journal reconciliation
+                // disambiguates same-operation replay from cross-operation
+                // confusion through the operation-bound retirement record.
+                return Ok(());
+            }
+            if registry.active_generation.as_ref() != Some(&expected_predecessor) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            registry.activate(&target_generation)
+        })
+    }
+
     /// Reads the current CAS revision for one exact pending activation.
     ///
     /// The intent records the registry snapshot used to stage the pending
