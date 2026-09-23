@@ -20,10 +20,10 @@
 //! Empty payloads never select scope or destination silently: create
 //! requires an explicit scope descriptor and closed class, verify and
 //! restore-test require explicit bundle bytes, restore-test additionally
-//! requires explicit target descriptors, authorization bytes, and
-//! provisioning attestations. Unknown outcomes stay unknown with their
-//! operation identity for same-operation reconciliation — never success,
-//! never blind retry.
+//! requires explicit target descriptors, authorization bytes,
+//! provisioning attestations, and an explicit introductions array.
+//! Unknown outcomes stay unknown with their operation identity for
+//! same-operation reconciliation — never success, never blind retry.
 
 use eliot_contracts::EpochLineageId;
 use eliot_protocol::RequestIdentity;
@@ -59,6 +59,13 @@ pub const BACKUP_WIRE_BYTES_MAX: usize = 1_048_576;
 pub const BACKUP_AUTH_BYTES_MAX: usize = 16_384;
 /// Maximum operator text field length (scope descriptors, identities).
 pub const BACKUP_TEXT_MAX: usize = 256;
+/// Maximum console-presented capability introductions admitted in one
+/// restore-test payload.
+///
+/// Mirrors `eliot_ors::MAX_RECOVERY_PAGE` (256) byte-exact with the
+/// Kernel bound; the Kernel exact-set check stays authoritative and
+/// refuses anything the live owner page cannot verify.
+pub const BACKUP_INTRODUCTIONS_MAX: usize = 256;
 
 /// Failure of one thin backup delegation: transport problems stay
 /// transport errors (with their operation identity for same-operation
@@ -128,7 +135,8 @@ pub struct BackupVerifyParams {
 }
 
 /// Typed isolated restore-test arguments: explicit archive, explicit
-/// authorization, explicit target, explicit provisioning attestations.
+/// authorization, explicit target, explicit provisioning attestations,
+/// explicit console-presented introductions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackupRestoreTestParams {
     /// Archive bytes as lowercase hex (bounded by [`BACKUP_WIRE_BYTES_MAX`]).
@@ -152,6 +160,10 @@ pub struct BackupRestoreTestParams {
     pub source_snapshot_digest: String,
     /// Capture operation that produced the source snapshot.
     pub capture_operation_id: String,
+    /// Console-presented capability introductions as owner-shaped JSON
+    /// objects (explicit array, may be explicitly empty; typed decode and
+    /// exact-set verification run Kernel-side against live owner readback).
+    pub introductions: Vec<Value>,
 }
 
 /// Parses bounded backup create arguments. No defaults: a missing scope
@@ -187,10 +199,12 @@ pub fn parse_backup_verify(bundle_hex: &str) -> Result<BackupVerifyParams, CliEr
 }
 
 /// Parses bounded restore-test arguments. Every binding is explicit:
-/// empty archive, authorization, target, or provisioning refuses.
+/// empty archive, authorization, target, or provisioning refuses, and
+/// the console-presented introductions arrive as an explicit JSON array
+/// (explicitly empty allowed — never absent, never defaulted).
 #[allow(
     clippy::too_many_arguments,
-    reason = "restore-test carries nine independently validated bindings; grouping them would hide which exact field refused"
+    reason = "restore-test carries eleven independently validated bindings; grouping them would hide which exact field refused"
 )]
 pub fn parse_backup_restore_test(
     bundle_hex: &str,
@@ -203,6 +217,7 @@ pub fn parse_backup_restore_test(
     residency_denominator_digest: &str,
     source_snapshot_digest: &str,
     capture_operation_id: &str,
+    introductions_json: &str,
 ) -> Result<BackupRestoreTestParams, CliError> {
     parse_backup_verify(bundle_hex)?;
     hex_bytes(
@@ -236,6 +251,27 @@ pub fn parse_backup_restore_test(
     )?;
     hex64(source_snapshot_digest, "backup.source_snapshot_digest")?;
     non_blank(capture_operation_id, "backup.capture_operation_id")?;
+    let introductions_value: Value =
+        serde_json::from_str(introductions_json).map_err(|_| CliError::InvalidArgument {
+            field: "backup.introductions",
+        })?;
+    let introductions_array = introductions_value
+        .as_array()
+        .ok_or(CliError::InvalidArgument {
+            field: "backup.introductions",
+        })?;
+    if introductions_array.len() > BACKUP_INTRODUCTIONS_MAX {
+        return Err(CliError::InvalidArgument {
+            field: "backup.introductions",
+        });
+    }
+    for introduction in introductions_array {
+        if !introduction.is_object() {
+            return Err(CliError::InvalidArgument {
+                field: "backup.introductions",
+            });
+        }
+    }
     Ok(BackupRestoreTestParams {
         bundle_hex: bundle_hex.to_owned(),
         authorization_hex: authorization_hex.to_owned(),
@@ -247,6 +283,7 @@ pub fn parse_backup_restore_test(
         residency_denominator_digest: residency_denominator_digest.to_owned(),
         source_snapshot_digest: source_snapshot_digest.to_owned(),
         capture_operation_id: capture_operation_id.to_owned(),
+        introductions: introductions_array.clone(),
     })
 }
 
@@ -279,17 +316,26 @@ pub struct BackupVerifyResult {
     pub receipt_count: u64,
 }
 
-/// Typed restore-test result: gates proven plus the exact missing owner
-/// blocking execution.
+/// Typed restore-test result: rehearsal gates proven, the minted
+/// identity bound, plus the exact missing Governor inputs blocking
+/// execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupRestoreTestResult {
-    /// Owner that must mint production journal admission.
+    /// Owner inputs that must arrive Governor-built.
     pub missing_owner: String,
     /// Exact reason execution is blocked.
     pub reason: String,
     /// Gates the Kernel proved, in order.
     pub gates_passed: Vec<String>,
+    /// Minted restore operation identity the Governor lane correlates.
+    pub restore_operation_id: String,
+    /// Coordination decision digest built from the minted admission.
+    pub decision_digest: String,
+    /// Admitted plan identity.
+    pub plan_id: String,
+    /// Admitted archive digest.
+    pub bundle_sha256: String,
 }
 
 fn require_command(
@@ -515,6 +561,7 @@ pub fn backup_restore_test(
             "source_snapshot_digest": params.source_snapshot_digest.as_str(),
             "capture_operation_id": params.capture_operation_id.as_str(),
         },
+        "introductions": Value::Array(params.introductions.clone()),
     });
     let response = client
         .transact_json(BACKUP_RESTORE_TEST_OPERATION, payload)
@@ -545,7 +592,18 @@ pub fn backup_restore_test(
                 missing_owner: envelope_text(&response, "missing_owner")?.to_owned(),
                 reason: envelope_text(&response, "reason")?.to_owned(),
                 gates_passed,
+                restore_operation_id: envelope_text(&response, "restore_operation_id")?.to_owned(),
+                decision_digest: envelope_text(&response, "decision_digest")?.to_owned(),
+                plan_id: envelope_text(&response, "plan_id")?.to_owned(),
+                bundle_sha256: envelope_text(&response, "bundle_sha256")?.to_owned(),
             };
+            if result.restore_operation_id.trim().is_empty()
+                || result.decision_digest.trim().is_empty()
+                || result.plan_id.trim().is_empty()
+                || result.bundle_sha256.trim().is_empty()
+            {
+                return Err(BackupClientError::Client(CliError::ResultMismatch));
+            }
             // Gates proven, execution blocked: candidate evidence under a
             // candidate-artifact ceiling (partial proof, never readiness).
             Ok(respond(

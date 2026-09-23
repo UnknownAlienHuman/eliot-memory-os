@@ -11,13 +11,18 @@
 //!
 //! This file owns exactly the backup method entry: the closed operation
 //! allowlist plus per-command decode/validate/gate handlers. It performs
-//! no capture (owner #959, open), no journal mutation, no store import,
+//! no capture (owner #959, open), no coordination commit, no store import,
 //! and no cutover: create refuses with the exact missing capture owner,
 //! verify executes bounded bundle validation with no owners needed, and
-//! restore-test runs every gate it can prove (decode, plan, destination
-//! authorization, fence currency, provisioning) before refusing execution
-//! with the exact missing journal-admission owner. Missing owners refuse
-//! as typed `plan_gap`, never as fake success and never silently.
+//! restore-test rehearses through the real owner gates it can reach —
+//! decode, plan, destination authorization, fence currency, provisioning,
+//! constructed-destination opening, journal production admission,
+//! introduction exact-set verification against live owner readback,
+//! admission mint, and coordination decision — before refusing execution
+//! with the exact missing Governor-built transitions (owning lane
+//! Governor/eliotd, open). Missing owners refuse as typed `plan_gap`,
+//! never as fake success and never silently. Rehearsal performs zero
+//! store effects and never activates, retires, or cuts over.
 //!
 //! Wire contract mirror: the operator CLI surface
 //! (`crates/surfaces/eliot-cli/src/backup.rs`) carries these exact
@@ -29,20 +34,32 @@
 //!
 //! Capability cell: Kernel front-door backup dispatch (bounded backup
 //! method entry). Forbidden authority: no capture orchestration, no
-//! journal admission minting, no store import, no activation/retirement/
-//! cutover, no second dispatch vocabulary.
+//! coordination commit, no store import, no activation/retirement/
+//! cutover, no second dispatch vocabulary. The rehearsal admission mint
+//! below is real but effect-free: it binds the journal readback into a
+//! per-restore admission without committing anything.
 
 use std::{num::NonZeroU64, path::Path};
 
 use eliot_backup::{BackupBundle, BackupClass, BackupError, RestoreContext, RestorePlan};
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_ipc::{Session, TransportError};
+use eliot_ors::CapabilityIntroductionProjection;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use serde_json::{Map, Value};
 
-use super::backup_owner_clients::{AuthorizationExpectation, verify_destination_authorization};
-use super::backup_restore_admission::RestoreProvisioningProof;
-use super::backup_restore_ports::check_kernel_effect_fence;
+use super::backup_coordination::CoordinationDecision;
+use super::backup_owner_clients::{
+    AuthorizationExpectation, VerifiedDestinationBinding, verify_destination_authorization,
+};
+use super::backup_restore_admission::{
+    KernelRestoreAdmission, RestoreAdmissionMintRequest, RestoreProvisioningProof,
+    mint_restore_admission,
+};
+use super::backup_restore_ports::{
+    KernelIsolatedDestination, KernelRestoreJournal, check_kernel_effect_fence, kernel_to_backup,
+    map_ors_to_backup,
+};
 use super::{KernelFrameAction, status_frame};
 
 /// Closed backup create operation selector (mirrored by the operator CLI
@@ -68,6 +85,14 @@ pub(crate) const BACKUP_WIRE_BYTES_MAX: usize = 1_048_576;
 pub(crate) const BACKUP_AUTH_BYTES_MAX: usize = 16_384;
 /// Maximum operator text field length (scope descriptors, identities).
 pub(crate) const BACKUP_TEXT_MAX: usize = 256;
+/// Maximum console-presented capability introductions admitted in one
+/// restore-test payload.
+///
+/// Mirrors `eliot_ors::MAX_RECOVERY_PAGE` (256) byte-exact: the rehearsal
+/// compares against one live owner page, so a larger presented set can
+/// never verify. The owner exact-set check stays authoritative; this
+/// bound only refuses absurd frames early.
+pub(crate) const BACKUP_INTRODUCTIONS_MAX: usize = 256;
 
 fn non_blank(value: &str, field: &'static str) -> Result<(), BackupError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -407,21 +432,105 @@ fn restore_provisioning(
     Ok(proof)
 }
 
-/// Handles one isolated restore-test frame: every gate provable without
-/// owners, then a typed execution refusal naming the exact missing owner.
+/// Decodes the console-presented capability introductions: an explicit
+/// JSON array of owner-shaped projections, never defaulted.
+///
+/// An explicitly empty array verifies vacuously downstream (a restore
+/// with no capability introductions has nothing to compare); an absent
+/// or non-array field refuses. Typed decoding runs here so malformed
+/// rows refuse before any owner readback.
+fn restore_introductions(
+    object: &Map<String, Value>,
+) -> Result<Vec<CapabilityIntroductionProjection>, BackupError> {
+    let array = object
+        .get("introductions")
+        .and_then(Value::as_array)
+        .ok_or(BackupError::InvalidField {
+            field: "backup.introductions",
+            reason: "console-presented introductions must be an explicit JSON array",
+        })?;
+    if array.len() > BACKUP_INTRODUCTIONS_MAX {
+        return Err(BackupError::InvalidField {
+            field: "backup.introductions",
+            reason: "exceeds the bounded console-presented introduction count",
+        });
+    }
+    serde_json::from_value::<Vec<CapabilityIntroductionProjection>>(Value::Array(array.clone()))
+        .map_err(|error| {
+            BackupError::Serialization(format!(
+                "introductions do not decode as owner projections: {error}"
+            ))
+        })
+}
+
+/// Runs the rehearsal owner gates that need the owner-held journal:
+/// constructed-destination opening, introduction exact-set verification
+/// against live owner readback, admission mint from the minter-bound
+/// inputs, and the coordination decision built from the minted admission.
+///
+/// The exact production order and calls from
+/// `dispatch_production_restore`/`drive_production_restore`, minus the
+/// effects: no coordination commit, no import, no reconciliation — those
+/// need the Governor-built `CoordinationCommit` plus restore-class
+/// imports the caller names as the remaining gap. Returns the minted
+/// admission with the decision so the reply carries their bound identity.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "rehearsal binds eight independently owned inputs (bundle, plan, binding, journal, root, fence, provisioning, payload); grouping them would hide which exact owner each gate needs"
+)]
+fn rehearse_owner_gates(
+    bundle: &BackupBundle,
+    plan: &RestorePlan,
+    verified: &VerifiedDestinationBinding,
+    journal: &KernelRestoreJournal,
+    work_root: &Path,
+    live_fence: &StateFence,
+    provisioning: RestoreProvisioningProof,
+    object: &Map<String, Value>,
+) -> Result<(KernelRestoreAdmission, CoordinationDecision), BackupError> {
+    let destination = KernelIsolatedDestination::open(work_root, plan.target.target_id.as_str())
+        .map_err(kernel_to_backup)?;
+    let presented = restore_introductions(object)?;
+    let live = journal
+        .scan_live_introductions(eliot_ors::MAX_RECOVERY_PAGE)
+        .map_err(map_ors_to_backup)?;
+    eliot_ors::verify_introduction_set(&presented, &live, false).map_err(map_ors_to_backup)?;
+    let admission = mint_restore_admission(RestoreAdmissionMintRequest {
+        plan,
+        bundle,
+        verified,
+        journal,
+        destination: &destination,
+        live_fence,
+        provisioning,
+    })?;
+    let decision = CoordinationDecision::from_admission(&admission)?;
+    Ok((admission, decision))
+}
+
+/// Handles one isolated restore-test frame: the full rehearsal through
+/// the real owner gates, then a typed execution refusal naming the exact
+/// missing Governor inputs.
+///
 /// Decode, structural validation, governed plan compilation (lineage
 /// advance proven inside), destination authorization verification
 /// against the plan/bundle-bound expectation, live fence currency,
-/// effect-fence gating, provisioning shape checks, and
-/// source-isolation binding all run here for real. The restore effect
-/// itself refuses with `plan_gap` naming the journal-admission minter:
-/// minting durability admission from nothing would fabricate authority,
-/// and rehearsal never activates, retires, or cuts over. The reply
-/// names every passed gate so the operator sees the safe next action.
+/// effect-fence gating, provisioning shape checks, source-isolation
+/// binding, constructed-destination opening, journal production
+/// admission, introduction exact-set verification against live owner
+/// readback, admission mint, and coordination decision all run here for
+/// real against the owner-held journal. Execution itself refuses with
+/// `plan_gap` naming the Governor-built coordination commit plus
+/// restore-class imports (owning lane Governor/eliotd, open): committing
+/// or importing without them would fabricate Governor authority, and
+/// rehearsal never activates, retires, or cuts over. The reply carries
+/// the minted identity plus every passed gate so the operator and the
+/// Governor lane see the safe next action.
 fn handle_backup_restore_test(
     payload: &Value,
     live_fence: &StateFence,
     work_root: &Path,
+    journal: &KernelRestoreJournal,
     idempotency_key: &str,
 ) -> Result<Value, BackupError> {
     let object = payload.as_object().ok_or(BackupError::InvalidField {
@@ -435,6 +544,7 @@ fn handle_backup_restore_test(
             "destination_authorization_hex",
             "target",
             "provisioning",
+            "introductions",
         ],
         "backup.restore-test",
     )?;
@@ -473,12 +583,46 @@ fn handle_backup_restore_test(
         });
     }
     check_kernel_effect_fence(live_fence, &bundle)?;
-    let _provisioning = restore_provisioning(object)?;
+    let provisioning = restore_provisioning(object)?;
     if plan.target.target_id == verified.source_installation_id() {
         return Err(BackupError::FenceMismatch {
             subject: "restore destination is not isolated from the source installation".to_owned(),
         });
     }
+    // Owner-held journal production admission is owner-supplied state
+    // (admitted or fixture-flagged at the handle), never minted here: a
+    // mapped `JournalNotAdmitted` would misdescribe the condition as a
+    // transaction mismatch, so the refusal names it exactly instead of
+    // flowing through the mechanical error branch.
+    if let Err(error) = journal
+        .require_production_admitted()
+        .map_err(kernel_to_backup)
+    {
+        match error {
+            BackupError::RestoreJournalMismatch
+            | BackupError::RestoreJournalRequired
+            | BackupError::RestoreJournalCorrupt => {
+                return Ok(refused_reply(
+                    BACKUP_RESTORE_TEST_OPERATION,
+                    idempotency_key,
+                    "plan_gap",
+                    "restore-journal production admission (owning lane: Governor/owner-channels journal transitions)",
+                    "owner-held journal does not admit production durable recovery (unadmitted or fixture-flagged); admission is owner-supplied, never minted at the front door",
+                ));
+            }
+            other => return Err(other),
+        }
+    }
+    let (admission, decision) = rehearse_owner_gates(
+        &bundle,
+        &plan,
+        &verified,
+        journal,
+        work_root,
+        live_fence,
+        provisioning,
+        object,
+    )?;
     Ok(backup_reply(
         BACKUP_RESTORE_TEST_OPERATION,
         "blocked",
@@ -487,14 +631,35 @@ fn handle_backup_restore_test(
             ("code", Value::String("plan_gap".to_owned())),
             (
                 "missing_owner",
-                Value::String("restore-journal-admission-minter".to_owned()),
+                Value::String(
+                    "governor-restore-transitions (CoordinationCommit plus restore-class imports; owning lane Governor/eliotd — coordination-transition builder bins/eliotd/src/restore_coordination_builder.rs::build_coordination_transition exists, commit/import assembly open)"
+                        .to_owned(),
+                ),
             ),
             (
                 "reason",
                 Value::String(
-                    "gates proven; restore effects need production journal admission that no owner mints yet"
-                        .to_owned(),
+                    format!(
+                        "gates proven and admission minted for restore {}; execution needs the Governor-built coordination commit plus restore-class imports, which no owner supplies yet",
+                        decision.operation_id().as_str(),
+                    ),
                 ),
+            ),
+            (
+                "restore_operation_id",
+                Value::String(decision.operation_id().as_str().to_owned()),
+            ),
+            (
+                "decision_digest",
+                Value::String(decision.decision_digest().to_owned()),
+            ),
+            (
+                "plan_id",
+                Value::String(admission.plan_id().to_owned()),
+            ),
+            (
+                "bundle_sha256",
+                Value::String(admission.bundle_sha256().to_owned()),
             ),
             (
                 "gates_passed",
@@ -508,6 +673,11 @@ fn handle_backup_restore_test(
                         "effect-fence",
                         "provisioning",
                         "isolation",
+                        "admission",
+                        "destination",
+                        "introductions",
+                        "mint",
+                        "decision",
                     ]
                     .iter()
                     .map(|gate| Value::String((*gate).to_owned()))
@@ -523,7 +693,11 @@ fn handle_backup_restore_test(
 /// Mirrors the sibling route entry shape: request identity presence,
 /// session fence join, connection join, JSON payload, and exact
 /// operation allowlist are all re-checked here so direct callers cannot
-/// bypass them. The adapter work root scopes destination containment.
+/// bypass them. The adapter work root scopes destination containment;
+/// the owner-held journal supplies production admission, live
+/// introduction readback, and the mint anchor for the restore-test
+/// rehearsal (bound by the caller from composition owners — see the
+/// proposed `frame_dispatch` arm).
 /// Domain outcomes return as typed reply frames; only authentication,
 /// session, and shape failures fence.
 ///
@@ -538,6 +712,7 @@ pub(crate) fn dispatch_backup_frame(
     session: &Session,
     frame: &Frame,
     work_root: &Path,
+    journal: &KernelRestoreJournal,
 ) -> Result<KernelFrameAction, TransportError> {
     let request_id = frame
         .request_id
@@ -577,7 +752,7 @@ pub(crate) fn dispatch_backup_frame(
         BACKUP_CREATE_OPERATION => handle_backup_create(&payload, idempotency_key),
         BACKUP_VERIFY_OPERATION => handle_backup_verify(&payload, idempotency_key),
         BACKUP_RESTORE_TEST_OPERATION => {
-            handle_backup_restore_test(&payload, live_fence, work_root, idempotency_key)
+            handle_backup_restore_test(&payload, live_fence, work_root, journal, idempotency_key)
         }
         _ => return Err(TransportError::SessionFenced),
     };
