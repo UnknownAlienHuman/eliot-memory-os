@@ -835,16 +835,18 @@ pub enum GovernedDispatchOutcome {
     Failed(ExecutionChainError),
 }
 
-/// Validate one retained Governor resolution against live owners: admitted
-/// session/task text into canonical types, session agreement with the live
-/// Kernel session (the daemon serves a single live owner session), then live
-/// Governor task-record currency (fence agreement plus owner-defined
+/// Validate one retained Governor resolution against live owners: the
+/// resolution's own admission fence first (it may only be consumed under the
+/// exact live fence it was admitted under), then admitted session/task text
+/// into canonical types, session agreement with the live Kernel session (the
+/// daemon serves a single live owner session), then live Governor
+/// task-record currency (fence agreement plus owner-defined
 /// non-terminality). Task, principal, scope, and plan are observed and
 /// traced — no independent live task/principal read exists in daemon scope,
 /// so they are never asserted, only recorded. The owner's revision counter
 /// is observed only: it has no canonical text rendering in-tree, so it is
 /// never compared against owner-minted revision text. Non-Resolved
-/// dispositions are checked by the caller before invoking this helper.
+/// dispositions carry no admission signal and pass through untouched.
 fn check_activation_admission(
     composition: &DaemonComposition,
     activation: Option<&AgentActivationResolutionResult>,
@@ -857,6 +859,15 @@ fn check_activation_admission(
     let AgentActivationResolutionDisposition::Resolved { binding } = &result.disposition else {
         return Ok(());
     };
+    // Currency of the retained artifact itself: the resolution was admitted
+    // under `ticket_state_fence` and may only be consumed under the exact
+    // live fence. A fence move between resolve and this poll fails closed
+    // here even when the session/task text below still matches — the live
+    // task-record read is no substitute, because the Governor owner may have
+    // refreshed under the new fence while this retained record stayed old.
+    if !fences_match_exact(&result.ticket_state_fence, live_fence) {
+        return Err(ExecutionChainError::StaleAdmissionFence);
+    }
     let admitted_session =
         SessionId::new(binding.session_id.clone()).map_err(ExecutionChainError::OwnerIdentity)?;
     let admitted_task =
@@ -893,17 +904,21 @@ fn check_activation_admission(
 
 /// Poll one governed execution dispatch from live owners.
 ///
-/// Evaluated in the daemon binary flow (see the run-loop dispatch arm):
-/// reads the live Kernel fence, owner session, and Governor fence; requires
-/// Kernel/Governor fence agreement under the normative
-/// [`fences_match_exact`]; validates a retained Governor resolution's
-/// admitted session/task triple against the live Kernel session and the
-/// live Governor task record (fence agreement plus owner-defined
-/// non-terminality); and either dispatches through
-/// [`launch_closed_execution`] with a presented bundle or declines with the
-/// exact live missing-owner inventory. Absence of dispatchable work is a
-/// normal idle outcome, never an error, and execution-plane failures must
-/// never fail the activation loop that hosts this poll.
+/// Evaluated in the daemon binary flow (see the run-loop dispatch arm).
+/// The poll acquires from six live owner sources, each with its gate, and
+/// nowhere else: the live Kernel fence, the Kernel owner session, and the
+/// Governor admitted fence (read every poll; Kernel/Governor fence agreement
+/// under the normative [`fences_match_exact`]); a retained Governor
+/// resolution's admitted triple (resolution-fence currency, then session
+/// agreement against the live Kernel session); the live Governor task record
+/// for the admitted task (record-fence agreement plus owner-defined
+/// non-terminality — terminal tasks never dispatch); and the daemon
+/// coordinator configuration (read live before any presented bundle
+/// dispatches through [`launch_closed_execution`]). Anything else a dispatch
+/// needs stays an exact missing-owner decline: no fake ports, no
+/// interface-only success. Absence of dispatchable work is a normal idle
+/// outcome, never an error, and execution-plane failures must never fail the
+/// activation loop that hosts this poll.
 ///
 /// Unknown/replay/cancellation preservation: the poll mutates nothing
 /// itself; the coordinator bind stays idempotent under canonical-input
@@ -928,18 +943,14 @@ pub fn poll_governed_dispatch(
     if !fences_match_exact(&live_fence, &governor_fence) {
         return GovernedDispatchOutcome::Failed(ExecutionChainError::StaleAdmissionFence);
     }
-    // Activation-resolved triple: when the loop retained a Governor
-    // resolution for this dispatch, validate its admitted session/task text
-    // into canonical types and require the session to equal the live Kernel
-    // session (the daemon serves a single live owner session). Task,
-    // principal, scope, and plan are observed and traced — no independent
-    // live task/principal read exists in daemon scope, so they are never
-    // asserted, only recorded. Disagreement fails closed with the exact
-    // field; non-Resolved dispositions carry no admission signal.
     // Activation-resolved admission: when the loop retained a Governor
-    // resolution for this dispatch, validate its admitted triple and task
-    // record against live owners. Non-Resolved dispositions carry no
-    // admission signal and pass through untouched.
+    // resolution for this dispatch, validate its own admission fence, then
+    // its admitted triple and live task record, against live owners (see
+    // `check_activation_admission`). Task, principal, scope, and plan are
+    // observed and traced — no independent live task/principal read exists
+    // in daemon scope, so they are never asserted, only recorded.
+    // Disagreement fails closed with the exact error; non-Resolved
+    // dispositions carry no admission signal and pass through untouched.
     if let Err(error) = check_activation_admission(
         composition,
         activation,

@@ -730,12 +730,34 @@ async fn run_loop(
                                 ActivationFlight::InFlight(state) => state.resolved.take(),
                                 ActivationFlight::Idle => None,
                             };
-                            eliotd::attempt_execution_chain::poll_governed_dispatch(
+                            // O1 daemon polling (issue #1942): the poll
+                            // outcome is consumed, never dropped. A live
+                            // owner refusal or view disagreement emits a
+                            // bounded error record with identities preserved
+                            // (never failing this loop);
+                            // Dispatched/Declined already trace inside the
+                            // poll, so the arm adds nothing for them.
+                            match eliotd::attempt_execution_chain::poll_governed_dispatch(
                                 kernel.as_ref(),
                                 composition.as_ref(),
                                 resolved.as_ref(),
                                 None,
-                            );
+                            ) {
+                                eliotd::attempt_execution_chain::GovernedDispatchOutcome::Failed(
+                                    error,
+                                ) => {
+                                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                        "governed-dispatch",
+                                        &error.to_string(),
+                                    )
+                                    .emit();
+                                }
+                                eliotd::attempt_execution_chain::GovernedDispatchOutcome::Dispatched(_)
+                                | eliotd::attempt_execution_chain::GovernedDispatchOutcome::Declined {
+                                    ..
+                                } => {}
+                            }
                             flight = ActivationFlight::Idle;
                         }
                         Err(ActivationDispatchError::Hard(error)) => return Err(error),
