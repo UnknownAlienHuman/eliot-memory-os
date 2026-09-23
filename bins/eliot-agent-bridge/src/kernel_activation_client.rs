@@ -63,6 +63,67 @@ pub(super) fn denial_reason_code(reason_code: AgentBridgeActivationDenialCode) -
     }
 }
 
+/// I7.20 agent-facing disposition projection for a typed activation denial.
+///
+/// Per `docs/architecture/I07-20-agent-facing-error-contract.md`, every
+/// non-success response carries a two-layer `disposition` + exact
+/// `reason_code` pair: bridges switch on the stable disposition and MAY
+/// specialise known reason codes. Catalogue groups: `TASK_SELECTION_REQUIRED` is
+/// request/identity; `AMBIGUOUS_RESULT` / `STALE_STATE_FENCE` is state/conflict;
+/// `DEADLINE_EXCEEDED` is capacity; `UNKNOWN_OUTCOME` is security/recovery.
+/// Exhaustive with no wildcard arm so a future denial code breaks compilation.
+pub(super) fn agent_disposition_for_denial(code: AgentBridgeActivationDenialCode) -> &'static str {
+    match code {
+        AgentBridgeActivationDenialCode::TaskSelectionRequired
+        | AgentBridgeActivationDenialCode::ScopeSelectionRequired => "INVALID_REQUEST",
+        AgentBridgeActivationDenialCode::ScopeAmbiguous
+        | AgentBridgeActivationDenialCode::StaleFence => "STALE_OR_CONFLICT",
+        AgentBridgeActivationDenialCode::NotReady => "UNAVAILABLE_OR_CAPACITY",
+        AgentBridgeActivationDenialCode::FailedInternal
+        | AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => "FAILED",
+    }
+}
+
+/// I7.20 Recovery / Conflict Directive kind for a typed activation denial.
+///
+/// Per `docs/architecture/I07-20-agent-facing-error-contract.md`, every
+/// non-success response includes the applicable Recovery or Conflict
+/// Directive. Selection denials carry candidate-recovery with no
+/// auto-selection; `NOT_READY` requires a new ticket on retry; stale fence is
+/// fail-closed; internal/semantic failures resolve to the failure capsule.
+/// Exhaustive with no wildcard arm.
+pub(super) fn denial_directive_kind(code: AgentBridgeActivationDenialCode) -> &'static str {
+    match code {
+        AgentBridgeActivationDenialCode::TaskSelectionRequired
+        | AgentBridgeActivationDenialCode::ScopeSelectionRequired
+        | AgentBridgeActivationDenialCode::ScopeAmbiguous => "candidate-recovery-no-auto-selection",
+        AgentBridgeActivationDenialCode::NotReady => "retry-requires-new-ticket",
+        AgentBridgeActivationDenialCode::StaleFence => "stale-fence-fail-closed",
+        AgentBridgeActivationDenialCode::FailedInternal
+        | AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => "failure-capsule",
+    }
+}
+
+/// I7.20 agent-facing projection triple for a typed activation denial.
+///
+/// Returns `(reason_code, disposition, directive_kind)` by routing through
+/// [`denial_reason_code`], [`agent_disposition_for_denial`], and
+/// [`denial_directive_kind`]. Carries the I7.20 disposition/directive literals
+/// inline (no core-crate const import); the core crate also projects the same
+/// triple through the `ActivationPortOutcome::DeniedDetailed` carrier.
+pub(super) fn denied_details_for(
+    code: AgentBridgeActivationDenialCode,
+) -> (&'static str, &'static str, &'static str) {
+    (
+        denial_reason_code(code),
+        agent_disposition_for_denial(code),
+        denial_directive_kind(code),
+    )
+}
+
+/// Transport failure stays distinct from a typed denial: deadline/unknown
+/// transport outcomes surface as `ProviderFailure` and never collapse into a
+/// known negative reason/disposition/directive triple.
 fn provider_failure() -> ProviderFailure {
     ProviderFailure::new(
         "eliot-kernel-front-door",
@@ -328,8 +389,21 @@ impl KernelTransportOwner {
             decode_activation_response(&wire, &activation_request, &self.admitted.receipt)?;
         match response.disposition {
             eliot_protocol::AgentBridgeActivationDisposition::Denied { reason_code } => {
-                let code: &'static str = denial_reason_code(reason_code);
-                Ok(ActivationPortOutcome::Denied { reason_code: code })
+                // I7.20 agent-facing projection: (reason_code, disposition, directive)
+                // triple. Selection denials carry candidate-recovery with no
+                // auto-selection; NOT_READY requires a new ticket on retry; stale
+                // fence is fail-closed; internal/semantic failures resolve to the
+                // distinct failure capsule. Transport ProviderFailure stays
+                // distinct: deadline/unknown never collapses into a known negative.
+                let (code_str, disposition, directive) = denied_details_for(reason_code);
+                debug_assert_eq!(code_str, denial_reason_code(reason_code));
+                assert!(!disposition.is_empty());
+                assert!(!directive.is_empty());
+                Ok(ActivationPortOutcome::DeniedDetailed {
+                    reason_code: code_str,
+                    disposition,
+                    directive_kind: directive,
+                })
             }
             eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } => {
                 let b = *binding;
