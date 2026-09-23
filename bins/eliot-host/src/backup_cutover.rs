@@ -62,12 +62,24 @@
 //! - Retirement barrier (#1751, Parfit, Host owner): `super::
 //!   GenerationRetirementFence`, `super::GenerationRetirementBarrier`, and
 //!   `HostComposition::require_generation_retirement_barrier` are Parfit-owned
-//!   and deliberately NOT duplicated here. The fence binds
+//!   and deliberately NOT duplicated here. LANDED in Parfit's branch
+//!   (`codex/finish-windows1751-20260922` @ `552ee79a`,
+//!   `bins/eliot-host/src/lease_drain.rs:12-73`: fence with pub
+//!   `activation_id`/`activation_generation`/`state_fence`; barrier with
+//!   private fields plus pub read accessors `fence()`,
+//!   `drain_commit_operation()`, `runtime_lease_census()`,
+//!   `kernel_process_id()`, `kernel_process_start_time_100ns()`; `pub fn`
+//!   on `HostComposition` taking `&mut self`; registered as
+//!   `#[cfg(windows)] mod lease_drain;` +
+//!   `#[cfg(windows)] pub use lease_drain::{GenerationRetirementBarrier,
+//!   GenerationRetirementFence};`). Remaining here: root serialization +
+//!   registration, then this module compiles wired. The fence binds
 //!   `activation_id: PlatformHandle` (`eliot_platform`, as in host `lib.rs`
 //!   line 214), `activation_generation: EpochTransition` (`eliot_host_state`
 //!   re-export of `eliot_contracts`, `epoch_identity.rs:211`), and
-//!   `state_fence: StateFence` (`eliot_contracts`). Until #1751 lands this
-//!   module does not compile standalone, by design.
+//!   `state_fence: StateFence` (`eliot_contracts`). Retirement reads the
+//!   issued fence through `barrier.fence()`; the barrier is otherwise held
+//!   opaquely and never destructured.
 //!
 //! Real effect callgraph (every call below resolves to an existing owner):
 //! - `HostComposition::ensure_admission_open` (host `lib.rs:7128`, private in
@@ -132,9 +144,9 @@ use eliot_protocol::{
     host_request_operation_id, HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestKind,
 };
 
-// Stubless consumption of the Parfit-owned (#1751) retirement barrier. These
-// items do not exist yet; root serializes their definition with Parfit's
-// `lease_drain.rs` + `lib.rs` change. This module defines no local duplicate.
+// Stubless consumption of the Parfit-owned (#1751) retirement barrier,
+// landed in Parfit's branch (see module docs); root serializes the
+// definition + registration. This module defines no local duplicate.
 use super::{GenerationRetirementBarrier, GenerationRetirementFence, HostComposition, HostError};
 
 /// Maximum bounded evidence references carried on any cutover outcome or
@@ -661,8 +673,7 @@ pub fn execute_cutover(
 pub fn retire_prior_generation(
     host: &HostComposition,
     validated: &ValidatedCutover,
-    retirement: &GenerationRetirementFence,
-    _barrier: &GenerationRetirementBarrier,
+    barrier: &GenerationRetirementBarrier,
     prior_host: &HostInstallationEpoch,
     retirement_authorization: &PlatformHandle,
 ) -> Result<CutoverOutcome, CutoverError> {
@@ -696,16 +707,18 @@ pub fn retire_prior_generation(
     let retired_at = PlatformHandle::new(format!("cutover-retired-at:{retired_digest}"))
         .map_err(|_| CutoverError::BindingMismatch)?;
     let record = HostStateRecord::EpochRetirement(EpochRetirementRecord {
-        // Full fence shape comes straight from the barrier-bound fence
-        // already checked in `execute_cutover` (same installation
-        // activation id + generation the barrier was issued for). The
+        // Fence shape comes from the ISSUED barrier itself
+        // (`GenerationRetirementBarrier::fence`), not a second
+        // caller-supplied copy: the activation id + generation recorded
+        // here are exactly the ones the barrier was issued for, already
+        // cross-checked against the request in `execute_cutover`. The
         // journal reducer runs the complete owner `validate()` on append,
         // including `HostInstallationEpoch::validate`, which this crate
         // cannot call directly (`pub(crate)` in `eliot-host-state`).
         fence: RecordFence {
             host: host.host.clone(),
-            activation_id: retirement.activation_id.clone(),
-            activation_generation: retirement.activation_generation.clone(),
+            activation_id: barrier.fence().activation_id.clone(),
+            activation_generation: barrier.fence().activation_generation.clone(),
         },
         operation,
         retired_host: prior_host.clone(),
