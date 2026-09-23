@@ -323,13 +323,13 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
-    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDecision,
-    AgentActivationResolutionResult, AgentActivationResolutionTicket, AgentActivationResultAck,
-    AgentActivationResultReconcile, AgentActivationResultSubmit, AgentBridgeActivationDenialCode,
-    AgentBridgeActivationDisposition, AgentBridgeActivationFence, AgentBridgeActivationRequest,
-    AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration,
-    AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind,
-    MessageType, ProtocolPayload, RequestIdentity,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
+    AgentActivationResultSubmit, AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition,
+    AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
+    AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
+    AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
+    RequestIdentity,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 #[cfg(test)]
@@ -530,8 +530,7 @@ pub struct KernelComposition {
     /// result ledger only; it never contains pending entries or live bindings.
     ///
     /// Every one of the seven closed dispositions shares one
-    /// exact-replay/conflict ledger here, independent of the legacy
-    /// success-only decision ledger on the pending entry. Only a `Resolved`
+    /// exact-replay/conflict ledger here. Only a `Resolved`
     /// disposition can later yield a transport Session, and that Session is
     /// created exactly once by the bridge activation path. The map lives
     /// beside the pending table (rather than inside its entries) so the
@@ -617,30 +616,19 @@ struct AgentActivationPendingState {
 struct AgentActivationPending {
     ticket: AgentActivationResolutionTicket,
     request: AgentBridgeActivationRequest,
-    decision: Option<AgentActivationResolutionDecision>,
     /// Private Kernel claim lease; it is deliberately absent from the wire
     /// ticket so retries cannot mint or select a caller-owned identity.
     claim_lease_until_unix_ms: Option<u64>,
 }
 
+/// Replay/commit/conflict disposition shared by the activation result
+/// entry classifiers (v2 result legs).
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActivationDecisionDisposition {
     Commit,
     ExactReplay,
     Conflict,
-}
-
-#[cfg(windows)]
-fn classify_activation_decision(
-    existing: Option<&AgentActivationResolutionDecision>,
-    incoming: &AgentActivationResolutionDecision,
-) -> ActivationDecisionDisposition {
-    match existing {
-        None => ActivationDecisionDisposition::Commit,
-        Some(existing) if existing == incoming => ActivationDecisionDisposition::ExactReplay,
-        Some(_) => ActivationDecisionDisposition::Conflict,
-    }
 }
 
 /// Submission phase of one retained v2 semantic result.
@@ -677,9 +665,8 @@ struct AgentActivationResultRecord {
     retention_order: u64,
 }
 
-/// Pure replay classifier for v2 results, mirroring the v1 decision
-/// classifier. The `NotReady` supersede gate is applied by the submit path
-/// only when this classifier reports `Conflict`.
+/// Pure replay classifier for v2 results. The `NotReady` supersede gate is
+/// applied by the submit path only when this classifier reports `Conflict`.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActivationResultDisposition {
@@ -718,9 +705,7 @@ impl AgentActivationPendingState {
             let Some(entry) = self.entries.get_mut(&ticket_id) else {
                 continue;
             };
-            if entry.decision.is_some()
-                || activation_deadline_expired(now, entry.ticket.kernel_deadline_unix_ms)
-            {
+            if activation_deadline_expired(now, entry.ticket.kernel_deadline_unix_ms) {
                 continue;
             }
             if entry
