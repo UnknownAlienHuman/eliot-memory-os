@@ -35,7 +35,8 @@ use crate::{
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
     AuthoritySnapshotReceipt, CanonicalDisposition, CanonicalReconciliation,
     CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
-    CapabilityIntroductionActivation, CapabilityIntroductionFence, CapabilityIntroductionReceipt,
+    CapabilityIntroductionActivation, CapabilityIntroductionFence, CapabilityIntroductionProjection,
+    CapabilityIntroductionReceipt,
     DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
     EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit, GrantClosureCommitReceipt,
@@ -377,6 +378,17 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         fence: CapabilityIntroductionFence,
     ) -> Result<CapabilityIntroductionReceipt, OrsError>;
+    /// Reads one current capability-introduction row after validating its
+    /// opaque record, key, kind, subject, phase, and store-issued receipt
+    /// (issues #1110/#2100).
+    ///
+    /// Only `Active` and `Fenced` rows are returned. Any other phase under
+    /// this kind is an integrity problem: introductions never reactivate, so
+    /// a `Fenced` row is fence evidence, never activatable authority.
+    fn load_capability_introduction(
+        &self,
+        subject_id: &crate::OperationIdentity,
+    ) -> Result<Option<CapabilityIntroductionProjection>, OrsError>;
     fn logical_snapshot(&self, request: OrsSnapshotRequest)
     -> Result<OrsSnapshotReceipt, OrsError>;
     fn scan_pending(
@@ -6903,11 +6915,29 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         &self,
         activation: CapabilityIntroductionActivation,
     ) -> Result<CapabilityIntroductionReceipt, OrsError> {
+        let input = activation.0;
+        if let Some(existing) = self.load_capability_introduction(&input.subject_id)? {
+            if existing.record() == &input && existing.phase() == OperationalPhase::Active {
+                return Ok(CapabilityIntroductionReceipt::from_receipt(
+                    existing.receipt().clone(),
+                ));
+            }
+            // Restore never reactivates a fenced introduction (I6.15): an
+            // exact replay of the committed activation is idempotent above,
+            // and any other presentation against an existing row — a changed
+            // payload, a new record over an `Active` row, or any record over
+            // a `Fenced` row — is a typed state-machine refusal, never a
+            // second activation.
+            return Err(OrsError::InvalidTransition);
+        }
+        // Only a missing row may enter `Active`: `Fenced` rows are never
+        // reactivated, so the allowed-prior set stays empty and any raced
+        // duplicate still fails closed through the transition check.
         self.mutate_operational(
             OperationalKind::CapabilityIntroduction,
-            activation.0,
+            input,
             false,
-            &[OperationalPhase::Fenced],
+            &[],
             OperationalPhase::Active,
         )
         .map(CapabilityIntroductionReceipt::from_receipt)
@@ -6925,6 +6955,40 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             OperationalPhase::Fenced,
         )
         .map(CapabilityIntroductionReceipt::from_receipt)
+    }
+
+    fn load_capability_introduction(
+        &self,
+        subject_id: &crate::OperationIdentity,
+    ) -> Result<Option<CapabilityIntroductionProjection>, OrsError> {
+        let key = Self::operational_key(OperationalKind::CapabilityIntroduction, subject_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let record: DurableOperationalRecord = decode_named(value.value(), "operational_current")?;
+        if record.kind != OperationalKind::CapabilityIntroduction
+            || record.input.subject_id != *subject_id
+            || !matches!(
+                record.phase,
+                OperationalPhase::Active | OperationalPhase::Fenced
+            )
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "capability_introduction",
+                reason: "current capability-introduction key, kind, subject, or phase mismatch"
+                    .to_owned(),
+            });
+        }
+        record.input.validate()?;
+        let receipt = Self::receipt_for(&record)?;
+        Ok(Some(CapabilityIntroductionProjection::from_store(
+            record.input,
+            record.phase,
+            record.operation_order,
+            receipt,
+        )))
     }
 
     #[allow(
