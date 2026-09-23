@@ -563,42 +563,118 @@ def matched_lines(text: str, needle: str) -> list[str]:
     return [line for line in text.splitlines() if needle in line]
 
 
-def candidate_base() -> str:
-    """Live owning-range base: the fork point of this candidate and main.
+_HEX40 = re.compile(r"[0-9a-fA-F]{40}\Z")
 
-    Computed from real Git (`merge-base HEAD origin/main`), never from a
-    frozen constant, so unrelated main evolution never enters the owning
-    range and no oracle edit is needed after unrelated main merges or a
-    candidate rebase. A missing/unrelated `origin/main` ref fails closed
-    instead of guessing a base; HEAD-as-its-own-base (empty range) can
-    never satisfy the exact-diff allowlist downstream.
-    """
-    base = subprocess.run(
-        ["git", "merge-base", "HEAD", "origin/main"],
+
+def _git_text(argv: list[str]) -> str:
+    """Run one read-only git command; fail closed on any transport error."""
+    proc = subprocess.run(
+        argv,
         cwd=ROOT,
         capture_output=True,
         text=True,
     )
-    if base.returncode != 0:
-        raise GateFailure("candidate owning base is unresolvable: origin/main required")
-    resolved = base.stdout.strip()
-    if not resolved:
-        raise GateFailure("candidate owning base is unresolvable: empty merge-base")
+    if proc.returncode != 0:
+        raise GateFailure(f"git identity unavailable: {' '.join(argv)}")
+    return proc.stdout
+
+
+def resolve_owning_range() -> tuple[str, str, str]:
+    """Resolve the immutable owning (base, candidate) range plus HEAD SHA.
+
+    `OWNING_BASE`/`OWNING_CANDIDATE` (40-hex SHAs, set by the acceptance
+    runner from the reviewed delivery record) are validated, never trusted:
+    both must resolve in the local DAG, base must be an ancestor of
+    candidate, and base must differ from candidate (a vacuous pair can never
+    satisfy the required allowlist entries downstream). When unset, the base
+    falls back to the live fork point (`merge-base HEAD origin/main`) and
+    the candidate to the checkout itself, preserving the standard entrypoint;
+    a fallback that collapses to HEAD fails closed with guidance instead of
+    measuring an empty range. Returned SHAs are recorded into gate evidence;
+    mechanically validated Git identity is recorded, never presented as
+    semantic approval (that association stays with reviewers comparing
+    evidence SHAs to the delivery record).
+    """
+    head = _git_text(["git", "rev-parse", "HEAD"]).strip()
+    if not _HEX40.fullmatch(head):
+        raise GateFailure("checkout HEAD is not a 40-hex commit")
+    base_env = os.environ.get("OWNING_BASE", "").strip()
+    candidate_env = os.environ.get("OWNING_CANDIDATE", "").strip()
+    if bool(base_env) != bool(candidate_env):
+        raise GateFailure("owning range inputs are partial: set both OWNING_BASE and OWNING_CANDIDATE or neither")
+    if candidate_env:
+        base, candidate = base_env, candidate_env
+        for label, value in (("OWNING_BASE", base), ("OWNING_CANDIDATE", candidate)):
+            if not _HEX40.fullmatch(value):
+                raise GateFailure(f"{label} is not a 40-hex commit SHA")
+            _git_text(["git", "cat-file", "-e", value])
+    else:
+        base = _git_text(["git", "merge-base", "HEAD", "origin/main"]).strip()
+        if not base:
+            raise GateFailure("candidate owning base is unresolvable: origin/main required")
+        candidate = head
     ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", resolved, "HEAD"],
+        ["git", "merge-base", "--is-ancestor", base, candidate],
         cwd=ROOT,
         capture_output=True,
         text=True,
     )
     if ancestor.returncode != 0:
-        raise GateFailure(f"candidate base is not an ancestor: {resolved}")
-    return resolved
+        raise GateFailure(f"owning base is not an ancestor of the candidate: {base}")
+    if base == candidate:
+        raise GateFailure(
+            "owning range is vacuous (base == candidate); on an integrated "
+            "checkout set OWNING_BASE and OWNING_CANDIDATE from the reviewed "
+            "delivery record"
+        )
+    return (base, candidate, head)
+
+
+def assert_worktree_matches_candidate(candidate: str, names: list[str]) -> None:
+    """Require the checkout to contain exactly the candidate's range bytes.
+
+    Only enforced for an explicitly supplied owning candidate (acceptance
+    mode): the default mode judges the checkout itself, so oracle
+    development on dirty trees keeps working. Every range path must exist
+    (or not) on both sides with identical bytes; any drift fails closed so
+    a verdict can never mix one commit's range with another tree's bytes.
+    Untracked worktree additions are covered separately by the membership
+    snapshot and the exact-diff allowlist cases.
+    """
+    for name in names:
+        candidate_proc = subprocess.run(
+            ["git", "cat-file", "-e", f"{candidate}:{name}"],
+            cwd=ROOT,
+            capture_output=True,
+        )
+        candidate_has = candidate_proc.returncode == 0
+        worktree_path = ROOT / name
+        worktree_has = worktree_path.is_file()
+        if candidate_has != worktree_has:
+            raise GateFailure(f"checkout does not contain the candidate range file: {name}")
+        if not candidate_has:
+            continue
+        if worktree_path.is_symlink() or not worktree_path.is_file():
+            raise GateFailure(f"checkout range path is not a regular file: {name}")
+        shown = subprocess.run(
+            ["git", "show", f"{candidate}:{name}"],
+            cwd=ROOT,
+            capture_output=True,
+        )
+        if shown.returncode != 0:
+            raise GateFailure(f"candidate range file is unreadable: {name}")
+        try:
+            live = worktree_path.read_bytes()
+        except OSError as exc:
+            raise GateFailure(f"checkout range file is unreadable: {name}: {exc}") from None
+        if live != shown.stdout:
+            raise GateFailure(f"checkout range file differs from the candidate: {name}")
 
 
 def git_diff_names() -> list[str]:
-    base = candidate_base()
+    base, candidate, _ = resolve_owning_range()
     diff = subprocess.run(
-        ["git", "diff", "--name-only", base],
+        ["git", "diff", "--name-only", base, candidate],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -778,14 +854,14 @@ GATE_DESCRIPTOR_REL = ".github/work-units/835.toml"
 GATE_ADMISSION_DIR = "scripts/testdata/cue-kind-retirement/admission"
 GATE_TARGET_DIR = "target/wu837-gate"
 GATE_MANIFEST_REL = "Cargo.toml"
-# Owning change-range identity (F1): the candidate base is derived live
-# from real Git (candidate_base: merge-base of HEAD and origin/main), so
-# the exact-diff cases measure only the owning range and stay passable
-# across unrelated main evolution without oracle edits. The allowlist in
+# Owning change-range identity (F1): the (base, candidate) pair is either
+# supplied explicitly (`OWNING_BASE`/`OWNING_CANDIDATE` from the reviewed
+# delivery record, validated against the Git DAG in resolve_owning_range)
+# or falls back to the live fork point plus the checkout itself, so the
+# exact-diff cases measure the owning range without frozen SHA constants
+# and without breaking the standard entrypoint. The allowlist in
 # allowed_diff.txt enumerates exactly that admitted range; any unrelated
-# file fails. A frozen base constant is deliberately absent: a stale SHA
-# assertion (donor-era 9a676803) made cases 23/28 fail on main's own
-# evolution, while HEAD-as-both-sides would make them vacuous. The
+# file fails, and the required entries reject vacuous pairs. The
 # built-binary evidence stays bound separately through the accepted cargo
 # builders below.
 GATE_RUST_SELECTION = (
@@ -874,6 +950,9 @@ class GateEvidence:
     shape: object
     package_receipt: object
     input_snapshot_before: tuple
+    owning_base: str
+    owning_candidate: str
+    head_sha: str
 
 
 def _gate_modules():
@@ -1318,6 +1397,13 @@ def run_accepted_gate():
         return _gate_evidence
     _, cb, c, r = _gate_modules()
     before = protected_snapshot()
+    owning_base, owning_candidate, head_sha = resolve_owning_range()
+    if os.environ.get("OWNING_CANDIDATE", "").strip():
+        # Explicit-candidate acceptance mode only: the checkout must contain
+        # exactly the candidate's range bytes, so a verdict can never mix
+        # one commit's range with another tree's bytes. Default mode judges
+        # the checkout itself (6e semantics; oracle development unaffected).
+        assert_worktree_matches_candidate(owning_candidate, git_diff_names())
     document = acquire_assignment()
     descriptor = load_descriptor(document)
     if descriptor.matrix_cases != 28:
@@ -1383,7 +1469,10 @@ def run_accepted_gate():
         rust_evidence=tuple(rust_evidence), rust_receipts=tuple(rust_receipts),
         rust_gaps=tuple(rust_gaps), accounting=accounting,
         shape=shape, package_receipt=package_receipt,
-        input_snapshot_before=tuple(sorted(before.items())))
+        input_snapshot_before=tuple(sorted(before.items())),
+        owning_base=owning_base,
+        owning_candidate=owning_candidate,
+        head_sha=head_sha)
     return _gate_evidence
 
 

@@ -64,6 +64,13 @@ MEMBER_KINDS = frozenset(("member", "excluded", "standalone", "unavailable"))
 ALLOWED_ENV_NAMES = frozenset((
     "PATH", "SYSTEMROOT", "TEMP", "TMP",
     "PYTHONDONTWRITEBYTECODE", "PYTHONIOENCODING",
+    # Owning-range binding for the cue-kind retirement oracle (issue #835):
+    # the acceptance runner sets these 40-hex SHAs from the reviewed delivery
+    # record; the oracle validates them against the Git DAG and the admitted
+    # range (never trusts them). Without passthrough, the owned gate child
+    # (which runs the exact-diff cases) would resolve a different range than
+    # the parent. No secret markers; 40-hex values fit the byte caps below.
+    "OWNING_BASE", "OWNING_CANDIDATE",
 ))
 BLOCKED_ENV_MARKERS = frozenset(("TOKEN", "SECRET", "CREDENTIAL", "PASSWORD", "KEY"))
 # Bounded child-environment byte caps (UTF-8 byte lengths, not characters).
