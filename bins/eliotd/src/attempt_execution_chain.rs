@@ -43,6 +43,8 @@
 //! triple — no other runtime join may invoke the supplier path, and no
 //! speculative loop is wired here.
 
+use std::path::PathBuf;
+
 use eliot_agent_api::{
     AgentLaunchRequest, AuthorityEnvelope, ExecutionUnit, NativeSession, ProviderExecutionBinding,
     RequestId, RouteFingerprint,
@@ -148,6 +150,14 @@ pub enum ExecutionChainError {
     /// disposition.
     #[error("retained Governor resolution fails its integrity validation")]
     RetainedResolutionInvalid,
+    /// The explicit session-attach payload is refused before observation:
+    /// blank/control-bearing refs or a non-absolute root. The activation
+    /// ticket is correlation-only and never authenticates an attach.
+    #[error("explicit session-attach payload refused: {reason}")]
+    AttachPayloadRefused {
+        /// Static refusal reason naming the exact failed shape check.
+        reason: &'static str,
+    },
     /// The adapter supplier rejected the bind inputs.
     #[error("execution-unit supplier rejected: {0}")]
     Supplier(#[from] CodexAdapterError),
@@ -1045,5 +1055,150 @@ pub fn poll_governed_dispatch(
         }
         Err(error) => GovernedDispatchOutcome::Failed(error),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Explicit session-attach trigger: authenticated root/session payload,
+// mechanical root observation, and the proposed WorkScope admission call
+// (issue #1787; O1 owns this daemon trigger ingress only).
+// ---------------------------------------------------------------------------
+
+/// Bound for attach-payload free-text refs. Matches the activation-result
+/// wire text bound (512); the attach IPC owners may tighten it when the
+/// ingress transport lands.
+const ATTACH_REF_MAX_BYTES: usize = 512;
+
+/// Explicit authenticated root/session attach payload for the scope-attach
+/// trigger (issue #1787).
+///
+/// O1-owned ingress shape. Every field is caller-explicit: the workspace
+/// root under attach, the handshake-bound session, the explicit root
+/// authorization reference, and the caller correlation for the attach
+/// receipt. Nothing is inferred from the activation ticket (correlation-only
+/// by contract), from cwd/proximity/recency, or from a live
+/// composition-method's mere existence. The admission fence and the retained
+/// descriptor/owner are read live at trigger time, never carried here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionAttachPayload {
+    /// Explicit workspace root under attach. Must be absolute; mechanical
+    /// observability (exists, is a directory) is checked at authentication.
+    pub explicit_root: PathBuf,
+    /// Handshake-bound session this attach serves. Must equal the live
+    /// Kernel owner session; the principal half stays with the Kernel owner.
+    pub session: SessionId,
+    /// Explicit root authorization reference. Bounded text; names the
+    /// root-authorized ingress authorization, never the ticket.
+    pub authorizing_ref: String,
+    /// Caller correlation for the attach receipt. Bounded text; correlation
+    /// only, never authority — the receipt itself is owner-issued.
+    pub receipt_ref: String,
+}
+
+/// An attach payload authenticated against live owners and ready to observe.
+///
+/// Carries only values checked live at trigger time: the explicit root
+/// (absolute, mechanically observable directory), the live-matched session,
+/// the bounded refs, and the exact admission fence the observation must
+/// derive under. The retained descriptor/owner and policy inputs are NOT
+/// carried: the owning admit entry reads them itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedSessionAttach {
+    /// Authenticated explicit workspace root.
+    pub explicit_root: PathBuf,
+    /// Live-matched handshake-bound session.
+    pub session: SessionId,
+    /// Bounded explicit authorization reference, carried through to admit.
+    pub authorizing_ref: String,
+    /// Bounded caller correlation, carried through to receipt production.
+    pub receipt_ref: String,
+    /// Exact admission fence the observation derives under.
+    pub fence: StateFence,
+}
+
+fn attach_ref_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+        && value.len() <= ATTACH_REF_MAX_BYTES
+}
+
+/// Authenticate one explicit session-attach payload against live owners.
+///
+/// Order: bounded-text shape on both refs; explicit-root absoluteness plus
+/// a thin mechanical observability check (exists, is a directory — symlinked
+/// roots are refused rather than traversed; full workspace observation
+/// belongs to the WorkScope owner at admit time); live Kernel owner session
+/// agreement (an absent handshake fails closed, and the activation ticket is
+/// never consulted); live Kernel/Governor fence agreement under
+/// [`fences_match_exact`]. The returned value is ready to observe at `fence`
+/// generation. Pure except for the one filesystem metadata read; mutates
+/// nothing.
+///
+/// Proposed complete path (WorkScope child owns the callee; O1 proposes, never
+/// seizes): `AuthenticatedSessionAttach` → WorkScope-owner mechanical
+/// observation of `explicit_root` at `fence.resource_generation` →
+/// `GovernorComposition::admit_observed_scope_attach(receipt_ref,
+/// observed, descriptor, authorizing_ref, privacy_class,
+/// governing_source_generation, sources, privacy, owner_revision)` at
+/// `crates/governor/eliot-governor/src/composition.rs` (WorkScope child
+/// `5ea54bf8`, not live) → `admit_scope_relocation` rebind with a fresh
+/// `MATCHED` source closure → receipt plus admitted owner retained alongside
+/// the authorization evidence. The daemon run-loop arm for this trigger
+/// (session-attach / first-tool-event / root-change ingress, pending on the
+/// authenticated-ingress transport owned by the Kernel/protocol owners) is
+/// likewise proposed, not built: no producer exists yet, and an arm polling
+/// a hardcoded-None source would be interface-only. CLI stays
+/// authority-free: the CLI scope-observe ingress derives the same
+/// observation shape as evidence only.
+pub fn authenticate_session_attach(
+    kernel: &DaemonKernelClient,
+    composition: &DaemonComposition,
+    payload: SessionAttachPayload,
+) -> Result<AuthenticatedSessionAttach, ExecutionChainError> {
+    if !attach_ref_valid(&payload.authorizing_ref) {
+        return Err(ExecutionChainError::AttachPayloadRefused {
+            reason: "authorizing_ref must be bounded non-blank text without control characters",
+        });
+    }
+    if !attach_ref_valid(&payload.receipt_ref) {
+        return Err(ExecutionChainError::AttachPayloadRefused {
+            reason: "receipt_ref must be bounded non-blank text without control characters",
+        });
+    }
+    if !payload.explicit_root.is_absolute() {
+        return Err(ExecutionChainError::AttachPayloadRefused {
+            reason: "explicit root must be absolute",
+        });
+    }
+    // Thin mechanical check only: existence plus directory-ness through the
+    // link itself, never traversed. TOCTOU between this read and admission
+    // is inherent; the owning admit entry re-verifies with a fresh MATCHED
+    // source closure before anything rebinds.
+    let root_observable = std::fs::symlink_metadata(&payload.explicit_root)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false);
+    if !root_observable {
+        return Err(ExecutionChainError::AttachPayloadRefused {
+            reason: "explicit root is not a mechanically observable directory",
+        });
+    }
+    let live_session = supply_owner_session(kernel)?;
+    if payload.session != live_session {
+        return Err(ExecutionChainError::LiveAttachMismatch {
+            field: "attach.session",
+        });
+    }
+    let live_fence = supply_live_kernel_fence(kernel);
+    let governor_fence = supply_governor_fence(composition);
+    if !fences_match_exact(&live_fence, &governor_fence) {
+        return Err(ExecutionChainError::StaleAdmissionFence);
+    }
+    Ok(AuthenticatedSessionAttach {
+        explicit_root: payload.explicit_root,
+        session: live_session,
+        authorizing_ref: payload.authorizing_ref,
+        receipt_ref: payload.receipt_ref,
+        fence: live_fence,
+    })
 }
 
