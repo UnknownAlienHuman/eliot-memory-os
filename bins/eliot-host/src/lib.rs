@@ -31,6 +31,8 @@ mod host_job_launch;
 #[cfg(windows)]
 mod lease_drain;
 #[cfg(windows)]
+pub mod backup_cutover;
+#[cfg(windows)]
 mod launch_artifact;
 #[cfg(windows)]
 mod launch_descriptor_validation;
