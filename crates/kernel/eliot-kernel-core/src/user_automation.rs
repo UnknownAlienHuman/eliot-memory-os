@@ -10,9 +10,9 @@
 
 use std::collections::BTreeSet;
 
-use eliot_config::ConfigPolicySnapshot;
+pub use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
-    ContractIdentity, ContractVersion, PolicyRevision, RequestMetadata, StateFence,
+    ContractIdentity, ContractVersion, OperationId, PolicyRevision, RequestMetadata, StateFence,
     canonical_json_bytes, contract_identity, sha256_hex,
 };
 use eliot_platform::PlatformHandle;
@@ -26,7 +26,7 @@ use thiserror::Error;
 /// Stable contract name for the Kernel-owned UserAutomation domain.
 pub const USER_AUTOMATION_CONTRACT_NAME: &str = "eliot.kernel.user-automation";
 /// Current semantic contract revision.
-pub const USER_AUTOMATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const USER_AUTOMATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
 /// Selector used by authenticated Kernel/Host preflight reads.
 pub const USER_AUTOMATION_PREFLIGHT_SELECTOR: &str = "eliot.config.user_automation.v1";
 /// Operation marker used by the preflight read route.
@@ -679,6 +679,81 @@ pub enum UserAutomationTriggerOrigin {
     AutomationChild,
 }
 
+/// Persisted evidence for the request that first admitted this invocation.
+///
+/// The Store writes this alongside a `RunNow` invocation. It retains the exact
+/// task/session metadata, closed operator payload, and canonical write
+/// identity that produced the invocation; a later daemon selector cannot
+/// replace or manufacture these fields.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationInvocationProvenance {
+    /// Authenticated Kernel request context that admitted the operator action.
+    pub request_metadata: RequestMetadata,
+    /// Closed operation payload that produced this invocation.
+    pub source_operation: UserAutomationOperation,
+    /// Canonical Store operation identity for the source action.
+    pub operation_id: OperationId,
+    /// Idempotency identity for the source action.
+    pub idempotency_key: String,
+    /// Canonical request digest verified by the Store write path.
+    pub canonical_request_hash: String,
+}
+
+impl UserAutomationInvocationProvenance {
+    fn validate_for(
+        &self,
+        invocation: &UserAutomationInvocation,
+        expected_state_fence: &StateFence,
+    ) -> Result<(), UserAutomationError> {
+        self.request_metadata
+            .validate()
+            .map_err(|_| UserAutomationError::Invalid("invocation.provenance.request_metadata"))?;
+        self.source_operation.validate()?;
+        text(
+            &self.idempotency_key,
+            "invocation.provenance.idempotency_key",
+        )?;
+        if self.canonical_request_hash.len() != 64
+            || !self
+                .canonical_request_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(UserAutomationError::Invalid(
+                "invocation.provenance.canonical_request_hash",
+            ));
+        }
+        if self.request_metadata.state_fence != *expected_state_fence
+            || self.request_metadata.session_id.is_none()
+            || self.request_metadata.task_id.is_none()
+        {
+            return Err(UserAutomationError::ReceiptBinding);
+        }
+
+        match (&self.source_operation, &invocation.trigger) {
+            (
+                UserAutomationOperation::RunNow {
+                    automation_id,
+                    automation_revision,
+                    nonce,
+                },
+                UserAutomationTrigger::Manual {
+                    nonce: invocation_nonce,
+                },
+            ) if automation_id == &invocation.automation_id
+                && automation_revision == &invocation.automation_revision
+                && nonce == invocation_nonce
+                && invocation.trigger_origin == UserAutomationTriggerOrigin::Human
+                && invocation.child_depth == 0 =>
+            {
+                Ok(())
+            }
+            _ => Err(UserAutomationError::ReceiptBinding),
+        }
+    }
+}
+
 /// Authenticated invocation selector accepted by the Kernel owner route.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -701,6 +776,11 @@ pub struct UserAutomationInvocation {
     pub trigger_origin: UserAutomationTriggerOrigin,
     /// Child depth carried by the admitted lineage.
     pub child_depth: u16,
+    /// Original owner-admitted request and exact `RunNow` receipt identity.
+    /// Older persisted invocations deserialize without provenance but are
+    /// rejected by production admission until reconciled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<UserAutomationInvocationProvenance>,
 }
 
 impl UserAutomationInvocation {
@@ -714,14 +794,49 @@ impl UserAutomationInvocation {
         text(&self.workdir_ref, "workdir_ref")
     }
 
+    /// Requires task/session and exact `RunNow` receipt provenance at the
+    /// production owner-admission boundary.
+    pub fn require_run_now_provenance(
+        &self,
+        expected_state_fence: &StateFence,
+    ) -> Result<&UserAutomationInvocationProvenance, UserAutomationError> {
+        let provenance = self
+            .provenance
+            .as_ref()
+            .ok_or(UserAutomationError::ReceiptBinding)?;
+        provenance.validate_for(self, expected_state_fence)?;
+        Ok(provenance)
+    }
+
     /// Returns the stable revision-bound occurrence identity.
     pub fn occurrence_identity(&self) -> Result<String, UserAutomationError> {
         self.validate()?;
-        let bytes = canonical_json_bytes(&(
-            OCCURRENCE_IDENTITY_DOMAIN,
+        Self::occurrence_identity_for(
             &self.automation_id,
             &self.automation_revision,
             &self.trigger,
+        )
+    }
+
+    /// Derives the stable occurrence identity from owner-selected immutable
+    /// identity and trigger material without constructing an invocation.
+    ///
+    /// This is a selector operation only. It does not assign a principal,
+    /// trigger origin, child depth, mode, or work scope; those fields must be
+    /// recovered from the owner-issued persisted invocation before admission.
+    pub fn occurrence_identity_for(
+        automation_id: &str,
+        automation_revision: &str,
+        trigger: &UserAutomationTrigger,
+    ) -> Result<String, UserAutomationError> {
+        text(automation_id, "automation_id")?;
+        text(automation_revision, "automation_revision")?;
+        trigger.validate()?;
+        let bytes = canonical_json_bytes(&(
+            OCCURRENCE_IDENTITY_DOMAIN,
+            automation_id,
+            automation_revision,
+            trigger,
         ))
         .map_err(|error| UserAutomationError::Serialization(error.to_string()))?;
         Ok(format!("user-automation-occurrence:{}", sha256_hex(&bytes)))
@@ -1022,6 +1137,10 @@ pub struct UserAutomationPreflightReceipt {
     pub occurrence_id: String,
     /// Canonical configuration snapshot identity.
     pub config_snapshot_id: String,
+    /// Existing B-owned complete config snapshot observed by this preflight.
+    /// The daemon admission gate compares this exact snapshot against the
+    /// live policy owner; the id alone is not sufficient.
+    pub config_snapshot: ConfigPolicySnapshot,
     /// Configuration state observed by this preflight.
     pub configuration_state: UserAutomationConfigurationState,
     /// I14.1 class for the existing Durable Job path.
@@ -1080,7 +1199,12 @@ pub struct UserAutomationPreflightProjection {
     pub occurrence_id: String,
     /// Full immutable revision owned by this projection.
     pub revision: UserAutomationRevision,
-    /// Canonical configuration state repeated for explicit readback.
+    /// Live canonical configuration state from the current pointer.
+    ///
+    /// This may differ from the immutable revision's state after pause,
+    /// resume, or retirement. Admission follows this owner readback; the
+    /// revision retains the state captured when that immutable document was
+    /// created.
     pub configuration_state: UserAutomationConfigurationState,
     /// Existing B-owned complete config snapshot.
     pub config_snapshot: ConfigPolicySnapshot,
@@ -1140,7 +1264,6 @@ impl UserAutomationPreflightProjection {
             || self.revision.automation_id != self.automation_id
             || self.revision.revision != self.automation_revision
             || self.revision.mode != self.mode
-            || self.configuration_state != self.revision.configuration_state
             || self.trigger_origin != invocation.trigger_origin
             || self.child_depth != invocation.child_depth
         {
@@ -1312,6 +1435,7 @@ impl UserAutomationPreflightProjection {
             automation_revision: self.automation_revision.clone(),
             occurrence_id: self.occurrence_id.clone(),
             config_snapshot_id: self.config_snapshot.snapshot_id.clone(),
+            config_snapshot: self.config_snapshot.clone(),
             configuration_state: self.configuration_state,
             work_class: self.revision.work_class,
             model_access_allowed_after_admission: self.mode == UserAutomationExecutionMode::Agent,
@@ -1785,6 +1909,7 @@ mod tests {
             workdir_ref: active.workdir_ref.clone(),
             trigger_origin: UserAutomationTriggerOrigin::ScheduledWake,
             child_depth: 0,
+            provenance: None,
         };
         let projection = UserAutomationPreflightProjection {
             automation_id: active.automation_id.clone(),
@@ -1869,6 +1994,7 @@ mod tests {
             workdir_ref: base.workdir_ref.clone(),
             trigger_origin: UserAutomationTriggerOrigin::Human,
             child_depth: 0,
+            provenance: None,
         };
         let scheduled = common(UserAutomationTrigger::Scheduled {
             occurrence_key: base.schedule.next_occurrences[0].clone(),

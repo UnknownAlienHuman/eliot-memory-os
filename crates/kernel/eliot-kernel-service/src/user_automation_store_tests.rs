@@ -460,6 +460,7 @@ fn store_request(
 ) -> UserAutomationStoreRequest {
     UserAutomationStoreRequest {
         context: context(),
+        authenticated_principal: "human-1".to_owned(),
         identity: OperationIdentity {
             operation_id: OperationId::new(operation_id).expect("operation"),
             idempotency_key: format!("idem-{operation_id}"),

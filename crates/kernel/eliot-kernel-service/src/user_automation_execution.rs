@@ -273,8 +273,32 @@ impl UserAutomationExecutionRequest {
                 "execution principal",
             ));
         }
+        validate_human_invocation_source(&self.context, &self.identity, &self.invocation)?;
         Ok(())
     }
+}
+
+fn validate_human_invocation_source(
+    context: &RequestMetadata,
+    identity: &OperationIdentity,
+    invocation: &UserAutomationInvocation,
+) -> Result<(), UserAutomationExecutionError> {
+    if invocation.trigger_origin
+        != eliot_kernel_core::user_automation::UserAutomationTriggerOrigin::Human
+    {
+        return Ok(());
+    }
+    let provenance = invocation.require_run_now_provenance(&context.state_fence)?;
+    if provenance.request_metadata != *context
+        || provenance.operation_id != identity.operation_id
+        || provenance.idempotency_key != identity.idempotency_key
+        || provenance.canonical_request_hash != identity.canonical_request_hash
+    {
+        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "human invocation source identity",
+        ));
+    }
+    Ok(())
 }
 
 /// Exact admitted input sent to the existing Durable Job/WakeIntent owners.
@@ -317,6 +341,7 @@ impl UserAutomationRuntimeAdmission {
         )?;
         self.revision.validate()?;
         self.invocation.validate()?;
+        validate_human_invocation_source(&self.context, &self.identity, &self.invocation)?;
         self.preflight
             .source_receipt
             .validate()
@@ -326,6 +351,7 @@ impl UserAutomationRuntimeAdmission {
             .map_err(|_| UserAutomationError::Invalid("runtime.wake_intent"))?;
         if self.preflight.configuration_state != UserAutomationConfigurationState::Active
             || self.wake_intent.state != WakeIntentState::Pending
+            || self.preflight.config_snapshot_id != self.preflight.config_snapshot.snapshot_id
         {
             return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
                 "runtime admission state",
@@ -430,6 +456,104 @@ impl UserAutomationWakeCancellation {
         }
         Ok(())
     }
+}
+
+/// Exact authenticated lookup for one persisted UserAutomation wake.
+///
+/// The wake identity is derived from the owner-issued invocation. Callers do
+/// not supply a replacement `WakeIntent`; the existing Host journal returns
+/// the record that it actually retains.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeReadRequest {
+    /// Original authenticated Human RunNow request metadata.
+    pub context: RequestMetadata,
+    /// Principal authenticated by Kernel/Host.
+    pub authenticated_principal: String,
+    /// Exact committed RunNow operation identity.
+    pub identity: OperationIdentity,
+    /// Invocation read back from the canonical UserAutomation owner.
+    pub invocation: UserAutomationInvocation,
+}
+
+impl UserAutomationWakeReadRequest {
+    /// Validates the request and returns its exact owner-issued occurrence ID.
+    pub fn validate(&self) -> Result<String, UserAutomationExecutionError> {
+        self.context
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        self.identity
+            .validate()
+            .map_err(UserAutomationServiceError::Store)
+            .map_err(UserAutomationExecutionError::Service)?;
+        validate_text(
+            &self.authenticated_principal,
+            "wake_read.authenticated_principal",
+        )?;
+        self.invocation.validate()?;
+        if self.invocation.trigger_origin
+            != eliot_kernel_core::user_automation::UserAutomationTriggerOrigin::Human
+            || self.invocation.principal_ref != self.authenticated_principal
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake read Human source",
+            ));
+        }
+        validate_human_invocation_source(&self.context, &self.identity, &self.invocation)?;
+        self.invocation
+            .occurrence_identity()
+            .map_err(UserAutomationExecutionError::Contract)
+    }
+}
+
+/// Exact readback from the existing Host wake journal.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeReadback {
+    /// Persisted wake intent returned by the Host owner.
+    pub intent: WakeIntent,
+    /// Host journal operation identity for the retained wake record.
+    pub operation_id: String,
+    /// Host journal idempotency identity for the retained wake record.
+    pub idempotency_key: String,
+    /// Checksum of the exact retained Host journal record.
+    pub record_checksum: String,
+}
+
+impl UserAutomationWakeReadback {
+    /// Validates the persisted record against the exact Human occurrence.
+    pub fn validate_for(
+        &self,
+        request: &UserAutomationWakeReadRequest,
+    ) -> Result<(), UserAutomationExecutionError> {
+        let occurrence_id = request.validate()?;
+        validate_text(&self.operation_id, "wake_read.operation_id")?;
+        validate_text(&self.idempotency_key, "wake_read.idempotency_key")?;
+        if !is_sha256_digest(&self.record_checksum) {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake read record checksum",
+            ));
+        }
+        self.intent.validate().map_err(|_| {
+            UserAutomationExecutionError::RuntimeResponseMismatch("wake read intent shape")
+        })?;
+        if self.intent.wake_id != occurrence_id
+            || self.intent.state_fence != request.context.state_fence
+            || self.intent.state != WakeIntentState::Pending
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake read occurrence/fence/state",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Failure record sent to the existing canonical failure-history and notify
@@ -746,6 +870,17 @@ pub trait UserAutomationDurableJobPort: Send + Sync {
 /// composition.
 #[allow(async_fn_in_trait)]
 pub trait UserAutomationWakePort: Send + Sync {
+    /// Reads one exact persisted Pending wake from the existing owner.
+    /// Implementations without a readback path fail closed.
+    async fn read_pending_wake(
+        &self,
+        _request: UserAutomationWakeReadRequest,
+    ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "UserAutomation wake readback is unavailable".to_owned(),
+        ))
+    }
+
     /// Cancels only unadmitted wakes for a retired revision.
     async fn cancel_pending_wakes(
         &self,
@@ -1375,6 +1510,7 @@ mod tests {
             workdir_ref: revision.workdir_ref.clone(),
             trigger_origin: UserAutomationTriggerOrigin::ScheduledWake,
             child_depth: 0,
+            provenance: None,
         };
         let occurrence_id = invocation.occurrence_identity().expect("occurrence");
         let wake_intent = revision

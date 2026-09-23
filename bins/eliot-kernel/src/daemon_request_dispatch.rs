@@ -16,8 +16,16 @@ use super::*;
 mod store_receipt_dispatch;
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{StateFence, sha256_hex};
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
+#[cfg(windows)]
+use eliot_kernel_service::{
+    AuthenticatedUserAutomationHostExecutionTransport, UserAutomationDurableJobPort,
+    UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
+    UserAutomationHostExecutionTransport, UserAutomationOwnerLookup,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
+    UserAutomationWakePort, UserAutomationWakeReadRequest,
+};
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlOperation, OriginControlPresentation,
     ProcessExecutionView, ProcessLifecycle,
@@ -28,11 +36,12 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RequestMeta,
-    RevisionHeadExpectation, StoreError, StoreGenesisRequest, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
+    OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
+    RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
+    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    verify_canonical_request_hash,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
@@ -43,6 +52,11 @@ use super::generation_control::{
 /// `EliotdStartupEvidence` carrier remains bin-owned; Kernel consumes its
 /// canonical JSON mechanically and never imports `bins/eliotd`.
 pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evidence";
+/// Authenticated daemon route that drives the typed Host `UserAutomation`
+/// transport.  The daemon session supplies the outer authority; the Host
+/// open handshake supplies the channel evidence and the Host owner supplies
+/// the Durable Job/Wake effects.
+pub(crate) const USER_AUTOMATION_RUNTIME_OPERATION: &str = "user_automation_runtime";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -342,6 +356,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "origin_control_decide" => "origin_control_decide",
         ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
+        USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
         "store_recovery" => "store_recovery",
         "store_initialize_genesis" => "store_initialize_genesis",
@@ -462,6 +477,39 @@ struct OriginControlDecideOperation {
     presentation: serde_json::Value,
 }
 
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationRuntimeOperation {
+    operation: String,
+    #[serde(default)]
+    request: Option<UserAutomationHostExecutionOperation>,
+    #[serde(default)]
+    trigger: Option<UserAutomationDaemonTrigger>,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationDaemonTrigger {
+    /// Stable automation identity selected by the operator.
+    automation_id: String,
+    /// Immutable revision selector; Kernel verifies it against the current row.
+    requested_revision: String,
+    /// Human-issued nonce; Kernel binds it into the owner-derived occurrence.
+    manual_nonce: String,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationPolicyOwnerSnapshotWire {
+    state_fence: StateFence,
+    revision: u64,
+    policy_digest: String,
+    snapshot: eliot_kernel_core::user_automation::ConfigPolicySnapshot,
+}
+
 impl KernelComposition {
     /// Executes one authenticated daemon lifecycle request.  Only the
     /// narrow handshake/health dispositions are handled here; semantic
@@ -478,10 +526,60 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
+        self.execute_daemon_request_observed(session, request_id, operation, payload, None)
+            .await
+    }
+
+    /// Executes one daemon request with the identity admitted on the same
+    /// front-door frame.  The compatibility wrapper above remains available
+    /// to non-semantic lifecycle callers, but `UserAutomation` production
+    /// ingress uses this method so the route can bind owner provenance to the
+    /// authenticated request rather than to the daemon peer alone.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_daemon_request_with_identity(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        request_identity: RequestIdentity,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<Frame, TransportError> {
+        request_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if request_identity.request.metadata.request_id != request_id
+            || request_identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        self.execute_daemon_request_observed(
+            session,
+            request_id,
+            operation,
+            payload,
+            Some(request_identity),
+        )
+        .await
+    }
+
+    async fn execute_daemon_request_observed(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        operation: &str,
+        payload: serde_json::Value,
+        request_identity: Option<RequestIdentity>,
+    ) -> Result<Frame, TransportError> {
         observe_daemon_request("kernel.daemon_request_received", "attempt");
         observe_daemon_operation(trusted_daemon_operation(operation), "received");
         let result = self
-            .execute_daemon_request_inner(session, request_id, operation, &payload)
+            .execute_daemon_request_inner(
+                session,
+                request_id,
+                operation,
+                &payload,
+                request_identity.as_ref(),
+            )
             .await;
         match &result {
             Ok(_) => {
@@ -510,6 +608,7 @@ impl KernelComposition {
         request_id: RequestId,
         operation: &str,
         payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
     ) -> Result<Frame, TransportError> {
         if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER {
             return Err(TransportError::SessionFenced);
@@ -597,6 +696,15 @@ impl KernelComposition {
             }
             DAEMON_STARTUP_EVIDENCE_OPERATION => {
                 self.daemon_startup_evidence_operation(session, &request_id, payload)
+            }
+            #[cfg(windows)]
+            USER_AUTOMATION_RUNTIME_OPERATION => {
+                self.user_automation_runtime_operation(
+                    session,
+                    payload.clone(),
+                    request_identity.ok_or(TransportError::SessionFenced)?,
+                )
+                .await
             }
             "health" => self
                 .daemon_health()
@@ -893,9 +1001,8 @@ impl KernelComposition {
                 ))
             }
             "publish_owner_bundle" => {
-                let operation: OwnerPublishOperation =
-                    serde_json::from_value(payload.clone())
-                        .map_err(|_| TransportError::SessionFenced)?;
+                let operation: OwnerPublishOperation = serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
                 if operation.expected_revision == 0 {
                     return Err(TransportError::SessionFenced);
                 }
@@ -944,6 +1051,859 @@ impl KernelComposition {
             "value": { "accepted": true },
             "recovery": null,
         })
+    }
+
+    #[cfg(windows)]
+    /// Drives one real `UserAutomation` owner operation from the authenticated
+    /// daemon session through the server-authored Host channel.
+    ///
+    /// The daemon payload contains only the closed typed operation.  The
+    /// channel, descriptor digest, peer receipt digest, and connection id are
+    /// obtained from the Host open handshake; a request fence that disagrees
+    /// with the daemon session is rejected before opening the owner channel.
+    /// Runtime owner failures remain typed projections so an uncertain send
+    /// can be reconciled by its original operation identity.
+    async fn user_automation_runtime_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+        request_identity: &RequestIdentity,
+    ) -> Result<serde_json::Value, TransportError> {
+        request_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if request_identity.request.state_fence != session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        let envelope: UserAutomationRuntimeOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        if envelope.operation != USER_AUTOMATION_RUNTIME_OPERATION {
+            return Err(TransportError::SessionFenced);
+        }
+        if envelope.request.is_some() == envelope.trigger.is_some() {
+            return Err(TransportError::SessionFenced);
+        }
+        let Some(request) = envelope.request else {
+            let Some(trigger) = envelope.trigger else {
+                return Err(TransportError::SessionFenced);
+            };
+            return self
+                .user_automation_owner_trigger_operation(session, trigger, request_identity)
+                .await;
+        };
+
+        let request_fence = match &request {
+            UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.context.state_fence
+            }
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.state_fence
+            }
+            UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.context.state_fence
+            }
+        };
+        if request_fence != &session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let owner_check = match &request {
+            UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
+                self.revalidate_user_automation_admission(session, request)
+                    .await
+            }
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+                self.revalidate_user_automation_cancellation(session, request)
+                    .await
+            }
+            UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
+                self.revalidate_user_automation_wake_read(session, request)
+                    .await
+            }
+        };
+        if let Err(error) = owner_check {
+            return Ok(Self::user_automation_runtime_error_response(error));
+        }
+
+        let transport =
+            match AuthenticatedUserAutomationHostExecutionTransport::connect_server_authored(
+                self.ipc_limits().operation_timeout,
+            )
+            .await
+            {
+                Ok(transport) => transport,
+                Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+            };
+        if transport.channel_binding().state_fence != session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        let client = match UserAutomationHostExecutionClient::new(transport) {
+            Ok(client) => client,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+
+        // The Host open handshake may have taken long enough for the current
+        // pointer or owner invocation to change. Re-read the canonical owner
+        // immediately before crossing into the effect owner; the earlier
+        // shape/fence check is not an effect-time admission proof.
+        let owner_check = match &request {
+            UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
+                self.revalidate_user_automation_admission(session, request)
+                    .await
+            }
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+                self.revalidate_user_automation_cancellation(session, request)
+                    .await
+            }
+            UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
+                self.revalidate_user_automation_wake_read(session, request)
+                    .await
+            }
+        };
+        if let Err(error) = owner_check {
+            return Ok(Self::user_automation_runtime_error_response(error));
+        }
+
+        match request {
+            UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
+                match client.admit_occurrence(request).await {
+                    Ok(execution) => Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "outcome": "admitted",
+                            "execution": execution,
+                        },
+                        "recovery": null,
+                    })),
+                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                }
+            }
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+                match client.cancel_pending_wakes(request).await {
+                    Ok(wake_ids) => Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "outcome": "cancelled",
+                            "wake_ids": wake_ids,
+                        },
+                        "recovery": null,
+                    })),
+                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                }
+            }
+            UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
+                match client.read_pending_wake(request).await {
+                    Ok(readback) => Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "outcome": "wake_readback",
+                            "readback": readback,
+                        },
+                        "recovery": null,
+                    })),
+                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    /// Acquires the canonical owner material for a daemon/operator trigger.
+    ///
+    /// The wire carrier is only `(automation_id, requested_revision,
+    /// manual_nonce)`. Principal and State Fence come from the authenticated
+    /// Kernel session, while the immutable revision and current pointer come
+    /// from the generation-routed canonical Store owner. No caller-supplied
+    /// preflight, invocation, or Host authority is accepted here.
+    async fn user_automation_owner_trigger_operation(
+        &self,
+        session: &Session,
+        trigger: UserAutomationDaemonTrigger,
+        request_identity: &RequestIdentity,
+    ) -> Result<serde_json::Value, TransportError> {
+        request_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if request_identity.request.state_fence != session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        validate_user_automation_trigger_text(&trigger.automation_id, "automation_id")?;
+        validate_user_automation_trigger_text(&trigger.requested_revision, "requested_revision")?;
+        validate_user_automation_trigger_text(&trigger.manual_nonce, "manual_nonce")?;
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let authenticated_principal = authenticated_user_automation_principal(session)?;
+        let manual_nonce = trigger.manual_nonce.clone();
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: trigger.automation_id,
+            requested_revision: trigger.requested_revision,
+            authenticated_principal,
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let gateway = self.retained_store_gateway()?;
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        if owner.current_configuration_state
+            != eliot_kernel_core::user_automation::UserAutomationConfigurationState::Active
+        {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation owner current configuration is not active".to_owned(),
+                ),
+            ));
+        }
+        let manual_trigger = eliot_kernel_core::user_automation::UserAutomationTrigger::Manual {
+            nonce: manual_nonce.clone(),
+        };
+        let occurrence_id =
+            eliot_kernel_core::user_automation::UserAutomationInvocation::occurrence_identity_for(
+                &owner.revision.automation_id,
+                &owner.revision.revision,
+                &manual_trigger,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        let invocation = gateway
+            .read_user_automation_invocation(
+                &lookup.state_fence,
+                &lookup.automation_id,
+                &occurrence_id,
+            )
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        if invocation.automation_id != owner.revision.automation_id
+            || invocation.automation_revision != owner.revision.revision
+            || invocation.trigger != manual_trigger
+            || invocation.principal_ref != owner.authenticated_principal
+            || invocation.mode != owner.revision.mode
+            || invocation.work_scope_ref != owner.revision.work_scope.scope_id
+            || invocation.workdir_ref != owner.revision.workdir_ref
+        {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::Rejected(
+                    "stored UserAutomation invocation does not bind to the owner revision"
+                        .to_owned(),
+                ),
+            ));
+        }
+        let provenance = match invocation.require_run_now_provenance(&lookup.state_fence) {
+            Ok(provenance) => provenance,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(error.to_string()),
+                ));
+            }
+        };
+        let source_identity = OperationIdentity {
+            operation_id: provenance.operation_id.clone(),
+            idempotency_key: provenance.idempotency_key.clone(),
+            canonical_request_hash: provenance.canonical_request_hash.clone(),
+        };
+        let source_store_receipt = match ensure_user_automation_run_now_receipt(
+            &*gateway,
+            &lookup.state_fence,
+            &source_identity,
+            &invocation,
+        )
+        .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        let Some(source_receipt) = source_store_receipt.envelope.as_ref() else {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::UnknownOutcome(
+                    "canonical UserAutomation source receipt envelope is not retained".to_owned(),
+                ),
+            ));
+        };
+        if source_receipt.core.request.metadata != provenance.request_metadata
+            || source_receipt.core.request.state_fence != lookup.state_fence
+            || source_receipt.core.work_scope.product_id != provenance.request_metadata.product_id
+        {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::IdentityConflict,
+            ));
+        }
+        let preflight_owner_snapshot = match self
+            .read_user_automation_preflight_owner_snapshot(&lookup.state_fence)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        let policy_snapshot = match Self::user_automation_policy_snapshot_from_recovery(
+            &preflight_owner_snapshot,
+            &lookup.state_fence,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        let wake_request = UserAutomationWakeReadRequest {
+            context: provenance.request_metadata.clone(),
+            authenticated_principal: lookup.authenticated_principal.clone(),
+            identity: source_identity.clone(),
+            invocation: invocation.clone(),
+        };
+        if let Err(error) = wake_request.validate() {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::Rejected(error.to_string()),
+            ));
+        }
+        let host_transport =
+            match AuthenticatedUserAutomationHostExecutionTransport::connect_server_authored(
+                self.ipc_limits().operation_timeout,
+            )
+            .await
+            {
+                Ok(transport) => transport,
+                Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+            };
+        if host_transport.channel_binding().state_fence != lookup.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        let host_client = match UserAutomationHostExecutionClient::new(host_transport) {
+            Ok(client) => client,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        let wake_readback = match host_client.read_pending_wake(wake_request.clone()).await {
+            Ok(readback) => readback,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        let owner_after = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        if owner_after.automation_id != owner.automation_id
+            || owner_after.revision != owner.revision
+            || owner_after.current_configuration_state != owner.current_configuration_state
+        {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation owner changed during trigger preflight".to_owned(),
+                ),
+            ));
+        }
+        let invocation_after = gateway
+            .read_user_automation_invocation(
+                &lookup.state_fence,
+                &lookup.automation_id,
+                &occurrence_id,
+            )
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        let preflight_owner_snapshot_after = match self
+            .read_user_automation_preflight_owner_snapshot(&lookup.state_fence)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        let policy_snapshot_after = match Self::user_automation_policy_snapshot_from_recovery(
+            &preflight_owner_snapshot_after,
+            &lookup.state_fence,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        if preflight_owner_snapshot_after != preflight_owner_snapshot
+            || policy_snapshot_after != policy_snapshot
+        {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::IdentityConflict,
+            ));
+        }
+        if invocation_after != invocation
+            || ensure_user_automation_run_now_receipt(
+                &*gateway,
+                &lookup.state_fence,
+                &source_identity,
+                &invocation_after,
+            )
+            .await
+            .is_err()
+        {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::IdentityConflict,
+            ));
+        }
+        let preflight_owner_readback_digest = match canonical_json_bytes(&preflight_owner_snapshot)
+        {
+            Ok(bytes) => sha256_hex(&bytes),
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(format!(
+                        "canonical UserAutomation preflight readback encoding failed: {error}"
+                    )),
+                ));
+            }
+        };
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "outcome": "owner_acquired",
+                "owner": owner,
+                "invocation": invocation,
+                "occurrence_id": occurrence_id,
+                "source_receipt": source_receipt,
+                "wake_readback": wake_readback,
+                "policy_snapshot": policy_snapshot,
+                "preflight_owner_readback_digest": preflight_owner_readback_digest,
+            },
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    /// Reads the canonical owner and Durable Job inputs for one `UserAutomation`
+    /// preflight at a single Store State Fence. This remains a mechanical
+    /// Kernel join: payloads stay opaque, but Store record identity, schema,
+    /// canonical bytes, and any embedded fence must agree before the caller
+    /// can use the readback as preflight evidence.
+    async fn read_user_automation_preflight_owner_snapshot(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<StoreRecoverySnapshot, UserAutomationRuntimeError> {
+        state_fence
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let records = ["config", "policy", "task", "skill", "module_registry"]
+            .into_iter()
+            .map(|key| {
+                RecoveryRecordKey::new("owner", key)
+                    .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected_records = records.iter().cloned().collect::<BTreeSet<_>>();
+        let request = StoreRecoveryRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence: state_fence.clone(),
+            records,
+            include_receipts: false,
+            include_jobs: true,
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation preflight Store route is unavailable".to_owned(),
+            )
+        })?;
+        let recovery = gateway
+            .recovery(request)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        recovery
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let observed_records = recovery
+            .owner_records
+            .iter()
+            .map(RecoveryRecord::record_key)
+            .collect::<BTreeSet<_>>();
+        if recovery.state_fence != *state_fence
+            || recovery.canonical_scope.state_fence != *state_fence
+            || recovery.owner_records.len() != expected_records.len()
+            || observed_records != expected_records
+            || !recovery.receipts.is_empty()
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        for record in &recovery.owner_records {
+            Self::validate_user_automation_preflight_record(record, state_fence, true)?;
+        }
+        for record in &recovery.job_records {
+            Self::validate_user_automation_preflight_record(record, state_fence, false)?;
+        }
+        Ok(recovery)
+    }
+
+    #[cfg(windows)]
+    fn validate_user_automation_preflight_record(
+        record: &RecoveryRecord,
+        state_fence: &StateFence,
+        owner_record: bool,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        record
+            .validate()
+            .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+        if record.state_fence != *state_fence
+            || (owner_record && record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA)
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&record.payload).map_err(|_| {
+            UserAutomationRuntimeError::Rejected(
+                "canonical UserAutomation preflight owner payload is invalid JSON".to_owned(),
+            )
+        })?;
+        let canonical = canonical_json_bytes(&payload).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical UserAutomation preflight owner encoding failed: {error}"
+            ))
+        })?;
+        if canonical != record.payload {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Self::validate_embedded_user_automation_fences(&payload, state_fence)
+    }
+
+    #[cfg(windows)]
+    fn validate_embedded_user_automation_fences(
+        value: &serde_json::Value,
+        expected: &StateFence,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    Self::validate_embedded_user_automation_fences(value, expected)?;
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                if let Some(fence_value) = fields.get("state_fence") {
+                    let observed: StateFence = serde_json::from_value(fence_value.clone())
+                        .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+                    if &observed != expected {
+                        return Err(UserAutomationRuntimeError::IdentityConflict);
+                    }
+                }
+                for value in fields.values() {
+                    Self::validate_embedded_user_automation_fences(value, expected)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    /// Reads the exact retained Governor Policy owner record from Store.
+    ///
+    /// This route deliberately accepts no handshake digest as snapshot data:
+    /// the Store record key, owner schema, canonical bytes, owner revision,
+    /// policy digest, embedded fence, and embedded revision must all correlate.
+    async fn read_user_automation_policy_snapshot(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<eliot_kernel_core::user_automation::ConfigPolicySnapshot, UserAutomationRuntimeError>
+    {
+        let recovery = self
+            .read_user_automation_preflight_owner_snapshot(state_fence)
+            .await?;
+        Self::user_automation_policy_snapshot_from_recovery(&recovery, state_fence)
+    }
+
+    #[cfg(windows)]
+    fn user_automation_policy_snapshot_from_recovery(
+        recovery: &StoreRecoverySnapshot,
+        state_fence: &StateFence,
+    ) -> Result<eliot_kernel_core::user_automation::ConfigPolicySnapshot, UserAutomationRuntimeError>
+    {
+        let record = recovery
+            .owner_records
+            .iter()
+            .find(|record| record.namespace == "owner" && record.key == "policy")
+            .ok_or(UserAutomationRuntimeError::IdentityConflict)?;
+        if recovery.state_fence != *state_fence
+            || record.state_fence != *state_fence
+            || record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let owner: UserAutomationPolicyOwnerSnapshotWire = serde_json::from_slice(&record.payload)
+            .map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "canonical Policy owner snapshot schema is invalid".to_owned(),
+                )
+            })?;
+        let canonical_owner = canonical_json_bytes(&owner).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy owner snapshot encoding failed: {error}"
+            ))
+        })?;
+        let snapshot_bytes = canonical_json_bytes(&owner.snapshot).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy snapshot encoding failed: {error}"
+            ))
+        })?;
+        owner.snapshot.validate().map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy owner snapshot is invalid: {error}"
+            ))
+        })?;
+        if canonical_owner != record.payload
+            || owner.state_fence != *state_fence
+            || owner.revision != record.revision
+            || owner.revision == 0
+            || owner.snapshot.state_fence != *state_fence
+            || owner.snapshot.revision.value() != owner.revision
+            || owner.policy_digest != sha256_hex(&snapshot_bytes)
+            || owner.policy_digest.len() != 64
+            || !owner
+                .policy_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(owner.snapshot)
+    }
+
+    #[cfg(windows)]
+    /// Revalidates a caller-supplied admission carrier against the canonical
+    /// owner immediately before the Host effect. The typed carrier remains a
+    /// compatibility surface, but it is never an authority source: current
+    /// revision, live configuration state, persisted invocation lineage, and
+    /// the committed Store operation are all recovered or checked here.
+    async fn revalidate_user_automation_admission(
+        &self,
+        session: &Session,
+        request: &UserAutomationRuntimeAdmission,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        let authenticated_principal =
+            authenticated_user_automation_principal(session).map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation session principal is unavailable".to_owned(),
+                )
+            })?;
+        if request.authenticated_principal != authenticated_principal {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: request.invocation.automation_id.clone(),
+            requested_revision: request.invocation.automation_revision.clone(),
+            authenticated_principal,
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        if owner.current_configuration_state
+            != eliot_kernel_core::user_automation::UserAutomationConfigurationState::Active
+        {
+            return Err(UserAutomationRuntimeError::Rejected(
+                "UserAutomation owner current configuration is not active".to_owned(),
+            ));
+        }
+        let occurrence_id = request
+            .invocation
+            .occurrence_identity()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        if request.revision != owner.revision
+            || request.preflight.occurrence_id != occurrence_id
+            || request.preflight.automation_id != owner.automation_id
+            || request.preflight.automation_revision != owner.revision.revision
+            || request.preflight.configuration_state
+                != eliot_kernel_core::user_automation::UserAutomationConfigurationState::Active
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let persisted = gateway
+            .read_user_automation_invocation(
+                &lookup.state_fence,
+                &lookup.automation_id,
+                &occurrence_id,
+            )
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        if persisted != request.invocation {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let source_receipt = ensure_user_automation_run_now_receipt(
+            &gateway,
+            &lookup.state_fence,
+            &request.identity,
+            &request.invocation,
+        )
+        .await?;
+        let Some(source_receipt_envelope) = source_receipt.envelope.as_ref() else {
+            return Err(UserAutomationRuntimeError::UnknownOutcome(
+                "canonical UserAutomation source receipt envelope is not retained".to_owned(),
+            ));
+        };
+        if &request.preflight.source_receipt != source_receipt_envelope {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let policy_snapshot = self
+            .read_user_automation_policy_snapshot(&lookup.state_fence)
+            .await?;
+        if request.preflight.config_snapshot_id != policy_snapshot.snapshot_id
+            || request.preflight.config_snapshot != policy_snapshot
+            || policy_snapshot.state_fence != lookup.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    /// Revalidates an exact persisted-wake read against the authenticated
+    /// session and canonical `RunNow` owner before crossing to Host.
+    async fn revalidate_user_automation_wake_read(
+        &self,
+        session: &Session,
+        request: &UserAutomationWakeReadRequest,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let authenticated_principal =
+            authenticated_user_automation_principal(session).map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation session principal is unavailable".to_owned(),
+                )
+            })?;
+        if request.authenticated_principal != authenticated_principal
+            || request.context.state_fence != session.module_generation.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let occurrence_id = request
+            .invocation
+            .occurrence_identity()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: request.invocation.automation_id.clone(),
+            requested_revision: request.invocation.automation_revision.clone(),
+            authenticated_principal: authenticated_principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        if owner.current_configuration_state
+            != eliot_kernel_core::user_automation::UserAutomationConfigurationState::Active
+            || owner.revision.owner_principal != authenticated_principal
+            || owner.revision.revision != request.invocation.automation_revision
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let persisted = gateway
+            .read_user_automation_invocation(
+                &lookup.state_fence,
+                &lookup.automation_id,
+                &occurrence_id,
+            )
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        if persisted != request.invocation {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        ensure_user_automation_run_now_receipt(
+            &gateway,
+            &lookup.state_fence,
+            &request.identity,
+            &request.invocation,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    /// Revalidates a compatibility cancellation carrier against the committed
+    /// owner remove operation and current retained revision. Cancellation may
+    /// target a retired current pointer, so it does not require ACTIVE state.
+    async fn revalidate_user_automation_cancellation(
+        &self,
+        session: &Session,
+        request: &UserAutomationWakeCancellation,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        let authenticated_principal =
+            authenticated_user_automation_principal(session).map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation session principal is unavailable".to_owned(),
+                )
+            })?;
+        if request.authenticated_principal != authenticated_principal {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: request.automation_id.clone(),
+            requested_revision: request.automation_revision.clone(),
+            authenticated_principal,
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        if owner.automation_id != request.automation_id
+            || owner.revision.revision != request.automation_revision
+            || owner.revision.owner_principal != request.authenticated_principal
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        ensure_user_automation_store_receipt(&*gateway, &lookup.state_fence, &request.identity)
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(windows)]
+    fn user_automation_runtime_error_response(
+        error: UserAutomationRuntimeError,
+    ) -> serde_json::Value {
+        match error {
+            UserAutomationRuntimeError::Unavailable(reason) => serde_json::json!({
+                "status": "unknown",
+                "value": { "outcome": "unavailable" },
+                "recovery": { "kind": "unavailable", "reason": reason },
+            }),
+            UserAutomationRuntimeError::UnknownOutcome(reason) => serde_json::json!({
+                "status": "unknown",
+                "value": { "outcome": "unknown_outcome" },
+                "recovery": { "kind": "unknown_outcome", "reason": reason },
+            }),
+            UserAutomationRuntimeError::Rejected(reason) => serde_json::json!({
+                "status": "known",
+                "value": {
+                    "accepted": false,
+                    "outcome": "rejected",
+                    "reason": reason,
+                },
+                "recovery": null,
+            }),
+            UserAutomationRuntimeError::IdentityConflict => serde_json::json!({
+                "status": "known",
+                "value": {
+                    "accepted": false,
+                    "outcome": "identity_conflict",
+                },
+                "recovery": null,
+            }),
+        }
     }
 
     async fn origin_challenge_issue_operation(
@@ -1658,6 +2618,89 @@ impl KernelComposition {
             "recovery": null,
         })
     }
+}
+
+#[cfg(windows)]
+fn authenticated_user_automation_principal(session: &Session) -> Result<String, TransportError> {
+    match &session.peer {
+        PeerIdentity::Authenticated { user_identity, .. }
+            if !user_identity.trim().is_empty() && !user_identity.chars().any(char::is_control) =>
+        {
+            Ok(user_identity.clone())
+        }
+        PeerIdentity::Authenticated { .. } => Err(TransportError::PeerIdentityUnavailable),
+        PeerIdentity::Unavailable { .. } => Err(TransportError::PeerIdentityUnavailable),
+    }
+}
+
+#[cfg(windows)]
+async fn ensure_user_automation_run_now_receipt(
+    gateway: &eliot_kernel_service::KernelStoreGateway,
+    state_fence: &StateFence,
+    identity: &OperationIdentity,
+    invocation: &eliot_kernel_core::user_automation::UserAutomationInvocation,
+) -> Result<eliot_store_api::WriteReceipt, UserAutomationRuntimeError> {
+    let provenance = invocation
+        .require_run_now_provenance(state_fence)
+        .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+    if provenance.operation_id != identity.operation_id
+        || provenance.idempotency_key != identity.idempotency_key
+        || provenance.canonical_request_hash != identity.canonical_request_hash
+    {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    ensure_user_automation_store_receipt(gateway, state_fence, identity).await
+}
+
+#[cfg(windows)]
+async fn ensure_user_automation_store_receipt(
+    gateway: &eliot_kernel_service::KernelStoreGateway,
+    state_fence: &StateFence,
+    identity: &OperationIdentity,
+) -> Result<eliot_store_api::WriteReceipt, UserAutomationRuntimeError> {
+    identity
+        .validate()
+        .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+    let receipt = gateway
+        .receipt(state_fence, identity.operation_id.clone())
+        .await
+        .map_err(UserAutomationRuntimeError::Unavailable)?
+        .ok_or_else(|| {
+            UserAutomationRuntimeError::UnknownOutcome(
+                "canonical UserAutomation Store receipt is not retained".to_owned(),
+            )
+        })?;
+    receipt
+        .validate()
+        .map_err(|error| UserAutomationRuntimeError::Unavailable(error.to_string()))?;
+    if receipt.operation_id != identity.operation_id
+        || receipt.idempotency_key != identity.idempotency_key
+        || receipt.canonical_request_hash != identity.canonical_request_hash
+        || receipt.state_fence != *state_fence
+    {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
+        return Err(UserAutomationRuntimeError::Rejected(
+            "canonical UserAutomation Store operation is not committed".to_owned(),
+        ));
+    }
+    receipt
+        .require_reconciliation_envelope()
+        .map_err(|error| UserAutomationRuntimeError::UnknownOutcome(error.to_string()))?;
+    Ok(receipt)
+}
+
+#[cfg(windows)]
+fn validate_user_automation_trigger_text(
+    value: &str,
+    field: &'static str,
+) -> Result<(), TransportError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) || value.len() > 256 {
+        return Err(TransportError::SessionFenced);
+    }
+    let _ = field;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -38,8 +38,8 @@ mod notification_state;
 mod payload_authority;
 mod reactive_state;
 mod request_hash;
-mod user_automation_state;
 mod store_failure;
+mod user_automation_state;
 mod wire;
 pub mod write_admission;
 
@@ -91,30 +91,30 @@ pub use reactive_state::{
 };
 
 pub use user_automation_state::{
-    AUTOMATION_OPERATION_CREATE, AUTOMATION_OPERATION_EDIT, AUTOMATION_OPERATION_PAUSE,
-    AUTOMATION_OPERATION_REMOVE, AUTOMATION_OPERATION_RESUME, AUTOMATION_OPERATION_RUN_NOW,
-    AUTOMATION_PAGE_CURRENT, AUTOMATION_PAGE_CURRENTS, AUTOMATION_PAGE_FAILURE,
-    AUTOMATION_PAGE_INVOCATIONS, AUTOMATION_PAGE_REVISION, AUTOMATION_PAGE_REVISIONS,
-    AUTOMATION_PAGE_STATE_FENCE, AUTOMATION_PARAM_AUTOMATION_ID,
+    AUTOMATION_OPERATION_CREATE, AUTOMATION_OPERATION_EDIT, AUTOMATION_OPERATION_FAILURE,
+    AUTOMATION_OPERATION_PAUSE, AUTOMATION_OPERATION_REMOVE, AUTOMATION_OPERATION_RESUME,
+    AUTOMATION_OPERATION_RUN_NOW, AUTOMATION_PAGE_CURRENT, AUTOMATION_PAGE_CURRENTS,
+    AUTOMATION_PAGE_FAILURE, AUTOMATION_PAGE_INVOCATIONS, AUTOMATION_PAGE_REVISION,
+    AUTOMATION_PAGE_REVISIONS, AUTOMATION_PAGE_STATE_FENCE, AUTOMATION_PARAM_AUTOMATION_ID,
     AUTOMATION_PARAM_CONFIGURATION_STATE, AUTOMATION_PARAM_FAILURE_JSON,
-    AUTOMATION_PARAM_INCLUDE_RETIRED,
-    AUTOMATION_PARAM_INVOCATION_JSON, AUTOMATION_PARAM_MAX_RECORDS, AUTOMATION_PARAM_OCCURRENCE_ID,
-    AUTOMATION_PARAM_OPERATION, AUTOMATION_PARAM_PREVIOUS_REVISION, AUTOMATION_PARAM_QUERY,
-    AUTOMATION_PARAM_REVISION, AUTOMATION_PARAM_REVISION_JSON, AUTOMATION_OPERATION_FAILURE,
-    AUTOMATION_QUERY_CURRENT,
-    AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY, AUTOMATION_QUERY_INVOCATIONS,
-    AUTOMATION_QUERY_LIST, AUTOMATION_STATE_ACTIVE, AUTOMATION_STATE_BLOCKED_CONFIG,
-    AUTOMATION_STATE_PAUSED, AUTOMATION_STATE_RETIRED, AutomationContractError,
-    AutomationFailureDocument,
+    AUTOMATION_PARAM_INCLUDE_RETIRED, AUTOMATION_PARAM_INVOCATION_JSON,
+    AUTOMATION_PARAM_MAX_RECORDS, AUTOMATION_PARAM_OCCURRENCE_ID, AUTOMATION_PARAM_OPERATION,
+    AUTOMATION_PARAM_PREVIOUS_REVISION, AUTOMATION_PARAM_QUERY, AUTOMATION_PARAM_REVISION,
+    AUTOMATION_PARAM_REVISION_JSON, AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE,
+    AUTOMATION_QUERY_HISTORY, AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST,
+    AUTOMATION_STATE_ACTIVE, AUTOMATION_STATE_BLOCKED_CONFIG, AUTOMATION_STATE_PAUSED,
+    AUTOMATION_STATE_RETIRED, AutomationContractError, AutomationFailureDocument,
     DecodedAutomationMutation, DecodedAutomationRead, MAX_AUTOMATION_DOC_BYTES,
     MAX_AUTOMATION_ID_BYTES, MAX_AUTOMATION_PAGE_RECORDS, MAX_AUTOMATION_REVISION_ID_BYTES,
     USER_AUTOMATION_MUTATION_NAME, USER_AUTOMATION_READ_NAME, USER_AUTOMATION_SCOPE,
     USER_AUTOMATION_STATE_SCHEMA_V1, automation_create_params, automation_edit_params,
     automation_failure_history_ref, automation_failure_key, automation_failure_params,
-    automation_mutation_request, automation_read_request, automation_run_now_params,
+    automation_invocation_read_request, automation_mutation_request, automation_read_request,
+    automation_revision_read_request, automation_run_now_params,
     automation_state_transition_params, decode_automation_mutation, is_configuration_state_wire,
-    parse_automation_failure_document, validate_automation_doc, validate_automation_failure_document,
-    validate_automation_mutation_params, validate_automation_read_params,
+    parse_automation_failure_document, validate_automation_doc,
+    validate_automation_failure_document, validate_automation_mutation_params,
+    validate_automation_read_params,
 };
 
 pub use request_hash::{
@@ -160,17 +160,17 @@ pub use erasure_admission::{
 };
 
 pub use experience_store::{
-    DecodedExperienceMutation, DecodedExperienceRead, EXPERIENCE_BANK_MUTATION_NAME,
-    EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_MUTATION_NAME, EXPERIENCE_FEEDBACK_READ_NAME,
-    EXPERIENCE_PAGE_MATCHED_TOTAL, EXPERIENCE_PAGE_RECORDS, EXPERIENCE_PAGE_STATE_FENCE,
-    EXPERIENCE_PAGE_TRUNCATED, EXPERIENCE_PARAM_FENCE_DIGEST, EXPERIENCE_PARAM_IDEMPOTENCY_KEY,
-    EXPERIENCE_PARAM_MAX_RECORDS, EXPERIENCE_PARAM_RECORD_DIGEST, EXPERIENCE_PARAM_RECORD_JSON,
-    EXPERIENCE_PARAM_RECORD_REVISION, EXPERIENCE_PARAM_SCOPE_DIGEST, EXPERIENCE_STORE_SCHEMA_V1,
-    ExperienceContractError, ExperienceRangePage, MAX_EXPERIENCE_HANDLE_BYTES,
-    MAX_EXPERIENCE_IDEMPOTENCY_BYTES, MAX_EXPERIENCE_PAGE_RECORDS,
-    MAX_EXPERIENCE_RECORD_JSON_BYTES, AUDIT_PARAM_CURSOR, audit_cursor_issue,
-    audit_cursor_parse, audit_envelope_candidate, decode_experience_mutation,
-    experience_bank_commit_params, experience_bank_mutation_request, experience_bank_read_request,
+    AUDIT_PARAM_CURSOR, DecodedExperienceMutation, DecodedExperienceRead,
+    EXPERIENCE_BANK_MUTATION_NAME, EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_MUTATION_NAME,
+    EXPERIENCE_FEEDBACK_READ_NAME, EXPERIENCE_PAGE_MATCHED_TOTAL, EXPERIENCE_PAGE_RECORDS,
+    EXPERIENCE_PAGE_STATE_FENCE, EXPERIENCE_PAGE_TRUNCATED, EXPERIENCE_PARAM_FENCE_DIGEST,
+    EXPERIENCE_PARAM_IDEMPOTENCY_KEY, EXPERIENCE_PARAM_MAX_RECORDS, EXPERIENCE_PARAM_RECORD_DIGEST,
+    EXPERIENCE_PARAM_RECORD_JSON, EXPERIENCE_PARAM_RECORD_REVISION, EXPERIENCE_PARAM_SCOPE_DIGEST,
+    EXPERIENCE_STORE_SCHEMA_V1, ExperienceContractError, ExperienceRangePage,
+    MAX_EXPERIENCE_HANDLE_BYTES, MAX_EXPERIENCE_IDEMPOTENCY_BYTES, MAX_EXPERIENCE_PAGE_RECORDS,
+    MAX_EXPERIENCE_RECORD_JSON_BYTES, audit_cursor_issue, audit_cursor_parse,
+    audit_envelope_candidate, decode_experience_mutation, experience_bank_commit_params,
+    experience_bank_mutation_request, experience_bank_read_request,
     experience_feedback_commit_params, experience_feedback_mutation_request,
     experience_feedback_read_request, validate_experience_mutation_params,
     validate_experience_read_params,
@@ -806,11 +806,11 @@ pub enum NamedMutationOperation {
     ApplyLifecyclePolicy,
     ReconcileRecovery,
     /// Persists the Governor-owned canonical finish receipt through the
-    /// existing RecoverySchema transition. The store treats the receipt as
+    /// existing `RecoverySchema` transition. The store treats the receipt as
     /// opaque bytes and only arbitrates the `owner/finish` revision.
     RecordFinishDecision,
     /// Persists the Governor-produced canonical finish-evidence owner image
-    /// through the same fenced RecoverySchema transition. The store treats
+    /// through the same fenced `RecoverySchema` transition. The store treats
     /// the snapshot as opaque bytes and only arbitrates `owner/canonical`.
     RecordFinishEvidence,
     AppendAuditEvent,
@@ -891,9 +891,7 @@ impl NamedMutationOperation {
             Self::ReconcileRecovery
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
-            | Self::RecordAuthorityRevocation => {
-                TransitionClass::RecoverySchema
-            }
+            | Self::RecordAuthorityRevocation => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
             Self::ApplyNotificationState => TransitionClass::NotificationState,
             Self::ApplyReactiveInjectionState | Self::ApplyResourceSnapshot => {
