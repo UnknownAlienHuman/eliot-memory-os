@@ -858,6 +858,19 @@ pub struct OnboardingReadinessReceipt {
     pub governance_profile_ref: String,
     pub limiting_integration_evidence: Vec<String>,
     pub route_profile_ref: String,
+    /// Frozen serializer/tokenizer and projection source identities bound at compile time.
+    ///
+    /// The canonical tokenizer/serializer observation is owned by
+    /// eliot-context-contracts `SerializedContextMeasurement`; the receipt
+    /// carries the frozen reference values.
+    pub serializer_id: String,
+    pub serializer_version: String,
+    pub serializer_options_digest: String,
+    pub tokenizer_id: String,
+    pub tokenizer_version: String,
+    pub tokenizer_hash: String,
+    pub projection_source_ref: String,
+    pub projection_generation: u64,
     pub readiness: ReadinessLifecycle,
     pub memory_state: MemoryState,
     pub missing_inputs: Vec<String>,
@@ -886,6 +899,14 @@ impl OnboardingReadinessReceipt {
         )?;
         text(&self.governance_profile_ref, "governance_profile_ref")?;
         text(&self.route_profile_ref, "route_profile_ref")?;
+        text(&self.serializer_id, "serializer_id")?;
+        text(&self.serializer_version, "serializer_version")?;
+        text(&self.serializer_options_digest, "serializer_options_digest")?;
+        text(&self.tokenizer_id, "tokenizer_id")?;
+        text(&self.tokenizer_version, "tokenizer_version")?;
+        text(&self.tokenizer_hash, "tokenizer_hash")?;
+        text(&self.projection_source_ref, "projection_source_ref")?;
+        counter(self.projection_generation, "projection_generation")?;
         text(&self.next_safe_action, "next_safe_action")?;
         counter(self.receipt_revision, "receipt_revision")?;
         self.scope.validate()?;
@@ -1027,6 +1048,14 @@ impl ColdStartController {
         governance_profile_ref: impl Into<String>,
         limiting_integration_evidence: Vec<String>,
         route_profile_ref: impl Into<String>,
+        serializer_id: impl Into<String>,
+        serializer_version: impl Into<String>,
+        serializer_options_digest: impl Into<String>,
+        tokenizer_id: impl Into<String>,
+        tokenizer_version: impl Into<String>,
+        tokenizer_hash: impl Into<String>,
+        projection_source_ref: impl Into<String>,
+        projection_generation: u64,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         now: u64,
@@ -1036,6 +1065,13 @@ impl ColdStartController {
         let session_ref = session_ref.into();
         let governance_profile_ref = governance_profile_ref.into();
         let route_profile_ref = route_profile_ref.into();
+        let serializer_id = serializer_id.into();
+        let serializer_version = serializer_version.into();
+        let serializer_options_digest = serializer_options_digest.into();
+        let tokenizer_id = tokenizer_id.into();
+        let tokenizer_version = tokenizer_version.into();
+        let tokenizer_hash = tokenizer_hash.into();
+        let projection_source_ref = projection_source_ref.into();
         Self::check_lease_and_identities(lease, scope, instance, lineage, candidate, sources, now)?;
         Self::check_fence_sources_privacy(state_fence, sources, scope, candidate, privacy)?;
         let (task_binding, scope_resolution, readiness, missing_inputs, next_safe_action) =
@@ -1059,6 +1095,14 @@ impl ColdStartController {
             governance_profile_ref,
             limiting_integration_evidence,
             route_profile_ref,
+            serializer_id,
+            serializer_version,
+            serializer_options_digest,
+            tokenizer_id,
+            tokenizer_version,
+            tokenizer_hash,
+            projection_source_ref,
+            projection_generation,
             readiness,
             memory_state: MemoryState::Unknown,
             missing_inputs,
@@ -1834,6 +1878,14 @@ mod tests {
             "governance-profile:test",
             vec!["integration:evidence:one".into()],
             "route-profile:test",
+            "serializer:test",
+            "serializer-version:test",
+            "serializer-options:test",
+            "tokenizer:test",
+            "tokenizer-version:test",
+            "tokenizer-hash:test",
+            "projection-source:test",
+            1,
             &privacy,
             task,
             1,
