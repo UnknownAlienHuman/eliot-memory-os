@@ -1,8 +1,8 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r5"
-revision = 5
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r4"
-supersedes_freeze_digest = "sha256:bfc30f19cde26efc13de7e3dfc3c326377aaa6746dc4769345bf03014c257dd5"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6"
+revision = 6
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r5"
+supersedes_freeze_digest = "sha256:b9f08ae6ad849e1c808703e711b9ef2acfd5715844f8bacba1aacc0bf2d176b9"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
