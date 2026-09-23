@@ -1328,14 +1328,14 @@ function Get-VerifiedOperatorBuildReceipt([string]$Repo, [string]$SourceCommit, 
         [string]$receipt.contracts.contract_hash -cne $pinnedContractHash) {
         throw 'Operator build receipt does not bind the pinned lock, project and protocol contract bytes'
     }
-    foreach ($input in @(
+    foreach ($expectedInput in @(
             @{ path = $csprojRel; sha256 = $pinnedCsprojHash },
             @{ path = $lockRel; sha256 = $pinnedLockHash },
             @{ path = $contractsRel; sha256 = $pinnedContractsHash }
         )) {
-        $matches = @($receipt.source_inputs | Where-Object { [string]$_.path -ceq [string]$input.path })
-        if ($matches.Count -ne 1 -or [string]$matches[0].sha256 -cne [string]$input.sha256) {
-            throw "Operator build receipt source_inputs do not bind $($input.path)"
+        $matchingInputs = @($receipt.source_inputs | Where-Object { [string]$_.path -ceq [string]$expectedInput.path })
+        if ($matchingInputs.Count -ne 1 -or [string]$matchingInputs[0].sha256 -cne [string]$expectedInput.sha256) {
+            throw "Operator build receipt source_inputs do not bind $($expectedInput.path)"
         }
     }
     $producerPath = Join-Path $Repo $producerRel
