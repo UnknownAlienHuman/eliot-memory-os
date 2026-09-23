@@ -422,6 +422,19 @@ pub struct ExperienceQualityEventOutput {
 /// state). Any drift, malformation, withheld-but-uncited material, or
 /// missing family fails closed; nothing partial is emitted as complete
 /// and nothing is persisted or submitted by this entry.
+///
+/// Ingress derivation (every field traces to an owner source or an
+/// explicitly edge-supplied param; nothing here mints authority):
+/// fence and request binding clone verbatim from the admitted `ctx`
+/// metadata (validated, never constructed); scope, projection ids,
+/// minimums, schedules, holds, receipts, obligation and attested
+/// handles arrive edge-supplied with owner-side validation at each
+/// boundary; revision cursors resolve only through the shared owner
+/// constructors, and a wrong edge-supplied source identity fails
+/// closed at revalidation because live cursors never match it; request
+/// lifetimes borrow caller-owned values documented on each input
+/// struct. No deadline, cancellation, head, or proof value is minted
+/// anywhere on this path.
 #[allow(clippy::too_many_lines)]
 pub async fn run_experience_quality_event(
     composition: &DaemonComposition,

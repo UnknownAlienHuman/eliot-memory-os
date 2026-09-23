@@ -147,7 +147,8 @@ use eliot_understanding_assessment::AssessmentError as UnderstandingError;
 use eliot_observation_contracts::{
     AgentFeedbackRecord, BankProjection, CoverageDisposition, CoverageEvidence, ExperienceBankRecord,
     ExperienceRetentionReadPosture, ExperienceSourceFamily, FeedbackProjection, JournalProjection,
-    ObservationError, ObservationRecordEnvelope, ObservationScope, ProjectionCoverage,
+    MAX_PROJECTION_MEMBERS, MAX_PROJECTION_OMISSIONS, ObservationError, ObservationRecordEnvelope,
+    ObservationScope, ProjectionCoverage, ProjectionOmission, ProjectionOmissionClass,
     RetentionHold, RetentionSchedule, bank_record_ref, feedback_record_ref, resolve_retention_read,
 };
 use eliot_receipts::WorkScopeId;
@@ -229,42 +230,94 @@ pub enum ProviderError {
     Foundation(#[from] eliot_contracts::ContractError),
 }
 
+/// Scaffold literals shadowing the canonical audit-paging contract
+/// (`codex/b223-canonical-owner-20260922` b86fc66d,
+/// `crates/storage/eliot-store-api/src/experience_store.rs`:
+/// `audit_cursor_issue`, `AUDIT_PARAM_CURSOR`,
+/// `MAX_AUDIT_RANGE_RECORDS`).
+///
+/// Values verified read-only against that commit; the store re-verifies
+/// every cursor on receipt (fence digest plus bound), so drift fails
+/// closed, never silent. Swap these literals for the canonical imports
+/// when that surface lands on main. Never hand-roll the cursor format
+/// elsewhere: all paging flows through [`page_cursor_for_ordinal`].
+const AUDIT_CURSOR_PARAM: &str = "cursor";
+/// Page bound every audit read carries: must equal the canonical bound
+/// the store enforces, or cursors are rejected there.
+const AUDIT_PAGE_BOUND: u32 = 32;
+/// Maximum pages one journal enumeration walks before failing closed.
+/// Bounds bridge work: a hotter store surfaces as an error, never a hang.
+const MAX_AUDIT_READ_PAGES: u32 = 64;
+/// Maximum restarts after fence/head advance before failing closed with
+/// [`ProviderError::PresenceDrift`]: the live owner state advanced past
+/// any coherent read this cell could finish.
+const MAX_AUDIT_READ_RESTARTS: u32 = 3;
+
 /// Plan one closed audit-range read (pure, no I/O).
 ///
-/// Builds the existing `GetAuditRange` catalogue read with no parameters
-/// and no scope (scope-free row: scope filtering stays consumer-owned)
-/// and validates it. This is the single request-shape implementation the
-/// bridge fetch below and the daemon registration planner both resolve:
-/// the O1 planner region delegates here so only one shape exists. The
-/// store catalogue remains the authority; activation and adapter
-/// handlers stay with the store lane.
+/// Builds the existing `GetAuditRange` catalogue read with an optional
+/// continuation cursor and no scope (scope-free row: scope filtering
+/// stays consumer-owned) and validates it. `None` reads from the start
+/// with legacy fail-closed overflow; `Some` resumes paging past that
+/// candidate ordinal. This is the single request-shape implementation
+/// the bridge fetch below and the daemon registration planner both
+/// resolve: the O1 planner region delegates here so only one shape
+/// exists. The store catalogue remains the authority; activation and
+/// adapter handlers stay with the store lane.
 pub fn plan_audit_range_request(
     fence: &StateFence,
     consistency: ReadConsistency,
+    cursor: Option<String>,
 ) -> Result<NamedReadRequest, ProviderError> {
+    let mut parameters = BTreeMap::new();
+    if let Some(cursor) = cursor {
+        parameters.insert(AUDIT_CURSOR_PARAM.to_owned(), serde_json::Value::String(cursor));
+    }
     let request = NamedReadRequest {
         operation: NamedReadOperation::GetAuditRange,
         scope_id: None,
         consistency,
         state_fence: fence.clone(),
-        parameters: BTreeMap::new(),
+        parameters,
     };
     request.validate().map_err(ProviderError::Bridge)?;
     Ok(request)
 }
 
-/// Producer: fetch one scoped audit range through the canonical bridge.
+/// Mint one page cursor for an ordinal under a fence.
 ///
-/// Issues the planned `GetAuditRange` read and validates the response
-/// shape, operation echo, and fence compatibility. A bridge that reports
-/// `Unavailable` becomes [`ProviderError::BridgeUnavailable`]; every
-/// other store failure travels as [`ProviderError::Bridge`].
+/// Scaffold twin of the canonical `audit_cursor_issue`: binds the exact
+/// query-fence digest, the next candidate ordinal, and the page bound.
+/// Every input here is owner-issued or observed (fence under read,
+/// ordinal counted from responses, catalogue bound); the store
+/// re-verifies all three on receipt, so a wrong cursor fails closed
+/// there, never silently.
+fn page_cursor_for_ordinal(fence: &StateFence, ordinal: u64) -> Result<String, ProviderError> {
+    let digest = canonical_json_bytes(fence)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| ProviderError::Response {
+            field: "read.fence",
+            reason: "read fence is not canonically encodable",
+        })?;
+    Ok(format!("audit:{digest}:{ordinal:010}:{AUDIT_PAGE_BOUND}"))
+}
+
+/// Producer: fetch one audit-range page through the canonical bridge.
+///
+/// Issues the planned read and validates transport shape, operation
+/// echo, and response shape. Semantic gates (fence agreement, head
+/// equality, revision minimums) run in [`gate_audit_response`], not
+/// here, so the page loop can distinguish transport failure from a
+/// vintage advance. A bridge that reports `Unavailable` becomes
+/// [`ProviderError::BridgeUnavailable`]; every other store failure
+/// travels as [`ProviderError::Bridge`].
 pub async fn fetch_audit_range<C: CanonicalReadClient + ?Sized>(
     client: &C,
     fence: &StateFence,
     consistency: ReadConsistency,
+    cursor: Option<String>,
 ) -> Result<NamedReadResponse, ProviderError> {
-    let request = plan_audit_range_request(fence, consistency)?;
+    let request = plan_audit_range_request(fence, consistency, cursor)?;
     let response = match client.execute_named(request).await {
         Err(StoreError::Unavailable) => {
             return Err(ProviderError::BridgeUnavailable);
@@ -278,31 +331,78 @@ pub async fn fetch_audit_range<C: CanonicalReadClient + ?Sized>(
             reason: "bridge did not answer the audit-range read",
         });
     }
+    Ok(response)
+}
+
+/// Enforce the owner head gates on one head set.
+///
+/// Exact per-head fence equality (a compatible-but-unequal head means
+/// the enumeration was not read under the claimed fence) plus revision
+/// minimums (a missing key or regressed revision means stale). Shared
+/// by response gating and fence-advance re-discovery so both enforce
+/// the identical rule.
+fn gate_audit_response_heads(
+    heads: &[RevisionHead],
+    fence: &StateFence,
+    minimums: &BTreeMap<RevisionKey, u64>,
+) -> Result<(), ProviderError> {
+    if heads
+        .iter()
+        .any(|head| head.state_fence != *fence)
+    {
+        return Err(ProviderError::Response {
+            field: "response.revision_heads",
+            reason: "owner head fence does not equal the read fence",
+        });
+    }
+    for (key, minimum) in minimums {
+        let current = heads
+            .iter()
+            .find(|head| head.key == *key)
+            .map(|head| head.revision);
+        if current.is_none_or(|revision| revision < *minimum) {
+            return Err(ProviderError::StaleRevision);
+        }
+    }
+    Ok(())
+}
+
+/// Enforce the owner read gates on one audit response.
+///
+/// Mirrors the read facade: response fence compatibility, then the
+/// shared head gates. Any violation fails the page closed; vintage
+/// advance is detected by the caller comparing fences and head digests
+/// across pages, not here.
+fn gate_audit_response(
+    response: &NamedReadResponse,
+    fence: &StateFence,
+    minimums: &BTreeMap<RevisionKey, u64>,
+) -> Result<(), ProviderError> {
     if !response.state_fence.is_compatible_with(fence) {
         return Err(ProviderError::Response {
             field: "response.state_fence",
             reason: "bridge fence is not compatible with the read fence",
         });
     }
-    Ok(response)
+    gate_audit_response_heads(&response.revision_heads, fence, minimums)
 }
 
-/// Provider inputs for shaping one bridge read into owner projections.
-pub struct JournalShapeInputs<'a> {
-    /// Stable identity minted by the caller for the projection envelope.
-    pub projection_id: ArtifactId,
-    /// Read scope governing the projection; carried event records must name it.
-    pub scope: ObservationScope,
-    /// Fence the bridge read ran under, carried for edge gating.
-    pub fence: StateFence,
-    /// Validated `GetAuditRange` bridge response shaping starts from.
-    pub response: &'a NamedReadResponse,
-    /// Record ids read from the live journal at call time for binding.
-    pub admitted_record_ids: &'a BTreeSet<String>,
-    /// Required revision minimums per head key (revision monotonicity):
-    /// every named key must be present with at least the named revision.
-    /// Empty imposes no constraint.
-    pub minimum_revisions: &'a BTreeMap<RevisionKey, u64>,
+/// Assembled shaping inputs: validated records plus read evidence.
+///
+/// Private assembly boundary shared by the single-read and multi-page
+/// paths: `records` arrive validated, scope-filtered, and presence-bound
+/// with `observed_total` counting every payload record read;
+/// `gap_ids` names carried-overflow record ids for omission accounting
+/// (capped); `canonical_heads` are the key-ordered owner heads of the
+/// single vintage being assembled.
+struct AssembledShapedInputs {
+    projection_id: ArtifactId,
+    scope: ObservationScope,
+    fence: StateFence,
+    records: Vec<ObservationRecordEnvelope>,
+    observed_total: u64,
+    gap_ids: Vec<String>,
+    canonical_heads: Vec<RevisionHead>,
 }
 
 /// Shaped owner projections plus the revalidated Smart view.
@@ -317,98 +417,46 @@ pub struct JournalShapeOutput {
     pub revision_heads: Vec<RevisionHead>,
 }
 
-/// Provider plus Smart-consumer call: shape one bridge read and bind it.
+/// Assemble one shaped journal read from validated page records.
 ///
-/// Parses the coordinated `audit_range_v1` payload, carries admitted V1
-/// envelopes (event records in the read scope plus scope-free gap/control
-/// records), binds every carried record against the live admitted-handle
-/// set, assembles the frozen [`JournalProjection`] with honest coverage,
-/// and assembles the journal-family [`ExperienceView`] as a ref-less
-/// coverage echo (V1 envelopes carry no owner revision cursor, so no ref
-/// handles are minted here). Any drift, malformation, or fence mismatch
-/// fails closed; nothing partial is ever emitted as complete.
-pub fn shape_journal_read(
-    inputs: &JournalShapeInputs<'_>,
+/// Private assembly boundary shared by every enumeration path: coverage
+/// binds the canonical owner heads with honest posture (exact carried
+/// count with empty omissions, or partial), carried overflow beyond the
+/// envelope bound becomes closed `TruncatedAtBound` omissions (never
+/// silent truncation, never failure), and the frozen envelope plus the
+/// ref-less echo view assemble exactly as the single-read path always
+/// did. Records arrive validated, scope-filtered, and presence-bound;
+/// `observed_total` counts every payload record read.
+fn assemble_shaped_journal(
+    inputs: AssembledShapedInputs,
 ) -> Result<JournalShapeOutput, ProviderError> {
-    if inputs.response.operation != NamedReadOperation::GetAuditRange {
-        return Err(ProviderError::Response {
-            field: "response.operation",
-            reason: "shaping starts from an audit-range read only",
-        });
+    let mut omissions: Vec<ProjectionOmission> = Vec::new();
+    for id in &inputs.gap_ids {
+        let omission = ProjectionOmission {
+            handle: ArtifactId::new(id.clone()).map_err(ProviderError::Foundation)?,
+            class: ProjectionOmissionClass::TruncatedAtBound,
+            detail: format!(
+                "audit-range carry bound {} exceeded",
+                MAX_PROJECTION_MEMBERS
+            ),
+        };
+        omission
+            .validate()
+            .map_err(ProviderError::Contract)?;
+        omissions.push(omission);
     }
-    inputs
-        .response
-        .validate()
-        .map_err(ProviderError::Bridge)?;
-    if !inputs.response.state_fence.is_compatible_with(&inputs.fence) {
-        return Err(ProviderError::Response {
-            field: "response.state_fence",
-            reason: "bridge fence is not compatible with the read fence",
-        });
-    }
-    // Schedule-fence owner check (mirrors the read facade): every
-    // owner-issued revision head must carry exactly the read fence. A
-    // compatible-but-unequal head means the enumeration was not read under
-    // the fence this projection claims, so the read fails closed.
-    if inputs
-        .response
-        .revision_heads
-        .iter()
-        .any(|head| head.state_fence != inputs.fence)
-    {
-        return Err(ProviderError::Response {
-            field: "response.revision_heads",
-            reason: "owner head fence does not equal the read fence",
-        });
-    }
-    // Revision monotonicity (mirrors the read facade): every required key
-    // must be present with at least the required revision. A missing key
-    // or a regressed revision means the read is stale for this caller.
-    for (key, minimum) in inputs.minimum_revisions {
-        let current = inputs
-            .response
-            .revision_heads
-            .iter()
-            .find(|head| head.key == *key)
-            .map(|head| head.revision);
-        if current.is_none_or(|revision| revision < *minimum) {
-            return Err(ProviderError::StaleRevision);
-        }
-    }
-    // Canonical refs: revision heads sort by key so the coverage digest
-    // and denominator ref are order-independent. The digest below proves
-    // this read's shape only; durable authority stays with the bound
-    // heads plus the fence-equality check above, both carried in the
-    // output for later re-proof.
-    let mut canonical_heads = inputs.response.revision_heads.clone();
+    let carried = inputs.records;
+    let mut canonical_heads = inputs.canonical_heads;
     canonical_heads.sort_by(|left, right| left.key.cmp(&right.key));
-    let payload: AuditRangeV1Payload =
-        serde_json::from_value(inputs.response.payload.clone())
-            .map_err(|error| ProviderError::Payload {
-                reason: error.to_string(),
-            })?;
-    let mut carried: Vec<ObservationRecordEnvelope> = Vec::new();
-    for record in &payload.records {
-        record.validate()?;
-        match &record.event {
-            Some(event) if event.affected_scope != inputs.scope => continue,
-            _ => carried.push(record.clone()),
-        }
-    }
-    for record in &carried {
-        if !inputs.admitted_record_ids.contains(record.record_id.as_str()) {
-            return Err(ProviderError::PresenceDrift);
-        }
-    }
     let heads_digest = canonical_json_bytes(&canonical_heads)
         .map(|bytes| sha256_hex(&bytes))
         .map_err(|_| ProviderError::Response {
             field: "response.revision_heads",
             reason: "revision heads are not canonically encodable",
         })?;
-    let observed_count = u64::try_from(payload.records.len()).unwrap_or(u64::MAX);
+    let observed_count = inputs.observed_total;
     let carried_count = u64::try_from(carried.len()).unwrap_or(u64::MAX);
-    let disposition = if carried_count == observed_count {
+    let disposition = if carried_count == observed_count && omissions.is_empty() {
         CoverageDisposition::Complete
     } else {
         CoverageDisposition::Partial
@@ -443,7 +491,7 @@ pub fn shape_journal_read(
         source_revision,
         carried,
         coverage,
-        Vec::new(),
+        omissions,
     )?;
     // Journal views carry no ref handles: V1 envelopes carry no owner
     // revision cursor by contract, and this cell never rebuilds cursors
@@ -500,26 +548,200 @@ pub struct ProduceJournalInputs<'a> {
 
 /// Composed producer-to-provider-to-consumer call in production types.
 ///
-/// Fetches the scope-free audit range through the caller-supplied bridge
-/// client, shapes the admitted V1 envelopes into the frozen owner
-/// projection, assembles the Smart view, and revalidates both. The caller
-/// supplies the bridge client and the live admitted-handle set; the only
-/// durable-touching operation is the read-only `GetAuditRange` catalogue
-/// read. Terminal invocation belongs to the runtime flow that owns both
-/// (Governor/daemon observation edge); this function is the typed join
-/// that invocation performs.
+/// Enumerates the scope-free audit range through the caller-supplied
+/// bridge client across bounded pages, shapes the admitted V1 envelopes
+/// into the frozen owner projection, assembles the Smart view, and
+/// revalidates both. Every page carries a fence-bound cursor (ordinal
+/// zero starts the enumeration, so the legacy fail-closed overflow
+/// path is never taken); a full page continues past the counted
+/// ordinal and a short page ends the enumeration. A fence or head
+/// advance mid-loop restarts from the head under the adopted vintage
+/// (bounded retries, then fail-closed); total volume past the envelope
+/// bound carries with an explicit coverage gap, never silent
+/// truncation. The caller supplies the bridge client and the live
+/// admitted-handle set; the only durable-touching operations are
+/// read-only `GetAuditRange` catalogue reads. Terminal invocation
+/// belongs to the runtime flow that owns both (Governor/daemon
+/// observation edge); this function is the typed join that invocation
+/// performs.
+#[allow(
+    clippy::too_many_lines,
+    reason = "page loop sequences fetch, vintage, accumulate, and assemble in explicit order"
+)]
 pub async fn produce_journal_read<C: CanonicalReadClient + ?Sized>(
     client: &C,
     inputs: &ProduceJournalInputs<'_>,
 ) -> Result<JournalShapeOutput, ProviderError> {
-    let response = fetch_audit_range(client, &inputs.fence, inputs.consistency.clone()).await?;
-    shape_journal_read(&JournalShapeInputs {
+    let mut fence = inputs.fence.clone();
+    let mut canonical_heads: Vec<RevisionHead> = Vec::new();
+    let mut have_vintage = false;
+    let mut ordinal: u64 = 0;
+    let mut pages: u32 = 0;
+    let mut restarts: u32 = 0;
+    let mut carried: Vec<ObservationRecordEnvelope> = Vec::new();
+    let mut gap_ids: Vec<String> = Vec::new();
+    let mut observed_total: u64 = 0;
+    loop {
+        if pages >= MAX_AUDIT_READ_PAGES {
+            return Err(ProviderError::Response {
+                field: "audit_range.pages",
+                reason: "enumeration exceeds the bounded page budget",
+            });
+        }
+        let cursor = page_cursor_for_ordinal(&fence, ordinal)?;
+        let response = match fetch_audit_range(
+            client,
+            &fence,
+            inputs.consistency.clone(),
+            Some(cursor),
+        )
+        .await
+        {
+            Err(ProviderError::Bridge(StoreError::FenceMismatch)) => {
+                // Fence advanced mid-enumeration: re-discover current
+                // heads for the observed keys and restart under the
+                // adopted vintage. No keys observed yet means the read
+                // fence itself is stale: propagate for the caller to
+                // refresh rather than guessing a fence here.
+                let known_keys: Vec<RevisionKey> = canonical_heads
+                    .iter()
+                    .map(|head| head.key.clone())
+                    .collect();
+                if known_keys.is_empty() {
+                    return Err(ProviderError::Bridge(StoreError::FenceMismatch));
+                }
+                let mut fresh = client
+                    .revision_heads(known_keys)
+                    .await
+                    .map_err(ProviderError::Bridge)?;
+                fresh.sort_by(|left, right| left.key.cmp(&right.key));
+                let adopted = fresh
+                    .first()
+                    .map(|head| head.state_fence.clone())
+                    .ok_or(ProviderError::Bridge(StoreError::FenceMismatch))?;
+                if fresh.iter().any(|head| head.state_fence != adopted)
+                    || !adopted.is_compatible_with(&inputs.fence)
+                {
+                    return Err(ProviderError::Response {
+                        field: "response.revision_heads",
+                        reason: "re-discovered heads carry no single compatible fence",
+                    });
+                }
+                gate_audit_response_heads(&fresh, &adopted, inputs.minimum_revisions)?;
+                fence = adopted;
+                canonical_heads = fresh;
+                have_vintage = true;
+                ordinal = 0;
+                carried.clear();
+                gap_ids.clear();
+                observed_total = 0;
+                restarts = restarts.saturating_add(1);
+                if restarts > MAX_AUDIT_READ_RESTARTS {
+                    return Err(ProviderError::PresenceDrift);
+                }
+                continue;
+            }
+            result => result?,
+        };
+        pages = pages.saturating_add(1);
+        gate_audit_response(&response, &fence, inputs.minimum_revisions)?;
+        let mut page_heads = response.revision_heads.clone();
+        page_heads.sort_by(|left, right| left.key.cmp(&right.key));
+        let page_digest = canonical_json_bytes(&page_heads)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| ProviderError::Response {
+                field: "response.revision_heads",
+                reason: "revision heads are not canonically encodable",
+            })?;
+        let vintage_digest = canonical_json_bytes(&canonical_heads)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| ProviderError::Response {
+                field: "response.revision_heads",
+                reason: "revision heads are not canonically encodable",
+            })?;
+        if have_vintage
+            && (response.state_fence != fence || page_digest != vintage_digest)
+        {
+            // Mid-enumeration advance: adopt the observed vintage only
+            // when its fence stays combinable with the read fence the
+            // caller isolated. An incompatible fence means the store
+            // moved to a generation this read must not observe: fail
+            // closed instead of projecting across the boundary.
+            if !response.state_fence.is_compatible_with(&inputs.fence) {
+                return Err(ProviderError::Response {
+                    field: "response.state_fence",
+                    reason: "advanced fence is not compatible with the read fence",
+                });
+            }
+            fence = response.state_fence.clone();
+            canonical_heads = page_heads;
+            ordinal = 0;
+            carried.clear();
+            gap_ids.clear();
+            observed_total = 0;
+            restarts = restarts.saturating_add(1);
+            if restarts > MAX_AUDIT_READ_RESTARTS {
+                return Err(ProviderError::PresenceDrift);
+            }
+            have_vintage = true;
+        } else {
+            canonical_heads = page_heads;
+            have_vintage = true;
+        }
+        gate_audit_response(&response, &fence, inputs.minimum_revisions)?;
+        let payload: AuditRangeV1Payload =
+            serde_json::from_value(response.payload.clone()).map_err(|error| {
+                ProviderError::Payload {
+                    reason: error.to_string(),
+                }
+            })?;
+        for record in &payload.records {
+            record.validate()?;
+            let in_scope = match &record.event {
+                Some(event) if event.affected_scope != inputs.scope => false,
+                _ => true,
+            };
+            observed_total = observed_total.saturating_add(1);
+            if !in_scope {
+                continue;
+            }
+            if !inputs
+                .admitted_record_ids
+                .contains(record.record_id.as_str())
+            {
+                return Err(ProviderError::PresenceDrift);
+            }
+            if carried.len() < MAX_PROJECTION_MEMBERS {
+                carried.push(record.clone());
+            } else if gap_ids.len() < MAX_PROJECTION_OMISSIONS {
+                gap_ids.push(record.record_id.clone());
+            }
+        }
+        let page_bound = usize::try_from(AUDIT_PAGE_BOUND).unwrap_or(usize::MAX);
+        if payload.records.len() > page_bound {
+            return Err(ProviderError::Response {
+                field: "response.payload",
+                reason: "page exceeds the bounded page size",
+            });
+        }
+        if payload.records.len() < page_bound {
+            break;
+        }
+        // Ordinals count candidates, not carried refs: the store numbers
+        // every envelope candidate in commit order, so the next page
+        // resumes past the full payload length regardless of scope
+        // filtering or carry bounds. Advancing by the filtered count
+        // would re-read (duplicating handles) or skip records.
+        ordinal = ordinal.saturating_add(u64::try_from(payload.records.len()).unwrap_or(u64::MAX));
+    }
+    assemble_shaped_journal(AssembledShapedInputs {
         projection_id: inputs.projection_id.clone(),
         scope: inputs.scope.clone(),
-        fence: inputs.fence.clone(),
-        response: &response,
-        admitted_record_ids: inputs.admitted_record_ids,
-        minimum_revisions: inputs.minimum_revisions,
+        fence,
+        records: carried,
+        observed_total,
+        gap_ids,
+        canonical_heads,
     })
 }
 
