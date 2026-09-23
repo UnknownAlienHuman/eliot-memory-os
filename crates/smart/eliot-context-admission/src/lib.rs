@@ -183,12 +183,12 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 /// comparison in [`check_plan_revisions`], the total classifier in
 /// [`classify_admission`], and the trace joins in [`trace_material`] and
 /// [`trace_material_with_warnings`]. No daemon retrieval drive exists in
-/// this candidate: consumption (`bins/eliotd` drive, tick, supplier
-/// injection) is M2/O1-owned through root, with the O1 caller record at
-/// `532a2b4e` (`bins/eliotd/src/attempt_execution_chain.rs` poll-docs
-/// hunk). Where that record predates this contract (assessed at
-/// `0f9b456b`: `None` entry as no-opinion), the strict rule in step 2
-/// governs — unresolved compares reject — pending root serialization.
+/// this candidate. Consumption (`bins/eliotd` drive, tick, supplier
+/// injection) is M2/O1-owned through root; the O1 caller record is
+/// `532a2b4e` (`bins/eliotd/src/attempt_execution_chain.rs` poll docs).
+/// Decided contract: unresolved revision compares reject
+/// (`StaleProjection` floor, `ProbeRequired` optional) with fence-mismatch
+/// priority to the refresh arm; the runtime consumer is pending.
 pub fn admit_context_traced(
     input: &AdmissionInput,
 ) -> Result<(AdmissionResult, Vec<MaterialRankTrace>), ContextError> {
