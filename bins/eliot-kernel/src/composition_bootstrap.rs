@@ -27,9 +27,9 @@ use super::{
     PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
     ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
     RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
-    StartupCoordinator, StateFence, UserOwnedPathLease, UserOwnedRootLease,
-    WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
-    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
+    StartupCoordinator, StateFence, USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease,
+    UserOwnedRootLease, WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner,
+    is_lower_sha256, owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -1118,7 +1118,17 @@ impl KernelComposition {
                 || format!("kernel-{}", std::process::id()),
                 |launch| launch.launch_nonce.as_str().to_owned(),
             ),
-            allowed_capabilities: vec!["daemon".to_owned()],
+            // The regular daemon session and the dedicated Host
+            // UserAutomation session share the authenticated front-door
+            // policy, but the latter is admitted through its own binder and
+            // can only project this exact capability.  Keeping the capability
+            // in the server-owned policy prevents the special binder from
+            // bypassing live policy while retaining the least-privilege
+            // Submit-only check in `front_door_session`/`dreamer_job_dispatch`.
+            allowed_capabilities: vec![
+                "daemon".to_owned(),
+                USER_AUTOMATION_KERNEL_CAPABILITY.to_owned(),
+            ],
             allowed_privacy_classes: vec!["PUBLIC".to_owned()],
             allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
             session_principal_binding,
