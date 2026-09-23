@@ -11,6 +11,9 @@ name = "eliot-host"
 path = "src/main.rs"
 
 [dependencies]
+# #961 cutover typed receipts (M2 port; first-party path edge with
+# bins/eliot precedent; #974 ratifies or reverts).
+eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true
 eliot-host-control-endpoint.workspace = true
 eliot-host-service.workspace = true

@@ -448,6 +448,52 @@ fn open_host(launch_options: HostLaunchOptions) -> Result<HostComposition, HostE
     HostComposition::open(launch_options)
 }
 
+/// Admitted installation post-restore cutover contour (#961, M2 port).
+///
+/// Exact call order: validate the separately-admitted request against
+/// current owner evidence, execute guard plus fresh registry readback plus
+/// barrier plus installation CAS, accept the new generation through the
+/// existing acceptance contours, then retire the prior generation holding
+/// the issued barrier and reconcile from owner receipts on unknown outcome.
+/// Dispatch wiring (console `Request` variant) is root-serialized; this
+/// contour lands first and is not yet called from `dispatch`.
+#[cfg(windows)]
+#[allow(dead_code, reason = "admitted-cutover dispatch serialized by root")]
+fn admitted_installation_cutover(
+    host: &mut HostComposition,
+    request: eliot_host::backup_cutover::CutoverRequest,
+    evidence: eliot_host::backup_cutover::IsolatedRecoveryEvidence,
+    retirement: &eliot_host::GenerationRetirementFence,
+    activation_id: &eliot_platform::PlatformHandle,
+    activation_generation: &eliot_host_state::EpochTransition,
+    prior_host: &eliot_host_state::HostInstallationEpoch,
+    retirement_authorization: &eliot_platform::PlatformHandle,
+) -> Result<
+    eliot_host::backup_cutover::CutoverOutcome,
+    eliot_host::backup_cutover::CutoverError,
+> {
+    let validated = eliot_host::backup_cutover::validate_cutover_request(
+        &request,
+        &evidence,
+        host.registry(),
+    )?;
+    let (_pending, barrier) = eliot_host::backup_cutover::execute_cutover(
+        host,
+        &validated,
+        retirement,
+        activation_id,
+        activation_generation,
+    )?;
+    let outcome = eliot_host::backup_cutover::retire_prior_generation(
+        host,
+        &validated,
+        &barrier,
+        prior_host,
+        retirement_authorization,
+    )?;
+    Ok(outcome)
+}
+
 fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
     match serde_json::from_str::<Request>(line) {
         Ok(Request::Status) => (
