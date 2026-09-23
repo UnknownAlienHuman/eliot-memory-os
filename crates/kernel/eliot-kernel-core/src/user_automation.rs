@@ -1189,7 +1189,12 @@ pub struct UserAutomationPreflightProjection {
     pub occurrence_id: String,
     /// Full immutable revision owned by this projection.
     pub revision: UserAutomationRevision,
-    /// Canonical configuration state repeated for explicit readback.
+    /// Live canonical configuration state from the current pointer.
+    ///
+    /// This may differ from the immutable revision's state after pause,
+    /// resume, or retirement. Admission follows this owner readback; the
+    /// revision retains the state captured when that immutable document was
+    /// created.
     pub configuration_state: UserAutomationConfigurationState,
     /// Existing B-owned complete config snapshot.
     pub config_snapshot: ConfigPolicySnapshot,
@@ -1249,7 +1254,6 @@ impl UserAutomationPreflightProjection {
             || self.revision.automation_id != self.automation_id
             || self.revision.revision != self.automation_revision
             || self.revision.mode != self.mode
-            || self.configuration_state != self.revision.configuration_state
             || self.trigger_origin != invocation.trigger_origin
             || self.child_depth != invocation.child_depth
         {
