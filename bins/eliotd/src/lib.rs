@@ -934,11 +934,12 @@ impl DaemonComposition {
     pub fn skill_run_install_to_receipt(
         &self,
         act: skill_lifecycle_adapters::VersionedDeliveryAct<'_>,
+        record: &skill_acceptance_read::AcceptanceRecord,
     ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
         let admitted = self.governor.kernel_snapshot().state_fence().clone();
         self.check_skill_lifecycle_standing(act.package, &admitted)?;
         self.shared_skill_adapter()
-            .run_install_to_receipt(act, &admitted)
+            .run_install_to_receipt(act, &admitted, record)
     }
 
     /// Runs the Hotset injector call end to end through the composed
@@ -959,6 +960,7 @@ impl DaemonComposition {
     pub fn skill_inject_hotset(
         &self,
         request: skill_lifecycle_adapters::SkillHotsetRequest<'_>,
+        record: &skill_acceptance_read::AcceptanceRecord,
     ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
         let (source, admitted_version) = eliot_governor::canonical_skill_tool_source()?;
         let aliases = eliot_skill::ToolAliasTable::new();
@@ -970,33 +972,51 @@ impl DaemonComposition {
             &aliases,
             &admitted_version,
             &fence,
+            record,
         )
     }
 
-    /// Drives one wire intake through the injector call end to end (issue
-    /// #1882).
+    /// Drives one owner-accepted intake through the injector call end to end
+    /// (issues #1882, #1191).
     ///
-    /// Daemon-side handler for Hotset intake bytes arriving over the
-    /// transport: decodes the
+    /// Daemon-side handler for a decoded Hotset intake the poller drive
+    /// already bound to its committed acceptance row: the
     /// [`SkillIntakePayload`](eliot_agent_bridge_core::SkillIntakePayload)
-    /// (decode failures map to a surface contract error), observes the live
-    /// canonical source, default alias table, and admitted fence, and drives
-    /// the composed delivery act with the admitted version read from the
-    /// payload's install context. Every delivery gate below runs unchanged.
+    /// arrives decoded (shape and package↔inputs binding verified from the
+    /// bytes, driven as-is — never re-produced), and the
+    /// [`AcceptanceRecord`](skill_acceptance_read::AcceptanceRecord) arrives
+    /// from the store owner via the authenticated acceptance read. The
+    /// composition observes every remaining authority term itself — the live
+    /// admitted fence, the recovered lifecycle standing, and the canonical
+    /// tool source plus Governor-admitted definition version — and drives
+    /// the composed delivery act. Owner-issued install context and
+    /// provider-signed readiness beyond shape/binding checks still arrive
+    /// with the injector-carried handoff; acquiring them from their owners
+    /// belongs to the external v2 producer/ack lanes.
     /// Returns the installed identity plus the receipt the injector carries
     /// to the receiver.
-    pub fn skill_ingest_wire_intake(
+    ///
+    /// The crate error travels by value here like every neighboring
+    /// composition seam feeding the Governor lifecycle API, so the size
+    /// lint is allowed for this seam.
+    #[allow(clippy::result_large_err)]
+    pub fn skill_ingest_accepted_intake(
         &self,
-        bytes: &[u8],
+        payload: &eliot_agent_bridge_core::SkillIntakePayload,
+        record: &skill_acceptance_read::AcceptanceRecord,
     ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
-        let payload = eliot_agent_bridge_core::SkillIntakePayload::decode(bytes)
-            .map_err(|error| eliot_skill::SkillError::Surface(error.to_string()))?;
-        let (source, _) = eliot_governor::canonical_skill_tool_source()?;
+        let (source, admitted_version) = eliot_governor::canonical_skill_tool_source()?;
         let aliases = eliot_skill::ToolAliasTable::new();
         let fence = self.governor.kernel_snapshot().state_fence().clone();
         self.check_skill_lifecycle_standing(&payload.package, &fence)?;
-        self.shared_skill_adapter()
-            .ingest_wire_intake(payload, source.as_ref(), &aliases, &fence)
+        self.shared_skill_adapter().ingest_wire_intake(
+            payload,
+            record,
+            source.as_ref(),
+            &aliases,
+            &admitted_version,
+            &fence,
+        )
     }
 
     /// Carries the receiver ack back to the display boundary under a fresh
