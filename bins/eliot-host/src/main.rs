@@ -989,6 +989,7 @@ enum RuntimeControlDispatch {
     Kernel,
     Store,
     ReactiveContext,
+    UserAutomation,
 }
 
 #[cfg(windows)]
@@ -1000,6 +1001,10 @@ fn runtime_control_dispatch(operation: &HostRuntimeControlOperation) -> RuntimeC
         | HostRuntimeControlOperation::ReconcileStoreRecovery => RuntimeControlDispatch::Store,
         HostRuntimeControlOperation::DeliverReactiveContext => {
             RuntimeControlDispatch::ReactiveContext
+        }
+        HostRuntimeControlOperation::AdmitUserAutomationOccurrence
+        | HostRuntimeControlOperation::CancelUserAutomationPendingWakes => {
+            RuntimeControlDispatch::UserAutomation
         }
     }
 }
@@ -1034,6 +1039,30 @@ fn process_reactive_context_request(
 }
 
 #[cfg(windows)]
+fn process_user_automation_request(
+    _host: &HostComposition,
+    request: &eliot_host::HostRuntimeControlRequest,
+) -> HostRuntimeControlResponse {
+    // The runtime-control transfer carries the typed UserAutomation carrier
+    // in `request.user_automation` (validated before queueing). Serving it
+    // needs the composed `UserAutomationHostExecutionEndpoint` —
+    // authenticated channel binding plus Durable Job owner plus journal Wake
+    // adapter — which this binary does not retain yet, so no owner effect
+    // is produced here. Preserve that uncertainty on the existing control
+    // response contract, exactly like the reactive-context handler below:
+    // the Kernel reconciles through the typed readback path instead of
+    // assuming execution.
+    HostRuntimeControlResponse::unknown_for(
+        request,
+        eliot_host_service::runtime_control::operation_unknown_ref(
+            &request.operation,
+            "validation",
+            request,
+        ),
+    )
+}
+
+#[cfg(windows)]
 fn process_runtime_control_requests(
     host: &mut HostComposition,
     queue: &eliot_host::HostRuntimeControlQueue,
@@ -1051,6 +1080,9 @@ fn process_runtime_control_requests(
             RuntimeControlDispatch::Store => host.handle_store_recovery_request(envelope.request()),
             RuntimeControlDispatch::ReactiveContext => {
                 process_reactive_context_request(host, envelope.request())
+            }
+            RuntimeControlDispatch::UserAutomation => {
+                process_user_automation_request(host, envelope.request())
             }
         };
         let _ = envelope.respond(response);
@@ -1261,6 +1293,16 @@ mod tests {
         assert_eq!(
             runtime_control_dispatch(&HostRuntimeControlOperation::DeliverReactiveContext),
             RuntimeControlDispatch::ReactiveContext
+        );
+        assert_eq!(
+            runtime_control_dispatch(&HostRuntimeControlOperation::AdmitUserAutomationOccurrence),
+            RuntimeControlDispatch::UserAutomation
+        );
+        assert_eq!(
+            runtime_control_dispatch(
+                &HostRuntimeControlOperation::CancelUserAutomationPendingWakes
+            ),
+            RuntimeControlDispatch::UserAutomation
         );
     }
 
