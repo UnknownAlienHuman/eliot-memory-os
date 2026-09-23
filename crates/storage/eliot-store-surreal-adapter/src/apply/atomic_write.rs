@@ -511,12 +511,9 @@ fn build_apply_statements(
     // #223 experience writes and #325 finish owner snapshots commit atomically
     // with the canonical receipt.
     append_experience_statements(&mut sql, &mut bindings, experience)?;
-<<<<<<< HEAD
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
-=======
     append_coordination_statements(&mut sql, &mut bindings, coordination)?;
->>>>>>> 6657812d (work/m2-integration: coordination executable path + proof-refs caller gate (surreal/memory legs))
 
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
