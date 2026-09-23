@@ -236,23 +236,21 @@ impl DaemonComposition {
                 .map_err(completion_error)?;
             return Ok(committed);
         }
-        let committed = self
-            .governor
-            .publish_testd_verifier_execution_fact(
-                &binding.request_identity,
-                &operation_id,
-                &task_id,
-                task_revision,
-                &job.job_id,
-                testd,
+        let committed = Box::pin(self.governor.publish_testd_verifier_execution_fact(
+            &binding.request_identity,
+            &operation_id,
+            &task_id,
+            task_revision,
+            &job.job_id,
+            testd,
+        ))
+        .await
+        .map_err(completion_error)?
+        .ok_or_else(|| {
+            completion_error(
+                "Governor reported an existing verifier fact without its committed WriteReceipt",
             )
-            .await
-            .map_err(completion_error)?
-            .ok_or_else(|| {
-                completion_error(
-                    "Governor reported an existing verifier fact without its committed WriteReceipt",
-                )
-            })?;
+        })?;
         validate_committed_receipt(&committed, binding, &operation_id).map_err(completion_error)?;
         let bytes = canonical_json_bytes(&committed).map_err(completion_error)?;
         let receipt_json = String::from_utf8(bytes).map_err(completion_error)?;
@@ -280,10 +278,7 @@ impl DaemonComposition {
             .map_err(completion_error)?;
         let mut committed = Vec::with_capacity(pending.len());
         for notice in pending {
-            committed.push(
-                self.publish_testd_terminal_completion(&notice, testd)
-                    .await?,
-            );
+            committed.push(Box::pin(self.publish_testd_terminal_completion(&notice, testd)).await?);
         }
         Ok(committed)
     }

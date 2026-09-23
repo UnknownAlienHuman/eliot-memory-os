@@ -3165,7 +3165,7 @@ pub enum TestdLaunchSkip {
 /// A prepared testd launch: admitted and nonce-bound, ready to spawn.
 pub enum PreparedTestdLaunch {
     /// Ready to spawn through the admitted executor.
-    Ready(ReadyTestdLaunch),
+    Ready(Box<ReadyTestdLaunch>),
     /// An exact resubmit under one job identity: carries the RETAINED
     /// original admission (original admitted-at time and digest), never
     /// the just-recomputed one.
@@ -3457,7 +3457,7 @@ pub fn prepare_testd_launch(
     {
         record.material_path = Some(material_path.clone());
     }
-    Ok(PreparedTestdLaunch::Ready(ReadyTestdLaunch {
+    Ok(PreparedTestdLaunch::Ready(Box::new(ReadyTestdLaunch {
         admission,
         nonce,
         operation_id,
@@ -3468,7 +3468,7 @@ pub fn prepare_testd_launch(
         authority_epoch,
         generation,
         owner_binding,
-    }))
+    })))
 }
 
 /// Spawns one prepared testd launch through the admitted process gateway.

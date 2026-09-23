@@ -1477,19 +1477,11 @@ pub enum ValidatedDispatchDriveOutcome {
 /// binary passes its dispatch-locator directory (the honest closed stand-in
 /// for the bounded probe, which reads no working directory); the production
 /// contour delivers the admitted generation root.
-pub async fn drive_validated_dispatch_material(
+fn load_dispatch_job(
     material: &crate::testd_material::ValidatedTestdMaterial,
-    source_root: &str,
-    now_unix_ms: u64,
-) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
-    if material.cancelled {
-        return Ok(ValidatedDispatchDriveOutcome::Cancelled {
-            job_id: material.job_id.clone(),
-        });
-    }
-    let source_root = Path::new(source_root);
+) -> Result<(TestdStore, TestJob), TestdError> {
     let store = TestdStore::open(&material.owner_store_path, RetryPolicy::default())?;
-    let mut job = store
+    let job = store
         .get(&material.job_id)?
         .ok_or_else(|| TestdError::Invalid {
             field: "job_id",
@@ -1502,6 +1494,14 @@ pub async fn drive_validated_dispatch_material(
             .validate_for_job(&job)?;
     }
     job.target_roots.validate()?;
+    Ok((store, job))
+}
+
+fn canonicalize_dispatch_roots(
+    source_root: &Path,
+    job: &TestJob,
+    material: &crate::testd_material::ValidatedTestdMaterial,
+) -> Result<PathBuf, TestdError> {
     let observed_source = std::fs::canonicalize(source_root).map_err(|_| TestdError::Invalid {
         field: "source_root",
         reason: "admitted source root cannot be canonicalized",
@@ -1521,6 +1521,15 @@ pub async fn drive_validated_dispatch_material(
     {
         return Err(TestdError::InvalidBinding);
     }
+    Ok(canonical_job_source)
+}
+
+fn ensure_dispatch_source_observation(
+    store: &TestdStore,
+    mut job: TestJob,
+    canonical_job_source: &Path,
+    now_unix_ms: u64,
+) -> Result<TestJob, TestdError> {
     if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
         if let Some(observation) = &job.source_observation_before {
             observation.validate()?;
@@ -1528,7 +1537,7 @@ pub async fn drive_validated_dispatch_material(
                 return Err(TestdError::InvalidBinding);
             }
         } else {
-            let observation = TestdSourceObservation::capture(&canonical_job_source)?;
+            let observation = TestdSourceObservation::capture(canonical_job_source)?;
             job = store.bind_source_observation_before_dispatch(
                 &job.job_id,
                 observation,
@@ -1536,12 +1545,20 @@ pub async fn drive_validated_dispatch_material(
             )?;
         }
     }
+    Ok(job)
+}
+
+fn derive_dispatch_process_intent(
+    job: &TestJob,
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    canonical_job_source: &Path,
+) -> Result<ProcessIntent, TestdError> {
     let program_path = if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
     } else {
         eliot_testd_core::TESTD_PROFILE_PROGRAM
     };
-    let tool = resolve_testd_tool_at(program_path, &canonical_job_source)?;
+    let tool = resolve_testd_tool_at(program_path, canonical_job_source)?;
     let tool_environment = bind_tool_environment_to_roots(
         &job.invocation.profile,
         tool.environment,
@@ -1562,10 +1579,24 @@ pub async fn drive_validated_dispatch_material(
         target_root: job.target_roots.target_root.clone(),
         cache_root: job.target_roots.cache_root.clone(),
     };
-    let intent = derive_testd_intent(&params)?;
+    derive_testd_intent(&params)
+}
+
+fn present_dispatch_admission(
+    job: &TestJob,
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    intent: &ProcessIntent,
+    now_unix_ms: u64,
+) -> Result<
+    (
+        crate::kernel_client::PresentedAdmission,
+        TestdDispatchAuthority,
+    ),
+    TestdError,
+> {
     let authority_epoch = material.epoch.clone();
     let authority = TestdDispatchAuthority::new()?;
-    let request = authority.issue(&intent, &material.grant, now_unix_ms)?;
+    let request = authority.issue(intent, &material.grant, now_unix_ms)?;
     if request.invocation_digest() != job.process.invocation_digest {
         return Err(TestdError::InvalidBinding);
     }
@@ -1591,6 +1622,47 @@ pub async fn drive_validated_dispatch_material(
         evidence_ref: material.operation_id.clone(),
         cancelled: material.cancelled,
     };
+    Ok((presented, authority))
+}
+
+fn project_dispatch_receipt_state(
+    receipt: &TestReceipt,
+) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    match receipt.state.as_str() {
+        "Succeeded" => Ok(ValidatedDispatchDriveOutcome::Completed {
+            job_id: receipt.job_id.clone(),
+        }),
+        "Failed" => Ok(ValidatedDispatchDriveOutcome::Failed {
+            job_id: receipt.job_id.clone(),
+        }),
+        "Cancelled" => Ok(ValidatedDispatchDriveOutcome::Cancelled {
+            job_id: receipt.job_id.clone(),
+        }),
+        "RetryWait" => Ok(ValidatedDispatchDriveOutcome::ReconcileRequired {
+            job_id: receipt.job_id.clone(),
+        }),
+        state => Err(TestdError::Contract(format!(
+            "durable TestD worker returned non-terminal state {state}"
+        ))),
+    }
+}
+
+pub async fn drive_validated_dispatch_material(
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    source_root: &str,
+    now_unix_ms: u64,
+) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    if material.cancelled {
+        return Ok(ValidatedDispatchDriveOutcome::Cancelled {
+            job_id: material.job_id.clone(),
+        });
+    }
+    let source_root = Path::new(source_root);
+    let (store, job) = load_dispatch_job(material)?;
+    let canonical_job_source = canonicalize_dispatch_roots(source_root, &job, material)?;
+    let job = ensure_dispatch_source_observation(&store, job, &canonical_job_source, now_unix_ms)?;
+    let intent = derive_dispatch_process_intent(&job, material, &canonical_job_source)?;
+    let (presented, authority) = present_dispatch_admission(&job, material, &intent, now_unix_ms)?;
     let executor = compose_process_executor(Arc::new(authority));
     let receipt = worker::drive_admitted_one_shot_from_store(
         &store,
@@ -1600,23 +1672,7 @@ pub async fn drive_validated_dispatch_material(
         ADMITTED_WORKER_LEASE_MS,
         now_unix_ms,
     )?;
-    match receipt.state.as_str() {
-        "Succeeded" => Ok(ValidatedDispatchDriveOutcome::Completed {
-            job_id: receipt.job_id,
-        }),
-        "Failed" => Ok(ValidatedDispatchDriveOutcome::Failed {
-            job_id: receipt.job_id,
-        }),
-        "Cancelled" => Ok(ValidatedDispatchDriveOutcome::Cancelled {
-            job_id: receipt.job_id,
-        }),
-        "RetryWait" => Ok(ValidatedDispatchDriveOutcome::ReconcileRequired {
-            job_id: receipt.job_id,
-        }),
-        state => Err(TestdError::Contract(format!(
-            "durable TestD worker returned non-terminal state {state}"
-        ))),
-    }
+    project_dispatch_receipt_state(&receipt)
 }
 
 /// Production one-shot entry: executes the durable admitted job and then
