@@ -43,9 +43,13 @@
 //! lease terminal ... supervision-lease authority
 //!                    (`KernelSupervisionLeaseAuthority::commit_terminal`
 //!                    with a caller-supplied terminal ticket, predecessor
-//!                    proof, trust anchor, and signer); runtime, session,
-//!                    route, and user-broker invalidations have no execution
-//!                    API in-tree and refuse with their exact owner.
+//!                    proof, trust anchor, and signer); session detach,
+//!                    broker fence, and route retirement execute through
+//!                    `SessionOwnerClient`/`BrokerOwnerClient` plus the
+//!                    router owner with journaled proofs; runtime
+//!                    invalidation has no execution API in-tree and refuses
+//!                    with its exact owner (prior-generation retirement
+//!                    belongs to the #961 installation-cutover owner).
 //! ```
 //!
 //! Verified destination authorization before effects: no client that performs
@@ -708,8 +712,12 @@ impl OrsOwnerClient {
 /// survive alongside a cutover. Lease revocation executes for real through
 /// the supervision-lease authority when the caller supplies the terminal
 /// ticket (with predecessor proof, trust anchor, and signer held by the
-/// authority); the runtime, session, route, and user-broker kinds have no
-/// execution API in-tree and refuse with their exact owner. Without a
+/// authority); session detach, broker fence, and route retirement execute
+/// through their dedicated owner clients (see `SessionOwnerClient`,
+/// `BrokerOwnerClient`, and the router-owner executor in `backup_restore`),
+/// while only the runtime kind has no execution API in-tree and refuses
+/// with its exact owner — prior-generation retirement belongs to the #961
+/// installation-cutover owner. Without a
 /// validated cutover receipt every kind refuses with `CutoverNotAuthorized`:
 /// invalidating live authority during isolated rehearsal would be
 /// destructive.

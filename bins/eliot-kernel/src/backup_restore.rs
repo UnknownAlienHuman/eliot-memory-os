@@ -1353,9 +1353,10 @@ impl KernelBackupRestore {
     /// module generations, and front-door session mechanics owned
     /// elsewhere, plus cutover execution, belong to the
     /// installer/Hume owner (#961), whose files are untouched here. The
-    /// lease, session, and broker legs execute here through their owners
-    /// (terminal ticket propose/commit with readback proof; session detach
-    /// and broker fence with journaled proofs). Without bound prerequisites
+    /// lease, session, broker, and route legs execute here through their
+    /// owners (terminal ticket propose/commit with readback proof;
+    /// session detach, broker fence, and route retirement with journaled
+    /// proofs). Without bound prerequisites
     /// there is no cutover; effects without a journaled decision still
     /// leave cutover unperformed, and retry re-runs enumerate-then-act
     /// from live state rather than replaying consumed effects. Rehearsal
@@ -1514,13 +1515,14 @@ fn suspended_entries(
 /// exact reconciliation owner can issue.
 ///
 /// The lease leg is additionally satisfied by a lease-owner-committed
-/// terminal ticket (F2 repair), and the session/broker legs by executed
-/// owner invalidations recorded in the decision: the finalize-built
-/// evidence cannot know cutover-time effects, so verified executions
-/// recorded here satisfy their legs. Without one, the evidence leg
-/// applies unchanged — and since finalize never marks them satisfied,
-/// cutover refuses with the exact owner. Route and runtime have no
-/// in-tree executors, so they pass by evidence only.
+/// terminal ticket (F2 repair), and the session/broker/route legs by
+/// executed owner invalidations recorded in the decision: the
+/// finalize-built evidence cannot know cutover-time effects, so verified
+/// executions recorded here satisfy their legs. Without one, the evidence
+/// leg applies unchanged — and since finalize never marks them satisfied,
+/// cutover refuses with the exact owner. Runtime has no in-tree executor
+/// (route executes through the router owner with a journaled proof), so
+/// it passes by evidence only.
 fn require_cutover_obligations(
     obligations: &RestoreObligations,
     bundle: &BackupBundle,
