@@ -258,6 +258,12 @@ pub struct HostDemandStartRuntimeRequest {
     pub trigger_evidence: Vec<PlatformHandle>,
     pub requested_capabilities: Vec<PlatformHandle>,
     pub state_fence: StateFence,
+    /// The authenticated owner projection used for the post-start Kernel
+    /// RuntimeLease admission.  It is optional on the wire only so older
+    /// callers remain decodable; Host fails closed before demand activation
+    /// when the current owner cannot provide it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_lease_admission: Option<eliot_kernel_service::RuntimeLeaseAdmission>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_lease_ref: Option<PlatformHandle>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,7 +275,10 @@ pub struct HostDemandStartRuntimeRequest {
 impl HostDemandStartRuntimeRequest {
     pub fn validate(&self) -> Result<(), String> {
         for (value, field) in [
-            (&self.requester_principal, "demand_start.requester_principal"),
+            (
+                &self.requester_principal,
+                "demand_start.requester_principal",
+            ),
             (&self.candidate_scope, "demand_start.candidate_scope"),
             (&self.trigger_class, "demand_start.trigger_class"),
         ] {
@@ -294,6 +303,17 @@ impl HostDemandStartRuntimeRequest {
         self.state_fence
             .validate()
             .map_err(|error| format!("demand_start.state_fence is invalid: {error}"))?;
+        if let Some(admission) = &self.runtime_lease_admission {
+            admission.validate().map_err(|error| {
+                format!("demand_start.runtime_lease_admission is invalid: {error}")
+            })?;
+            if admission.state_fence != self.state_fence {
+                return Err(
+                    "demand_start.runtime_lease_admission.state_fence does not match demand_start.state_fence"
+                        .to_owned(),
+                );
+            }
+        }
         if let Some(wake) = &self.wake {
             wake.validate()?;
         }
@@ -549,7 +569,10 @@ impl HostRuntimeControlRequest {
 
     pub fn validate(&self) -> Result<(), String> {
         self.validate_identity()?;
-        if matches!(&self.operation, HostRuntimeControlOperation::RequestDemandStart) {
+        if matches!(
+            &self.operation,
+            HostRuntimeControlOperation::RequestDemandStart
+        ) {
             let source = self
                 .demand_start
                 .as_ref()
@@ -802,7 +825,11 @@ impl HostDemandStartReceipt {
         ] {
             validate_demand_handle(value, name)?;
         }
-        validate_demand_handles(&self.readiness_evidence_refs, "readiness_evidence_refs", true)?;
+        validate_demand_handles(
+            &self.readiness_evidence_refs,
+            "readiness_evidence_refs",
+            true,
+        )?;
         if let Some(value) = &self.drain_disposition {
             validate_demand_handle(value, "drain_disposition")?;
         }

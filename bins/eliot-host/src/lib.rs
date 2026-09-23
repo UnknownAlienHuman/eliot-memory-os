@@ -202,7 +202,7 @@ use eliot_kernel_service::{
     KernelReadyReceipt, KernelServiceState, ProcessAuthorityHandoffDescriptor, RestartBudget,
     StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
     StoreRebindReceipt, control_request_frame, decode_control_response_frame,
-    expected_runtime_lease,
+    expected_runtime_lease, expected_runtime_lease_id,
     semantic_store_config_hash_from_json,
 };
 use eliot_observation_contracts::{
@@ -521,14 +521,9 @@ fn validate_probe_response(
     response
         .validate()
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let expected_runtime_lease = expected_runtime_lease(&request.candidate, request.generation)
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let runtime_lease = response.runtime_lease.as_ref().ok_or_else(|| {
-        HostError::ProcessContour("Kernel did not return a RuntimeLease readback".to_owned())
-    })?;
-    if runtime_lease != &expected_runtime_lease {
+    if response.runtime_lease.is_some() {
         return Err(HostError::ProcessContour(
-            "Kernel RuntimeLease is not bound to the exact candidate, authority, generation, and scope"
+            "Kernel ProbeReady response carried a RuntimeLease before owner admission"
                 .to_owned(),
         ));
     }
@@ -597,12 +592,137 @@ fn validate_probe_response(
 }
 
 #[cfg(windows)]
+fn validate_runtime_lease_response(
+    request: &KernelControlRequest,
+    admission: &eliot_kernel_service::RuntimeLeaseAdmission,
+    response: &KernelControlResponse,
+) -> Result<RuntimeLease, HostError> {
+    request
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    response
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if !matches!(
+        &request.command,
+        KernelControlCommand::AcquireRuntimeLease(_)
+    ) || response.message_id != request.message_id
+        || response.request_digest != request.payload_digest
+        || response.state != KernelServiceState::Ready
+        || response.error.is_some()
+        || response.receipt.is_some()
+        || response.runtime_health.is_some()
+        || response.activation_receipt.is_some()
+        || response.store_rebind_receipt.is_some()
+        || response.supervision_lease.is_some()
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel RuntimeLease acquisition response binding failed".to_owned(),
+        ));
+    }
+    admission
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let runtime_lease = response.runtime_lease.clone().ok_or_else(|| {
+        HostError::ProcessContour(
+            "Kernel RuntimeLease acquisition response lost its owner readback".to_owned(),
+        )
+    })?;
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            .as_millis(),
+    )
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let expected_lease_id = expected_runtime_lease_id(
+        &request.candidate,
+        request.generation,
+        admission,
+    )
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if runtime_lease.lease_id != expected_lease_id
+        || runtime_lease.state_fence != admission.state_fence
+        || runtime_lease.obligation.expires_at_ms <= now_ms
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel RuntimeLease readback is not bound to the current owner admission"
+                .to_owned(),
+        ));
+    }
+    let expected = expected_runtime_lease(
+        &request.candidate,
+        request.generation,
+        admission,
+        runtime_lease.obligation.issued_at_ms,
+        runtime_lease.obligation.expires_at_ms,
+        runtime_lease.obligation.renew_before_ms,
+    )
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if runtime_lease.lease_id != expected.lease_id
+        || runtime_lease.scope_ref != expected.scope_ref
+        || runtime_lease.authority_epoch != expected.authority_epoch
+        || runtime_lease.state_fence != expected.state_fence
+        || runtime_lease.state != eliot_runtime_contracts::LeaseState::Active
+        || runtime_lease.obligation.holder != expected.obligation.holder
+        || runtime_lease.obligation.reason != expected.obligation.reason
+        || runtime_lease.obligation.required_runtime_branches
+            != expected.obligation.required_runtime_branches
+        || runtime_lease.obligation.required_capabilities != expected.obligation.required_capabilities
+        || runtime_lease.obligation.obligation_refs != expected.obligation.obligation_refs
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel RuntimeLease readback differs from the canonical immutable owner projection"
+                .to_owned(),
+        ));
+    }
+    Ok(runtime_lease)
+}
+
+#[cfg(windows)]
+async fn send_runtime_lease_acquire(
+    transport: &mut NamedPipeTransport,
+    candidate: &HostKernelCandidateBinding,
+    generation: ResourceGeneration,
+    admission: &eliot_kernel_service::RuntimeLeaseAdmission,
+    sequence: u64,
+    connection_id: String,
+) -> Result<RuntimeLease, HostError> {
+    let request = kernel_control_request(
+        candidate,
+        generation,
+        KernelControlCommand::AcquireRuntimeLease(admission.clone()),
+        sequence,
+    )?;
+    let frame = control_request_frame(connection_id, &request)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    match transport
+        .send_frame(&frame, TransportLimits::default())
+        .await
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+    {
+        DeliveryOutcome::Delivered => {}
+        DeliveryOutcome::UnknownOutcome => {
+            return Err(HostError::RecoveryRequired(
+                "Kernel RuntimeLease acquisition delivery outcome is unknown".to_owned(),
+            ));
+        }
+    }
+    let response = transport
+        .receive_frame(TransportLimits::default())
+        .await
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    let response = decode_control_response_frame(&response)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    validate_runtime_lease_response(&request, admission, &response)
+}
+
+#[cfg(windows)]
 struct AuthenticatedKernelReadiness {
     request: KernelControlRequest,
     response: KernelControlResponse,
     ready: KernelReadyReceipt,
     runtime_health: KernelRuntimeHealthEvidence,
-    runtime_lease: RuntimeLease,
     supervision_lease: eliot_ors::SupervisionLeaseSnapshot,
     store_fence: PlatformHandle,
     peer_evidence: PlatformHandle,
@@ -1350,6 +1470,7 @@ impl HostJobBranches {
         kernel_generation: EpochTransition,
         kernel_authority_epoch: EpochId,
         active_manifest: &CandidateManifest,
+        demand: Option<&HostDemandStartRuntimeRequest>,
     ) -> Result<(KernelActivationReceipt, KernelReadyReceipt), HostError> {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
@@ -1855,16 +1976,42 @@ impl HostJobBranches {
             // and health vector before Host commits Active.
             let (ready, _runtime_health) =
                 validate_probe_response(&probe_request, &activation_receipt, &response)?;
-            let runtime_lease = response.runtime_lease.clone().ok_or_else(|| {
-                HostError::ProcessContour(
-                    "Kernel ProbeReady response lost its RuntimeLease readback".to_owned(),
-                )
-            })?;
             let supervision_lease = response.supervision_lease.clone().ok_or_else(|| {
                 HostError::ProcessContour(
                     "Kernel ProbeReady response lost its supervision readback".to_owned(),
                 )
             })?;
+            let runtime_lease = if let Some(demand) = demand {
+                let admission = demand.runtime_lease_admission.as_ref().ok_or_else(|| {
+                    HostError::OwnerLeaseRecovery(
+                        "demand-start has no authenticated RuntimeLease owner admission"
+                            .to_owned(),
+                    )
+                })?;
+                if admission.state_fence != demand.state_fence {
+                    return Err(HostError::OwnerLeaseRecovery(
+                        "demand-start RuntimeLease admission fence differs from demand fence"
+                            .to_owned(),
+                    ));
+                }
+                Some(
+                    send_runtime_lease_acquire(
+                        &mut transport,
+                        &candidate,
+                        launch.authority_generation,
+                        admission,
+                        probe_sequence + 2,
+                        format!(
+                            "host-control:{}:{}:runtime-lease",
+                            generation.as_str(),
+                            candidate.activation_id.as_str()
+                        ),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
             Ok((activation_receipt, ready, runtime_lease, supervision_lease))
         });
         let (activation_receipt, ready, runtime_lease, supervision_lease) = match ready {
@@ -1879,7 +2026,7 @@ impl HostJobBranches {
                 });
             }
         };
-        self.kernel_runtime_lease = Some(runtime_lease);
+        self.kernel_runtime_lease = runtime_lease;
         self.kernel_supervision_lease = Some(supervision_lease);
         if let Err(error) = activation.active(&candidate, &activation_receipt, &ready) {
             let failure = activation.fail("kernel-active-commit-failed");
@@ -1900,6 +2047,82 @@ impl HostJobBranches {
             activation_generation,
         )?;
         Ok((activation_receipt, ready))
+    }
+
+    #[cfg(windows)]
+    fn acquire_runtime_lease_for_demand(
+        &mut self,
+        demand: &HostDemandStartRuntimeRequest,
+    ) -> Result<(), HostError> {
+        let admission = demand.runtime_lease_admission.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "demand-start has no authenticated RuntimeLease owner admission".to_owned(),
+            )
+        })?;
+        admission
+            .validate()
+            .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
+        if admission.state_fence != demand.state_fence {
+            return Err(HostError::OwnerLeaseRecovery(
+                "demand-start RuntimeLease admission fence differs from demand fence".to_owned(),
+            ));
+        }
+        let candidate = self.kernel_candidate.clone().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "demand-start cannot acquire a lease without the current Kernel candidate"
+                    .to_owned(),
+            )
+        })?;
+        let launch = self.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour(
+                "demand-start cannot acquire a lease without the current launch descriptor"
+                    .to_owned(),
+            )
+        })?;
+        let kernel = self.kernel.as_ref().ok_or_else(|| {
+            HostError::ProcessContour(
+                "demand-start cannot acquire a lease without the live Kernel process".to_owned(),
+            )
+        })?;
+        let process = kernel.evidence().process().clone();
+        let expected_kernel_image = self
+            .kernel_executable
+            .as_ref()
+            .ok_or_else(|| HostError::ProcessContour("Kernel image is missing".to_owned()))?
+            .clone();
+        let generation = launch.authority_generation;
+        let admission = admission.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let lease = runtime.block_on(async {
+            let mut transport = connect_authenticated_kernel_front_door(&candidate, &process)
+                .await
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            validate_authenticated_kernel_peer(
+                transport.peer_identity(),
+                process.process_id,
+                process.start_time_100ns,
+                &expected_kernel_image,
+            )
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            send_runtime_lease_acquire(
+                &mut transport,
+                &candidate,
+                generation,
+                &admission,
+                1,
+                format!(
+                    "host-demand-runtime-lease:{}:{}",
+                    candidate.activation_id.as_str(),
+                    demand.state_fence.resource_generation.value()
+                ),
+            )
+            .await
+        })?;
+        self.kernel_runtime_lease = Some(lease);
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -2795,11 +3018,6 @@ impl HostJobBranches {
             let response = decode_control_response_frame(&frame)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let (ready, runtime_health) = validate_probe_response(&request, activation, &response)?;
-            let runtime_lease = response.runtime_lease.clone().ok_or_else(|| {
-                HostError::ProcessContour(
-                    "Kernel did not return the exact current RuntimeLease readback".to_owned(),
-                )
-            })?;
             let supervision_lease = response.supervision_lease.clone().ok_or_else(|| {
                 HostError::ProcessContour(
                     "Kernel did not return the exact current supervision ORS snapshot".to_owned(),
@@ -2817,13 +3035,11 @@ impl HostJobBranches {
                 response,
                 ready,
                 runtime_health,
-                runtime_lease,
                 supervision_lease,
                 store_fence,
                 peer_evidence,
             })
         })?;
-        self.kernel_runtime_lease = Some(proof.runtime_lease.clone());
         self.kernel_supervision_lease = Some(proof.supervision_lease.clone());
         Ok(proof)
     }
@@ -5127,6 +5343,7 @@ impl HostComposition {
                     demand,
                 )?;
                 self.bind_verified_demand_leases(demand)?;
+                self.transition_activation(ActivationState::Active, "host-demand-start-active")?;
                 let _ = store_artifact;
             }
             ActivationState::ControlReady => {
@@ -5136,6 +5353,7 @@ impl HostComposition {
                         "demand-start reconcile did not prove readiness: {disposition:?}"
                     )));
                 }
+                self.jobs.acquire_runtime_lease_for_demand(demand)?;
                 self.bind_verified_demand_leases(demand)?;
                 self.transition_activation_with_drain_disposition(
                     ActivationState::Active,
@@ -5172,6 +5390,7 @@ impl HostComposition {
                         "demand-start reconcile did not prove readiness: {disposition:?}"
                     )));
                 }
+                self.jobs.acquire_runtime_lease_for_demand(demand)?;
                 self.bind_verified_demand_leases(demand)?;
             }
             ActivationState::Draining => {
@@ -5212,6 +5431,7 @@ impl HostComposition {
                             .to_owned(),
                     ));
                 }
+                self.jobs.acquire_runtime_lease_for_demand(demand)?;
                 self.bind_verified_demand_leases(demand)?;
                 self.transition_activation_with_drain_disposition(
                     ActivationState::Active,
@@ -5670,6 +5890,7 @@ impl HostComposition {
             kernel_generation.clone(),
             kernel_authority_epoch,
             &active_manifest,
+            None,
         );
         let (activation_receipt, ready_receipt) = match complete_result {
             Ok(v) => v,
@@ -6318,6 +6539,7 @@ impl HostComposition {
             kernel_generation,
             kernel_authority_epoch,
             &active_manifest.manifest,
+            None,
         )?;
         if let Err(error) = self.accept_kernel_ready(&receipt) {
             let durable = self.fail_current_kernel_record("kernel-ready-accept-failed");
@@ -6612,6 +6834,7 @@ impl HostComposition {
             kernel_generation,
             kernel_authority_epoch,
             manifest,
+            demand.map(|(_, demand)| demand),
         ) {
             Ok(value) => value,
             Err(error) => return self.cleanup_launched_contour(error),
@@ -6624,10 +6847,12 @@ impl HostComposition {
         {
             return self.cleanup_active_kernel_contour(error, "host-control-ready-commit-failed");
         }
-        if let Err(error) =
-            self.transition_activation(ActivationState::Active, "host-runtime-active")
-        {
-            return self.cleanup_active_kernel_contour(error, "host-active-commit-failed");
+        if demand.is_none() {
+            if let Err(error) =
+                self.transition_activation(ActivationState::Active, "host-runtime-active")
+            {
+                return self.cleanup_active_kernel_contour(error, "host-active-commit-failed");
+            }
         }
         if let Err(error) = self.persist_process_observations(&manifest.generation) {
             self.cleanup_active_kernel_contour(error, "host-process-observation-failed")
@@ -7046,6 +7271,7 @@ impl HostComposition {
                 kernel_generation,
                 kernel_authority_epoch,
                 &active.manifest,
+                None,
             ) {
                 let cleanup = self.jobs.terminate_kernel();
                 return Err(match cleanup {
