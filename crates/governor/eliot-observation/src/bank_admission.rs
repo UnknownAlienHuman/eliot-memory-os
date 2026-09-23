@@ -28,6 +28,10 @@
 //!   edge driver. Assembles both envelopes from admitted snapshots and
 //!   re-resolves them at the consumer scope/fence before return, so the
 //!   Smart consumer receives pre-validated owner envelopes.
+//! - [`parse_bank_record`] / [`parse_feedback_record`]: the readback
+//!   join. Decode verbatim store documents and re-prove each record
+//!   (digest recomputed from fields) before refs resolve: the bridge
+//!   persists bytes, this owner re-establishes their authority on read.
 //! - [`supply_bank_refs`] / [`supply_feedback_refs`]: the owner projection
 //!   supplier. Builds opaque [`ExperienceRecordRef`]s with owner-issued
 //!   revision cursors for admitted records only, enforcing envelope
@@ -430,6 +434,39 @@ pub fn revalidate_feedback_projection_for_consumer(
         });
     }
     Ok(())
+}
+
+/// Decode and re-prove one bank record from a durable readback document.
+///
+/// The readback join: deserializes the verbatim `record_json` the store
+/// persisted, then runs full [`ExperienceBankRecord::validate`] — which
+/// recomputes the owner digest from fields and compares it to the stored
+/// digest. A forged or drifted stored digest fails closed here, before
+/// any ref resolves or any projection assembles. Single-document
+/// granularity preserves exact failure identity: the caller (terminal
+/// invocation loop) knows which document failed from its own position.
+/// Decode failures map to [`GovernorObservationError::Serialization`];
+/// content failures map to their exact contract error.
+pub fn parse_bank_record(document: &str) -> Result<ExperienceBankRecord, GovernorObservationError> {
+    let record: ExperienceBankRecord =
+        serde_json::from_str(document).map_err(|_| GovernorObservationError::Serialization)?;
+    record
+        .validate()
+        .map_err(GovernorObservationError::Observation)?;
+    Ok(record)
+}
+
+/// Decode and re-prove one feedback record from a durable readback
+/// document. Same digest re-proof rule as [`parse_bank_record`].
+pub fn parse_feedback_record(
+    document: &str,
+) -> Result<AgentFeedbackRecord, GovernorObservationError> {
+    let record: AgentFeedbackRecord =
+        serde_json::from_str(document).map_err(|_| GovernorObservationError::Serialization)?;
+    record
+        .validate()
+        .map_err(GovernorObservationError::Observation)?;
+    Ok(record)
 }
 
 /// Re-resolve one journal projection against the consumer edge.
