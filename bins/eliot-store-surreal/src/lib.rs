@@ -81,6 +81,8 @@ use schema_bootstrap_contract::{
     StoreSchemaBootstrapBinding, StoreSchemaBootstrapCache, map_schema_bootstrap_error,
 };
 pub use schema_bootstrap_contract::{
+    StoreRestoreDestinationProvisionCommand, StoreRestoreDestinationProvisionReceipt,
+    StoreRestoreDestinationRotateCommand, StoreRestoreDestinationRotateReceipt,
     StoreSchemaBootstrapCommand, StoreSchemaBootstrapError, StoreSchemaBootstrapReceipt,
 };
 mod request_dispatch;
@@ -538,6 +540,65 @@ impl StoreComposition {
             )
             .await
             .map_err(map_adapter_error)
+    }
+
+    /// Provisions one isolated restore destination under an explicitly
+    /// bound SystemService deployment command (issues #952/#975 F3).
+    ///
+    /// The production deployment-role path, mirroring
+    /// [`Self::bootstrap_schema`]: the command must match the immutable
+    /// Store launch binding or it is rejected before any provider I/O.
+    /// Idempotency rides the durable destination record (identical command
+    /// replays; anything else conflicts), so no in-process one-shot cache
+    /// is needed. This seam, not the portable-dev method above, is what a
+    /// production deployment invokes.
+    pub async fn bootstrap_restore_destination(
+        &self,
+        command: StoreRestoreDestinationProvisionCommand,
+    ) -> Result<StoreRestoreDestinationProvisionReceipt, StoreSchemaBootstrapError> {
+        self.schema_bootstrap_binding
+            .validate_destination_provision(&command)?;
+        self.store
+            .provision_restore_destination(
+                &command.dest_store_id,
+                &command.dest_installation_id,
+                &command.state_fence,
+                &command.cutover_authority,
+                &command.observed_clock,
+            )
+            .await
+            .map_err(map_schema_bootstrap_error)?;
+        self.schema_bootstrap_binding
+            .destination_provision_receipt(&command)
+    }
+
+    /// Rotates one destination's cutover authority under an explicitly
+    /// bound SystemService deployment command (issues #952/#975 F5).
+    ///
+    /// Owner-controlled transition without out-of-band bypass: the stored
+    /// authority must equal the command's expected value
+    /// (compare-and-set), and only the authority field may change —
+    /// destination identity, fence, and the serving flag are immutable
+    /// here. Fence changes are never rotated in place (provision a fresh
+    /// destination); serving activation belongs to the coordinated
+    /// cutover owner (#961) and is refused by every path in this lane.
+    pub async fn rotate_restore_destination_authority(
+        &self,
+        command: StoreRestoreDestinationRotateCommand,
+    ) -> Result<StoreRestoreDestinationRotateReceipt, StoreSchemaBootstrapError> {
+        self.schema_bootstrap_binding
+            .validate_destination_rotate(&command)?;
+        self.store
+            .rotate_restore_destination_authority(
+                &command.dest_store_id,
+                &command.expected_cutover_authority,
+                &command.new_cutover_authority,
+                &command.state_fence,
+            )
+            .await
+            .map_err(map_schema_bootstrap_error)?;
+        self.schema_bootstrap_binding
+            .destination_rotate_receipt(&command)
     }
 
     /// Executes one explicitly bound `SystemService` schema bootstrap command.

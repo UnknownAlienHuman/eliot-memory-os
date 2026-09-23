@@ -643,6 +643,25 @@ impl SurrealStoreAdapter {
             .await
             .map_err(AdapterError::into_store_error)
     }
+
+    /// Rotates one destination's cutover authority under compare-and-set
+    /// (issues #952/#975 F5). See [`apply::rotate_restore_destination_authority`].
+    pub async fn rotate_restore_destination_authority(
+        &self,
+        dest_store_id: &str,
+        expected_cutover_authority: &str,
+        new_cutover_authority: &str,
+        state_fence: &StateFence,
+    ) -> Result<(), AdapterError> {
+        apply::rotate_restore_destination_authority(
+            self,
+            dest_store_id,
+            expected_cutover_authority,
+            new_cutover_authority,
+            state_fence,
+        )
+        .await
+    }
 }
 
 impl CanonicalStoreClient for SurrealStoreAdapter {

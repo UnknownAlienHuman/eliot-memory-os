@@ -72,6 +72,7 @@ pub(crate) async fn initialize_genesis(
 pub(crate) use backup_restore::{
     backup_isolated_restore, backup_provisioned, backup_reconcile, backup_status, backup_validate,
     provision_restore_destination, read_restore_destination_heads,
+    rotate_restore_destination_authority,
 };
 pub(crate) use backup_snapshot::{backup_begin, backup_end, backup_page};
 #[cfg(test)]

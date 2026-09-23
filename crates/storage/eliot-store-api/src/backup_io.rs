@@ -22,9 +22,9 @@ use crate::{OperationIdentity, OrderingHead, RevisionHead, StoreError, Transitio
 
 /// Contract revision of the store backup port surface.
 ///
-/// 1.1.0: isolated restore carries the Governor-minted restore admission
-/// (issues #952/#975 R2/R3) and completion receipts repeat the admission
-/// decision digest.
+/// 1.1.0: isolated restore carries the provisional restore admission
+/// slot (issues #952/#975 R2/R3) and completion receipts repeat the
+/// presented decision digest.
 pub const STORE_BACKUP_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
 /// Largest member population admitted in one backup page.
 pub const MAX_STORE_BACKUP_PAGE_MEMBERS: usize = 256;
@@ -390,7 +390,7 @@ pub struct StoreBackupCompletionReceipt {
     pub ordering_heads: Vec<OrderingHead>,
     /// Whether the capture closed over a partial denominator.
     pub partial: bool,
-    /// Governor admission decision digest repeated from the restore
+    /// Presented admission decision digest repeated from the restore
     /// admission (issues #952/#975 R2). `None` on capture receipts, which
     /// are not admitted restores; `Some` on every restore receipt, so the
     /// committed receipt repeats the exact admitted decision digest it
@@ -455,38 +455,49 @@ impl StoreBackupCompletionReceipt {
 
 /// Admitted restore operation class marker (issues #952/#975 R3).
 ///
-/// The single operation class the Governor admits for isolated restore. It
-/// is carried per operation on [`StoreRestoreAdmission`], never granted
+/// The single operation class reserved for isolated restore. It is
+/// carried per operation on [`StoreRestoreAdmission`], never granted
 /// through a normal-write capability, and never reinterpreted from a
 /// reserved request: a restore without exactly this class refuses before
 /// any provider I/O.
 pub const RESTORE_OPERATION_CLASS: &str = "backup.restore";
 
-/// Governor-minted restore admission carried by one isolated restore
+/// PROVISIONAL restore admission carried by one isolated restore
 /// (issues #952/#975 R2/R3).
 ///
-/// This is the operation-class admission the restore executes under: it
-/// binds the stable restore identity, the fixed `RecoverySchema`
+/// This is the operation-class admission slot the restore executes under:
+/// it binds the stable restore identity, the fixed `RecoverySchema`
 /// transition class, the fixed [`RESTORE_OPERATION_CLASS`], the admitted
 /// isolated destination, the shared fence, the capture denominator, and
-/// the source snapshot. The Governor owner mints it during semantic
-/// admission; the store bridge recomputes [`Self::decision_digest`] and
-/// refuses any mismatch, then executes exactly the admitted plan and
-/// repeats the digest in the restore receipt. The bridge never mints,
-/// widens, or reinterprets this admission: without it the restore is not
-/// admitted at all.
+/// the source snapshot. The store bridge recomputes
+/// [`Self::decision_digest`] and refuses any mismatch, then executes
+/// exactly the presented plan and repeats the digest in the restore
+/// receipt. The bridge never mints, widens, or reinterprets this
+/// admission.
 ///
-/// Minter gap (exact): the Governor-side minter (#959/#960) does not
-/// exist yet, so no caller can honestly produce this admission today and
-/// no restore can be admitted. What this contract verifies: closed shape,
-/// fixed class markers, identity/destination/fence/denominator/snapshot
-/// cross-bindings against the request and scope, and equality of the
-/// recomputed decision digest. What it cannot supply: the admission
-/// itself — minting stays with the Governor owner and must arrive through
-/// it, never through session capability, reserved-write relabeling, or a
-/// caller-fabricated digest (a self-consistent fabrication passes shape
-/// only and proves no admission). Verification here is deliberately not
-/// weakened to fake admittability.
+/// PROVISIONAL — not proof of Governor issuance: recomputation verifies
+/// self-consistency only. Any transport peer can mint a fully consistent
+/// struct, so this admission alone authorizes nothing; the bridge
+/// additionally binds it to independent canonical anchors (the completed
+/// live source-capture row, the deployment-provisioned destination
+/// record, the frame-enforced session capability and transport identity)
+/// and refuses replays under a rotated digest. The future Governor
+/// minter (#959/#960) replaces provisional minting with a durable
+/// admission anchor the bridge reads back: a committed coordination row
+/// keyed by the restore operation identity carrying the Governor's
+/// decision digest over the exact operation/destination/payload-digest/
+/// fence tuple below. Until that anchor exists, no restore is admittable
+/// by this struct, and no claim in this module asserts otherwise.
+///
+/// Minter gap (exact): the Governor-side minter does not exist yet, so
+/// no caller can honestly produce an admitted instance today. What this
+/// contract verifies: closed shape, fixed class markers,
+/// identity/destination/fence/denominator/snapshot cross-bindings against
+/// the request and scope, and equality of the recomputed decision digest.
+/// What it cannot supply: issuance itself — which must arrive through the
+/// Governor owner, never through session capability, reserved-write
+/// relabeling, or a caller-fabricated digest. Verification here is
+/// deliberately not weakened to fake admittability.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreRestoreAdmission {
@@ -507,18 +518,19 @@ pub struct StoreRestoreAdmission {
     pub residency_denominator_digest: String,
     /// Source snapshot digest; must equal the request source digest.
     pub source_snapshot_digest: String,
-    /// Governor-minted decision digest over every field above, recomputed
-    /// by [`Self::decision_digest`] and compared for equality downstream.
+    /// Decision digest over every field above, recomputed by
+    /// [`Self::decision_digest`] and compared for equality downstream.
+    /// Recomputation proves self-consistency, never issuance.
     pub admission_decision_digest: String,
 }
 
 impl StoreRestoreAdmission {
     /// Recomputes the admission decision digest over the bound fields.
     ///
-    /// Pure over closed inputs: the Governor mints with this same function
-    /// and the store bridge re-derives it, so equal bytes under different
-    /// bindings stay distinct and no digest is ever accepted from a caller
-    /// without recomputation.
+    /// Pure over closed inputs, so equal bytes under different bindings
+    /// stay distinct and no digest is ever accepted from a caller without
+    /// recomputation. This binds the fields to each other; it does not
+    /// bind them to any issuer.
     pub fn decision_digest(&self) -> Result<String, StoreError> {
         use eliot_contracts::{canonical_json_bytes, sha256_hex};
         let fence_bytes = canonical_json_bytes(&self.state_fence)
@@ -598,9 +610,9 @@ pub struct StoreIsolatedRestoreRequest {
     pub source_snapshot_digest: String,
     /// Admitted isolated destination scope; differs from the source.
     pub scope: StoreBackupScope,
-    /// Governor-minted restore admission this execution runs under. The
-    /// restore is not admitted without it: session capability alone never
-    /// authorizes a restore.
+    /// Provisional restore admission this execution presents. Session
+    /// capability alone never authorizes a restore; and this struct alone
+    /// proves no issuance (see [`StoreRestoreAdmission`]).
     pub admission: StoreRestoreAdmission,
     /// Expected member population from the source receipt.
     pub expected_member_count: u64,

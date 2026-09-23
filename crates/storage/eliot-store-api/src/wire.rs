@@ -351,7 +351,7 @@ impl StoreRequest {
             Self::Named { .. } => CAPABILITY_NAMED_READ,
             Self::Apply { .. } => CAPABILITY_APPLY,
             Self::ReservedWrite { .. } => CAPABILITY_RESERVED_WRITE,
-            Self::Backup { .. } => CAPABILITY_STORE_BACKUP,
+            Self::Backup { .. } => StoreBackupEnvelope::required_capability(),
             Self::Receipt { .. } => CAPABILITY_RECEIPT,
             Self::RevisionHeads { .. } => CAPABILITY_REVISION_HEADS,
             Self::OrderingHeads { .. } => CAPABILITY_ORDERING_HEADS,

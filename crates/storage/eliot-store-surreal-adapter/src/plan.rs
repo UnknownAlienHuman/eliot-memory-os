@@ -823,9 +823,16 @@ fn ensure_unique_ordering_scopes(scopes: &[OrderingScopeId]) -> Result<(), Store
 /// [`outbox_records`] derive every queryable projection and outbox body
 /// from admitted transition intents. Re-deriving frozen derived rows
 /// inside the restore would require re-running semantic admission, which
-/// the bridge is forbidden to invent (I1.8, A12.3). Verbatim replay of
-/// the frozen derived bytes is therefore the accepted restore path,
-/// exactly when all of the following hold:
+/// the bridge is forbidden to invent (I1.8, A12.3); that prohibition
+/// outranks the I5.13 "rebuild projections/indexes" preference at the
+/// bridge layer, so verbatim replay of the frozen owner-built bytes —
+/// content-pinned, owner-type-validated, purge-filtered, isolated, and
+/// readback-verified — is the accepted restore path here, exactly when
+/// all of the following hold. No sessions, leases, epochs, or route
+/// continuations can revive through this gate: the captured denominator
+/// contains none as active authority (I5.13), and non-pending outbox
+/// evidence stays historical upstream. Fresh Authority Epoch lineage is
+/// minted at cutover by its owner, never in this replay.
 ///
 /// ```text
 /// the row was frozen under a completed capture receipt (provenance);

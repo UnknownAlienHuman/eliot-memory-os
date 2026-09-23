@@ -13,19 +13,26 @@
 //! restore; the live backup-operation ledger records only coordination
 //! metadata (identity, admission digest, destination, receipt).
 //!
-//! Every restore executes under the Governor-minted restore admission it
-//! carries: the bridge recomputes the admission decision digest, refuses
-//! any mismatch, executes exactly the admitted plan, and repeats the digest
-//! in the restore receipt. Replay converges instead of overwriting: a
-//! present row with identical content converges, a present row with
-//! divergent content conflicts, and members named by a current purge
-//! suppression are never resurrected. Derived rows replay verbatim only
-//! through the projection owner's admission gate. Classification happens
-//! before any write; one atomic destination transaction carries the fence
-//! guard, the conditional creates, and the destination fence advance; the
-//! restore ledger row commits only after every replayed member verifies.
-//! Unknown stays unknown: transport loss or a moved fence during replay
-//! reports `UnknownOutcome` for exact readback instead of success.
+//! Every restore presents the provisional restore admission slot: the
+//! bridge recomputes the decision digest (self-consistency only, never
+//! issuance proof), refuses any mismatch, binds the presented fields to
+//! the independent canonical anchors below, executes exactly the
+//! presented plan, and repeats the digest in the restore receipt. The
+//! independent anchors are the completed live source-capture row (source
+//! snapshot and denominator the caller cannot fabricate), the
+//! deployment-provisioned destination record (destination identity the
+//! caller cannot provision), and the frame-enforced session capability
+//! plus transport identity (bound before dispatch). Replay converges
+//! instead of overwriting: a present row with identical content
+//! converges, a present row with divergent content conflicts, and
+//! members named by a current purge suppression are never resurrected.
+//! Derived rows replay verbatim only through the projection owner's
+//! admission gate. Classification happens before any write; one atomic
+//! destination transaction carries the fence guard, the conditional
+//! creates, and the destination fence advance; the restore ledger row
+//! commits only after every replayed member verifies. Unknown stays
+//! unknown: transport loss or a moved fence during replay reports
+//! `UnknownOutcome` for exact readback instead of success.
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -63,18 +70,24 @@ const FENCE_DRIFT_MARKER: &str = "backup_fence_drift";
 const FENCE_BUMP_STATEMENT: &str = "LET $backup_bump = (UPDATE canonical_fence:current SET next_commit_sequence = $backup_next_commit_sequence, next_outbox_sequence = $backup_next_outbox_sequence WHERE next_commit_sequence = $backup_expected_commit_sequence AND next_outbox_sequence = $backup_expected_outbox_sequence RETURN AFTER); IF array::len($backup_bump ?? []) != 1 { THROW 'backup_fence_drift'; };";
 
 /// Restores validated canonical records into the admitted isolated
-/// destination only. Same-operation replay returns the original receipt;
-/// changed input under the same identity conflicts; loss of response stays
-/// unknown for exact readback.
+/// destination only. Same-operation replay returns the original receipt
+/// only when the presented admission digest matches the stored one;
+/// changed input — including a rotated admission — under the same
+/// identity conflicts; loss of response stays unknown for exact
+/// readback.
 ///
-/// The admitted restore admission is verified before any restore I/O: the
-/// closed request validation recomputes the Governor-minted decision
-/// digest and cross-binds identity, destination, fence, denominator, and
-/// snapshot. The replay lands only in the dedicated destination database;
-/// the serving store's canonical tables and fence sequences are never
-/// written or spent. Converge-or-conflict plus fence guards remain the
-/// write-safety layer *inside* the isolated destination, never a
-/// substitute for it.
+/// The presented provisional admission is verified before any restore
+/// I/O: closed request validation recomputes the decision digest
+/// (self-consistency) and cross-binds identity, destination, fence,
+/// denominator, and snapshot; the bridge then binds the presented
+/// source digest and denominator to the completed live source-capture
+/// row and the presented destination to the provisioned destination
+/// record — both independent canonical anchors the caller cannot
+/// fabricate. The replay lands only in the dedicated destination
+/// database; the serving store's canonical tables and fence sequences
+/// are never written or spent. Converge-or-conflict plus fence guards
+/// remain the write-safety layer *inside* the isolated destination,
+/// never a substitute for it.
 pub(crate) async fn backup_isolated_restore(
     adapter: &crate::SurrealStoreAdapter,
     request: StoreIsolatedRestoreRequest,
@@ -133,6 +146,17 @@ pub(crate) async fn backup_isolated_restore(
         return Err(AdapterError::Store(StoreError::IdentityConflict));
     }
     if source_receipt.scope_residency_digest != request.scope.residency_denominator_digest {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    // F1 source anchor: bind the presented admission to the independent
+    // canonical record — the completed live capture row the caller cannot
+    // fabricate must carry the exact snapshot and denominator the
+    // admission claims. Transitive with request validation by construction;
+    // enforced here so the anchor binding survives at the bridge layer.
+    if request.admission.source_snapshot_digest != source_receipt.snapshot_digest
+        || request.admission.residency_denominator_digest
+            != source_receipt.scope_residency_digest
+    {
         return Err(AdapterError::Store(StoreError::IdentityConflict));
     }
     let source_members =
@@ -263,7 +287,10 @@ async fn current_live_fence(
     Ok(fence)
 }
 
-/// Reconciles a repeated restore against the durable row.
+/// Reconciles a repeated restore against the durable row. An identical
+/// admission replays the stored receipt; a rotated admission under a
+/// reused identity triple conflicts instead of returning a receipt bound
+/// to a different admission (F6).
 fn replay_or_conflict_restore(
     request: &StoreIsolatedRestoreRequest,
     existing: &BackupOperationRow,
@@ -274,7 +301,13 @@ fn replay_or_conflict_restore(
     {
         return Err(AdapterError::Store(StoreError::IdentityConflict));
     }
-    completed_receipt(existing)?.ok_or(AdapterError::Store(StoreError::ReceiptNotFound))
+    let receipt = completed_receipt(existing)?.ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
+    if receipt.admission_decision_digest.as_deref()
+        != Some(request.admission.admission_decision_digest.as_str())
+    {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    Ok(receipt)
 }
 
 /// Requires a completed capture source with a stored receipt.
@@ -1268,6 +1301,18 @@ async fn verify_destination_record(
             reason: "destination admission does not name the admitted destination",
         }));
     }
+    // F1 destination anchor: the presented admission must name the exact
+    // deployment-provisioned destination the caller cannot provision —
+    // bound here directly, not only transitively through the scope.
+    if request.admission.dest_store_id != record.dest_store_id
+        || request.admission.dest_installation_id != record.dest_installation_id
+        || request.admission.state_fence != record.state_fence
+    {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "backup.destination",
+            reason: "presented admission does not name the provisioned destination",
+        }));
+    }
     if record.state_fence != request.scope.state_fence {
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
@@ -1287,6 +1332,22 @@ async fn verify_destination_record(
     }
     Ok(())
 }
+
+// Cutover handoff (issues #952/#975, I5.13, A13.7).
+//
+// This lane never activates a destination, unblocks effects, or retires
+// the source: cutover requires the separate owner authorization, whose
+// canonical file-level algorithm lives with the `eliot-backup` owner
+// (issue #1873: `IsolatedRestorePlan` + `CutoverAuthorization` +
+// `authorize_cutover`, purge-first ordering, suspended recovery, fresh
+// lineage at cutover). The store edge mirrors that discipline at the
+// canonical-row level — isolated destination, purge suppression,
+// suspended (never runnable) outbox evidence, no session/lease/epoch
+// revival, serving refusal above — and hands activation to the
+// coordinated cutover owner (#961) presenting plan-bound, bundle-bound
+// authorization. The `cutover_authority` recorded here names the owner
+// whose grant the coordinator must present; this lane mints no grant
+// and accepts no activation through any of its paths.
 
 /// Provisions one isolated restore destination database (issues #952/#975
 /// R1).
@@ -1400,6 +1461,7 @@ pub(crate) async fn provision_restore_destination(
             dest_installation_id,
             state_fence,
             cutover_authority,
+            prose_pinned,
         })
         .await,
         Some(record) => {
@@ -1448,6 +1510,7 @@ struct EmptyDestinationProvision<'a> {
     dest_installation_id: &'a str,
     state_fence: &'a StateFence,
     cutover_authority: &'a str,
+    prose_pinned: bool,
 }
 
 /// Builds the bindings for empty-destination provisioning: the schema-meta
@@ -1512,6 +1575,7 @@ async fn provision_empty_destination(
         dest_installation_id,
         state_fence,
         cutover_authority,
+        prose_pinned,
     } = provision;
     let bindings = provision_empty_bindings(&provision, updated_at, migration);
     let mut sql = String::from(schema::TX_BEGIN);
@@ -1551,8 +1615,11 @@ async fn provision_empty_destination(
         });
     }
     // Verify the winner's result: exact baseline identity, shared fence
-    // at genesis sequences, identical destination record.
-    let schema = probe_destination_schema(dest, true)
+    // at genesis sequences, identical destination record. Verification
+    // threads the real prose-pin flag (F4): on an unpinned provider an
+    // absent table stays a fail-closed PartialOutcome, never a
+    // misclassified success.
+    let schema = probe_destination_schema(dest, prose_pinned)
         .await?
         .ok_or(AdapterError::PartialOutcome)?;
     if schema.migration_id != migration.migration_id
@@ -1562,13 +1629,13 @@ async fn provision_empty_destination(
     {
         return Err(AdapterError::PartialOutcome);
     }
-    let fence = read_destination_fence(dest, config, state_fence, true)
+    let fence = read_destination_fence(dest, config, state_fence, prose_pinned)
         .await
         .map_err(|_| AdapterError::PartialOutcome)?;
     if fence.next_commit_sequence != 1 || fence.next_outbox_sequence != 1 {
         return Err(AdapterError::PartialOutcome);
     }
-    let record = load_destination_record(dest, true)
+    let record = load_destination_record(dest, prose_pinned)
         .await
         .map_err(|_| AdapterError::PartialOutcome)?;
     if record.dest_store_id != dest_store_id
@@ -1784,6 +1851,165 @@ async fn ensure_domain_block(
         .query_write("backup.restore", &sql, Map::new())
         .await?;
     if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    Ok(())
+}
+
+/// Provider marker for destination authority-rotation CAS drift.
+const ROTATE_CONFLICT_MARKER: &str = "backup_destination_rotate_conflict";
+
+/// Rotates one destination's cutover authority under compare-and-set
+/// (issues #952/#975 F5).
+///
+/// Owner-controlled transition without out-of-band bypass: the durable
+/// record must exist with matching destination identity and the shared
+/// fence, and must be non-serving — a serving destination's authority
+/// rotates only through the coordinated cutover owner (#961), never here.
+/// The record must currently carry exactly `expected_cutover_authority`;
+/// only the authority field changes, so destination identity, fence, and
+/// especially the serving flag are immutable in this statement. A fence
+/// change is never rotated in place: provisioning a fresh destination is
+/// the only fence-change path. An identical rotation replays; a
+/// concurrent winner's identical record replays; anything else conflicts.
+pub(crate) async fn rotate_restore_destination_authority(
+    adapter: &crate::SurrealStoreAdapter,
+    dest_store_id: &str,
+    expected_cutover_authority: &str,
+    new_cutover_authority: &str,
+    state_fence: &StateFence,
+) -> Result<(), AdapterError> {
+    if dest_store_id.trim().is_empty() || dest_store_id.chars().any(char::is_control) {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "backup.destination",
+            reason: "restore destination database name is not admitted",
+        }));
+    }
+    if dest_store_id == adapter.config.database {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "backup.destination",
+            reason: "the serving store has no restore destination record",
+        }));
+    }
+    for (value, field) in [
+        (expected_cutover_authority, "backup.expected_cutover_authority"),
+        (new_cutover_authority, "backup.cutover_authority"),
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field,
+                reason: "cutover authority rotation carries no blank identity",
+            }));
+        }
+    }
+    state_fence.validate().map_err(StoreError::Foundation)?;
+    let db = super::client(adapter).await?;
+    super::ensure_ready(adapter, db).await?;
+    let prose_pinned = super::backup_snapshot::provider_prose_pinned(adapter);
+    let dest =
+        client::connect_restore_destination(db.provider(), &adapter.config, dest_store_id).await?;
+    read_destination_fence(&dest, &adapter.config, state_fence, prose_pinned).await?;
+    let record = load_destination_record(&dest, prose_pinned).await?;
+    if record.serving {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "backup.destination",
+            reason: "a serving destination rotates only through the cutover owner",
+        }));
+    }
+    if record.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    if record.cutover_authority != expected_cutover_authority {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    if expected_cutover_authority == new_cutover_authority {
+        return Ok(());
+    }
+    let mut bindings = Map::new();
+    bindings.insert("expected_state_fence".to_owned(), json!(state_fence));
+    let fence = read_destination_fence(&dest, &adapter.config, state_fence, prose_pinned).await?;
+    bindings.insert(
+        "expected_commit_sequence".to_owned(),
+        json!(fence.next_commit_sequence),
+    );
+    bindings.insert(
+        "expected_outbox_sequence".to_owned(),
+        json!(fence.next_outbox_sequence),
+    );
+    bindings.insert(
+        "destination_table".to_owned(),
+        json!(schema::table::RESTORE_DESTINATION),
+    );
+    bindings.insert(
+        "destination_key".to_owned(),
+        json!(schema::RESTORE_DESTINATION_KEY),
+    );
+    bindings.insert(
+        "destination_expected_authority".to_owned(),
+        json!(expected_cutover_authority),
+    );
+    bindings.insert(
+        "destination_new_authority".to_owned(),
+        json!(new_cutover_authority),
+    );
+    let mut sql = String::from(schema::TX_BEGIN);
+    sql.push_str(schema::TX_GUARD_FENCE);
+    sql.push(' ');
+    sql.push_str(
+        "LET $backup_rotate = (UPDATE type::record($destination_table, $destination_key) SET cutover_authority = $destination_new_authority WHERE cutover_authority == $destination_expected_authority AND serving == false RETURN AFTER); IF array::len($backup_rotate ?? []) != 1 { THROW 'backup_destination_rotate_conflict'; };",
+    );
+    sql.push(' ');
+    sql.push_str(schema::TX_COMMIT);
+    let mut response = dest.query_write("backup.restore", &sql, bindings).await?;
+    let errors = response.take_errors();
+    if errors.is_empty() {
+        return verify_rotated_record(
+            &dest,
+            dest_store_id,
+            state_fence,
+            new_cutover_authority,
+            prose_pinned,
+        )
+        .await;
+    }
+    if errors
+        .iter()
+        .any(|error| error.contains(ROTATE_CONFLICT_MARKER))
+    {
+        // A concurrent winner's identical record replays; anything else
+        // conflicts instead of reporting a rotation that did not happen.
+        return match load_destination_record(&dest, prose_pinned).await {
+            Ok(current)
+                if current.cutover_authority == new_cutover_authority
+                    && !current.serving
+                    && current.state_fence == *state_fence =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(AdapterError::Store(StoreError::IdentityConflict)),
+            Err(_) => Err(AdapterError::PartialOutcome),
+        };
+    }
+    Err(AdapterError::PartialOutcome)
+}
+
+/// Verifies the rotated destination record: new authority present,
+/// still non-serving, identity and fence otherwise unchanged.
+async fn verify_rotated_record(
+    dest: &RestoreDestinationTransport,
+    dest_store_id: &str,
+    state_fence: &StateFence,
+    new_cutover_authority: &str,
+    prose_pinned: bool,
+) -> Result<(), AdapterError> {
+    let record = load_destination_record(dest, prose_pinned)
+        .await
+        .map_err(|_| AdapterError::PartialOutcome)?;
+    if record.dest_store_id != dest_store_id
+        || record.state_fence != *state_fence
+        || record.serving
+        || record.cutover_authority != new_cutover_authority
+    {
         return Err(AdapterError::PartialOutcome);
     }
     Ok(())
