@@ -1586,14 +1586,30 @@ impl KernelComposition {
         if persisted != request.invocation {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
-        ensure_user_automation_run_now_receipt(
-            &*gateway,
+        let source_receipt = ensure_user_automation_run_now_receipt(
+            &gateway,
             &lookup.state_fence,
             &request.identity,
             &request.invocation,
         )
-        .await
-        .map(|_| ())
+        .await?;
+        let Some(source_receipt_envelope) = source_receipt.envelope.as_ref() else {
+            return Err(UserAutomationRuntimeError::UnknownOutcome(
+                "canonical UserAutomation source receipt envelope is not retained".to_owned(),
+            ));
+        };
+        if &request.preflight.source_receipt != source_receipt_envelope {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let policy_snapshot = self
+            .read_user_automation_policy_snapshot(&lookup.state_fence)
+            .await?;
+        if request.preflight.config_snapshot_id != policy_snapshot.snapshot_id
+            || policy_snapshot.state_fence != lookup.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
