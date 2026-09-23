@@ -10,6 +10,7 @@ description = "Persistent scheduling and state core for the ELIOT instrument tes
 blake3 = "1.8.5"
 eliot-contracts.workspace = true
 eliot-instrument-api.workspace = true
+eliot-protocol.workspace = true
 eliot-process.workspace = true
 redb = "4.1.0"
 serde = { version = "1.0.228", features = ["derive"] }

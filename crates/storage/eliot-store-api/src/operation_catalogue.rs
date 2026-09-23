@@ -29,6 +29,9 @@
 //! ceiling and the owner-approved six-field task-control schema emitted by
 //! the Governor task lifecycle envelope
 //! (`crates/governor/eliot-governor/src/task_lifecycle.rs`, `task_envelope`)),
+//! plus the `RecordFinishDecision` mutation (issue #325: persists the
+//! Governor-owned opaque finish receipt through the existing `RecoverySchema`
+//! owner path),
 //! plus the `ApplyEpistemicRevision` mutation (T11.2: persists
 //! `TransitionClass::Epistemic` with the `EffectClass::Candidate`
 //! ceiling and the owner-approved epistemic-revision payload),
@@ -387,8 +390,9 @@ struct ActivatedMutationDescriptor {
 /// `CaptureObservation` and `AppendAuditEvent` persist the lowest ceiling
 /// (`Candidate`) through the `CaptureCandidate` family; `ApplyLifecyclePolicy`
 /// persists `ReversibleMutation` through the `LifecyclePolicy` family;
-/// `ReconcileRecovery` persists `ReversibleMutation` through the
-/// `RecoverySchema` family; `UpdateTaskState` persists `ReversibleMutation`
+/// `ReconcileRecovery`, `RecordFinishEvidence`, and `RecordFinishDecision` persist
+/// `ReversibleMutation` through the `RecoverySchema` family;
+/// `UpdateTaskState` persists `ReversibleMutation`
 /// through the `TaskControl` family; `ApplyEpistemicRevision` persists
 /// `ReversibleMutation` through the `Epistemic` family; `ApplyErasure`
 /// persists `ReversibleMutation` through the `Erasure` family (issue #1712:
@@ -403,10 +407,10 @@ struct ActivatedMutationDescriptor {
 /// `CommitExperienceBank` and `CommitAgentFeedback` persist `Candidate`
 /// through the `CaptureCandidate` family (issue #223: Store-owned durable
 /// experience-bank/feedback rows with the closed experience typed
-/// contract). All
-/// thirteen address no scope, mirroring the scope-free read descriptors. Every
+/// contract). All fifteen address no scope, mirroring the scope-free read
+/// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 13] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 15] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -433,6 +437,18 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 13] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ReconcileRecovery,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordFinishDecision,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordFinishEvidence,
         transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: READ_MAX_INPUT_BYTES,
@@ -549,7 +565,7 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
 /// Declaration order is the canonical order: the seventeen activated reads, the
-/// thirteen activated mutations, then the genesis bootstrap entry. Generation is
+/// fifteen activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -781,6 +797,8 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::AppendAuditEvent
             | NamedMutationOperation::ApplyLifecyclePolicy
             | NamedMutationOperation::ReconcileRecovery
+            | NamedMutationOperation::RecordFinishDecision
+            | NamedMutationOperation::RecordFinishEvidence
             | NamedMutationOperation::UpdateTaskState
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure => {
