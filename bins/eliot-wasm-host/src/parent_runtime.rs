@@ -236,10 +236,10 @@ pub fn drive_parent_runtime(
             field: "working-directory",
         })?
         .to_path_buf();
-    let authority = ParentDispatchAuthority::activate()?;
+    let authority = ParentDispatchAuthority::activate(material, &epoch)?;
     let intent =
         derive_parent_intent(material, &executable_path, &host_digest, &working_directory)?;
-    let issued = authority.issue_permit(&intent, grant, &epoch, now_ms)?;
+    let issued = authority.issue_permit(&intent, material, &epoch, now_ms)?;
     let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(authority)));
     let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(BoundedParentSink::new());
     let process = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink));
