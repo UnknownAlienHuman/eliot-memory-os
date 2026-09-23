@@ -16,7 +16,7 @@ use super::*;
 mod store_receipt_dispatch;
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{StateFence, sha256_hex};
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 #[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, UserAutomationDurableJobPort,
@@ -36,11 +36,12 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency, RequestMeta,
+    OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
+    RecoveryRecordKey, RequestMeta,
     RevisionHeadExpectation, StoreError, StoreGenesisRequest, StoreRecoveryRequest,
     StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
@@ -458,6 +459,16 @@ struct UserAutomationDaemonTrigger {
     requested_revision: String,
     /// Human-issued nonce; Kernel binds it into the owner-derived occurrence.
     manual_nonce: String,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationPolicyOwnerSnapshotWire {
+    state_fence: StateFence,
+    revision: u64,
+    policy_digest: String,
+    snapshot: eliot_kernel_core::user_automation::ConfigPolicySnapshot,
 }
 
 impl KernelComposition {
@@ -1250,6 +1261,13 @@ impl KernelComposition {
                 UserAutomationRuntimeError::IdentityConflict,
             ));
         }
+        let policy_snapshot = match self
+            .read_user_automation_policy_snapshot(&lookup.state_fence)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
         let wake_request = UserAutomationWakeReadRequest {
             context: provenance.request_metadata.clone(),
             authenticated_principal: lookup.authenticated_principal.clone(),
@@ -1301,6 +1319,18 @@ impl KernelComposition {
             )
             .await
             .map_err(|_| TransportError::SessionFenced)?;
+        let policy_snapshot_after = match self
+            .read_user_automation_policy_snapshot(&lookup.state_fence)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        if policy_snapshot_after != policy_snapshot {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::IdentityConflict,
+            ));
+        }
         if invocation_after != invocation
             || ensure_user_automation_run_now_receipt(
                 &*gateway,
@@ -1324,9 +1354,96 @@ impl KernelComposition {
                 "occurrence_id": occurrence_id,
                 "source_receipt": source_receipt,
                 "wake_readback": wake_readback,
+                "policy_snapshot": policy_snapshot,
             },
             "recovery": null,
         }))
+    }
+
+    #[cfg(windows)]
+    /// Reads the exact retained Governor Policy owner record from Store.
+    ///
+    /// This route deliberately accepts no handshake digest as snapshot data:
+    /// the Store record key, owner schema, canonical bytes, owner revision,
+    /// policy digest, embedded fence, and embedded revision must all correlate.
+    async fn read_user_automation_policy_snapshot(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<
+        eliot_kernel_core::user_automation::ConfigPolicySnapshot,
+        UserAutomationRuntimeError,
+    > {
+        let key = RecoveryRecordKey::new("owner", "policy")
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let request = StoreRecoveryRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence: state_fence.clone(),
+            records: vec![key.clone()],
+            include_receipts: false,
+            include_jobs: false,
+        };
+        let gateway = self
+            .retained_store_gateway()
+            .map_err(|_| UserAutomationRuntimeError::Unavailable(
+                "canonical Policy owner Store route is unavailable".to_owned(),
+            ))?;
+        let recovery = gateway
+            .recovery(request)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        if recovery.state_fence != *state_fence
+            || recovery.owner_records.len() != 1
+            || !recovery.job_records.is_empty()
+            || !recovery.receipts.is_empty()
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let record = &recovery.owner_records[0];
+        if record.record_key() != key
+            || record.state_fence != *state_fence
+            || record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA
+            || record.revision == 0
+            || record.value_digest != sha256_hex(&record.payload)
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let owner: UserAutomationPolicyOwnerSnapshotWire =
+            serde_json::from_slice(&record.payload).map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "canonical Policy owner snapshot schema is invalid".to_owned(),
+                )
+            })?;
+        let canonical_owner = canonical_json_bytes(&owner).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy owner snapshot encoding failed: {error}"
+            ))
+        })?;
+        let snapshot_bytes = canonical_json_bytes(&owner.snapshot).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy snapshot encoding failed: {error}"
+            ))
+        })?;
+        owner.snapshot.validate().map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical Policy owner snapshot is invalid: {error}"
+            ))
+        })?;
+        if canonical_owner != record.payload
+            || owner.state_fence != *state_fence
+            || owner.revision != record.revision
+            || owner.revision == 0
+            || owner.snapshot.state_fence != *state_fence
+            || owner.snapshot.revision.value() != owner.revision
+            || owner.policy_digest != sha256_hex(&snapshot_bytes)
+            || owner.policy_digest.len() != 64
+            || !owner
+                .policy_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(owner.snapshot)
     }
 
     #[cfg(windows)]

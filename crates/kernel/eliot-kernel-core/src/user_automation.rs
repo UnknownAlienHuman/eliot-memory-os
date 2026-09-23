@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_config::ConfigPolicySnapshot;
+pub use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
     ContractIdentity, ContractVersion, OperationId, PolicyRevision, RequestMetadata, StateFence,
     canonical_json_bytes, contract_identity, sha256_hex,
