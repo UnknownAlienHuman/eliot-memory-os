@@ -180,6 +180,7 @@ members = [
   "crates/meta/eliot-learning-activation-assessment",  # agent_order 36
   "crates/meta/eliot-self-quality",  # agent_order 38
   "crates/smart/eliot-understanding-assessment",  # agent_order 85
+  "crates/governor/eliot-memory-projection-provider",  # agent_order 46
   "crates/smart/eliot-experience-projection",  # agent_order 48
   "crates/smart/eliot-experience-provider",  # agent_order 51
   "crates/smart/eliot-dreamer-self-query",  # agent_order 49
