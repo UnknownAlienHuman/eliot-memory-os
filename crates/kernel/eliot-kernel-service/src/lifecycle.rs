@@ -569,6 +569,12 @@ impl KernelService {
                     reason: "Store rebind reconciliation requires the authenticated request boundary",
                 });
             }
+            KernelControlCommand::ReadRuntimeLeaseCensus(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "runtime_lease_census",
+                    reason: "RuntimeLease census requires the authenticated Kernel composition boundary",
+                });
+            }
             KernelControlCommand::ProbeReady => {
                 // A wire command cannot carry a caller-shaped readiness
                 // receipt. The composition root must perform live
