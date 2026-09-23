@@ -19,6 +19,7 @@ eliot-agent-bridge-core.workspace = true
 eliot-agent-contracts.workspace = true
 eliot-agent-coordinator.workspace = true
 eliot-authority.workspace = true
+eliot-cognitive-quality = { path = "../../crates/smart/eliot-cognitive-quality", version = "0.1.0" }
 eliot-contracts.workspace = true
 eliot-config.workspace = true
 eliot-controlboard.workspace = true
@@ -34,6 +35,7 @@ eliot-experience-provider = { path = "../../crates/smart/eliot-experience-provid
 eliot-governor.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
+eliot-learning-contracts.workspace = true
 eliot-maintenance.workspace = true
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
 eliot-observation.workspace = true

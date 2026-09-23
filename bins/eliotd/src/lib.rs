@@ -152,8 +152,8 @@ pub use governor_local_read::{
     serve_admitted_local_read,
 };
 pub use experience_runtime::{
-    ExperienceDriverError, ExperienceJournalDriverInputs, produce_journal_projection,
-    read_current_position,
+    ExperienceDriverError, ExperienceJournalDriverInputs, ExperienceQualityDriverInputs,
+    assess_experience_quality, produce_journal_projection, read_current_position,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
