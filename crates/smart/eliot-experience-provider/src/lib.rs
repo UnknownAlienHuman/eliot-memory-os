@@ -17,10 +17,16 @@
 //! plus handles actually read from the live journal at call time:
 //!
 //! - coverage binds the owner-issued `revision_heads` of the bridge
-//!   response (denominator ref plus digest), never an invented denominator;
-//!   `Complete` posture is taken only on exact carried-to-observed count
-//!   with empty omissions and empty blind intervals, exactly as the envelope
-//!   contract requires;
+//!   response (canonical key order, denominator ref plus digest), never an
+//!   invented denominator; every head fence must equal the read fence and
+//!   every caller-required revision minimum must hold, mirroring the read
+//!   facade owner checks, or the read fails closed (`StaleRevision`). The
+//!   coverage digest proves this read's shape only: durable authority stays
+//!   with the bound heads plus fence equality, and the output carries the
+//!   canonical heads so a later read can re-prove durability and
+//!   monotonicity. `Complete` posture is taken only on exact
+//!   carried-to-observed count with empty omissions and empty blind
+//!   intervals, exactly as the envelope contract requires;
 //! - carried records presence-check against the live admitted-handle set and
 //!   the read fails closed on drift (`PresenceDrift`);
 //! - view revision cursors digest the envelope bytes actually read; the
@@ -81,7 +87,7 @@ use eliot_observation_contracts::{
 };
 use eliot_store_api::{
     CanonicalReadClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
-    ScopeId, StoreError,
+    RevisionHead, RevisionKey, ScopeId, StoreError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -129,6 +135,11 @@ pub enum ProviderError {
     /// invented; the hold cites the bridge condition for owner review.
     #[error("retention blocked ({hold}): ordinary use unavailable, no invented schedule")]
     RetentionBlocked { hold: &'static str },
+    /// A required revision head is missing or regressed: the bridge read is
+    /// stale relative to the caller-supplied minimums. Re-read at a current
+    /// revision; never project a regressed enumeration.
+    #[error("bridge revision heads are stale relative to required minimums")]
+    StaleRevision,
     /// The live journal advanced past the bridge read: a carried record no
     /// longer presence-checks. Re-read; never project stale presence.
     #[error("live owner state advanced past the bridge read")]
@@ -198,6 +209,10 @@ pub struct JournalShapeInputs<'a> {
     pub response: &'a NamedReadResponse,
     /// Record ids read from the live journal at call time for binding.
     pub admitted_record_ids: &'a BTreeSet<String>,
+    /// Required revision minimums per head key (revision monotonicity):
+    /// every named key must be present with at least the named revision.
+    /// Empty imposes no constraint.
+    pub minimum_revisions: &'a BTreeMap<RevisionKey, u64>,
 }
 
 /// Shaped owner projections plus the revalidated Smart view.
@@ -206,6 +221,10 @@ pub struct JournalShapeOutput {
     pub projection: JournalProjection,
     /// Smart read-aid view over the carried event records, revalidated.
     pub view: ExperienceView,
+    /// Owner-issued revision heads bound into coverage, in canonical key
+    /// order, carried so a later read can re-prove durability and
+    /// monotonicity against this read.
+    pub revision_heads: Vec<RevisionHead>,
 }
 
 /// Provider plus Smart-consumer call: shape one bridge read and revalidate.
@@ -236,6 +255,42 @@ pub fn shape_journal_read(
             reason: "bridge fence is not compatible with the read fence",
         });
     }
+    // Schedule-fence owner check (mirrors the read facade): every
+    // owner-issued revision head must carry exactly the read fence. A
+    // compatible-but-unequal head means the enumeration was not read under
+    // the fence this projection claims, so the read fails closed.
+    if inputs
+        .response
+        .revision_heads
+        .iter()
+        .any(|head| head.state_fence != inputs.fence)
+    {
+        return Err(ProviderError::Response {
+            field: "response.revision_heads",
+            reason: "owner head fence does not equal the read fence",
+        });
+    }
+    // Revision monotonicity (mirrors the read facade): every required key
+    // must be present with at least the required revision. A missing key
+    // or a regressed revision means the read is stale for this caller.
+    for (key, minimum) in inputs.minimum_revisions {
+        let current = inputs
+            .response
+            .revision_heads
+            .iter()
+            .find(|head| head.key == *key)
+            .map(|head| head.revision);
+        if current.is_none_or(|revision| revision < *minimum) {
+            return Err(ProviderError::StaleRevision);
+        }
+    }
+    // Canonical refs: revision heads sort by key so the coverage digest
+    // and denominator ref are order-independent. The digest below proves
+    // this read's shape only; durable authority stays with the bound
+    // heads plus the fence-equality check above, both carried in the
+    // output for later re-proof.
+    let mut canonical_heads = inputs.response.revision_heads.clone();
+    canonical_heads.sort_by(|left, right| left.key.cmp(&right.key));
     let payload: AuditRangeV1Payload =
         serde_json::from_value(inputs.response.payload.clone())
             .map_err(|error| ProviderError::Payload {
@@ -254,7 +309,7 @@ pub fn shape_journal_read(
             return Err(ProviderError::PresenceDrift);
         }
     }
-    let heads_digest = canonical_json_bytes(&inputs.response.revision_heads)
+    let heads_digest = canonical_json_bytes(&canonical_heads)
         .map(|bytes| sha256_hex(&bytes))
         .map_err(|_| ProviderError::Response {
             field: "response.revision_heads",
@@ -349,7 +404,11 @@ pub fn shape_journal_read(
         Vec::new(),
     )?;
     revalidate_journal_presence(&view, &projection)?;
-    Ok(JournalShapeOutput { projection, view })
+    Ok(JournalShapeOutput {
+        projection,
+        view,
+        revision_heads: canonical_heads,
+    })
 }
 
 /// Composed production inputs: one bridge fetch plus shaping context.
@@ -366,6 +425,8 @@ pub struct ProduceJournalInputs<'a> {
     pub consistency: ReadConsistency,
     /// Record ids read from the live journal at call time for binding.
     pub admitted_record_ids: &'a BTreeSet<String>,
+    /// Required revision minimums per head key (revision monotonicity).
+    pub minimum_revisions: &'a BTreeMap<RevisionKey, u64>,
 }
 
 /// Composed producer-to-provider-to-consumer call in production types.
@@ -395,5 +456,6 @@ pub async fn produce_journal_read<C: CanonicalReadClient + ?Sized>(
         fence: inputs.fence.clone(),
         response: &response,
         admitted_record_ids: inputs.admitted_record_ids,
+        minimum_revisions: inputs.minimum_revisions,
     })
 }
