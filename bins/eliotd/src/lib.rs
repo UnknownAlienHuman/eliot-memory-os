@@ -23,10 +23,7 @@ use eliot_governor::{
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
-use eliot_protocol::{
-    AgentActivationResolutionDecision, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket,
-};
+use eliot_protocol::{AgentActivationResolutionResult, AgentActivationResolutionTicket};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -74,9 +71,9 @@ mod skill_surface_adapters;
 pub mod staffing_policy;
 pub mod startup_evidence_producer;
 mod store_failure_projection;
-pub mod testd_terminal_completion;
 pub mod task_binding_admission;
 mod task_lifecycle_adapters;
+pub mod testd_terminal_completion;
 
 pub use activation_projection::AgentActivationResolver;
 pub use activation_projection::{
@@ -94,9 +91,6 @@ pub use agent_fabric::{
 };
 
 use controlboard_adapters::SharedOperatorReplay;
-
-#[cfg(test)]
-use activation_projection::map_activation_snapshot;
 
 pub use canonical_config_precedence::{
     ALL_LAYERS, CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PrecedenceError, ResolvedChain,
@@ -144,6 +138,13 @@ pub use dreamer_model_adapter::{
     DAEMON_GENERATION_PROJECTION_OPERATION, DreamerModelExecution, GovernedDreamerModelAdapter,
     KernelGenerationProjection, ModelInvokeInput, query_kernel_generation,
 };
+pub use experience_runtime::{
+    CommonGroundEventInputs, ExperienceCommitOutput, ExperienceDriverError,
+    ExperienceJournalDriverInputs, ExperienceQualityEvent, ExperienceQualityEventOutput,
+    UnderstandingEventInputs, commit_experience_event_records, derive_commit_ingress,
+    produce_journal_projection, propose_memory_extinction_candidate, read_current_position,
+    run_experience_quality_event, run_experience_quality_event_with_revision,
+};
 pub use first_run_wiring::{
     DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
     recommend_for_disabled_automation, resolve_first_run_routes,
@@ -159,23 +160,15 @@ pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
     serve_admitted_local_read,
 };
-pub use experience_runtime::{
-    CommonGroundEventInputs, ExperienceCommitOutput, ExperienceDriverError,
-    ExperienceJournalDriverInputs, ExperienceQualityEvent, ExperienceQualityEventOutput,
-    UnderstandingEventInputs, commit_experience_event_records, derive_commit_ingress,
-    produce_journal_projection, propose_memory_extinction_candidate, read_current_position,
-    run_experience_quality_event, run_experience_quality_event_with_revision,
-};
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
 pub use process_origin::{
-    CapabilityEvidenceSource, Generation, OperationDisposition,
-    OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant,
-    OriginControlOperation, OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY,
-    PhysicalProcessBinding, ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError,
-    ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
-    request_origin_control,
+    CapabilityEvidenceSource, Generation, OperationDisposition, OriginChallenge,
+    OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
+    OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY, PhysicalProcessBinding,
+    ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError, ProcessOriginEvidence,
+    ProcessStatusReceipt, canonical_origin_digest, gate_process_control, request_origin_control,
 };
 pub use reactive_feed::{ReactiveFeedError, ReactiveFeedOutcome, drive_reactive_delivery_once};
 pub use route_receipts::{
@@ -699,58 +692,6 @@ impl DaemonComposition {
             degraded: !self.started
                 || self.view_stale
                 || self.readiness() != CompositionReadiness::Ready,
-        }
-    }
-
-    /// v1 compatibility projection: resolves one Kernel-issued semantic ticket
-    /// to the legacy decision shape through the sole Governor.
-    ///
-    /// v1-compat only. This method must not consume v2 typed-result data;
-    /// `resolve_agent_activation_v2` is the single production resolver spine.
-    /// Behavior is preserved (only `Resolved` maps; every other outcome is an
-    /// error, never coerced to success) so existing compatibility consumers keep
-    /// working. The runtime production path already resolves through v2 (the
-    /// `daemon_runtime` claim arm); this v1 method has no production caller.
-    ///
-    /// Final v1 retirement is tracked by #66 (#204 removes the success-only
-    /// compatibility path after the complete migration passes); this method is
-    /// not removed as opportunistic cleanup.
-    ///
-    /// The Governor typed outcome is the sole discriminator: only `Resolved`
-    /// produces a decision. Every other outcome is surfaced as an error and is
-    /// never coerced to success.
-    pub fn resolve_agent_activation(
-        &self,
-        ticket: &AgentActivationResolutionTicket,
-        now: u64,
-    ) -> Result<AgentActivationResolutionDecision, DaemonError> {
-        ticket
-            .validate()
-            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        if self.readiness() != CompositionReadiness::Ready {
-            return Err(DaemonError::Lifecycle(
-                "semantic activation resolution requires a ready Governor".to_owned(),
-            ));
-        }
-        if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
-            return Err(DaemonError::Lifecycle(
-                "semantic activation ticket deadline has expired".to_owned(),
-            ));
-        }
-        match self.governor.resolve_activation_outcome(now) {
-            GovernorActivationOutcome::Resolved(snapshot) => {
-                if snapshot.state_fence != ticket.state_fence {
-                    return Err(DaemonError::Lifecycle(
-                        "semantic activation ticket fence does not match the Governor snapshot"
-                            .to_owned(),
-                    ));
-                }
-                activation_projection::map_activation_snapshot(ticket, snapshot)
-            }
-            outcome => Err(DaemonError::Lifecycle(format!(
-                "semantic activation did not resolve: {}",
-                outcome.kind_str()
-            ))),
         }
     }
 
@@ -1692,14 +1633,6 @@ fn failed_internal_or_mapping_error(
 }
 
 impl AgentActivationResolver for DaemonComposition {
-    fn resolve_agent_activation(
-        &self,
-        ticket: &AgentActivationResolutionTicket,
-        now: u64,
-    ) -> Result<AgentActivationResolutionDecision, DaemonError> {
-        DaemonComposition::resolve_agent_activation(self, ticket, now)
-    }
-
     fn resolve_agent_activation_v2(
         &self,
         ticket: &AgentActivationResolutionTicket,

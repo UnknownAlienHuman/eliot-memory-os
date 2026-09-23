@@ -17,8 +17,8 @@ use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, Sourc
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_protocol::{
-    AgentActivationResolutionDecision, AgentActivationResolutionResult, AgentActivationResultAck,
-    AgentActivationResultReconcile, AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
+    AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
+    AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, LocalReadAttempt, MessageType, ProtocolPayload, ProtocolVersion,
     RequestIdentity, host_request_operation_id,
@@ -255,23 +255,6 @@ impl DaemonKernelClient {
         let ticket_bytes = serde_json::to_vec(&ticket)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         Ok(super::classify_claimed_ticket_value(&ticket_bytes))
-    }
-
-    #[cfg(windows)]
-    pub async fn submit_agent_activation_decision(
-        &self,
-        decision: &AgentActivationResolutionDecision,
-    ) -> Result<(), super::DaemonError> {
-        decision
-            .validate()
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        self.transact_async(
-            "agent_activation_submit",
-            serde_json::json!({ "decision": decision }),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|error| super::DaemonError::Kernel(error.to_string()))
     }
 
     #[cfg(windows)]
