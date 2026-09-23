@@ -20,12 +20,11 @@
 //!   revoked source lineage — never an invented cause;
 //! - the affected set comes verbatim from the committed closure row (the
 //!   complete denominator, never re-derived);
-//! - the served revision is the durable per-root watermark read under the
-//!   same snapshot as the served rows; a closure newer than the watermark
-//!   refuses instead of serving a partial view, a watermark change across
-//!   pages refuses instead of serving a torn view, and a matched set
-//!   larger than the request bound refuses instead of truncating
-//!   (overflow is never partial);
+//! - the served rows plus the revision watermark are read under one
+//!   durable snapshot as one bounded selected set; a closure newer than
+//!   the watermark refuses instead of serving a partial view, and a
+//!   selected set larger than the request bound refuses instead of
+//!   truncating (overflow is never partial);
 //! - an empty matched set with a present watermark attests zero recorded
 //!   revocations at that revision; a missing watermark refuses because
 //!   absence of history is not evidence.
@@ -56,13 +55,14 @@ use eliot_security_contracts::RevocationReason;
 ///
 /// Returns [`StoreError::InvalidField`] for a malformed selector,
 /// [`StoreError::PayloadTooLarge`] for an over-bound request or an
-/// overflowing matched set, [`StoreError::FenceMismatch`] for a request
+/// overflowing selected set, [`StoreError::FenceMismatch`] for a request
 /// fence that disagrees with the live session fence,
 /// [`StoreError::InvalidProjection`] for incoherent durable rows,
 /// [`StoreError::ReceiptNotFound`] when no history exists for the
-/// origin, [`StoreError::Unavailable`] for a concurrent mutation that
-/// moves the per-root watermark mid-read, and
-/// [`StoreError::UnknownOperation`] for any other operation.
+/// origin, [`StoreError::Unavailable`] for a transient store failure,
+/// and [`StoreError::UnknownOperation`] for any other operation. Store
+/// integrity conflicts stay integrity-visible (`InvalidProjection`):
+/// they are never reported as transient.
 #[allow(
     clippy::too_many_lines,
     reason = "the history projector keeps selectors, scan, filter, currency, overflow, and envelope in one audited sequence"
@@ -117,79 +117,71 @@ pub fn serve_authority_revocation_history(
     if max_records > REVOCATION_HISTORY_MAX_RECORDS {
         return Err(StoreError::PayloadTooLarge);
     }
-    // Rows page per lineage from the store in operation order; every page
-    // carries the per-root revision watermark read under the same durable
-    // snapshot as its rows, so one page is self-consistent. A watermark
-    // change across pages proves a concurrent mutation during the bounded
-    // read and refuses instead of serving a torn view; unrelated rows
-    // never count against the page bound, so an unrelated lineage can
-    // never disable this view.
+    // The whole selected set plus its per-root revision watermark comes
+    // from the store under one durable snapshot, so the served view is
+    // self-consistent with no paging cursor and no cross-page torn
+    // views. The store bound below is the request bound itself: an
+    // oversize selected set refuses early instead of decoding a whole
+    // lineage only to discard it, and unrelated rows never count
+    // against it, so an unrelated lineage can never disable this view.
     let lineage = OpaqueLabel::new(origin_ref).map_err(|_| StoreError::InvalidField {
         field: "operation.parameter",
         reason: "origin_ref must be a bounded non-blank string",
     })?;
-    let mut after_order = 0u64;
+    let bound = u16::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+    let (selected, watermark) = store
+        .scan_grant_closures_for_lineage(&lineage, bound)
+        .map_err(|error| match error {
+            eliot_ors::OrsError::IntegrityProblem { .. }
+            | eliot_ors::OrsError::DuplicateConflict => StoreError::InvalidProjection,
+            eliot_ors::OrsError::ProjectionLimitExceeded => StoreError::PayloadTooLarge,
+            _ => StoreError::Unavailable,
+        })?;
     let mut matched: Vec<RecordedRevocation> = Vec::new();
     let mut resolved_root: Option<String> = None;
-    let mut baseline_revision: Option<Option<u64>> = None;
-    loop {
-        let (page, watermark) = store
-            .scan_grant_closures_for_lineage(&lineage, after_order, eliot_ors::MAX_RECOVERY_PAGE)
-            .map_err(|_| StoreError::Unavailable)?;
-        match baseline_revision {
-            Some(baseline) if baseline != watermark => {
-                return Err(StoreError::Unavailable);
+    for projection in &selected {
+        let commit = projection.commit();
+        let target = commit.target_id.as_str();
+        let root = commit.authority_root.as_str();
+        if target != origin_ref && root != origin_ref {
+            continue;
+        }
+        // Only fenced closures are revocation history. Activation
+        // closures share the row kind and must never project as
+        // revocations.
+        if commit.state != GrantClosureState::Fenced {
+            continue;
+        }
+        match &resolved_root {
+            Some(known) if known != root => {
+                return Err(StoreError::InvalidProjection);
             }
             Some(_) => {}
-            None => baseline_revision = Some(watermark),
+            None => resolved_root = Some(root.to_owned()),
         }
-        if page.is_empty() {
-            break;
-        }
-        for projection in &page {
-            after_order = after_order.max(projection.operation_order());
-            let commit = projection.commit();
-            let target = commit.target_id.as_str();
-            let root = commit.authority_root.as_str();
-            if target != origin_ref && root != origin_ref {
-                continue;
-            }
-            // Only fenced closures are revocation history. Activation
-            // closures share the row kind and must never project as
-            // revocations.
-            if commit.state != GrantClosureState::Fenced {
-                continue;
-            }
-            match &resolved_root {
-                Some(known) if known != root => {
-                    return Err(StoreError::InvalidProjection);
-                }
-                Some(_) => {}
-                None => resolved_root = Some(root.to_owned()),
-            }
-            let mut dependents: Vec<String> = commit
-                .affected
-                .iter()
-                .map(|identity| identity.as_str().to_owned())
-                .collect();
-            dependents.sort();
-            dependents.dedup();
-            let record = RecordedRevocation {
-                closure_id: commit.operation_id.as_str().to_owned(),
-                root_ref: target.to_owned(),
-                dependent_refs: dependents,
-                invalidation_reason: RevocationReason::SourceRevoked,
-                revision: commit.revision,
-            };
-            record.validate()?;
-            matched.push(record);
-        }
+        let mut dependents: Vec<String> = commit
+            .affected
+            .iter()
+            .map(|identity| identity.as_str().to_owned())
+            .collect();
+        dependents.sort();
+        dependents.dedup();
+        let record = RecordedRevocation {
+            closure_id: commit.operation_id.as_str().to_owned(),
+            root_ref: target.to_owned(),
+            dependent_refs: dependents,
+            invalidation_reason: RevocationReason::SourceRevoked,
+            revision: commit.revision,
+        };
+        record.validate()?;
+        matched.push(record);
     }
-    // The rows and the watermark below share the snapshots that served
-    // the pages: an empty matched set with a present watermark attests
-    // zero recorded revocations at its revision; a missing watermark
-    // refuses because absence of history is not evidence.
-    let Some(watermark) = baseline_revision.flatten() else {
+    // The rows and the watermark above share the one snapshot that
+    // served the selected set: an empty matched set with a present
+    // watermark attests zero recorded revocations at its revision; a
+    // missing watermark refuses because absence of history is not
+    // evidence.
+    let Some(watermark) = watermark else {
         return Err(StoreError::ReceiptNotFound);
     };
     if matched.is_empty() {

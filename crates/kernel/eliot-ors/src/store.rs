@@ -348,25 +348,25 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         authority_root: &OpaqueLabel,
     ) -> Result<Option<u64>, OrsError>;
-    /// Scans one bounded page of committed grant-closure rows for one
-    /// lineage selector in operation order (issues #2100/#686).
+    /// Scans the bounded selected set of committed grant-closure rows for
+    /// one lineage selector in operation order (issues #2100/#686).
     ///
     /// `lineage` names a lineage root or one closure target grant.
     /// Selection happens inside the store before any bound applies:
     /// unrelated rows never count against `limit` and total table size
-    /// never refuses a requested view. Returned rows satisfy
-    /// `operation_order > after_order` in increasing operation order, up
-    /// to `limit` rows; the caller pages until an empty page. The second
-    /// tuple element is the durable per-root revision watermark read
-    /// under the SAME read snapshot as the rows, so one page is
-    /// self-consistent: a watermark change across pages proves a
-    /// concurrent mutation and the projector refuses instead of serving
-    /// a torn view. One selector resolving to more than one lineage root
-    /// refuses with [`OrsError::IntegrityProblem`].
+    /// never refuses a requested view. The whole selected set is read
+    /// under ONE durable read snapshot together with the per-root
+    /// revision watermark, so the returned response is self-consistent
+    /// with no cross-page torn views and no paging cursor: rows arrive
+    /// in increasing operation order, up to `limit` rows. A selected set
+    /// larger than `limit` refuses with
+    /// [`OrsError::ProjectionLimitExceeded`] instead of truncating, and
+    /// the refusal happens before receipt/projection work. One selector
+    /// resolving to more than one lineage root refuses with
+    /// [`OrsError::IntegrityProblem`].
     fn scan_grant_closures_for_lineage(
         &self,
         lineage: &OpaqueLabel,
-        after_order: u64,
         limit: u16,
     ) -> Result<(Vec<GrantClosureProjection>, Option<u64>), OrsError>;
     fn activate_capability_introduction(
@@ -6764,17 +6764,17 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
     fn scan_grant_closures_for_lineage(
         &self,
         lineage: &OpaqueLabel,
-        after_order: u64,
         limit: u16,
     ) -> Result<(Vec<GrantClosureProjection>, Option<u64>), OrsError> {
         if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
             return Err(OrsError::InvalidCursorLimit);
         }
-        // One durable read snapshot covers both the selected rows and the
-        // per-root revision watermark, so a returned page is
-        // self-consistent. Selection filters by lineage before any bound
-        // applies: unrelated rows never refuse a requested view, and
-        // paging follows operation order through `after_order`.
+        // One durable read snapshot covers the whole selected set and
+        // the per-root revision watermark, so the returned response is
+        // self-consistent with no paging cursor and no cross-page torn
+        // views. Selection filters by lineage before any bound applies:
+        // unrelated rows never refuse a requested view. An oversize
+        // selected set refuses before receipt/projection work.
         let read = self.database.begin_read().map_err(storage)?;
         let current = read.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
         let mut rows: Vec<(u64, DurableGrantClosureRecord)> = Vec::new();
@@ -6797,9 +6797,6 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             {
                 continue;
             }
-            if record.operation_order <= after_order {
-                continue;
-            }
             match resolved_root.as_deref() {
                 Some(known) if known != commit.authority_root.as_str() => {
                     return Err(OrsError::IntegrityProblem {
@@ -6812,9 +6809,11 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 None => resolved_root = Some(commit.authority_root.as_str().to_owned()),
             }
             rows.push((record.operation_order, record));
+            if rows.len() > usize::from(limit) {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
         }
         rows.sort_by_key(|(order, _)| *order);
-        rows.truncate(usize::from(limit));
         // The watermark resolves to the matched lineage root when rows
         // matched, else to the selector itself; both reads share the
         // snapshot opened above.
