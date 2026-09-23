@@ -30,7 +30,7 @@
 //! planned under. Scope/status/governance strings pass through untouched —
 //! the bridge records them verbatim and this module never reads them.
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{ArtifactId, StateFence};
 use eliot_integration_coverage::{EventCompleteness, GovernanceProfile};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -175,6 +175,52 @@ pub fn assess_reactive_risk(
         profile_fingerprint: profile.fingerprint.clone(),
         fence: fence.clone(),
         critical,
+    })
+}
+
+/// Governor risk attestation bound to one admission material.
+///
+/// This is the typed atom join key between Governor risk and the admission
+/// trace: `atom_id` is the stable identity of the evaluated candidate, and
+/// `assessment` is the owner-state attestation (tier, profile
+/// revision/fingerprint, echoed fence, criticality bit) evaluated under
+/// [`assess_reactive_risk`]. Provenance travels with the binding — profile
+/// revision and fingerprint name the exact GovernanceProfile derivation,
+/// the echoed fence names the evaluation posture — while atom-to-source
+/// resolution stays with the admission join, which owns the candidates.
+/// The binding carries no warning text and decides no admission outcome:
+/// risk evidence stays factual and separate from warning authority, which
+/// the admission join derives from candidate-owned epistemic signals.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AtomRiskBinding {
+    /// Stable identity of the risk-assessed material.
+    pub atom_id: ArtifactId,
+    /// Owner-state risk attestation for this material.
+    pub assessment: ReactiveRiskAssessment,
+}
+
+/// Binds one Governor risk attestation to one admission material.
+///
+/// Pure threading of [`assess_reactive_risk`] over owner state with the
+/// atom join key attached: the same evidence set is required and the same
+/// withholds apply (`MissingGovernanceProfile`, `UnverifiedProfile`,
+/// `StaleEvidence`, `InvalidFence`) — a bound material is never a guessed
+/// tier. No reads, no clock, no I/O, no minted state beyond the binding.
+///
+/// # Errors
+///
+/// Returns [`ReactiveAdmissionError`] on any missing/invalid evidence, with
+/// exactly the [`assess_reactive_risk`] semantics above.
+pub fn bind_atom_risk(
+    profile: Option<&GovernanceProfile>,
+    critical: bool,
+    fence: &StateFence,
+    atom_id: ArtifactId,
+) -> Result<AtomRiskBinding, ReactiveAdmissionError> {
+    Ok(AtomRiskBinding {
+        atom_id,
+        assessment: assess_reactive_risk(profile, critical, fence)?,
     })
 }
 

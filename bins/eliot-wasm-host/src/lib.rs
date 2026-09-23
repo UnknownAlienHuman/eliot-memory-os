@@ -25,8 +25,13 @@ mod artifact_preflight;
 mod child_engine;
 mod cli_contract;
 mod contour;
+mod dispatch_drive;
+mod dispatch_material;
 mod guest_exec;
 mod installed_binary;
+mod parent_authority;
+mod parent_dispatch;
+mod parent_runtime;
 mod shadow;
 mod typed_bindings;
 mod typed_execution;
@@ -45,6 +50,22 @@ pub use contour::{
     STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
     authorize_host_call, check_activation_imports, check_admitted_request,
 };
+pub use dispatch_drive::{
+    DispatchDriveResponse, DriveAdmission, DriveError, GUEST_EXEC_ARGV0_HINT, LifecycleVerdicts,
+    OwnerRecords, SeatedVerdicts, assemble_owner_records, drive_admission, drive_dispatch,
+    evaluate_lifecycle_verdicts, evaluate_seated_verdicts, guest_exec_argv,
+};
+pub use dispatch_material::{
+    DISPATCH_MATERIAL_MAX_BYTES, WASM_DISPATCH_MATERIAL_WIRE_ID,
+    WASM_DISPATCH_MATERIAL_WIRE_VERSION, WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+    WASM_HOST_GUEST_INPUT_FILE_NAME, WASM_HOST_MATERIAL_FILE_NAME, DispatchMaterialInput,
+    MaterialError, ValidatedAssuranceInput, ValidatedDispatchGrant, ValidatedDispatchMaterial,
+    ValidatedGuestCeilings, ValidatedGuestCeilingsInput, ValidatedManifestInput,
+    ValidatedManifestRecord, ValidatedPromotionInput, ValidatedPromotionRecord,
+    ValidatedSnapshotInput, ValidatedSnapshotRecord, ValidatedWorkInput, ValidatedWorkRecord,
+    ValidatedAssuranceRecord, admitted_material_path, bind_dispatch_material, consume_staged,
+    read_dispatch_material, read_dispatch_material_from, read_staged_bytes,
+};
 pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
     GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,
@@ -53,6 +74,9 @@ pub use guest_exec::{
 pub use installed_binary::{
     InstalledBinary, InstalledBinaryError, WasmHostBinaryBinding, resolve_installed_binary,
 };
+pub use parent_dispatch::drive_parent_dispatch;
+pub use parent_authority::{ParentDispatchAuthority, edge_now_ms};
+pub use parent_runtime::{GovernorPorts, drive_parent_runtime};
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
     LEGACY_EXPORT, LEGACY_WORLD, TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld,

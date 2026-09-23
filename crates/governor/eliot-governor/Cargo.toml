@@ -23,11 +23,14 @@ eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", ve
 eliot-evidence.workspace = true
 eliot-finish.workspace = true
 eliot-integration-coverage.workspace = true
+eliot-kernel-core.workspace = true
 eliot-maintenance.workspace = true
 eliot-mcp.workspace = true
 eliot-module-registry.workspace = true
 eliot-observation.workspace = true
 eliot-observation-contracts.workspace = true
+eliot-ors.workspace = true
+eliot-platform.workspace = true
 eliot-problem.workspace = true
 eliot-protocol.workspace = true
 eliot-read = { path = "../eliot-read", version = "0.1.0" }

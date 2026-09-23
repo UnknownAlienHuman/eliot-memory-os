@@ -35,11 +35,13 @@ mod lifecycle_persist_tests;
 mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
+mod notify_grant;
 mod process_execution_client;
 mod protocol;
 mod reactive_state;
 #[cfg(test)]
 mod reactive_state_tests;
+mod owner_history;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
@@ -56,6 +58,7 @@ mod user_automation_failure_history_tests;
 mod user_automation_store;
 #[cfg(test)]
 mod user_automation_store_tests;
+mod wasm_dispatch;
 mod write_coordinator;
 
 pub use capacity_evidence::{
@@ -102,6 +105,10 @@ pub use notification_state::{
     NotificationStateReadResponse, NotificationStateRequest, NotificationStateResponse,
     handle_notification_state_read, handle_notification_state_request,
     reconcile_notification_state,
+};
+pub use notify_grant::{
+    NOTIFY_GRANT_OPERATION_PREFIX, NOTIFY_IMAGE_FILE_NAME, NotifyGrantInputs,
+    NotifyLaunchAuthorization, bind_notify_launch_grant,
 };
 pub use process_execution_client::{
     KernelProcessExecutionClient, ProcessOperationFuture, ProcessOperationPort, ProcessStarter,
@@ -162,6 +169,7 @@ pub use store_client::{
 };
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;
+pub use owner_history::serve_authority_revocation_history;
 pub use store_write_reservation::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
     RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,
@@ -206,6 +214,18 @@ pub use user_automation_failure_history::{
     StoreUserAutomationFailureHistory, build_failure_transition,
 };
 pub use user_automation_store::CanonicalUserAutomationStore;
+pub use wasm_dispatch::{
+    JoinDeny, WASM_DISPATCH_AUTHORITY_PREFIX, WASM_DISPATCH_DERIVATION_DOMAIN,
+    WASM_DISPATCH_GRANT_WINDOW_MS, WASM_DISPATCH_LAUNCH_GRANT_HEAD,
+    WASM_DISPATCH_MATERIAL_WIRE_ID, WASM_DISPATCH_MATERIAL_WIRE_VERSION,
+    WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
+    WASM_HOST_MATERIAL_FILE_NAME, WasmAssuranceRecord, WasmDispatchDerivation, WasmDispatchError,
+    WasmDispatchGrant, WasmDispatchMaterial, WasmGuestCeilings, WasmJoinGate, WasmJoinTable,
+    WasmManifestRecord, WasmOwnerClaim, WasmPromotionRecord, WasmPublishedBundle,
+    WasmSnapshotRecord, WasmWorkRecord, material_bytes, publish_wasm_dispatch_bundle,
+    publish_wasm_dispatch_material, wasm_dispatch_derivation,
+    wasm_dispatch_derivation_from_epoch_json, wasm_dispatch_grant_for, wasm_join_gate,
+};
 pub use write_coordinator::{
     CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,
     default_executor_lanes,

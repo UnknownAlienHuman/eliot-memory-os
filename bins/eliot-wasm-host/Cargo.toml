@@ -19,10 +19,16 @@ eliot-profile-d2-operational = []
 eliot-profile-full-composition = []
 
 [dependencies]
+eliot-contracts.workspace = true
+eliot-platform.workspace = true
 eliot-process-executor.workspace = true
 eliot-process.workspace = true
 eliot-runtime.workspace = true
+eliot-runtime-contracts.workspace = true
+eliot-security-contracts.workspace = true
 eliot-wasm-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 wasmtime.workspace = true
 thiserror.workspace = true
 
