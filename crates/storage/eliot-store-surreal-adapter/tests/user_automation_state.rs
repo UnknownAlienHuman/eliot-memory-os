@@ -180,6 +180,7 @@ fn invocation_for(automation_id: &str, revision: &str, nonce: &str) -> (String, 
         workdir_ref: "workdir-1".to_owned(),
         trigger_origin: UserAutomationTriggerOrigin::Human,
         child_depth: 0,
+        provenance: None,
     };
     invocation.validate().expect("fixture invocation valid");
     let occurrence_id = invocation

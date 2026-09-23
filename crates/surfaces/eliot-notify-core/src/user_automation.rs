@@ -362,6 +362,7 @@ mod tests {
             workdir_ref: "workdir-1".to_owned(),
             trigger_origin: eliot_kernel_core::UserAutomationTriggerOrigin::Human,
             child_depth: 0,
+            provenance: None,
         };
         let replay = invocation.clone();
         assert_eq!(
