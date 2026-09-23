@@ -324,16 +324,10 @@ async fn serve_connection(
                 // first; unknown operations never reach this arm (dispatch
                 // fences them) and any handler failure fences the session
                 // instead of silently dropping the submit.
-                let reply = if operation
-                    == crate::testd_terminal_completion_route::OPERATION
-                {
+                let reply = if operation == eliot_kernel::TESTD_TERMINAL_COMPLETION_OPERATION {
                     kernel
                         .execute_testd_terminal_completion(
-                            &session,
-                            request_id,
-                            &identity,
-                            &operation,
-                            payload,
+                            &session, request_id, &identity, &operation, payload,
                         )
                         .await?
                 } else {

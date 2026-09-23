@@ -1399,12 +1399,8 @@ impl KernelComposition {
                 .service
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
-            super::dispatch_launch::read_testd_terminal_completion(
-                &service,
-                identity,
-                &request,
-            )
-            .map_err(|_| TransportError::SessionFenced)?
+            super::dispatch_launch::read_testd_terminal_completion(&service, &request)
+                .map_err(|_| TransportError::SessionFenced)?
         };
         let mut reply = status_frame(
             session,

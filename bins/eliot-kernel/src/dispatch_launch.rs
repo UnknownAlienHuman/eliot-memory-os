@@ -104,8 +104,8 @@ use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
-    KernelService, KernelServiceError, KernelServiceState, NATIVE_WORKER_CLAIM_WIRE_ID, NativeWorkerClaimReceipt,
-    NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
+    KernelService, KernelServiceError, KernelServiceState, NATIVE_WORKER_CLAIM_WIRE_ID,
+    NativeWorkerClaimReceipt, NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
     TestdAdmissionAttemptRequest, TestdAdmissionEnvelope, TestdAdmissionResponse,
     advertise_doctor_repair, advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
     handle_testd_admission_attempt, reconcile_testd_admission,
@@ -116,11 +116,10 @@ use eliot_ors::{
 };
 use eliot_process::OperationId;
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
-use eliot_protocol::RequestIdentity;
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    JobState as TestdJobState, ProcessAdmission, RetryPolicy, TestdStore,
-    TestdVerifierDispatchBinding, TESTD_PRODUCTIVE_PROFILE, verification_receipt_sha256,
+    JobState as TestdJobState, ProcessAdmission, RetryPolicy, TESTD_PRODUCTIVE_PROFILE, TestdStore,
+    TestdVerifierDispatchBinding, verification_receipt_sha256,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1175,15 +1174,11 @@ fn capture_testd_launch_owner_binding(
 /// The transport request never supplies a task, operation, plan, or verdict.
 pub(crate) fn read_testd_terminal_completion(
     service: &KernelService,
-    identity: &RequestIdentity,
     request: &super::testd_terminal_completion_route::Request,
 ) -> Result<super::testd_terminal_completion_route::Response, DispatchLaunchError> {
     request
         .validate()
         .map_err(DispatchLaunchError::InvalidMaterial)?;
-    identity
-        .validate()
-        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
     if !matches!(
         service.state(),
         KernelServiceState::Ready | KernelServiceState::Degraded
@@ -1195,11 +1190,9 @@ pub(crate) fn read_testd_terminal_completion(
     let contour = DISPATCH_CONTOUR
         .get()
         .ok_or(DispatchLaunchError::Uncomposed("testd front door"))?;
-    let authenticated_session = AuthenticatedTestdSession::bind(
-        service,
-        contour.principal_owner.as_str(),
-    )
-    .map_err(gate_error)?;
+    let authenticated_session =
+        AuthenticatedTestdSession::bind(service, contour.principal_owner.as_str())
+            .map_err(gate_error)?;
     let retained = {
         let launches = launches_table(contour)?;
         launches.by_identity.get(&request.job_id).cloned()
@@ -1207,15 +1200,15 @@ pub(crate) fn read_testd_terminal_completion(
     .ok_or_else(|| DispatchLaunchError::Gate("TestD launch owner is absent".to_owned()))?;
     if retained.kind != DispatchedWorkerKind::Testd
         || retained.identity != request.job_id
-        || !matches!(retained.phase, LaunchPhase::Launched | LaunchPhase::Reconciled)
-        || retained
-            .testd_admission
-            .as_ref()
-            .is_none_or(|admission| {
-                admission.job_id != request.job_id
-                    || admission.admission_digest != retained.admission_digest
-                    || admission.request_digest != retained.request_digest
-            })
+        || !matches!(
+            retained.phase,
+            LaunchPhase::Launched | LaunchPhase::Reconciled
+        )
+        || retained.testd_admission.as_ref().is_none_or(|admission| {
+            admission.job_id != request.job_id
+                || admission.admission_digest != retained.admission_digest
+                || admission.request_digest != retained.request_digest
+        })
     {
         return Err(DispatchLaunchError::Gate(
             "terminal request does not bind the retained TestD launch".to_owned(),
@@ -1276,7 +1269,6 @@ pub(crate) fn read_testd_terminal_completion(
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let invocation_digest = sha256_hex(&invocation_bytes);
     if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
-        || binding.request_identity != *identity
         || binding.operation_id != job.process.operation_id.as_str()
         || owner_binding.verifier_dispatch.as_ref() != Some(binding)
         || job.process != owner_binding.process
@@ -1327,19 +1319,21 @@ pub(crate) fn read_testd_terminal_completion(
         if receipt.status != WriteReceiptStatus::Committed
             || receipt.operation_id.as_str() != expected_operation
             || receipt.idempotency_key != expected_idempotency
-            || receipt.state_fence != identity.request.state_fence
+            || receipt.state_fence != binding.request_identity.request.state_fence
         {
             return Err(DispatchLaunchError::Gate(
                 "stored terminal acknowledgement is not the exact committed Governor receipt"
                     .to_owned(),
             ));
         }
-        return Ok(super::testd_terminal_completion_route::Response::Committed {
-            job_id: request.job_id.clone(),
-            receipt_sha256: request.receipt_sha256.clone(),
-            request_digest: request.request_digest.clone(),
-            receipt,
-        });
+        return Ok(
+            super::testd_terminal_completion_route::Response::Committed {
+                job_id: request.job_id.clone(),
+                receipt_sha256: request.receipt_sha256.clone(),
+                request_digest: request.request_digest.clone(),
+                receipt,
+            },
+        );
     }
     Ok(super::testd_terminal_completion_route::Response::Pending {
         job_id: request.job_id.clone(),
@@ -3002,18 +2996,11 @@ pub fn prepare_testd_launch(
             .service
             .lock()
             .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
-        let session = AuthenticatedTestdSession::bind(
-            &service,
-            contour.principal_owner.as_str(),
-        )
-        .map_err(gate_error)?;
-        let response = handle_testd_admission_attempt(
-            &service,
-            &session,
-            material.request,
-            now_unix_nanos,
-        )
-        .map_err(gate_error)?;
+        let session = AuthenticatedTestdSession::bind(&service, contour.principal_owner.as_str())
+            .map_err(gate_error)?;
+        let response =
+            handle_testd_admission_attempt(&service, &session, material.request, now_unix_nanos)
+                .map_err(gate_error)?;
         (
             session.authority_epoch().clone(),
             session.generation(),

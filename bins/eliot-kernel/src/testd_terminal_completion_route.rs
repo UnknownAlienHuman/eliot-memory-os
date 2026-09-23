@@ -6,7 +6,8 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_store_api::WriteReceipt;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const OPERATION: &str = "eliot.kernel.testd-terminal-completion";
+/// Authenticated operation name used by TestD terminal completion.
+pub const OPERATION: &str = "eliot.kernel.testd-terminal-completion";
 pub(crate) const WIRE_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -76,8 +77,7 @@ pub(crate) fn request_from_payload(payload: &serde_json::Value) -> Result<Reques
         .get("request")
         .cloned()
         .ok_or_else(|| "terminal request is absent".to_owned())?;
-    let request: Request =
-        serde_json::from_value(value).map_err(|error| error.to_string())?;
+    let request: Request = serde_json::from_value(value).map_err(|error| error.to_string())?;
     request.validate()?;
     Ok(request)
 }

@@ -13,7 +13,7 @@ use eliot_instrument_api::InstrumentInvocation;
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    TestdStore, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding, TestJob,
+    TestJob, TestdStore, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
     verification_receipt_sha256,
 };
 
@@ -143,8 +143,8 @@ impl DaemonComposition {
             .as_ref()
             .map(|revision| revision.value())
             .ok_or_else(|| completion_error("admitted request has no task revision"))?;
-        let operation_id = OperationId::new(job.process.operation_id.clone())
-            .map_err(completion_error)?;
+        let operation_id =
+            OperationId::new(job.process.operation_id.clone()).map_err(completion_error)?;
         let binding = self.testd_verifier_dispatch_binding(
             identity,
             &operation_id,
@@ -161,7 +161,7 @@ impl DaemonComposition {
     /// receipt is the canonical WriteReceipt from Governor; the durable TestD
     /// row is updated only after that commit has been observed.
     pub async fn publish_testd_terminal_completion(
-        &mut self,
+        &self,
         notice: &TestdTerminalCompletionNotice,
         testd: &TestdStore,
     ) -> Result<WriteReceipt, DaemonError> {
@@ -182,25 +182,24 @@ impl DaemonComposition {
             .verification_receipt
             .as_ref()
             .ok_or_else(|| completion_error("durable finish receipt is absent"))?;
-        if verification_receipt_sha256(receipt).map_err(completion_error)?
-            != notice.receipt_sha256
+        if verification_receipt_sha256(receipt).map_err(completion_error)? != notice.receipt_sha256
         {
             return Err(completion_error(
                 "terminal notification does not bind the exact durable finish receipt",
             ));
         }
         if job.lease.is_some() {
-            return Err(completion_error("TestD job still has an active worker lease"));
+            return Err(completion_error(
+                "TestD job still has an active worker lease",
+            ));
         }
         let binding = job
             .verifier_dispatch
             .as_ref()
             .ok_or_else(|| completion_error("pre-dispatch Governor binding is absent"))?;
-        binding
-            .validate_for_job(&job)
-            .map_err(completion_error)?;
-        let bound_plan: CanonicalPlanBinding = serde_json::from_str(&binding.canonical_plan_json)
-            .map_err(completion_error)?;
+        binding.validate_for_job(&job).map_err(completion_error)?;
+        let bound_plan: CanonicalPlanBinding =
+            serde_json::from_str(&binding.canonical_plan_json).map_err(completion_error)?;
         bound_plan.validate().map_err(completion_error)?;
         let current_plan = self
             .governor
@@ -252,8 +251,7 @@ impl DaemonComposition {
                     "Governor reported an existing verifier fact without its committed WriteReceipt",
                 )
             })?;
-        validate_committed_receipt(&committed, binding, &operation_id)
-            .map_err(completion_error)?;
+        validate_committed_receipt(&committed, binding, &operation_id).map_err(completion_error)?;
         let bytes = canonical_json_bytes(&committed).map_err(completion_error)?;
         let receipt_json = String::from_utf8(bytes).map_err(completion_error)?;
         testd
@@ -271,7 +269,7 @@ impl DaemonComposition {
     /// daemon reactive-feed owner calls this API; each item is rehydrated and
     /// committed independently before its canonical receipt is recorded.
     pub async fn publish_pending_testd_terminal_completions(
-        &mut self,
+        &self,
         testd: &TestdStore,
         limit: usize,
     ) -> Result<Vec<WriteReceipt>, DaemonError> {
@@ -305,7 +303,9 @@ fn validate_committed_receipt(
         || receipt.idempotency_key != expected_idempotency
         || receipt.state_fence != binding.request_identity.request.state_fence
     {
-        return Err("Governor response is not the exact committed verifier WriteReceipt".to_owned());
+        return Err(
+            "Governor response is not the exact committed verifier WriteReceipt".to_owned(),
+        );
     }
     Ok(())
 }
