@@ -38,8 +38,13 @@
 //! deterministic restore identity, no receipt synthesis, no blind retry,
 //! no cutover/activation/retirement.
 
-use eliot_backup::{BackupBundle, BackupError, RestorePlan};
-use eliot_contracts::{RequestMetadata, StateFence};
+use std::num::NonZeroU64;
+use std::path::Path;
+
+use eliot_backup::{BackupBundle, BackupError, RestoreContext, RestorePlan};
+use eliot_contracts::{
+    EpochId, EpochLineageId, RequestMetadata, ResourceGeneration, StateFence,
+};
 use eliot_store_api::{
     OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, WriteReceipt,
 };
@@ -53,9 +58,11 @@ use super::backup_restore_admission::{
     KernelRestoreAdmission, RestoreAdmissionMintRequest, RestoreProvisioningProof,
     mint_restore_admission,
 };
+use super::backup_restore::KernelBackupRestore;
 use super::backup_restore_ports::{
-    KernelIsolatedDestination, KernelRestoreJournal, kernel_to_backup,
+    KernelIsolatedDestination, KernelRestoreJournal, check_kernel_effect_fence, kernel_to_backup,
 };
+use eliot_ors::CapabilityIntroductionProjection;
 
 /// One Governor-built coordination commit: the coordination transition
 /// plus its execution context and expectations.
@@ -110,6 +117,11 @@ pub struct ProductionRestoreRequest<'a> {
     pub coordination: CoordinationCommit,
     /// Governor-built restore-class imports in execution order.
     pub imports: Vec<RestoreImport>,
+    /// Console-presented capability introductions, verified live against
+    /// owner/ORS readback by the journal owner before any effect (F-AUR-1).
+    /// An empty list verifies vacuously (a restore with no capability
+    /// introductions has nothing to compare).
+    pub introductions: Vec<CapabilityIntroductionProjection>,
 }
 
 /// Observed outcome of one restore-class import: its receipt plus its
@@ -169,6 +181,7 @@ pub async fn drive_production_restore(
         provisioning,
         coordination,
         imports,
+        introductions,
     } = request;
     let admission: KernelRestoreAdmission = mint_restore_admission(RestoreAdmissionMintRequest {
         plan,
@@ -180,6 +193,14 @@ pub async fn drive_production_restore(
         provisioning,
     })
     .map_err(OwnerChannelError::Backup)?;
+    // F-AUR-1: console-presented capability introductions are compared
+    // against live owner/ORS readback by the journal owner before any
+    // effect (subject, fence, order, phase). Shape-only checks never
+    // suffice; this gate refuses forged/stale/active rows closed.
+    journal
+        .verify_introductions_fenced(&introductions)
+        .map_err(kernel_to_backup)
+        .map_err(OwnerChannelError::Backup)?;
     let decision =
         CoordinationDecision::from_admission(&admission).map_err(OwnerChannelError::Backup)?;
     let client: CanonicalStoreImportClient = channels.store_import_client(verified);
@@ -278,6 +299,9 @@ pub struct ProductionRestoreCall<'a> {
     /// Governor-built restore-class imports in execution order (owning
     /// lane: Governor/eliotd).
     pub imports: Vec<RestoreImport>,
+    /// Console-presented capability introductions, verified live against
+    /// owner/ORS readback by the journal owner before any effect (F-AUR-1).
+    pub introductions: Vec<CapabilityIntroductionProjection>,
 }
 
 /// Invokes production restore for the H5 operator path.
@@ -307,6 +331,7 @@ pub async fn drive_production(
         provisioning,
         coordination,
         imports,
+        introductions,
     } = call;
     journal
         .require_production_admitted()
@@ -331,6 +356,7 @@ pub async fn drive_production(
         provisioning,
         coordination,
         imports,
+        introductions,
     })
     .await
 }
