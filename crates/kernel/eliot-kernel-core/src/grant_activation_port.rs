@@ -3437,15 +3437,20 @@ fn derive_closure_fence(
     }
     let affected = closure_affected_set(enumeration);
     let affected_set: BTreeSet<&str> = affected.iter().map(String::as_str).collect();
+    // Preserved-survivor membership (`#2100` C73-F1): every declared
+    // survivor must prove covering authority at the current revision and
+    // fence. A declaration from an older revision is never carried
+    // silently and never dropped silently — each survivor is proven or
+    // the enumeration refuses.
     for survivor in &enumeration.preserved {
-        if let Some(record) = ledger.grants.get(&survivor.grant_id)
-            && record.status != LiveStatus::Active
-        {
-            return Err(KernelError::InvalidField {
-                field: "enumeration.preserved",
-                reason: "a declared survivor is not live authority",
-            });
-        }
+        prove_survivor_membership(
+            ledger,
+            boundary,
+            active_epoch,
+            request,
+            &affected_set,
+            survivor,
+        )?;
     }
     let preserved_set: BTreeSet<&str> = enumeration
         .preserved
@@ -3532,6 +3537,108 @@ fn derive_closure_fence(
         members,
         unknown_target: false,
     })
+}
+
+/// Proves one declared survivor still carries covering authority at the
+/// current revision and fence (`#2100` C73-F1).
+///
+/// A survivor is preserved, never fenced, so its survival must be proven
+/// on every closure that carries it: a declaration from an older revision
+/// is never carried silently, and a lapsed cover is never dropped
+/// silently — each survivor is proven or the enumeration refuses:
+///
+/// - the survivor itself, when live-recorded, must be `Active` on the
+///   closure root and fence contour (existing gate, kept);
+/// - the declared covering grant must prove CURRENT authority: a live
+///   `Active` record on the declared covering root and fence contour,
+///   or (e.g. after a restart, before live rehydration) an `Active`
+///   durable row bound to the presented fence and epoch. A covering
+///   grant fenced by this same closure, recorded non-`Active`, revoked,
+///   missing, or contour-mismatched refuses instead of preserving stale
+///   authority.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] for a non-live or
+/// contour-disagreeing live record, [`KernelError::FenceMismatch`] for a
+/// root or fence disagreement, and [`KernelError::RecoveryUnavailable`]
+/// when no durable covering authority exists or the durable row
+/// disagrees.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the survivor gate binds ledger, store, epoch, request, affected set, and survivor explicitly"
+)]
+fn prove_survivor_membership(
+    ledger: &PortLedger,
+    boundary: &DurableRootGrantBoundary,
+    active_epoch: &EpochId,
+    request: &GrantClosureRevocationIntent,
+    affected_set: &BTreeSet<&str>,
+    survivor: &GrantClosureSurvivor,
+) -> Result<(), KernelError> {
+    if let Some(record) = ledger.grants.get(&survivor.grant_id) {
+        if record.status != LiveStatus::Active {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.preserved",
+                reason: "a declared survivor is not live authority",
+            });
+        }
+        if record.authority_root_ref != request.authority_root_ref {
+            return Err(KernelError::FenceMismatch);
+        }
+        if record.binding.state_fence != request.binding.state_fence {
+            return Err(KernelError::FenceMismatch);
+        }
+    }
+    if affected_set.contains(survivor.covering_grant_id.as_str()) {
+        return Err(KernelError::InvalidField {
+            field: "enumeration.preserved",
+            reason: "a declared survivor cover is fenced by this closure",
+        });
+    }
+    if ledger.revoked_grants.contains(&survivor.covering_grant_id) {
+        return Err(KernelError::InvalidField {
+            field: "enumeration.preserved",
+            reason: "a declared survivor cover is fenced",
+        });
+    }
+    if let Some(covering) = ledger.grants.get(&survivor.covering_grant_id) {
+        if covering.status != LiveStatus::Active {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.preserved",
+                reason: "a declared survivor cover is not live authority",
+            });
+        }
+        if covering.authority_root_ref != survivor.covering_root_ref {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.preserved",
+                reason: "a declared survivor cover disagrees with its declared root",
+            });
+        }
+        if covering.binding.state_fence != request.binding.state_fence {
+            return Err(KernelError::FenceMismatch);
+        }
+        return Ok(());
+    }
+    let subject = OperationIdentity::new(&survivor.covering_grant_id)
+        .map_err(KernelError::RecoveryState)?;
+    let projection = boundary
+        .store
+        .load_capability_grant(&subject)
+        .map_err(|error| map_ors_recovery_error(&error))?
+        .ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "survivor covering path has no durable authority; stale survivor evidence"
+                    .to_owned(),
+            )
+        })?;
+    if projection.phase() != OperationalPhase::Active {
+        return Err(KernelError::RecoveryUnavailable(
+            "survivor covering path is fenced; stale survivor evidence".to_owned(),
+        ));
+    }
+    check_opaque_record_binding(projection.record(), &request.binding, active_epoch)?;
+    Ok(())
 }
 
 /// Ledger-only fence derivation: the recorded live descendant closure, or an
