@@ -19,7 +19,9 @@ eliot-agent-bridge-core.workspace = true
 eliot-agent-contracts.workspace = true
 eliot-agent-coordinator.workspace = true
 eliot-authority.workspace = true
+eliot-cognitive-quality = { path = "../../crates/smart/eliot-cognitive-quality", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-context-contracts.workspace = true
 eliot-config.workspace = true
 eliot-controlboard.workspace = true
 eliot-doctor-core.workspace = true
@@ -28,13 +30,21 @@ eliot-dreamer-candidate-validation = { path = "../../crates/smart/eliot-dreamer-
 eliot-dreamer-claim-grounding = { path = "../../crates/smart/eliot-dreamer-claim-grounding", version = "0.1.0" }
 eliot-dreamer-probe-plan = { path = "../../crates/smart/eliot-dreamer-probe-plan", version = "0.1.0" }
 eliot-dreamer-rival-model = { path = "../../crates/smart/eliot-dreamer-rival-model", version = "0.1.0" }
+eliot-dreamer-contracts.workspace = true
 eliot-evaluation-contracts.workspace = true
+eliot-epistemic-contracts.workspace = true
+eliot-experience-provider = { path = "../../crates/smart/eliot-experience-provider", version = "0.1.0" }
 eliot-governor.workspace = true
+eliot-instrument-api.workspace = true
+eliot-testd-core.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
+eliot-learning-contracts.workspace = true
 eliot-maintenance.workspace = true
+eliot-memory-quality = { path = "../../crates/smart/eliot-memory-quality", version = "0.1.0" }
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
 eliot-observation.workspace = true
+eliot-observation-contracts.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
@@ -45,6 +55,7 @@ eliot-runtime-contracts.workspace = true
 eliot-security-contracts.workspace = true
 eliot-skill.workspace = true
 eliot-store-api.workspace = true
+eliot-understanding-assessment.workspace = true
 eliot-watchdog-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

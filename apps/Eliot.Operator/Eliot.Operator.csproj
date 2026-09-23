@@ -35,4 +35,13 @@
           DestinationFiles="@(_GeneratedWinUiXbf->'$(PublishDir)%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true" />
   </Target>
+
+  <Target Name="WriteOperatorBuildReceipt"
+          AfterTargets="Publish"
+          DependsOnTargets="CopyGeneratedWinUiResourcesToPublishDirectory"
+          Condition="'$(OperatorBuildReceiptPath)' != ''">
+    <Error Condition="'$(OperatorBuildReceiptWriterPath)' == '' or '$(OperatorBuildReceiptRepositoryRoot)' == '' or '$(OperatorBuildReceiptSourceCommit)' == '' or '$(OperatorBuildReceiptInvocationId)' == '' or '$(OperatorBuildReceiptDotnetPath)' == '' or '$(OperatorBuildReceiptPowerShellPath)' == ''"
+           Text="Operator build receipt properties are incomplete." />
+    <Exec Command="&quot;$(OperatorBuildReceiptPowerShellPath)&quot; -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(OperatorBuildReceiptWriterPath)&quot; -RepositoryRoot &quot;$(OperatorBuildReceiptRepositoryRoot)&quot; -PublishDirectory &quot;$([System.IO.Path]::TrimEndingDirectorySeparator('$(PublishDir)'))&quot; -ReceiptPath &quot;$(OperatorBuildReceiptPath)&quot; -SourceCommit &quot;$(OperatorBuildReceiptSourceCommit)&quot; -InvocationId &quot;$(OperatorBuildReceiptInvocationId)&quot; -DotnetPath &quot;$(OperatorBuildReceiptDotnetPath)&quot; -TargetFramework &quot;$(TargetFramework)&quot; -RuntimeIdentifier &quot;$(RuntimeIdentifier)&quot; -Platform &quot;$(PlatformTarget)&quot; -Configuration &quot;$(Configuration)&quot; -RestoreLockedMode &quot;$(RestoreLockedMode)&quot; -SelfContained &quot;$(SelfContained)&quot; -WindowsAppSDKSelfContained &quot;$(WindowsAppSDKSelfContained)&quot; -UseWinUI &quot;$(UseWinUI)&quot; -WindowsPackageType &quot;$(WindowsPackageType)&quot; -DotnetSdk &quot;$(NETCoreSdkVersion)&quot; -MSBuildVersion &quot;$(MSBuildVersion)&quot;" />
+  </Target>
 </Project>

@@ -18,6 +18,8 @@ use thiserror::Error;
 
 mod experience_projection;
 pub use experience_projection::*;
+mod failure_observation;
+pub use failure_observation::*;
 mod experience_records;
 pub use experience_records::*;
 mod record_family_v2;

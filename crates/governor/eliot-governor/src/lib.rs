@@ -40,6 +40,7 @@ mod context_inputs;
 mod cue_composition;
 mod epistemic_composition;
 mod experience_commit;
+mod finish_attempt;
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
@@ -51,9 +52,12 @@ pub use cue_composition::{
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
+pub use finish_attempt::{FinishAttemptError, GovernorFinishAttempt};
 mod controlboard_projection;
 mod observation_reconciliation;
 mod operator_reconciliation;
+mod owner_closure_feed;
+mod owner_closure_provider;
 mod owner_projection_refresh;
 mod reactive_admission;
 mod skill_lifecycle;
@@ -82,7 +86,10 @@ pub use controlboard_projection::{
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
-pub use eliot_canonical::CanonicalWriteEnvelope;
+pub use eliot_canonical::{
+    CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome,
+};
+pub use eliot_finish::FinishDecisionReceipt;
 /// Task lifecycle domain types re-exported so the daemon composition root
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
@@ -92,8 +99,14 @@ pub use observation_reconciliation::{
     WatchdogEntryKind,
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
+pub use owner_closure_feed::{OwnerPublishPort, publish_owner_feed, synchronize_owner_feed};
+pub use owner_closure_provider::{
+    GrantAdmissionParams, IntroductionAdmissionParams, OWNER_HYDRATION_SNAPSHOT_SCHEMA,
+    OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider, PreservedAdmission,
+};
 pub use reactive_admission::{
-    ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier, assess_reactive_risk,
+    AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
+    assess_reactive_risk, bind_atom_risk,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;

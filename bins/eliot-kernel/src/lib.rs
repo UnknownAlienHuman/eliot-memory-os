@@ -54,6 +54,10 @@ pub mod kernel_diagnostics;
 mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
+mod testd_terminal_completion_route;
+
+/// Public wire-operation name for the authenticated TestD completion route.
+pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
 
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
@@ -216,8 +220,9 @@ use eliot_ipc::{
     ServerHandshakePolicy, Session, TransportError, TransportLimits,
 };
 use eliot_kernel_core::{
-    AuthoritySnapshotBinding, DispatchSnapshotCodec, GenerationRoute, GenerationRouter,
-    KernelError, ProcessDispatchAuthorityController, RouteScope,
+    AuthoritySnapshotBinding, BoundCanonicalOwner, DispatchSnapshotCodec, GenerationRoute,
+    GenerationRouter, GovernorClosureRestore, KernelError, ProcessDispatchAuthorityController,
+    RouteScope, bind_canonical_owner, owner_bundle_digest,
 };
 #[cfg(windows)]
 pub use eliot_kernel_service::KernelStoreGateway;
@@ -323,7 +328,7 @@ use eliot_protocol::{
     AgentBridgeActivationDisposition, AgentBridgeActivationFence, AgentBridgeActivationRequest,
     AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration,
     AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind,
-    MessageType, ProtocolPayload,
+    MessageType, ProtocolPayload, RequestIdentity,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 #[cfg(test)]
@@ -533,6 +538,20 @@ pub struct KernelComposition {
     /// Material/Critical admission paths instead of inferring readiness from
     /// process liveness or pipe availability.
     startup_coordinator: Mutex<StartupCoordinator>,
+    /// Canonical P-07 durable owner binding (`#2100`). `None` until the
+    /// Governor feed publishes the first owner bundle; `Some` once
+    /// [`KernelComposition::bind_p07_owner`] binds the port at the exact
+    /// admitted revision. Refresh and recovery rebind through the same
+    /// retained ORS handle below, never through a second store.
+    p07_owner: Mutex<Option<BoundCanonicalOwner>>,
+    /// Canonical content digest of the bound owner bundle, computed by the
+    /// one shared definition both sides call. The owner readback serves it
+    /// so the Governor feed can prove the Kernel bound its exact bytes.
+    p07_owner_digest: Mutex<Option<String>>,
+    /// ORS handle retained for P-07 owner bind/refresh/recovery. Cloned
+    /// from the assembly store so later owner operations never reopen the
+    /// database file or invent a second recovery store.
+    p07_ors: Arc<RedbRecoveryStore>,
 }
 
 #[cfg(windows)]
@@ -882,6 +901,9 @@ pub enum KernelFrameAction {
     Testd {
         /// Correlation identity to echo in the response.
         request_id: RequestId,
+        /// Exact authenticated owner identity from the EBP frame. The
+        /// terminal route compares it with the durable pre-dispatch binding.
+        identity: RequestIdentity,
         /// Closed operation name; must equal `TESTD_ADMISSION_WIRE_ID`.
         operation: String,
         /// Bounded operation payload carrying the typed admission request.

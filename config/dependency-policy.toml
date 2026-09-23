@@ -1,6 +1,8 @@
 schema = "eliot.dependency-policy.v1"
 issue = 1229
-updated_at = "2026-09-22"
+updated_at = "2026-09-23"
+# Structured exceptions are package/version/advisory/target/feature scoped, owned, expiring and invalidated by drift.
+exceptions = []
 
 [scanner]
 tool = "cargo-deny"
@@ -29,6 +31,7 @@ require_hashes = true
 [ecosystems.node]
 contract = "integrations/opencode/plugin-bridge-contract.json"
 manifest = "integrations/opencode/opencode.json"
+package_root = "integrations"
 
 [external_executables.surrealdb]
 name = "surreal.exe"
@@ -51,12 +54,12 @@ advisory_scope = "rust-crate"
 distributed_binary_applicability = "unestablished"
 advisory_source = "https://api.osv.dev/v1/query"
 advisory_query = '{"package":{"name":"surrealdb","ecosystem":"crates.io"},"version":"3.1.4"}'
-advisory_checked_at = "2026-09-22T14:38:31.9718905Z"
+advisory_checked_at = "2026-09-23T03:21:38Z"
 advisory_digest = "ca3ee13e6d878ee2613ea4adb337648ff4819f99c4d1bdd654222e59e17f0a30"
-advisory_response_digest = "a3e6a2595a54def2ff791c962c74891fd8795c042aff9c498a6b4b779e81d4f0"
+advisory_response_digest = "ca3ee13e6d878ee2613ea4adb337648ff4819f99c4d1bdd654222e59e17f0a30"
 advisory_query_sha256 = "08a71d32c9f3e8a31c35c6e6b82d8cc2201b271aa3ec7779e04796fb07e7611c"
-advisory_query_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-query.json"
-advisory_response_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-response.json"
+advisory_query_path = ".eliot/dependency-policy/surrealdb/v3.1.4/osv-query.json"
+advisory_response_path = ".eliot/dependency-policy/surrealdb/v3.1.4/osv-response.json"
 advisory_status = "findings"
 advisory_findings = [
     "GHSA-848m-r628-vrxw",
@@ -124,6 +127,10 @@ source_tag_ref_path = ".eliot/dependency-policy/surrealdb/v3.2.0/github-tag-v3.2
 release_metadata_path = ".eliot/dependency-policy/surrealdb/v3.2.0/github-release-v3.2.0.json"
 advisory_query_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-query.json"
 advisory_response_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-response.json"
+advisory_package = "surrealdb"
+advisory_ecosystem = "crates.io"
+advisory_scope = "rust-crate"
+advisory_max_age_hours = 24
 
 [direct_dependencies.aes-gcm]
 ecosystem = "rust"
@@ -425,14 +432,57 @@ version = "4.25.1"
 public_exposure = "scripts only"
 removal_plan = "manual json validation"
 
-[direct_dependencies.pyyaml]
-ecosystem = "python"
-consumer = "scripts verification"
-owner = "scripts"
-reason = "YAML parsing for GitHub workflow and config verification"
-version = "6.0.3"
-public_exposure = "scripts only"
-removal_plan = "custom YAML parser"
+[[workspace_dependency_dispositions]]
+consumer = "eliot-wasm-host"
+dependency = "eliot-contracts"
+dependency_kind = "dependencies"
+target = "all"
+owner = "bins/eliot-wasm-host"
+reason = "owner-permit issuance context for P03 parent drive"
+features = ["default"]
+public_exposure = "none"
+removal_plan = "Remove when P03 parent-drive epoch parsing and owner-fence construction no longer require eliot-contracts."
 
-# Structured exceptions are package/version/advisory/target/feature scoped, owned, expiring and invalidated by drift.
-exceptions = []
+[[workspace_dependency_dispositions]]
+consumer = "eliot-wasm-host"
+dependency = "eliot-platform"
+dependency_kind = "dependencies"
+target = "all"
+owner = "bins/eliot-wasm-host"
+reason = "owner-permit issuance context for P03 parent drive"
+features = ["default"]
+public_exposure = "none"
+removal_plan = "Remove when P03 parent-drive validation no longer carries the owner-observed ClockObservation."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-governor"
+dependency = "eliot-kernel-core"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/governor/eliot-governor"
+reason = "Restore and publish the canonical owner closure through Kernel hydration and closure contracts."
+features = ["default"]
+public_exposure = "Public owner-closure provider methods use Kernel grant, introduction, and restore contract types."
+removal_plan = "Remove when owner-closure hydration no longer consumes Kernel closure restore types and the manifest edge is deleted."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-governor"
+dependency = "eliot-ors"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/governor/eliot-governor"
+reason = "Validate and construct opaque operational-record inputs and grant/introduction activation values for owner-closure hydration."
+features = ["default"]
+public_exposure = "Opaque ORS activation values flow through owner-closure restore payloads; secret bytes are not exposed."
+removal_plan = "Remove when owner-closure hydration no longer encodes ORS grant/introduction activation records and the manifest edge is deleted."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-governor"
+dependency = "eliot-platform"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/governor/eliot-governor"
+reason = "Pass SecretReference handles to owner-closure admission while keeping secret bytes outside the provider."
+features = ["default"]
+public_exposure = "SecretReference is a public admission parameter; secret bytes are not exposed."
+removal_plan = "Remove when owner-closure admission no longer consumes eliot_platform::SecretReference and the manifest edge is deleted."

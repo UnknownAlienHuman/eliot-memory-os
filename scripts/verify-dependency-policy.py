@@ -14,6 +14,7 @@ Executes and verifies the documented dependency admission policy:
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,7 +22,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
@@ -29,7 +30,16 @@ import sys
 import tarfile
 import tempfile
 import tomllib
+import xml.etree.ElementTree as ET
 
+
+def _json_object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    value: dict = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key '{key}'")
+        value[key] = item
+    return value
 
 @dataclass(frozen=True)
 class Finding:
@@ -64,6 +74,15 @@ _DIAGNOSTIC_SEVERITIES = {"error", "warning", "note", "help"}
 _SUMMARY_CHECKS = {"advisories", "bans", "licenses", "sources"}
 _SUMMARY_COUNTERS = {"errors", "warnings", "notes", "helps"}
 _REPARSE_POINT = 0x400
+
+def _has_exact_scanner_checks(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and all(isinstance(check, str) for check in value)
+        and len(value) == len(_SUMMARY_CHECKS)
+        and set(value) == _SUMMARY_CHECKS
+    )
+
 
 
 def _stable_file_identity(stat_result: os.stat_result) -> tuple[object, ...]:
@@ -241,13 +260,13 @@ def check_policy_manifest(root: Path) -> tuple[list[Finding], dict]:
         findings.append(Finding("DEP-002", rel_path, 1, "[scanner].sha256 must be a 64-character hexadecimal digest"))
 
     scanner_checks = scanner.get("checks", [])
-    if not isinstance(scanner_checks, list) or not {"advisories", "bans", "licenses", "sources"}.issubset(scanner_checks):
+    if not _has_exact_scanner_checks(scanner_checks):
         findings.append(
             Finding(
                 "DEP-002",
                 rel_path,
                 1,
-                "[scanner].checks must include advisories, bans, licenses and sources",
+                "[scanner].checks must contain advisories, bans, licenses and sources exactly once",
             )
         )
 
@@ -312,70 +331,900 @@ def check_policy_manifest(root: Path) -> tuple[list[Finding], dict]:
     return findings, data
 
 
-def collect_direct_rust_dependencies(root: Path) -> tuple[list[Finding], set[str]]:
+def _cargo_manifest_paths(root: Path) -> list[Path]:
+    """Return the Cargo manifests included in the repository dependency scan."""
+
+    manifests = {root / "Cargo.toml"}
+    for sub in ("crates", "bins", "apps", "workspace/tools"):
+        sub_dir = root / sub
+        if sub_dir.is_dir():
+            manifests.update(sub_dir.rglob("Cargo.toml"))
+    return sorted(
+        manifests,
+        key=lambda path: path.relative_to(root).as_posix().casefold(),
+    )
+
+
+def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str], list[dict]]:
     findings: list[Finding] = []
     direct_deps: set[str] = set()
+    dependency_edges: list[dict] = []
     internal_crates: set[str] = set()
 
     cargo_root = root / "Cargo.toml"
     if not cargo_root.is_file():
         findings.append(Finding("DEP-003", "Cargo.toml", 0, "root Cargo.toml is missing"))
-        return findings, direct_deps
+        return findings, direct_deps, dependency_edges
 
+    workspace_member_patterns: list[str] = []
+    workspace_exclude_patterns: list[str] = []
     try:
         root_data = tomllib.loads(cargo_root.read_text(encoding="utf-8"))
-        ws_deps = root_data.get("workspace", {}).get("dependencies", {})
-        if isinstance(ws_deps, dict):
-            for name, spec in ws_deps.items():
-                if isinstance(spec, dict) and "path" in spec:
-                    internal_crates.add(name)
+        workspace_data = root_data.get("workspace", {})
+        if not isinstance(workspace_data, dict):
+            raise ValueError("root workspace table must be a table")
+        workspace_members = workspace_data.get("members", [])
+        if not isinstance(workspace_members, list) or any(not isinstance(item, str) for item in workspace_members):
+            findings.append(Finding("DEP-003", "Cargo.toml", 1, "root workspace members must be an array of strings"))
+        else:
+            workspace_member_patterns = workspace_members
+        workspace_excludes = workspace_data.get("exclude", [])
+        if not isinstance(workspace_excludes, list) or any(not isinstance(item, str) for item in workspace_excludes):
+            findings.append(Finding("DEP-003", "Cargo.toml", 1, "root workspace exclude must be an array of strings"))
+        else:
+            workspace_exclude_patterns = workspace_excludes
+        ws_deps = workspace_data.get("dependencies", {})
+        if not isinstance(ws_deps, dict):
+            raise ValueError("root workspace dependencies must be a table")
+        for name, spec in ws_deps.items():
+            package_name = spec.get("package", name) if isinstance(spec, dict) else name
+            if isinstance(spec, dict) and "path" in spec:
+                internal_crates.add(name)
+                if isinstance(package_name, str):
+                    internal_crates.add(package_name)
     except Exception as exc:
         findings.append(Finding("DEP-003", "Cargo.toml", 1, f"failed to parse root Cargo.toml: {exc}"))
+        ws_deps = {}
 
-    cargo_files = [cargo_root]
-    for sub in ("crates", "bins", "apps", "workspace/tools"):
-        sub_dir = root / sub
-        if sub_dir.is_dir():
-            cargo_files.extend(sub_dir.rglob("Cargo.toml"))
+    cargo_files = _cargo_manifest_paths(root)
+    parsed_manifests: list[tuple[Path, dict]] = []
 
     for cpath in cargo_files:
         try:
             data = tomllib.loads(cpath.read_text(encoding="utf-8"))
-            pkg_name = data.get("package", {}).get("name")
-            if pkg_name:
-                internal_crates.add(pkg_name)
-        except Exception:
-            pass
-
-    for cpath in cargo_files:
-        try:
-            data = tomllib.loads(cpath.read_text(encoding="utf-8"))
-        except Exception as exc:
-            rel = str(cpath.relative_to(root)).replace("\\", "/")
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            rel = cpath.relative_to(root).as_posix()
             findings.append(Finding("DEP-003", rel, 1, f"failed to parse Cargo.toml: {exc}"))
             continue
+        parsed_manifests.append((cpath, data))
+        pkg = data.get("package", {})
+        pkg_name = pkg.get("name") if isinstance(pkg, dict) else None
+        if isinstance(pkg_name, str) and pkg_name:
+            internal_crates.add(pkg_name)
 
-        for sec in ("dependencies", "dev-dependencies", "build-dependencies"):
-            deps = data.get(sec, {})
-            if isinstance(deps, dict):
-                for name, spec in deps.items():
-                    if name in internal_crates or name.startswith("eliot"):
-                        continue
-                    if isinstance(spec, dict) and "path" in spec:
-                        continue
-                    direct_deps.add(name)
+    parsed_by_path = {path.resolve(): data for path, data in parsed_manifests}
 
-        ws_deps = data.get("workspace", {}).get("dependencies", {})
-        if isinstance(ws_deps, dict):
-            for name, spec in ws_deps.items():
-                if name in internal_crates or name.startswith("eliot"):
+    def add_dependency_table(
+        dependencies: object,
+        manifest_path: str,
+        consumer: str,
+        dependency_kind: str,
+        target: str,
+        root_workspace_member: bool,
+        resolver_workspace_root: str | None,
+        workspace_dependencies: dict,
+    ) -> None:
+        if not isinstance(dependencies, dict):
+            if dependencies is not None:
+                findings.append(
+                    Finding("DEP-003", manifest_path, 1, f"{dependency_kind} must be a table")
+                )
+            return
+        for declared_name, spec in dependencies.items():
+            if not isinstance(declared_name, str):
+                findings.append(Finding("DEP-003", manifest_path, 1, "dependency alias must be a string"))
+                continue
+            effective_spec: str | dict = spec
+            if isinstance(spec, dict) and "workspace" in spec:
+                if spec.get("workspace") is not True:
+                    findings.append(
+                        Finding(
+                            "DEP-003",
+                            manifest_path,
+                            1,
+                            f"dependency '{declared_name}' has an invalid workspace inheritance marker",
+                        )
+                    )
                     continue
-                if isinstance(spec, dict) and "path" in spec:
+                inherited = workspace_dependencies.get(declared_name)
+                if isinstance(inherited, str):
+                    effective_spec = {"version": inherited}
+                elif isinstance(inherited, dict):
+                    effective_spec = dict(inherited)
+                else:
+                    findings.append(
+                        Finding(
+                            "DEP-003",
+                            manifest_path,
+                            1,
+                            f"dependency '{declared_name}' inherits a missing workspace dependency",
+                        )
+                    )
                     continue
-                direct_deps.add(name)
+                member_overrides = {
+                    key: value for key, value in spec.items() if key != "workspace"
+                }
+                if "features" in member_overrides:
+                    inherited_features = effective_spec.get("features", [])
+                    member_features = member_overrides.pop("features")
+                    if (
+                        isinstance(inherited_features, list)
+                        and isinstance(member_features, list)
+                    ):
+                        # Cargo workspace dependency features are additive in members.
+                        effective_spec["features"] = [
+                            *inherited_features,
+                            *member_features,
+                        ]
+                    elif not isinstance(inherited_features, list):
+                        # Preserve malformed inherited data so validation fails closed.
+                        effective_spec["features"] = inherited_features
+                    else:
+                        # Preserve malformed member data so validation fails closed.
+                        effective_spec["features"] = member_features
+                effective_spec.update(member_overrides)
+            elif not isinstance(spec, (str, dict)):
+                findings.append(
+                    Finding(
+                        "DEP-003",
+                        manifest_path,
+                        1,
+                        f"dependency '{declared_name}' has an unsupported manifest declaration",
+                    )
+                )
+                continue
 
+            package_name = (
+                effective_spec.get("package", declared_name)
+                if isinstance(effective_spec, dict)
+                else declared_name
+            )
+            if not isinstance(package_name, str) or not package_name:
+                findings.append(Finding("DEP-003", manifest_path, 1, f"dependency alias '{declared_name}' has no valid package identity"))
+                continue
+            raw_features = effective_spec.get("features", []) if isinstance(effective_spec, dict) else []
+            if not isinstance(raw_features, list) or any(not isinstance(feature, str) for feature in raw_features):
+                findings.append(Finding("DEP-003", manifest_path, 1, f"dependency '{declared_name}' has malformed feature metadata"))
+                raw_features = []
+            optional = effective_spec.get("optional", False) if isinstance(effective_spec, dict) else False
+            default_features = effective_spec.get("default-features", True) if isinstance(effective_spec, dict) else True
+            if not isinstance(optional, bool) or not isinstance(default_features, bool):
+                findings.append(Finding("DEP-003", manifest_path, 1, f"dependency '{declared_name}' has malformed optional/default-feature metadata"))
+                optional = optional if isinstance(optional, bool) else False
+                default_features = default_features if isinstance(default_features, bool) else True
+            if isinstance(effective_spec, str):
+                version_requirement = effective_spec
+                source_kind = "registry"
+            else:
+                version_requirement = effective_spec.get("version")
+                source_kind = (
+                    "path" if "path" in effective_spec
+                    else "git" if "git" in effective_spec
+                    else "registry" if "version" in effective_spec or "registry" in effective_spec
+                    else "unspecified"
+                )
+            internal = package_name in internal_crates and source_kind == "path"
+            if version_requirement is not None and not isinstance(version_requirement, str):
+                findings.append(Finding("DEP-003", manifest_path, 1, f"dependency '{declared_name}' has a malformed version requirement"))
+                version_requirement = None
+            source_spec = {}
+            if isinstance(effective_spec, dict):
+                for key in ("path", "git", "branch", "tag", "rev", "registry"):
+                    value = effective_spec.get(key)
+                    if isinstance(value, str) and value.strip():
+                        source_spec[key] = value
+            dependency_edges.append(
+                {
+                    "consumer": consumer,
+                    "manifest": manifest_path,
+                    "alias": declared_name,
+                    "package": package_name,
+                    "dependency_kind": dependency_kind,
+                    "target": target,
+                    "version_requirement": version_requirement,
+                    "source_kind": source_kind,
+                    "source_spec": source_spec,
+                    "features": sorted(set(raw_features)),
+                    "optional": optional,
+                    "default_features": default_features,
+                    "internal_workspace_package": internal,
+                    "root_workspace_member": root_workspace_member,
+                    "resolver_workspace_root": resolver_workspace_root,
+                }
+            )
+            if not internal:
+                direct_deps.add(package_name)
+
+    contextual_manifests: list[tuple[Path, dict, bool, str | None]] = []
+    for cpath, data in parsed_manifests:
+        manifest_path = cpath.relative_to(root).as_posix()
+        manifest_dir = cpath.parent.relative_to(root).as_posix()
+        is_excluded = any(PurePosixPath(manifest_dir).match(pattern) for pattern in workspace_exclude_patterns)
+        is_root_member = (
+            manifest_dir in {"", "."} and isinstance(data.get("package"), dict)
+        ) or (
+            not is_excluded
+            and any(PurePosixPath(manifest_dir).match(pattern) for pattern in workspace_member_patterns)
+        )
+        if is_root_member:
+            resolver_workspace_root = "."
+        elif isinstance(data.get("workspace"), dict):
+            resolver_workspace_root = manifest_dir
+        else:
+            package_data = data.get("package", {})
+            workspace_ref = package_data.get("workspace") if isinstance(package_data, dict) else None
+            resolver_workspace_root = None
+            if isinstance(workspace_ref, str) and workspace_ref.strip():
+                try:
+                    resolved_workspace = (cpath.parent / workspace_ref).resolve()
+                    resolver_workspace_root = resolved_workspace.relative_to(root.resolve()).as_posix()
+                except (OSError, ValueError):
+                    resolver_workspace_root = None
+        contextual_manifests.append((cpath, data, is_root_member, resolver_workspace_root))
+        if is_root_member:
+            workspace_dependencies = ws_deps
+        elif isinstance(resolver_workspace_root, str) and resolver_workspace_root:
+            workspace_dir = root if resolver_workspace_root == "." else root / Path(resolver_workspace_root)
+            workspace_data = parsed_by_path.get((workspace_dir / "Cargo.toml").resolve(), {})
+            workspace_table = workspace_data.get("workspace", {}) if isinstance(workspace_data, dict) else {}
+            workspace_dependencies = workspace_table.get("dependencies", {}) if isinstance(workspace_table, dict) else {}
+            if not isinstance(workspace_dependencies, dict):
+                findings.append(
+                    Finding(
+                        "DEP-003",
+                        (workspace_dir / "Cargo.toml").relative_to(root).as_posix(),
+                        1,
+                        "standalone workspace dependencies must be a table",
+                    )
+                )
+                workspace_dependencies = {}
+        else:
+            workspace_dependencies = {}
+        package = data.get("package", {})
+        consumer = package.get("name") if isinstance(package, dict) else None
+        if not isinstance(consumer, str) or not consumer:
+            consumer = manifest_path
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            add_dependency_table(
+                data.get(section, {}), manifest_path, consumer, section, "all",
+                is_root_member, resolver_workspace_root, workspace_dependencies,
+            )
+
+        target_sections = data.get("target", {})
+        if isinstance(target_sections, dict):
+            for target_expression, target_data in target_sections.items():
+                if not isinstance(target_data, dict):
+                    findings.append(Finding("DEP-003", manifest_path, 1, f"target dependency group '{target_expression}' must be a table"))
+                    continue
+                for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                    add_dependency_table(
+                        target_data.get(section, {}),
+                        manifest_path,
+                        consumer,
+                        section,
+                        target_expression,
+                        is_root_member,
+                        resolver_workspace_root,
+                        workspace_dependencies,
+                    )
+        elif target_sections is not None:
+            findings.append(Finding("DEP-003", manifest_path, 1, "target dependency groups must be a table"))
+
+    dependency_edges.sort(
+        key=lambda edge: (
+            edge["consumer"].casefold(),
+            edge["package"].casefold(),
+            edge["dependency_kind"],
+            edge["target"].casefold(),
+            edge["alias"].casefold(),
+        )
+    )
+    return findings, direct_deps, dependency_edges
+
+
+def _resolver_workspace_dir(root: Path, workspace_root: object) -> Path | None:
+    if not isinstance(workspace_root, str) or not workspace_root:
+        return None
+    relative = Path(workspace_root)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    try:
+        resolved_root = root.resolve()
+        resolved_workspace = (root if workspace_root == "." else root / relative).resolve()
+        resolved_workspace.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return None
+    return resolved_workspace
+
+
+def _resolver_toolchain_inputs(root: Path, workspace_dir: Path) -> list[str]:
+    inputs: set[str] = set()
+    root_resolved = root.resolve()
+    current = workspace_dir.resolve()
+    while True:
+        for relative_name in (
+            "rust-toolchain.toml",
+            "rust-toolchain",
+            ".cargo/config.toml",
+            ".cargo/config",
+        ):
+            candidate = current / relative_name
+            if not candidate.is_file():
+                continue
+            try:
+                inputs.add(candidate.resolve().relative_to(root_resolved).as_posix())
+            except (OSError, ValueError):
+                continue
+        if current == root_resolved or root_resolved not in current.parents:
+            break
+        current = current.parent
+    return sorted(inputs)
+
+
+def _effective_cargo_resolver(root: Path, workspace_dir: Path) -> tuple[str | None, str | None]:
+    manifest = workspace_dir / "Cargo.toml"
+    try:
+        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        return None, f"workspace Cargo.toml cannot be read for resolver identity: {exc}"
+    workspace = data.get("workspace", {})
+    package = data.get("package", {})
+    if not isinstance(workspace, dict) or not isinstance(package, dict):
+        return None, "workspace or package resolver metadata is malformed"
+    workspace_package = workspace.get("package", {})
+    if not isinstance(workspace_package, dict):
+        return None, "workspace.package metadata is malformed"
+    explicit = workspace.get("resolver")
+    if explicit is not None:
+        if explicit in ("1", "2", "3"):
+            return explicit, "workspace.resolver"
+        return None, "workspace.resolver is not a supported string version"
+    if "package" not in data:
+        return "1", "Cargo default for a virtual workspace without a package root"
+    edition = package.get("edition")
+    if isinstance(edition, dict):
+        if edition.get("workspace") is not True:
+            return None, "package edition inheritance marker is malformed"
+        edition = workspace_package.get("edition")
+    if edition is None:
+        return "1", "Cargo default package edition 2015"
+    if not isinstance(edition, (str, int)):
+        return None, "workspace package edition is malformed"
+    edition_text = str(edition)
+    if edition_text == "2024":
+        return "3", "Cargo edition 2024 default"
+    if edition_text == "2021":
+        return "2", "Cargo edition 2021 default"
+    if edition_text in {"2015", "2018"}:
+        return "1", f"Cargo edition {edition_text} default"
+    return None, f"cannot infer Cargo resolver from edition {edition_text!r}"
+
+
+def _run_resolver_command(argv: list[str], cwd: Path, timeout_seconds: int) -> dict:
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    stdout_bytes = completed.stdout if isinstance(completed.stdout, bytes) else b""
+    stderr_bytes = completed.stderr if isinstance(completed.stderr, bytes) else b""
+    return {
+        "ok": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "stdout": stdout_bytes.decode("utf-8", errors="replace"),
+        "stderr": stderr_bytes.decode("utf-8", errors="replace"),
+        "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+    }
+
+
+def _load_nonmember_resolver_metadata(
+    root: Path, workspace_dir: Path, lockfile: str
+) -> tuple[dict, dict | None, str | None]:
+    resolver, resolver_source = _effective_cargo_resolver(root, workspace_dir)
+    toolchain_inputs = _resolver_toolchain_inputs(root, workspace_dir)
+    evidence = {
+        "status": "metadata_not_executed",
+        "workspace_root": workspace_dir.resolve().relative_to(root.resolve()).as_posix() or ".",
+        "lockfile": lockfile,
+        "resolver_version": resolver,
+        "resolver_source": resolver_source,
+        "feature_scope": "all-features",
+        "target_scope": "all-declared-platforms",
+        "locked": True,
+        "offline": True,
+        "toolchain_inputs": toolchain_inputs,
+    }
+    if resolver is None:
+        evidence["status"] = "resolver_identity_unavailable"
+        return evidence, None, resolver_source or "effective Cargo resolver version is unknown"
+
+    cargo = shutil.which("cargo")
+    rustc = shutil.which("rustc")
+    if not cargo or not rustc:
+        evidence["status"] = "tool_unavailable"
+        return evidence, None, "Cargo and rustc must both be available to bind resolver/toolchain identity"
+    cargo_path = str(Path(cargo).resolve())
+    rustc_path = str(Path(rustc).resolve())
+    cargo_version = _run_resolver_command([cargo_path, "--version", "--verbose"], workspace_dir, 20)
+    rustc_version = _run_resolver_command([rustc_path, "--version", "--verbose"], workspace_dir, 20)
+    evidence.update(
+        {
+            "cargo_executable": cargo_path,
+            "rustc_executable": rustc_path,
+            "cargo_version_sha256": cargo_version.get("stdout_sha256"),
+            "rustc_version_sha256": rustc_version.get("stdout_sha256"),
+            "cargo_version": cargo_version.get("stdout", "").strip(),
+            "rustc_version": rustc_version.get("stdout", "").strip(),
+            "cargo_version_stderr_sha256": cargo_version.get("stderr_sha256"),
+            "rustc_version_stderr_sha256": rustc_version.get("stderr_sha256"),
+            "resolution_environment": {
+                key: os.environ[key]
+                for key in (
+                    "CARGO_HOME",
+                    "RUSTUP_HOME",
+                    "RUSTUP_TOOLCHAIN",
+                    "RUSTFLAGS",
+                    "CARGO_ENCODED_RUSTFLAGS",
+                )
+                if key in os.environ
+            },
+        }
+    )
+    if not cargo_version.get("ok") or not cargo_version.get("stdout", "").strip():
+        evidence["status"] = "cargo_version_failed"
+        return evidence, None, "cargo --version --verbose did not return a successful tool identity"
+    if not rustc_version.get("ok") or not rustc_version.get("stdout", "").strip():
+        evidence["status"] = "rustc_version_failed"
+        return evidence, None, "rustc --version --verbose did not return a successful tool identity"
+
+    manifest = workspace_dir / "Cargo.toml"
+    argv = [
+        cargo_path,
+        "metadata",
+        "--format-version",
+        "1",
+        "--locked",
+        "--offline",
+        "--all-features",
+        "--manifest-path",
+        str(manifest),
+    ]
+    result = _run_resolver_command(argv, workspace_dir, 120)
+    evidence["command"] = argv
+    evidence["exit_code"] = result.get("returncode")
+    evidence["metadata_sha256"] = result.get("stdout_sha256")
+    evidence["metadata_stderr_sha256"] = result.get("stderr_sha256")
+    if not result.get("ok"):
+        evidence["status"] = "metadata_failed"
+        error = result.get("error") or result.get("stderr", "").strip() or f"cargo metadata exited {result.get('returncode')}"
+        evidence["error"] = str(error)[:2000]
+        return evidence, None, f"locked offline cargo metadata failed: {str(error)[:600]}"
+    try:
+        metadata = json.loads(
+            result.get("stdout", ""),
+            object_pairs_hook=_json_object_without_duplicate_keys,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        evidence["status"] = "metadata_malformed"
+        evidence["error"] = f"{type(exc).__name__}: {exc}"
+        return evidence, None, "cargo metadata output is malformed or contains duplicate JSON keys"
+    if not isinstance(metadata, dict) or metadata.get("version") != 1:
+        evidence["status"] = "metadata_shape_invalid"
+        return evidence, None, "cargo metadata output does not have the version-1 object shape"
+    expected_root = os.path.normcase(str(workspace_dir.resolve()))
+    reported_root = metadata.get("workspace_root")
+    try:
+        same_workspace = isinstance(reported_root, str) and os.path.normcase(str(Path(reported_root).resolve())) == expected_root
+    except (OSError, ValueError):
+        same_workspace = False
+    if not same_workspace:
+        evidence["status"] = "workspace_identity_mismatch"
+        return evidence, None, "cargo metadata workspace_root does not match the requested workspace"
+    packages = metadata.get("packages")
+    workspace_members = metadata.get("workspace_members")
+    resolve = metadata.get("resolve")
+    if (
+        not isinstance(packages, list)
+        or not isinstance(workspace_members, list)
+        or any(not isinstance(item, str) for item in workspace_members)
+        or not isinstance(resolve, dict)
+        or not isinstance(resolve.get("nodes"), list)
+    ):
+        evidence["status"] = "metadata_shape_invalid"
+        return evidence, None, "cargo metadata lacks packages, workspace members, or resolved dependency nodes"
+    package_ids = [item.get("id") for item in packages if isinstance(item, dict)]
+    if len(package_ids) != len(packages) or any(not isinstance(item, str) for item in package_ids) or len(set(package_ids)) != len(package_ids):
+        evidence["status"] = "metadata_package_identity_invalid"
+        return evidence, None, "cargo metadata package identities are malformed or duplicated"
+    evidence["status"] = "metadata_ready"
+    return evidence, metadata, None
+
+
+def _cargo_kind_and_target(edge: dict) -> tuple[object, object] | None:
+    kind = {
+        "dependencies": None,
+        "dev-dependencies": "dev",
+        "build-dependencies": "build",
+    }.get(edge.get("dependency_kind"), "__invalid__")
+    if kind == "__invalid__":
+        return None
+    target = edge.get("target")
+    if target == "all":
+        target = None
+    return kind, target
+
+
+def _cargo_requirement_matches(requested: object, resolved_request: object) -> bool:
+    if requested is None:
+        return resolved_request in (None, "*")
+    if not isinstance(requested, str) or not isinstance(resolved_request, str):
+        return False
+    requested = requested.strip()
+    if requested == resolved_request:
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", requested):
+        return "^" + requested == resolved_request
+    return False
+
+
+def _same_resolved_path(left: object, right: Path) -> bool:
+    if not isinstance(left, str) or not left.strip():
+        return False
+    try:
+        return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(str(right.resolve()))
+    except (OSError, ValueError):
+        return False
+
+
+def _bind_nonmember_edge_to_metadata(
+    root: Path,
+    edge: dict,
+    workspace_dir: Path,
+    metadata: dict,
+    locked_packages: list[dict],
+) -> tuple[dict | None, str | None]:
+    kind_target = _cargo_kind_and_target(edge)
+    if kind_target is None:
+        return None, "manifest dependency kind or target is malformed"
+    expected_kind, expected_target = kind_target
+    alias = edge.get("alias")
+    package_name = edge.get("package")
+    manifest = edge.get("manifest")
+    consumer = edge.get("consumer")
+    if not all(isinstance(value, str) and value for value in (alias, package_name, manifest, consumer)):
+        return None, "manifest edge lacks consumer, alias, package, or manifest identity"
+    manifest_path = root / Path(manifest)
+    try:
+        manifest_path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None, "manifest edge path escapes the repository boundary"
+    packages = metadata.get("packages", [])
+    members = metadata.get("workspace_members", [])
+    consumer_packages = []
+    for package in packages:
+        if not isinstance(package, dict) or package.get("name") != consumer:
+            continue
+        if _same_resolved_path(package.get("manifest_path"), manifest_path):
+            consumer_packages.append(package)
+    if len(consumer_packages) != 1:
+        return None, "cargo metadata does not identify exactly one consumer package at the source manifest"
+    consumer_package = consumer_packages[0]
+    consumer_id = consumer_package.get("id")
+    if not isinstance(consumer_id, str) or consumer_id not in members:
+        return None, "source consumer package is not a member of the resolved Cargo workspace"
+    resolve = metadata.get("resolve", {})
+    nodes = resolve.get("nodes", []) if isinstance(resolve, dict) else []
+    consumer_nodes = [node for node in nodes if isinstance(node, dict) and node.get("id") == consumer_id]
+    if len(consumer_nodes) != 1:
+        return None, "cargo resolve graph does not contain exactly one consumer node"
+    node_deps = consumer_nodes[0].get("deps", [])
+    if not isinstance(node_deps, list):
+        return None, "cargo resolve consumer node dependencies are malformed"
+    # Cargo metadata normalizes dependency names to Rust crate identifiers in
+    # resolve.nodes (hyphens become underscores); Package.dependencies.rename
+    # retains the manifest spelling and is compared exactly below.
+    resolve_node_name = alias.replace("-", "_")
+    matching_node_deps = []
+    for node_dep in node_deps:
+        if not isinstance(node_dep, dict) or node_dep.get("name") != resolve_node_name:
+            continue
+        dep_kinds = node_dep.get("dep_kinds", [])
+        if not isinstance(dep_kinds, list):
+            continue
+        if any(
+            isinstance(dep_kind, dict)
+            and dep_kind.get("kind") in ((None, "normal") if expected_kind is None else (expected_kind,))
+            and dep_kind.get("target") == expected_target
+            for dep_kind in dep_kinds
+        ):
+            matching_node_deps.append(node_dep)
+    if len(matching_node_deps) != 1:
+        return None, "cargo resolve graph does not bind exactly one package ID for the alias/kind/target edge"
+    resolved_id = matching_node_deps[0].get("pkg")
+    if not isinstance(resolved_id, str):
+        return None, "cargo resolve dependency node lacks a package ID"
+    resolved_packages = [package for package in packages if isinstance(package, dict) and package.get("id") == resolved_id]
+    if len(resolved_packages) != 1:
+        return None, "resolved package ID does not identify exactly one cargo metadata package"
+    resolved_package = resolved_packages[0]
+    if resolved_package.get("name") != package_name:
+        return None, "resolved package name does not match the manifest package name"
+    dependency_records = consumer_package.get("dependencies", [])
+    if not isinstance(dependency_records, list):
+        return None, "cargo metadata consumer dependency declarations are malformed"
+    edge_features = edge.get("features", [])
+    if not isinstance(edge_features, list) or any(not isinstance(item, str) for item in edge_features):
+        return None, "manifest edge feature selection is malformed"
+    matching_declarations = []
+    for dependency in dependency_records:
+        if not isinstance(dependency, dict) or dependency.get("name") != package_name:
+            continue
+        rename = dependency.get("rename")
+        actual_alias = rename if isinstance(rename, str) and rename else dependency.get("name")
+        if actual_alias != alias:
+            continue
+        actual_kind = dependency.get("kind")
+        if expected_kind is None:
+            if actual_kind not in (None, "normal"):
+                continue
+        elif actual_kind != expected_kind:
+            continue
+        if dependency.get("target") != expected_target:
+            continue
+        if not _cargo_requirement_matches(edge.get("version_requirement"), dependency.get("req")):
+            continue
+        if dependency.get("optional") is not edge.get("optional"):
+            continue
+        if dependency.get("uses_default_features") is not edge.get("default_features"):
+            continue
+        features = dependency.get("features")
+        if not isinstance(features, list) or any(not isinstance(item, str) for item in features):
+            continue
+        if sorted(set(features)) != sorted(set(edge_features)):
+            continue
+        matching_declarations.append(dependency)
+    if len(matching_declarations) != 1:
+        return None, "cargo metadata does not identify exactly one declaration matching alias/kind/target/version/features"
+
+    declaration = matching_declarations[0]
+    source_kind = edge.get("source_kind")
+    source_spec = edge.get("source_spec", {})
+    if not isinstance(source_spec, dict):
+        return None, "manifest source selector is malformed"
+    declared_source = declaration.get("source")
+    package_source = resolved_package.get("source")
+    if declared_source != package_source:
+        return None, "cargo metadata declaration source does not equal the resolved package source"
+    if source_kind == "registry":
+        if not isinstance(package_source, str) or not package_source.startswith("registry+"):
+            return None, "registry declaration did not resolve to an exact registry source"
+        explicit_registry = source_spec.get("registry")
+        metadata_registry = declaration.get("registry")
+        if explicit_registry is not None and metadata_registry != explicit_registry:
+            return None, "explicit registry selector does not match cargo metadata"
+    elif source_kind == "path":
+        raw_path = source_spec.get("path")
+        if not isinstance(raw_path, str):
+            return None, "path dependency has no exact manifest path selector"
+        expected_path = (manifest_path.parent / raw_path).resolve()
+        try:
+            expected_path.relative_to(root.resolve())
+        except (OSError, ValueError):
+            return None, "path dependency resolves outside the repository input boundary"
+        if package_source is not None or not _same_resolved_path(declaration.get("path"), expected_path):
+            return None, "path dependency source does not match the manifest path and resolved package"
+        if not _same_resolved_path(resolved_package.get("manifest_path"), expected_path / "Cargo.toml"):
+            return None, "resolved path package manifest does not match the declared path"
+    elif source_kind == "git":
+        git_url = source_spec.get("git")
+        if not isinstance(git_url, str) or not isinstance(package_source, str) or not package_source.startswith("git+"):
+            return None, "git dependency lacks an exact Cargo git source identity"
+        source_without_prefix = package_source[4:]
+        source_base = re.split(r"[?#]", source_without_prefix, maxsplit=1)[0]
+        if git_url not in (source_base, source_base.removesuffix(".git"), source_base + ".git"):
+            return None, "resolved git source does not match the manifest URL"
+        for selector in ("branch", "tag", "rev"):
+            requested_selector = source_spec.get(selector)
+            if requested_selector is not None and requested_selector not in package_source:
+                return None, f"resolved git source does not retain the manifest {selector} selector"
+    else:
+        return None, "manifest dependency source kind is not explicit enough for resolver binding"
+
+    version = resolved_package.get("version")
+    resolved_name = resolved_package.get("name")
+    if not isinstance(version, str) or not version or not isinstance(resolved_name, str):
+        return None, "resolved Cargo package lacks an exact name or version"
+    lock_matches = [
+        package for package in locked_packages
+        if package.get("name") == resolved_name
+        and package.get("version") == version
+        and package.get("source") == package_source
+    ]
+    if len(lock_matches) != 1:
+        return None, "resolved package ID does not join uniquely to an exact package in the adjacent Cargo.lock"
+    lock_identity = lock_matches[0]
+    if isinstance(package_source, str) and package_source.startswith("registry+"):
+        checksum = lock_identity.get("checksum")
+        if not isinstance(checksum, str) or not _HEX64.fullmatch(checksum):
+            return None, "resolved registry package lacks its exact Cargo.lock checksum"
+    resolved_nodes = [node for node in nodes if isinstance(node, dict) and node.get("id") == resolved_id]
+    if len(resolved_nodes) != 1:
+        return None, "resolved package ID does not identify exactly one Cargo resolve node"
+    resolved_features = resolved_nodes[0].get("features")
+    if not isinstance(resolved_features, list) or any(not isinstance(item, str) for item in resolved_features):
+        return None, "resolved package node features are malformed"
+    if any(feature not in resolved_features for feature in edge_features):
+        return None, "Cargo resolve node does not include every feature requested by the manifest edge"
+    consumer_resolved_features = consumer_nodes[0].get("features")
+    consumer_declared_features = consumer_package.get("features")
+    if (
+        not isinstance(consumer_resolved_features, list)
+        or any(not isinstance(item, str) for item in consumer_resolved_features)
+        or not isinstance(consumer_declared_features, dict)
+        or any(feature not in consumer_resolved_features for feature in consumer_declared_features)
+    ):
+        return None, "Cargo resolve node does not prove that every consumer feature was enabled"
+    return {
+        "id": resolved_id,
+        "name": resolved_name,
+        "version": version,
+        "source": package_source,
+        "checksum": lock_identity.get("checksum"),
+        "lockfile_dependencies": lock_identity.get("dependencies", []),
+        "consumer_features": sorted(set(consumer_resolved_features)),
+        "features": sorted(set(resolved_features)),
+    }, None
+
+
+def bind_nonmember_resolver_identity(
+    root: Path, dependency_edges: list[dict]
+) -> list[Finding]:
+    """Join non-member declarations through their own locked Cargo resolver graph."""
+
+    findings: list[Finding] = []
+    workspace_edges: dict[str, list[dict]] = {}
+    unresolved_reason: dict[int, str] = {}
+    workspace_dirs: dict[str, Path | None] = {}
+    workspace_locks: dict[str, str | None] = {}
+    for edge in dependency_edges:
+        if not isinstance(edge, dict) or edge.get("root_workspace_member") is not False:
+            continue
+        workspace_root = edge.get("resolver_workspace_root")
+        workspace_key = workspace_root if isinstance(workspace_root, str) else "<unknown>"
+        workspace_dir = _resolver_workspace_dir(root, workspace_root)
+        workspace_dirs[workspace_key] = workspace_dir
+        lockfile = None
+        if workspace_dir is not None:
+            candidate = workspace_dir / "Cargo.lock"
+            try:
+                lockfile = candidate.resolve().relative_to(root.resolve()).as_posix() if candidate.is_file() else None
+            except (OSError, ValueError):
+                lockfile = None
+        workspace_locks[workspace_key] = lockfile
+        workspace_edges.setdefault(workspace_key, []).append(edge)
+
+    for workspace_key, edges in sorted(workspace_edges.items()):
+        workspace_dir = workspace_dirs.get(workspace_key)
+        lockfile = workspace_locks.get(workspace_key)
+        workspace_resolver, resolver_source = (
+            _effective_cargo_resolver(root, workspace_dir)
+            if workspace_dir is not None else (None, "workspace root is unavailable")
+        )
+        workspace_evidence = {
+            "status": "lock_missing",
+            "workspace_root": workspace_key if workspace_key != "<unknown>" else None,
+            "lockfile": None,
+            "resolver_version": workspace_resolver,
+            "resolver_source": resolver_source,
+            "feature_scope": "all-features",
+            "target_scope": "all-declared-platforms",
+            "locked": True,
+            "offline": True,
+            "toolchain_inputs": _resolver_toolchain_inputs(root, workspace_dirs[workspace_key])
+            if workspace_dirs.get(workspace_key) is not None else [],
+        }
+        metadata = None
+        locked_packages: list[dict] = []
+        workspace_failure = None
+        if workspace_dir is None:
+            workspace_failure = "non-member workspace root is missing, malformed, or outside the repository"
+            workspace_evidence["status"] = "workspace_identity_invalid"
+        elif lockfile is None:
+            workspace_failure = "non-member workspace has no checked-in adjacent Cargo.lock; no resolver is run and the declaration stays source-only"
+        else:
+            workspace_evidence["lockfile"] = lockfile
+            lock_findings, locked_packages = collect_all_rust_locked_packages(root, lockfile)
+            if lock_findings:
+                workspace_failure = "; ".join(finding.detail for finding in lock_findings[:3])
+                workspace_evidence["status"] = "lock_invalid"
+            else:
+                workspace_evidence, metadata, workspace_failure = _load_nonmember_resolver_metadata(
+                    root, workspace_dir, lockfile
+                )
+
+        per_manifest: dict[str, dict] = {}
+        for edge in edges:
+            manifest = edge.get("manifest")
+            manifest_key = manifest if isinstance(manifest, str) and manifest else "<unknown manifest>"
+            consumer = edge.get("consumer")
+            summary = per_manifest.setdefault(
+                manifest_key,
+                {"consumer": consumer if isinstance(consumer, str) else manifest_key, "edge_count": 0, "unresolved": 0, "reasons": set()},
+            )
+            summary["edge_count"] += 1
+            resolved_package = None
+            reason = workspace_failure
+            if reason is None and metadata is not None and workspace_dir is not None:
+                resolved_package, reason = _bind_nonmember_edge_to_metadata(
+                    root, edge, workspace_dir, metadata, locked_packages
+                )
+            if resolved_package is None:
+                summary["unresolved"] += 1
+                summary["reasons"].add(reason or "resolver evidence did not bind this declaration")
+            edge["resolver_identity"] = {
+                "status": "lock_bound" if resolved_package is not None else "source_only_incomplete",
+                "workspace_root": workspace_key if workspace_key != "<unknown>" else None,
+                "lockfile": lockfile,
+                "resolved_package": resolved_package,
+                "requested_version": edge.get("version_requirement"),
+                "requested_features": edge.get("features", []),
+                "target": edge.get("target"),
+                "dependency_kind": edge.get("dependency_kind"),
+                "alias": edge.get("alias"),
+                "source_spec": edge.get("source_spec", {}),
+                "workspace_evidence": workspace_evidence,
+                "reason": reason,
+            }
+
+        joined_count = sum(
+            1 for edge in edges
+            if isinstance(edge.get("resolver_identity"), dict)
+            and edge["resolver_identity"].get("status") == "lock_bound"
+        )
+        workspace_evidence["joined_edge_count"] = joined_count
+        workspace_evidence["incomplete_edge_count"] = len(edges) - joined_count
+        workspace_evidence["join_status"] = "complete" if joined_count == len(edges) else "incomplete"
+
+        for manifest, summary in sorted(per_manifest.items()):
+            if summary["unresolved"] == 0:
+                continue
+            reasons = sorted(summary["reasons"])
+            reason_text = "; ".join(reasons[:2])
+            findings.append(
+                Finding(
+                    IDENTITY_BINDING_FINDING,
+                    manifest,
+                    1,
+                    f"non-member Cargo package '{summary['consumer']}' has {summary['unresolved']} of "
+                    f"{summary['edge_count']} observed edge(s) without an exact resolver/lock join: {reason_text}",
+                )
+            )
+    return findings
+
+
+def collect_direct_rust_dependencies(root: Path) -> tuple[list[Finding], set[str]]:
+    """Compatibility API exposing third-party direct roots only."""
+
+    findings, direct_deps, _ = _collect_rust_dependency_graph(root)
     return findings, direct_deps
-
 
 def check_cargo_inventory(manifest_data: dict, direct_deps: set[str]) -> list[Finding]:
     findings: list[Finding] = []
@@ -407,6 +1256,189 @@ def check_cargo_inventory(manifest_data: dict, direct_deps: set[str]) -> list[Fi
                     )
                 )
 
+    return findings
+
+
+def _normalize_ecosystem_package_name(ecosystem: str, name: str) -> str:
+    if ecosystem == "python":
+        return re.sub(r"[-_.]+", "-", name).lower()
+    if ecosystem in {"nuget", "node"}:
+        return name.lower()
+    return name
+
+
+def check_direct_inventory_reconciliation(
+    manifest_data: dict,
+    ecosystem: str,
+    observed_direct_names: set[str],
+    finding_code: str,
+) -> list[Finding]:
+    """Require the policy inventory and observed direct roots to agree both ways."""
+
+    findings: list[Finding] = []
+    inventory = manifest_data.get("direct_dependencies", {})
+    if not isinstance(inventory, dict):
+        return [Finding(finding_code, "config/dependency-policy.toml", 1, "direct_dependencies must be a table")]
+
+    observed = {
+        _normalize_ecosystem_package_name(ecosystem, name): name
+        for name in observed_direct_names
+    }
+    declared: dict[str, str] = {}
+    for name, entry in inventory.items():
+        if not isinstance(entry, dict):
+            findings.append(
+                Finding(
+                    finding_code,
+                    "config/dependency-policy.toml",
+                    1,
+                    f"direct dependency inventory entry '{name}' must be a table",
+                )
+            )
+            continue
+        entry_ecosystem = entry.get("ecosystem")
+        if entry_ecosystem not in {"rust", "nuget", "python", "node"}:
+            findings.append(
+                Finding(
+                    finding_code,
+                    "config/dependency-policy.toml",
+                    1,
+                    f"direct dependency '{name}' has no recognized ecosystem",
+                )
+            )
+        elif entry_ecosystem == ecosystem:
+            normalized = _normalize_ecosystem_package_name(ecosystem, name)
+            if normalized in declared:
+                findings.append(
+                    Finding(
+                        finding_code,
+                        "config/dependency-policy.toml",
+                        1,
+                        f"duplicate normalized {ecosystem} inventory identity '{name}'",
+                    )
+                )
+            declared[normalized] = name
+
+    for normalized, name in sorted(observed.items()):
+        if normalized not in declared:
+            findings.append(
+                Finding(
+                    finding_code,
+                    "config/dependency-policy.toml",
+                    1,
+                    f"observed direct {ecosystem} dependency '{name}' is missing from inventory",
+                )
+            )
+    for normalized, name in sorted(declared.items()):
+        if normalized not in observed:
+            findings.append(
+                Finding(
+                    finding_code,
+                    "config/dependency-policy.toml",
+                    1,
+                    f"stale {ecosystem} inventory entry '{name}' is not an observed direct dependency",
+                )
+            )
+    return findings
+
+
+def check_workspace_dependency_dispositions(
+    manifest_data: dict, dependency_edges: list[dict]
+) -> list[Finding]:
+    """Bind explicitly governed internal workspace edges to observed manifest edges."""
+
+    findings: list[Finding] = []
+    dispositions = manifest_data.get("workspace_dependency_dispositions", [])
+    if not isinstance(dispositions, list):
+        return [
+            Finding(
+                "DEP-003",
+                "config/dependency-policy.toml",
+                1,
+                "workspace_dependency_dispositions must be an array of tables",
+            )
+        ]
+
+    observed = {
+        (
+            edge.get("consumer"),
+            edge.get("package"),
+            edge.get("dependency_kind"),
+            edge.get("target"),
+        )
+        for edge in dependency_edges
+        if isinstance(edge, dict) and edge.get("internal_workspace_package") is True
+    }
+    seen: set[tuple[str, str, str, str]] = set()
+    required_strings = (
+        "consumer",
+        "dependency",
+        "dependency_kind",
+        "target",
+        "owner",
+        "reason",
+        "public_exposure",
+        "removal_plan",
+    )
+    for index, disposition in enumerate(dispositions, 1):
+        if not isinstance(disposition, dict):
+            findings.append(
+                Finding(
+                    "DEP-003",
+                    "config/dependency-policy.toml",
+                    index,
+                    "workspace dependency disposition must be a table",
+                )
+            )
+            continue
+        malformed = [
+            field
+            for field in required_strings
+            if not isinstance(disposition.get(field), str) or not disposition[field].strip()
+        ]
+        features = disposition.get("features")
+        if not isinstance(features, list) or not features or any(
+            not isinstance(feature, str) or not feature.strip() for feature in features
+        ):
+            malformed.append("features")
+        if malformed:
+            findings.append(
+                Finding(
+                    "DEP-003",
+                    "config/dependency-policy.toml",
+                    index,
+                    "workspace dependency disposition is missing valid fields: "
+                    + ", ".join(sorted(set(malformed))),
+                )
+            )
+            continue
+
+        key = (
+            disposition["consumer"],
+            disposition["dependency"],
+            disposition["dependency_kind"],
+            disposition["target"],
+        )
+        if key in seen:
+            findings.append(
+                Finding(
+                    "DEP-003",
+                    "config/dependency-policy.toml",
+                    index,
+                    f"duplicate workspace dependency disposition for {key[0]} -> {key[1]}",
+                )
+            )
+            continue
+        seen.add(key)
+        if key not in observed:
+            findings.append(
+                Finding(
+                    "DEP-003",
+                    "config/dependency-policy.toml",
+                    index,
+                    f"workspace dependency disposition {key[0]} -> {key[1]} ({key[2]}, target={key[3]}) has no matching observed internal manifest edge",
+                )
+            )
     return findings
 
 
@@ -463,10 +1495,12 @@ def _configured_repo_path(root: Path, raw_value: object, label: str, code: str) 
     return root / path, []
 
 
-def check_nuget_ecosystem(root: Path, nuget_policy: dict | None = None) -> list[Finding]:
+def _collect_nuget_locked_packages(
+    root: Path, nuget_policy: dict | None = None
+) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
     policy = nuget_policy if isinstance(nuget_policy, dict) else {}
-    csproj_path, path_findings = _configured_repo_path(
+    project_path, path_findings = _configured_repo_path(
         root, policy.get("project"), "[ecosystems.nuget].project", "DEP-007"
     )
     findings.extend(path_findings)
@@ -474,42 +1508,184 @@ def check_nuget_ecosystem(root: Path, nuget_policy: dict | None = None) -> list[
         root, policy.get("lockfile"), "[ecosystems.nuget].lockfile", "DEP-007"
     )
     findings.extend(path_findings)
-    if csproj_path is None or lock_path is None:
-        return findings
+    if project_path is None or lock_path is None:
+        return findings, {"status": "incomplete", "direct_packages": [], "locked_packages": []}
 
-    rel_csproj = str(csproj_path.relative_to(root)).replace("\\", "/")
-    rel_lock = str(lock_path.relative_to(root)).replace("\\", "/")
-
-    if not csproj_path.is_file():
-        findings.append(Finding("DEP-007", rel_csproj, 0, "configured NuGet project is missing"))
+    relative_project = project_path.relative_to(root).as_posix()
+    relative_lock = lock_path.relative_to(root).as_posix()
+    declared: dict[str, dict] = {}
+    project_framework: str | None = None
+    if not project_path.is_file():
+        findings.append(Finding("DEP-007", relative_project, 0, "configured NuGet project is missing"))
     else:
         try:
-            content = csproj_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            findings.append(Finding("DEP-007", rel_csproj, 1, f"cannot read configured NuGet project: {exc}"))
+            project_root = ET.fromstring(project_path.read_text(encoding="utf-8"))
+        except (OSError, ET.ParseError) as exc:
+            findings.append(Finding("DEP-007", relative_project, 1, f"configured NuGet project is unreadable or malformed: {exc}"))
         else:
-            if "<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>" not in content:
-                findings.append(
-                    Finding(
-                        "DEP-007",
-                        rel_csproj,
-                        1,
-                        "missing <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>",
-                    )
-                )
+            restore_lock_enabled = False
+            parent_map = {child: parent for parent in project_root.iter() for child in parent}
+            for element in project_root.iter():
+                tag = element.tag.rsplit("}", 1)[-1]
+                if tag == "TargetFrameworks":
+                    findings.append(Finding("DEP-007", relative_project, 1, "multiple NuGet target frameworks require an explicit per-target policy"))
+                if tag == "TargetFramework" and element.text and element.text.strip():
+                    observed_framework = element.text.strip()
+                    if project_framework is not None and project_framework != observed_framework:
+                        findings.append(Finding("DEP-007", relative_project, 1, "project declares multiple target-framework values"))
+                    project_framework = observed_framework
+                if tag == "Import":
+                    findings.append(Finding("DEP-007", relative_project, 1, "explicit MSBuild imports are outside the configured NuGet denominator"))
+                if tag == "RestorePackagesWithLockFile" and element.text:
+                    restore_lock_enabled = element.text.strip().lower() == "true"
+                if tag != "PackageReference":
+                    continue
+                ancestor = element
+                conditional_reference = False
+                while ancestor is not None:
+                    if "Condition" in ancestor.attrib:
+                        conditional_reference = True
+                        break
+                    ancestor = parent_map.get(ancestor)
+                if conditional_reference:
+                    findings.append(Finding("DEP-007", relative_project, 1, "conditional NuGet PackageReference cannot be enumerated as one locked direct set"))
+                name = element.attrib.get("Include") or element.attrib.get("Update")
+                version = element.attrib.get("Version")
+                if not version:
+                    for child in element:
+                        if child.tag.rsplit("}", 1)[-1] == "Version" and child.text:
+                            version = child.text.strip()
+                            break
+                if not isinstance(name, str) or not name.strip() or not isinstance(version, str) or not version.strip():
+                    findings.append(Finding("DEP-007", relative_project, 1, "NuGet PackageReference must declare a literal package name and version"))
+                    continue
+                normalized = _normalize_ecosystem_package_name("nuget", name.strip())
+                if normalized in declared:
+                    findings.append(Finding("DEP-007", relative_project, 1, f"duplicate NuGet PackageReference '{name.strip()}'"))
+                    continue
+                declared[normalized] = {"name": name.strip(), "version": version.strip()}
+            if project_framework is None:
+                findings.append(Finding("DEP-007", relative_project, 1, "project must declare one literal TargetFramework"))
+            if not restore_lock_enabled:
+                findings.append(Finding("DEP-007", relative_project, 1, "missing <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>"))
 
     if not lock_path.is_file():
-        findings.append(Finding("DEP-007", rel_lock, 0, "configured NuGet packages.lock.json is missing"))
+        findings.append(Finding("DEP-007", relative_lock, 0, "configured NuGet packages.lock.json is missing"))
+        lock_data = {}
     else:
         try:
-            lock_data = json.loads(lock_path.read_text(encoding="utf-8"))
-            if not isinstance(lock_data, dict) or not lock_data.get("dependencies"):
-                findings.append(Finding("DEP-007", rel_lock, 1, "packages.lock.json has empty dependencies"))
-        except Exception as exc:
-            findings.append(Finding("DEP-007", rel_lock, 1, f"malformed packages.lock.json: {exc}"))
+            lock_data = json.loads(lock_path.read_text(encoding="utf-8"), object_pairs_hook=_json_object_without_duplicate_keys)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            findings.append(Finding("DEP-007", relative_lock, 1, f"malformed packages.lock.json: {exc}"))
+            lock_data = {}
+    groups = lock_data.get("dependencies") if isinstance(lock_data, dict) else None
+    if not isinstance(groups, dict) or not groups:
+        findings.append(Finding("DEP-007", relative_lock, 1, "packages.lock.json has empty or malformed dependencies"))
+        groups = {}
 
+    target_framework = policy.get("target_framework")
+    if not isinstance(target_framework, str) or not target_framework.strip():
+        findings.append(Finding("DEP-007", "config/dependency-policy.toml", 1, "[ecosystems.nuget].target_framework must be a non-empty string"))
+        target_framework = ""
+    if project_framework and target_framework and project_framework.removesuffix(".0") != target_framework:
+        findings.append(
+            Finding(
+                "DEP-007",
+                relative_project,
+                1,
+                f"project target framework '{project_framework}' does not match locked policy target '{target_framework}'",
+            )
+        )
+    if target_framework not in groups:
+        findings.append(Finding("DEP-007", relative_lock, 1, f"packages.lock.json has no configured target framework '{target_framework}'"))
+
+    locked_packages: list[dict] = []
+    selected_direct: dict[str, dict] = {}
+    for framework, packages in sorted(groups.items()):
+        if not isinstance(packages, dict) or not packages:
+            findings.append(Finding("DEP-007", relative_lock, 1, f"NuGet target '{framework}' has empty or malformed package identities"))
+            continue
+        for package_name, package in sorted(packages.items(), key=lambda item: item[0].lower()):
+            if not isinstance(package_name, str) or not package_name.strip() or not isinstance(package, dict):
+                findings.append(Finding("DEP-007", relative_lock, 1, f"NuGet target '{framework}' contains a malformed package entry"))
+                continue
+            resolved = package.get("resolved")
+            package_type = package.get("type")
+            content_hash = package.get("contentHash")
+            if not isinstance(resolved, str) or not resolved.strip():
+                findings.append(Finding("DEP-007", relative_lock, 1, f"NuGet package '{package_name}' in '{framework}' has no exact resolved version"))
+                continue
+            if package_type not in {"Direct", "Transitive"}:
+                findings.append(Finding("DEP-007", relative_lock, 1, f"NuGet package '{package_name}' in '{framework}' has invalid dependency type"))
+            try:
+                hash_bytes = base64.b64decode(content_hash, validate=True) if isinstance(content_hash, str) else b""
+            except Exception:
+                hash_bytes = b""
+            if len(hash_bytes) != 64:
+                findings.append(Finding("DEP-007", relative_lock, 1, f"NuGet package '{package_name}' in '{framework}' lacks a valid SHA-512 content hash"))
+            dependency_map = package.get("dependencies", {})
+            if not isinstance(dependency_map, dict):
+                findings.append(Finding("DEP-007", relative_lock, 1, f"NuGet package '{package_name}' in '{framework}' has malformed dependency edges"))
+                dependency_map = {}
+            identity = {
+                "target_framework": framework,
+                "name": package_name,
+                "version": resolved,
+                "type": package_type.lower() if isinstance(package_type, str) else "invalid",
+                "requested": package.get("requested"),
+                "content_hash_sha512": content_hash if isinstance(content_hash, str) else None,
+                "dependencies": [
+                    {"name": dependency, "requested": requested}
+                    for dependency, requested in sorted(dependency_map.items(), key=lambda item: item[0].lower())
+                    if isinstance(dependency, str) and isinstance(requested, str)
+                ],
+            }
+            locked_packages.append(identity)
+            if framework == target_framework and package_type == "Direct":
+                normalized = _normalize_ecosystem_package_name("nuget", package_name)
+                if normalized in selected_direct:
+                    findings.append(Finding("DEP-007", relative_lock, 1, f"NuGet selected target repeats direct package identity '{package_name}'"))
+                else:
+                    selected_direct[normalized] = identity
+
+    declared_names = set(declared)
+    locked_direct_names = set(selected_direct)
+    for normalized, package in sorted(declared.items()):
+        locked = selected_direct.get(normalized)
+        if locked is None:
+            findings.append(Finding("DEP-007", relative_lock, 1, f"direct NuGet package '{package['name']}' is absent from the selected lock target"))
+        elif package["version"] != locked["version"]:
+            findings.append(
+                Finding(
+                    "DEP-007",
+                    relative_project,
+                    1,
+                    f"NuGet PackageReference '{package['name']}' version '{package['version']}' differs from locked version '{locked['version']}'",
+                )
+            )
+    for normalized in sorted(locked_direct_names - declared_names):
+        findings.append(Finding("DEP-007", relative_lock, 1, f"lock marks undeclared NuGet package '{selected_direct[normalized]['name']}' as direct"))
+
+    locked_packages.sort(key=lambda item: (item["target_framework"].lower(), item["name"].lower(), item["version"]))
+    direct_packages = [
+        {"name": package["name"], "version": package["version"]}
+        for _, package in sorted(declared.items())
+    ]
+    return findings, {
+        "status": "complete" if not findings else "incomplete",
+        "project": policy.get("project"),
+        "lockfile": policy.get("lockfile"),
+        "target_framework": target_framework,
+        "direct_package_count": len(direct_packages),
+        "direct_packages": direct_packages,
+        "locked_package_instance_count": len(locked_packages),
+        "locked_packages": locked_packages,
+    }
+
+
+def check_nuget_ecosystem(root: Path, nuget_policy: dict | None = None) -> list[Finding]:
+    findings, _ = _collect_nuget_locked_packages(root, nuget_policy)
     return findings
-
 
 def collect_locked_dependency_identity(
     root: Path, direct_deps: set[str], lockfile: object
@@ -560,6 +1736,64 @@ def collect_locked_dependency_identity(
 
     return findings, identities
 
+
+def collect_all_rust_locked_packages(
+    root: Path, lockfile: object
+) -> tuple[list[Finding], list[dict]]:
+    findings: list[Finding] = []
+    if not isinstance(lockfile, str) or not lockfile.strip() or Path(lockfile).is_absolute() or ".." in Path(lockfile).parts:
+        return [Finding(IDENTITY_BINDING_FINDING, "config/dependency-policy.toml", 1, "Rust lockfile path is invalid for complete package accounting")], []
+    lock_path = root / lockfile
+    relative_lock = lock_path.relative_to(root).as_posix()
+    if not lock_path.is_file():
+        return [Finding(IDENTITY_BINDING_FINDING, relative_lock, 0, "Cargo.lock is missing for complete package accounting")], []
+    try:
+        lock_data = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return [Finding(IDENTITY_BINDING_FINDING, relative_lock, 1, f"Cargo.lock cannot be parsed for complete package accounting: {exc}")], []
+    packages = lock_data.get("package")
+    if not isinstance(packages, list) or not packages:
+        return [Finding(IDENTITY_BINDING_FINDING, relative_lock, 1, "Cargo.lock has no package identities")], []
+
+    identities: list[dict] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    for package in packages:
+        if not isinstance(package, dict):
+            findings.append(Finding(IDENTITY_BINDING_FINDING, relative_lock, 1, "Cargo.lock contains a malformed package identity"))
+            continue
+        name = package.get("name")
+        version = package.get("version")
+        source = package.get("source")
+        checksum = package.get("checksum")
+        if not isinstance(name, str) or not name.strip() or not isinstance(version, str) or not version.strip():
+            findings.append(Finding(IDENTITY_BINDING_FINDING, relative_lock, 1, "Cargo.lock package identity lacks an exact name or version"))
+            continue
+        if source is not None and (not isinstance(source, str) or not source.strip()):
+            findings.append(Finding(IDENTITY_BINDING_FINDING, relative_lock, 1, f"Cargo.lock package '{name}' has an invalid source"))
+            continue
+        if checksum is not None and (not isinstance(checksum, str) or not _HEX64.fullmatch(checksum)):
+            findings.append(Finding(IDENTITY_BINDING_FINDING, relative_lock, 1, f"Cargo.lock package '{name}' has an invalid checksum"))
+        if isinstance(source, str) and source.startswith("registry+") and not isinstance(checksum, str):
+            findings.append(Finding(IDENTITY_BINDING_FINDING, relative_lock, 1, f"registry package '{name}' lacks a lock checksum"))
+        identity_key = (name, version, source)
+        if identity_key in seen:
+            findings.append(Finding(IDENTITY_BINDING_FINDING, relative_lock, 1, f"Cargo.lock repeats package identity '{name} {version}'"))
+        seen.add(identity_key)
+        dependency_edges = package.get("dependencies", [])
+        if not isinstance(dependency_edges, list) or any(not isinstance(edge, str) for edge in dependency_edges):
+            findings.append(Finding(IDENTITY_BINDING_FINDING, relative_lock, 1, f"Cargo.lock package '{name}' has malformed dependency edges"))
+            dependency_edges = []
+        identities.append(
+            {
+                "name": name,
+                "version": version,
+                "source": source,
+                "checksum": checksum,
+                "dependencies": sorted(set(dependency_edges)),
+            }
+        )
+    identities.sort(key=lambda item: (item["name"], item["version"], item["source"] or ""))
+    return findings, identities
 
 def _validated_node_input(
     root: Path,
@@ -754,7 +1988,7 @@ def _node_input_paths(
             root, contract_relative, "Node contract", findings
         )
         try:
-            contract = json.loads(contract_bytes.decode("utf-8")) if contract_bytes is not None else {}
+            contract = json.loads(contract_bytes.decode("utf-8"), object_pairs_hook=_json_object_without_duplicate_keys) if contract_bytes is not None else {}
         except (UnicodeDecodeError, json.JSONDecodeError):
             contract = {}
         surface = contract.get("surface") if isinstance(contract, dict) else None
@@ -792,6 +2026,11 @@ def _node_input_paths(
                     )
                     if instruction_relative:
                         paths.append(instruction_relative)
+    node_findings, node_denominator = _collect_node_dependency_denominator(root, policy)
+    if findings is not None:
+        findings.extend(node_findings)
+    paths.extend(node_denominator.get("surface_source_files", []))
+    paths.extend(node_denominator.get("package_manager_files", []))
     return list(dict.fromkeys(paths))
 
 
@@ -938,51 +2177,270 @@ def check_node_ecosystem(root: Path, node_policy: dict | None = None) -> list[Fi
     return findings
 
 
-def check_python_ecosystem(root: Path) -> list[Finding]:
+def _collect_node_dependency_denominator(
+    root: Path, node_policy: dict | None = None
+) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
-    req_path = root / "scripts" / "requirements-verification.txt"
-    rel_req = "scripts/requirements-verification.txt"
+    policy = node_policy if isinstance(node_policy, dict) else {}
+    package_root, path_findings = _configured_repo_path(
+        root, policy.get("package_root", "integrations"), "[ecosystems.node].package_root", NODE_ECOSYSTEM_FINDING
+    )
+    findings.extend(path_findings)
+    package_manager_names = {
+        "package.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+    }
+    package_manager_files: list[str] = []
+    if package_root is None:
+        package_root_relative = None
+    else:
+        package_root_relative = package_root.relative_to(root).as_posix()
+        if not package_root.is_dir():
+            findings.append(Finding(NODE_ECOSYSTEM_FINDING, package_root_relative, 0, "configured Node package root is missing or not a directory"))
+        else:
+            try:
+                _assert_no_reparse_parents(package_root)
+            except OSError as exc:
+                findings.append(Finding(NODE_ECOSYSTEM_FINDING, package_root_relative, 0, f"Node package root is not a stable repository directory: {exc}"))
+            else:
+                for directory, directory_names, file_names in os.walk(package_root, followlinks=False):
+                    directory_path = Path(directory)
+                    directory_names[:] = sorted(
+                        name
+                        for name in directory_names
+                        if name not in {".git", ".eliot", "node_modules", "target"}
+                        and not (directory_path / name).is_symlink()
+                    )
+                    for file_name in sorted(file_names):
+                        if file_name.lower() in package_manager_names:
+                            package_manager_files.append((directory_path / file_name).relative_to(root).as_posix())
+    package_manager_files.sort()
+    if package_manager_files:
+        findings.append(
+            Finding(
+                NODE_ECOSYSTEM_FINDING,
+                package_root_relative or "config/dependency-policy.toml",
+                1,
+                "Node package-manager manifests or locks are present but are not admitted by the configured empty-package policy",
+            )
+        )
 
+    contract_path, contract_relative = _validated_node_input(
+        root, policy.get("contract"), "[ecosystems.node].contract", findings
+    )
+    surface_relative: str | None = None
+    if contract_path is not None and contract_relative is not None:
+        contract_bytes = _read_validated_node_bytes(root, contract_relative, "Node contract", findings)
+        try:
+            contract = json.loads(contract_bytes.decode("utf-8"), object_pairs_hook=_json_object_without_duplicate_keys) if contract_bytes is not None else {}
+        except (UnicodeDecodeError, ValueError):
+            contract = {}
+            findings.append(Finding(NODE_ECOSYSTEM_FINDING, contract_relative, 1, "Node contract cannot be parsed for import accounting"))
+        surface = contract.get("surface") if isinstance(contract, dict) else None
+        if not isinstance(surface, str) or not surface.strip():
+            findings.append(Finding(NODE_ECOSYSTEM_FINDING, contract_relative, 1, "Node contract has no observed source surface"))
+        else:
+            _, surface_relative = _validated_node_input(root, surface, "Node contract surface", findings)
+    source_files: set[str] = set()
+    external_imports: list[dict] = []
+    direct_packages: set[str] = set()
+    if surface_relative is not None:
+        pending = [surface_relative]
+        visited: set[str] = set()
+        import_pattern = re.compile(r"""(?m)^\s*import\s+(?:(?:[^;]*?\s+from\s+)?["']([^"']+)["']|["']([^"']+)["'])""")
+        export_pattern = re.compile(r"""(?m)^\s*export\s+[^;]*?\s+from\s+["']([^"']+)["']""")
+        require_pattern = re.compile(r"""\brequire\s*\(\s*["']([^"']+)["']\s*\)""")
+        dynamic_import_pattern = re.compile(r"""\bimport\s*\(\s*["']([^"']+)["']\s*\)""")
+        computed_import_pattern = re.compile(r"""\bimport\s*\(\s*(?!["'])""")
+        computed_require_pattern = re.compile(r"""\brequire\s*\(\s*(?!["'])""")
+        dynamic_loader_pattern = re.compile(r"""\b(?:createRequire|require\s*\.\s*resolve|module\s*\.\s*require|eval|new\s+Function)\b""")
+        while pending:
+            relative = pending.pop()
+            if relative in visited:
+                continue
+            visited.add(relative)
+            _, validated_relative = _validated_node_input(root, relative, "Node import source", findings)
+            if validated_relative is None:
+                continue
+            source_path = root / validated_relative
+            payload = _read_validated_node_bytes(root, validated_relative, "Node import source", findings)
+            if payload is None:
+                continue
+            source_files.add(validated_relative)
+            if source_path.suffix.lower() not in {".js", ".mjs", ".cjs"}:
+                continue
+            try:
+                source = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                findings.append(Finding(NODE_ECOSYSTEM_FINDING, validated_relative, 1, "Node import source is not UTF-8"))
+                continue
+
+            matches: list[tuple[int, str]] = []
+            for pattern in (import_pattern, export_pattern, require_pattern, dynamic_import_pattern):
+                matches.extend((match.start(), next(group for group in match.groups() if group is not None)) for match in pattern.finditer(source))
+            if computed_import_pattern.search(source) or computed_require_pattern.search(source) or dynamic_loader_pattern.search(source):
+                findings.append(Finding(NODE_ECOSYSTEM_FINDING, validated_relative, 1, "computed Node import cannot be bound to a package identity"))
+            for offset, specifier in sorted(set(matches)):
+                if specifier.startswith(("node:", "data:")):
+                    continue
+                if specifier.startswith("."):
+                    base = source_path.parent / specifier
+                    candidates = [base]
+                    if not base.suffix:
+                        candidates.extend(
+                            Path(str(base) + suffix)
+                            for suffix in (".js", ".mjs", ".cjs", ".json")
+                        )
+                        candidates.extend(base / ("index" + suffix) for suffix in (".js", ".mjs", ".cjs", ".json"))
+                    resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
+                    if resolved is None:
+                        line = source.count("\n", 0, offset) + 1
+                        findings.append(Finding(NODE_ECOSYSTEM_FINDING, validated_relative, line, f"local Node import '{specifier}' cannot be resolved"))
+                        continue
+                    try:
+                        child_relative = resolved.resolve().relative_to(root.resolve()).as_posix()
+                    except ValueError:
+                        findings.append(Finding(NODE_ECOSYSTEM_FINDING, validated_relative, 1, f"local Node import '{specifier}' escapes the repository"))
+                        continue
+                    pending.append(child_relative)
+                    continue
+                segments = specifier.split("/")
+                package_name = "/".join(segments[:2]) if segments[0].startswith("@") and len(segments) > 1 else segments[0]
+                direct_packages.add(package_name)
+                external_imports.append(
+                    {
+                        "specifier": specifier,
+                        "package": package_name,
+                        "source": validated_relative,
+                        "status": "unlocked",
+                    }
+                )
+                line = source.count("\n", 0, offset) + 1
+                findings.append(Finding(NODE_ECOSYSTEM_FINDING, validated_relative, line, f"external Node import '{specifier}' has no configured locked package identity"))
+
+    surface_sources = sorted(source_files)
+    denominator = {
+        "status": "complete" if not findings else "incomplete",
+        "package_root": package_root_relative,
+        "package_manager_files": package_manager_files,
+        "surface": surface_relative,
+        "surface_source_files": surface_sources,
+        "direct_package_count": len(direct_packages),
+        "direct_packages": sorted(direct_packages),
+        "locked_package_count": 0,
+        "locked_packages": [],
+        "external_imports": sorted(external_imports, key=lambda item: (item["package"], item["specifier"], item["source"])),
+    }
+    return findings, denominator
+
+def _collect_python_locked_packages(
+    root: Path, raw_lockfile: object = "scripts/requirements-verification.txt"
+) -> tuple[list[Finding], dict]:
+    findings: list[Finding] = []
+    req_path, path_findings = _configured_repo_path(
+        root, raw_lockfile, "[ecosystems.python].manifest", "DEP-008"
+    )
+    findings.extend(path_findings)
+    if req_path is None:
+        return findings, {"status": "incomplete", "direct_packages": [], "locked_packages": []}
+    relative_path = req_path.relative_to(root).as_posix()
     if not req_path.is_file():
-        findings.append(Finding("DEP-008", rel_req, 0, "missing requirements-verification.txt"))
-        return findings
+        findings.append(Finding("DEP-008", relative_path, 0, "Python requirements lock is missing"))
+        return findings, {"status": "incomplete", "manifest": relative_path, "direct_packages": [], "locked_packages": []}
+    try:
+        lines = req_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        findings.append(Finding("DEP-008", relative_path, 1, f"Python requirements lock cannot be read: {exc}"))
+        return findings, {"status": "incomplete", "manifest": relative_path, "direct_packages": [], "locked_packages": []}
 
-    lines = req_path.read_text(encoding="utf-8").splitlines()
-    current_package = None
-    has_hash = False
+    package_pattern = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)\s*\\?$")
+    hash_pattern = re.compile(r"^--hash=sha256:([0-9a-fA-F]{64})\s*\\?$")
+    locked_packages: list[dict] = []
+    current: dict | None = None
+    current_line = 0
+
+    def finish_current() -> None:
+        nonlocal current
+        if current is None:
+            return
+        if not current["hashes"]:
+            findings.append(
+                Finding("DEP-008", relative_path, current_line, f"package '{current['name']}' is missing SHA-256 hashes")
+            )
+        locked_packages.append(current)
+        current = None
 
     for line_no, raw_line in enumerate(lines, 1):
         stripped = raw_line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped:
             continue
-
-        if stripped.startswith("--hash="):
-            if not re.fullmatch(r"--hash=sha256:[0-9a-fA-F]{64}\s*\\?", stripped):
-                findings.append(Finding("DEP-008", rel_req, line_no, f"invalid hash format: {stripped}"))
+        if stripped.startswith("#"):
+            direct_marker = re.match(r"^#\s*via\s+-r\s+(.+?)\s*$", stripped, re.IGNORECASE)
+            if current is not None and direct_marker is not None:
+                marker_path = direct_marker.group(1).replace("\\", "/")
+                if marker_path == relative_path:
+                    current["direct"] = True
+            continue
+        hash_match = hash_pattern.fullmatch(stripped)
+        if hash_match is not None:
+            if current is None:
+                findings.append(Finding("DEP-008", relative_path, line_no, "hash appears before a pinned Python package"))
             else:
-                has_hash = True
+                current["hashes"].append(hash_match.group(1).lower())
             continue
+        finish_current()
+        requirement = package_pattern.fullmatch(stripped)
+        if requirement is None:
+            findings.append(Finding("DEP-008", relative_path, line_no, f"requirement '{stripped}' is not a supported exact name==version pin"))
+            continue
+        current_line = line_no
+        current = {
+            "name": requirement.group(1),
+            "normalized_name": _normalize_ecosystem_package_name("python", requirement.group(1)),
+            "version": requirement.group(2),
+            "direct": False,
+            "hashes": [],
+        }
+    finish_current()
 
-        if current_package and not has_hash:
-            findings.append(
-                Finding("DEP-008", rel_req, line_no - 1, f"package '{current_package}' is missing --hash=sha256")
-            )
+    seen: set[str] = set()
+    for package in locked_packages:
+        normalized = package["normalized_name"]
+        if normalized in seen:
+            findings.append(Finding("DEP-008", relative_path, 1, f"duplicate normalized Python package identity '{normalized}'"))
+        seen.add(normalized)
+        if not package["hashes"]:
+            continue
+        package["hashes"] = sorted(set(package["hashes"]))
+    direct_packages = [
+        {"name": package["name"], "version": package["version"]}
+        for package in locked_packages
+        if package["direct"]
+    ]
+    if not locked_packages:
+        findings.append(Finding("DEP-008", relative_path, 1, "Python requirements lock has no package identities"))
+    if not direct_packages:
+        findings.append(Finding("DEP-008", relative_path, 1, "Python requirements lock has no observed direct requirement"))
+    locked_packages.sort(key=lambda item: (item["normalized_name"], item["version"]))
+    return findings, {
+        "status": "complete" if not findings else "incomplete",
+        "manifest": relative_path,
+        "hash_locked": True,
+        "direct_package_count": len(direct_packages),
+        "direct_packages": direct_packages,
+        "locked_package_count": len(locked_packages),
+        "locked_packages": locked_packages,
+    }
 
-        pkg_part = stripped.rstrip("\\").strip()
-        if "==" not in pkg_part:
-            findings.append(
-                Finding("DEP-008", rel_req, line_no, f"requirement '{pkg_part}' is not exact version-pinned with ==")
-            )
-        current_package = pkg_part
-        has_hash = False
 
-    if current_package and not has_hash:
-        findings.append(
-            Finding("DEP-008", rel_req, len(lines), f"package '{current_package}' is missing --hash=sha256")
-        )
-
+def check_python_ecosystem(root: Path) -> list[Finding]:
+    findings, _ = _collect_python_locked_packages(root)
     return findings
-
 
 def _extract_external_version(output: str) -> str | None:
     match = re.search(r"(?<!\d)(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)(?!\d)", output)
@@ -1119,7 +2577,12 @@ _OSV_ENDPOINT = "https://api.osv.dev/v1/query"
 _PROVISIONING_RECEIPT_RELATIVE = ".eliot/dependency-policy/surrealdb/provisioning-receipt.json"
 
 
-def _canonical_surreal_evidence_records(surreal: dict, candidate: dict) -> list[dict]:
+def _canonical_surreal_evidence_records(
+    surreal: dict,
+    candidate: dict,
+    *,
+    include_candidate_advisories: bool = False,
+) -> list[dict]:
     """Derive evidence subjects and URLs from the official source contract.
 
     Configured URL strings are checked against these derived values; they do
@@ -1185,6 +2648,17 @@ def _canonical_surreal_evidence_records(surreal: dict, candidate: dict) -> list[
 
     add("osv.query.surrealdb", surreal.get("advisory_query_path"), _OSV_ENDPOINT, surreal.get("advisory_query_sha256"))
     add("osv.response.surrealdb", surreal.get("advisory_response_path"), _OSV_ENDPOINT, surreal.get("advisory_response_digest"))
+    if include_candidate_advisories and isinstance(candidate, dict) and isinstance(candidate_tag, str):
+        add(
+            f"osv.query.surrealdb.release-candidate.{candidate_tag}",
+            candidate.get("advisory_query_path"),
+            _OSV_ENDPOINT,
+        )
+        add(
+            f"osv.response.surrealdb.release-candidate.{candidate_tag}",
+            candidate.get("advisory_response_path"),
+            _OSV_ENDPOINT,
+        )
     return records
 
 
@@ -1193,6 +2667,8 @@ def _validate_provisioning_receipt(
     surreal: dict,
     candidate: dict,
     findings: list[Finding],
+    *,
+    require_candidate_advisories: bool = False,
 ) -> dict:
     """Consume the provisioner's canonical URL/path/bytes/digest binding."""
 
@@ -1234,7 +2710,11 @@ def _validate_provisioning_receipt(
     if receipt.get("repository") != _SURREAL_REPOSITORY or receipt.get("shared_installation_touched") is not False:
         findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "project-local provisioning receipt does not bind the official repository and no-shared-installation boundary"))
 
-    expected_records = _canonical_surreal_evidence_records(surreal, candidate)
+    expected_records = _canonical_surreal_evidence_records(
+        surreal,
+        candidate,
+        include_candidate_advisories=require_candidate_advisories,
+    )
     actual_records = receipt.get("records")
     if not isinstance(actual_records, list):
         findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "project-local provisioning receipt records must be a list"))
@@ -1247,7 +2727,20 @@ def _validate_provisioning_receipt(
 
     verified: list[dict] = []
     expected_subjects = {item["subject"] for item in expected_records}
-    if set(receipt_by_subject) != expected_subjects:
+    optional_candidate_subjects: set[str] = set()
+    if not require_candidate_advisories and isinstance(candidate, dict):
+        candidate_tag = candidate.get("source_tag")
+        if isinstance(candidate_tag, str):
+            optional_candidate_subjects = {
+                f"osv.query.surrealdb.release-candidate.{candidate_tag}",
+                f"osv.response.surrealdb.release-candidate.{candidate_tag}",
+            }
+    actual_subjects = set(receipt_by_subject)
+    if (
+        not expected_subjects.issubset(actual_subjects)
+        or not actual_subjects.issubset(expected_subjects | optional_candidate_subjects)
+        or any(len(receipt_by_subject.get(subject, [])) > 1 for subject in optional_candidate_subjects)
+    ):
         findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "project-local provisioning receipt subjects do not exactly cover the canonical evidence set"))
 
     for expected in expected_records:
@@ -1285,6 +2778,63 @@ def _validate_provisioning_receipt(
             else:
                 verified.append({**expected, "sha256": actual_sha, "bytes": len(payload)})
 
+    candidate_refresh: dict = {"status": "not_assessed"}
+    candidate_tag = candidate.get("source_tag") if isinstance(candidate, dict) else None
+    candidate_version = candidate.get("version") if isinstance(candidate, dict) else None
+    if require_candidate_advisories and isinstance(candidate_tag, str) and isinstance(candidate_version, str):
+        response_subject = f"osv.response.surrealdb.release-candidate.{candidate_tag}"
+        query_subject = f"osv.query.surrealdb.release-candidate.{candidate_tag}"
+        response_matches = receipt_by_subject.get(response_subject, [])
+        query_matches = receipt_by_subject.get(query_subject, [])
+        if len(response_matches) == 1 and len(query_matches) == 1:
+            response_record = response_matches[0]
+            query_record = query_matches[0]
+            retrieved_at = response_record.get("retrieved_at_utc")
+            max_age_hours = candidate.get("advisory_max_age_hours")
+            refresh_status = "verified"
+            if query_record.get("request") is not True:
+                refresh_status = "findings"
+                findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV query was not recorded as a provisioner request"))
+            if response_record.get("fetched") is not True or response_record.get("request") is not False:
+                refresh_status = "findings"
+                findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV response was not fetched by the provisioner"))
+            if not isinstance(max_age_hours, int) or isinstance(max_age_hours, bool) or max_age_hours <= 0:
+                refresh_status = "findings"
+                findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV maximum age is not a positive integer"))
+            try:
+                parsed_retrieved_at = datetime.fromisoformat(str(retrieved_at).replace("Z", "+00:00"))
+                if parsed_retrieved_at.tzinfo is None:
+                    raise ValueError("timestamp has no timezone")
+                age_seconds = (datetime.now(timezone.utc) - parsed_retrieved_at.astimezone(timezone.utc)).total_seconds()
+                if age_seconds < 0 or age_seconds > int(max_age_hours) * 3600:
+                    refresh_status = "stale"
+                    findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV response is outside its locked freshness window"))
+            except (TypeError, ValueError) as exc:
+                age_seconds = None
+                refresh_status = "findings"
+                findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, f"selected-candidate OSV response timestamp is invalid: {exc}"))
+            candidate_refresh = {
+                "status": refresh_status,
+                "query": {
+                    "subject": query_subject,
+                    "path": query_record.get("relative_path"),
+                    "sha256": query_record.get("sha256"),
+                    "bytes": query_record.get("bytes"),
+                },
+                "response": {
+                    "subject": response_subject,
+                    "path": response_record.get("relative_path"),
+                    "sha256": response_record.get("sha256"),
+                    "bytes": response_record.get("bytes"),
+                    "fetched": response_record.get("fetched"),
+                    "retrieved_at_utc": retrieved_at,
+                    "age_seconds": age_seconds,
+                },
+                "maximum_age_hours": max_age_hours,
+            }
+        else:
+            findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "provisioning receipt must contain exactly one selected-candidate OSV query and response"))
+
     return {
         "status": "verified" if len(verified) == len(expected_records) and not any(
             finding.code == RECEIPT_PROVENANCE_FINDING for finding in findings
@@ -1293,6 +2843,7 @@ def _validate_provisioning_receipt(
         "sha256": hashlib.sha256(receipt_bytes).hexdigest(),
         "bytes": len(receipt_bytes),
         "records": verified,
+        "candidate_advisory_refresh": candidate_refresh,
     }
 
 
@@ -1617,7 +3168,12 @@ def _validate_surreal_binary_evidence(
 
 
 def _validate_patched_candidate(
-    root: Path, surreal: dict, catalog: dict, advisory_fix_versions: dict, findings: list[Finding]
+    root: Path,
+    surreal: dict,
+    catalog: dict,
+    advisory_fix_versions: dict,
+    findings: list[Finding],
+    probe_executable: bool = True,
 ) -> dict:
     """Validate the project-local release bytes selected by the release lock."""
 
@@ -1647,6 +3203,10 @@ def _validate_patched_candidate(
         "release_metadata_path",
         "advisory_query_path",
         "advisory_response_path",
+        "advisory_package",
+        "advisory_ecosystem",
+        "advisory_scope",
+        "advisory_max_age_hours",
     )
     if not isinstance(candidate, dict):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate must be a project-local release lock table"))
@@ -1700,6 +3260,10 @@ def _validate_patched_candidate(
 
     candidate_config_valid = len(findings) == candidate_config_start
     artifact_execution_valid = candidate_config_valid
+    version_probe: dict = {
+        "status": "not_executed",
+        "reason": "candidate artifact is absent or failed byte-and-PE validation",
+    }
     artifact_path, artifact_bytes = _read_external_evidence_file(
         root, candidate.get("artifact_path"), "SurrealDB patched candidate artifact", findings
     )
@@ -1721,7 +3285,7 @@ def _validate_patched_candidate(
         elif machine != 0x8664:
             artifact_execution_valid = False
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate PE machine is not x86_64"))
-        if artifact_execution_valid and artifact_path is not None:
+        if artifact_execution_valid and artifact_path is not None and probe_executable:
             try:
                 proc = _run_verified_executable(
                     artifact_bytes,
@@ -1731,12 +3295,29 @@ def _validate_patched_candidate(
                 )
                 combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
                 observed_candidate_version = _extract_external_version(combined)
-                if proc.returncode != 0 or observed_candidate_version != str(candidate.get("version")):
+                probe_verified = proc.returncode == 0 and observed_candidate_version == str(candidate.get("version"))
+                version_probe = {
+                    "status": "verified" if probe_verified else "failed",
+                    "execution": "verified_private_copy",
+                    "command": ["version"],
+                    "exit_code": proc.returncode,
+                    "expected_version": str(candidate.get("version")),
+                    "observed_version": observed_candidate_version,
+                }
+                if not probe_verified:
                     artifact_execution_valid = False
                     findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate version probe does not match the pinned release"))
             except (OSError, subprocess.TimeoutExpired) as exc:
                 artifact_execution_valid = False
+                version_probe = {
+                    "status": "failed",
+                    "execution": "verified_private_copy",
+                    "command": ["version"],
+                    "error": str(exc),
+                }
                 findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb patched candidate version probe failed: {exc}"))
+        elif artifact_execution_valid and artifact_path is not None:
+            version_probe = {"status": "not_executed", "reason": "selected-release evidence mode is byte-and-metadata only"}
 
     release_path, _, release_data = _parse_external_json(
         root, candidate.get("release_metadata_path"), "SurrealDB patched candidate release metadata", findings
@@ -1771,8 +3352,26 @@ def _validate_patched_candidate(
         "SurrealDB patched candidate source archive",
         findings,
     )
-    if candidate.get("advisory_query_path") != surreal.get("advisory_query_path") or candidate.get("advisory_response_path") != surreal.get("advisory_response_path"):
-        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "patched candidate advisory evidence must use the actual configured OSV snapshot"))
+    candidate_directory = str(Path(str(candidate.get("artifact_path", ""))).parent).replace("\\", "/")
+    if (
+        candidate.get("advisory_query_path") != f"{candidate_directory}/osv-query.json"
+        or candidate.get("advisory_response_path") != f"{candidate_directory}/osv-response.json"
+        or candidate.get("advisory_query_path") == surreal.get("advisory_query_path")
+        or candidate.get("advisory_response_path") == surreal.get("advisory_response_path")
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "patched candidate OSV query and response must be separate files beside its exact artifact"))
+    if (
+        candidate.get("advisory_package") != "surrealdb"
+        or candidate.get("advisory_ecosystem") != "crates.io"
+        or candidate.get("advisory_scope") != "rust-crate"
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "patched candidate advisory scope must target crates.io/surrealdb as a Rust crate"))
+    if (
+        not isinstance(candidate.get("advisory_max_age_hours"), int)
+        or isinstance(candidate.get("advisory_max_age_hours"), bool)
+        or candidate.get("advisory_max_age_hours") <= 0
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "patched candidate advisory_max_age_hours must be a positive integer"))
 
     catalog_candidate = catalog.get("patched_candidate") if isinstance(catalog, dict) else None
     if not isinstance(catalog_candidate, dict):
@@ -1803,6 +3402,7 @@ def _validate_patched_candidate(
             "path": str(artifact_path.relative_to(root)).replace("\\", "/") if artifact_path else None,
             "sha256": artifact_sha,
             "bytes": len(artifact_bytes) if artifact_bytes is not None else None,
+            "version_probe": version_probe,
         },
         "release_metadata": {
             "status": "observed" if release_path and isinstance(release_data, dict) else "missing",
@@ -1814,6 +3414,114 @@ def _validate_patched_candidate(
             "sha256": hashlib.sha256(tag_payload).hexdigest() if tag_payload is not None else None,
         },
         "source_archive": candidate_source_archive,
+    }
+
+
+def _validate_candidate_release_advisories(
+    root: Path,
+    surreal: dict,
+    candidate: dict,
+    provisioning_receipt: dict,
+    findings: list[Finding],
+) -> dict:
+    """Bind a fresh OSV query/result to the exact selected candidate version."""
+
+    initial_findings = len(findings)
+    version = str(candidate.get("version", ""))
+    package = candidate.get("advisory_package")
+    ecosystem = candidate.get("advisory_ecosystem")
+    query_path, query_bytes, query_data = _parse_external_json(
+        root,
+        candidate.get("advisory_query_path"),
+        "SurrealDB selected-candidate OSV query",
+        findings,
+    )
+    response_path, response_bytes, response_data = _parse_external_json(
+        root,
+        candidate.get("advisory_response_path"),
+        "SurrealDB selected-candidate OSV response",
+        findings,
+    )
+    query_sha = hashlib.sha256(query_bytes).hexdigest() if query_bytes is not None else None
+    response_sha = hashlib.sha256(response_bytes).hexdigest() if response_bytes is not None else None
+    expected_query = {
+        "package": {"ecosystem": ecosystem, "name": package},
+        "version": version,
+    }
+    if query_data != expected_query:
+        findings.append(Finding("DEP-009", str(query_path.relative_to(root)).replace("\\", "/") if query_path else "config/dependency-policy.toml", 1, "selected-candidate OSV query does not bind its exact package, ecosystem and version"))
+
+    refresh = provisioning_receipt.get("candidate_advisory_refresh", {}) if isinstance(provisioning_receipt, dict) else {}
+    query_record = refresh.get("query", {}) if isinstance(refresh, dict) else {}
+    response_record = refresh.get("response", {}) if isinstance(refresh, dict) else {}
+    expected_query_path = str(query_path.relative_to(root)).replace("\\", "/") if query_path else None
+    expected_response_path = str(response_path.relative_to(root)).replace("\\", "/") if response_path else None
+    if (
+        refresh.get("status") != "verified"
+        or query_record.get("path") != expected_query_path
+        or query_record.get("sha256") != query_sha
+        or response_record.get("path") != expected_response_path
+        or response_record.get("sha256") != response_sha
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "selected-candidate OSV inputs do not match a fresh provisioner receipt"))
+
+    vulnerabilities = response_data.get("vulns", []) if isinstance(response_data, dict) else None
+    advisory_ids: list[str] = []
+    if isinstance(response_data, dict):
+        unexpected_response_fields = set(response_data) - {"vulns", "next_page_token"}
+        if unexpected_response_fields:
+            findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response contains unsupported fields"))
+        if "next_page_token" in response_data:
+            next_page_token = response_data["next_page_token"]
+            if not isinstance(next_page_token, str):
+                findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response next_page_token must be a string when present"))
+            elif next_page_token:
+                findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response is paginated and incomplete"))
+    if not isinstance(vulnerabilities, list):
+        findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response vulns field must be an array when present"))
+        vulnerabilities = []
+    for vulnerability in vulnerabilities:
+        if not isinstance(vulnerability, dict) or not isinstance(vulnerability.get("id"), str) or not vulnerability["id"].strip():
+            findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response contains a malformed vulnerability record"))
+            continue
+        vulnerability_id = vulnerability["id"]
+        advisory_ids.append(vulnerability_id)
+        affected = vulnerability.get("affected")
+        if not isinstance(affected, list) or not any(
+            isinstance(item, dict)
+            and isinstance(item.get("package"), dict)
+            and item["package"].get("ecosystem") == ecosystem
+            and item["package"].get("name") == package
+            for item in affected
+        ):
+            findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, f"selected-candidate OSV record {vulnerability_id} does not identify crates.io/surrealdb"))
+    if len(set(advisory_ids)) != len(advisory_ids):
+        findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response contains duplicate advisory identifiers"))
+
+    return {
+        "evidence_status": "verified" if len(findings) == initial_findings else "findings",
+        "advisory_status": "findings" if advisory_ids else "no_known_vulnerabilities",
+        "source": _OSV_ENDPOINT,
+        "package": package,
+        "ecosystem": ecosystem,
+        "scope": candidate.get("advisory_scope"),
+        "version": version,
+        "query": {
+            "path": expected_query_path,
+            "sha256": query_sha,
+            "bytes": len(query_bytes) if query_bytes is not None else None,
+            "body": query_data,
+        },
+        "response": {
+            "path": expected_response_path,
+            "sha256": response_sha,
+            "bytes": len(response_bytes) if response_bytes is not None else None,
+            "retrieved_at_utc": response_record.get("retrieved_at_utc"),
+            "age_seconds": response_record.get("age_seconds"),
+            "maximum_age_hours": refresh.get("maximum_age_hours") if isinstance(refresh, dict) else None,
+        },
+        "advisory_ids": sorted(advisory_ids),
+        "distributed_binary_applicability": "unestablished",
     }
 
 
@@ -2075,6 +3783,13 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
             catalog_evidence = {"status": "invalid", "path": catalog_rel}
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"malformed surrealdb catalog: {exc}"))
 
+    provisioning_receipt = _validate_provisioning_receipt(
+        root,
+        surreal,
+        surreal.get("patched_candidate") if isinstance(surreal.get("patched_candidate"), dict) else {},
+        findings,
+    )
+    candidate_config = surreal.get("patched_candidate") if isinstance(surreal.get("patched_candidate"), dict) else {}
     candidate_evidence = _validate_patched_candidate(
         root,
         surreal,
@@ -2082,13 +3797,6 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
         binary_evidence.get("advisory_fix_versions", {}),
         findings,
     )
-    provisioning_receipt = _validate_provisioning_receipt(
-        root,
-        surreal,
-        surreal.get("patched_candidate") if isinstance(surreal.get("patched_candidate"), dict) else {},
-        findings,
-    )
-
     evidence[name] = {
         "status": "findings" if findings else "observed",
         "configured": surreal,
@@ -2136,6 +3844,177 @@ def check_external_executables(
         root = Path(".")
     findings, _ = _collect_external_evidence(root, manifest_data)
     return findings
+
+
+def build_selected_release_receipt(
+    root: Path,
+    selected_artifact_path: str,
+    selected_artifact_sha256: str,
+    selected_artifact_version: str,
+    selected_catalog_sha256: str,
+    selected_provisioning_receipt_sha256: str,
+) -> tuple[list[Finding], dict]:
+    """Build a non-runtime receipt for the exact project-local release selection."""
+
+    findings: list[Finding] = []
+    manifest_findings, manifest_data = check_policy_manifest(root)
+    findings.extend(manifest_findings)
+    externals = manifest_data.get("external_executables", {}) if isinstance(manifest_data, dict) else {}
+    surreal = externals.get("surrealdb") if isinstance(externals, dict) else None
+    if not isinstance(surreal, dict):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "selected release receipt requires the canonical surrealdb policy table"))
+        surreal = {}
+    candidate = surreal.get("patched_candidate")
+    if not isinstance(candidate, dict):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "selected release receipt requires the canonical patched_candidate table"))
+        candidate = {}
+
+    current_source_commit = None
+    try:
+        source_proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if source_proc.returncode == 0 and _HEX40.fullmatch(source_proc.stdout.strip()):
+            current_source_commit = source_proc.stdout.strip()
+        else:
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "cannot bind selected release receipt to a current Git source commit"))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"cannot read selected release source commit: {exc}"))
+
+    _, config_relative, config_bytes, _ = _read_validated_repo_bytes(
+        root,
+        "config/dependency-policy.toml",
+        "dependency policy manifest",
+        findings,
+        "DEP-009",
+    )
+    _, catalog_relative, catalog_bytes, _ = _read_validated_repo_bytes(
+        root,
+        surreal.get("catalog"),
+        "SurrealDB selected-release catalogue",
+        findings,
+        "DEP-009",
+    )
+    catalog: dict = {}
+    if catalog_bytes is not None:
+        try:
+            catalog_data = json.loads(catalog_bytes.decode("utf-8-sig"))
+            if isinstance(catalog_data, dict):
+                catalog = catalog_data
+            else:
+                findings.append(Finding("DEP-009", str(catalog_relative), 1, "selected-release catalogue root must be a JSON object"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            findings.append(Finding("DEP-009", str(catalog_relative), 1, f"selected-release catalogue is invalid JSON: {exc}"))
+
+    actual_candidate_path = str(candidate.get("artifact_path", "")).replace("\\", "/")
+    actual_candidate_sha256 = str(candidate.get("sha256", "")).lower()
+    actual_candidate_version = str(candidate.get("version", ""))
+    if (
+        selected_artifact_path.replace("\\", "/") != actual_candidate_path
+        or selected_artifact_sha256.lower() != actual_candidate_sha256
+        or selected_artifact_version != actual_candidate_version
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "release consumer selection differs from the locked candidate artifact path, digest or version"))
+
+    actual_catalog_sha256 = hashlib.sha256(catalog_bytes).hexdigest() if catalog_bytes is not None else None
+    if selected_catalog_sha256.lower() != str(actual_catalog_sha256 or "").lower():
+        findings.append(Finding("DEP-009", "docs/release/SURREALDB_WINDOWS_X64.lock.json", 1, "release consumer catalogue digest differs from the safely read catalogue bytes"))
+
+    source_evidence = surreal.get("distributed_binary_evidence", {})
+    source_evidence = source_evidence if isinstance(source_evidence, dict) else {}
+    candidate_evidence = _validate_patched_candidate(
+        root,
+        surreal,
+        catalog,
+        source_evidence.get("advisory_fix_versions", {}),
+        findings,
+        probe_executable=False,
+    )
+    provisioning_receipt = _validate_provisioning_receipt(
+        root,
+        surreal,
+        candidate,
+        findings,
+        require_candidate_advisories=True,
+    )
+    actual_provisioning_sha256 = provisioning_receipt.get("sha256")
+    if selected_provisioning_receipt_sha256.lower() != str(actual_provisioning_sha256 or "").lower():
+        findings.append(Finding("DEP-009", _PROVISIONING_RECEIPT_RELATIVE, 1, "release consumer provisioning-receipt digest differs from the safely read receipt bytes"))
+    candidate_advisory = _validate_candidate_release_advisories(
+        root,
+        surreal,
+        candidate,
+        provisioning_receipt,
+        findings,
+    )
+    candidate_evidence["advisory_snapshot"] = candidate_advisory
+
+    try:
+        generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except (OSError, OverflowError, ValueError):
+        generated_at = None
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "cannot establish selected-release receipt generation time"))
+
+    validation_findings = [
+        {"code": finding.code, "path": finding.path, "line": finding.line, "detail": finding.detail}
+        for finding in findings
+    ]
+    binding_status = "EVIDENCE_VERIFIED" if not findings else "INVALID"
+    candidate_advisory_status = candidate_advisory.get("advisory_status", "incomplete")
+    receipt = {
+        "schema": "eliot.selected-release-dependency-policy.v1",
+        "binding_status": binding_status,
+        "candidate_advisory_status": candidate_advisory_status,
+        "release_admission": "INCOMPLETE",
+        "generated_at_utc": generated_at,
+        "source_commit": current_source_commit,
+        "policy_scope": "selected-release external executable: surrealdb",
+        "selected_artifact": {
+            "name": candidate.get("name"),
+            "path": actual_candidate_path,
+            "version": actual_candidate_version,
+            "source_tag": candidate.get("source_tag"),
+            "release_asset": candidate.get("release_asset"),
+            "source_commit": candidate.get("source_commit"),
+            "architecture": candidate.get("architecture"),
+            "pe_machine": candidate.get("pe_machine"),
+            "sha256": candidate_evidence.get("artifact", {}).get("sha256"),
+            "bytes": candidate_evidence.get("artifact", {}).get("bytes"),
+            "version_probe": "not_executed",
+        },
+        "policy_manifest": {
+            "path": config_relative,
+            "sha256": hashlib.sha256(config_bytes).hexdigest() if config_bytes is not None else None,
+        },
+        "catalogue": {
+            "path": catalog_relative,
+            "sha256": actual_catalog_sha256,
+        },
+        "provisioning": {
+            "path": _PROVISIONING_RECEIPT_RELATIVE,
+            "sha256": actual_provisioning_sha256,
+            "status": provisioning_receipt.get("status"),
+            "candidate_advisory_refresh": provisioning_receipt.get("candidate_advisory_refresh"),
+            "records": provisioning_receipt.get("records"),
+        },
+        "advisory_snapshot": candidate_advisory,
+        "installed_scope": {
+            "version": surreal.get("version"),
+            "status": "not_assessed_by_selected-release receipt; current-advisories retains its findings",
+        },
+        "limitations": [
+            "OSV result is scoped to crates.io/surrealdb at the selected version.",
+            "Applicability of crate advisories to the distributed Windows binary remains unestablished.",
+            "This receipt does not claim a complete dependency-policy PASS, runtime compatibility, installation approval, or product support.",
+        ],
+        "proof_ceiling": "SELECTED_RELEASE_ARTIFACT_AND_FRESH_CRATE_ADVISORY_EVIDENCE_CANDIDATE",
+        "validation_findings": validation_findings,
+    }
+    return findings, receipt
 
 
 def _scanner_version(raw_output: str) -> str | None:
@@ -2538,8 +4417,20 @@ def _receipt_input_paths(
         "deny.toml",
         "config/dependency-policy.toml",
         "scripts/verify-dependency-policy.py",
-        "scripts/requirements-verification.txt",
     }
+    for cargo_manifest in _cargo_manifest_paths(root):
+        try:
+            paths.add(cargo_manifest.relative_to(root).as_posix())
+        except ValueError:
+            if findings is not None:
+                findings.append(
+                    Finding(
+                        IDENTITY_BINDING_FINDING,
+                        "Cargo.toml",
+                        1,
+                        f"Cargo manifest is outside the repository input boundary: {cargo_manifest}",
+                    )
+                )
     ecosystems = manifest_data.get("ecosystems", {})
     if isinstance(ecosystems, dict):
         rust = ecosystems.get("rust", {})
@@ -2554,6 +4445,11 @@ def _receipt_input_paths(
                 value = nuget.get(key)
                 if isinstance(value, str) and value.strip() and not Path(value).is_absolute() and ".." not in Path(value).parts:
                     paths.add(value.replace("\\", "/"))
+        python = ecosystems.get("python", {})
+        if isinstance(python, dict):
+            value = python.get("manifest", "scripts/requirements-verification.txt")
+            if isinstance(value, str) and value.strip() and not Path(value).is_absolute() and ".." not in Path(value).parts:
+                paths.add(value.replace("\\", "/"))
         node = ecosystems.get("node", {})
         paths.update(_node_input_paths(root, node, findings))
     externals = manifest_data.get("external_executables", {})
@@ -2619,12 +4515,7 @@ def run_cargo_deny(
     if not _HEX64.fullmatch(expected_digest):
         scanner_config_errors.append("[scanner].sha256 must be a 64-character hexadecimal digest")
     configured_checks = scanner_info.get("checks")
-    required_checks = {"advisories", "bans", "licenses", "sources"}
-    if (
-        not isinstance(configured_checks, list)
-        or any(not isinstance(check, str) for check in configured_checks)
-        or set(configured_checks) != required_checks
-    ):
+    if not _has_exact_scanner_checks(configured_checks):
         scanner_config_errors.append("[scanner].checks must contain advisories, bans, licenses and sources exactly once")
 
     option_args, option_evidence, config_errors = _rust_policy_options(root, rust_policy)
@@ -3014,20 +4905,47 @@ def build_receipt(
     cargo_summary: dict,
     direct_deps: set[str] | int,
     external_evidence: dict | None = None,
+    ecosystem_denominator: dict | None = None,
 ) -> dict:
     source_sha, source_provenance, source_finding = _git_source_provenance(root)
     if source_finding is not None:
         findings.append(source_finding)
+    if ecosystem_denominator is None:
+        findings.append(Finding(IDENTITY_BINDING_FINDING, "config/dependency-policy.toml", 1, "complete ecosystem denominator was not collected"))
+        ecosystem_denominator = {"status": "NOT_COLLECTED"}
 
     ecosystems = manifest_data.get("ecosystems", {})
     node_policy = ecosystems.get("node", {}) if isinstance(ecosystems, dict) else {}
     if not isinstance(node_policy, dict):
         node_policy = {}
     node_input_paths = set(_node_input_paths(root, node_policy, findings))
-    input_paths = _receipt_input_paths(root, manifest_data, findings)
+    input_paths = set(_receipt_input_paths(root, manifest_data, findings))
+    if isinstance(ecosystem_denominator, dict):
+        rust_denominator = ecosystem_denominator.get("rust", {})
+        rust_edges = rust_denominator.get("workspace_dependency_edges", []) if isinstance(rust_denominator, dict) else []
+        for edge in rust_edges if isinstance(rust_edges, list) else []:
+            resolver_identity = edge.get("resolver_identity", {}) if isinstance(edge, dict) else {}
+            lockfile = resolver_identity.get("lockfile") if isinstance(resolver_identity, dict) else None
+            if (
+                isinstance(lockfile, str)
+                and lockfile
+                and ".." not in Path(lockfile).parts
+                and not Path(lockfile).is_absolute()
+            ):
+                input_paths.add(lockfile.replace("\\", "/"))
+            workspace_evidence = resolver_identity.get("workspace_evidence", {}) if isinstance(resolver_identity, dict) else {}
+            toolchain_inputs = workspace_evidence.get("toolchain_inputs", []) if isinstance(workspace_evidence, dict) else []
+            for toolchain_input in toolchain_inputs if isinstance(toolchain_inputs, list) else []:
+                if (
+                    isinstance(toolchain_input, str)
+                    and toolchain_input
+                    and not Path(toolchain_input).is_absolute()
+                    and ".." not in Path(toolchain_input).parts
+                ):
+                    input_paths.add(toolchain_input.replace("\\", "/"))
     digests = {}
     missing_inputs = []
-    for relative_path in input_paths:
+    for relative_path in sorted(input_paths):
         if relative_path in node_input_paths:
             payload = _read_validated_node_bytes(root, relative_path, f"Node receipt input {relative_path}", findings)
             if payload is not None:
@@ -3110,38 +5028,7 @@ def build_receipt(
             "scanner_exit_accepted": scanner_execution.get("scanner_exit_accepted"),
             "advisory_binding_digest": scanner_execution.get("advisory_binding_digest"),
         },
-        "ecosystem_denominator": {
-            "rust": {
-                "direct_dependencies_count": direct_dependency_count,
-                "direct_dependencies": direct_dependency_names,
-                "manifest": rust_policy.get("manifest", "Cargo.toml"),
-                "lockfile": rust_policy.get("lockfile", "Cargo.lock"),
-                "policy_file": rust_policy.get("policy_file", "deny.toml"),
-                "workspace": True,
-                "locked": True,
-                "targets": rust_policy.get("targets", []),
-                "features": rust_policy.get("features", "all"),
-            },
-            "nuget": {
-                "project": nuget_policy.get("project"),
-                "lock_mode": "RestorePackagesWithLockFile",
-                "lockfile": nuget_policy.get("lockfile"),
-                "target_framework": nuget_policy.get("target_framework"),
-            },
-            "python": {
-                "manifest": (ecosystems.get("python", {}) if isinstance(ecosystems.get("python", {}), dict) else {}).get(
-                    "manifest", "scripts/requirements-verification.txt"
-                ),
-                "hash_locked": True,
-            },
-            "node": {
-            "contract": node_policy.get("contract"),
-            "manifest": node_policy.get("manifest"),
-            "inputs": _node_input_paths(root, node_policy),
-            "surface_observation": _node_surface_observation(root, node_policy, findings),
-        },
-            "external_executables": list(manifest_data.get("external_executables", {}).keys()),
-        },
+        "ecosystem_denominator": ecosystem_denominator,
         "input_digests": digests,
         "missing_inputs": missing_inputs,
         "exceptions": manifest_data.get("exceptions", []),
@@ -3209,12 +5096,226 @@ def _derive_overall_status(scanner_status: str, findings: list[Finding]) -> str:
         return STATUS_ADVISORY_SOURCE_UNAVAILABLE
     if scanner_status in (STATUS_STALE, STATUS_CONFLICTED, STATUS_NOT_EXECUTED):
         return scanner_status
-    if any(f.code in ("DEP-002", "DEP-003", RECEIPT_PROVENANCE_FINDING, IDENTITY_BINDING_FINDING, NODE_ECOSYSTEM_FINDING) for f in findings):
+    if any(f.code in ("DEP-002", "DEP-003", "DEP-007", "DEP-008", RECEIPT_PROVENANCE_FINDING, IDENTITY_BINDING_FINDING, NODE_ECOSYSTEM_FINDING) for f in findings):
         return STATUS_INCOMPLETE
     if any(f.code == "DEP-006" for f in findings):
         return STATUS_FINDINGS
     return STATUS_FINDINGS if findings else STATUS_PASS
 
+
+def _collect_ecosystem_denominator(
+    root: Path,
+    manifest_data: dict,
+    direct_rust_dependencies: set[str],
+    direct_rust_identity: dict[str, list[dict]],
+    rust_source_findings: list[Finding] | None = None,
+    rust_dependency_edges: list[dict] | None = None,
+) -> tuple[list[Finding], dict]:
+    findings: list[Finding] = []
+    ecosystems = manifest_data.get("ecosystems", {})
+    if not isinstance(ecosystems, dict):
+        ecosystems = {}
+    rust_policy = ecosystems.get("rust", {})
+    nuget_policy = ecosystems.get("nuget", {})
+    python_policy = ecosystems.get("python", {})
+    node_policy = ecosystems.get("node", {})
+    rust_policy = rust_policy if isinstance(rust_policy, dict) else {}
+    nuget_policy = nuget_policy if isinstance(nuget_policy, dict) else {}
+    python_policy = python_policy if isinstance(python_policy, dict) else {}
+    node_policy = node_policy if isinstance(node_policy, dict) else {}
+
+    rust_findings, rust_locked_packages = collect_all_rust_locked_packages(
+        root, rust_policy.get("lockfile")
+    )
+    if rust_source_findings:
+        rust_findings.extend(rust_source_findings)
+    rust_inventory_findings = check_direct_inventory_reconciliation(
+        manifest_data, "rust", direct_rust_dependencies, "DEP-003"
+    )
+    rust_dependency_edges = rust_dependency_edges if isinstance(rust_dependency_edges, list) else []
+    nonmember_edges = [
+        edge for edge in rust_dependency_edges
+        if isinstance(edge, dict) and edge.get("root_workspace_member") is False
+    ]
+    # Count every edge lacking the explicit resolver-to-lock join as incomplete;
+    # missing or malformed identity records must never make the denominator green.
+    incomplete_nonmember_edges = [
+        edge for edge in nonmember_edges
+        if not isinstance(edge.get("resolver_identity"), dict)
+        or edge["resolver_identity"].get("status") != "lock_bound"
+    ]
+    joined_nonmember_edges = len(nonmember_edges) - len(incomplete_nonmember_edges)
+    nonmember_workspace_evidence: dict[str, dict] = {}
+    for edge in nonmember_edges:
+        identity = edge.get("resolver_identity", {})
+        evidence = identity.get("workspace_evidence") if isinstance(identity, dict) else None
+        if not isinstance(evidence, dict):
+            continue
+        workspace_root = evidence.get("workspace_root")
+        key = workspace_root if isinstance(workspace_root, str) else "<unknown>"
+        nonmember_workspace_evidence.setdefault(key, evidence)
+    workspace_disposition_findings = check_workspace_dependency_dispositions(
+        manifest_data, rust_dependency_edges
+    )
+    findings.extend(rust_findings)
+    findings.extend(rust_inventory_findings)
+    findings.extend(workspace_disposition_findings)
+    rust_denominator = {
+        "status": (
+            "complete"
+            if not rust_findings
+            and not rust_inventory_findings
+            and not workspace_disposition_findings
+            and not incomplete_nonmember_edges
+            else "incomplete"
+        ),
+        "direct_dependencies_count": len(direct_rust_dependencies),
+        "direct_dependencies": sorted(direct_rust_dependencies),
+        "direct_dependency_identities": direct_rust_identity,
+        "direct_dependency_identity_scope": "root-workspace direct edges; non-member identities are attached to resolver-joined edges",
+        "workspace_dependency_edge_count": len(rust_dependency_edges),
+        "workspace_dependency_edges": rust_dependency_edges,
+        "non_member_manifest_count": len({edge.get("manifest") for edge in nonmember_edges}),
+        "non_member_resolver_joined_edge_count": joined_nonmember_edges,
+        "non_member_resolver_incomplete_edge_count": len(incomplete_nonmember_edges),
+        "non_member_resolver_incomplete_manifests": sorted(
+            {edge.get("manifest") for edge in incomplete_nonmember_edges if isinstance(edge.get("manifest"), str)}
+        ),
+        "non_member_resolver_workspaces": [
+            nonmember_workspace_evidence[key] for key in sorted(nonmember_workspace_evidence)
+        ],
+        "workspace_dependency_dispositions": manifest_data.get(
+            "workspace_dependency_dispositions", []
+        ),
+        "manifest": rust_policy.get("manifest", "Cargo.toml"),
+        "lockfile": rust_policy.get("lockfile", "Cargo.lock"),
+        "policy_file": rust_policy.get("policy_file", "deny.toml"),
+        "workspace": True,
+        "locked": True,
+        "targets": rust_policy.get("targets", []),
+        "features": rust_policy.get("features", "all"),
+        "locked_package_count": len(rust_locked_packages),
+        "locked_packages": rust_locked_packages,
+    }
+
+    nuget_findings, nuget_denominator = _collect_nuget_locked_packages(root, nuget_policy)
+    nuget_direct = {
+        item["name"] for item in nuget_denominator.get("direct_packages", [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    nuget_inventory_findings = check_direct_inventory_reconciliation(
+        manifest_data, "nuget", nuget_direct, "DEP-007"
+    )
+    inventory = manifest_data.get("direct_dependencies", {})
+    inventory = inventory if isinstance(inventory, dict) else {}
+    nuget_version_findings: list[Finding] = []
+    for package in nuget_denominator.get("direct_packages", []):
+        if not isinstance(package, dict) or not isinstance(package.get("name"), str):
+            continue
+        key = _normalize_ecosystem_package_name("nuget", package["name"])
+        entry = next(
+            (
+                value
+                for name, value in inventory.items()
+                if isinstance(name, str)
+                and _normalize_ecosystem_package_name("nuget", name) == key
+                and isinstance(value, dict)
+                and value.get("ecosystem") == "nuget"
+            ),
+            None,
+        )
+        if entry is not None and entry.get("version") != package.get("version"):
+            nuget_version_findings.append(
+                Finding(
+                    "DEP-007",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"NuGet inventory version for '{package['name']}' does not match the project and lock",
+                )
+            )
+    findings.extend(nuget_findings)
+    findings.extend(nuget_inventory_findings)
+    findings.extend(nuget_version_findings)
+    nuget_denominator["status"] = (
+        "complete"
+        if not nuget_findings and not nuget_inventory_findings and not nuget_version_findings
+        else "incomplete"
+    )
+
+    python_lock = python_policy.get("manifest", "scripts/requirements-verification.txt")
+    python_findings, python_denominator = _collect_python_locked_packages(root, python_lock)
+    python_direct = {
+        item["name"] for item in python_denominator.get("direct_packages", [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    python_inventory_findings = check_direct_inventory_reconciliation(
+        manifest_data, "python", python_direct, "DEP-008"
+    )
+    python_version_findings: list[Finding] = []
+    for package in python_denominator.get("direct_packages", []):
+        if not isinstance(package, dict) or not isinstance(package.get("name"), str):
+            continue
+        key = _normalize_ecosystem_package_name("python", package["name"])
+        entry = next(
+            (
+                value
+                for name, value in inventory.items()
+                if isinstance(name, str)
+                and _normalize_ecosystem_package_name("python", name) == key
+                and isinstance(value, dict)
+                and value.get("ecosystem") == "python"
+            ),
+            None,
+        )
+        if entry is not None and entry.get("version") != package.get("version"):
+            python_version_findings.append(
+                Finding(
+                    "DEP-008",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"Python inventory version for '{package['name']}' does not match the requirements lock",
+                )
+            )
+    findings.extend(python_findings)
+    findings.extend(python_inventory_findings)
+    findings.extend(python_version_findings)
+    python_denominator["status"] = (
+        "complete"
+        if not python_findings and not python_inventory_findings and not python_version_findings
+        else "incomplete"
+    )
+
+    node_validation_findings = check_node_ecosystem(root, node_policy)
+    node_findings, node_denominator = _collect_node_dependency_denominator(root, node_policy)
+    node_direct = {
+        package for package in node_denominator.get("direct_packages", [])
+        if isinstance(package, str)
+    }
+    node_inventory_findings = check_direct_inventory_reconciliation(
+        manifest_data, "node", node_direct, NODE_ECOSYSTEM_FINDING
+    )
+    findings.extend(node_validation_findings)
+    findings.extend(node_findings)
+    findings.extend(node_inventory_findings)
+    node_denominator["status"] = (
+        "complete"
+        if not node_validation_findings and not node_findings and not node_inventory_findings
+        else "incomplete"
+    )
+
+    denominator = {
+        "status": "complete" if not findings else "incomplete",
+        "rust": rust_denominator,
+        "nuget": nuget_denominator,
+        "python": python_denominator,
+        "node": node_denominator,
+        "external_executables": sorted(
+            manifest_data.get("external_executables", {}).keys()
+            if isinstance(manifest_data.get("external_executables", {}), dict)
+            else []
+        ),
+    }
+    return findings, denominator
 
 def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict, int]:
     all_findings: list[Finding] = []
@@ -3224,16 +5325,26 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
     all_findings.extend(m_findings)
 
     # 2. Check Rust direct dependencies & inventory
-    d_findings, direct_deps = collect_direct_rust_dependencies(root)
+    d_findings, direct_deps, rust_dependency_edges = _collect_rust_dependency_graph(root)
     all_findings.extend(d_findings)
+    resolver_findings = bind_nonmember_resolver_identity(root, rust_dependency_edges)
+    all_findings.extend(resolver_findings)
     inv_findings = check_cargo_inventory(manifest_data, direct_deps)
     all_findings.extend(inv_findings)
 
     ecosystems = manifest_data.get("ecosystems", {})
     rust_policy = ecosystems.get("rust", {}) if isinstance(ecosystems, dict) else {}
     rust_policy = rust_policy if isinstance(rust_policy, dict) else {}
+    root_workspace_direct_deps = {
+        edge["package"]
+        for edge in rust_dependency_edges
+        if isinstance(edge, dict)
+        and edge.get("root_workspace_member") is True
+        and edge.get("internal_workspace_package") is False
+        and isinstance(edge.get("package"), str)
+    }
     identity_findings, direct_dependency_identity = collect_locked_dependency_identity(
-        root, direct_deps, rust_policy.get("lockfile")
+        root, root_workspace_direct_deps, rust_policy.get("lockfile")
     )
     all_findings.extend(identity_findings)
 
@@ -3241,19 +5352,16 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
     exc_findings = check_exceptions(manifest_data)
     all_findings.extend(exc_findings)
 
-    # 4. Check NuGet
-    nuget_policy = ecosystems.get("nuget", {}) if isinstance(ecosystems, dict) else {}
-    nu_findings = check_nuget_ecosystem(root, nuget_policy if isinstance(nuget_policy, dict) else {})
-    all_findings.extend(nu_findings)
-
-    # 5. Check Python requirements
-    py_findings = check_python_ecosystem(root)
-    all_findings.extend(py_findings)
-
-    # 6. Check configured Node ecosystem inputs
-    node_policy = ecosystems.get("node", {}) if isinstance(ecosystems, dict) else {}
-    node_findings = check_node_ecosystem(root, node_policy if isinstance(node_policy, dict) else {})
-    all_findings.extend(node_findings)
+    # 4. Join complete ecosystem denominators from project manifests, locks, and source imports.
+    denominator_findings, ecosystem_denominator = _collect_ecosystem_denominator(
+        root,
+        manifest_data,
+        direct_deps,
+        direct_dependency_identity,
+        [*d_findings, *resolver_findings, *inv_findings, *identity_findings],
+        rust_dependency_edges=rust_dependency_edges,
+    )
+    all_findings.extend(denominator_findings)
 
     # 7. Check external executables and retain the exact observation for the receipt.
     ext_findings, external_evidence = _collect_external_evidence(root, manifest_data)
@@ -3294,6 +5402,7 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
         cargo_summary,
         direct_deps,
         external_evidence=external_evidence,
+        ecosystem_denominator=ecosystem_denominator,
     )
     all_findings = _deduplicate_findings(all_findings)
     overall_status = _derive_overall_status(scanner_status, all_findings)
@@ -3430,6 +5539,12 @@ def main() -> int:
     )
     parser.add_argument("--json-out", help="Write findings to JSON output file")
     parser.add_argument("--receipt-out", help="Write canonical receipt to JSON output file")
+    parser.add_argument("--selected-release-policy-receipt-out", help="Build a non-runtime receipt for the exact locked release candidate")
+    parser.add_argument("--selected-artifact-path", help="Repository-relative artifact path selected by the release consumer")
+    parser.add_argument("--selected-artifact-sha256", help="SHA-256 selected by the release consumer")
+    parser.add_argument("--selected-artifact-version", help="Version selected by the release consumer")
+    parser.add_argument("--selected-catalog-sha256", help="SHA-256 of the release consumer's selected catalogue")
+    parser.add_argument("--selected-provisioning-receipt-sha256", help="SHA-256 of the release consumer's selected provisioning receipt")
     parser.add_argument("--self-test", action="store_true", help="Run internal self-tests")
     args = parser.parse_args()
 
@@ -3437,6 +5552,41 @@ def main() -> int:
         return run_self_tests()
 
     root = Path(args.root).resolve()
+    if args.selected_release_policy_receipt_out:
+        selected_args = (
+            args.selected_artifact_path,
+            args.selected_artifact_sha256,
+            args.selected_artifact_version,
+            args.selected_catalog_sha256,
+            args.selected_provisioning_receipt_sha256,
+        )
+        if any(not isinstance(value, str) or not value.strip() for value in selected_args):
+            parser.error("selected-release receipt mode requires every --selected-* value")
+        findings, receipt = build_selected_release_receipt(
+            root,
+            args.selected_artifact_path,
+            args.selected_artifact_sha256,
+            args.selected_artifact_version,
+            args.selected_catalog_sha256,
+            args.selected_provisioning_receipt_sha256,
+        )
+        selected_receipt_path = Path(args.selected_release_policy_receipt_out)
+        selected_receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        selected_receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        print(
+            "SELECTED_RELEASE_DEPENDENCY_POLICY: "
+            f"{receipt['binding_status']} "
+            f"(candidate_advisories={receipt['candidate_advisory_status']}, "
+            f"release_admission={receipt['release_admission']}, "
+            f"validation_findings={len(findings)})"
+        )
+        for finding in findings:
+            print(f"  [{finding.code}] {finding.path}:{finding.line}: {finding.detail}")
+        return 0 if (
+            receipt["binding_status"] == "EVIDENCE_VERIFIED"
+            and receipt["candidate_advisory_status"] == "no_known_vulnerabilities"
+        ) else 1
+
     findings, status, receipt, _, _ = verify_all(root, args.profile)
 
     if args.json_out:

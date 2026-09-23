@@ -80,9 +80,11 @@
 //! F2 resolution (implemented rule, not a challenge): audit-range reads
 //! are scope-free at the store catalogue (`SCOPE_KIND_NONE`,
 //! `requires_scope_id: false`) while the Governor facade requires a
-//! caller scope (`requires_scope` arm, pre-existing) — the `GetMailbox`
-//! precedent, where the two flags answer different questions (row
-//! addressing vs caller context). I12-26 evaluates scope and fence at
+//! caller scope (`requires_scope` arm, pre-existing) — matching the
+//! established in-catalogue scope-free reads (`GetNotificationState`,
+//! `GetReactiveInjectionState`, `GetResourceSnapshot`): catalogue rows
+//! stay scope-free while caller context is enforced at the facade and
+//! decided at the retrieval layer. I12-26 evaluates scope and fence at
 //! the retrieval decision layer, and the coordinated consumer filters
 //! by event scope itself while carrying scope-free records regardless;
 //! store-level scope filtering would diverge the memory/surreal
