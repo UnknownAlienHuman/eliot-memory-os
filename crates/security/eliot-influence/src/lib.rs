@@ -194,6 +194,35 @@ impl ProvenanceRecord {
     }
 }
 
+/// Mixed-lineage influence ceiling (I12.20 S3).
+///
+/// A derived item with more than one material supporting source (`parent_refs`)
+/// inherits the minimum allowed influence across those sources. The wire shape
+/// carries one assurance, one policy minimum, and one dependency closure, so
+/// the minimum is taken across every locally material allowance: the
+/// candidate level, the requested level, the policy minimum, and the closure
+/// ceiling (`Stored` unless the closure is `Active`). Single-lineage items
+/// pass through unchanged.
+#[must_use]
+pub fn minimum_allowed_influence(
+    request: &InfluenceRequest,
+    candidate: InfluenceLevel,
+) -> InfluenceLevel {
+    if request.provenance.parent_refs.len() <= 1 {
+        return candidate;
+    }
+    let closure_ceiling = match request.dependency_closure.current_influence {
+        InfluenceState::Active => InfluenceLevel::VerifiedUse,
+        InfluenceState::Quarantined | InfluenceState::Revoked | InfluenceState::Unknown => {
+            InfluenceLevel::Stored
+        }
+    };
+    candidate
+        .min(request.requested_level)
+        .min(request.policy.minimum_level)
+        .min(closure_ceiling)
+}
+
 pub fn decide(request: &InfluenceRequest) -> Result<InfluenceDecision, InfluenceError> {
     let digest = request.digest()?;
     let source = &request.provenance.source_assurance;
@@ -257,13 +286,14 @@ pub fn decide(request: &InfluenceRequest) -> Result<InfluenceDecision, Influence
         )
     });
     let restricted = !reasons.is_empty();
-    let allowed_level = if blocked {
+    let baseline_level = if blocked {
         InfluenceLevel::Stored
     } else if restricted {
         InfluenceLevel::Available.min(request.policy.minimum_level)
     } else {
         request.requested_level.min(request.policy.minimum_level)
     };
+    let allowed_level = minimum_allowed_influence(request, baseline_level);
     if allowed_level != request.requested_level {
         reasons.push(InfluenceReason::RequestedLevelCapped);
     }
@@ -292,24 +322,23 @@ pub fn decide(request: &InfluenceRequest) -> Result<InfluenceDecision, Influence
     })
 }
 
-pub fn revoke(request: &RevocationRequest) -> Result<RevocationReceipt, InfluenceError> {
-    text(&request.request_id, "request_id")?;
-    text(&request.root_ref, "root_ref")?;
-    request
-        .state_fence
-        .validate()
-        .map_err(|_| InfluenceError::InvalidField("state_fence"))?;
-    let mut adjacency: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for edge in &request.graph {
-        text(&edge.source_ref, "edge.source_ref")?;
-        text(&edge.dependent_ref, "edge.dependent_ref")?;
+/// Traverse the explicit influence dependency closure (I12.20 S1-S2).
+///
+/// Breadth-first, multi-hop, and cycle-safe over the caller-supplied derived
+/// edges: returns every transitively affected handle (root included), sorted
+/// and unique — not just the direct dependents. Callers validate edge text
+/// before traversal; this engine never mutates its input.
+#[must_use]
+pub fn traverse_dependency_closure<'a>(root: &'a str, graph: &'a [InfluenceEdge]) -> Vec<String> {
+    let mut adjacency: BTreeMap<&'a str, Vec<&'a str>> = BTreeMap::new();
+    for edge in graph {
         adjacency
-            .entry(&edge.source_ref)
+            .entry(edge.source_ref.as_str())
             .or_default()
-            .push(&edge.dependent_ref);
+            .push(edge.dependent_ref.as_str());
     }
     let mut affected = BTreeSet::new();
-    let mut queue = VecDeque::from([request.root_ref.as_str()]);
+    let mut queue = VecDeque::from([root]);
     while let Some(reference) = queue.pop_front() {
         if !affected.insert(reference.to_owned()) {
             continue;
@@ -318,7 +347,21 @@ pub fn revoke(request: &RevocationRequest) -> Result<RevocationReceipt, Influenc
             queue.extend(dependents.iter().copied());
         }
     }
-    let affected_refs: Vec<String> = affected.into_iter().collect();
+    affected.into_iter().collect()
+}
+
+pub fn revoke(request: &RevocationRequest) -> Result<RevocationReceipt, InfluenceError> {
+    text(&request.request_id, "request_id")?;
+    text(&request.root_ref, "root_ref")?;
+    request
+        .state_fence
+        .validate()
+        .map_err(|_| InfluenceError::InvalidField("state_fence"))?;
+    for edge in &request.graph {
+        text(&edge.source_ref, "edge.source_ref")?;
+        text(&edge.dependent_ref, "edge.dependent_ref")?;
+    }
+    let affected_refs = traverse_dependency_closure(request.root_ref.as_str(), &request.graph);
     let closures = affected_refs
         .iter()
         .map(|subject| InfluenceDependencyClosure {
