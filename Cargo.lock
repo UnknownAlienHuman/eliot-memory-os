@@ -2442,6 +2442,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-memory-projection-provider"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-memory-projection-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-memory-quality"
 version = "0.1.0"
 dependencies = [
