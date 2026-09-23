@@ -754,6 +754,512 @@ impl OnboardingResolver {
     }
 }
 
+/// How far a cold-start scope binding has advanced toward authentication.
+///
+/// `Unbound` is the pre-compile state. [`ColdStartController::compile`] never
+/// emits `Unbound`: a unique lease-bound candidate with a missing, exploratory,
+/// ambiguous or stale task compiles to `Provisional`, and only an exact
+/// current task contract compiles to `Authenticated`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ScopeResolutionState {
+    Unbound,
+    Provisional,
+    Authenticated,
+    Ambiguous,
+}
+
+/// Task selection carried by an [`OnboardingReadinessReceipt`].
+///
+/// Ambiguous handles are preserved verbatim and never resolved here: the
+/// controller has no authority to prefer one candidate over another, so an
+/// ambiguous binding always stays non-material until the caller supplies one
+/// exact task contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "disposition", content = "detail")]
+pub enum TaskBindingState {
+    #[serde(rename = "none")]
+    None_,
+    Exploratory {
+        task_ref: String,
+        task_revision: u64,
+        acceptance_digest: String,
+    },
+    CurrentTaskContract {
+        task_ref: String,
+        task_revision: u64,
+        acceptance_digest: String,
+    },
+    Ambiguous {
+        candidate_handles: Vec<String>,
+    },
+    Stale {
+        task_ref: String,
+        task_revision: u64,
+    },
+}
+
+/// Cold-start lifecycle position of one compiled readiness receipt.
+///
+/// `compile` emits a narrow subset: `NeedsTask` for a missing, ambiguous or
+/// stale task selection, `ReadyReadOnly` for an exploratory task, and
+/// `ReadyMaterial` only for an exact current task contract. `Conflicted` is
+/// reserved for conflicted governing sources, which fail compilation instead
+/// of producing a receipt; the remaining variants belong to other stages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReadinessLifecycle {
+    Unseen,
+    Scanning,
+    NeedsScope,
+    NeedsTask,
+    NeedsSources,
+    ReadyReadOnly,
+    ReadyMaterial,
+    Degraded,
+    Conflicted,
+}
+
+/// Memory assessment carried by an [`OnboardingReadinessReceipt`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MemoryState {
+    Empty,
+    Partial,
+    Current,
+    Contaminated,
+    Unknown,
+}
+
+/// Governor-owned cold-start readiness receipt.
+///
+/// This is the compiled first-useful-work gate: it binds one exact scope,
+/// instance and lineage snapshot to one [`StateFence`], one governing-source
+/// generation and one task selection. It grants nothing by itself; only a
+/// `CurrentTaskContract` binding with `ReadyMaterial` readiness admits
+/// material effects, and only through the owning governor path. An
+/// `Exploratory` binding compiles to `ReadyReadOnly` and is explicitly
+/// non-material.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OnboardingReadinessReceipt {
+    pub receipt_ref: String,
+    pub lease_ref: String,
+    pub principal_ref: String,
+    pub session_ref: String,
+    pub scope: ScopeIdentity,
+    pub instance: WorkspaceInstanceIdentity,
+    pub lineage: Option<RepositoryLineageIdentity>,
+    pub scope_resolution: ScopeResolutionState,
+    pub task_binding: TaskBindingState,
+    pub state_fence: StateFence,
+    pub governing_source_set_ref: String,
+    pub governing_source_generation: u64,
+    pub governance_profile_ref: String,
+    pub limiting_integration_evidence: Vec<String>,
+    pub route_profile_ref: String,
+    pub readiness: ReadinessLifecycle,
+    pub memory_state: MemoryState,
+    pub missing_inputs: Vec<String>,
+    pub next_safe_action: String,
+    pub receipt_revision: u64,
+}
+
+impl OnboardingReadinessReceipt {
+    /// Validates every bound reference without re-resolving any authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any reference is blank, any required revision is
+    /// zero, identities disagree, task evidence is incomplete, or a bounded
+    /// collection leaves its range (evidence 1..=8, missing inputs 0..=32,
+    /// ambiguous handles 2..=16).
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        text(&self.receipt_ref, "receipt_ref")?;
+        text(&self.lease_ref, "lease_ref")?;
+        text(&self.principal_ref, "principal_ref")?;
+        text(&self.session_ref, "session_ref")?;
+        text(&self.governing_source_set_ref, "governing_source_set_ref")?;
+        counter(
+            self.governing_source_generation,
+            "governing_source_generation",
+        )?;
+        text(&self.governance_profile_ref, "governance_profile_ref")?;
+        text(&self.route_profile_ref, "route_profile_ref")?;
+        text(&self.next_safe_action, "next_safe_action")?;
+        counter(self.receipt_revision, "receipt_revision")?;
+        self.scope.validate()?;
+        self.instance.validate()?;
+        if let Some(lineage) = &self.lineage {
+            lineage.validate()?;
+            if self.scope.lineage_ref.as_deref() != Some(lineage.lineage_ref.as_str()) {
+                return Err(WorkScopeError::SourceSetMismatch);
+            }
+        }
+        if self.scope.instance_ref != self.instance.instance_ref
+            || self.scope.root_identity != self.instance.root_identity
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| WorkScopeError::InvalidStateFence)?;
+        match &self.task_binding {
+            TaskBindingState::None_ => Ok(()),
+            TaskBindingState::Exploratory {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            }
+            | TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            } => {
+                text(task_ref, "task_ref")?;
+                counter(*task_revision, "task_revision")?;
+                text(acceptance_digest, "acceptance_digest")
+            }
+            TaskBindingState::Ambiguous { candidate_handles } => {
+                if candidate_handles.len() < 2 || candidate_handles.len() > 16 {
+                    return Err(WorkScopeError::EmptyCollection {
+                        field: "candidate_handles",
+                    });
+                }
+                unique(candidate_handles.iter(), "candidate_handles")?;
+                for handle in candidate_handles {
+                    text(handle, "candidate_handles")?;
+                }
+                Ok(())
+            }
+            TaskBindingState::Stale {
+                task_ref,
+                task_revision,
+            } => {
+                text(task_ref, "task_ref")?;
+                counter(*task_revision, "task_revision")
+            }
+        }?;
+        if self.limiting_integration_evidence.is_empty()
+            || self.limiting_integration_evidence.len() > 8
+        {
+            return Err(WorkScopeError::EmptyCollection {
+                field: "limiting_integration_evidence",
+            });
+        }
+        for evidence in &self.limiting_integration_evidence {
+            text(evidence, "limiting_integration_evidence")?;
+        }
+        if self.missing_inputs.len() > 32 {
+            return Err(WorkScopeError::EmptyCollection {
+                field: "missing_inputs",
+            });
+        }
+        for missing in &self.missing_inputs {
+            text(missing, "missing_inputs")?;
+        }
+        Ok(())
+    }
+}
+
+/// Caller-selected task input for [`ColdStartController::compile`].
+///
+/// This is a transient compiler argument, not a persisted binding: ambiguous
+/// handles are carried through, never resolved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskBindingInput {
+    NoTask,
+    Exploratory {
+        task_ref: String,
+        task_revision: u64,
+        acceptance_digest: String,
+    },
+    Current {
+        task_ref: String,
+        task_revision: u64,
+        acceptance_digest: String,
+    },
+    AmbiguousCandidates(Vec<String>),
+    Stale {
+        task_ref: String,
+        task_revision: u64,
+    },
+}
+
+/// Stateless cold-start compiler over caller-supplied exact identities.
+///
+/// `compile` binds one candidate to one lease, source set, fence and task
+/// selection and emits an [`OnboardingReadinessReceipt`]. Memory assessment
+/// belongs to a later stage, so compilation always emits
+/// [`MemoryState::Unknown`] rather than manufacturing a memory claim; likewise
+/// the receipt revision is always 1 and advancement is owned elsewhere.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColdStartController;
+
+impl ColdStartController {
+    /// Compiles one readiness receipt or fails closed without a fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkScopeError::InvalidCounter`] with field `lease` when the
+    /// lease is invalid or not active at `now`; [`WorkScopeError::BindingReceiptMismatch`]
+    /// when the candidate, the passed identities, or the lease references
+    /// disagree; [`WorkScopeError::InvalidStateFence`] when the fence is
+    /// invalid and [`WorkScopeError::StateFenceMismatch`] when its resource
+    /// generation is stale for the scope or source set;
+    /// [`WorkScopeError::PrivacyDenied`] when the candidate class is outside
+    /// the privacy boundary; [`WorkScopeError::SourceSetMismatch`] when the
+    /// governing sources do not close over the scope; and the usual text,
+    /// counter or collection errors when task or receipt fields are invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        &self,
+        receipt_ref: impl Into<String>,
+        lease: &OnboardingLease,
+        principal_ref: impl Into<String>,
+        session_ref: impl Into<String>,
+        scope: &ScopeIdentity,
+        instance: &WorkspaceInstanceIdentity,
+        lineage: Option<&RepositoryLineageIdentity>,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        state_fence: &StateFence,
+        governance_profile_ref: impl Into<String>,
+        limiting_integration_evidence: Vec<String>,
+        route_profile_ref: impl Into<String>,
+        privacy: &PrivacyProfile,
+        task: TaskBindingInput,
+        now: u64,
+    ) -> Result<OnboardingReadinessReceipt, WorkScopeError> {
+        let receipt_ref = receipt_ref.into();
+        let principal_ref = principal_ref.into();
+        let session_ref = session_ref.into();
+        let governance_profile_ref = governance_profile_ref.into();
+        let route_profile_ref = route_profile_ref.into();
+        Self::check_lease_and_identities(lease, scope, instance, lineage, candidate, sources, now)?;
+        Self::check_fence_sources_privacy(state_fence, sources, scope, candidate, privacy)?;
+        let (task_binding, scope_resolution, readiness, missing_inputs, next_safe_action) =
+            Self::resolve_task_binding(task)?;
+        let receipt = OnboardingReadinessReceipt {
+            receipt_ref,
+            lease_ref: lease.lease_ref.clone(),
+            principal_ref,
+            session_ref,
+            scope: scope.clone(),
+            instance: instance.clone(),
+            lineage: lineage.cloned(),
+            scope_resolution,
+            task_binding,
+            state_fence: state_fence.clone(),
+            governing_source_set_ref: format!(
+                "governing-source-set:{}:{}",
+                sources.scope_ref, sources.generation
+            ),
+            governing_source_generation: sources.generation,
+            governance_profile_ref,
+            limiting_integration_evidence,
+            route_profile_ref,
+            readiness,
+            memory_state: MemoryState::Unknown,
+            missing_inputs,
+            next_safe_action,
+            receipt_revision: 1,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    fn check_lease_and_identities(
+        lease: &OnboardingLease,
+        scope: &ScopeIdentity,
+        instance: &WorkspaceInstanceIdentity,
+        lineage: Option<&RepositoryLineageIdentity>,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        now: u64,
+    ) -> Result<(), WorkScopeError> {
+        lease
+            .validate()
+            .map_err(|_| WorkScopeError::InvalidCounter { field: "lease" })?;
+        if !lease.is_active(now) {
+            return Err(WorkScopeError::InvalidCounter { field: "lease" });
+        }
+        scope.validate()?;
+        instance.validate()?;
+        if let Some(lineage) = lineage {
+            lineage.validate()?;
+        }
+        if candidate.scope != *scope
+            || candidate.instance != *instance
+            || candidate.lineage != lineage.cloned()
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        if scope.lineage_ref.as_deref() != Some(lease.lineage_candidate_ref.as_str())
+            || scope.instance_ref != lease.workspace_instance_candidate_ref
+            || lease.governing_source_generation != sources.generation
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        Ok(())
+    }
+
+    fn check_fence_sources_privacy(
+        state_fence: &StateFence,
+        sources: &GoverningSourceSet,
+        scope: &ScopeIdentity,
+        candidate: &WorkScopeCandidate,
+        privacy: &PrivacyProfile,
+    ) -> Result<(), WorkScopeError> {
+        state_fence
+            .validate()
+            .map_err(|_| WorkScopeError::InvalidStateFence)?;
+        if state_fence.resource_generation.value() != scope.generation
+            || state_fence.resource_generation.value() != sources.generation
+        {
+            return Err(WorkScopeError::StateFenceMismatch);
+        }
+        if !privacy.admits(candidate.privacy_class) {
+            return Err(WorkScopeError::PrivacyDenied);
+        }
+        sources
+            .validate_for(scope, privacy)
+            .map_err(|_| WorkScopeError::SourceSetMismatch)
+    }
+
+    fn resolve_task_binding(
+        task: TaskBindingInput,
+    ) -> Result<
+        (
+            TaskBindingState,
+            ScopeResolutionState,
+            ReadinessLifecycle,
+            Vec<String>,
+            String,
+        ),
+        WorkScopeError,
+    > {
+        match task {
+            TaskBindingInput::NoTask => Ok((
+                TaskBindingState::None_,
+                ScopeResolutionState::Provisional,
+                ReadinessLifecycle::NeedsTask,
+                vec!["task_ref".to_owned()],
+                "await_exact_task_binding".to_owned(),
+            )),
+            TaskBindingInput::Exploratory {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            } => {
+                Self::check_task_ref(task_ref, task_revision, acceptance_digest, false)
+            }
+            TaskBindingInput::Current {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+            } => Self::check_task_ref(task_ref, task_revision, acceptance_digest, true),
+            TaskBindingInput::AmbiguousCandidates(handles) => {
+                Self::check_ambiguous_handles(handles)
+            }
+            TaskBindingInput::Stale {
+                task_ref,
+                task_revision,
+            } => {
+                text(&task_ref, "task_ref")?;
+                counter(task_revision, "task_revision")?;
+                Ok((
+                    TaskBindingState::Stale {
+                        task_ref,
+                        task_revision,
+                    },
+                    ScopeResolutionState::Provisional,
+                    ReadinessLifecycle::NeedsTask,
+                    vec!["task_refresh".to_owned()],
+                    "refresh_task_binding".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn check_task_ref(
+        task_ref: String,
+        task_revision: u64,
+        acceptance_digest: String,
+        material: bool,
+    ) -> Result<
+        (
+            TaskBindingState,
+            ScopeResolutionState,
+            ReadinessLifecycle,
+            Vec<String>,
+            String,
+        ),
+        WorkScopeError,
+    > {
+        text(&task_ref, "task_ref")?;
+        counter(task_revision, "task_revision")?;
+        text(&acceptance_digest, "acceptance_digest")?;
+        if material {
+            Ok((
+                TaskBindingState::CurrentTaskContract {
+                    task_ref,
+                    task_revision,
+                    acceptance_digest,
+                },
+                ScopeResolutionState::Authenticated,
+                ReadinessLifecycle::ReadyMaterial,
+                Vec::new(),
+                "execute_current_task_contract".to_owned(),
+            ))
+        } else {
+            Ok((
+                TaskBindingState::Exploratory {
+                    task_ref,
+                    task_revision,
+                    acceptance_digest,
+                },
+                ScopeResolutionState::Provisional,
+                ReadinessLifecycle::ReadyReadOnly,
+                Vec::new(),
+                "read_only_governing_sources".to_owned(),
+            ))
+        }
+    }
+
+    fn check_ambiguous_handles(
+        handles: Vec<String>,
+    ) -> Result<
+        (
+            TaskBindingState,
+            ScopeResolutionState,
+            ReadinessLifecycle,
+            Vec<String>,
+            String,
+        ),
+        WorkScopeError,
+    > {
+        if handles.len() < 2 || handles.len() > 16 {
+            return Err(WorkScopeError::EmptyCollection {
+                field: "candidate_handles",
+            });
+        }
+        unique(handles.iter(), "candidate_handles")?;
+        for handle in &handles {
+            text(handle, "candidate_handles")?;
+        }
+        Ok((
+            TaskBindingState::Ambiguous {
+                candidate_handles: handles,
+            },
+            ScopeResolutionState::Provisional,
+            ReadinessLifecycle::NeedsTask,
+            vec!["task_disambiguation".to_owned()],
+            "disambiguate_task_candidates".to_owned(),
+        ))
+    }
+}
+
 /// ELIOT_ARCH_OWNER: ARCH-SCOPE-01
 /// Stateless mid-task scope binding guard.
 #[allow(clippy::doc_markdown)]
@@ -1299,5 +1805,171 @@ mod tests {
             "guard_receipt": receipt,
         });
         assert!(serde_json::from_value::<WorkScopeBindingSnapshot>(invalid).is_err());
+    }
+
+    fn readiness_fence() -> StateFence {
+        StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
+    }
+
+    fn compile_with(
+        candidate: &WorkScopeCandidate,
+        instance: &WorkspaceInstanceIdentity,
+        fence: &StateFence,
+        task: TaskBindingInput,
+    ) -> Result<OnboardingReadinessReceipt, WorkScopeError> {
+        let lease = onboarding_lease();
+        let sources = source_set(candidate);
+        let privacy = PrivacyProfile {
+            admitted_classes: vec![PrivacyClass::Internal],
+        };
+        ColdStartController.compile(
+            "receipt:one",
+            &lease,
+            "principal:test",
+            "session:test",
+            &candidate.scope,
+            instance,
+            candidate.lineage.as_ref(),
+            candidate,
+            &sources,
+            fence,
+            "governance-profile:test",
+            vec!["integration:evidence:one".into()],
+            "route-profile:test",
+            &privacy,
+            task,
+            1,
+        )
+    }
+
+    fn current_task_input() -> TaskBindingInput {
+        TaskBindingInput::Current {
+            task_ref: "task:one".into(),
+            task_revision: 1,
+            acceptance_digest: "digest:acceptance:one".into(),
+        }
+    }
+
+    #[test]
+    fn unique_current_task_compiles_to_ready_material() {
+        let one = candidate("instance:a");
+        let receipt = match compile_with(
+            &one,
+            &one.instance,
+            &readiness_fence(),
+            current_task_input(),
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("readiness compilation failed: {error}"),
+        };
+        assert_eq!(receipt.readiness, ReadinessLifecycle::ReadyMaterial);
+        assert_eq!(receipt.scope, one.scope);
+        assert_eq!(receipt.instance, one.instance);
+        assert_eq!(receipt.lineage, one.lineage);
+        assert_eq!(
+            receipt.scope_resolution,
+            ScopeResolutionState::Authenticated
+        );
+        assert!(matches!(
+            receipt.task_binding,
+            TaskBindingState::CurrentTaskContract { .. }
+        ));
+        match receipt.validate() {
+            Ok(()) => (),
+            Err(error) => panic!("compiled receipt is invalid: {error}"),
+        }
+    }
+
+    #[test]
+    fn ambiguous_candidates_preserve_handles_without_selecting_task() {
+        let one = candidate("instance:a");
+        let handles = vec!["task:a".to_owned(), "task:b".to_owned()];
+        let receipt = match compile_with(
+            &one,
+            &one.instance,
+            &readiness_fence(),
+            TaskBindingInput::AmbiguousCandidates(handles.clone()),
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("readiness compilation failed: {error}"),
+        };
+        assert_eq!(
+            receipt.task_binding,
+            TaskBindingState::Ambiguous {
+                candidate_handles: handles,
+            }
+        );
+        assert_ne!(receipt.readiness, ReadinessLifecycle::ReadyMaterial);
+    }
+
+    #[test]
+    fn missing_task_compiles_to_needs_task() {
+        let one = candidate("instance:a");
+        let receipt = match compile_with(
+            &one,
+            &one.instance,
+            &readiness_fence(),
+            TaskBindingInput::NoTask,
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("readiness compilation failed: {error}"),
+        };
+        assert_eq!(receipt.task_binding, TaskBindingState::None_);
+        assert_eq!(receipt.readiness, ReadinessLifecycle::NeedsTask);
+    }
+
+    #[test]
+    fn stale_fence_generation_is_rejected() {
+        let one = candidate("instance:a");
+        let stale = StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            match ResourceGeneration::new(2) {
+                Ok(value) => value,
+                Err(error) => panic!("fence fixture is invalid: {error}"),
+            },
+        );
+        assert_eq!(
+            compile_with(&one, &one.instance, &stale, current_task_input()),
+            Err(WorkScopeError::StateFenceMismatch)
+        );
+    }
+
+    #[test]
+    fn changed_instance_is_rejected() {
+        let one = candidate("instance:a");
+        let other = candidate("instance:b");
+        assert_eq!(
+            compile_with(
+                &one,
+                &other.instance,
+                &readiness_fence(),
+                current_task_input()
+            ),
+            Err(WorkScopeError::BindingReceiptMismatch)
+        );
+    }
+
+    #[test]
+    fn exploratory_task_is_read_only_and_never_material() {
+        let one = candidate("instance:a");
+        let receipt = match compile_with(
+            &one,
+            &one.instance,
+            &readiness_fence(),
+            TaskBindingInput::Exploratory {
+                task_ref: "task:explore".into(),
+                task_revision: 1,
+                acceptance_digest: "digest:acceptance:explore".into(),
+            },
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("readiness compilation failed: {error}"),
+        };
+        assert_eq!(receipt.readiness, ReadinessLifecycle::ReadyReadOnly);
+        assert_ne!(receipt.readiness, ReadinessLifecycle::ReadyMaterial);
+        assert!(matches!(
+            receipt.task_binding,
+            TaskBindingState::Exploratory { .. }
+        ));
     }
 }

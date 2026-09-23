@@ -167,6 +167,61 @@ pub struct BootstrapContext {
     pub next_safe_expansion: String,
 }
 
+impl BootstrapContext {
+    /// Ref-bound projection constructor over the canonical
+    /// `OnboardingReadinessReceipt` (I4.4.1).
+    ///
+    /// The canonical readiness decision stays with the receipt; this only
+    /// carries its reference (`receipt_ref` -> `onboarding_readiness_ref`) and
+    /// passes the disposition through unchanged. It can never invent
+    /// readiness: the assessment is capped later by [`cap_assessment`] in
+    /// [`get_understanding_bootstrap`]. Fails closed via `validate_context`
+    /// on blank/unbounded refs and handles (reuse of `non_blank` /
+    /// `bounded_list` codes such as `READINESS_REF_MISSING`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_receipt(
+        receipt_ref: String,
+        principal_ref: String,
+        profile_ref: String,
+        workscope_ref: String,
+        onboarding_disposition: ReadinessDisposition,
+        revision_refs: Vec<String>,
+        orientation_handles: Vec<String>,
+        attention_handles: Vec<String>,
+        problem_handles: Vec<String>,
+        role_lease_ref: String,
+        state_fence_ref: String,
+        governance: GovernanceEvidence,
+        supported_count: u32,
+        verified_count: u32,
+        candidate_count: u32,
+        conflicts_unknowns: Vec<String>,
+        next_safe_expansion: String,
+    ) -> Result<Self, BootstrapError> {
+        let context = Self {
+            principal_ref,
+            profile_ref,
+            workscope_ref,
+            onboarding_readiness_ref: receipt_ref,
+            onboarding_disposition,
+            revision_refs,
+            orientation_handles,
+            attention_handles,
+            problem_handles,
+            role_lease_ref,
+            state_fence_ref,
+            governance,
+            supported_count,
+            verified_count,
+            candidate_count,
+            conflicts_unknowns,
+            next_safe_expansion,
+        };
+        validate_context(&context)?;
+        Ok(context)
+    }
+}
+
 /// Selected task identity with its exact revision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -853,5 +908,64 @@ mod tests {
         let error = get_understanding_bootstrap(&context, &tasks, CurrentAssessment::Ready)
             .expect_err("bootstrap without limiting integration evidence must fail");
         assert_eq!(error.code, "GOVERNANCE_EVIDENCE_MISSING");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_receipt_with(
+        receipt_ref: &str,
+        disposition: ReadinessDisposition,
+    ) -> Result<BootstrapContext, BootstrapError> {
+        BootstrapContext::from_receipt(
+            receipt_ref.to_owned(),
+            "principal-1".to_owned(),
+            "SPINE_FUNCTIONAL".to_owned(),
+            "workscope-1".to_owned(),
+            disposition,
+            vec!["source-gen-9".to_owned()],
+            vec!["orientation:project".to_owned()],
+            vec!["attention:conflict-1".to_owned()],
+            vec!["problem:stale-proof".to_owned()],
+            "role-lease-1".to_owned(),
+            "fence-epoch-3-gen-7".to_owned(),
+            fixture_governance(),
+            4,
+            3,
+            1,
+            Vec::new(),
+            "bind task before material effects".to_owned(),
+        )
+    }
+
+    #[test]
+    fn from_receipt_carries_canonical_ref_and_caps_assessment() {
+        let tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Session,
+            candidates: Vec::new(),
+            authoritative_selection: None,
+        };
+        let ready = from_receipt_with("readiness-receipt-1", ReadinessDisposition::ReadyMaterial)
+            .expect("ref-bound construction must succeed");
+        assert_eq!(ready.onboarding_readiness_ref, "readiness-receipt-1");
+        assert_eq!(
+            ready.onboarding_disposition,
+            ReadinessDisposition::ReadyMaterial
+        );
+        let bootstrap = get_understanding_bootstrap(&ready, &tasks, CurrentAssessment::Ready)
+            .expect("composition must succeed");
+        assert_eq!(bootstrap.onboarding_readiness_ref, "readiness-receipt-1");
+        assert_eq!(bootstrap.current_assessment, CurrentAssessment::Ready);
+
+        let gated = from_receipt_with("readiness-receipt-2", ReadinessDisposition::NeedsTask)
+            .expect("ref-bound construction must succeed");
+        let capped = get_understanding_bootstrap(&gated, &tasks, CurrentAssessment::Ready)
+            .expect("composition must succeed");
+        assert_eq!(capped.current_assessment, CurrentAssessment::NotOnboarded);
+    }
+
+    #[test]
+    fn from_receipt_blank_ref_fails_closed() {
+        let error = from_receipt_with("", ReadinessDisposition::ReadyMaterial)
+            .expect_err("blank receipt ref must fail closed");
+        assert_eq!(error.code, "READINESS_REF_MISSING");
     }
 }
