@@ -27,8 +27,8 @@ use crate::scope_identity_admission::{
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
-    Governor, GovernorConfig, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
-    ServiceObservation,
+    FinishAttemptError, Governor, GovernorConfig, GovernorFinishAttempt, GovernorState,
+    QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
 };
 use eliot_authority::{
     GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
@@ -36,15 +36,30 @@ use eliot_authority::{
     IntroductionStatus, P07AuthorityPort, P07PortError,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
-use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
+use eliot_canonical::{
+    AcceptanceCoverage, CanonicalError, CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence,
+};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
-    EpochId, OperationId, ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes,
-    sha256_hex,
+    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
+    ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
-use eliot_finish::{FinishDecisionReceipt, FinishService};
+use eliot_diagnostic::{
+    CONTRACT_NAME as DIAGNOSTIC_CONTRACT, DiagnosticClassifier, DiagnosticEvent, DiagnosticInput,
+    DiagnosticSeverity, DiagnosticStatus,
+};
+use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
+use eliot_finish::{DescendantClosure, FinishDecisionReceipt, FinishService};
+use eliot_instrument_api::{
+    EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus,
+    InstrumentInvocation, InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource,
+    VerificationOutcome, VerificationRun,
+};
+use eliot_instrument_nextest::{
+    NextestTestEvent, NextestTestStatus, catalog_test_id, parse_test_events,
+};
 use eliot_maintenance::{
     MaintenanceController, MaintenanceError, MaintenanceJob, MaintenanceStateStore,
 };
@@ -61,6 +76,10 @@ use eliot_store_api::{
     ScopeRevisionView, StoreHealth, WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
+use eliot_testd_core::{
+    JobState, RawArtifactStream, ReceiptBinding, TestJob, TestdSourceObservation,
+    TestdSourceObservationRange, TestdStore, VerificationReceipt,
+};
 use eliot_workscope::{
     GoverningSourceSet, GuardTrigger, GuardVerdict, IdentityEvidence, ObservedScopeResources,
     PrivacyProfile, ResolutionAuthentication, ResolutionRequest, ScopeBinding,
@@ -795,6 +814,11 @@ pub struct CanonicalPlanBinding {
     pub plan_revision: String,
     pub task_id: TaskId,
     pub work_scope_id: String,
+    /// Verifier request contract selected by this canonical plan. Older
+    /// plans may omit it, but the verifier fact producer refuses such a plan
+    /// because profile/config/scope/artifact currentness cannot be proved.
+    #[serde(default)]
+    pub verifier: Option<CanonicalVerifierPlanBinding>,
 }
 
 impl CanonicalPlanBinding {
@@ -810,6 +834,7 @@ impl CanonicalPlanBinding {
             plan_revision: plan_revision.into(),
             task_id,
             work_scope_id: work_scope_id.into(),
+            verifier: None,
         };
         binding.validate()?;
         Ok(binding)
@@ -834,8 +859,1096 @@ impl CanonicalPlanBinding {
                 "canonical work scope id is blank or contains control characters".to_owned(),
             ));
         }
+        if let Some(verifier) = &self.verifier {
+            verifier.validate()?;
+        }
         Ok(())
     }
+}
+
+/// Verifier request identity selected by the canonical plan.
+///
+/// This is the owner-side expectation used to join a TestD invocation to the
+/// exact verifier configuration. A terminal binding alone is insufficient:
+/// its planned configuration hash and contract revision are intentionally
+/// consumer-validated here.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierPlanBinding {
+    pub planned: eliot_evaluation_contracts::PlannedVerifierRef,
+    /// Registered instrument which performs the admitted verifier run.
+    pub instrument: ContractId,
+    /// Instrument kind admitted by the productive evaluator.
+    pub kind: InstrumentKind,
+    pub profile: String,
+    /// Exact target carried by the admitted invocation.
+    pub target: String,
+    /// Exact instrument-level arguments carried by the admitted invocation.
+    pub arguments: Vec<String>,
+    pub declared_scope: String,
+    pub input_artifacts: Vec<ArtifactId>,
+    /// Required test ids selected by the canonical plan owner.
+    pub required_test_ids: BTreeSet<String>,
+    /// Registered evaluator identity and version used for this plan.
+    pub evaluator: ContractId,
+    pub evaluator_version: ContractVersion,
+}
+
+impl CanonicalVerifierPlanBinding {
+    fn validate(&self) -> Result<(), CompositionError> {
+        for (field, value) in [
+            ("verifier_id", self.planned.verifier_id.as_str()),
+            ("instrument", self.instrument.as_str()),
+            ("profile", self.profile.as_str()),
+            ("target", self.target.as_str()),
+            ("declared_scope", self.declared_scope.as_str()),
+            ("evaluator", self.evaluator.as_str()),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(CompositionError::Recovery(format!(
+                    "canonical verifier plan {field} is blank or contains control characters"
+                )));
+            }
+        }
+        self.planned
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.planned.scope != self.declared_scope {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan scope differs from declared scope".to_owned(),
+            ));
+        }
+        if self.kind != InstrumentKind::Test {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan must bind the TEST instrument kind".to_owned(),
+            ));
+        }
+        if self.instrument.as_str() != eliot_instrument_nextest::NEXTEST_INSTRUMENT {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan must bind the registered nextest instrument".to_owned(),
+            ));
+        }
+        if self.evaluator.as_str() != eliot_verifier::CONTRACT_NAME
+            || self.planned.verifier_id != self.evaluator
+            || self.evaluator_version
+                != ContractVersion::new(
+                    eliot_verifier::CONTRACT_VERSION.0,
+                    eliot_verifier::CONTRACT_VERSION.1,
+                    eliot_verifier::CONTRACT_VERSION.2,
+                )
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan is not bound to the current evaluator contract".to_owned(),
+            ));
+        }
+        if self
+            .arguments
+            .iter()
+            .any(|argument| argument.trim().is_empty() || argument.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan contains an invalid argument".to_owned(),
+            ));
+        }
+        if self.required_test_ids.is_empty()
+            || self
+                .required_test_ids
+                .iter()
+                .any(|test_id| test_id.trim().is_empty() || test_id.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan has no required test ids".to_owned(),
+            ));
+        }
+        if self.input_artifacts.is_empty()
+            || self
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.as_str().trim().is_empty())
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan has no exact input artifact binding".to_owned(),
+            ));
+        }
+        let config_hash = verifier_invocation_config_digest(
+            &self.instrument,
+            self.kind,
+            &self.profile,
+            &self.target,
+            &self.arguments,
+            &self.declared_scope,
+            &self.input_artifacts,
+            &self.required_test_ids,
+            &self.evaluator,
+            self.evaluator_version,
+        )?;
+        if self.planned.verifier_config_hash != config_hash {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan config hash does not bind its invocation shape".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Observed immutable invocation/evaluator identity recovered from the durable
+/// TestD job. This is kept separate from `PlannedVerifierRef`: a terminal
+/// binding may carry the plan as an expectation, but this record is populated
+/// from the actual admitted invocation and evaluated run.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierInvocationBinding {
+    pub instrument: ContractId,
+    pub kind: InstrumentKind,
+    pub profile: String,
+    pub target: String,
+    pub arguments: Vec<String>,
+    pub declared_scope: String,
+    pub input_artifacts: Vec<ArtifactId>,
+    pub required_test_ids: BTreeSet<String>,
+    pub evaluator: ContractId,
+    pub evaluator_version: ContractVersion,
+    pub config_hash: String,
+}
+
+impl CanonicalVerifierInvocationBinding {
+    fn from_invocation(
+        invocation: &InstrumentInvocation,
+        plan: &CanonicalVerifierPlanBinding,
+    ) -> Result<Self, CompositionError> {
+        invocation.validate().map_err(|error| {
+            verifier_fact_error(format!("TestD invocation validation failed: {error}"))
+        })?;
+        let config_hash = verifier_invocation_config_digest(
+            &invocation.instrument,
+            invocation.kind,
+            &invocation.profile,
+            &invocation.target,
+            &invocation.arguments,
+            &invocation.declared_scope,
+            &invocation.input_artifacts,
+            &plan.required_test_ids,
+            &plan.evaluator,
+            plan.evaluator_version,
+        )?;
+        Ok(Self {
+            instrument: invocation.instrument.clone(),
+            kind: invocation.kind,
+            profile: invocation.profile.clone(),
+            target: invocation.target.clone(),
+            arguments: invocation.arguments.clone(),
+            declared_scope: invocation.declared_scope.clone(),
+            input_artifacts: invocation.input_artifacts.clone(),
+            required_test_ids: plan.required_test_ids.clone(),
+            evaluator: plan.evaluator.clone(),
+            evaluator_version: plan.evaluator_version,
+            config_hash,
+        })
+    }
+
+    fn validate(&self) -> Result<(), CompositionError> {
+        if self.kind != InstrumentKind::Test
+            || self.instrument.as_str() != eliot_instrument_nextest::NEXTEST_INSTRUMENT
+            || self.evaluator.as_str() != eliot_verifier::CONTRACT_NAME
+            || self.profile.trim().is_empty()
+            || self.target.trim().is_empty()
+            || self.declared_scope.trim().is_empty()
+            || self.input_artifacts.is_empty()
+            || self.required_test_ids.is_empty()
+            || self.config_hash.len() != 64
+            || self
+                .config_hash
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(verifier_fact_error(
+                "observed verifier invocation binding is incomplete or wrong-kind",
+            ));
+        }
+        if self
+            .arguments
+            .iter()
+            .any(|argument| argument.trim().is_empty() || argument.chars().any(char::is_control))
+            || self
+                .required_test_ids
+                .iter()
+                .any(|test_id| test_id.trim().is_empty() || test_id.chars().any(char::is_control))
+        {
+            return Err(verifier_fact_error(
+                "observed verifier invocation binding has invalid text",
+            ));
+        }
+        let recomputed = verifier_invocation_config_digest(
+            &self.instrument,
+            self.kind,
+            &self.profile,
+            &self.target,
+            &self.arguments,
+            &self.declared_scope,
+            &self.input_artifacts,
+            &self.required_test_ids,
+            &self.evaluator,
+            self.evaluator_version,
+        )?;
+        if recomputed != self.config_hash {
+            return Err(verifier_fact_error(
+                "observed verifier invocation config hash is not exact",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn verifier_invocation_config_digest(
+    instrument: &ContractId,
+    kind: InstrumentKind,
+    profile: &str,
+    target: &str,
+    arguments: &[String],
+    declared_scope: &str,
+    input_artifacts: &[ArtifactId],
+    required_test_ids: &BTreeSet<String>,
+    evaluator: &ContractId,
+    evaluator_version: ContractVersion,
+) -> Result<String, CompositionError> {
+    #[derive(Serialize)]
+    struct Config<'a> {
+        instrument: &'a ContractId,
+        kind: InstrumentKind,
+        profile: &'a str,
+        target: &'a str,
+        arguments: &'a [String],
+        declared_scope: &'a str,
+        input_artifacts: &'a [ArtifactId],
+        required_test_ids: &'a BTreeSet<String>,
+        evaluator: &'a ContractId,
+        evaluator_version: ContractVersion,
+    }
+    let bytes = canonical_json_bytes(&Config {
+        instrument,
+        kind,
+        profile,
+        target,
+        arguments,
+        declared_scope,
+        input_artifacts,
+        required_test_ids,
+        evaluator,
+        evaluator_version,
+    })
+    .map_err(|error| {
+        CompositionError::Recovery(format!("verifier config canonicalization failed: {error}"))
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Exact raw artifact identity carried by a durable TestD verifier receipt.
+///
+/// The bytes remain owned by TestD's durable receipt.  Canonical state keeps
+/// the immutable handle, digest, and capture shape needed to prove that a
+/// terminal verifier run used the same artifact lineage after rehydration.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierRawArtifactBinding {
+    pub handle: String,
+    pub content_type: String,
+    pub length: u64,
+    pub sha256: String,
+    pub truncated: bool,
+}
+
+/// Exact TestD receipt identity retained by the canonical verifier fact.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierReceiptBinding {
+    pub job_id: String,
+    pub operation_id: String,
+    pub process_tree_id: String,
+    pub generation: u64,
+    pub authority_epoch: EpochId,
+    pub invocation_id: String,
+    pub invocation_digest: String,
+    pub execution: ExecutionStatus,
+    pub receipt_sha256: String,
+    pub allowed_contour_root: String,
+    pub source_root: String,
+    pub target_root: String,
+    pub cache_root: String,
+}
+
+impl CanonicalVerifierReceiptBinding {
+    fn from_binding(
+        binding: &ReceiptBinding,
+        execution: ExecutionStatus,
+        receipt_sha256: String,
+    ) -> Self {
+        Self {
+            job_id: binding.job_id.clone(),
+            operation_id: binding.operation_id.clone(),
+            process_tree_id: binding.process_tree_id.clone(),
+            generation: binding.generation,
+            authority_epoch: binding.authority_epoch.clone(),
+            invocation_id: binding.invocation_id.clone(),
+            invocation_digest: binding.invocation_digest.clone(),
+            execution,
+            receipt_sha256,
+            allowed_contour_root: binding.allowed_contour_root.clone(),
+            source_root: binding.source_root.clone(),
+            target_root: binding.target_root.clone(),
+            cache_root: binding.cache_root.clone(),
+        }
+    }
+}
+
+/// Immutable source identity captured by the TestD owner around execution.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierSourceObservation {
+    pub repository_root: String,
+    pub branch: String,
+    pub commit: String,
+    pub dirty_state_sha256: String,
+}
+
+impl CanonicalVerifierSourceObservation {
+    fn from_testd(observation: &TestdSourceObservation) -> Self {
+        Self {
+            repository_root: observation.repository_root.clone(),
+            branch: observation.branch.clone(),
+            commit: observation.commit.clone(),
+            dirty_state_sha256: observation.dirty_state_sha256.clone(),
+        }
+    }
+
+    fn validate(&self, expected_root: &str) -> Result<(), CompositionError> {
+        let commit_valid = matches!(self.commit.len(), 40 | 64)
+            && self
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let dirty_digest_valid = self.dirty_state_sha256.len() == 64
+            && self
+                .dirty_state_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if self.repository_root != expected_root
+            || !std::path::Path::new(&self.repository_root).is_absolute()
+            || std::path::Path::new(&self.repository_root)
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || self.repository_root.chars().any(char::is_control)
+            || self.branch.trim().is_empty()
+            || self.branch.chars().any(char::is_control)
+            || !commit_valid
+            || !dirty_digest_valid
+        {
+            return Err(verifier_fact_error(
+                "persisted source observation is malformed or outside the admitted repository",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Before/after source identity retained with the canonical verifier fact.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierSourceObservationRange {
+    pub before: CanonicalVerifierSourceObservation,
+    pub after: CanonicalVerifierSourceObservation,
+}
+
+impl CanonicalVerifierSourceObservationRange {
+    fn from_testd(range: &TestdSourceObservationRange) -> Self {
+        Self {
+            before: CanonicalVerifierSourceObservation::from_testd(&range.before),
+            after: CanonicalVerifierSourceObservation::from_testd(&range.after),
+        }
+    }
+
+    fn validate(&self, expected_root: &str) -> Result<(), CompositionError> {
+        self.before.validate(expected_root)?;
+        self.after.validate(expected_root)?;
+        if self.before.repository_root != self.after.repository_root {
+            return Err(verifier_fact_error(
+                "source observation changed repository roots during verification",
+            ));
+        }
+        Ok(())
+    }
+
+    fn unchanged(&self) -> bool {
+        self.before == self.after
+    }
+}
+
+/// One physical TestD effect bound to the task and verifier run.
+///
+/// This is a retained execution receipt reference, not an assertion that the
+/// effect is closed.  Descendant/effect closure remains a later canonical
+/// owner phase.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierEffectBinding {
+    pub task_id: String,
+    pub job_id: String,
+    pub operation_id: String,
+    pub process_tree_id: String,
+    pub state_fence: StateFence,
+    pub execution: ExecutionStatus,
+    pub receipt_sha256: String,
+}
+
+impl CanonicalVerifierEffectBinding {
+    fn validate(
+        &self,
+        expected_task_id: &str,
+        expected_fence: &StateFence,
+    ) -> Result<(), CompositionError> {
+        if self.task_id != expected_task_id
+            || self.state_fence != *expected_fence
+            || self.job_id.trim().is_empty()
+            || self.operation_id.trim().is_empty()
+            || self.process_tree_id.trim().is_empty()
+            || self.job_id.chars().any(char::is_control)
+            || self.operation_id.chars().any(char::is_control)
+            || self.process_tree_id.chars().any(char::is_control)
+            || self.receipt_sha256.len() != 64
+            || self
+                .receipt_sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier effect binding is not task/fence bound".to_owned(),
+            ));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if !self.execution.is_terminal() {
+            return Err(CompositionError::Recovery(
+                "canonical verifier effect binding is not terminal".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Canonical fact produced from a terminal TestD job and its persisted
+/// verifier receipt.
+///
+/// The fact retains failed, stale, partial, and otherwise non-certifying
+/// verifier runs for readback.  [`Self::certifies_completion`] is deliberately
+/// derived from the bound execution/evaluation axes and never from a caller
+/// label or task command.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierExecutionFact {
+    pub task_id: String,
+    pub task_revision: u64,
+    pub plan: CanonicalPlanBinding,
+    pub state_fence: StateFence,
+    pub job_id: String,
+    pub job_state: String,
+    pub receipt: CanonicalVerifierReceiptBinding,
+    /// Real branch, commit, and dirty-state observations retained by TestD.
+    #[serde(default)]
+    pub source_observation: Option<CanonicalVerifierSourceObservationRange>,
+    pub verification_run: VerificationRun,
+    /// Observed invocation/evaluator identity recovered from the TestD job.
+    /// This is the non-tautological config/currentness join.
+    pub invocation: CanonicalVerifierInvocationBinding,
+    pub terminal_binding: TerminalVerifierBinding,
+    pub input_artifact_bindings: Vec<ArtifactId>,
+    pub raw_artifact_bindings: Vec<CanonicalVerifierRawArtifactBinding>,
+    pub effect_reference_bindings: Vec<CanonicalVerifierEffectBinding>,
+}
+
+impl CanonicalVerifierExecutionFact {
+    /// Builds a fact only from a terminal, durably receipt-bound TestD job.
+    ///
+    /// `receipt` must equal the full receipt retained by TestD after the
+    /// worker/verifier transition.  The terminal binding and run are checked
+    /// against the same invocation, fence, outcome, and artifact lineage.
+    pub fn from_testd(
+        task_id: &TaskId,
+        task_revision: u64,
+        plan: &CanonicalPlanBinding,
+        state_fence: &StateFence,
+        job: &TestJob,
+        receipt: &VerificationReceipt,
+        run: VerificationRun,
+    ) -> Result<Self, CompositionError> {
+        receipt.validate(job).map_err(|error| {
+            verifier_fact_error(format!("TestD receipt validation failed: {error}"))
+        })?;
+        if !job.state.is_terminal() {
+            return Err(verifier_fact_error(
+                "TestD verifier fact requires a terminal job",
+            ));
+        }
+        let receipt_binding = receipt.binding();
+        if job.receipt.as_ref() != Some(&receipt_binding)
+            || job.verification_receipt.as_ref() != Some(receipt)
+        {
+            return Err(verifier_fact_error(
+                "TestD verifier receipt is not the durably retained job receipt",
+            ));
+        }
+        if job.execution != Some(receipt.execution)
+            || job.invocation.request.state_fence != *state_fence
+            || receipt.authority_epoch != state_fence.authority_epoch
+            || receipt.generation != state_fence.resource_generation.value()
+        {
+            return Err(verifier_fact_error(
+                "TestD receipt does not bind to the current canonical fence",
+            ));
+        }
+        if plan.task_id != *task_id || task_revision == 0 {
+            return Err(verifier_fact_error(
+                "verifier fact task or plan binding is invalid",
+            ));
+        }
+        plan.validate()?;
+        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+            verifier_fact_error(
+                "canonical plan has no verifier profile/config/scope/artifact binding",
+            )
+        })?;
+        if job.invocation.request.task_id.as_ref() != Some(task_id) {
+            return Err(verifier_fact_error(
+                "TestD verifier request is not bound to the canonical plan",
+            ));
+        }
+        let invocation =
+            CanonicalVerifierInvocationBinding::from_invocation(&job.invocation, verifier_plan)?;
+        if invocation.instrument != verifier_plan.instrument
+            || invocation.kind != verifier_plan.kind
+            || invocation.profile != verifier_plan.profile
+            || invocation.target != verifier_plan.target
+            || invocation.arguments != verifier_plan.arguments
+            || invocation.declared_scope != verifier_plan.declared_scope
+            || invocation.input_artifacts != verifier_plan.input_artifacts
+            || invocation.required_test_ids != verifier_plan.required_test_ids
+            || invocation.evaluator != verifier_plan.evaluator
+            || invocation.evaluator_version != verifier_plan.evaluator_version
+            || invocation.config_hash != verifier_plan.planned.verifier_config_hash
+        {
+            return Err(verifier_fact_error(
+                "observed TestD invocation is not the exact canonical plan request",
+            ));
+        }
+        run.validate().map_err(|error| {
+            verifier_fact_error(format!("VerificationRun validation failed: {error}"))
+        })?;
+        if !run.execution.is_terminal()
+            || run.state_fence != *state_fence
+            || run.invocation_id.as_str() != job.invocation.request.request_id.as_str()
+            || run.invocation_id.as_str() != receipt.invocation_id
+            || run.execution != receipt.execution
+        {
+            return Err(verifier_fact_error(
+                "VerificationRun is not the terminal TestD execution outcome",
+            ));
+        }
+        let evidence_refs: Vec<_> = run
+            .raw_evidence
+            .iter()
+            .cloned()
+            .chain(
+                run.evidence
+                    .iter()
+                    .map(|evidence| evidence.evidence_id.clone()),
+            )
+            .collect();
+        let terminal_binding = TerminalVerifierBinding {
+            planned: verifier_plan.planned.clone(),
+            evidence: VerifierEvidenceRef {
+                run_id: run.run_id.clone(),
+                verifier_id: run.verifier.clone(),
+                scope: run.scope.clone(),
+                execution: run.execution,
+                outcome: run.outcome,
+                proof_ceiling: verifier_plan.planned.proof_ceiling,
+                evidence_refs,
+            },
+        };
+        terminal_binding.validate().map_err(|error| {
+            verifier_fact_error(format!("terminal verifier binding invalid: {error}"))
+        })?;
+        if terminal_binding.evidence.run_id != run.run_id
+            || terminal_binding.evidence.verifier_id != run.verifier
+            || terminal_binding.evidence.scope != run.scope
+            || terminal_binding.evidence.execution != run.execution
+            || terminal_binding.evidence.outcome != run.outcome
+        {
+            return Err(verifier_fact_error(
+                "terminal verifier binding does not match the executed run",
+            ));
+        }
+        if terminal_binding.planned.verifier_id != verifier_plan.planned.verifier_id
+            || terminal_binding.planned.scope != verifier_plan.declared_scope
+            || terminal_binding.planned.verifier_config_hash
+                != verifier_plan.planned.verifier_config_hash
+            || terminal_binding.planned.contract_revision != verifier_plan.planned.contract_revision
+            || run.verifier != verifier_plan.evaluator
+            || run.scope != job.invocation.declared_scope
+        {
+            return Err(verifier_fact_error(
+                "terminal verifier configuration is not the canonical requested profile/revision",
+            ));
+        }
+
+        let raw_handles: BTreeSet<String> = receipt
+            .raw_artifacts
+            .iter()
+            .map(|artifact| artifact.handle.clone())
+            .collect();
+        let run_raw_handles: BTreeSet<String> =
+            run.raw_evidence.iter().map(ToString::to_string).collect();
+        if !run_raw_handles.is_subset(&raw_handles) {
+            return Err(verifier_fact_error(
+                "VerificationRun raw evidence is outside the TestD receipt",
+            ));
+        }
+        for evidence in &run.evidence {
+            if !raw_handles.contains(evidence.raw_artifact_id.as_str()) {
+                return Err(verifier_fact_error(
+                    "normalized verifier evidence is outside the TestD receipt",
+                ));
+            }
+        }
+        let run_artifacts: BTreeSet<String> = run
+            .raw_evidence
+            .iter()
+            .map(ToString::to_string)
+            .chain(
+                run.evidence
+                    .iter()
+                    .map(|evidence| evidence.evidence_id.to_string()),
+            )
+            .collect();
+        if terminal_binding
+            .evidence
+            .evidence_refs
+            .iter()
+            .any(|reference| !run_artifacts.contains(reference.as_str()))
+        {
+            return Err(verifier_fact_error(
+                "terminal verifier evidence references an unbound artifact",
+            ));
+        }
+
+        let receipt_sha256 =
+            eliot_testd_core::verification_receipt_sha256(receipt).map_err(|error| {
+                verifier_fact_error(format!("TestD receipt digest failed: {error}"))
+            })?;
+        let canonical_receipt = CanonicalVerifierReceiptBinding::from_binding(
+            &receipt_binding,
+            receipt.execution,
+            receipt_sha256.clone(),
+        );
+        let fact = Self {
+            task_id: task_id.as_str().to_owned(),
+            task_revision,
+            plan: plan.clone(),
+            state_fence: state_fence.clone(),
+            job_id: job.job_id.clone(),
+            job_state: canonical_job_state(job.state).to_owned(),
+            receipt: canonical_receipt,
+            source_observation: receipt
+                .source_observation
+                .as_ref()
+                .map(CanonicalVerifierSourceObservationRange::from_testd),
+            verification_run: run,
+            invocation,
+            terminal_binding,
+            input_artifact_bindings: job.invocation.input_artifacts.clone(),
+            raw_artifact_bindings: receipt
+                .raw_artifacts
+                .iter()
+                .map(|artifact| CanonicalVerifierRawArtifactBinding {
+                    handle: artifact.handle.clone(),
+                    content_type: artifact.content_type.clone(),
+                    length: artifact.length,
+                    sha256: artifact.sha256.clone(),
+                    truncated: artifact.truncated,
+                })
+                .collect(),
+            effect_reference_bindings: vec![CanonicalVerifierEffectBinding {
+                task_id: task_id.as_str().to_owned(),
+                job_id: receipt.job_id.clone(),
+                operation_id: receipt.operation_id.clone(),
+                process_tree_id: receipt.process_tree_id.clone(),
+                state_fence: state_fence.clone(),
+                execution: receipt.execution,
+                receipt_sha256,
+            }],
+        };
+        fact.validate(state_fence)?;
+        Ok(fact)
+    }
+
+    /// Validates the persisted fact without consulting a caller or provider.
+    pub fn validate(&self, expected_fence: &StateFence) -> Result<(), CompositionError> {
+        if &self.state_fence != expected_fence
+            || self.task_id.trim().is_empty()
+            || self.task_id.chars().any(char::is_control)
+            || self.job_id.trim().is_empty()
+            || self.job_id.chars().any(char::is_control)
+            || self.task_revision == 0
+        {
+            return Err(verifier_fact_error(
+                "canonical verifier fact has an invalid task, job, or fence",
+            ));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| verifier_fact_error(error.to_string()))?;
+        self.plan.validate()?;
+        if self.plan.task_id.as_str() != self.task_id {
+            return Err(verifier_fact_error(
+                "canonical verifier fact plan is task-mismatched",
+            ));
+        }
+        let verifier_plan = self.plan.verifier.as_ref().ok_or_else(|| {
+            verifier_fact_error("persisted verifier fact has no canonical verifier plan binding")
+        })?;
+        self.invocation.validate()?;
+        if self.invocation.instrument != verifier_plan.instrument
+            || self.invocation.kind != verifier_plan.kind
+            || self.invocation.profile != verifier_plan.profile
+            || self.invocation.target != verifier_plan.target
+            || self.invocation.arguments != verifier_plan.arguments
+            || self.invocation.declared_scope != verifier_plan.declared_scope
+            || self.invocation.input_artifacts != verifier_plan.input_artifacts
+            || self.invocation.required_test_ids != verifier_plan.required_test_ids
+            || self.invocation.evaluator != verifier_plan.evaluator
+            || self.invocation.evaluator_version != verifier_plan.evaluator_version
+            || self.invocation.config_hash != verifier_plan.planned.verifier_config_hash
+        {
+            return Err(verifier_fact_error(
+                "persisted verifier invocation does not match canonical plan config",
+            ));
+        }
+        if self.input_artifact_bindings.is_empty()
+            || self.input_artifact_bindings != verifier_plan.input_artifacts
+        {
+            return Err(verifier_fact_error(
+                "persisted verifier input artifacts are not the canonical plan artifacts",
+            ));
+        }
+        self.verification_run.validate().map_err(|error| {
+            verifier_fact_error(format!("persisted VerificationRun is invalid: {error}"))
+        })?;
+        if !self.verification_run.execution.is_terminal()
+            || self.verification_run.state_fence != *expected_fence
+        {
+            return Err(verifier_fact_error(
+                "persisted verifier run is not terminal or is stale",
+            ));
+        }
+        self.terminal_binding.validate().map_err(|error| {
+            verifier_fact_error(format!("persisted terminal binding is invalid: {error}"))
+        })?;
+        if self.terminal_binding.evidence.run_id != self.verification_run.run_id
+            || self.terminal_binding.evidence.verifier_id != self.verification_run.verifier
+            || self.terminal_binding.evidence.scope != self.verification_run.scope
+            || self.terminal_binding.evidence.execution != self.verification_run.execution
+            || self.terminal_binding.evidence.outcome != self.verification_run.outcome
+        {
+            return Err(verifier_fact_error(
+                "persisted terminal binding does not match the run",
+            ));
+        }
+        validate_canonical_receipt_binding(&self.receipt, &self.state_fence)?;
+        match &self.source_observation {
+            Some(observation) => observation.validate(&self.receipt.source_root)?,
+            None if self.receipt.execution == ExecutionStatus::Succeeded => {
+                return Err(verifier_fact_error(
+                    "successful verifier fact lacks an observed source identity",
+                ));
+            }
+            None => {}
+        }
+        if self.receipt.job_id != self.job_id
+            || self.receipt.invocation_id != self.verification_run.invocation_id.as_str()
+            || self.receipt.execution != self.verification_run.execution
+        {
+            return Err(verifier_fact_error(
+                "persisted receipt binding does not match the run",
+            ));
+        }
+        if self.verification_run.verifier != verifier_plan.evaluator
+            || self.verification_run.scope != self.invocation.declared_scope
+            || self.verification_run.invocation_id.as_str() != self.receipt.invocation_id
+        {
+            return Err(verifier_fact_error(
+                "persisted verifier run is not bound to the admitted evaluator invocation",
+            ));
+        }
+        let mut handles = BTreeSet::new();
+        for artifact in &self.raw_artifact_bindings {
+            if artifact.handle.trim().is_empty()
+                || artifact.content_type.trim().is_empty()
+                || artifact.handle.chars().any(char::is_control)
+                || artifact.content_type.chars().any(char::is_control)
+                || artifact.sha256.len() != 64
+                || artifact
+                    .sha256
+                    .bytes()
+                    .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                || !handles.insert(artifact.handle.clone())
+            {
+                return Err(verifier_fact_error(
+                    "persisted verifier artifact binding is invalid or duplicated",
+                ));
+            }
+        }
+        let run_artifacts: BTreeSet<String> = self
+            .verification_run
+            .raw_evidence
+            .iter()
+            .map(ToString::to_string)
+            .chain(
+                self.verification_run
+                    .evidence
+                    .iter()
+                    .map(|evidence| evidence.evidence_id.to_string()),
+            )
+            .collect();
+        if self
+            .verification_run
+            .raw_evidence
+            .iter()
+            .any(|reference| !handles.contains(reference.as_str()))
+            || self
+                .verification_run
+                .evidence
+                .iter()
+                .any(|evidence| !handles.contains(evidence.raw_artifact_id.as_str()))
+            || self
+                .terminal_binding
+                .evidence
+                .evidence_refs
+                .iter()
+                .any(|reference| !run_artifacts.contains(reference.as_str()))
+        {
+            return Err(verifier_fact_error(
+                "persisted verifier artifact lineage is not exact",
+            ));
+        }
+        for evidence in &self.verification_run.evidence {
+            let Some(raw_handles) = evidence.value.get("raw_artifact_handles") else {
+                continue;
+            };
+            let raw_handles = raw_handles.as_array().ok_or_else(|| {
+                verifier_fact_error("normalized evidence raw_artifact_handles is not an array")
+            })?;
+            let mut seen_raw_handles = BTreeSet::new();
+            for raw_handle in raw_handles {
+                let raw_handle = raw_handle.as_str().ok_or_else(|| {
+                    verifier_fact_error(
+                        "normalized evidence raw_artifact_handles contains a non-string value",
+                    )
+                })?;
+                if !handles.contains(raw_handle) || !seen_raw_handles.insert(raw_handle) {
+                    return Err(verifier_fact_error(
+                        "normalized evidence names an unbound or duplicate raw artifact",
+                    ));
+                }
+            }
+        }
+        if !matches!(
+            self.job_state.as_str(),
+            "succeeded" | "failed" | "cancelled" | "quarantined"
+        ) {
+            return Err(verifier_fact_error(
+                "persisted verifier fact does not identify a terminal TestD job",
+            ));
+        }
+        if self.effect_reference_bindings.len() != 1
+            || self.effect_reference_bindings.iter().any(|effect| {
+                effect.validate(&self.task_id, expected_fence).is_err()
+                    || effect.receipt_sha256 != self.receipt.receipt_sha256
+                    || effect.job_id != self.receipt.job_id
+                    || effect.operation_id != self.receipt.operation_id
+                    || effect.process_tree_id != self.receipt.process_tree_id
+                    || effect.execution != self.receipt.execution
+            })
+        {
+            return Err(verifier_fact_error(
+                "persisted verifier fact does not join its exact TestD effect receipt",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the bound execution/evaluation is eligible to certify finish.
+    #[must_use]
+    pub fn certifies_completion(&self) -> bool {
+        let fresh = matches!(
+            self.verification_run.freshness,
+            EvidenceFreshness::ExactCandidate
+                | EvidenceFreshness::ExactCommit
+                | EvidenceFreshness::ExactQuiescedWorktree
+        );
+        self.job_state == "succeeded"
+            && self.receipt.execution == ExecutionStatus::Succeeded
+            && self.verification_run.execution == ExecutionStatus::Succeeded
+            && self.verification_run.outcome == VerificationOutcome::Pass
+            && self.verification_run.coverage == EvidenceCoverage::CompleteForScope
+            && self.verification_run.finished_at.is_some()
+            && fresh
+            && self
+                .source_observation
+                .as_ref()
+                .is_some_and(CanonicalVerifierSourceObservationRange::unchanged)
+            && !self.raw_artifact_bindings.is_empty()
+            && !self.verification_run.raw_evidence.is_empty()
+            && !self.verification_run.evidence.is_empty()
+            && self.verification_run.evidence.iter().all(|evidence| {
+                    matches!(
+                        evidence.freshness,
+                        EvidenceFreshness::ExactCandidate
+                            | EvidenceFreshness::ExactCommit
+                            | EvidenceFreshness::ExactQuiescedWorktree
+                    ) && evidence.coverage == EvidenceCoverage::CompleteForScope
+                })
+            && self
+                .raw_artifact_bindings
+                .iter()
+                .all(|artifact| !artifact.truncated)
+    }
+}
+
+/// Rebuilds acceptance dispositions from the terminal verifier evidence and
+/// canonical plan. Persisted `satisfied` flags are never an independent
+/// source of acceptance truth.
+pub(crate) fn acceptance_coverage_from_verifier_fact(
+    fact: &CanonicalVerifierExecutionFact,
+) -> Result<Vec<AcceptanceCoverage>, CompositionError> {
+    let verifier_plan = fact.plan.verifier.as_ref().ok_or_else(|| {
+        verifier_fact_error("canonical finish plan has no verifier item bindings")
+    })?;
+    let run_ref = fact.verification_run.run_id.to_string();
+    let run_is_current = matches!(
+        fact.verification_run.freshness,
+        EvidenceFreshness::ExactCandidate
+            | EvidenceFreshness::ExactCommit
+            | EvidenceFreshness::ExactQuiescedWorktree
+    );
+    let mut acceptance = Vec::with_capacity(verifier_plan.required_test_ids.len());
+    for item_id in &verifier_plan.required_test_ids {
+        let item_events = fact
+            .verification_run
+            .evidence
+            .iter()
+            .filter(|event| {
+                event
+                    .value
+                    .get("nextest_test_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(item_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let mut evidence_refs = BTreeSet::new();
+        for event in &item_events {
+            evidence_refs.insert(event.evidence_id.to_string());
+            evidence_refs.insert(event.raw_artifact_id.to_string());
+            if let Some(handles) = event
+                .value
+                .get("raw_artifact_handles")
+                .and_then(serde_json::Value::as_array)
+            {
+                evidence_refs.extend(
+                    handles
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+        }
+        if item_events.is_empty() {
+            // Keep the negative item disposition tied to the actual raw run
+            // artifacts inspected; never mint a placeholder item receipt.
+            evidence_refs.extend(
+                fact.verification_run
+                    .raw_evidence
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
+        let satisfied = run_is_current
+            && !item_events.is_empty()
+            && item_events.iter().all(|event| {
+                event
+                    .value
+                    .get("nextest_status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("PASS")
+            });
+        let verifier_run_refs = if item_events.is_empty() {
+            Vec::new()
+        } else {
+            vec![run_ref.clone()]
+        };
+        acceptance.push(AcceptanceCoverage {
+            item_id: item_id.clone(),
+            satisfied,
+            evidence_refs: evidence_refs.into_iter().collect(),
+            verifier_run_refs,
+            requires_verifier: true,
+        });
+    }
+    Ok(acceptance)
+}
+
+fn verifier_fact_error(reason: impl Into<String>) -> CompositionError {
+    CompositionError::Recovery(format!(
+        "canonical verifier execution fact: {}",
+        reason.into()
+    ))
+}
+
+fn canonical_job_state(state: JobState) -> &'static str {
+    match state {
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
+        JobState::Quarantined => "quarantined",
+        JobState::Queued | JobState::Running | JobState::RetryWait => "non_terminal",
+    }
+}
+
+fn validate_canonical_receipt_binding(
+    binding: &CanonicalVerifierReceiptBinding,
+    expected_fence: &StateFence,
+) -> Result<(), CompositionError> {
+    let text_fields = [
+        (&binding.job_id, "job_id"),
+        (&binding.operation_id, "operation_id"),
+        (&binding.process_tree_id, "process_tree_id"),
+        (&binding.invocation_id, "invocation_id"),
+        (&binding.invocation_digest, "invocation_digest"),
+        (&binding.allowed_contour_root, "allowed_contour_root"),
+        (&binding.source_root, "source_root"),
+        (&binding.target_root, "target_root"),
+        (&binding.cache_root, "cache_root"),
+    ];
+    if text_fields
+        .iter()
+        .any(|(value, _)| value.trim().is_empty() || value.chars().any(char::is_control))
+        || binding.generation != expected_fence.resource_generation.value()
+        || binding.authority_epoch != expected_fence.authority_epoch
+        || !binding.execution.is_terminal()
+    {
+        return Err(verifier_fact_error(
+            "persisted TestD receipt identity is stale or malformed",
+        ));
+    }
+    Ok(())
 }
 
 /// Persisted current-plan authority for one exact Governor fence.
@@ -845,6 +1958,160 @@ pub struct CanonicalAdmissionSnapshot {
     pub state_fence: StateFence,
     pub owner_revision: u64,
     pub current_plan: Option<CanonicalPlanBinding>,
+    /// Last terminal verifier execution fact admitted for this exact task,
+    /// plan, artifact lineage, and fence.
+    #[serde(default)]
+    pub verifier_execution_fact: Option<CanonicalVerifierExecutionFact>,
+    /// Canonical evidence required to evaluate a finish candidate.  The
+    /// candidate draft never supplies this record; it is rehydrated with the
+    /// current canonical owner image and must carry the same fence as it.
+    #[serde(default)]
+    pub finish_evidence: Option<CanonicalFinishEvidence>,
+}
+
+/// Canonical owner evidence consumed by the Governor finish path.
+///
+/// This is deliberately a projection owned by the canonical owner, rather
+/// than a second finish machine.  `FinishService` derives the decision from
+/// this record; the Store only persists the resulting receipt projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalFinishEvidence {
+    /// Fence at which the evidence was observed.
+    pub state_fence: StateFence,
+    /// Acceptance, artifact, verifier, and effect evidence from canonical
+    /// state.  It is never accepted from the finish caller.
+    pub evidence: FinishEvidence,
+    /// Exact effect receipts joined to the terminal verifier owner fact.
+    pub effect_reference_bindings: Vec<CanonicalVerifierEffectBinding>,
+    /// Closure observation for admitted descendants and external effects.
+    pub descendant_closure: DescendantClosure,
+    /// Authority owner reference for finish evaluation.
+    pub finish_authority_ref: String,
+    /// Optional explicit authority for a closing lifecycle action.
+    pub closure_authority_ref: Option<String>,
+}
+
+impl CanonicalFinishEvidence {
+    /// Validates the evidence against one active canonical fence.
+    pub fn validate(&self, expected_fence: &StateFence) -> Result<(), CompositionError> {
+        if &self.state_fence != expected_fence {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence has a stale state fence".to_owned(),
+            ));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        self.evidence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.evidence.task_id.trim().is_empty()
+            || self.evidence.task_id.chars().any(char::is_control)
+        {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence task identity is invalid".to_owned(),
+            ));
+        }
+        if self.finish_authority_ref.trim().is_empty()
+            || self.finish_authority_ref.chars().any(char::is_control)
+        {
+            return Err(CompositionError::Recovery(
+                "canonical finish authority reference is invalid".to_owned(),
+            ));
+        }
+        if let Some(reference) = &self.closure_authority_ref
+            && (reference.trim().is_empty() || reference.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical closure authority reference is invalid".to_owned(),
+            ));
+        }
+        if self.effect_reference_bindings.is_empty()
+            || self.effect_reference_bindings.iter().any(|effect| {
+                effect
+                    .validate(&self.evidence.task_id, expected_fence)
+                    .is_err()
+            })
+        {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence has no valid owner-bound effect receipt".to_owned(),
+            ));
+        }
+        match &self.descendant_closure {
+            DescendantClosure::Complete { receipt_ref }
+                if !self.evidence.artifact_refs.contains(receipt_ref) =>
+            {
+                return Err(CompositionError::Recovery(
+                    "complete descendant closure is missing its owner receipt artifact".to_owned(),
+                ));
+            }
+            DescendantClosure::Incomplete { unresolved_refs }
+                if unresolved_refs
+                    .iter()
+                    .any(|reference| !self.evidence.unresolved_effect_refs.contains(reference)) =>
+            {
+                return Err(CompositionError::Recovery(
+                    "descendant closure is not joined to unresolved effect dispositions".to_owned(),
+                ));
+            }
+            DescendantClosure::Unknown { reason_ref }
+                if !self.evidence.unresolved_effect_refs.contains(reason_ref)
+                    && !self.evidence.artifact_refs.contains(reason_ref) =>
+            {
+                return Err(CompositionError::Recovery(
+                    "unknown descendant closure has no canonical owner reference".to_owned(),
+                ));
+            }
+            DescendantClosure::Complete { .. }
+            | DescendantClosure::Incomplete { .. }
+            | DescendantClosure::Unknown { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn validate_owner_joins(
+        &self,
+        plan: &CanonicalPlanBinding,
+        fact: &CanonicalVerifierExecutionFact,
+    ) -> Result<(), CompositionError> {
+        if self.evidence.task_id != fact.task_id
+            || self.evidence.current_task_revision != fact.task_revision
+            || plan != &fact.plan
+            || plan.task_id.as_str() != self.evidence.task_id
+            || self.effect_reference_bindings != fact.effect_reference_bindings
+        {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence does not join the current plan, task, or verifier effect owner"
+                    .to_owned(),
+            ));
+        }
+        let run_ref = fact.verification_run.run_id.to_string();
+        if self.evidence.executed_verifier_run_refs != [run_ref.clone()] {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence does not name its exact executed verifier run"
+                    .to_owned(),
+            ));
+        }
+        let expected_stale = if fact.certifies_completion() {
+            Vec::new()
+        } else {
+            vec![run_ref]
+        };
+        if self.evidence.stale_verifier_run_refs != expected_stale {
+            return Err(CompositionError::Recovery(
+                "canonical verifier execution/outcome disposition is not joined to finish evidence"
+                    .to_owned(),
+            ));
+        }
+        if self.evidence.acceptance != acceptance_coverage_from_verifier_fact(fact)? {
+            return Err(CompositionError::Recovery(
+                "canonical per-item acceptance dispositions differ from verifier evidence"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl CanonicalAdmissionSnapshot {
@@ -858,6 +2125,8 @@ impl CanonicalAdmissionSnapshot {
             state_fence,
             owner_revision,
             current_plan,
+            verifier_execution_fact: None,
+            finish_evidence: None,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -876,6 +2145,33 @@ impl CanonicalAdmissionSnapshot {
         if let Some(current_plan) = &self.current_plan {
             current_plan.validate()?;
         }
+        if let Some(fact) = &self.verifier_execution_fact {
+            fact.validate(&self.state_fence)?;
+            let current_plan = self.current_plan.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "canonical verifier fact has no current plan owner".to_owned(),
+                )
+            })?;
+            if current_plan != &fact.plan || current_plan.task_id.as_str() != fact.task_id {
+                return Err(CompositionError::Recovery(
+                    "canonical verifier fact does not match the current plan".to_owned(),
+                ));
+            }
+        }
+        if let Some(finish_evidence) = &self.finish_evidence {
+            finish_evidence.validate(&self.state_fence)?;
+            let current_plan = self.current_plan.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "canonical finish evidence has no current plan owner".to_owned(),
+                )
+            })?;
+            let fact = self.verifier_execution_fact.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "canonical finish evidence has no verifier execution owner".to_owned(),
+                )
+            })?;
+            finish_evidence.validate_owner_joins(current_plan, fact)?;
+        }
         Ok(())
     }
 }
@@ -886,6 +2182,10 @@ struct CanonicalAdmissionSnapshotWire {
     state_fence: StateFence,
     owner_revision: u64,
     current_plan: Option<CanonicalPlanBinding>,
+    #[serde(default)]
+    verifier_execution_fact: Option<CanonicalVerifierExecutionFact>,
+    #[serde(default)]
+    finish_evidence: Option<CanonicalFinishEvidence>,
 }
 
 impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
@@ -894,7 +2194,16 @@ impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
         D: serde::Deserializer<'de>,
     {
         let wire = CanonicalAdmissionSnapshotWire::deserialize(deserializer)?;
-        Self::new(wire.state_fence, wire.owner_revision, wire.current_plan)
+        let snapshot = Self {
+            state_fence: wire.state_fence,
+            owner_revision: wire.owner_revision,
+            current_plan: wire.current_plan,
+            verifier_execution_fact: wire.verifier_execution_fact,
+            finish_evidence: wire.finish_evidence,
+        };
+        snapshot
+            .validate()
+            .map(|()| snapshot)
             .map_err(serde::de::Error::custom)
     }
 }
@@ -1051,6 +2360,134 @@ impl CanonicalAdmissionOwner {
                 "canonical current plan is absent; semantic activation is unavailable".to_owned(),
             )
         })
+    }
+
+    /// Returns the durable canonical owner revision used by a finish-evidence
+    /// compare-and-set.
+    #[must_use]
+    pub const fn owner_revision(&self) -> u64 {
+        self.snapshot.owner_revision
+    }
+
+    /// Builds the next canonical owner image after a verifier has completed
+    /// and its durable TestD row has been rehydrated. The fact is retained
+    /// even when its execution/outcome is non-certifying; finish evaluation
+    /// must see the real failed, stale, partial, or unknown run rather than a
+    /// caller assertion or a missing-value default.
+    pub fn prepare_verifier_execution_fact(
+        &self,
+        fact: CanonicalVerifierExecutionFact,
+    ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
+        fact.validate(&self.state_fence)?;
+        if let Some(plan) = &self.snapshot.current_plan
+            && (plan.task_id.as_str() != fact.task_id
+                || plan.plan_id != fact.plan.plan_id
+                || plan.plan_revision != fact.plan.plan_revision)
+        {
+            return Err(CompositionError::Recovery(
+                "verifier execution fact does not match the current canonical plan".to_owned(),
+            ));
+        }
+        let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("canonical owner revision overflow".to_owned())
+        })?;
+        let snapshot = CanonicalAdmissionSnapshot {
+            state_fence: self.state_fence.clone(),
+            owner_revision,
+            current_plan: self.snapshot.current_plan.clone(),
+            verifier_execution_fact: Some(fact),
+            finish_evidence: self.snapshot.finish_evidence.clone(),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Reads the exact verifier execution fact retained by the canonical
+    /// owner at the active fence. Absence is a recovery gap, never an empty
+    /// verifier result.
+    pub fn read_verifier_execution_fact(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalVerifierExecutionFact, CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.state_fence != *state_fence
+            || self.scope.state_fence != *state_fence
+            || self.snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier fact read used a stale state fence".to_owned(),
+            ));
+        }
+        let fact = self
+            .snapshot
+            .verifier_execution_fact
+            .clone()
+            .ok_or_else(|| {
+            CompositionError::Recovery(
+                "canonical verifier execution fact is absent; completion proof is unavailable"
+                    .to_owned(),
+            )
+        })?;
+        fact.validate(state_fence)?;
+        Ok(fact)
+    }
+
+    /// Builds the next canonical admission owner image after a Governor-owned
+    /// finish-evidence derivation.  This is a pure owner transition payload;
+    /// persistence is performed only by the Kernel transition port.
+    pub fn prepare_finish_evidence(
+        &self,
+        evidence: CanonicalFinishEvidence,
+    ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
+        evidence.validate(&self.state_fence)?;
+        if let Some(plan) = &self.snapshot.current_plan
+            && plan.task_id.as_str() != evidence.evidence.task_id
+        {
+            return Err(CompositionError::Recovery(
+                "finish evidence task does not match the current canonical plan".to_owned(),
+            ));
+        }
+        let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("canonical owner revision overflow".to_owned())
+        })?;
+        let snapshot = CanonicalAdmissionSnapshot {
+            state_fence: self.state_fence.clone(),
+            owner_revision,
+            current_plan: self.snapshot.current_plan.clone(),
+            verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
+            finish_evidence: Some(evidence),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Reads the canonical finish evidence at the exact active fence.
+    ///
+    /// The result is owner state recovered from the Kernel named read.  A
+    /// missing record is a plan gap, never an empty evidence default, because
+    /// the finish service must not derive proof from the caller draft.
+    pub fn read_finish_evidence(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalFinishEvidence, CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.state_fence != *state_fence || self.scope.state_fence != *state_fence {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence read used a stale state fence".to_owned(),
+            ));
+        }
+        let evidence = self.snapshot.finish_evidence.clone().ok_or_else(|| {
+            CompositionError::Recovery(
+                "canonical finish evidence owner is absent; completion proof is unavailable"
+                    .to_owned(),
+            )
+        })?;
+        evidence.validate(state_fence)?;
+        Ok(evidence)
     }
 }
 
@@ -1591,6 +3028,13 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         }
         let canonical_snapshot: CanonicalAdmissionSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Canonical)?;
+        let canonical_read_revision = recovery.owner_read(RecoveryOwner::Canonical)?.revision;
+        if canonical_snapshot.owner_revision != canonical_read_revision {
+            return Err(CompositionError::Recovery(
+                "canonical snapshot revision does not match its Kernel named-read revision"
+                    .to_owned(),
+            ));
+        }
         let canonical = CanonicalAdmissionOwner::new(
             state_fence.clone(),
             recovery.canonical_scope.clone(),
@@ -1665,6 +3109,338 @@ pub struct GovernorComposition<P: ?Sized> {
     /// Exact P-07 presentations retained with their owner snapshots until
     /// exact reconciliation, keyed by [`PresentedAuthorityRequest::ledger_key`].
     authority_presentations: BTreeMap<String, RetainedAuthorityRequest>,
+}
+
+fn testd_finished_clock(job: &TestJob) -> ClockReading {
+    let finished_at_ms = job.updated_at_ms.min(i64::MAX as u64) as i64;
+    ClockReading {
+        valid_time_ms: Some(finished_at_ms),
+        known_time_ms: Some(finished_at_ms),
+        transaction_sequence: None,
+        monotonic_ns: None,
+    }
+}
+
+/// Converts the durable TestD bytes into the standard raw-evidence contract.
+/// TestD's storage digest is length-domain-separated; the verifier receives a
+/// fresh standard digest over the exact retained bytes, so no handle or
+/// process-exit label can substitute for the captured stream.
+fn testd_raw_evidence(
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+) -> Result<Vec<RawEvidence>, CompositionError> {
+    receipt.validate(job).map_err(|error| {
+        CompositionError::Recovery(format!("TestD receipt validation failed: {error}"))
+    })?;
+    let mut artifacts = receipt.raw_artifacts.clone();
+    artifacts.sort_by(|left, right| {
+        left.capture_sequence
+            .cmp(&right.capture_sequence)
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    artifacts
+        .into_iter()
+        .map(|artifact| {
+            let artifact_id = ArtifactId::new(artifact.handle.clone()).map_err(|error| {
+                CompositionError::Recovery(format!("raw verifier artifact id is invalid: {error}"))
+            })?;
+            let sha256 = sha256_hex(&artifact.bytes);
+            let content_type = match artifact.stream {
+                RawArtifactStream::Stdout => {
+                    eliot_instrument_nextest::NEXTEST_STDOUT_CONTENT_TYPE.to_owned()
+                }
+                RawArtifactStream::Stderr => {
+                    eliot_instrument_nextest::NEXTEST_STDERR_CONTENT_TYPE.to_owned()
+                }
+                RawArtifactStream::Unknown => artifact.content_type.clone(),
+            };
+            let raw = RawEvidence {
+                artifact_id,
+                invocation_id: job.invocation.request.request_id.clone(),
+                source: RawEvidenceSource::Process,
+                content_type,
+                bytes: artifact.bytes,
+                sha256,
+                captured_at: artifact.captured_at,
+                truncated: artifact.truncated,
+            };
+            raw.validate().map_err(|error| {
+                CompositionError::Recovery(format!("raw verifier artifact is invalid: {error}"))
+            })?;
+            Ok(raw)
+        })
+        .collect()
+}
+
+/// Runs the registered diagnostic normalizer over every completed nextest
+/// event. The evaluator owns outcome/coverage; this projection only attaches
+/// canonical event identity and keeps each normalized item linked to the
+/// exact raw stream which produced it.
+fn normalize_nextest_run(
+    run: &mut VerificationRun,
+    job: &TestJob,
+    plan: &CanonicalVerifierPlanBinding,
+    receipt: &VerificationReceipt,
+    raw: &[RawEvidence],
+    observed_at: ClockReading,
+) -> Result<(), CompositionError> {
+    if raw.is_empty() {
+        return Err(CompositionError::Recovery(
+            "nextest normalization has no raw artifact".to_owned(),
+        ));
+    }
+    let Some(source_observation) = receipt.source_observation.as_ref() else {
+        run.freshness = EvidenceFreshness::Unknown;
+        run.coverage = EvidenceCoverage::PartialForScope;
+        return Ok(());
+    };
+    source_observation.validate().map_err(|error| {
+        CompositionError::Recovery(format!("source observation invalid: {error}"))
+    })?;
+    if source_observation.before.repository_root != job.target_roots.source_root
+        || source_observation.after.repository_root != job.target_roots.source_root
+    {
+        return Err(CompositionError::Recovery(
+            "source observation is outside the admitted TestD repository".to_owned(),
+        ));
+    }
+    if !source_observation.unchanged() {
+        run.freshness = EvidenceFreshness::Unknown;
+        run.coverage = EvidenceCoverage::PartialForScope;
+    }
+    let source_before = &source_observation.before;
+    let tool = receipt.tool_observation.as_ref().ok_or_else(|| {
+        CompositionError::Recovery(
+            "productive TestD receipt has no owner-observed tool identity".to_owned(),
+        )
+    })?;
+    tool.validate().map_err(|error| {
+        CompositionError::Recovery(format!("tool observation invalid: {error}"))
+    })?;
+    let stdout = raw
+        .iter()
+        .filter(|evidence| {
+            evidence.content_type == eliot_instrument_nextest::NEXTEST_STDOUT_CONTENT_TYPE
+                || evidence.content_type == "application/json"
+        })
+        .collect::<Vec<_>>();
+    if stdout.is_empty() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer has no stdout event stream".to_owned(),
+        ));
+    }
+    let mut stream = Vec::new();
+    let mut spans = Vec::new();
+    for evidence in stdout {
+        let start = stream.len();
+        stream.extend_from_slice(&evidence.bytes);
+        spans.push((start, stream.len(), evidence.artifact_id.clone()));
+    }
+    let events = parse_test_events(&stream).map_err(|error| {
+        CompositionError::Recovery(format!(
+            "registered nextest normalizer rejected the joined stdout stream: {error}"
+        ))
+    })?;
+    let mut normalized = Vec::new();
+    let classifier = DiagnosticClassifier::default();
+    let mut line_start = 0usize;
+    let mut line_events = Vec::new();
+    for line_end in stream
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+        .chain((!stream.is_empty() && !stream.ends_with(b"\n")).then_some(stream.len()))
+    {
+        if line_end < line_start {
+            continue;
+        }
+        let line = &stream[line_start..line_end];
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            line_events.extend(parse_test_events(line).map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "registered nextest normalizer could not map joined event: {error}"
+                ))
+            })?);
+        }
+        line_start = line_end.saturating_add(1);
+    }
+    if line_events.len() != events.len() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer lost an event while joining stdout chunks".to_owned(),
+        ));
+    }
+    let mut line_start = 0usize;
+    let mut event_index = 0usize;
+    for line_end in stream
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+        .chain((!stream.is_empty() && !stream.ends_with(b"\n")).then_some(stream.len()))
+    {
+        let line = &stream[line_start..line_end];
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            let line_event_count = parse_test_events(line)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?
+                .len();
+            let handles = spans
+                .iter()
+                .filter(|(start, end, _)| *start < line_end && *end > line_start)
+                .map(|(_, _, artifact_id)| artifact_id.clone())
+                .collect::<Vec<_>>();
+            if handles.is_empty() && line_event_count != 0 {
+                return Err(CompositionError::Recovery(
+                    "nextest event has no raw artifact lineage".to_owned(),
+                ));
+            }
+            for _ in 0..line_event_count {
+                let event = &line_events[event_index];
+                event_index += 1;
+                let NextestTestEvent::Completed { name, status } = event else {
+                    continue;
+                };
+                let status_label = nextest_status_label(*status);
+                let severity = match status {
+                    NextestTestStatus::Pass => DiagnosticSeverity::Information,
+                    NextestTestStatus::Fail
+                    | NextestTestStatus::Timeout
+                    | NextestTestStatus::Leak
+                    | NextestTestStatus::Cancelled => DiagnosticSeverity::Error,
+                    NextestTestStatus::Skip => DiagnosticSeverity::Warning,
+                };
+                let raw_observation_ref = handles.first().cloned().ok_or_else(|| {
+                    CompositionError::Recovery("nextest event has no raw artifact".to_owned())
+                })?;
+                let diagnostic = DiagnosticEvent::from_input(DiagnosticInput {
+                        project_id: job.invocation.request.product_id.to_string(),
+                        task_id: job
+                            .invocation
+                            .request
+                            .task_id
+                            .as_ref()
+                            .map(ToString::to_string),
+                        tool_id: job.invocation.instrument.to_string(),
+                        tool_version: tool.nextest_identity(),
+                        config_hash: plan.planned.verifier_config_hash.clone(),
+                    branch: source_before.branch.clone(),
+                    commit: source_before.commit.clone(),
+                    dirty_state_hash: source_before.dirty_state_sha256.clone(),
+                        file_path: job.invocation.target.clone(),
+                        range: None,
+                        severity,
+                        rule_id: format!("nextest.test.{}", status_label.to_ascii_lowercase()),
+                    message: format!("nextest test {name} completed with status {status_label}"),
+                        raw_observation_ref: raw_observation_ref.clone(),
+                        observed_at,
+                        status: if matches!(*status, NextestTestStatus::Pass) {
+                            DiagnosticStatus::Resolved
+                        } else {
+                            DiagnosticStatus::Active
+                        },
+                    })
+                    .map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "registered diagnostic normalizer rejected nextest event: {error}"
+                        ))
+                    })?;
+                let diagnostic = classifier.admit(diagnostic).map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "registered diagnostic normalizer rejected nextest event: {error}"
+                        ))
+                    })?;
+                let evidence_id = ArtifactId::new(format!("nextest-evidence-{}", sha256_hex(line)))
+                .map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "normalized evidence id is invalid: {error}"
+                        ))
+                })?;
+                let mut value = serde_json::to_value(&diagnostic).map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "normalized diagnostic serialization failed: {error}"
+                    ))
+                })?;
+                value["raw_artifact_handles"] = serde_json::json!(handles);
+                // Preserve the typed nextest item identity and outcome in the
+                // normalized owner evidence. FinishAttempt joins these exact
+                // fields to the canonical required-test set; diagnostic prose
+                // and run-level status are not item-level acceptance proof.
+                value["nextest_test_id"] = serde_json::json!(catalog_test_id(name));
+                value["nextest_status"] = serde_json::json!(status_label);
+                normalized.push(NormalizedEvidence {
+                    evidence_id,
+                    raw_artifact_id: raw_observation_ref,
+                    normalizer: ContractId::new(DIAGNOSTIC_CONTRACT).map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "diagnostic contract id is invalid: {error}"
+                        ))
+                    })?,
+                    kind: "nextest.test".to_owned(),
+                    summary: format!("nextest test {name} completed with status {status_label}"),
+                    value,
+                    axes: EvidenceAxes::observed(),
+                    freshness: run.freshness,
+                    coverage: if plan.required_test_ids.contains(catalog_test_id(name)) {
+                        run.coverage
+                    } else {
+                        EvidenceCoverage::PartialForScope
+                    },
+                });
+            }
+        }
+        line_start = line_end.saturating_add(1);
+    }
+    if event_index != line_events.len() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer did not consume every parsed event".to_owned(),
+        ));
+    }
+    if normalized.is_empty() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer produced no completed test evidence".to_owned(),
+        ));
+    }
+    run.evidence = normalized;
+    run.validate().map_err(|error| {
+        CompositionError::Recovery(format!("normalized VerificationRun is invalid: {error}"))
+    })
+}
+
+const fn nextest_status_label(status: NextestTestStatus) -> &'static str {
+    match status {
+        NextestTestStatus::Pass => "PASS",
+        NextestTestStatus::Fail => "FAIL",
+        NextestTestStatus::Skip => "SKIP",
+        NextestTestStatus::Timeout => "TIMEOUT",
+        NextestTestStatus::Leak => "LEAK",
+        NextestTestStatus::Cancelled => "CANCELLED",
+    }
+}
+
+pub(crate) fn evaluate_testd_verification_current(
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+    plan: &CanonicalVerifierPlanBinding,
+) -> Result<VerificationRun, CompositionError> {
+    if job.invocation.profile != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        return Err(CompositionError::Recovery(
+            "current verifier evaluation requires the productive nextest profile".to_owned(),
+        ));
+    }
+    let raw = testd_raw_evidence(job, receipt)?;
+    let finished_at = testd_finished_clock(job);
+    let mut run = eliot_verifier::evaluate_current(
+        &job.invocation,
+        &raw,
+        &plan.required_test_ids,
+        job.invocation.request.clock,
+        finished_at,
+    )
+    .map_err(|error| {
+        CompositionError::Recovery(format!(
+            "registered nextest evaluator rejected durable TestD evidence: {error}"
+        ))
+    })?;
+    normalize_nextest_run(&mut run, job, plan, receipt, &raw, finished_at)?;
+    Ok(run)
 }
 
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
@@ -1743,6 +3519,94 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    /// Rehydrates one verifier execution fact from the current Governor task,
+    /// plan, and the current durable TestD owner row. The caller supplies only
+    /// the durable job identity; it cannot pass a held `TestJob` image or a
+    /// verifier verdict. The store read, task/plan join, persisted receipt,
+    /// execution run, artifact lineage, and canonical fence are checked by
+    /// the one fact constructor.
+    pub fn rehydrate_testd_verifier_execution_fact(
+        &self,
+        task_id: &TaskId,
+        task_revision: u64,
+        job_id: &str,
+        testd: &TestdStore,
+    ) -> Result<CanonicalVerifierExecutionFact, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let task = self.owners.task.task(task_id).ok_or_else(|| {
+            CompositionError::Recovery(format!("canonical task {} is absent", task_id.as_str()))
+        })?;
+        if task.task_id != *task_id || task.revision != task_revision || task.state_fence != fence {
+            return Err(CompositionError::Recovery(
+                "canonical task owner is stale for verifier rehydration".to_owned(),
+            ));
+        }
+        let plan = self.owners.canonical.read_current_plan(&fence)?;
+        if plan.task_id != *task_id {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan is task-mismatched".to_owned(),
+            ));
+        }
+        let job = testd
+            .get(job_id)
+            .map_err(|error| {
+                CompositionError::Recovery(format!("TestD owner read failed: {error}"))
+            })?
+            .ok_or_else(|| {
+                CompositionError::Recovery(format!("durable TestD job {job_id} is absent"))
+            })?;
+        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "canonical plan has no verifier profile/config/scope/artifact binding".to_owned(),
+            )
+        })?;
+        let receipt = job.verification_receipt.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "durable TestD job has no full verification receipt".to_owned(),
+            )
+        })?;
+        let run = evaluate_testd_verification_current(&job, receipt, verifier_plan)?;
+        CanonicalVerifierExecutionFact::from_testd(
+            task_id,
+            task_revision,
+            &plan,
+            &fence,
+            &job,
+            receipt,
+            run,
+        )
+    }
+
+    /// Prepares the canonical owner image for a TestD verifier fact. The
+    /// returned snapshot is committed only through the existing canonical
+    /// transition/CAS path; no public setter can install a caller assertion.
+    pub fn prepare_testd_verifier_execution_fact(
+        &self,
+        task_id: &TaskId,
+        task_revision: u64,
+        job_id: &str,
+        testd: &TestdStore,
+    ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
+        let fact =
+            self.rehydrate_testd_verifier_execution_fact(task_id, task_revision, job_id, testd)?;
+        self.owners.canonical.prepare_verifier_execution_fact(fact)
+    }
+
+    /// Reads the canonical verifier plan only from this ready composition's
+    /// retained owner and the exact admitted state fence.
+    pub fn read_current_plan(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalPlanBinding, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        self.owners.canonical.read_current_plan(state_fence)
     }
 
     /// Returns the authenticated Kernel snapshot admitted at construction.
@@ -1857,6 +3721,85 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &self.owners.canonical,
             self.kernel.as_ref(),
         )
+    }
+
+    /// Borrows the single Governor FinishAttempt adapter.
+    ///
+    /// The adapter rehydrates the current task and canonical finish-evidence
+    /// sources at the retained fence. The composition's production method
+    /// publishes the Governor-derived `owner/canonical` evidence CAS and
+    /// refreshes its readback before the adapter evaluates the existing
+    /// [`FinishService`]. It never consumes provider result state as proof.
+    #[must_use]
+    pub fn finish_attempt_service(&self) -> GovernorFinishAttempt<'_, P> {
+        let finish_revision = self
+            .recovery
+            .owner_reads
+            .iter()
+            .find(|read| read.owner == RecoveryOwner::Finish)
+            .map_or(0, |read| read.revision);
+        GovernorFinishAttempt::new(
+            &self.owners,
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+            finish_revision,
+        )
+    }
+
+    /// Publishes the current durable TestD verifier execution fact through
+    /// the same canonical owner CAS used by FinishEvidence. The caller gives
+    /// only the job identity; TestD currentness and the full receipt/run are
+    /// re-read inside the Governor service before the write.
+    pub async fn publish_testd_verifier_execution_fact(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        task_id: &TaskId,
+        task_revision: u64,
+        job_id: &str,
+        testd: &TestdStore,
+    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.finish_attempt_service()
+            .publish_testd_verifier_execution_fact(
+                identity,
+                operation_id,
+                task_id,
+                task_revision,
+                job_id,
+                testd,
+            )
+            .await
+    }
+
+    /// Runs the production FinishAttempt path and returns only after the
+    /// canonical receipt has committed. Publication is performed by the
+    /// daemon composition through `refresh_from_kernel`, using the same
+    /// committed-receipt boundary as the other daemon callers.
+    pub async fn finish_attempt(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<FinishDecisionReceipt, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        {
+            let service = self.finish_attempt_service();
+            service
+                .publish_finish_evidence(identity, &operation_id, &draft)
+                .await?;
+        }
+        self.refresh_from_kernel()
+            .map_err(FinishAttemptError::Composition)?;
+        let receipt = {
+            let service = self.finish_attempt_service();
+            service.submit(identity, operation_id, draft).await?
+        };
+        Ok(receipt)
     }
 
     /// Borrows the single observation/verified-repair reconciliation owner as
@@ -3757,6 +5700,8 @@ mod tests {
                 state_fence: state_fence.clone(),
                 owner_revision: 1,
                 current_plan: None,
+                verifier_execution_fact: None,
+                finish_evidence: None,
             }),
             RecoveryOwner::Task => serde_json::to_value(TaskLifecycleSnapshot {
                 next_sequence: 1,
@@ -3868,7 +5813,10 @@ mod tests {
                 plan_revision: "1".to_owned(),
                 task_id: TaskId::new("task-1").expect("task id"),
                 work_scope_id: "scope:work".to_owned(),
+                verifier: None,
             }),
+            verifier_execution_fact: None,
+            finish_evidence: None,
         }
     }
 
@@ -4114,8 +6062,12 @@ mod tests {
     fn policy_owner_recovers_with_fence_revision_digest_correlation() {
         let observed = snapshot();
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
-        let composition =
-            GovernorComposition::new(Arc::new(fake_kernel(observed.clone())), None, &expected, QueueLimits::default())
+        let composition = GovernorComposition::new(
+            Arc::new(fake_kernel(observed.clone())),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
                 .expect("composition");
         let policy = composition.owners().policy.as_ref().expect("policy owner");
         assert_eq!(policy.state_fence(), &observed.state_fence());
@@ -4757,7 +6709,10 @@ mod tests {
                 plan_revision: "1".to_owned(),
                 task_id: TaskId::new("task-other").expect("task id"),
                 work_scope_id: "scope:work".to_owned(),
+                verifier: None,
             }),
+            verifier_execution_fact: None,
+            finish_evidence: None,
         };
         mismatched_plan.validate().expect("plan shape");
         let mut mismatch = activation_fake(&observed);
@@ -5838,8 +7793,7 @@ mod tests {
         // `PreparedTransition` via `commit_canonical` correlated by
         // `operation_id` / `canonical_request_hash` / `state_fence`.
         let observed = snapshot();
-        let expected =
-            KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let composition = GovernorComposition::new(
             Arc::new(activation_fake(&observed)),
             None,

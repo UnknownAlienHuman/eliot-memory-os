@@ -804,6 +804,14 @@ pub enum NamedMutationOperation {
     UpdateTaskState,
     ApplyLifecyclePolicy,
     ReconcileRecovery,
+    /// Persists the Governor-owned canonical finish receipt through the
+    /// existing RecoverySchema transition. The store treats the receipt as
+    /// opaque bytes and only arbitrates the `owner/finish` revision.
+    RecordFinishDecision,
+    /// Persists the Governor-produced canonical finish-evidence owner image
+    /// through the same fenced RecoverySchema transition. The store treats
+    /// the snapshot as opaque bytes and only arbitrates `owner/canonical`.
+    RecordFinishEvidence,
     AppendAuditEvent,
     /// Durable authority-revocation record (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
@@ -879,7 +887,10 @@ impl NamedMutationOperation {
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
-            Self::ReconcileRecovery | Self::RecordAuthorityRevocation => {
+            Self::ReconcileRecovery
+            | Self::RecordFinishDecision
+            | Self::RecordFinishEvidence
+            | Self::RecordAuthorityRevocation => {
                 TransitionClass::RecoverySchema
             }
             Self::ApplyErasure => TransitionClass::Erasure,
