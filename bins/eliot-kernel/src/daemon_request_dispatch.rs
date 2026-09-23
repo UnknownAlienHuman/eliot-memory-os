@@ -1742,6 +1742,7 @@ impl KernelComposition {
             .read_user_automation_policy_snapshot(&lookup.state_fence)
             .await?;
         if request.preflight.config_snapshot_id != policy_snapshot.snapshot_id
+            || request.preflight.config_snapshot != policy_snapshot
             || policy_snapshot.state_fence != lookup.state_fence
         {
             return Err(UserAutomationRuntimeError::IdentityConflict);
