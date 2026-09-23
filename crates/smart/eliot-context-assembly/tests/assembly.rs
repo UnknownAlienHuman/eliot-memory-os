@@ -63,6 +63,7 @@ fn candidate(context: &ContextBinding) -> ContextCandidate {
             content_sha256: digest(),
             predecessor: None,
         },
+        learning: None,
         representation: AtomRepresentation::Whole {
             content: "whole goal matériél".to_owned(),
         },
@@ -686,8 +687,10 @@ fn refinalize(value: &mut AdmittedContextSet, recipe_digest: &str) {
     let capacity = value.floor.capacity;
     value.economy.allocations.admitted_required = 0;
     value.economy.allocations.admitted_optional = 0;
-    value.economy.allocations.remaining_headroom =
-        capacity.route_capacity - capacity.fixed_overhead - capacity.output_reserve - capacity.review_reserve;
+    value.economy.allocations.remaining_headroom = capacity.route_capacity
+        - capacity.fixed_overhead
+        - capacity.output_reserve
+        - capacity.review_reserve;
     refresh_economy_receipt(value);
     let payload_bytes = value
         .canonical_payload_utf8_bytes()
@@ -699,9 +702,7 @@ fn refinalize(value: &mut AdmittedContextSet, recipe_digest: &str) {
         - capacity.review_reserve
         - payload_bytes;
     refresh_economy_receipt(value);
-    value.economy.measurement.digest = value
-        .canonical_payload_digest()
-        .expect("admitted digest");
+    value.economy.measurement.digest = value.canonical_payload_digest().expect("admitted digest");
     refresh_economy_receipt(value);
 }
 
@@ -986,10 +987,7 @@ fn missing_admitted_material_yields_exact_incomplete() {
     );
     match result {
         Err(AssemblyError::Incomplete(incomplete)) => {
-            assert_eq!(
-                incomplete.code,
-                ContextErrorCode::DecisionContextIncomplete
-            );
+            assert_eq!(incomplete.code, ContextErrorCode::DecisionContextIncomplete);
             assert_eq!(incomplete.missing, vec![id("atom")]);
         }
         other => panic!("expected exact incomplete, got {other:?}"),
@@ -1245,10 +1243,7 @@ fn no_ranking_compression_summary_implementation() {
             "no compression or summary rewrite"
         );
         assert!(
-            matches!(
-                rendered.representation,
-                AtomRepresentation::Whole { .. }
-            ),
+            matches!(rendered.representation, AtomRepresentation::Whole { .. }),
             "only whole units pass a NonDroppable route"
         );
     }
@@ -1455,10 +1450,7 @@ fn omission_expansion_records_are_retained() {
         vec![id("displaced-atom")]
     );
     assert_eq!(value.economy.omissions.len(), 1);
-    assert_eq!(
-        value.economy.omissions[0].reason,
-        OmissionReason::Capacity
-    );
+    assert_eq!(value.economy.omissions[0].reason, OmissionReason::Capacity);
     view.view
         .validate_against(&value)
         .expect("omission evidence conserved");
@@ -1485,9 +1477,7 @@ fn missing_changed_crosstask_expansion_handle_fails() {
     value.economy.omissions[0].expansion = Some(handle);
     value.economy.omissions[0].non_recoverable_reason = None;
     refinalize(&mut value, &omission_recipe.recipe_sha256.clone());
-    value
-        .validate()
-        .expect("bound expansion handle validates");
+    value.validate().expect("bound expansion handle validates");
 
     let mut wrong_atom = value.clone();
     wrong_atom.economy.omissions[0]
@@ -1758,16 +1748,11 @@ fn measurement_port_called_exactly_once_on_final_bytes() {
         fence_digest: "b".repeat(64),
         ..policy(100_000)
     };
-    let result: Result<_, AssemblyError> = assemble_active_view(
-        &value,
-        &recipe,
-        quality(&context),
-        &forged,
-        |bytes| {
+    let result: Result<_, AssemblyError> =
+        assemble_active_view(&value, &recipe, quality(&context), &forged, |bytes| {
             refused_calls += 1;
             Ok(measurement(&context, bytes))
-        },
-    );
+        });
     assert!(result.is_err());
     assert_eq!(refused_calls, 0, "no local fallback call on refusal");
 }
@@ -1783,7 +1768,10 @@ fn source_guard_rejects_local_fallback_estimators() {
     };
     let char_count = material.chars().count() as u64;
     let byte_count = material.len() as u64;
-    assert!(byte_count > char_count, "non-ASCII separates bytes from chars");
+    assert!(
+        byte_count > char_count,
+        "non-ASCII separates bytes from chars"
+    );
     let view = assemble_active_view(
         &value,
         &recipe(&context),
@@ -1919,10 +1907,7 @@ fn missing_omission_coverage_evidence_is_rejected() {
         &policy(100_000),
         |_bytes| panic!("missing quality axis must fail"),
     );
-    assert!(matches!(
-        result,
-        Err(AssemblyError::QualityIncomplete(_))
-    ));
+    assert!(matches!(result, Err(AssemblyError::QualityIncomplete(_))));
 }
 
 // WORK_UNIT_CASE: 626/33
@@ -2051,10 +2036,7 @@ fn unknown_mandatory_quality_blocks_complete() {
         &policy(100_000),
         |_bytes| panic!("unknown evidence must block before measurement"),
     );
-    assert!(matches!(
-        result,
-        Err(AssemblyError::QualityIncomplete(_))
-    ));
+    assert!(matches!(result, Err(AssemblyError::QualityIncomplete(_))));
 
     let mut qualified_unknown = quality(&context);
     qualified_unknown.results[1].unknown_evidence = vec![id("unknown-evidence")];
@@ -2065,10 +2047,7 @@ fn unknown_mandatory_quality_blocks_complete() {
         &policy(100_000),
         |_bytes| panic!("passed with unknown evidence must block"),
     );
-    assert!(matches!(
-        result,
-        Err(AssemblyError::QualityIncomplete(_))
-    ));
+    assert!(matches!(result, Err(AssemblyError::QualityIncomplete(_))));
 }
 
 // WORK_UNIT_CASE: 626/36
@@ -2094,10 +2073,7 @@ fn no_scalar_weighted_average_compensation() {
         &policy(100_000),
         |_bytes| panic!("compensation must not complete"),
     );
-    assert!(matches!(
-        result,
-        Err(AssemblyError::QualityIncomplete(_))
-    ));
+    assert!(matches!(result, Err(AssemblyError::QualityIncomplete(_))));
 }
 
 // WORK_UNIT_CASE: 626/37
@@ -2146,10 +2122,7 @@ fn complete_partial_upstream_material_measurement_stay_distinct() {
         &policy(100_000),
         |_| panic!("quality gap precedes measurement"),
     );
-    assert!(matches!(
-        material,
-        Err(AssemblyError::QualityIncomplete(_))
-    ));
+    assert!(matches!(material, Err(AssemblyError::QualityIncomplete(_))));
 
     let tight = assemble_active_view(
         &complete_value,
@@ -2249,13 +2222,9 @@ fn successful_views_are_one_to_one_and_within_measured_bounds() {
     for (value, recipe) in &fixtures {
         let context = value.binding.clone();
         let max = 100_000;
-        let view = assemble_active_view(
-            value,
-            recipe,
-            quality(&context),
-            &policy(max),
-            |bytes| Ok(measurement(&context, bytes)),
-        )
+        let view = assemble_active_view(value, recipe, quality(&context), &policy(max), |bytes| {
+            Ok(measurement(&context, bytes))
+        })
         .expect("bounded one-to-one view");
         let mut admitted_sorted = view.view.admitted_ids.clone();
         admitted_sorted.sort();

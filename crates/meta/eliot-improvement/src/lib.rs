@@ -11,7 +11,16 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod candidate_bounds;
+pub mod governed_screen;
 pub mod learning_closure;
+pub mod producer;
+
+pub use governed_screen::{
+    CarriageMark, PresentedLearning, bounds_to_context_error, check_governed_carriage,
+    datetime_from_unix,
+};
+pub use producer::{LearningProduction, produce_learning_candidate};
 
 pub mod promotion_input;
 

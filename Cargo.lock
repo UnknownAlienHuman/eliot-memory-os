@@ -1077,6 +1077,8 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-governor",
+ "eliot-improvement",
  "eliot-reactive-context-plan",
  "eliot-receipts",
  "serde",
@@ -1090,6 +1092,8 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-governor",
+ "eliot-improvement",
  "eliot-observation-contracts",
  "eliot-receipts",
  "serde",
@@ -1889,6 +1893,7 @@ dependencies = [
  "eliot-change-monitor",
  "eliot-config",
  "eliot-context-candidates",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-coordination",
  "eliot-cue-contracts",
@@ -2035,6 +2040,12 @@ name = "eliot-improvement"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-agent-contracts",
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-governor",
+ "eliot-receipts",
  "serde",
  "thiserror",
  "time",
@@ -3281,8 +3292,12 @@ dependencies = [
 name = "eliot-wasm-host"
 version = "0.1.0"
 dependencies = [
+ "eliot-context-admission",
+ "eliot-context-assembly",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-governor",
+ "eliot-improvement",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-process",

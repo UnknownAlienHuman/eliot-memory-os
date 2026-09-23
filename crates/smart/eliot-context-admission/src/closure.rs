@@ -57,6 +57,7 @@ pub fn assemble_closure(parts: ClosureParts) -> Result<AdmissionInput, ContextEr
         binding: parts.binding,
         recipe: parts.recipe,
         candidates: parts.candidates,
+        learning_tickets: Vec::new(),
         floor: parts.floor,
         priority: parts.priority,
         rule: parts.rule,

@@ -9,14 +9,22 @@
 
 pub mod closure;
 pub mod decision;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod learning_gate;
 
 pub use closure::{ClosureParts, assemble_closure};
 
 pub use decision::{
-    ClassifiedAdmission, ClassificationEvidence, MaterialRankTrace, RetrievalAdmissionDecision,
+    ClassificationEvidence, ClassifiedAdmission, MaterialRankTrace, RetrievalAdmissionDecision,
     RetrievalStaleness, SuppliedWarning, check_plan_revisions, check_retrieval_freshness,
-    classify_admission, derive_candidate_warnings, derive_input_warnings,
-    trace_material, trace_material_with_warnings,
+    classify_admission, derive_candidate_warnings, derive_input_warnings, trace_material,
+    trace_material_with_warnings,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use learning_gate::{
+    LearningSubject, admit_context_with_learning, screen_admission_input_learning,
+    screen_learning_subjects,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

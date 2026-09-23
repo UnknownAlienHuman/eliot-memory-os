@@ -54,6 +54,7 @@ pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicP
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
 pub use finish_attempt::{FinishAttemptError, GovernorFinishAttempt};
 mod controlboard_projection;
+mod learning_admission;
 mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_closure_feed;
@@ -86,14 +87,18 @@ pub use controlboard_projection::{
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
-pub use eliot_canonical::{
-    CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome,
-};
+pub use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome};
 pub use eliot_finish::FinishDecisionReceipt;
 /// Task lifecycle domain types re-exported so the daemon composition root
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
 pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
+pub use learning_admission::{
+    LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
+    LearningAdmissionError, LearningAdmissionPermit, VerifiedLearningAdmission,
+    issue_learning_admission, issue_learning_ticket, verify_learning_admission,
+    verify_learning_ticket,
+};
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
     WatchdogEntryKind,

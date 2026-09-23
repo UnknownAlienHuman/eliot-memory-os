@@ -14,6 +14,7 @@ mod canonical_projections;
 mod economy;
 mod error;
 mod identity;
+mod learning_ticket;
 mod measurement;
 mod omission;
 mod quality;
@@ -36,8 +37,9 @@ pub use admission_input::{
 };
 pub use atom::{
     AdmissionDisposition, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,
-    CapacityLimits, ContextCandidate, ContextRecipe, LossPolicy, MeasurementRef, PrivacyClass,
-    ProviderDisposition, ProviderRoleDenominator, RepresentationKind, RoleLossRule,
+    CapacityLimits, ContextCandidate, ContextRecipe, LearningProvenance, LossPolicy,
+    MeasurementRef, PrivacyClass, ProviderDisposition, ProviderRoleDenominator, RepresentationKind,
+    RoleLossRule,
 };
 pub use canonical_projections::{
     AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
@@ -51,6 +53,10 @@ pub use error::{
 pub use identity::{
     CONTEXT_CONTRACT_NAME, CONTEXT_CONTRACT_VERSION, ContextBinding, DecisionRevision,
     ProofBinding, ProviderId, ProviderRole, SemanticRole, SourceSnapshot,
+};
+pub use learning_ticket::{
+    LEARNING_TICKET_DIGEST_DOMAIN, LEARNING_TICKET_SCHEMA_VERSION, LearningAdmissionTicket,
+    learning_ticket_digest, ticket_fresh_for,
 };
 pub use measurement::{
     MeasurementStatus, SerializedContextMeasurement, StuEstimate, TokenizerObservation,

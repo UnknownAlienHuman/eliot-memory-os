@@ -1,0 +1,167 @@
+//! Governor-minted learning admission ticket, wire form (I12.24, #1869).
+//!
+//! [`LearningAdmissionTicket`] is the serializable twin of the owner-held
+//! admission: the Governor owner mints it after live admission checks, and
+//! any holder can verify its integrity by recomputing
+//! [`learning_ticket_digest`] and its freshness via [`ticket_fresh_for`].
+//! It crosses process boundaries (host dispatch, guest envelope) where the
+//! opaque in-process permit cannot travel.
+//!
+//! Honest security statement (read before relying on this):
+//!
+//! - The digest binds every bound field, so post-issuance tampering,
+//!   cross-campaign/task transplanting, and subject substitution are
+//!   detected by recomputation — no secrets, no registry.
+//! - Forging a ticket from scratch for *currently valid* parameters is
+//!   equivalent to legitimate issuance, because the issuance checks ARE the
+//!   admission policy (live epoch/generation/fence/shape). What forgery
+//!   cannot do is backdate (live-epoch recompute fails after rotation),
+//!   drift fences (exact-match fails), widen subjects, or mint during a
+//!   non-admitting owner state.
+//! - Wall-clock expiry is NOT enforceable from the digest or inside the
+//!   clockless guest; it is enforced by native gates and the host contour.
+//!   Stale-together full-compilation replays pass structural checks and rely
+//!   on contour fence freshness (I14.14 generation fencing).
+
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence, fences_match_exact};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::{ContextError, validate_digest, validate_text};
+
+/// Schema version of the ticket wire shape.
+pub const LEARNING_TICKET_SCHEMA_VERSION: u32 = 1;
+/// Digest domain separator (APPENDIX-P: canonical hashes use normalized
+/// versioned serialization).
+pub const LEARNING_TICKET_DIGEST_DOMAIN: &str = "eliot.smart.context.learning-ticket.v1";
+
+/// Owner-minted learning admission ticket (serializable wire form).
+///
+/// Field-for-field identical in meaning to the owner-held permit; the
+/// `digest` binds them all. Minted only by the Governor owner after live
+/// admission checks; verified by recomputation plus live-state binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LearningAdmissionTicket {
+    pub schema_version: u32,
+    pub source_campaign_id: String,
+    pub target_task_id: String,
+    pub fence: StateFence,
+    pub overlay_id: Option<String>,
+    pub candidate_id: Option<String>,
+    pub scope_ref: String,
+    pub authority_ref: String,
+    pub retention_ref: String,
+    pub evaluator_ref: String,
+    pub rollback_ref: String,
+    pub digest: String,
+}
+
+impl LearningAdmissionTicket {
+    /// Shape validation only; issuance and freshness happen owner-side.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        if self.schema_version != LEARNING_TICKET_SCHEMA_VERSION {
+            return Err(ContextError::InvalidField("learning_ticket.schema_version"));
+        }
+        validate_text(
+            &self.source_campaign_id,
+            "learning_ticket.source_campaign_id",
+        )?;
+        validate_text(&self.target_task_id, "learning_ticket.target_task_id")?;
+        validate_text(&self.scope_ref, "learning_ticket.scope_ref")?;
+        validate_text(&self.authority_ref, "learning_ticket.authority_ref")?;
+        validate_text(&self.retention_ref, "learning_ticket.retention_ref")?;
+        validate_text(&self.evaluator_ref, "learning_ticket.evaluator_ref")?;
+        validate_text(&self.rollback_ref, "learning_ticket.rollback_ref")?;
+        if self
+            .overlay_id
+            .as_ref()
+            .is_none_or(|id| id.trim().is_empty())
+            && self
+                .candidate_id
+                .as_ref()
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(ContextError::MissingField("learning_ticket.subject"));
+        }
+        self.fence
+            .validate()
+            .map_err(|_| ContextError::InvalidFence)?;
+        validate_digest(&self.digest, "learning_ticket.digest")?;
+        Ok(())
+    }
+}
+
+/// Canonical digest input: explicit field order, versioned domain. The
+/// fence enters through its canonical tuple encoding, never a scalar.
+#[derive(Serialize)]
+struct TicketDigestInput<'a> {
+    domain: &'static str,
+    schema_version: u32,
+    source_campaign_id: &'a str,
+    target_task_id: &'a str,
+    fence: &'a StateFence,
+    overlay_id: Option<&'a str>,
+    candidate_id: Option<&'a str>,
+    scope_ref: &'a str,
+    authority_ref: &'a str,
+    retention_ref: &'a str,
+    evaluator_ref: &'a str,
+    rollback_ref: &'a str,
+}
+
+/// Compute the binding digest for a ticket's fields.
+///
+/// Pure canonical encoding (same family as [`crate::canonical_digest`]);
+/// policy lives with the minting/verifying owner, never here.
+pub fn learning_ticket_digest(ticket: &LearningAdmissionTicket) -> Result<String, ContextError> {
+    let input = TicketDigestInput {
+        domain: LEARNING_TICKET_DIGEST_DOMAIN,
+        schema_version: ticket.schema_version,
+        source_campaign_id: ticket.source_campaign_id.trim(),
+        target_task_id: ticket.target_task_id.trim(),
+        fence: &ticket.fence,
+        overlay_id: ticket.overlay_id.as_deref(),
+        candidate_id: ticket.candidate_id.as_deref(),
+        scope_ref: ticket.scope_ref.trim(),
+        authority_ref: ticket.authority_ref.trim(),
+        retention_ref: ticket.retention_ref.trim(),
+        evaluator_ref: ticket.evaluator_ref.trim(),
+        rollback_ref: ticket.rollback_ref.trim(),
+    };
+    let bytes = eliot_contracts::canonical_json_bytes(&input)
+        .map_err(|_| ContextError::InvalidField("learning_ticket.canonical"))?;
+    Ok(eliot_contracts::sha256_hex(&bytes))
+}
+
+/// Pure freshness/binding check of a ticket against trusted live state.
+///
+/// Returns true only when the digest recomputes (untampered), the epoch is
+/// the live authority, the generation matches, and the presented fence
+/// exactly matches the admitted fence. Mirrors the [`fences_match_exact`]
+/// precedent: comparison only, no policy. The caller supplies live state
+/// from the owner (native) or the admitted dispatch contour — never from
+/// the requester.
+pub fn ticket_fresh_for(
+    ticket: &LearningAdmissionTicket,
+    live_epoch: &EpochId,
+    live_generation: ResourceGeneration,
+    current_fence: &StateFence,
+) -> bool {
+    if ticket.schema_version != LEARNING_TICKET_SCHEMA_VERSION {
+        return false;
+    }
+    let Ok(recomputed) = learning_ticket_digest(ticket) else {
+        return false;
+    };
+    if recomputed != ticket.digest {
+        return false;
+    }
+    if !ticket.fence.authority_epoch.is_same_authority(live_epoch) {
+        return false;
+    }
+    if ticket.fence.resource_generation != live_generation {
+        return false;
+    }
+    fences_match_exact(current_fence, &ticket.fence)
+}

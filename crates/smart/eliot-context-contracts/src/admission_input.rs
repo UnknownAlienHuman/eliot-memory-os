@@ -15,9 +15,9 @@ use crate::{
     AdmissionDisposition, AdmissionRecord, CONTEXT_CONTRACT_VERSION, CapacityLimits,
     ContextBinding, ContextCandidate, ContextCandidateSet, ContextEconomyReceipt, ContextError,
     ContextOutcome, ContextRecipe, DecisionContextIncomplete, DecisionRevision,
-    DecisionSafetyFloor, ExpansionHandle, LossPolicy, NonRecoverableReason, OmissionRecord,
-    RepresentationKind, StuEstimate, TokenizerObservation, canonical_digest, validate_digest,
-    validate_text,
+    DecisionSafetyFloor, ExpansionHandle, LearningAdmissionTicket, LossPolicy,
+    NonRecoverableReason, OmissionRecord, RepresentationKind, StuEstimate, TokenizerObservation,
+    canonical_digest, validate_digest, validate_text,
 };
 
 /// Closed unit used by an admission cost.  A unit is never inferred from a
@@ -485,6 +485,13 @@ pub struct AdmissionInput {
     pub binding: ContextBinding,
     pub recipe: ContextRecipe,
     pub candidates: ContextCandidateSet,
+    /// Owner-minted learning admission tickets authorizing marked atoms in
+    /// this input. Empty when no learning influence is presented. Carried
+    /// verbatim across transports (I5.26); validated by the retrieval and
+    /// guest screens against the verified permit/issuance, never trusted
+    /// from shape alone.
+    #[serde(default)]
+    pub learning_tickets: Vec<LearningAdmissionTicket>,
     pub floor: SafetyFloorIdentity,
     pub priority: PriorityPolicyIdentity,
     pub rule: AdmissionRuleIdentity,
