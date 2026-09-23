@@ -1,0 +1,5 @@
+# Transitive revocation fixture: three-node cycle plus a self edge.
+node:a node:b
+node:b node:c
+node:c node:a
+node:d node:d
