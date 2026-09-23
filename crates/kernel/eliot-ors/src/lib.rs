@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod backup_snapshot;
 mod cutover_ownership;
 mod doctor;
 mod model;
@@ -21,6 +22,13 @@ mod versioned_artifact;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub use backup_snapshot::{
+    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, MAX_BACKUP_BYTES, MAX_BACKUP_ID_LEN,
+    MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES, OrsBackupDestination, OrsBackupEntry,
+    OrsBackupFence, OrsBackupImportReceipt, OrsBackupImportRequest, OrsBackupPage,
+    OrsBackupRequest, OrsBackupSnapshot, OrsBackupSourceIdentity, PerEntryOutcome, RowDisposition,
+    RowFamilyDisposition, RowFamilyKind, StoredEffectClass,
+};
 pub use cutover_ownership::{
     CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,
     CutoverRouteTable, GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt,
