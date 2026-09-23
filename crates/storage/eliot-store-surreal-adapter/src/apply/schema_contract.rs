@@ -43,6 +43,7 @@ pub(super) enum MigrationPreflight {
     ExactReplay,
     V1ToV2,
     BackupTables,
+    BackupCoordination,
 }
 
 pub(super) fn v1_identity() -> SchemaMigrationIdentity {
@@ -115,6 +116,19 @@ pub(super) fn schema_meta_record_for_v1_to_v2(
 /// generation stays at v2, so later preflight observes an applied v2
 /// baseline plus the backup delta instead of a generation change.
 pub(super) fn schema_meta_record_for_backup_tables(
+    existing: &SchemaMetaRecord,
+    migration: &CompiledMigration,
+    updated_at: &str,
+) -> SchemaMetaRecord {
+    schema_meta_record_for_v1_to_v2(existing, migration, updated_at)
+}
+
+/// Builds the schema-meta record for the additive coordination-tables
+/// delta (issue #975 T1): the coordination migration identity is
+/// appended to the migration chain while the generation stays at v2, so
+/// later preflight observes an applied backup baseline plus the
+/// coordination delta instead of a generation change.
+pub(super) fn schema_meta_record_for_backup_coordination(
     existing: &SchemaMetaRecord,
     migration: &CompiledMigration,
     updated_at: &str,

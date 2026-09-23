@@ -598,6 +598,21 @@ impl SurrealStoreAdapter {
         )
     }
 
+    /// Builds the additive coordination-tables migration (issue #975 T1).
+    /// The delta creates only the restore coordination decision table on
+    /// top of a backup baseline without changing the generation, in the
+    /// backup-tables delta style. Applied explicitly by the deployment
+    /// owner through [`SurrealStoreAdapter::apply_migration`]; never
+    /// implicitly. Separate from the backup tables so already-provisioned
+    /// backup deployments keep their exact-replay identity.
+    pub fn backup_coordination_tables_migration() -> CompiledMigration {
+        CompiledMigration::new(
+            schema::MIGRATION_ID_BACKUP_COORDINATION,
+            schema::BACKUP_COORDINATION_DDL,
+            SchemaGeneration::v2(),
+        )
+    }
+
     /// Proves backup-table provisioning for truthful capability
     /// advertisement. See [`apply::backup_provisioned`].
     pub async fn backup_provisioned(&self) -> bool {

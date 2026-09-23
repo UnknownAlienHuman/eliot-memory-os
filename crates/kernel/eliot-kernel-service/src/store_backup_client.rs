@@ -17,13 +17,13 @@
 //! exact identity and never becomes success.
 
 use eliot_store_api::{
-    OperationIdentity, StoreBackupBeginRequest, StoreBackupCompletionReceipt,
+    OperationId, OperationIdentity, StoreBackupBeginRequest, StoreBackupCompletionReceipt,
     StoreBackupConsistency, StoreBackupEndRequest, StoreBackupEnvelope,
     StoreBackupEnvelopeResponse, StoreBackupOperation, StoreBackupOutcome, StoreBackupPage,
     StoreBackupPageRequest, StoreBackupReconcileRequest, StoreBackupReconciliation,
-    StoreBackupStatusReport, StoreBackupStatusRequest, StoreBackupValidationReceipt,
-    StoreBackupValidationRequest, StoreError, StoreIsolatedRestoreRequest, StoreRequest,
-    StoreResponse,
+    StoreBackupScope, StoreBackupStatusReport, StoreBackupStatusRequest,
+    StoreBackupValidationReceipt, StoreBackupValidationRequest, StoreError,
+    StoreIsolatedRestoreRequest, StoreRequest, StoreRestoreAdmissionInputs, StoreResponse,
 };
 
 use super::store_exchange::RequestFailure;
@@ -41,6 +41,45 @@ fn backup_identity_for_operation(
 }
 
 impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
+    /// Assembles one closed isolated-restore request from pre-verified
+    /// Governor bindings for the paired restore callers (issues #959/#960
+    /// Kernel restore adapter, #963 caller).
+    ///
+    /// Mechanical request mapping (issue #975 T2): the provisional Store
+    /// admission is built through `StoreRestoreAdmission::map_inputs` —
+    /// the real mapping invocation — and bound with the scope, source
+    /// reference, and batch bounds into a fully validated request. The
+    /// caller (paired Restore lane) pre-verified every binding against
+    /// live owner state; this function performs zero owner judgment:
+    /// admission mapping plus closed request validation only. The
+    /// returned request is ready for
+    /// [`EbpCanonicalStoreClient::backup_isolated_restore`] transport.
+    /// Associated function (no transport needed): pure request assembly
+    /// on the client type the paired callers already drive.
+    pub fn assemble_restore_request(
+        identity: OperationIdentity,
+        source_operation_id: OperationId,
+        source_snapshot_digest: String,
+        scope: StoreBackupScope,
+        admission_inputs: StoreRestoreAdmissionInputs,
+        expected_member_count: u64,
+        max_members_per_batch: u32,
+    ) -> Result<StoreIsolatedRestoreRequest, StoreError> {
+        let admission =
+            eliot_store_api::StoreRestoreAdmission::map_inputs(admission_inputs)?;
+        let request = StoreIsolatedRestoreRequest {
+            identity,
+            source_operation_id,
+            source_snapshot_digest,
+            scope,
+            admission,
+            expected_member_count,
+            max_members_per_batch,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
     fn check_backup_fence(&self, fence: &eliot_contracts::StateFence) -> Result<(), StoreError> {
         if fence != &self.requirement().state_fence {
             return Err(StoreError::FenceMismatch);

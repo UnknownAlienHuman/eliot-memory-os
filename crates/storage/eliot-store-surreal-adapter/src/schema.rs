@@ -89,6 +89,15 @@ pub(crate) mod table {
     /// the exact member/byte denominators. Written once at `Begin`
     /// alongside the frozen members; never mutated afterwards.
     pub(crate) const BACKUP_RESIDENCY: &str = "backup_residency";
+    /// Durable restore coordination decision row per restore operation
+    /// (issue #975 T1). One row per `operation_id` carrying the verified
+    /// decision fields the bridge acted on — destination pair, payload
+    /// and denominator digests, fence digest, and the presented decision
+    /// and admission digests — as top-level queryable columns (never
+    /// JSON-blob parsing at verification). Written once by the restore
+    /// ledger commit from verified values only; never mutated afterwards.
+    /// Replays and status read it back by exact operation identity.
+    pub(crate) const BACKUP_COORDINATION: &str = "backup_coordination";
     /// Admitted isolated restore destination record (issues #952/#975 R1).
     /// Exactly one row (`restore_destination:current`) per destination
     /// database, written once by explicit deployment provisioning. It
@@ -363,6 +372,36 @@ DEFINE INDEX backup_residency_key ON backup_residency FIELDS operation_id, resid
 /// Migration identity of the additive backup-tables delta.
 pub(crate) const MIGRATION_ID_BACKUP_TABLES: &str = "eliot.store.surreal.schema.backup_tables";
 
+/// Restore coordination decision table (issue #975 T1). Additive delta
+/// in the backup-tables style, applied explicitly by the deployment
+/// owner through [`crate::SurrealStoreAdapter::backup_coordination_tables_migration`];
+/// never executed implicitly by the adapter. Bodies fail closed with
+/// `MigrationRequired` while the table is absent. Column vocabulary
+/// mirrors the donor coordination parameter keys one for one
+/// (`coordination_operation_id`, `coordination_destination`,
+/// `coordination_payload_digest`, `coordination_fence_digest`,
+/// `coordination_decision_digest`, `coordination_admission_digest`)
+/// plus the restore idempotency key and the admitted destination
+/// installation, so the future canonical-path handler adopts the same
+/// row without reshaping it.
+pub(crate) const BACKUP_COORDINATION_DDL: &str = r"
+DEFINE TABLE backup_coordination SCHEMALESS;
+DEFINE FIELD operation_id ON backup_coordination TYPE string;
+DEFINE FIELD idempotency_key ON backup_coordination TYPE string;
+DEFINE FIELD dest_store_id ON backup_coordination TYPE string;
+DEFINE FIELD dest_installation_id ON backup_coordination TYPE string;
+DEFINE FIELD payload_digest ON backup_coordination TYPE string;
+DEFINE FIELD denominator_digest ON backup_coordination TYPE string;
+DEFINE FIELD fence_digest ON backup_coordination TYPE string;
+DEFINE FIELD decision_digest ON backup_coordination TYPE string;
+DEFINE FIELD admission_digest ON backup_coordination TYPE string;
+DEFINE INDEX backup_coordination_id ON backup_coordination FIELDS operation_id UNIQUE;
+";
+
+/// Migration identity of the additive coordination-tables delta.
+pub(crate) const MIGRATION_ID_BACKUP_COORDINATION: &str =
+    "eliot.store.surreal.schema.backup_coordination";
+
 /// Restore-destination admission record (issues #952/#975 R1). Applied to
 /// the destination database only, by the explicit deployment provisioning
 /// entrypoint — never implicitly, never to the serving database. The
@@ -619,6 +658,24 @@ pub(crate) fn backup_forward_migration_sql() -> String {
         TX_BEGIN,
         TX_GUARD_FENCE,
         BACKUP_TABLES_DDL.trim(),
+        TX_GUARD_SCHEMA_PREDECESSOR,
+        TX_UPDATE_SCHEMA_META_CAS,
+        TX_COMMIT
+    )
+}
+
+/// Forward migration from a v2-plus-backup baseline to the v2-plus-backup
+/// plus coordination schema: creates only the restore coordination
+/// decision table under exactly the same fence plus predecessor guards,
+/// without changing the generation. Separate delta (never folded into
+/// `BACKUP_TABLES_DDL`) so already-provisioned backup deployments keep
+/// their exact-replay identity.
+pub(crate) fn backup_coordination_forward_migration_sql() -> String {
+    format!(
+        "{} {} {} {} {} {}",
+        TX_BEGIN,
+        TX_GUARD_FENCE,
+        BACKUP_COORDINATION_DDL.trim(),
         TX_GUARD_SCHEMA_PREDECESSOR,
         TX_UPDATE_SCHEMA_META_CAS,
         TX_COMMIT

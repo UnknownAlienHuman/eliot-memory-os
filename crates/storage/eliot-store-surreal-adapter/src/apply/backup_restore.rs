@@ -50,7 +50,8 @@ use eliot_store_api::{
     StoreBackupPhase, StoreBackupReconcileRequest, StoreBackupReconciliation,
     StoreBackupStatusReport, StoreBackupStatusRequest, StoreBackupValidationOutcome,
     StoreBackupValidationReceipt, StoreBackupValidationRequest, StoreError,
-    StoreIsolatedRestoreRequest, TransitionClass, WriteReceiptStatus, sha256_hex,
+    StoreIsolatedRestoreRequest, TransitionClass, WriteReceiptStatus, canonical_json_bytes,
+    sha256_hex,
 };
 
 use super::backup_snapshot::{
@@ -143,7 +144,8 @@ pub(crate) async fn backup_isolated_restore(
     )
     .await?
     {
-        return replay_or_conflict_restore(&request, &existing);
+        return replay_or_conflict_restore(db, &adapter.config, &request, &existing, prose_pinned)
+            .await;
     }
     let source = load_operation_row(
         db,
@@ -343,13 +345,19 @@ async fn verify_coordination_receipt(
     Ok(())
 }
 
-/// Reconciles a repeated restore against the durable row. An identical
+/// Reconciles a repeated restore against the durable rows. An identical
 /// admission replays the stored receipt; a rotated admission under a
 /// reused identity triple conflicts instead of returning a receipt bound
-/// to a different admission (F6).
-fn replay_or_conflict_restore(
+/// to a different admission (F6). The durable coordination decision row
+/// is re-read and bound on every replay: a ledger row whose decision
+/// content diverged (or is missing for a same-format row) conflicts
+/// rather than replaying evidence the bridge would not freshly accept.
+async fn replay_or_conflict_restore(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
     request: &StoreIsolatedRestoreRequest,
     existing: &BackupOperationRow,
+    prose_pinned: bool,
 ) -> Result<StoreBackupCompletionReceipt, AdapterError> {
     if existing.operation_kind != KIND_RESTORE
         || existing.idempotency_key != request.identity.idempotency_key
@@ -363,6 +371,10 @@ fn replay_or_conflict_restore(
     {
         return Err(AdapterError::Store(StoreError::IdentityConflict));
     }
+    let stored = load_coordination_row(db, config, &request.identity.operation_id, prose_pinned)
+        .await?
+        .ok_or(AdapterError::PartialOutcome)?;
+    verify_coordination_content(&stored, request, &receipt)?;
     Ok(receipt)
 }
 
@@ -841,6 +853,147 @@ async fn verify_replay_slots(
 /// operation index arbitrates concurrent same-identity restores: a
 /// concurrent winner's identical receipt replays; anything else stays a
 /// conflict.
+/// Durable restore coordination decision row (issue #975 T1).
+///
+/// Materialized verified bindings written once by the restore ledger
+/// commit from values already bound to the coordination receipt, the
+/// source receipt, the scope, and the presented admission — a projection
+/// of verified inputs, never an independent claim. Column vocabulary
+/// follows the donor closed parameters where semantics coincide
+/// (`coordination_operation_id` → `operation_id`,
+/// `coordination_destination` → `dest_installation_id` (the plan
+/// target), `coordination_payload_digest` → the transition canonical
+/// request hash, `coordination_fence_digest` → sha256 over the canonical
+/// fence bytes, `coordination_decision_digest` → the presented Store
+/// admission digest); store extensions carry what the bridge
+/// additionally binds (`idempotency_key`, `dest_store_id`,
+/// `snapshot_digest`, `denominator_digest`). Top-level columns only —
+/// never JSON-blob parsing at verification. Replays and status read it
+/// back by exact operation identity with an explicit column projection
+/// (never `SELECT *`, whose provider `id` field breaks closed
+/// deserialization). When the canonical-path handler for
+/// `RecordRestoreCoordination` lands, it adopts this same row without
+/// reshaping it.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoordinationDecisionRow {
+    operation_id: String,
+    idempotency_key: String,
+    dest_store_id: String,
+    dest_installation_id: String,
+    payload_digest: String,
+    snapshot_digest: String,
+    denominator_digest: String,
+    fence_digest: String,
+    decision_digest: String,
+}
+
+/// Computes the fence digest bound into coordination rows: sha256 over
+/// the canonical fence bytes, exactly the donor parameter recipe, so
+/// store and kernel fence digests agree byte for byte.
+fn coordination_fence_digest(fence: &StateFence) -> Result<String, AdapterError> {
+    let fence_bytes = canonical_json_bytes(fence)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(&fence_bytes))
+}
+
+/// Builds the coordination decision record persisted for one verified
+/// restore: every value comes from already-verified inputs (request
+/// identity and scope, source receipt, presented admission digest).
+fn coordination_decision_record(
+    request: &StoreIsolatedRestoreRequest,
+    source_receipt: &StoreBackupCompletionReceipt,
+) -> Result<Value, AdapterError> {
+    Ok(json!({
+        "operation_id": request.identity.operation_id.to_string(),
+        "idempotency_key": request.identity.idempotency_key,
+        "dest_store_id": request.scope.dest_store_id,
+        "dest_installation_id": request.scope.dest_installation_id,
+        "payload_digest": request.identity.canonical_request_hash,
+        "snapshot_digest": source_receipt.snapshot_digest,
+        "denominator_digest": request.scope.residency_denominator_digest,
+        "fence_digest": coordination_fence_digest(&request.scope.state_fence)?,
+        "decision_digest": request.admission.admission_decision_digest,
+    }))
+}
+
+/// Loads one durable coordination decision row by exact operation
+/// identity with an explicit column projection. Absent coordination
+/// tables mean an unprovisioned coordination delta and refuse with
+/// `MigrationRequired`; any other error class keeps the reconciling
+/// disposition.
+async fn load_coordination_row(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    operation_id: &eliot_store_api::OperationId,
+    prose_pinned: bool,
+) -> Result<Option<CoordinationDecisionRow>, AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert(
+        "backup_operation_id".to_owned(),
+        json!(operation_id.to_string()),
+    );
+    let mut response = client::query(
+        db,
+        config,
+        "backup.restore",
+        &format!(
+            "SELECT VALUE {{ operation_id: operation_id, idempotency_key: idempotency_key, dest_store_id: dest_store_id, dest_installation_id: dest_installation_id, payload_digest: payload_digest, snapshot_digest: snapshot_digest, denominator_digest: denominator_digest, fence_digest: fence_digest, decision_digest: decision_digest }} FROM {} WHERE operation_id = $backup_operation_id LIMIT 1;",
+            schema::table::BACKUP_COORDINATION
+        ),
+        bindings,
+    )
+    .await?;
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        if prose_pinned
+            && errors.iter().all(|error| {
+                super::backup_snapshot::is_absent_table_pinned(
+                    error,
+                    schema::table::BACKUP_COORDINATION,
+                    prose_pinned,
+                )
+            })
+        {
+            return Err(AdapterError::MigrationRequired);
+        }
+        return Err(AdapterError::PartialOutcome);
+    }
+    match response.take::<Vec<CoordinationDecisionRow>>(0) {
+        Ok(mut rows) => Ok(rows.pop()),
+        Err(AdapterError::Serialization(_)) => Err(AdapterError::PartialOutcome),
+        Err(error) => Err(error),
+    }
+}
+
+/// Verifies one durable coordination decision row against the restore it
+/// records: exact operation identity, destination pair, payload and
+/// denominator digests, recomputed fence digest, and the presented
+/// decision digest, with the snapshot taken from the governing receipt
+/// (source receipt at commit time, stored restore receipt on replay).
+/// Divergence conflicts — the row is a projection of verified inputs,
+/// so a mismatch means a concurrent winner's different decision or
+/// corruption, never a stale read worth retrying as the same decision.
+fn verify_coordination_content(
+    row: &CoordinationDecisionRow,
+    request: &StoreIsolatedRestoreRequest,
+    receipt: &StoreBackupCompletionReceipt,
+) -> Result<(), AdapterError> {
+    if row.operation_id != request.identity.operation_id.to_string()
+        || row.idempotency_key != request.identity.idempotency_key
+        || row.dest_store_id != request.scope.dest_store_id
+        || row.dest_installation_id != request.scope.dest_installation_id
+        || row.payload_digest != request.identity.canonical_request_hash
+        || row.snapshot_digest != receipt.snapshot_digest
+        || row.denominator_digest != request.scope.residency_denominator_digest
+        || row.fence_digest != coordination_fence_digest(&request.scope.state_fence)?
+        || row.decision_digest != request.admission.admission_decision_digest
+    {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    Ok(())
+}
+
 /// Inputs for the live restore ledger commit: admitted request, source
 /// evidence, restored set, and destination post-commit sequences. Bundled
 /// so the commit signature stays reviewable without an argument-count
@@ -905,14 +1058,45 @@ async fn commit_restore_ledger(commit: RestoreLedgerCommit<'_>) -> Result<StoreB
         "CREATE {} CONTENT $backup_operation_record;",
         schema::table::BACKUP_OPERATION
     );
+    // The durable coordination decision row commits atomically with the
+    // ledger row: one transaction, no ledger-without-decision state.
+    bindings.insert(
+        "backup_coordination_record".to_owned(),
+        coordination_decision_record(request, source_receipt)?,
+    );
+    let _ = write!(
+        sql,
+        "CREATE {} CONTENT $backup_coordination_record;",
+        schema::table::BACKUP_COORDINATION
+    );
     sql.push_str(schema::TX_COMMIT);
     let mut response = db.query_write("backup.restore", &sql, bindings).await?;
     let errors = response.take_errors();
     if errors.is_empty() {
+        // Readback proof: the committed decision row must be re-readable
+        // by exact operation identity with matching content before the
+        // receipt is handed out.
+        let stored = load_coordination_row(db, config, &request.identity.operation_id, prose_pinned)
+            .await?
+            .ok_or(AdapterError::PartialOutcome)?;
+        verify_coordination_content(&stored, request, source_receipt)?;
         return Ok(receipt);
     }
-    // Coordination tables proved present by the source load above; any
-    // error here keeps the reconciling disposition.
+    // Coordination tables proved present by the source load above applies
+    // to the ledger tables only: an absent coordination table means the
+    // coordination delta was never provisioned and refuses with
+    // MigrationRequired instead of a reconciling claim.
+    if prose_pinned
+        && errors.iter().all(|error| {
+            super::backup_snapshot::is_absent_table_pinned(
+                error,
+                schema::table::BACKUP_COORDINATION,
+                prose_pinned,
+            )
+        })
+    {
+        return Err(AdapterError::MigrationRequired);
+    }
     if is_duplicate_operation(&errors, prose_pinned) {
         let existing = load_operation_row(
             db,
@@ -923,7 +1107,7 @@ async fn commit_restore_ledger(commit: RestoreLedgerCommit<'_>) -> Result<StoreB
         )
         .await?
         .ok_or(AdapterError::PartialOutcome)?;
-        return replay_or_conflict_restore(request, &existing);
+        return replay_or_conflict_restore(db, config, request, &existing, prose_pinned).await;
     }
     Err(AdapterError::PartialOutcome)
 }

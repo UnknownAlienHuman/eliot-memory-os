@@ -542,6 +542,30 @@ impl StoreComposition {
             .map_err(map_adapter_error)
     }
 
+    /// Applies exactly the adapter's additive coordination-tables migration
+    /// (issue #975 T1). This is the deployment caller that provisions the
+    /// restore coordination decision table: normal Store startup never
+    /// calls this method; portable development opts into the separate
+    /// schema-initialization path, and production deployment invokes the
+    /// admitted migration explicitly through this same composition seam.
+    /// The delta is idempotent: an already-provisioned database replays
+    /// exactly instead of duplicating the table. Separate from the backup
+    /// tables so already-provisioned backup deployments keep their
+    /// exact-replay identity.
+    pub async fn apply_backup_coordination_migration(
+        &self,
+        observed_clock: &ClockObservation,
+    ) -> Result<MigrationReceipt, StoreCompositionError> {
+        if self.schema_bootstrap_binding.profile != InstallationProfile::PortableDev {
+            return Err(StoreCompositionError::Store(StoreError::Unavailable));
+        }
+        let migration = SurrealStoreAdapter::backup_coordination_tables_migration();
+        self.store
+            .apply_migration(&migration, observed_clock, &self.state_fence)
+            .await
+            .map_err(map_adapter_error)
+    }
+
     /// Provisions one isolated restore destination under an explicitly
     /// bound SystemService deployment command (issues #952/#975 F3).
     ///
