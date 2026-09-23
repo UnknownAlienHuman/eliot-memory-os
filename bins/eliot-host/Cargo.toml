@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 eliot-contracts.workspace = true
 eliot-host-control-endpoint.workspace = true
+eliot-notify = { path = "../eliot-notify", version = "0.1.0" }
 eliot-host-service.workspace = true
 eliot-kernel-core.workspace = true
 eliot-installation.workspace = true
