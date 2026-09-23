@@ -505,6 +505,10 @@ class RetirementCoordinator(unittest.TestCase):
     # WORK_UNIT_CASE: 835/28
     def test_28_no_algorithm_authority_effect_or_false_claim(self):
         self.assertBoundCase(28)
+        # End-of-run live re-verification (F2): no nested gate in the
+        # owned child (returns None there); raises on any post-gate
+        # input or membership drift in a real run.
+        a.verify_run_inputs_unchanged()
         diff = a.git_diff_names()
         for name in diff:
             self.assertFalse(

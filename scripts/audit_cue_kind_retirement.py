@@ -217,7 +217,14 @@ def _consume_char_or_lifetime(data: bytes, index: int, out: list[str]) -> int:
         for _ in range(index, cursor + 2):
             out.append(" ")
         return cursor + 2
-    while cursor < size and (chr(data[cursor]).isalnum() or data[cursor] == 0x5F):
+    # Byte-exact mirror of the accepted Rust oracle: only ASCII
+    # alphanumerics continue a lifetime name (Rust
+    # `is_ascii_alphanumeric`); a non-ASCII byte ends the name exactly
+    # as the oracle observes it.
+    while cursor < size and (
+        (chr(data[cursor]).isascii() and chr(data[cursor]).isalnum())
+        or data[cursor] == 0x5F
+    ):
         cursor += 1
     if cursor > start and cursor < size and data[cursor] == 0x27:
         for _ in range(index, cursor + 1):
@@ -601,6 +608,7 @@ INCOMPLETE_INCLUDE_MACRO = "include-macro-fixture-bytes"
 INCOMPLETE_MACRO_RULES = "macro-rules-definition"
 INCOMPLETE_UNCLOSED = "unclosed-lexical-input"
 INCOMPLETE_UNKNOWN_ROOT = "unknown-scan-root"
+INCOMPLETE_NON_UTF8 = "non-utf8-input"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -620,8 +628,17 @@ def lexical_closure(text: str) -> list[str]:
     return [INCOMPLETE_UNCLOSED] if unclosed else []
 
 def scan_file_status(relative: str) -> tuple[str, str]:
-    """COMPLETE/INCOMPLETE status plus reason for one scanned file."""
-    text = read_text(relative)
+    """COMPLETE/INCOMPLETE status plus reason for one scanned file.
+
+    A non-UTF8 input is INCOMPLETE with an explicit reason, never a
+    masked zero and never an unhandled decoder error on the verdict
+    path: the lexical denominator cannot prove absence inside bytes it
+    cannot decode.
+    """
+    try:
+        text = read_text(relative)
+    except UnicodeDecodeError:
+        return ("INCOMPLETE", INCOMPLETE_NON_UTF8)
     anomalies = lexical_closure(text)
     if anomalies:
         return ("INCOMPLETE", anomalies[0])
@@ -741,10 +758,17 @@ GATE_DESCRIPTOR_REL = ".github/work-units/835.toml"
 GATE_ADMISSION_DIR = "scripts/testdata/cue-kind-retirement/admission"
 GATE_TARGET_DIR = "target/wu837-gate"
 GATE_MANIFEST_REL = "Cargo.toml"
-# Frozen candidate base: the branch point of codex/835-cue-retirement.
-# Exact-diff cases measure the FULL candidate delta (committed + uncommitted)
-# against this base, never just the uncommitted remainder.
-GATE_BASE_COMMIT = "9a6768033f36b003a23f4d914bac9c75e5eee147"
+# Pinned integration base: current-main 8ce704a9, the verified ancestor this
+# candidate was cut from (published authority receipt; enforced below by the
+# merge-base --is-ancestor check in git_diff_names). Exact-diff cases measure
+# the FULL owning change-range (committed + uncommitted) against this base,
+# never just the uncommitted remainder; allowed_diff.txt enumerates exactly
+# that range, and any unrelated file fails. Re-pointing this base is an
+# oracle delta needing its own review: a stale donor-era base (9a676803)
+# makes cases 23/28 fail on main's own evolution, while HEAD-as-both-sides
+# would make them vacuous. The built-binary evidence stays bound separately
+# through the accepted cargo builders below.
+GATE_BASE_COMMIT = "8ce704a90430cbadbc08dafea0d043afb08aae47"
 GATE_RUST_SELECTION = (
     (
         "eliot-cue-contracts",
@@ -766,16 +790,50 @@ GATE_RUST_SELECTION = (
     ),
 )
 GATE_PROTECTED_RELS = (
+    # Assignment / descriptor / oracle / coordinator core.
     ".github/work-units/835.toml",
     "scripts/tests/test_cue_kind_retirement.py",
     "scripts/audit_cue_kind_retirement.py",
+    # Retired boundary-test inputs: every Rust oracle file the static
+    # denominator consumes or asserts over.
+    "crates/eliot-types/tests/cue_kind_retirement.rs",
+    "crates/eliot-types/tests/cue_kind_legacy_boundary.rs",
+    "crates/eliot-types/tests/cue_kind_internal_legacy_boundary.rs",
+    # Handoff manifest + retired source seam.
     "crates/eliot-types/tests/data/cue_kind_migration.toml",
     "crates/eliot-types/src/ul/cue.rs",
+    # Rust-evidence inputs: the executed evidence test files, the
+    # current-owner sources they exercise, and the package manifests
+    # the accepted builders consume.
+    "crates/smart/eliot-cue-contracts/src/normalization.rs",
+    "crates/smart/eliot-cue-contracts/src/lib.rs",
+    "crates/smart/eliot-cue-contracts/tests/acceptance_804.rs",
+    "crates/smart/eliot-cue-contracts/tests/contract_shape.rs",
+    "crates/eliot-types/Cargo.toml",
+    "crates/smart/eliot-cue-contracts/Cargo.toml",
+    # Admission bundle: every file the assignment acquisition binds.
     "scripts/testdata/cue-kind-retirement/admission/835-snapshot.json",
     "scripts/testdata/cue-kind-retirement/admission/835-snapshot.admission.json",
+    "scripts/testdata/cue-kind-retirement/admission/835-capture-receipt.json",
+    "scripts/testdata/cue-kind-retirement/admission/835-freshness-policy.json",
+    # Fixtures: every detector/coverage input the coordinator reads.
+    "scripts/testdata/cue-kind-retirement/adversarial_kinds.json",
+    "scripts/testdata/cue-kind-retirement/allowed_diff.txt",
+    "scripts/testdata/cue-kind-retirement/historical_owners.json",
+    "scripts/testdata/cue-kind-retirement/malformed_current_legacy.json",
+    "scripts/testdata/cue-kind-retirement/persisted_ipc_provider_wasm_coverage.json",
+    "scripts/testdata/cue-kind-retirement/v1_enum_golden.txt",
+    "scripts/testdata/cue-kind-retirement/version_pins.json",
+    "scripts/testdata/cue-kind-retirement/wire_vectors.json",
     "Cargo.toml",
     "Cargo.lock",
 )
+
+# Generated outputs are never protected inputs: they must not enter their
+# own source hash. A protected rel matching an excluded class fails fast
+# in protected_snapshot instead of binding build output as evidence.
+PROTECTED_EXCLUDED_SEGMENTS = ("/target/", "/.eliot/")
+PROTECTED_EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".log", ".out")
 
 
 class GateFailure(Exception):
@@ -796,6 +854,8 @@ class GateEvidence:
     accounting: object
     shape: object
     package_receipt: object
+    input_snapshot_before: tuple
+    members_before: tuple
 
 
 def _gate_modules():
@@ -899,7 +959,44 @@ def parse_markers(descriptor):
 
 def protected_snapshot():
     _, _, _, r = _gate_modules()
+    for rel in GATE_PROTECTED_RELS:
+        if any(segment in f"/{rel}/" for segment in PROTECTED_EXCLUDED_SEGMENTS):
+            raise GateFailure(f"protected input must not be a generated output: {rel}")
+        if rel.endswith(PROTECTED_EXCLUDED_SUFFIXES):
+            raise GateFailure(f"protected input must not be a generated output: {rel}")
     return r.snapshot_protected(ROOT, list(GATE_PROTECTED_RELS))
+
+
+# Admitted scan-membership scopes for the before/after membership guard
+# (F2): every consumed input lives under the workspace scan roots or the
+# fixture directory. The guard uses live uncached I/O only — never the
+# lru_cache scan layer — so stale per-process caches cannot mask
+# membership drift (additions, removals, renames).
+MEMBERSHIP_FIXTURE_DIR = "scripts/testdata/cue-kind-retirement"
+
+
+def _live_membership() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Live (uncached) admitted-input membership.
+
+    Returns (workspace .rs members, fixture members), both sorted. Reads
+    the filesystem directly instead of the cached scan wrappers: this
+    function is the independent membership witness for the gate bracket
+    and the end-of-run re-verification.
+    """
+    rs: list[str] = []
+    for root in SCAN_ROOTS:
+        candidate = ROOT / root
+        if not candidate.is_dir():
+            continue
+        for path in sorted(candidate.rglob("*.rs")):
+            rs.append(path.relative_to(ROOT).as_posix())
+    fixture_dir = ROOT / MEMBERSHIP_FIXTURE_DIR
+    fixtures = sorted(
+        path.relative_to(ROOT).as_posix()
+        for path in fixture_dir.rglob("*")
+        if path.is_file()
+    )
+    return (tuple(rs), tuple(fixtures))
 
 
 def _cargo_env():
@@ -1193,6 +1290,7 @@ def run_accepted_gate():
         return _gate_evidence
     _, cb, c, r = _gate_modules()
     before = protected_snapshot()
+    members_before = _live_membership()
     document = acquire_assignment()
     descriptor = load_descriptor(document)
     if descriptor.matrix_cases != 28:
@@ -1223,6 +1321,8 @@ def run_accepted_gate():
     diff = r.compare_snapshots(before, after)
     if diff.get("mutated") or diff.get("added") or diff.get("removed"):
         raise GateFailure(f"source mutation invalidates result: {diff}")
+    if _live_membership() != members_before:
+        raise GateFailure("admitted-input membership drift invalidates result")
     accounting = cb.reconcile_case_bindings(
         document.receipt, descriptor, markers, discoveries, executions, findings=())
     source_items = len(before)
@@ -1257,7 +1357,9 @@ def run_accepted_gate():
         markers=tuple(markers), discoveries=discoveries, executions=executions,
         rust_evidence=tuple(rust_evidence), rust_receipts=tuple(rust_receipts),
         rust_gaps=tuple(rust_gaps), accounting=accounting,
-        shape=shape, package_receipt=package_receipt)
+        shape=shape, package_receipt=package_receipt,
+        input_snapshot_before=tuple(sorted(before.items())),
+        members_before=members_before)
     return _gate_evidence
 
 
@@ -1282,6 +1384,32 @@ def case_gate_result(number: int):
             return (member.execution.disposition.value,
                     member.execution.discovery.test.qualified_name)
     raise GateFailure(f"case {number} absent from bound accounting")
+
+
+def verify_run_inputs_unchanged():
+    """Live end-of-run re-verification of all admitted inputs (F2).
+
+    Re-hashes the full protected set and re-enumerates admitted
+    membership with live I/O only, then compares both against the
+    gate-start evidence bound in run_accepted_gate. Any content or
+    membership drift after the gate bracket — including drift visible
+    only to cached scans — raises GateFailure instead of passing, so
+    stale per-process caches can never turn changed source into PASS.
+    Returns True. Returns None inside the owned gate child (argv carries
+    --_python-child): binding there is the parent's job, never a nested
+    gate.
+    """
+    if "--_python-child" in sys.argv:
+        return None
+    evidence = run_accepted_gate()
+    _, _, _, r = _gate_modules()
+    live = r.snapshot_protected(ROOT, list(GATE_PROTECTED_RELS))
+    diff = r.compare_snapshots(dict(evidence.input_snapshot_before), live)
+    if diff.get("mutated") or diff.get("added") or diff.get("removed"):
+        raise GateFailure(f"post-gate input drift invalidates result: {diff}")
+    if _live_membership() != evidence.members_before:
+        raise GateFailure("post-gate membership drift invalidates result")
+    return True
 
 
 if __name__ == "__main__":
