@@ -2007,10 +2007,20 @@ def _validate_candidate_release_advisories(
     ):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "selected-candidate OSV inputs do not match a fresh provisioner receipt"))
 
-    vulnerabilities = response_data.get("vulns") if isinstance(response_data, dict) else None
+    vulnerabilities = response_data.get("vulns", []) if isinstance(response_data, dict) else None
     advisory_ids: list[str] = []
+    if isinstance(response_data, dict):
+        unexpected_response_fields = set(response_data) - {"vulns", "next_page_token"}
+        if unexpected_response_fields:
+            findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response contains unsupported fields"))
+        if "next_page_token" in response_data:
+            next_page_token = response_data["next_page_token"]
+            if not isinstance(next_page_token, str):
+                findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response next_page_token must be a string when present"))
+            elif next_page_token:
+                findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response is paginated and incomplete"))
     if not isinstance(vulnerabilities, list):
-        findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response must contain a vulns array"))
+        findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response vulns field must be an array when present"))
         vulnerabilities = []
     for vulnerability in vulnerabilities:
         if not isinstance(vulnerability, dict) or not isinstance(vulnerability.get("id"), str) or not vulnerability["id"].strip():

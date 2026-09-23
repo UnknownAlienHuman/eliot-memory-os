@@ -33,6 +33,10 @@ def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
 def _path_identity(stat_result: os.stat_result) -> tuple[object, ...]:
     return (
         getattr(stat_result, "st_dev", None),
@@ -416,25 +420,29 @@ def main() -> int:
         **query_record,
     })
     try:
-        _, response_relative, response_bytes = read_local(root, surreal["advisory_response_path"])
-        response_reused = True
+        _, _, source_response_bytes = read_local(root, surreal["advisory_response_path"])
     except RuntimeError as exc:
         if "not a regular file" not in str(exc) or _validate_components(root, _relative_path(surreal["advisory_response_path"])).exists():
             raise
-        response_bytes = fetch(OSV_ENDPOINT, data=query_bytes, accept="application/json")
-        response_record = materialize(root, surreal["advisory_response_path"], response_bytes, surreal["advisory_response_digest"])
-        response_relative = response_record["relative_path"]
-        response_reused = False
-    if response_reused:
-        response_sha = sha256_bytes(response_bytes)
-        if response_sha != str(surreal["advisory_response_digest"]).lower():
-            raise RuntimeError(f"existing bytes for {response_relative} have SHA-256 {response_sha}, expected {surreal['advisory_response_digest']}")
-        response_record = {"path": response_relative, "relative_path": response_relative, "bytes": len(response_bytes), "sha256": response_sha}
+        source_response_bytes = fetch(OSV_ENDPOINT, data=query_bytes, accept="application/json")
+    try:
+        response_data = json.loads(source_response_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"installed SurrealDB OSV response is not valid JSON: {exc}") from exc
+    if not isinstance(response_data, dict) or not isinstance(response_data.get("vulns"), list):
+        raise RuntimeError("installed SurrealDB OSV response must contain a vulns array")
+    response_bytes = canonical_json_bytes(response_data)
+    response_record = materialize(
+        root,
+        surreal["advisory_response_path"],
+        response_bytes,
+        surreal["advisory_response_digest"],
+        replace_existing=source_response_bytes != response_bytes,
+    )
     records.append({
         "subject": "osv.response.surrealdb",
         "url": OSV_ENDPOINT,
         "request": False,
-        "reused": response_reused,
         "expected_sha256": str(surreal["advisory_response_digest"]).lower(),
         "expected_bytes": None,
         **response_record,
@@ -476,8 +484,23 @@ def main() -> int:
         candidate_response_data = json.loads(candidate_response_bytes.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"candidate OSV response is not valid JSON: {exc}") from exc
-    if not isinstance(candidate_response_data, dict) or not isinstance(candidate_response_data.get("vulns"), list):
-        raise RuntimeError("candidate OSV response must contain a vulns array")
+    if not isinstance(candidate_response_data, dict):
+        raise RuntimeError("candidate OSV response must be a JSON object")
+    unexpected_response_fields = set(candidate_response_data) - {"vulns", "next_page_token"}
+    if unexpected_response_fields:
+        raise RuntimeError(
+            "candidate OSV response contains unsupported fields: "
+            + ", ".join(sorted(str(field) for field in unexpected_response_fields))
+        )
+    candidate_vulnerabilities = candidate_response_data.get("vulns", [])
+    if not isinstance(candidate_vulnerabilities, list):
+        raise RuntimeError("candidate OSV response vulns field must be an array when present")
+    if "next_page_token" in candidate_response_data:
+        next_page_token = candidate_response_data["next_page_token"]
+        if not isinstance(next_page_token, str):
+            raise RuntimeError("candidate OSV response next_page_token must be a string when present")
+        if next_page_token:
+            raise RuntimeError("candidate OSV response is paginated and cannot establish a complete advisory result")
     candidate_retrieved_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     candidate_response_record = materialize(
         root,

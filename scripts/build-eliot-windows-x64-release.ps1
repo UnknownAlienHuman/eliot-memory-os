@@ -2009,10 +2009,33 @@ function Test-ReleaseBundle([string]$Path) {
         }
         $candidateQuery = [System.Text.Encoding]::UTF8.GetString($queryEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
         $candidateResponse = [System.Text.Encoding]::UTF8.GetString($responseEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        if ($null -eq $candidateResponse -or $candidateResponse -isnot [pscustomobject]) {
+            throw 'staged candidate OSV response must be a JSON object'
+        }
+        $candidateResponseFields = @($candidateResponse.PSObject.Properties.Name)
+        $unsupportedCandidateResponseFields = @($candidateResponseFields | Where-Object { $_ -cnotin @('vulns', 'next_page_token') })
+        if ($unsupportedCandidateResponseFields.Count -gt 0) {
+            throw 'staged candidate OSV response contains unsupported fields'
+        }
+        $candidateVulnerabilities = @()
+        if ($candidateResponseFields -contains 'vulns') {
+            if ($null -eq $candidateResponse.vulns -or $candidateResponse.vulns -isnot [array]) {
+                throw 'staged candidate OSV response vulns field must be an array when present'
+            }
+            $candidateVulnerabilities = @($candidateResponse.vulns)
+        }
+        if ($candidateResponseFields -contains 'next_page_token') {
+            if ($candidateResponse.next_page_token -isnot [string]) {
+                throw 'staged candidate OSV response next_page_token must be a string when present'
+            }
+            if (-not [string]::IsNullOrEmpty([string]$candidateResponse.next_page_token)) {
+                throw 'staged candidate OSV response is paginated and incomplete'
+            }
+        }
         if ([string]$candidateQuery.package.name -cne 'surrealdb' -or
             [string]$candidateQuery.package.ecosystem -cne 'crates.io' -or
             [string]$candidateQuery.version -cne [string]$surrealEntry.version -or
-            @($candidateResponse.vulns).Count -ne 0) {
+            $candidateVulnerabilities.Count -ne 0) {
             throw 'staged OSV evidence does not show an empty exact-version crates.io/surrealdb query result'
         }
         $querySubject = "osv.query.surrealdb.release-candidate.$([string]$catalogBinding.source_tag)"
