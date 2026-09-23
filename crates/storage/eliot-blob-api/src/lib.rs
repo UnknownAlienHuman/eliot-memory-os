@@ -45,8 +45,8 @@ pub const CONTRACT_VERSION: &str = "s-04-v2";
 
 pub mod backup_io;
 pub use backup_io::{
-    BlobBackupCompletionReceipt, BlobBackupFence, BlobBackupPage, BlobBackupPartial,
-    BlobBackupScope, PageCompletion, SealedBlobCaptureRecord, BLOB_BACKUP_GENESIS,
+    BLOB_BACKUP_GENESIS, BlobBackupCompletionReceipt, BlobBackupFence, BlobBackupPage,
+    BlobBackupPartial, BlobBackupScope, PageCompletion, SealedBlobCaptureRecord,
 };
 
 fn valid_text(value: &str, field: &'static str) -> Result<(), BlobError> {

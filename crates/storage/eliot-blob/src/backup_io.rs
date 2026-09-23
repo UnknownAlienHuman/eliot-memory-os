@@ -13,9 +13,9 @@
 //! never plaintext authentication or key possession.
 
 use eliot_blob_api::{
-    BlobBackupCompletionReceipt, BlobBackupFence, BlobBackupPage, BlobBackupPartial,
-    BlobBackupScope, BlobError, BlobId, BlobLocator, BlobRootLease, CryptoDescriptor,
-    ObjectResidencyKey, PageCompletion, SealedBlobCaptureRecord, BLOB_BACKUP_GENESIS,
+    BLOB_BACKUP_GENESIS, BlobBackupCompletionReceipt, BlobBackupFence, BlobBackupPage,
+    BlobBackupPartial, BlobBackupScope, BlobError, BlobId, BlobLocator, BlobRootLease,
+    CryptoDescriptor, ObjectResidencyKey, PageCompletion, SealedBlobCaptureRecord,
 };
 
 use super::{AeadOpenRequest, AeadSealRequest, BlobAeadPort, BlobKeyPort, BlobKeySelection};
@@ -372,15 +372,13 @@ fn seal_fetched_member(
     )
 }
 
-fn add_sealed_total(
-    running: u64,
-    sealed_len: u64,
-    ceiling: u64,
-) -> Result<u64, BlobError> {
-    let running = running.checked_add(sealed_len).ok_or(BlobError::InvalidField {
-        field: "backup_page.bounds",
-        reason: "sealed byte totals overflow",
-    })?;
+fn add_sealed_total(running: u64, sealed_len: u64, ceiling: u64) -> Result<u64, BlobError> {
+    let running = running
+        .checked_add(sealed_len)
+        .ok_or(BlobError::InvalidField {
+            field: "backup_page.bounds",
+            reason: "sealed byte totals overflow",
+        })?;
     if running > ceiling {
         return Err(BlobError::InvalidField {
             field: "backup_page.bounds",
@@ -397,13 +395,12 @@ pub fn export_page(
     page: &BlobBackupPage,
     fetch: &mut PlaintextFetch,
 ) -> Result<ExportedPage, PageInterrupt> {
-    let interrupt = |completed: Vec<SealedMember>, failed_index: usize, cause: BlobError| {
-        PageInterrupt {
+    let interrupt =
+        |completed: Vec<SealedMember>, failed_index: usize, cause: BlobError| PageInterrupt {
             completed,
             failed_index,
             cause,
-        }
-    };
+        };
     let expected_digest = page
         .page_digest(fence)
         .map_err(|cause| interrupt(Vec::new(), page.start_index(), cause))?;
@@ -421,21 +418,13 @@ pub fn export_page(
                 },
             ));
         };
-        let plaintext = fetch(locator).map_err(|cause| {
-            interrupt(std::mem::take(&mut members), member_position, cause)
-        })?;
-        let sealed = match seal_fetched_member(
-            key_port,
-            aead,
-            fence,
-            page,
-            locator,
-            *index,
-            &plaintext,
-        ) {
-            Ok(sealed) => sealed,
-            Err(cause) => return Err(interrupt(members, member_position, cause)),
-        };
+        let plaintext = fetch(locator)
+            .map_err(|cause| interrupt(std::mem::take(&mut members), member_position, cause))?;
+        let sealed =
+            match seal_fetched_member(key_port, aead, fence, page, locator, *index, &plaintext) {
+                Ok(sealed) => sealed,
+                Err(cause) => return Err(interrupt(members, member_position, cause)),
+            };
         match add_sealed_total(
             sealed_running,
             sealed.sealed_bytes().len() as u64,
@@ -447,9 +436,8 @@ pub fn export_page(
         members.push(sealed);
     }
     let total_sealed_bytes = sealed_running - page.cumulative_bytes_before();
-    let completion = PageCompletion::for_page(page, fence, total_sealed_bytes).map_err(
-        |cause| interrupt(std::mem::take(&mut members), page.end_index(), cause),
-    )?;
+    let completion = PageCompletion::for_page(page, fence, total_sealed_bytes)
+        .map_err(|cause| interrupt(std::mem::take(&mut members), page.end_index(), cause))?;
     debug_assert_eq!(completion.page_digest(), expected_digest.as_str());
     Ok(ExportedPage {
         page: page.clone(),
@@ -480,10 +468,8 @@ pub fn complete_export(
         .iter()
         .flat_map(|page| page.members.iter().map(|member| member.record.clone()))
         .collect();
-    let completions: Vec<PageCompletion> = pages
-        .iter()
-        .map(|page| page.completion.clone())
-        .collect();
+    let completions: Vec<PageCompletion> =
+        pages.iter().map(|page| page.completion.clone()).collect();
     BlobBackupCompletionReceipt::complete(fence, &records, &completions, scope)
 }
 
@@ -801,11 +787,9 @@ fn export_run_page(
     window: usize,
     fetch: &mut PlaintextFetch,
 ) -> Result<ExportedPage, (u32, usize, BlobError)> {
-    let predecessor = done
-        .last()
-        .map_or(BLOB_BACKUP_GENESIS.to_owned(), |page| {
-            page.page_digest().to_owned()
-        });
+    let predecessor = done.last().map_or(BLOB_BACKUP_GENESIS.to_owned(), |page| {
+        page.page_digest().to_owned()
+    });
     let cumulative_members: u64 = done.iter().map(|page| page.members().len() as u64).sum();
     let cumulative_bytes: u64 = done.iter().map(ExportedPage::total_sealed_bytes).sum();
     let page = match BlobBackupPage::open(
@@ -820,13 +804,7 @@ fn export_run_page(
         Ok(page) => page,
         Err(cause) => return Err((page_index, start, cause)),
     };
-    match export_page(
-        &mut *ports.key_port,
-        &mut *ports.aead,
-        fence,
-        &page,
-        fetch,
-    ) {
+    match export_page(&mut *ports.key_port, &mut *ports.aead, fence, &page, fetch) {
         Ok(exported) => Ok(exported),
         Err(interrupt) => Err((
             page_index,
@@ -848,11 +826,7 @@ fn finalize_capture(
     let receipt = complete_export(fence, done, scope)?;
     let records: Vec<SealedBlobCaptureRecord> = done
         .iter()
-        .flat_map(|page| {
-            page.members()
-                .iter()
-                .map(|member| member.record().clone())
-        })
+        .flat_map(|page| page.members().iter().map(|member| member.record().clone()))
         .collect();
     let bindings = bind_restore_set(key_port, scope, lease, crypto, residency, &records)?;
     let evidence = ConsumerEvidencePack::assemble(receipt.clone(), bindings, scope)?;
@@ -903,9 +877,8 @@ pub fn run_capture(
         let window = usize::try_from(fence.max_members_per_page())
             .unwrap_or(usize::MAX)
             .min(remaining);
-        let exported = match export_run_page(
-            ports, fence, &done, page_index, start, window, fetch,
-        ) {
+        let exported = match export_run_page(ports, fence, &done, page_index, start, window, fetch)
+        {
             Ok(exported) => exported,
             Err((failed_page, failed_index, cause)) => {
                 return interrupt_outcome(
