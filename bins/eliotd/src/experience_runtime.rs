@@ -32,10 +32,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use eliot_contracts::{ArtifactId, RequestMetadata, StateFence};
 use eliot_cognitive_quality::QualityAssessmentCandidate;
 use eliot_context_contracts::ActiveUnderstandingView;
+use eliot_contracts::{ArtifactId, RequestMetadata, StateFence};
 use eliot_dreamer_contracts::self_query::AcceptedSourceProjection;
+use eliot_dreamer_memory_revision::{
+    NegativeMemoryExtinctionCandidate, RevisionError, RevisionIntake,
+};
 use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness, ProviderContribution};
 use eliot_experience_provider::{
     BankShapeInputs, ExperienceView, FeedbackShapeInputs, JournalShapeOutput, ProduceJournalInputs,
@@ -49,9 +52,9 @@ use eliot_observation::{
     GovernorObservationError,
     bank_admission::{
         BankStoreSnapshot, ExperienceRevisionLedger, FeedbackStoreSnapshot,
-        bank_records_from_range_payload, feedback_records_from_range_payload,
-        produce_bank_commit, produce_feedback_commit,
-        supply_bank_projection_from_store, supply_feedback_projection_from_store,
+        bank_records_from_range_payload, feedback_records_from_range_payload, produce_bank_commit,
+        produce_feedback_commit, supply_bank_projection_from_store,
+        supply_feedback_projection_from_store,
     },
 };
 use eliot_observation_contracts::{
@@ -60,14 +63,14 @@ use eliot_observation_contracts::{
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{RequestBinding, WorkScopeId};
+use eliot_store_api::{
+    CanonicalReadClient, EXPERIENCE_PAGE_NEXT_CURSOR, NamedReadOperation, NamedReadRequest,
+    OrderingHeadExpectation, ReadConsistency, RevisionHeadExpectation, RevisionKey, ScopeId,
+    StoreError, WriteReceipt, epistemic_revision::EpistemicPositionReadback,
+};
 use eliot_understanding_assessment::{
     AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
     ExperienceEvidence, OwnerContext, ScopedUnderstandingAssessment,
-};
-use eliot_store_api::{
-    CanonicalReadClient, NamedReadOperation, NamedReadRequest, OrderingHeadExpectation, ReadConsistency,
-    RevisionHeadExpectation, RevisionKey, ScopeId, StoreError, WriteReceipt,
-    epistemic_revision::EpistemicPositionReadback,
 };
 use thiserror::Error;
 
@@ -105,6 +108,80 @@ pub enum ExperienceDriverError {
     Commit(String),
 }
 
+/// Maps a Dreamer memory-revision owner rejection into the Governor
+/// leg of the driver error.
+///
+/// The observer-shape rejection maps exactly
+/// ([`RevisionError::Observation`] into
+/// [`GovernorObservationError::Observation`]: both name
+/// `eliot_observation_contracts::ObservationError`). The remaining
+/// intake/candidate rejections have no exact Governor counterpart, so
+/// they narrow to [`GovernorObservationError::InvalidField`] with the
+/// owner-issued field path forwarded verbatim and a fixed reason naming
+/// the violated intake contract. The wrapped source detail is not
+/// preserved; the field plus reason still fail closed at the same
+/// boundary. This mirrors the `produce_memory_quality` pattern: the
+/// owner call returns its own error and `?` converts at the call site.
+impl From<RevisionError> for ExperienceDriverError {
+    fn from(error: RevisionError) -> Self {
+        ExperienceDriverError::Governor(match error {
+            RevisionError::Observation(inner) => GovernorObservationError::Observation(inner),
+            RevisionError::Context(_) => GovernorObservationError::InvalidField {
+                field: "dmr.intake.projection",
+                reason: "admitted task/safety projection rejected its shape",
+            },
+            RevisionError::SelfQuery(_) => GovernorObservationError::InvalidField {
+                field: "dmr.intake.query",
+                reason: "frozen self-query input or accepted-source projection rejected its shape",
+            },
+            RevisionError::ScopeMismatch { field } => GovernorObservationError::InvalidField {
+                field,
+                reason: "admitted scope identity does not match its governing scope",
+            },
+            RevisionError::FenceMismatch { field } => GovernorObservationError::InvalidField {
+                field,
+                reason: "admitted fence is incompatible with its governing fence",
+            },
+            RevisionError::DigestMismatch { field } => GovernorObservationError::InvalidField {
+                field,
+                reason: "posed digest does not match the frozen query it claims",
+            },
+            RevisionError::StaleCitation { field } => GovernorObservationError::InvalidField {
+                field,
+                reason: "cited source triple is stale or uncited",
+            },
+            RevisionError::Bounds { field } => GovernorObservationError::InvalidField {
+                field,
+                reason: "admitted intake bound exceeded",
+            },
+            RevisionError::NotDigestible => GovernorObservationError::InvalidField {
+                field: "dmr.candidate.digest",
+                reason: "candidate is not canonically encodable",
+            },
+        })
+    }
+}
+
+/// Dreamer memory-revision consumer invocation: propose one advisory
+/// extinction candidate over admitted intake.
+///
+/// Calls the released [`propose`](eliot_dreamer_memory_revision::propose)
+/// consumer with the edge-supplied owner intake (owner-neutral failure
+/// observation, revision evidence refs, admitted task/safety
+/// projections, frozen self-query/accepted-source refs, pose digest,
+/// candidate id). Intake contract violations fail closed as
+/// [`ExperienceDriverError::Governor`]; valid intake with insufficient
+/// evidence yields `Ok` with state `Inconclusive` or `Unsupported`
+/// naming the exact missing evidence. No automatic trigger lives here:
+/// the caller passes intake only when the trigger edge already holds
+/// every admitted member; nothing is synthesized from the quality
+/// event's bank/feedback envelopes.
+pub fn propose_memory_extinction_candidate(
+    intake: &RevisionIntake<'_>,
+) -> Result<NegativeMemoryExtinctionCandidate, ExperienceDriverError> {
+    Ok(eliot_dreamer_memory_revision::propose(intake)?)
+}
+
 /// Read the TRUE admitted edge position through the real bridge client.
 ///
 /// Issues `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, exact
@@ -119,18 +196,17 @@ pub async fn read_current_position(
     scope: ScopeId,
     position_subject: String,
 ) -> Result<CurrentEpistemicPosition, ExperienceDriverError> {
-    if position_subject.trim().is_empty()
-        || position_subject.chars().any(char::is_control)
-    {
+    if position_subject.trim().is_empty() || position_subject.chars().any(char::is_control) {
         return Err(ExperienceDriverError::Position {
             field: "position_subject",
             reason: "must be non-blank and free of control characters",
         });
     }
-    ctx.validate().map_err(|_| ExperienceDriverError::Position {
-        field: "request_metadata",
-        reason: "invalid request metadata",
-    })?;
+    ctx.validate()
+        .map_err(|_| ExperienceDriverError::Position {
+            field: "request_metadata",
+            reason: "invalid request metadata",
+        })?;
     let client = composition
         .context_read_client(kernel)
         .map_err(|error| ExperienceDriverError::Composition(error.to_string()))?;
@@ -146,14 +222,9 @@ pub async fn read_current_position(
         state_fence: ctx.state_fence.clone(),
         parameters,
     };
-    request
-        .validate()
-        .map_err(ExperienceDriverError::Bridge)?;
-    let response: eliot_store_api::NamedReadResponse =
-        client.execute_named(request).await?;
-    response
-        .validate()
-        .map_err(ExperienceDriverError::Bridge)?;
+    request.validate().map_err(ExperienceDriverError::Bridge)?;
+    let response: eliot_store_api::NamedReadResponse = client.execute_named(request).await?;
+    response.validate().map_err(ExperienceDriverError::Bridge)?;
     if response.operation != NamedReadOperation::GetCurrentEpistemicPosition {
         return Err(ExperienceDriverError::Position {
             field: "response.operation",
@@ -166,12 +237,10 @@ pub async fn read_current_position(
             reason: "bridge fence is not compatible with the read fence",
         });
     }
-    let readback: EpistemicPositionReadback =
-        serde_json::from_value(response.payload.clone()).map_err(|_| {
-            ExperienceDriverError::Position {
-                field: "response.payload",
-                reason: "position readback is not the versioned shape",
-            }
+    let readback: EpistemicPositionReadback = serde_json::from_value(response.payload.clone())
+        .map_err(|_| ExperienceDriverError::Position {
+            field: "response.payload",
+            reason: "position readback is not the versioned shape",
         })?;
     for position in &readback.positions {
         position
@@ -220,10 +289,11 @@ pub async fn produce_journal_projection(
     ctx: &RequestMetadata,
     inputs: &ExperienceJournalDriverInputs<'_>,
 ) -> Result<JournalShapeOutput, ExperienceDriverError> {
-    ctx.validate().map_err(|_| ExperienceDriverError::Position {
-        field: "request_metadata",
-        reason: "invalid request metadata",
-    })?;
+    ctx.validate()
+        .map_err(|_| ExperienceDriverError::Position {
+            field: "request_metadata",
+            reason: "invalid request metadata",
+        })?;
     let client = composition
         .context_read_client(kernel)
         .map_err(|error| ExperienceDriverError::Composition(error.to_string()))?;
@@ -412,10 +482,43 @@ pub struct ExperienceQualityEventOutput {
     pub feedback_withheld: Vec<WithheldMember>,
     /// Memory ecology assessment, when the memory family ran.
     pub memory_assessment: Option<MemoryEcologyAssessment>,
+    /// Owner-minted bank continuation cursor echoed verbatim from the
+    /// consumed range payload (`next_cursor`), or `None` when the page
+    /// ends the enumeration.
+    ///
+    /// Multi-page enumeration contract: the trigger edge re-issues the
+    /// owner range read with this cursor echoed back as the `cursor`
+    /// selector and runs this entry again per page until the echoed
+    /// cursor is `None`. Cursors bind fence plus revision heads exactly
+    /// like the audit range, so a cursor read under drifted fence/heads
+    /// fails closed at the store and the caller restarts from the head
+    /// page; this entry never synthesizes or advances a cursor itself.
+    pub bank_next_cursor: Option<String>,
+    /// Owner-minted feedback continuation cursor, same contract as
+    /// `bank_next_cursor` above.
+    pub feedback_next_cursor: Option<String>,
     /// Scoped understanding assessment, when the understanding family ran.
     pub understanding: Option<ScopedUnderstandingAssessment>,
     /// Common-ground assessment, when the common-ground family ran.
     pub common_ground: Option<CommonGroundAssessment>,
+}
+
+/// Echoes the owner-minted range continuation cursor from a consumed
+/// bank/feedback range payload, if the page carries one.
+///
+/// Reads only the [`EXPERIENCE_PAGE_NEXT_CURSOR`] member minted by the
+/// owner page envelope
+/// ([`ExperienceRangePage`](eliot_store_api::ExperienceRangePage)): a
+/// missing member, a non-string member, or a blank cursor echoes as
+/// `None` (page ends the enumeration). The cursor is echoed verbatim,
+/// never parsed or advanced here; multi-page iteration belongs to the
+/// trigger edge per the output contract.
+fn range_next_cursor(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get(EXPERIENCE_PAGE_NEXT_CURSOR)
+        .and_then(serde_json::Value::as_str)
+        .filter(|cursor| !cursor.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// Terminal event entry: trigger event to reviewed candidate.
@@ -442,10 +545,11 @@ pub async fn run_experience_quality_event(
     ctx: &RequestMetadata,
     event: &ExperienceQualityEvent<'_>,
 ) -> Result<ExperienceQualityEventOutput, ExperienceDriverError> {
-    ctx.validate().map_err(|_| ExperienceDriverError::Position {
-        field: "request_metadata",
-        reason: "invalid request metadata",
-    })?;
+    ctx.validate()
+        .map_err(|_| ExperienceDriverError::Position {
+            field: "request_metadata",
+            reason: "invalid request metadata",
+        })?;
     if let Some(journal) = &event.journal
         && journal.scope != event.scope
     {
@@ -485,19 +589,17 @@ pub async fn run_experience_quality_event(
         event.schedule,
         event.holds,
     )?;
-    let bank_shaped = eliot_experience_provider::shape_bank_view(
-        &BankShapeInputs {
-            scope: event.scope.clone(),
-            fence: ctx.state_fence.clone(),
-            records: &bank_records,
-            live: &bank_live,
-            source_id: event.bank.source_id.as_str(),
-            retention: &RetentionContext {
-                schedule: event.schedule,
-                holds: event.holds,
-            },
+    let bank_shaped = eliot_experience_provider::shape_bank_view(&BankShapeInputs {
+        scope: event.scope.clone(),
+        fence: ctx.state_fence.clone(),
+        records: &bank_records,
+        live: &bank_live,
+        source_id: event.bank.source_id.as_str(),
+        retention: &RetentionContext {
+            schedule: event.schedule,
+            holds: event.holds,
         },
-    )?;
+    })?;
     let feedback_records = feedback_records_from_range_payload(&event.feedback.payload)?;
     let feedback_live = supply_feedback_projection_from_store(
         &mut ledger,
@@ -513,19 +615,17 @@ pub async fn run_experience_quality_event(
         event.schedule,
         event.holds,
     )?;
-    let feedback_shaped = eliot_experience_provider::shape_feedback_view(
-        &FeedbackShapeInputs {
-            scope: event.scope.clone(),
-            fence: ctx.state_fence.clone(),
-            records: &feedback_records,
-            live: &feedback_live,
-            source_id: event.feedback.source_id.as_str(),
-            retention: &RetentionContext {
-                schedule: event.schedule,
-                holds: event.holds,
-            },
+    let feedback_shaped = eliot_experience_provider::shape_feedback_view(&FeedbackShapeInputs {
+        scope: event.scope.clone(),
+        fence: ctx.state_fence.clone(),
+        records: &feedback_records,
+        live: &feedback_live,
+        source_id: event.feedback.source_id.as_str(),
+        retention: &RetentionContext {
+            schedule: event.schedule,
+            holds: event.holds,
         },
-    )?;
+    })?;
     let candidate = assess_and_recheck(SelfQualityRecheckInputs {
         assess: SelfQualityInputs {
             assessment_id: event.assessment_id.clone(),
@@ -605,9 +705,42 @@ pub async fn run_experience_quality_event(
         bank_withheld: bank_shaped.withheld,
         feedback_withheld: feedback_shaped.withheld,
         memory_assessment,
+        bank_next_cursor: range_next_cursor(&event.bank.payload),
+        feedback_next_cursor: range_next_cursor(&event.feedback.payload),
         understanding,
         common_ground,
     })
+}
+
+/// Terminal event entry with an optional admitted extinction intake.
+///
+/// Runs [`run_experience_quality_event`] unchanged, then — only when
+/// `revision` is `Some` — proposes one advisory extinction candidate
+/// via [`propose_memory_extinction_candidate`] over the admitted
+/// intake the trigger edge already holds. `None` skips the revision
+/// lane entirely: no intake is synthesized from the quality event's
+/// envelopes, and no automatic trigger exists. This entry calls
+/// [`run_experience_quality_event`] and then the propose wrapper,
+/// so both new symbols have a production caller in this file; the
+/// read-only base path is unaffected.
+pub async fn run_experience_quality_event_with_revision(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    ctx: &RequestMetadata,
+    event: &ExperienceQualityEvent<'_>,
+    revision: Option<&RevisionIntake<'_>>,
+) -> Result<
+    (
+        ExperienceQualityEventOutput,
+        Option<NegativeMemoryExtinctionCandidate>,
+    ),
+    ExperienceDriverError,
+> {
+    let output = run_experience_quality_event(composition, kernel, ctx, event).await?;
+    let extinction = revision
+        .map(propose_memory_extinction_candidate)
+        .transpose()?;
+    Ok((output, extinction))
 }
 
 /// Daemon-edge commit lifecycle bound in milliseconds.
@@ -624,6 +757,21 @@ pub struct ExperienceCommitOutput {
     pub bank_receipts: Vec<WriteReceipt>,
     /// Owner receipts for committed feedback records, in input order.
     pub feedback_receipts: Vec<WriteReceipt>,
+    /// True when the composition's dependent view is stale/pending after
+    /// this batch, echoed from the composition status projection.
+    ///
+    /// P2 stale-projection marking: every per-record commit publishes
+    /// its owner change through the composition's refresh/stale
+    /// discipline (a failed post-commit refresh keeps the already
+    /// durable receipt and marks the dependent view stale/pending
+    /// instead of hiding divergence). This flag echoes that marker so
+    /// the caller can observe it without a second status read; when
+    /// set, projections must not be trusted until the caller drops this
+    /// composition and re-runs authenticated connect+start. There is no
+    /// `refresh_dependent_view` entry: refresh runs inside the
+    /// per-record composition commit calls, never as a separate step
+    /// from this file.
+    pub view_stale: bool,
 }
 
 /// Derives admitted commit ingress from retained invocation state.
@@ -790,8 +938,10 @@ pub async fn commit_experience_event_records(
         composition.note_experience_committed(commit_key, receipt.clone());
         feedback_receipts.push(receipt);
     }
+    let view_stale = composition.status().health.as_str() == "stale";
     Ok(ExperienceCommitOutput {
         bank_receipts,
         feedback_receipts,
+        view_stale,
     })
 }

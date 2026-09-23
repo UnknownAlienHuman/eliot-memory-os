@@ -39,7 +39,7 @@ use thiserror::Error;
 /// Freeze identity this consumer builds against.
 ///
 /// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
-pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22";
+pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6";
 /// Contract version carried by every candidate emitted here.
 pub const CANDIDATE_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 /// Maximum revision-evidence refs carried by one intake.

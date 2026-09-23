@@ -733,6 +733,12 @@ fn retention_omission(
 /// envelope at the consumer scope/fence. Withheld volume keeps the
 /// envelope at partial posture: completeness still requires the owner
 /// `Complete` disposition with empty omissions.
+///
+/// Single-page entry: the owner continuation cursor is not threaded
+/// here (this predates the five-part fence+heads `next_cursor` the
+/// owner store mints). Multi-page callers use
+/// [`supply_bank_projection_from_store_paged`], which echoes the opaque
+/// owner cursor alongside the identical projection join.
 pub fn supply_bank_projection_from_store(
     ledger: &mut ExperienceRevisionLedger,
     snapshot: BankStoreSnapshot<'_>,
@@ -780,6 +786,8 @@ pub fn supply_bank_projection_from_store(
 
 /// Supply a validated feedback projection from a durable store snapshot.
 /// Same durable-read join as [`supply_bank_projection_from_store`].
+/// Single-page entry (cursor dropped); multi-page callers use
+/// [`supply_feedback_projection_from_store_paged`].
 pub fn supply_feedback_projection_from_store(
     ledger: &mut ExperienceRevisionLedger,
     snapshot: FeedbackStoreSnapshot<'_>,
@@ -823,6 +831,124 @@ pub fn supply_feedback_projection_from_store(
             .map_err(GovernorObservationError::Observation)?;
     }
     Ok(projection)
+}
+
+/// Fail-closed gate for an owner-minted continuation cursor.
+///
+/// The cursor is opaque here: the store owner mints the five-part
+/// fence+heads shape (`audit:{fence_digest}:{heads_digest}:{ordinal}:{bound}`)
+/// and the store owner alone parses it (`audit_cursor_issue` /
+/// `audit_cursor_parse` in the store-api owner). This lane never parses,
+/// rebuilds, or re-mints a cursor; it only echoes what the owner issued.
+/// A present-but-blank or control-bearing cursor is malformed owner
+/// evidence and fails closed rather than silently starting, skipping,
+/// or duplicating a page.
+fn check_owner_cursor(
+    cursor: Option<String>,
+    field: &'static str,
+) -> Result<Option<String>, GovernorObservationError> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor) if cursor.trim().is_empty() || cursor.chars().any(char::is_control) => {
+            Err(GovernorObservationError::InvalidField {
+                field,
+                reason: "owner continuation cursor is malformed; fail closed, never skip or duplicate a page",
+            })
+        }
+        Some(cursor) => Ok(Some(cursor)),
+    }
+}
+
+/// One bank page: the validated projection plus the opaque owner
+/// continuation cursor for the next page (`None` ends enumeration).
+///
+/// `BankProjection` itself stays frozen in its owner crate (digest-bound,
+/// `deny_unknown_fields`): the cursor travels alongside the projection,
+/// never inside it.
+pub struct PagedBankProjection {
+    /// Validated bank envelope for this page, same join as
+    /// [`supply_bank_projection_from_store`].
+    pub projection: BankProjection,
+    /// Opaque owner-minted cursor for the next page, or `None` when this
+    /// page ends the enumeration. Echoed verbatim from the owner store;
+    /// never constructed or parsed in this lane.
+    pub next_cursor: Option<String>,
+}
+
+/// One feedback page: same alongside-cursor rule as
+/// [`PagedBankProjection`].
+pub struct PagedFeedbackProjection {
+    /// Validated feedback envelope for this page.
+    pub projection: FeedbackProjection,
+    /// Opaque owner-minted cursor for the next page, or `None` when this
+    /// page ends the enumeration.
+    pub next_cursor: Option<String>,
+}
+
+/// Supply one validated bank page from a durable store snapshot.
+///
+/// Identical projection join to [`supply_bank_projection_from_store`];
+/// the extra `next_cursor` is the opaque owner-minted continuation
+/// cursor for the page the snapshot was read from. It is echoed into
+/// [`PagedBankProjection::next_cursor`] with only the fail-closed
+/// malformed gate ([`check_owner_cursor`]): no parsing, no authority
+/// invention. The pre-existing single-page supplier delegates here with
+/// `None`, so external single-page callers keep compiling unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn supply_bank_projection_from_store_paged(
+    ledger: &mut ExperienceRevisionLedger,
+    snapshot: BankStoreSnapshot<'_>,
+    projection_id: ArtifactId,
+    scope: ObservationScope,
+    fence: StateFence,
+    schedule: &RetentionSchedule,
+    holds: &BTreeMap<String, RetentionHold>,
+    next_cursor: Option<String>,
+) -> Result<PagedBankProjection, GovernorObservationError> {
+    let next_cursor = check_owner_cursor(next_cursor, "bank_page.next_cursor")?;
+    let projection = supply_bank_projection_from_store(
+        ledger,
+        snapshot,
+        projection_id,
+        scope,
+        fence,
+        schedule,
+        holds,
+    )?;
+    Ok(PagedBankProjection {
+        projection,
+        next_cursor,
+    })
+}
+
+/// Supply one validated feedback page from a durable store snapshot.
+/// Same opaque-cursor echo rule as
+/// [`supply_bank_projection_from_store_paged`].
+#[allow(clippy::too_many_arguments)]
+pub fn supply_feedback_projection_from_store_paged(
+    ledger: &mut ExperienceRevisionLedger,
+    snapshot: FeedbackStoreSnapshot<'_>,
+    projection_id: ArtifactId,
+    scope: ObservationScope,
+    fence: StateFence,
+    schedule: &RetentionSchedule,
+    holds: &BTreeMap<String, RetentionHold>,
+    next_cursor: Option<String>,
+) -> Result<PagedFeedbackProjection, GovernorObservationError> {
+    let next_cursor = check_owner_cursor(next_cursor, "feedback_page.next_cursor")?;
+    let projection = supply_feedback_projection_from_store(
+        ledger,
+        snapshot,
+        projection_id,
+        scope,
+        fence,
+        schedule,
+        holds,
+    )?;
+    Ok(PagedFeedbackProjection {
+        projection,
+        next_cursor,
+    })
 }
 
 /// Both owner envelopes assembled and edge-re-resolved for one consumer.
@@ -877,6 +1003,82 @@ pub fn assemble_experience_for_consumer(
     revalidate_bank_projection_for_consumer(&bank, &scope, &fence)?;
     revalidate_feedback_projection_for_consumer(&feedback, &scope, &fence)?;
     Ok(ExperienceConsumerBundle { bank, feedback })
+}
+
+/// Both owner envelopes for one page, edge-re-resolved, plus the opaque
+/// owner continuation cursors for the next page.
+///
+/// Multi-page contract (owner five-part fence+heads cursors):
+/// the consumer iterates a family by echoing that family's cursor back
+/// to the owner store as the next read's cursor selector until the
+/// cursor is `None`. Bank and feedback paginate independently: each
+/// family's cursor resumes only its own enumeration. A fence/heads
+/// mismatch on the next page (the owner store fails the cursor closed
+/// because a commit advanced a revision head or the fence moved) means
+/// restart that family's enumeration from the headless first page —
+/// never skip ahead, never replay rows into a duplicate, never treat a
+/// rejected cursor as truncation. `None` on both families ends the read;
+/// anything else is a partial read, never a complete one.
+pub struct PagedExperienceConsumerBundle {
+    /// Assembled bank envelope for this page.
+    pub bank: BankProjection,
+    /// Assembled feedback envelope for this page.
+    pub feedback: FeedbackProjection,
+    /// Opaque owner cursor for the next bank page (`None` ends it).
+    pub bank_next_cursor: Option<String>,
+    /// Opaque owner cursor for the next feedback page (`None` ends it).
+    pub feedback_next_cursor: Option<String>,
+}
+
+/// Assemble and edge-consume one page of both experience envelopes.
+///
+/// Paged entry of [`assemble_experience_for_consumer`]: runs the same
+/// per-family supply join plus consumer-edge re-resolution, then echoes
+/// the opaque owner continuation cursors (fail-closed on malformed, no
+/// parsing in this lane) into [`PagedExperienceConsumerBundle`]. See its
+/// multi-page contract for iteration, per-family independence, and the
+/// restart-instead-of-skip/dup rule.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_experience_for_consumer_paged(
+    ledger: &mut ExperienceRevisionLedger,
+    projection_id: ArtifactId,
+    scope: ObservationScope,
+    fence: StateFence,
+    bank: BankStoreSnapshot<'_>,
+    feedback: FeedbackStoreSnapshot<'_>,
+    schedule: &RetentionSchedule,
+    holds: &BTreeMap<String, RetentionHold>,
+    bank_next_cursor: Option<String>,
+    feedback_next_cursor: Option<String>,
+) -> Result<PagedExperienceConsumerBundle, GovernorObservationError> {
+    let bank = supply_bank_projection_from_store_paged(
+        ledger,
+        bank,
+        projection_id.clone(),
+        scope.clone(),
+        fence.clone(),
+        schedule,
+        holds,
+        bank_next_cursor,
+    )?;
+    let feedback = supply_feedback_projection_from_store_paged(
+        ledger,
+        feedback,
+        projection_id,
+        scope.clone(),
+        fence.clone(),
+        schedule,
+        holds,
+        feedback_next_cursor,
+    )?;
+    revalidate_bank_projection_for_consumer(&bank.projection, &scope, &fence)?;
+    revalidate_feedback_projection_for_consumer(&feedback.projection, &scope, &fence)?;
+    Ok(PagedExperienceConsumerBundle {
+        bank: bank.projection,
+        feedback: feedback.projection,
+        bank_next_cursor: bank.next_cursor,
+        feedback_next_cursor: feedback.next_cursor,
+    })
 }
 
 /// Produce the durable commit payload for one admitted bank record.
@@ -955,13 +1157,12 @@ pub fn produce_feedback_commit(
 pub fn bank_records_from_range_payload(
     payload: &Value,
 ) -> Result<Vec<ExperienceBankRecord>, GovernorObservationError> {
-    let members = payload
-        .get("records")
-        .and_then(Value::as_array)
-        .ok_or(GovernorObservationError::InvalidField {
+    let members = payload.get("records").and_then(Value::as_array).ok_or(
+        GovernorObservationError::InvalidField {
             field: "audit_range.records",
             reason: "range payload must carry a records array",
-        })?;
+        },
+    )?;
     let mut records = Vec::with_capacity(members.len());
     for member in members {
         let document = unwrap_range_member(member, "bank_revision")?;
@@ -976,13 +1177,12 @@ pub fn bank_records_from_range_payload(
 pub fn feedback_records_from_range_payload(
     payload: &Value,
 ) -> Result<Vec<AgentFeedbackRecord>, GovernorObservationError> {
-    let members = payload
-        .get("records")
-        .and_then(Value::as_array)
-        .ok_or(GovernorObservationError::InvalidField {
+    let members = payload.get("records").and_then(Value::as_array).ok_or(
+        GovernorObservationError::InvalidField {
             field: "audit_range.records",
             reason: "range payload must carry a records array",
-        })?;
+        },
+    )?;
     let mut records = Vec::with_capacity(members.len());
     for member in members {
         let document = unwrap_range_member(member, "feedback_revision")?;
@@ -1002,16 +1202,16 @@ fn unwrap_range_member(
     member: &Value,
     revision_field: &'static str,
 ) -> Result<String, GovernorObservationError> {
-    let object = member.as_object().ok_or(GovernorObservationError::InvalidField {
-        field: "audit_range.records",
-        reason: "range record must be an object",
-    })?;
+    let object = member
+        .as_object()
+        .ok_or(GovernorObservationError::InvalidField {
+            field: "audit_range.records",
+            reason: "range record must be an object",
+        })?;
     let Some(document) = object.get("record_json").and_then(Value::as_str) else {
-        return serde_json::to_string(member).map_err(|_| {
-            GovernorObservationError::InvalidField {
-                field: "audit_range.records",
-                reason: "range record must re-encode canonically",
-            }
+        return serde_json::to_string(member).map_err(|_| GovernorObservationError::InvalidField {
+            field: "audit_range.records",
+            reason: "range record must re-encode canonically",
         });
     };
     let parsed: Value =
@@ -1019,31 +1219,30 @@ fn unwrap_range_member(
             field: "audit_range.record_json",
             reason: "wrapped record document must decode",
         })?;
-    let body = parsed.as_object().ok_or(GovernorObservationError::InvalidField {
-        field: "audit_range.record_json",
-        reason: "wrapped record document must be an object",
-    })?;
-    let handle = object
-        .get("handle")
-        .and_then(Value::as_str)
+    let body = parsed
+        .as_object()
         .ok_or(GovernorObservationError::InvalidField {
+            field: "audit_range.record_json",
+            reason: "wrapped record document must be an object",
+        })?;
+    let handle = object.get("handle").and_then(Value::as_str).ok_or(
+        GovernorObservationError::InvalidField {
             field: "audit_range.handle",
             reason: "wrapper handle must be present text",
-        })?;
-    let revision = object
-        .get("revision")
-        .and_then(Value::as_u64)
-        .ok_or(GovernorObservationError::InvalidField {
+        },
+    )?;
+    let revision = object.get("revision").and_then(Value::as_u64).ok_or(
+        GovernorObservationError::InvalidField {
             field: "audit_range.revision",
             reason: "wrapper revision must be a count",
-        })?;
-    let digest = object
-        .get("record_digest")
-        .and_then(Value::as_str)
-        .ok_or(GovernorObservationError::InvalidField {
+        },
+    )?;
+    let digest = object.get("record_digest").and_then(Value::as_str).ok_or(
+        GovernorObservationError::InvalidField {
             field: "audit_range.record_digest",
             reason: "wrapper digest must be present text",
-        })?;
+        },
+    )?;
     if body.get("handle").and_then(Value::as_str) != Some(handle) {
         return Err(GovernorObservationError::InvalidField {
             field: "audit_range.handle",
@@ -1136,5 +1335,101 @@ pub fn consume_feedback_range_payload(
         fence,
         schedule,
         holds,
+    )
+}
+
+/// Extract the opaque owner continuation cursor from a bridge
+/// range-payload envelope.
+///
+/// The store backends bind `next_cursor` into the payload (`None`
+/// serializes as `null` when the page ends enumeration). A present
+/// non-text member is a malformed bridge envelope and fails closed;
+/// text passes through the same blank/control gate as
+/// [`check_owner_cursor`]. No cursor is ever parsed or minted here.
+fn owner_cursor_from_range_payload(
+    payload: &Value,
+) -> Result<Option<String>, GovernorObservationError> {
+    match payload.get("next_cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(cursor)) => {
+            check_owner_cursor(Some(cursor.clone()), "audit_range.next_cursor")
+        }
+        Some(_) => Err(GovernorObservationError::InvalidField {
+            field: "audit_range.next_cursor",
+            reason: "owner continuation cursor must be text or null",
+        }),
+    }
+}
+
+/// Consume one bank range payload into one validated bank page.
+///
+/// Same payload-to-projection rule as [`consume_bank_range_payload`],
+/// plus the opaque owner `next_cursor` echoed from the payload envelope
+/// into [`PagedBankProjection::next_cursor`]. Single-page callers stay
+/// on [`consume_bank_range_payload`]; multi-page callers iterate per
+/// the contract on [`PagedExperienceConsumerBundle`].
+#[allow(clippy::too_many_arguments)]
+pub fn consume_bank_range_payload_paged(
+    ledger: &mut ExperienceRevisionLedger,
+    projection_id: ArtifactId,
+    scope: ObservationScope,
+    fence: StateFence,
+    schedule: &RetentionSchedule,
+    holds: &BTreeMap<String, RetentionHold>,
+    payload: &Value,
+    source_revision: String,
+    coverage: ProjectionCoverage,
+    omissions: Vec<ProjectionOmission>,
+) -> Result<PagedBankProjection, GovernorObservationError> {
+    let records = bank_records_from_range_payload(payload)?;
+    let next_cursor = owner_cursor_from_range_payload(payload)?;
+    supply_bank_projection_from_store_paged(
+        ledger,
+        BankStoreSnapshot {
+            records: &records,
+            source_revision,
+            coverage,
+            omissions,
+        },
+        projection_id,
+        scope,
+        fence,
+        schedule,
+        holds,
+        next_cursor,
+    )
+}
+
+/// Consume one feedback range payload into one validated feedback page.
+/// Same opaque-cursor echo rule as [`consume_bank_range_payload_paged`].
+#[allow(clippy::too_many_arguments)]
+pub fn consume_feedback_range_payload_paged(
+    ledger: &mut ExperienceRevisionLedger,
+    projection_id: ArtifactId,
+    scope: ObservationScope,
+    fence: StateFence,
+    schedule: &RetentionSchedule,
+    holds: &BTreeMap<String, RetentionHold>,
+    payload: &Value,
+    source_revision: String,
+    coverage: ProjectionCoverage,
+    omissions: Vec<ProjectionOmission>,
+) -> Result<PagedFeedbackProjection, GovernorObservationError> {
+    let records = feedback_records_from_range_payload(payload)?;
+    let next_cursor = owner_cursor_from_range_payload(payload)?;
+    supply_feedback_projection_from_store_paged(
+        ledger,
+        FeedbackStoreSnapshot {
+            records: &records,
+            source_revision,
+            coverage,
+            omissions,
+        },
+        projection_id,
+        scope,
+        fence,
+        schedule,
+        holds,
+        next_cursor,
     )
 }

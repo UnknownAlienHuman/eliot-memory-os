@@ -3403,6 +3403,7 @@ dependencies = [
  "eliot-dreamer-candidate-validation",
  "eliot-dreamer-claim-grounding",
  "eliot-dreamer-contracts",
+ "eliot-dreamer-memory-revision",
  "eliot-dreamer-probe-plan",
  "eliot-dreamer-rival-model",
  "eliot-epistemic-contracts",

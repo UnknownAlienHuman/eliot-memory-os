@@ -75,6 +75,18 @@ pub const QUALITY_CONTRACT_NAME: &str = "eliot.smart.memory-quality";
 /// Exact equality only: an assessment written against any other revision is
 /// rejected with [`QualityError::VersionMismatch`].
 pub const QUALITY_CONTRACT_VERSION: ContractVersion = ContractVersion::new(0, 1, 0);
+/// Freeze identity this consumer package builds against.
+///
+/// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
+pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6";
+
+/// Fail closed unless this package builds against the delivered r6 freeze.
+fn check_consumed_freeze() -> Result<(), QualityError> {
+    if CONSUMED_FREEZE_ID != "cognitive-rev12-contract-schema-freeze-2026-09-22-r6" {
+        return Err(QualityError::VersionMismatch);
+    }
+    Ok(())
+}
 /// Hard ceiling on advisory receipt candidates carried by one request.
 pub const MAX_QUALITY_RECEIPTS: usize = 64;
 
@@ -170,6 +182,7 @@ pub struct QualityRequest {
 impl QualityRequest {
     /// Validate owner shapes, binding echoes, and the handle union.
     pub fn validate(&self) -> Result<(), QualityError> {
+        check_consumed_freeze()?;
         self.batch.validate()?;
         self.applicable.validate()?;
         if self.applicable.binding != self.batch.binding {

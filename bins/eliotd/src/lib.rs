@@ -163,7 +163,8 @@ pub use experience_runtime::{
     CommonGroundEventInputs, ExperienceCommitOutput, ExperienceDriverError,
     ExperienceJournalDriverInputs, ExperienceQualityEvent, ExperienceQualityEventOutput,
     UnderstandingEventInputs, commit_experience_event_records, derive_commit_ingress,
-    produce_journal_projection, read_current_position, run_experience_quality_event,
+    produce_journal_projection, propose_memory_extinction_candidate, read_current_position,
+    run_experience_quality_event, run_experience_quality_event_with_revision,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
