@@ -215,6 +215,7 @@ pub use doctor_recovery_ledger::{KernelDoctorRecoveryLedger, doctor_recovery_led
 pub use dreamer_job_dispatch::DREAMER_JOB_WIRE_ID;
 use eliot_contracts::{
     ArtifactId, AuthorityEpoch, ContractId, RequestId, ResourceGeneration, StateFence,
+    canonical_json_bytes,
 };
 use eliot_ipc::{
     AcceptedAgentBridgeTransport, HandshakeResult, PeerIdentity, ServerFirstConnection,
@@ -236,6 +237,8 @@ use eliot_kernel_service::{
     KernelControlResponse, KernelReadyReceipt, KernelService, KernelServiceError,
     KernelServiceState, ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest,
     ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
+    USER_AUTOMATION_KERNEL_CAPABILITY, USER_AUTOMATION_KERNEL_MODULE_ID,
+    USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING, USER_AUTOMATION_KERNEL_PRIVACY_CLASS,
 };
 /// P-07 Doctor wire seam for the front-door dispatch/driver arms (T6-D2 Slice B).
 ///

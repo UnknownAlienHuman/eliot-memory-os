@@ -123,6 +123,10 @@ impl Drop for HostTerminalGuard<'_> {
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 pub use eliot_host_control_endpoint::{
     HOST_RUNTIME_CONTROL_PIPE, HostRuntimeControl, HostRuntimeControlQueue,
+    HostUserAutomationExecutionEnvelope, HostUserAutomationExecutionQueue,
+    UserAutomationHostExecutionEndpoint, UserAutomationHostExecutionRequest,
+    UserAutomationHostExecutionResponse, UserAutomationRuntimeError, pop_user_automation_execution,
+    process_user_automation_execution_queue, reject_unbound_user_automation_execution,
 };
 use eliot_host_service::runtime_control::runtime_control_unknown_ref;
 pub use eliot_host_service::runtime_control::{
@@ -169,6 +173,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGeneration};
 #[cfg(windows)]
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
+#[cfg(windows)]
+use eliot_host_service::{HostDurableJobAdapter, HostWakeIntentAdapter};
 use eliot_host_state::{
     ActivationState, AppendReceipt, DrainRecord, DrainState, EpochIdentity, EpochLineageId,
     EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
@@ -417,8 +423,9 @@ mod kernel_front_door_client;
 use kernel_front_door_client::kernel_front_door_acl_mode;
 #[cfg(windows)]
 use kernel_front_door_client::{
-    activation_response_or_reconcile, connect_authenticated_kernel_front_door,
-    kernel_control_request, validate_authenticated_kernel_peer,
+    HostKernelUserAutomationOwner, activation_response_or_reconcile,
+    connect_authenticated_kernel_front_door, kernel_control_request,
+    validate_authenticated_kernel_peer,
 };
 
 #[cfg(all(windows, test))]
@@ -3733,6 +3740,8 @@ pub struct HostComposition {
     #[cfg(windows)]
     runtime_control_queue: HostRuntimeControlQueue,
     #[cfg(windows)]
+    user_automation_execution_queue: HostUserAutomationExecutionQueue,
+    #[cfg(windows)]
     store_recovery_startup_fence: StoreRecoveryStartupFence,
     active_phase_b_rebind_recovery: ActivePhaseBRebindRecoveryKind,
     owner_lease: HostOwnerLease,
@@ -4187,6 +4196,10 @@ impl HostComposition {
             runtime_restarts: durable_restarts,
             #[cfg(windows)]
             runtime_control_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            #[cfg(windows)]
+            user_automation_execution_queue: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
             #[cfg(windows)]
@@ -4928,8 +4941,9 @@ impl HostComposition {
         let _guard = capability
             .live_guard()
             .map_err(|e| HostError::Platform(e.to_string()))?;
-        let control = HostRuntimeControl::new_with_capability(
+        let control = HostRuntimeControl::new_with_capability_and_user_automation(
             std::sync::Arc::clone(&self.runtime_control_queue),
+            std::sync::Arc::clone(&self.user_automation_execution_queue),
             &capability,
         )
         .map_err(HostError::Platform)?;
@@ -4939,9 +4953,126 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    fn user_automation_owner(&self) -> Result<HostKernelUserAutomationOwner, HostError> {
+        let candidate = self.jobs.kernel_candidate.clone().ok_or_else(|| {
+            HostError::ProcessContour(
+                "UserAutomation owner has no retained Kernel candidate".to_owned(),
+            )
+        })?;
+        let activation = self.jobs.kernel_activation_receipt.clone().ok_or_else(|| {
+            HostError::ProcessContour(
+                "UserAutomation owner has no Kernel activation receipt".to_owned(),
+            )
+        })?;
+        let kernel_process = self.jobs.kernel_process().cloned().ok_or_else(|| {
+            HostError::ProcessContour(
+                "UserAutomation owner has no retained live Kernel process".to_owned(),
+            )
+        })?;
+        self.jobs.validate_running_kernel_candidate(&candidate)?;
+        HostKernelUserAutomationOwner::new(candidate, activation, kernel_process)
+    }
+
+    /// Drains the authenticated `UserAutomation` queue through the retained
+    /// Kernel front-door owner and the canonical Host journal Wake owner.
+    ///
+    /// The queue carries the channel evidence selected by the authenticated
+    /// runtime-control transport. An endpoint is therefore composed per
+    /// request from that exact binding; a request can never borrow another
+    /// request's connection identity or fence. The Durable Job adapter calls
+    /// the Kernel's authenticated Dreamer route, which in turn calls the
+    /// retained canonical Store gateway. Wake cancellation remains a direct
+    /// operation of the sole Host journal owner.
+    #[cfg(windows)]
+    pub fn process_user_automation_requests(
+        &self,
+        queue: &HostUserAutomationExecutionQueue,
+    ) -> Result<usize, HostError> {
+        let queue_empty = queue
+            .lock()
+            .map_err(|_| {
+                HostError::ProcessContour("UserAutomation owner queue lock is poisoned".to_owned())
+            })?
+            .is_empty();
+        if queue_empty {
+            return Ok(0);
+        }
+        host_lifecycle_observe_scm("host.user-automation owner requested");
+        let (kernel_owner, unavailable_reason) = match self.user_automation_owner() {
+            Ok(owner) => (Some(owner), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        runtime.block_on(async {
+            let mut processed = 0;
+            while let Some(envelope) = pop_user_automation_execution(queue) {
+                let request = envelope.request().clone();
+                let session = envelope.session().clone();
+                let response =
+                    if let Some(owner) = kernel_owner.as_ref() {
+                        match owner.owner_binding() {
+                            Ok(owner_binding) if session.owner() == &owner_binding => {
+                                let endpoint =
+                                    UserAutomationHostExecutionEndpoint::new_with_owner_binding(
+                                        owner_binding,
+                                        HostDurableJobAdapter::new(owner),
+                                        HostWakeIntentAdapter::new(&self.journal),
+                                    );
+                                match endpoint {
+                                    Ok(endpoint) => {
+                                        Box::pin(endpoint.execute_authenticated_response(
+                                            request.clone(),
+                                            session,
+                                        ))
+                                        .await
+                                    }
+                                    Err(error) => UserAutomationHostExecutionResponse::failed_for(
+                                        &request, error,
+                                    ),
+                                }
+                            }
+                            Ok(_) => UserAutomationHostExecutionResponse::failed_for(
+                                &request,
+                                UserAutomationRuntimeError::IdentityConflict,
+                            ),
+                            Err(error) => UserAutomationHostExecutionResponse::failed_for(
+                                &request,
+                                UserAutomationRuntimeError::Unavailable(error.to_string()),
+                            ),
+                        }
+                    } else {
+                        UserAutomationHostExecutionResponse::failed_for(
+                            &request,
+                            UserAutomationRuntimeError::Unavailable(
+                                unavailable_reason
+                                    .as_deref()
+                                    .unwrap_or("UserAutomation Kernel owner is unavailable")
+                                    .to_owned(),
+                            ),
+                        )
+                    };
+                let _ = envelope.respond(response);
+                processed += 1;
+            }
+            Ok::<usize, HostError>(processed)
+        })
+    }
+
+    #[cfg(windows)]
     #[allow(missing_docs)]
     pub fn runtime_control_queue(&self) -> HostRuntimeControlQueue {
         std::sync::Arc::clone(&self.runtime_control_queue)
+    }
+
+    /// Returns the bounded `UserAutomation` owner queue admitted by the
+    /// authenticated runtime-control endpoint.
+    #[cfg(windows)]
+    pub fn user_automation_execution_queue(&self) -> HostUserAutomationExecutionQueue {
+        std::sync::Arc::clone(&self.user_automation_execution_queue)
     }
 
     #[cfg(windows)]

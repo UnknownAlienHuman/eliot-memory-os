@@ -508,9 +508,9 @@ fn runtime_health_for_ready(
     ready: &KernelReadyReceipt,
 ) -> Result<eliot_kernel_core::KernelRuntimeHealthEvidence, TestError> {
     use eliot_kernel_core::{
-        CapabilityReadiness, CompatibilityEnvelope, DurableCompatibilityState,
-        HealthDimensionKind, NormativePairReceipt, ProcessHealthStatus,
-        ProcessHealthVector, StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
+        CapabilityReadiness, CompatibilityEnvelope, DurableCompatibilityState, HealthDimensionKind,
+        NormativePairReceipt, ProcessHealthStatus, ProcessHealthVector, StateMigrationClass,
+        VersionRange, admit_handshake, expected_seal_tag,
     };
     use eliot_runtime_contracts::{GenerationCutoverState, ModuleGenerationState};
 
@@ -645,7 +645,8 @@ fn authenticated_proof(
     validation_revision: u64,
 ) -> Result<AuthenticatedKernelReadiness, TestError> {
     let (request, response, _ready) = probe_exchange(fixture, validation_revision)?;
-    let (ready, runtime_health) = validate_probe_response(&request, &fixture.activation, &response)?;
+    let (ready, runtime_health) =
+        validate_probe_response(&request, &fixture.activation, &response)?;
     let supervision_lease = response
         .supervision_lease
         .clone()
@@ -3762,6 +3763,10 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
             watchdog_start_recovery: None,
             runtime_restarts: std::collections::HashMap::new(),
             runtime_control_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            #[cfg(windows)]
+            user_automation_execution_queue: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
             store_recovery_startup_fence: StoreRecoveryStartupFence::Clear,
