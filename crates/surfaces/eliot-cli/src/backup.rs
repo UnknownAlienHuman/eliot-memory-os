@@ -316,9 +316,10 @@ pub struct BackupVerifyResult {
     pub receipt_count: u64,
 }
 
-/// Typed restore-test result: rehearsal gates proven, the minted
-/// identity bound, plus the exact missing Governor inputs blocking
-/// execution.
+/// Typed restore-test result: rehearsal gates proven plus the exact
+/// missing Governor inputs blocking execution. Execution is blocked: no
+/// Governor identity exists yet, so the stable operation identity is the
+/// correlated idempotency key for same-operation reconciliation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupRestoreTestResult {
@@ -328,14 +329,9 @@ pub struct BackupRestoreTestResult {
     pub reason: String,
     /// Gates the Kernel proved, in order.
     pub gates_passed: Vec<String>,
-    /// Minted restore operation identity the Governor lane correlates.
+    /// Stable operation identity (the correlated idempotency key) the
+    /// Governor lane correlates on retry.
     pub restore_operation_id: String,
-    /// Coordination decision digest built from the minted admission.
-    pub decision_digest: String,
-    /// Admitted plan identity.
-    pub plan_id: String,
-    /// Admitted archive digest.
-    pub bundle_sha256: String,
 }
 
 fn require_command(
@@ -526,6 +522,25 @@ pub fn backup_verify(
                 json!({"status": "invalid", "reason": reason}),
             ))
         }
+        "refused" => {
+            if envelope_text(&response, "code")? != "plan_gap" {
+                return Err(BackupClientError::Client(CliError::ResultMismatch));
+            }
+            // Archive decode belongs to the #960 follow-up edge
+            // (backup-verify-owner eliot-backup decode edge): bounded hex
+            // shape is admitted here, decode goes real when that edge lands.
+            let missing_owner = envelope_text(&response, "missing_owner")?.to_owned();
+            let reason = envelope_text(&response, "reason")?.to_owned();
+            // Refusal performed bounded validation reads only: nothing
+            // admitted, nothing proven beyond observation.
+            Ok(respond(
+                request,
+                CommandId::BackupVerify,
+                EffectClass::Read,
+                ProofCeiling::Observation,
+                json!({"status": "refused", "code": "plan_gap", "missing_owner": missing_owner, "reason": reason}),
+            ))
+        }
         _ => Err(BackupClientError::Client(CliError::ResultMismatch)),
     }
 }
@@ -592,16 +607,14 @@ pub fn backup_restore_test(
                 missing_owner: envelope_text(&response, "missing_owner")?.to_owned(),
                 reason: envelope_text(&response, "reason")?.to_owned(),
                 gates_passed,
-                restore_operation_id: envelope_text(&response, "restore_operation_id")?.to_owned(),
-                decision_digest: envelope_text(&response, "decision_digest")?.to_owned(),
-                plan_id: envelope_text(&response, "plan_id")?.to_owned(),
-                bundle_sha256: envelope_text(&response, "bundle_sha256")?.to_owned(),
+                // No Governor identity exists yet: the stable mutation
+                // operation identity for retry is the correlated
+                // idempotency key, already validated via
+                // envelope_idempotency above — never fabricated from the
+                // response envelope.
+                restore_operation_id: request.request.idempotency_key.clone(),
             };
-            if result.restore_operation_id.trim().is_empty()
-                || result.decision_digest.trim().is_empty()
-                || result.plan_id.trim().is_empty()
-                || result.bundle_sha256.trim().is_empty()
-            {
+            if result.restore_operation_id.trim().is_empty() {
                 return Err(BackupClientError::Client(CliError::ResultMismatch));
             }
             // Gates proven, execution blocked: candidate evidence under a
