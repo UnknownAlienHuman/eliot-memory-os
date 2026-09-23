@@ -1580,25 +1580,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-memory-revision"
+version = "0.1.0"
+dependencies = [
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-observation-contracts",
+ "schemars",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-dreamer-orchestration-plan"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-evidence",
-]
-
-[[package]]
-name = "eliot-dreamer-memory-revision"
-version = "0.1.0"
-dependencies = [
- "eliot-contracts",
- "eliot-context-contracts",
- "eliot-dreamer-contracts",
- "eliot-observation-contracts",
- "schemars",
- "serde",
- "thiserror",
 ]
 
 [[package]]
@@ -1726,10 +1726,14 @@ name = "eliot-engine"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-nextest",
  "eliot-instrument-runner",
+ "eliot-instrument-rustc",
+ "eliot-observability",
+ "eliot-process",
  "eliot-store",
  "eliot-types",
  "eliot-verifier",
@@ -2115,6 +2119,7 @@ dependencies = [
 name = "eliot-instrument-runner"
 version = "0.1.0"
 dependencies = [
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-cargo",

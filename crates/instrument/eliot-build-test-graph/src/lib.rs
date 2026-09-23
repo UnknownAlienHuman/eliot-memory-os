@@ -18,6 +18,31 @@ pub const CONTRACT_NAME: &str = "eliot.instrument.build-test-graph";
 pub const CONTRACT_VERSION: (u16, u16, u16) = (1, 0, 0);
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
+mod derived_cache;
+
+pub use derived_cache::{
+    ADMITTED_SCHEMA_REVISIONS, ArtifactLineage, CacheCounters, CacheLimits, CacheLookup,
+    CacheRejectReason, CacheStoreError, CachedArtifact, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES,
+    DEFAULT_MAX_REJECTIONS, DERIVED_CACHE_SCHEMA_V1, DerivationOutcome, DerivedCacheIdentity,
+    DerivedCacheStore, FreshDerivation, RejectedCacheRecord, RootDisposition, TrustPolicy,
+};
+
+pub(crate) fn validate_text_shape(value: &str, field: &'static str) -> Result<(), GraphError> {
+    text(value, field)
+}
+
+pub(crate) fn validate_digest_shape(value: &str, field: &'static str) -> Result<(), GraphError> {
+    digest(value, field)
+}
+
+pub(crate) fn digest_bytes_for<T: Serialize>(value: &T) -> Result<String, GraphError> {
+    canonical(value)
+}
+
+pub(crate) fn sha256_of(bytes: &[u8]) -> String {
+    digest_bytes(bytes)
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GraphError {
     #[error("{field} must be non-blank and free of control characters")]
