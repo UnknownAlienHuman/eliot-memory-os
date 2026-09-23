@@ -83,6 +83,38 @@ pub struct OwnerSessionFacts {
     pub(crate) protected_snapshot_digest: String,
 }
 
+/// Selector-only carrier for one manual `UserAutomation` producer request.
+///
+/// Kernel derives the authenticated principal, current fence, immutable
+/// revision material, and occurrence identity. These three fields are never
+/// treated as authority by the daemon or Kernel route.
+///
+/// The authenticated producer/sender is a known remaining item (no run-now
+/// forward path exists in this binary yet); construction follows with it.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Serialize)]
+pub struct UserAutomationDaemonTrigger {
+    pub automation_id: String,
+    pub requested_revision: String,
+    pub manual_nonce: String,
+}
+
+#[allow(dead_code)]
+impl UserAutomationDaemonTrigger {
+    pub fn validate(&self) -> Result<(), String> {
+        for (value, field) in [
+            (&self.automation_id, "automation_id"),
+            (&self.requested_revision, "requested_revision"),
+            (&self.manual_nonce, "manual_nonce"),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) || value.len() > 256 {
+                return Err(format!("UserAutomation trigger {field} is invalid"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 pub(super) async fn retry_pre_admission<T, F, Fut>(
     timeout: Duration,

@@ -1835,14 +1835,22 @@ async fn automation_current_payload(
     let automation_id = require_automation_id(decoded)?;
     let row = super::surreal_automation::read_current_for_read(db, config, &automation_id).await?;
     let (current, revision) = match row {
-        Some(row) if row.state_fence == *state_fence => (
-            json!({
-                "automation_id": row.automation_id,
-                "revision": row.revision,
-                "configuration_state": row.configuration_state,
-            }),
-            1,
-        ),
+        Some(row)
+            if row.state_fence == *state_fence
+                && decoded
+                    .requested_revision
+                    .as_deref()
+                    .is_none_or(|revision| revision == row.revision) =>
+        {
+            (
+                json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "configuration_state": row.configuration_state,
+                }),
+                1,
+            )
+        }
         _ => (Value::Null, 0),
     };
     Ok(json!({
@@ -1861,9 +1869,20 @@ async fn automation_history_payload(
 ) -> Result<Value, AdapterError> {
     let automation_id = require_automation_id(decoded)?;
     let limit = usize::from(decoded.max_records.max(1));
-    let rows =
+    let rows = if let Some(requested_revision) = decoded.requested_revision.as_deref() {
+        super::surreal_automation::read_revision_for_read(
+            db,
+            config,
+            &automation_id,
+            requested_revision,
+        )
+        .await?
+        .into_iter()
+        .collect()
+    } else {
         super::surreal_automation::read_revisions_for_read(db, config, &automation_id, limit)
-            .await?;
+            .await?
+    };
     let mut revisions = Vec::new();
     for row in rows {
         if row.state_fence != *state_fence {
@@ -1895,12 +1914,30 @@ async fn automation_invocations_payload(
 ) -> Result<Value, AdapterError> {
     let automation_id = require_automation_id(decoded)?;
     let limit = usize::from(decoded.max_records.max(1));
-    let rows =
+    let rows = if let Some(occurrence_id) = decoded.requested_occurrence_id.as_deref() {
+        super::surreal_automation::read_invocation_for_read(
+            db,
+            config,
+            &automation_id,
+            occurrence_id,
+        )
+        .await?
+        .into_iter()
+        .collect()
+    } else {
         super::surreal_automation::read_invocations_for_read(db, config, &automation_id, limit)
-            .await?;
+            .await?
+    };
     let mut invocations = Vec::new();
     for row in rows {
         if row.state_fence != *state_fence {
+            continue;
+        }
+        if decoded
+            .requested_occurrence_id
+            .as_deref()
+            .is_some_and(|occurrence_id| row.occurrence_id != occurrence_id)
+        {
             continue;
         }
         if invocations.len() >= limit {
