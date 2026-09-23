@@ -98,7 +98,8 @@ pub use owner_closure_provider::{
     OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider, PreservedAdmission,
 };
 pub use reactive_admission::{
-    ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier, assess_reactive_risk,
+    AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
+    assess_reactive_risk, bind_atom_risk,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
