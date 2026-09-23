@@ -837,6 +837,36 @@ async fn run_loop(
                                     ..
                                 } => {}
                             }
+                            // O1 owner feed trigger (issue #2100): one
+                            // evaluation per activation completion over the
+                            // retained snapshot currency plus the Kernel
+                            // readback state. First bind, rotation, and
+                            // recovery re-presentation invoke the full
+                            // exchange; already-bound revisions verify
+                            // without republishing; regressions and
+                            // anomalies fail closed with exact detail.
+                            // Trigger outcomes never fail this loop.
+                            match eliotd::owner_feed::drive_owner_feed_once(
+                                &kernel,
+                                composition.as_ref(),
+                            )
+                            .await
+                            {
+                                eliotd::owner_feed::OwnerFeedDriveOutcome::Failed(error) => {
+                                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                        "owner-feed",
+                                        &error.to_string(),
+                                    )
+                                    .emit();
+                                }
+                                eliotd::owner_feed::OwnerFeedDriveOutcome::Published {
+                                    ..
+                                }
+                                | eliotd::owner_feed::OwnerFeedDriveOutcome::BoundVerified {
+                                    ..
+                                } => {}
+                            }
                             flight = ActivationFlight::Idle;
                         }
                         Err(ActivationDispatchError::Hard(error)) => return Err(error),

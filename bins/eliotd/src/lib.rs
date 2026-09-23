@@ -60,6 +60,8 @@ mod kernel_recovery_client;
 mod kernel_transition_client;
 pub mod notification_board_attach;
 mod observation_adapters;
+pub mod owner_feed;
+mod owner_publish;
 mod process_origin;
 pub mod reactive_feed;
 mod route_receipts;
@@ -1106,6 +1108,60 @@ impl DaemonComposition {
             privacy,
             owner_revision,
         )?)
+    }
+
+    /// Reads the retained Governor authority owner snapshot for owner-feed
+    /// triggering (issue #2100).
+    ///
+    /// Thin readiness-gated borrow of the canonical recovery snapshot the
+    /// Governor composition retains (`owners().authority.snapshot()`): the
+    /// caller derives the expected graph revision and the lineage-root
+    /// origin set from its public fields, never inventing either. No
+    /// observation, receipt, or binding logic lives here.
+    pub fn authority_owner_snapshot(
+        &self,
+    ) -> Result<eliot_governor::AuthorityOwnerSnapshot, DaemonError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(self.governor.owners().authority.snapshot()?)
+    }
+
+    /// Synchronizes the Kernel P-07 owner from live Governor state (issue
+    /// #2100 owner-closure feed call).
+    ///
+    /// Thin forwarder over
+    /// [`GovernorComposition::synchronize_kernel_owner`](eliot_governor::GovernorComposition::synchronize_kernel_owner):
+    /// readiness is checked first so callers observe the entry only on the
+    /// admitted path, then every argument crosses verbatim — origin
+    /// selector, record bound, and expected graph revision supplied by the
+    /// trigger from retained/live owner reads, never defaulted. The entry
+    /// reads history, decodes, restores, publishes, and verifies readback
+    /// itself; failures leave retained state untouched in the owners. No
+    /// observation, receipt, or binding logic lives here.
+    pub async fn synchronize_kernel_owner<R, K>(
+        &self,
+        reads: &R,
+        kernel: &K,
+        origin_ref: &str,
+        max_records: u32,
+        expected_revision: u64,
+    ) -> Result<u64, DaemonError>
+    where
+        R: eliot_store_api::CanonicalReadClient + ?Sized,
+        K: eliot_governor::OwnerPublishPort + ?Sized,
+    {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(self
+            .governor
+            .synchronize_kernel_owner(reads, kernel, origin_ref, max_records, expected_revision)
+            .await?)
     }
 
     /// Borrows the single Governor Skill lifecycle owner as the provider-neutral

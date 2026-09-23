@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
+use eliot_kernel_core::GovernorClosureRestore;
 use eliot_protocol::{
     AgentActivationResolutionDecision, AgentActivationResolutionResult, AgentActivationResultAck,
     AgentActivationResultReconcile, AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
@@ -920,6 +921,117 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Publishes one Governor owner bundle under an exact expected revision
+    /// through the authenticated `publish_owner_bundle` front-door operation
+    /// (issue #2100 owner-closure feed).
+    ///
+    /// The request carries the canonical restore plus the expected graph
+    /// revision; the Kernel binds (or refreshes) its retained P-07 owner
+    /// and acknowledges the bound revision. A zero expected revision fails
+    /// here before any transport is touched (the Kernel never binds
+    /// revision zero); a disagreeing bundle fails closed Kernel-side as an
+    /// identity conflict. The response shape (`kind` plus receipt value
+    /// with `revision` and bound `status`) is verified exactly — a
+    /// well-formed transport reply with the wrong shape fails closed like
+    /// a transport error, never coerced into a bound revision.
+    pub async fn publish_owner_bundle(
+        &self,
+        bundle: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, super::DaemonError> {
+        if expected_revision == 0 {
+            return Err(super::DaemonError::Kernel(
+                "owner publish expected revision must be nonzero".to_owned(),
+            ));
+        }
+        let value = self
+            .transact_async(
+                "publish_owner_bundle",
+                serde_json::json!({
+                    "bundle": bundle,
+                    "expected_revision": expected_revision,
+                }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let kind = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                super::DaemonError::Kernel(
+                    "Kernel publish response omitted receipt kind".to_owned(),
+                )
+            })?;
+        if kind != "owner_bundle_receipt" {
+            return Err(super::DaemonError::Kernel(format!(
+                "Kernel publish response kind is not an owner bundle receipt: {kind}"
+            )));
+        }
+        let status = value
+            .pointer("/value/status")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                super::DaemonError::Kernel(
+                    "Kernel publish receipt omitted bound status".to_owned(),
+                )
+            })?;
+        if status != "bound" {
+            return Err(super::DaemonError::Kernel(format!(
+                "Kernel publish receipt status is not bound: {status}"
+            )));
+        }
+        value
+            .pointer("/value/revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                super::DaemonError::Kernel(
+                    "Kernel publish receipt omitted bound revision".to_owned(),
+                )
+            })
+    }
+
+    /// Reads back the Kernel-retained P-07 owner triple through the
+    /// authenticated `query_owner_bundle` front-door operation (issue #2100
+    /// owner-closure feed).
+    ///
+    /// Returns `(bound, revision, digest)` exactly as retained: unbound
+    /// with absent revision/digest is normal pre-bind idle, never an
+    /// error. A present-but-malformed field (wrong JSON shape where a
+    /// value stands) fails closed; explicit nulls decode to `None`.
+    pub async fn query_owner_readback(
+        &self,
+    ) -> Result<(bool, Option<u64>, Option<String>), super::DaemonError> {
+        let refused = |detail: &str| super::DaemonError::Kernel(detail.to_owned());
+        let value = self
+            .transact_async("query_owner_bundle", serde_json::json!({}))
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let kind = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| refused("Kernel readback response omitted readback kind"))?;
+        if kind != "owner_bundle_readback" {
+            return Err(refused("Kernel readback response kind is not an owner bundle readback"));
+        }
+        let bound = value
+            .pointer("/value/bound")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| refused("Kernel readback omitted bound flag"))?;
+        let revision = match value.pointer("/value/revision") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Number(number)) => Some(number.as_u64().ok_or_else(|| {
+                refused("Kernel readback revision is not a non-negative integer")
+            })?),
+            Some(_) => return Err(refused("Kernel readback revision has the wrong shape")),
+        };
+        let digest = match value.pointer("/value/digest") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(digest)) => Some(digest.clone()),
+            Some(_) => return Err(refused("Kernel readback digest has the wrong shape")),
+        };
+        Ok((bound, revision, digest))
     }
 
     /// Executes one closed local read through the authenticated Kernel route.
