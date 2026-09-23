@@ -106,6 +106,7 @@ fn marked_candidate(context: &ContextBinding, permit_digest: &str) -> ContextCan
 /// Minimal envelope shell: encode/decode validates the envelope and the
 /// byte ceiling only, so structural (non-admission) fields suffice here.
 /// Full admission validity is proven natively; this proves transport.
+#[allow(clippy::too_many_lines)]
 fn envelope(candidate: ContextCandidate) -> GuestRequest {
     let context = binding();
     let role = ProviderRole {

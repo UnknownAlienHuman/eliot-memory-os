@@ -182,6 +182,7 @@ fn replay_plan() -> ReplayPlan {
 
 /// Full valid admission input embedding one producer-emitted marked atom
 /// plus one required floor atom, all bound to `task`/`fence`.
+#[allow(clippy::too_many_lines)]
 fn input_with_produced(
     task: &str,
     fence: &StateFence,
@@ -237,7 +238,7 @@ fn input_with_produced(
                 allowed_representations: vec![RepresentationKind::Whole],
             },
             RoleLossRule {
-                role: learning.provider_role.role.clone(),
+                role: learning.provider_role.role,
                 loss_policy: LossPolicy::Summarizable,
                 required: false,
                 allowed_representations: vec![

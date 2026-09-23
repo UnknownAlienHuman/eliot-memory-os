@@ -36,6 +36,7 @@ wasmparser = "0.256.0"
 # Governor issuance and registries and must never enter the guest closure.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 eliot-context-assembly = { path = "../eliot-context-assembly", version = "0.1.0" }
+eliot-governor = { path = "../../governor/eliot-governor", version = "0.1.0" }
 eliot-improvement = { path = "../../meta/eliot-improvement", version = "0.1.0" }
 time = { version = "0.3.44", features = ["serde", "formatting", "parsing"] }
 
