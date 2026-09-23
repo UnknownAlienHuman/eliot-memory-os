@@ -44,6 +44,19 @@
 //! authority, reinterprets the catalogue, or weakens verification to fake
 //! admittability.
 //!
+//! Paired convergence (single agreed durable operation): the Store lane
+//! carries the same six parameter keys byte-exact plus a durable
+//! coordination decision row keyed by operation identity, and its bridge
+//! fetches the coordination receipt by the restore identity with
+//! byte-exact triple/fence/class agreement (no second identity on either
+//! side). This module's decision binds the same restore identity triple
+//! the Store request carries, so kernel admission, coordination row, and
+//! Store request converge on one anchor. Which named operation writes
+//! the row stays M1B-ruled (a dedicated coordination record is
+//! recommended; a coordination-carrying reconcile is accepted without
+//! code change here since neither this module nor the commit path names
+//! the variant — only its RecoverySchema class and closed parameters).
+//!
 //! Owner-controlled fence/generation transition (F5) stays with the #961
 //! installation-cutover owner: reprovision mints a fresh admission (stale
 //! fences refuse), rotation never happens in place.

@@ -176,9 +176,14 @@ mod owners {
 /// obligation vocabulary above is retained for phase attribution and
 /// evidence; every effect call site below binds the live clients.
 use super::backup_owner_clients::{
-    AuthorizationExpectation, BlobOwnerClient, BrokerOwnerClient, CanonicalOwnerClient,
-    OrsOwnerClient, PurgeOwnerClient, SessionOwnerClient, VerifiedDestinationBinding,
-    verify_destination_authorization,
+    AuthorizationExpectation, BackupOwnerChannels, BlobOwnerClient, BrokerOwnerClient,
+    CanonicalOwnerClient, OrsOwnerClient, OwnerChannelError, PurgeOwnerClient, SessionOwnerClient,
+    VerifiedDestinationBinding, verify_destination_authorization,
+};
+use super::backup_restore_admission::RestoreProvisioningProof;
+use super::backup_restore_driver::{
+    CoordinationCommit, ProductionRestoreOutcome, ProductionRestoreRequest, RestoreImport,
+    drive_production_restore,
 };
 
 /// Outcome of one Kernel-executed isolated restore: the journaled receipt,
@@ -329,6 +334,44 @@ impl KernelBackupRestore {
     /// Returns the bound journal (admission, stream binding, inspection).
     pub fn journal(&mut self) -> &mut KernelRestoreJournal {
         &mut self.journal
+    }
+
+    /// Drives one production restore composition through the admitted
+    /// wires (H5 owner caller site).
+    ///
+    /// The true owner caller: the coordinator supplies its owner-held
+    /// journal while the caller supplies channels, the verified binding,
+    /// the compiled plan and validated bundle, the constructed
+    /// destination, the live fence, provisioning proofs, and the
+    /// Governor-built coordination and import transitions. Delegates to
+    /// [`drive_production_restore`]; the rehearsal paths (`restore`,
+    /// `request_cutover`) are untouched — this additive entry changes no
+    /// existing behavior. #963 invokes it once wired to the operator path.
+    pub async fn drive_production(
+        &self,
+        channels: &BackupOwnerChannels,
+        verified: &VerifiedDestinationBinding,
+        plan: &RestorePlan,
+        bundle: &BackupBundle,
+        destination: &KernelIsolatedDestination,
+        live_fence: &StateFence,
+        provisioning: RestoreProvisioningProof,
+        coordination: CoordinationCommit,
+        imports: Vec<RestoreImport>,
+    ) -> Result<ProductionRestoreOutcome, OwnerChannelError> {
+        drive_production_restore(ProductionRestoreRequest {
+            journal: &self.journal,
+            channels,
+            verified,
+            plan,
+            bundle,
+            destination,
+            live_fence,
+            provisioning,
+            coordination,
+            imports,
+        })
+        .await
     }
 
     /// Compiles the governed plan for one archive and target context.
