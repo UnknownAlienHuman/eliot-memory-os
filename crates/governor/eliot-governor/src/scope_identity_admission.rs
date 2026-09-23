@@ -18,6 +18,11 @@
 //! - [`GovernorComposition::admit_scope_relocation`] admits an authorized
 //!   relocation/attach receipt as the new expected binding, gated on a fresh
 //!   `MATCHED` source-closure check for the observed instance;
+//! - [`GovernorComposition::admit_observed_scope_attach`] is the owning thin
+//!   caller for the attach trigger path: it produces the owner-issued attach
+//!   receipt from a live mechanical observation plus the retained descriptor
+//!   and explicit authorization, then admits it through
+//!   [`GovernorComposition::admit_scope_relocation`];
 //! - [`check_task_observation`] is the daemon fast-path helper: it enforces
 //!   the sources-independent identity legs (instance, scope claim,
 //!   generation) and never fabricates source-closure outcomes. Lineage is
