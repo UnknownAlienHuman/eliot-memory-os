@@ -1640,9 +1640,10 @@ fn experience_range_payload(
 /// [`StoreError::PayloadTooLarge`] past
 /// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
 /// instead of truncating; a present cursor verified by
-/// `audit_cursor_parse` against this fence resumes paging past that
-/// candidate ordinal with the same bound and no overflow failure.
-/// Cross-fence or malformed cursors fail closed.
+/// `audit_cursor_parse` against this fence and the current revision
+/// heads resumes paging past that candidate ordinal with the same bound
+/// and no overflow failure. Cross-fence, stale-heads, or malformed
+/// cursors fail closed (callers restart enumeration).
 fn audit_range_payload(
     state: &MemoryState,
     query: &NamedReadRequest,
@@ -1650,10 +1651,18 @@ fn audit_range_payload(
 ) -> Result<Value, serde_json::Error> {
     let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
         None => None,
-        Some(cursor) => Some(
-            eliot_store_api::audit_cursor_parse(cursor, fence)
-                .map_err(|error| serde_json::Error::custom(error.to_string()))?,
-        ),
+        Some(cursor) => {
+            let heads: Vec<(String, u64)> = state
+                .revision_heads
+                .values()
+                .map(|head| (head.key.as_str().to_owned(), head.revision))
+                .collect();
+            Some(
+                eliot_store_api::audit_cursor_parse(cursor, fence, &heads).map_err(|error| {
+                    serde_json::Error::custom(error.to_string())
+                })?,
+            )
+        }
     };
     let mut records = Vec::new();
     let mut ordinal: u64 = 0;

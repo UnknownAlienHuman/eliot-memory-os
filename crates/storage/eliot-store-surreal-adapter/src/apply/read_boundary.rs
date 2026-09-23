@@ -1969,12 +1969,13 @@ async fn automation_failure_payload(
 /// Continuation cursors (optional `cursor` selector): an absent cursor
 /// reads from the start and fails closed with `PayloadTooLarge` past
 /// `MAX_AUDIT_RANGE_RECORDS` instead of truncating; a present cursor
-/// verified by `audit_cursor_parse` against this fence resumes paging
-/// past that candidate ordinal (commit-sequence, evidence-position
-/// order) with the same bound and no overflow failure. Cross-fence or
-/// malformed cursors fail closed; cursors stay valid only while
-/// revision heads are unchanged (the consumer re-proves heads per read
-/// and restarts paging on advance). Candidate-only: full envelope
+/// verified by `audit_cursor_parse` against this fence and the current
+/// revision heads resumes paging past that candidate ordinal
+/// (commit-sequence, evidence-position order) with the same bound and
+/// no overflow failure. Cross-fence, stale-heads, or malformed cursors
+/// fail closed (callers restart enumeration); cursors stay valid only
+/// while revision heads are unchanged (the consumer re-proves heads per
+/// read and restarts paging on advance). Candidate-only: full envelope
 /// validation and live-journal presence binding stay downstream, so a
 /// carried candidate can never become a false journal record here.
 async fn audit_range_payload(
@@ -2016,10 +2017,15 @@ async fn audit_range_payload(
         }
     }
     ordered.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
     let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
         None => None,
         Some(cursor) => Some(
-            eliot_store_api::audit_cursor_parse(cursor, state_fence)
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
                 .map_err(AdapterError::Store)?,
         ),
     };

@@ -169,7 +169,7 @@ pub use experience_store::{
     ExperienceContractError, ExperienceRangePage, MAX_EXPERIENCE_HANDLE_BYTES,
     MAX_EXPERIENCE_IDEMPOTENCY_BYTES, MAX_EXPERIENCE_PAGE_RECORDS,
     MAX_EXPERIENCE_RECORD_JSON_BYTES, AUDIT_PARAM_CURSOR, audit_cursor_issue,
-    audit_cursor_parse, audit_envelope_candidate, decode_experience_mutation,
+    audit_cursor_parse, audit_envelope_candidate, audit_heads_digest, decode_experience_mutation,
     experience_bank_commit_params, experience_bank_mutation_request, experience_bank_read_request,
     experience_feedback_commit_params, experience_feedback_mutation_request,
     experience_feedback_read_request, validate_experience_mutation_params,
