@@ -14,18 +14,22 @@
 //! before the composition path runs:
 //!
 //! ```text
-//! latest row for (skill_id, package source_digest), by commit order
+//! latest row for the skill, by commit order, binds the presented digest
 //!   action in {keep, patch, split, merge, restore} → Accepted
 //!   action in {suppress, archive, quarantine}      → Revoked
-//!   no row for the digest                          → Unknown (provisional only)
+//! latest row binds another digest, or no row binds the digest
+//!                                                  → Unknown (provisional only)
 //!   truncated history                              → Unresolvable (refuse)
 //! ```
 //!
-//! Supersession emerges from the same ordering: a newer digest accepted for
-//! the skill leaves the older digest without a later accepting row, and an
-//! explicit suppress/archive/quarantine row revokes it. Unknown digests
-//! install provisional under the existing catalogue policy and never as
-//! accepted material: absence of a row proves nothing.
+//! Supersession emerges from the same ordering: once a newer row commits for
+//! the skill — accepting or revoking a different package digest — the older
+//! digest no longer holds the current owner position, so it resolves Unknown
+//! even when an older row accepted it. An explicit suppress/archive/quarantine
+//! row revokes only the digest it binds. Unknown digests never bind material
+//! as accepted: absence of a row proves nothing, and a superseded digest
+//! proves only that the owner moved on. I7.25 keeps every such intake a
+//! reversible candidate until governed promotion commits a row for it.
 //!
 //! Reads run under `ExactFence` against the caller-observed admitted fence;
 //! the response operation, fence, scope, skill, and payload version are
@@ -167,13 +171,84 @@ pub async fn resolve_intake_acceptance(
     resolve_acceptance(&request, &response, package_digest)
 }
 
+/// Latest committed rows for one skill: the overall owner position plus the
+/// presented-digest position, each as commit order with its deciding fields.
+type LatestSkillRows = (Option<(u64, String)>, Option<(u64, String, String, String)>);
+
+/// Scans served lifecycle-policy rows for one skill and returns the latest
+/// committed row overall plus the latest row binding the presented digest.
+///
+/// Both positions advance by commit order (`capture_index`); served order
+/// breaks ties. Every row must carry the exact six lifecycle parameters —
+/// a row missing its base view, or naming another skill, fails closed
+/// rather than deciding currency on a partial claim.
+fn latest_skill_rows(
+    records: &[serde_json::Value],
+    planned_skill: &str,
+    package_digest: &str,
+) -> Result<LatestSkillRows, AcceptanceReadError> {
+    let mut latest_overall: Option<(u64, String)> = None;
+    let mut latest_match: Option<(u64, String, String, String)> = None;
+    for record in records {
+        if record.get("operation").and_then(serde_json::Value::as_str)
+            != Some("ApplyLifecyclePolicy")
+        {
+            return Err(AcceptanceReadError::Payload("operation"));
+        }
+        let parameters = record
+            .get("parameters")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(AcceptanceReadError::Payload("parameters"))?;
+        let text = |name: &str| {
+            parameters
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .ok_or(AcceptanceReadError::Payload("parameters"))
+        };
+        if text("skill_id")? != planned_skill {
+            return Err(AcceptanceReadError::Payload("skill"));
+        }
+        // The committed row carries the exact six lifecycle parameters; a
+        // row missing its base view cannot prove the promotion it claims.
+        text("base_view_digest")?;
+        let row_digest = text("candidate_package_digest")?.to_owned();
+        let revision = record
+            .get("capture_index")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(AcceptanceReadError::Payload("capture_index"))?;
+        if latest_overall
+            .as_ref()
+            .is_none_or(|current| revision > current.0)
+        {
+            latest_overall = Some((revision, row_digest.clone()));
+        }
+        if row_digest != package_digest {
+            continue;
+        }
+        let action = text("action")?.to_owned();
+        let verifier_ref = text("verifier_ref")?.to_owned();
+        let candidate_digest = text("candidate_digest")?.to_owned();
+        if latest_match
+            .as_ref()
+            .is_none_or(|current| revision > current.0)
+        {
+            latest_match = Some((revision, action, verifier_ref, candidate_digest));
+        }
+    }
+    Ok((latest_overall, latest_match))
+}
+
 /// Resolves the canonical acceptance verdict for one package digest.
 ///
 /// Validates operation, fence, scope, skill, and payload-version identity
 /// against the planned read, then takes the latest committed row (by commit
-/// order) binding `package_digest`. A truncated history cannot prove
-/// currency and fails closed: the error refuses the drive rather than
-/// installing on a possibly revoked digest.
+/// order) for the skill. Only the digest bound by that latest row can decide
+/// Accepted or Revoked: a newer row binding a different package digest
+/// supersedes the presented one, resolving Unknown even when an older row
+/// accepted it. Absence of any row for the digest resolves Unknown as well —
+/// never acceptance. A truncated history cannot prove currency and fails
+/// closed: the error refuses the drive rather than installing on a possibly
+/// revoked digest.
 pub fn resolve_acceptance(
     request: &NamedReadRequest,
     response: &NamedReadResponse,
@@ -227,41 +302,15 @@ pub fn resolve_acceptance(
         .get("records")
         .and_then(serde_json::Value::as_array)
         .ok_or(AcceptanceReadError::Payload("records"))?;
-    let mut latest: Option<(u64, String, String, String)> = None;
-    for record in records {
-        if record.get("operation").and_then(serde_json::Value::as_str)
-            != Some("ApplyLifecyclePolicy")
-        {
-            return Err(AcceptanceReadError::Payload("operation"));
-        }
-        let parameters = record
-            .get("parameters")
-            .and_then(serde_json::Value::as_object)
-            .ok_or(AcceptanceReadError::Payload("parameters"))?;
-        let text = |name: &str| {
-            parameters
-                .get(name)
-                .and_then(serde_json::Value::as_str)
-                .ok_or(AcceptanceReadError::Payload("parameters"))
-        };
-        if text("skill_id")? != planned_skill {
-            return Err(AcceptanceReadError::Payload("skill"));
-        }
-        if text("candidate_package_digest")? != package_digest {
-            continue;
-        }
-        let revision = record
-            .get("capture_index")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or(AcceptanceReadError::Payload("capture_index"))?;
-        let action = text("action")?.to_owned();
-        let verifier_ref = text("verifier_ref")?.to_owned();
-        let candidate_digest = text("candidate_digest")?.to_owned();
-        if latest.as_ref().is_none_or(|current| revision > current.0) {
-            latest = Some((revision, action, verifier_ref, candidate_digest));
-        }
+    let (latest_overall, latest_match) = latest_skill_rows(records, planned_skill, package_digest)?;
+    // Currency first: a newer committed row for another digest supersedes the
+    // presented one — the owner moved on, so the older acceptance no longer
+    // decides. Absence of any row resolves Unknown the same way.
+    match latest_overall {
+        Some((_, current_digest)) if current_digest == package_digest => {}
+        _ => return Ok(AcceptanceVerdict::Unknown),
     }
-    let Some((revision, action, verifier_ref, candidate_digest)) = latest else {
+    let Some((revision, action, verifier_ref, candidate_digest)) = latest_match else {
         return Ok(AcceptanceVerdict::Unknown);
     };
     let record = AcceptanceRecord {
@@ -315,7 +364,6 @@ mod tests {
             },
         })
     }
-
     fn response(records: Vec<serde_json::Value>, truncated: bool) -> NamedReadResponse {
         NamedReadResponse {
             operation: NamedReadOperation::GetCapabilityEvidenceState,
@@ -390,6 +438,64 @@ mod tests {
         )
         .expect("resolves");
         assert!(matches!(verdict, AcceptanceVerdict::Unknown));
+    }
+
+    #[test]
+    fn newer_different_digest_supersedes_older_acceptance() {
+        // The owner moved on: a newer committed row binds another package
+        // digest, so the older digest resolves Unknown even though an older
+        // row accepted it. Only the current digest decides.
+        let rows = vec![
+            record(1, "keep", &"d".repeat(64)),
+            record(2, "keep", &"e".repeat(64)),
+        ];
+        let superseded =
+            resolve_acceptance(&planned(), &response(rows.clone(), false), &"d".repeat(64))
+                .expect("resolves");
+        assert!(matches!(superseded, AcceptanceVerdict::Unknown));
+        let current = resolve_acceptance(&planned(), &response(rows, false), &"e".repeat(64))
+            .expect("resolves");
+        assert!(matches!(
+            current,
+            AcceptanceVerdict::Accepted(ref record) if record.revision == 2
+        ));
+    }
+
+    #[test]
+    fn superseded_digest_never_revives_past_a_later_revocation() {
+        // An older acceptance stays superseded once a newer row commits for
+        // another digest — including a revocation of that newer digest.
+        let rows = vec![
+            record(1, "keep", &"d".repeat(64)),
+            record(2, "suppress", &"e".repeat(64)),
+        ];
+        let superseded =
+            resolve_acceptance(&planned(), &response(rows.clone(), false), &"d".repeat(64))
+                .expect("resolves");
+        assert!(matches!(superseded, AcceptanceVerdict::Unknown));
+        let revoked = resolve_acceptance(&planned(), &response(rows, false), &"e".repeat(64))
+            .expect("resolves");
+        assert!(matches!(
+            revoked,
+            AcceptanceVerdict::Revoked(ref record) if record.revision == 2
+        ));
+    }
+
+    #[test]
+    fn row_missing_its_base_view_fails_closed() {
+        // Committed rows carry the exact six lifecycle parameters: a row
+        // without its base view cannot prove the promotion it claims.
+        let mut partial = record(1, "keep", &"d".repeat(64));
+        partial["parameters"]
+            .as_object_mut()
+            .expect("parameters")
+            .remove("base_view_digest");
+        let refused =
+            resolve_acceptance(&planned(), &response(vec![partial], false), &"d".repeat(64));
+        assert!(matches!(
+            refused,
+            Err(AcceptanceReadError::Payload(field)) if field == "parameters"
+        ));
     }
 
     #[test]
