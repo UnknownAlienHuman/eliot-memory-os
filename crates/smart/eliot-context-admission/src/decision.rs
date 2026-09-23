@@ -47,6 +47,7 @@ use eliot_context_contracts::{
     ContextCandidate, ContextError, ContextOutcome, OmissionRecord,
 };
 use eliot_contracts::{ArtifactId, DecisionId, StateFence, fences_match_exact};
+use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_reactive_context_plan::RetrievalPlan;
 use serde::{Deserialize, Serialize};
 
@@ -130,14 +131,13 @@ impl RetrievalAdmissionDecision {
 ///
 /// Warning-text ownership (I12.26 `include_with_warning`: framing,
 /// staleness bound, or contradiction risk staying below suppression) is
-/// assigned, not invented here: risk-derived warnings belong to the
-/// Governor risk owner for reactive admission (1942 C1 per-item risk and
-/// attestation), contradiction-risk warnings to the conflict-analysis
-/// owner, and staleness-bound warnings with expected source/projection
-/// revision comparands to the reactive projection owners. Bound producers
-/// mint [`SuppliedWarning`] records threaded through the warning-capable
-/// join; the Governor lane's bridge-transport risk tiers are never mapped
-/// to warning text here, which would invent a cross-vocabulary quotient.
+/// assigned, not invented here. The live channel is candidate-owned
+/// epistemic evidence evaluated by [`derive_candidate_warnings`] under the
+/// canonical [`ContextCandidate::validate`] coherence rule (see below);
+/// lane producers (projection owners and successors) may additionally mint
+/// [`SuppliedWarning`] records threaded through the warning-capable join.
+/// Governor risk stays factual and separate: its atom-keyed attestation
+/// never authorises warning text here, and no tier maps to any outcome.
 /// [`classify_admission`] keeps the total unable-path for absent evidence;
 /// no new outcome kind is created.
 pub struct ClassificationEvidence<'a> {
@@ -279,6 +279,74 @@ fn validate_warning_text(value: &str) -> Result<(), ContextError> {
     Ok(())
 }
 
+/// Derive owner warning evidence from one candidate's epistemic record.
+///
+/// ## Canonical grounding (exact, no quotient)
+///
+/// [`ContextCandidate::validate`] imposes the coherence lattice this
+/// derivation reads, it invents nothing:
+///
+/// - `Observed`/`Unknown` or `Stale`/`Contested`/`Superseded`/`Rejected`
+///   status can never pair with `Assertable`; `Verified` requires it.
+/// - `PresentCurrent` availability can never pair with `Stale`/`Superseded`
+///   status, so epistemic staleness on admitted material is owned by the
+///   availability gate, never by this derivation.
+///
+/// Hence admitted material carrying `Contested` status is the I12.26
+/// contradiction risk below suppression (the analysis preserves without
+/// resolving; the decision admits with warning), and admitted material
+/// whose assertability is not `Assertable` carries the validity-imposed
+/// framing qualification (attributed or fenced, never asserted). Clean
+/// pairs (`Supported`/`Verified` with `Assertable`) derive nothing. Each
+/// signal is quoted by its canonical wire spelling in fixed order
+/// (epistemic status, then assertability); the text is bounded short
+/// literals, so it always satisfies [`SuppliedWarning::validate`].
+/// Selection is untouched: degraded statuses that policy must suppress
+/// stay a disposition/policy matter, never a warning invention here.
+#[must_use]
+pub fn derive_candidate_warnings(candidate: &ContextCandidate) -> Option<SuppliedWarning> {
+    let mut signals = Vec::new();
+    if candidate.status == EpistemicStatus::Contested {
+        signals.push("epistemic:CONTESTED");
+    }
+    match candidate.assertability {
+        Assertability::Assertable => {}
+        Assertability::NonAssertableUnverified => {
+            signals.push("assertability:NON_ASSERTABLE_UNVERIFIED");
+        }
+        Assertability::AbstainOrFence => {
+            signals.push("assertability:ABSTAIN_OR_FENCE");
+        }
+    }
+    if signals.is_empty() {
+        return None;
+    }
+    Some(SuppliedWarning {
+        atom_id: candidate.atom_id.clone(),
+        text: signals.join("; "),
+    })
+}
+
+/// Derive the warning set for one admission input closure.
+///
+/// Applies [`derive_candidate_warnings`] to every input candidate in
+/// canonical atom-identity order. The runtime join threads the result
+/// into [`trace_material_with_warnings`]; admitted candidates carrying
+/// derived evidence classify to `include_with_warning` through the
+/// unchanged [`classify_admission`] arm. Pure over the input: no I/O, no
+/// selection, no mutation.
+#[must_use]
+pub fn derive_input_warnings(input: &AdmissionInput) -> Vec<SuppliedWarning> {
+    let mut warnings: Vec<SuppliedWarning> = input
+        .candidates
+        .candidates
+        .iter()
+        .filter_map(derive_candidate_warnings)
+        .collect();
+    warnings.sort_by(|left, right| left.atom_id.cmp(&right.atom_id));
+    warnings
+}
+
 /// Closed stale-projection outcome from the pre-admission fence comparison.
 ///
 /// Exactly the I12.26 trichotomy yielded when source/projection revisions and
@@ -373,19 +441,32 @@ pub fn check_retrieval_freshness(input: &AdmissionInput) -> Result<(), Retrieval
 
 /// Compare candidate source revisions against plan expectations.
 ///
-/// For every candidate whose source owner carries a plan-supplied
-/// `expected_revision`, the candidate's actual source revision must match
-/// it — but only under a matching State Fence: fence-disagreeing
-/// candidates defer to the fence arm (`PacketRefreshRequired`) and take no
-/// revision verdict here. A revision mismatch on a mandatory (floor)
-/// candidate yields [`RetrievalStaleness::StaleProjection`]; on an optional
-/// candidate it yields [`RetrievalStaleness::ProbeRequired`]. Sources
-/// without a plan entry, and entries without an expectation, carry no
-/// revision opinion: the plan owner scoped expectations to listed sources
-/// only. The outcome is deterministic and independent of candidate order:
-/// floor mismatches report before optional ones. This check performs no
-/// selection, ranking, or mutation; the runtime join runs it beside plan
-/// validation before admission firing.
+/// For every fence-matching candidate, the candidate's actual source
+/// revision must resolve against a plan-supplied `expected_revision`:
+/// fence-disagreeing candidates defer to the fence arm
+/// (`PacketRefreshRequired`) and take no revision verdict here.
+///
+/// ## Owning record and namespace semantics
+///
+/// The actual comparand is the source owner's revision string on the
+/// candidate; the expected comparand is the retrieval owner's
+/// `expected_revision` on the matching plan fence entry, matched by exact
+/// source-owner identity. Revision strings are an opaque source-owner
+/// namespace — they are not task counters and never task-revision values;
+/// no text-to-counter equivalence is assumed or constructed anywhere in
+/// this comparison, only exact string equality within one source owner.
+///
+/// ## Fail-closed coverage
+///
+/// An unresolved compare rejects: a fence-matching candidate whose source
+/// has no plan entry, or whose entry states no expectation, yields
+/// [`RetrievalStaleness::StaleProjection`] when mandatory (floor) and
+/// [`RetrievalStaleness::ProbeRequired`] when optional. Silence would admit
+/// material the plan owner never bound. Floor verdicts report before
+/// optional ones, so the outcome is deterministic and independent of
+/// candidate order. This check performs no selection, ranking, or
+/// mutation; the runtime join runs it beside plan validation before
+/// admission firing.
 pub fn check_plan_revisions(
     plan: &RetrievalPlan,
     input: &AdmissionInput,
@@ -397,7 +478,7 @@ pub fn check_plan_revisions(
         .iter()
         .map(|member| &member.atom_id)
         .collect();
-    let mut optional_mismatch = false;
+    let mut optional_unresolved = false;
     for candidate in &input.candidates.candidates {
         // Fence disagreement is owned by the fence arm
         // (`check_retrieval_freshness` → `PacketRefreshRequired`):
@@ -407,24 +488,20 @@ pub fn check_plan_revisions(
         if !fences_match_exact(&input.binding.state_fence, &candidate.binding.state_fence) {
             continue;
         }
-        let Some(entry) = plan
+        let resolved = plan
             .source_projection_fences
             .iter()
             .find(|entry| entry.source == candidate.source.source_id)
-        else {
-            continue;
-        };
-        let Some(expected) = entry.expected_revision.as_deref() else {
-            continue;
-        };
-        if candidate.source.revision != expected {
+            .and_then(|entry| entry.expected_revision.as_deref())
+            .is_some_and(|expected| candidate.source.revision == *expected);
+        if !resolved {
             if floor_ids.contains(&candidate.atom_id) {
                 return Err(RetrievalStaleness::StaleProjection);
             }
-            optional_mismatch = true;
+            optional_unresolved = true;
         }
     }
-    if optional_mismatch {
+    if optional_unresolved {
         return Err(RetrievalStaleness::ProbeRequired);
     }
     Ok(())
