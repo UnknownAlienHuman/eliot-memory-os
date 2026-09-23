@@ -1151,9 +1151,7 @@ impl ColdStartController {
                 task_ref,
                 task_revision,
                 acceptance_digest,
-            } => {
-                Self::check_task_ref(task_ref, task_revision, acceptance_digest, false)
-            }
+            } => Self::check_task_ref(task_ref, task_revision, acceptance_digest, false),
             TaskBindingInput::Current {
                 task_ref,
                 task_revision,
