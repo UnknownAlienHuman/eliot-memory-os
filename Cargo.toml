@@ -285,6 +285,7 @@ eliot-runtime = { path = "crates/kernel/eliot-runtime", version = "0.1.0" }
 eliot-native-worker-core = { path = "crates/modules/eliot-native-worker-core", version = "0.1.0" }
 eliot-wasm-runtime = { path = "crates/modules/eliot-wasm-runtime", version = "0.1.0" }
 eliot-source-assurance = { path = "crates/security/eliot-source-assurance", version = "0.1.0" }
+eliot-influence = { path = "crates/security/eliot-influence", version = "0.1.0" }
 eliot-host-service = { path = "crates/kernel/eliot-host-service", version = "0.1.0" }
 eliot-installation = { path = "crates/kernel/eliot-installation", version = "0.1.0" }
 eliot-kernel-service = { path = "crates/kernel/eliot-kernel-service", version = "0.1.0" }

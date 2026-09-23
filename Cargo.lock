@@ -851,6 +851,7 @@ name = "eliot-authority"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-influence",
  "eliot-receipts",
  "eliot-runtime-contracts",
  "eliot-security-contracts",

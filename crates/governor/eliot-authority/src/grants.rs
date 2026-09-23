@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use eliot_contracts::StateFence;
+use eliot_influence::{
+    BoundedRevocationRequest, ClosureCompleteness, InfluenceEdgeDisposition, QualifiedInfluenceEdge,
+};
 use eliot_receipts::{AuthorityBinding, EffectClass, SessionBinding, WorkScopeBinding};
-use eliot_security_contracts::EffectCeiling;
+use eliot_security_contracts::{EffectCeiling, RevocationReason};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -586,6 +590,41 @@ impl GrantGraph {
             }
         }
         let suppressed = derive_suppressions(&graph, &closures);
+        // Fail-closed recheck: every engine-reachable in-graph descendant of
+        // an affected in-graph grant must already be suppressed. The engine
+        // traverses exactly the same-root parent links as
+        // `derive_suppressions`, so this holds by construction on complete
+        // evidence and refuses when a closure under-claims its transitive
+        // descendants. Affected references naming no grant in this graph
+        // belong to another graph's denominator and refuse nothing.
+        let suppressed_ids: BTreeSet<&str> = suppressed
+            .iter()
+            .map(|entry| entry.grant_id.as_str())
+            .collect();
+        for closure in &closures {
+            for affected_ref in &closure.affected {
+                let Ok(grant_id) = GrantId::new(affected_ref.as_str()) else {
+                    continue;
+                };
+                if graph.grant(grant_id.as_str()).is_none() {
+                    continue;
+                }
+                let outcome = graph
+                    .transitive_revocation_closure(
+                        &grant_id,
+                        &evidence.state_fence,
+                        &eliot_influence::RevocationBounds::default_bounds(),
+                    )
+                    .map_err(|_| RevocationHistoryError::UnknownHistory)?;
+                for engine_ref in &outcome.affected_refs {
+                    if graph.grant(engine_ref.as_str()).is_some()
+                        && !suppressed_ids.contains(engine_ref.as_str())
+                    {
+                        return Err(RevocationHistoryError::UnknownHistory);
+                    }
+                }
+            }
+        }
         for entry in &suppressed {
             if let Ok(grant_id) = GrantId::new(entry.grant_id.clone()) {
                 graph.apply_restored_revocation(&grant_id);
@@ -671,6 +710,70 @@ impl GrantGraph {
             revision: self.revision,
             members,
         })
+    }
+
+    /// Recomputes the exact transitive revocation closure of one grant
+    /// through the pure `eliot-influence` bounded revocation evaluator.
+    ///
+    /// This is a read-only recheck of a complete, current closure against
+    /// the same origin, scope, fence, and snapshot: the caller supplies the
+    /// origin grant, the recovery fence, and explicit bounds, and the engine
+    /// derives the exact affected set from live-graph delegation edges.
+    /// Historical drift is rejected earlier at `require_current` plus the
+    /// fence checks in
+    /// [`from_recovery_snapshot_with_revocation_history`](Self::from_recovery_snapshot_with_revocation_history);
+    /// this method evaluates the current live graph only.
+    ///
+    /// Every delegation link on the origin's authority root becomes one
+    /// qualified influence edge with
+    /// [`PermittedCurrent`](InfluenceEdgeDisposition::PermittedCurrent)
+    /// disposition: live-graph edges are current by construction. Lineage
+    /// that crosses authority roots is never followed, mirroring
+    /// [`delegated_closure`](Self::delegated_closure).
+    ///
+    /// Historical grants and lineage are preserved: this method takes
+    /// `&self` and deletes nothing. The graph crate never mutates
+    /// authority; this crate calls the pure evaluator only, and any engine
+    /// error maps to [`AuthorityError::InvalidField`] without adding a
+    /// variant (a new variant would break exhaustive downstream matches).
+    pub fn transitive_revocation_closure(
+        &self,
+        origin: &GrantId,
+        fence: &StateFence,
+        bounds: &eliot_influence::RevocationBounds,
+    ) -> Result<eliot_influence::BoundedRevocationOutcome, AuthorityError> {
+        let target = self
+            .grants
+            .get(origin)
+            .ok_or_else(|| AuthorityError::MissingParent(origin.clone()))?;
+        let authority_root_ref = target.authority_root_ref.clone();
+        // `BTreeMap` iteration is grant-id ordered, so edge order is
+        // deterministic across restarts and owners.
+        let mut edges = Vec::new();
+        for grant in self.grants.values() {
+            let Some(parent_id) = grant.parent_grant_id.as_ref() else {
+                continue;
+            };
+            if grant.authority_root_ref != authority_root_ref {
+                continue;
+            }
+            edges.push(QualifiedInfluenceEdge {
+                source_ref: parent_id.as_str().to_owned(),
+                dependent_ref: grant.grant_id.as_str().to_owned(),
+                disposition: InfluenceEdgeDisposition::PermittedCurrent,
+            });
+        }
+        let request = BoundedRevocationRequest {
+            request_id: format!("transitive-revocation:{}", origin.as_str()),
+            root_ref: origin.as_str().to_owned(),
+            reason: RevocationReason::SourceRevoked,
+            state_fence: fence.clone(),
+            edges,
+            completeness: ClosureCompleteness::Complete,
+            resumed_visited: Vec::new(),
+        };
+        eliot_influence::revoke_bounded(&request, bounds)
+            .map_err(|_| AuthorityError::InvalidField("transitive_revocation_closure"))
     }
 
     pub fn snapshot(
