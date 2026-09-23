@@ -1,3 +1,4 @@
+using Eliot.Operator.Protocol;
 using Microsoft.UI.Xaml;
 
 namespace Eliot.Operator;
@@ -53,12 +54,18 @@ public partial class App : Application
                 "Eliot",
                 "logs");
             Directory.CreateDirectory(directory);
-            var details = exception is null
-                ? string.Empty
-                : $" hresult=0x{exception.HResult:X8} type={exception.GetType().FullName} message={exception.Message}{Environment.NewLine}{exception}";
-            File.AppendAllText(
-                Path.Combine(directory, "operator-startup.log"),
-                $"{DateTimeOffset.UtcNow:O} {stage}{details}{Environment.NewLine}");
+            var path = Path.Combine(directory, "operator-startup.log");
+            // Bounded redacted record: stage, exception type, and HRESULT
+            // only. Messages, stack traces, pipe names, nonces, endpoints,
+            // credentials, and command/query bodies never enter the log.
+            var record = OperatorDiagnostics.FormatStartupRecord(
+                stage, exception?.GetType().FullName, exception?.HResult);
+            var info = new FileInfo(path);
+            if (info.Exists && OperatorDiagnostics.ShouldRotate(info.Length))
+            {
+                File.Delete(path);
+            }
+            File.AppendAllText(path, $"{record}{Environment.NewLine}");
         }
         catch
         {

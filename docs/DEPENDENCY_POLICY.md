@@ -76,6 +76,21 @@ proof ceilings:
    content-addressed canonical receipt. Proof ceiling:
    `DEPENDENCY_ADMISSION_AND_ADVISORY_EVIDENCE_CANDIDATE`.
 
+For a Windows release selecting the project-local SurrealDB candidate, the
+provisioner keeps the installed-version OSV evidence separate and fetches a
+fresh query/result for the exact selected candidate version. After the Windows
+build, the release builder consumes a selected-release receipt that binds the
+candidate artifact bytes, policy manifest, release catalogue, provisioning
+receipt, exact OSV query/response digests and retrieval time. It stages the
+receipt and the query/response bytes, then verifies those bindings again with
+the release bundle. The receipt reports `release_admission: INCOMPLETE` while
+applicability of crate advisories to the distributed Windows binary remains
+unestablished; it does not turn the installed `3.1.4` findings into a clean
+result or claim a complete dependency-policy PASS.
+This release-only refresh does not make the `offline-source` profile depend on
+network access or current candidate advisories; that profile does not assess
+the selected candidate's advisory response.
+
 ## Multi-ecosystem denominator and inventory
 
 All third-party inputs admitted into ELIOT are accounted for in a single
@@ -109,4 +124,3 @@ with executable digest). Policy execution produces a canonical receipt
 - advisory database snapshot timestamp and source;
 - evaluated targets and feature profiles;
 - structured exceptions and verification findings.
-

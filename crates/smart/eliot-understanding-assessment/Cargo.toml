@@ -1,0 +1,33 @@
+[package]
+name = "eliot-understanding-assessment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Bounded Common Ground and scoped understanding assessment over frozen compiled-view and accepted-source refs by handle (#223)"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "IMPLEMENTED_PROTOTYPE"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.understanding.common_ground"
+freeze_ref = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+source_layer = "C1"
+agent_order = 85
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-context-contracts.workspace = true
+eliot-dreamer-contracts.workspace = true
+eliot-epistemic-contracts.workspace = true
+eliot-observation-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

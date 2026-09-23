@@ -295,6 +295,12 @@
                                      TextWrapping="Wrap" AcceptsReturn="True" MinHeight="56" />
                             <Button Content="Submit typed action" Click="ExecuteAction_OnClick"
                                     AutomationProperties.Name="Submit selected typed action through Governor" />
+                            <StackPanel x:Name="UnknownOutcomePanel" Spacing="6" Visibility="Collapsed">
+                                <TextBlock Text="Unknown outcome: a mutation may have executed. Reconciling reuses the same operation identity; it never creates a second mutation."
+                                           TextWrapping="Wrap" FontSize="12" Opacity="0.85" />
+                                <Button Content="Reconcile unknown operations" Click="ReconcileUnknown_OnClick"
+                                        AutomationProperties.Name="Reconcile unknown operator operations under the same identity" />
+                            </StackPanel>
                         </StackPanel>
                     </ScrollViewer>
                 </Border>

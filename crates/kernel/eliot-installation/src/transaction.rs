@@ -1981,6 +1981,57 @@ impl InstallationTransaction {
         self.validate()
     }
 
+    /// Retires an owner-acknowledged first-install activation projection and
+    /// enters the existing exact-effect rollback path.
+    ///
+    /// This transition is intentionally separate from `mark_unknown`: it is
+    /// legal only while the signed activation contour is still pre-no-return,
+    /// and the caller must have already received the Host registry's exact
+    /// `ABORTED` terminal acknowledgement.  The intent is cleared only by
+    /// the transaction-store CAS performed by the coordinator after this
+    /// in-memory transition succeeds.
+    pub(crate) fn prepare_pre_no_return_rollback(
+        &mut self,
+        abort_evidence: PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        if self.stage != InstallationStage::Activating {
+            return Err(InstallationError::IllegalTransition {
+                from: self.stage,
+                to: InstallationStage::RollbackRequired,
+            });
+        }
+        if self.activation_projection_intent.is_none() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.no_return_boundary.is_some() || self.active_verified_receipt.is_some() {
+            return Err(InstallationError::IncompleteObservation(
+                "pre-no-return activation rollback requires no committed activation boundary"
+                    .to_owned(),
+            ));
+        }
+        if self.current_active_manifest.is_some() || self.last_known_good.is_some() {
+            return Err(InstallationError::IncompleteObservation(
+                "activation-intent rollback is restricted to a first installation".to_owned(),
+            ));
+        }
+        // This contour proves that both SCM starts and the credential/Phase-B
+        // suffix remain pending: no service is running/committed and no
+        // credential or Phase-B receipt is available to roll back here.
+        self.require_signed_pending_activation_effects()?;
+        handle(&abort_evidence, "activation_projection.abort_evidence")?;
+        self.completed_stage_refs.push(abort_evidence.clone());
+        self.pending_external_changes = vec![abort_evidence];
+        self.activation_projection_intent = None;
+        self.stage = InstallationStage::RollbackRequired;
+        self.revision =
+            self.revision
+                .checked_add(1)
+                .ok_or_else(|| InstallationError::InvalidField {
+                    field: "revision".to_owned(),
+                    reason: "overflow".to_owned(),
+                })?;
+        self.validate()
+    }
     /// Quarantines a signed projection mismatch without rolling back any
     /// external effect or changing another actor's transaction.
     pub(crate) fn quarantine_activation_projection(
@@ -2164,7 +2215,7 @@ impl InstallationTransactionWire {
 }
 
 /// Validates the canonical transaction JSON without exposing a deserialized
-/// transaction authority object to another crate. Pre-v23 records are
+/// transaction authority object to another crate. Pre-v24 records are
 /// classified as an explicit migration requirement rather than synthesizing
 /// missing progress.
 pub fn validate_installation_transaction_json(bytes: &[u8]) -> Result<(), InstallationError> {
@@ -2226,6 +2277,34 @@ fn validate_current_transaction_progress(
                 });
             }
         }
+        if let Some(grant) = progress
+            .get("service_control_grant")
+            .filter(|grant| !grant.is_null())
+        {
+            let grant = grant
+                .as_object()
+                .ok_or_else(|| InstallationError::CorruptRegistry {
+                    reason: format!(
+                        "installation transaction effect progress entry {index} service control grant is not an object"
+                    ),
+                })?;
+            for (field, label) in [
+                ("principal_service", "principal service"),
+                ("principal_sid", "principal SID"),
+                ("access_mask", "access mask"),
+                ("security_descriptor_owner", "security descriptor owner"),
+                ("security_descriptor_group", "security descriptor group"),
+                ("security_descriptor_digest", "security descriptor digest"),
+            ] {
+                if !grant.contains_key(field) {
+                    return Err(InstallationError::CorruptRegistry {
+                        reason: format!(
+                            "installation transaction effect progress entry {index} is missing mandatory {label} in service control grant"
+                        ),
+                    });
+                }
+            }
+        }
         if let Some(ownership) = progress
             .get("ownership_secret")
             .filter(|ownership| !ownership.is_null())
@@ -2247,7 +2326,7 @@ fn validate_current_transaction_progress(
                 if !object.contains_key(field) {
                     return Err(InstallationError::MigrationRequired {
                         reason: format!(
-                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v23 is required"
+                            "installation transaction effect progress entry {index} is missing mandatory {label}; explicit migration to v24 is required"
                         ),
                     });
                 }
@@ -2286,7 +2365,7 @@ fn decode_installation_transaction_json_with_policy(
         })?;
     let version = value.get("transaction_wire_version").ok_or_else(|| {
         InstallationError::MigrationRequired {
-            reason: "installation transaction predates the required v23 discriminator".to_owned(),
+            reason: "installation transaction predates the required v24 discriminator".to_owned(),
         }
     })?;
     let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {

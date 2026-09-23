@@ -1,0 +1,37 @@
+[package]
+name = "eliot-experience-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Audit-bridge experience provider: V1 journal projections over durable reads (#223)"
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "IMPLEMENTED_PROTOTYPE"
+workspace_admission = "workspace member; package proof pending; no edge or pulse"
+functional_cell = "smart.experience.provider"
+freeze_ref = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+source_layer = "C1"
+agent_order = 51
+
+[dependencies]
+eliot-cognitive-quality = { path = "../eliot-cognitive-quality", version = "0.1.0" }
+eliot-contracts.workspace = true
+eliot-epistemic-contracts.workspace = true
+eliot-experience-projection = { path = "../eliot-experience-projection", version = "0.1.0" }
+eliot-learning-contracts.workspace = true
+eliot-observation-contracts.workspace = true
+eliot-receipts.workspace = true
+eliot-store-api = { path = "../../storage/eliot-store-api", version = "0.1.0" }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

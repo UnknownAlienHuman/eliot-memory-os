@@ -182,11 +182,13 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 /// trichotomy gate in [`check_retrieval_freshness`], the plan revision
 /// comparison in [`check_plan_revisions`], the total classifier in
 /// [`classify_admission`], and the trace joins in [`trace_material`] and
-/// [`trace_material_with_warnings`]. Live daemon consumption
-/// (`bins/eliotd/src/reactive_feed.rs`, tick in `daemon_runtime.rs`,
-/// supplier injection in `bins/eliotd/src/lib.rs`) is M2/O1-owned through
-/// root; the exact wired invocation is proven in the
-/// `work/1947-admission-decision` donor copy at `b95c0fce`.
+/// [`trace_material_with_warnings`]. No daemon retrieval drive exists in
+/// this candidate. Consumption (`bins/eliotd` drive, tick, supplier
+/// injection) is M2/O1-owned through root; the O1 caller record is
+/// `532a2b4e` (`bins/eliotd/src/attempt_execution_chain.rs` poll docs).
+/// Decided contract: unresolved revision compares reject
+/// (`StaleProjection` floor, `ProbeRequired` optional) with fence-mismatch
+/// priority to the refresh arm; the runtime consumer is pending.
 pub fn admit_context_traced(
     input: &AdmissionInput,
 ) -> Result<(AdmissionResult, Vec<MaterialRankTrace>), ContextError> {

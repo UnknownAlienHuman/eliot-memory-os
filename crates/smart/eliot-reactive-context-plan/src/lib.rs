@@ -14,7 +14,6 @@ mod input;
 mod plan;
 mod result;
 mod retrieval_plan;
-mod session_envelope;
 mod settled_plan_feed;
 
 pub use session_envelope::{

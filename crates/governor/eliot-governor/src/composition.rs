@@ -19,6 +19,7 @@ use crate::controlboard_projection::{
 };
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
+use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::scope_identity_admission::{
     ensure_snapshot_fresh, guard_recovery_error, require_fresh_matched_binding,
@@ -56,8 +57,8 @@ use eliot_security_contracts::PrivacyClass;
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
-    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, ScopeRevisionView,
-    StoreHealth, WriteReceipt,
+    CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
+    ScopeRevisionView, StoreHealth, WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
 use eliot_workscope::{
@@ -2593,6 +2594,68 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<(), CompositionError> {
         let retained = self.retain_presentation(presented)?;
         retained.note_unknown_outcome(snapshot_id)
+    }
+
+/// Restores the authority owner with live revocation-history evidence
+/// (`#2100` owner-closure join).
+///
+/// Builds the closed `GetAuthorityRevocationHistory` read for one exact
+/// origin, executes it through the canonical read client (the Kernel
+/// serves its durable fence state on the `store_named` route), decodes
+/// the reply against the expected fence, and restores the authority
+/// owner with that evidence. A transport failure, a fence disagreement,
+/// an absent history, or a stale/invalid view refuses before any owner
+/// state is installed: unavailable history is never absence of
+/// revocation.
+pub async fn restore_authority_with_live_history<R: CanonicalReadClient + ?Sized>(
+    reads: &R,
+    snapshot: &AuthorityOwnerSnapshot,
+    state_fence: &StateFence,
+    origin_ref: &str,
+    max_records: u32,
+) -> Result<AuthorityRestoreOutcome, CompositionError> {
+    let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
+    let response = reads
+        .execute_named(request)
+        .await
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let evidence = decode_revocation_history_evidence(&response, state_fence)?;
+    AuthorityOwner::from_snapshot_with_revocation_history(snapshot, state_fence, Some(&evidence))
+}
+
+    /// Synchronizes the Kernel P-07 owner from live Governor state after
+    /// a revision advance (`#2100` owner-closure feed call).
+    ///
+    /// Binds the feed to the live composition snapshot and fence at call
+    /// time — never caller-supplied — and runs the full
+    /// read→decode→restore→publish→readback exchange through
+    /// [`synchronize_owner_feed`]. The owning daemon runtime calls this
+    /// on provider-revision advance and on recovery; a stale trigger
+    /// refuses before any publish, and no owner state installs until
+    /// the Kernel readback proves the exact published bytes.
+    pub async fn synchronize_kernel_owner<
+        R: CanonicalReadClient + ?Sized,
+        K: OwnerPublishPort + ?Sized,
+    >(
+        &self,
+        reads: &R,
+        kernel: &K,
+        origin_ref: &str,
+        max_records: u32,
+        expected_revision: u64,
+    ) -> Result<u64, CompositionError> {
+        let snapshot = self.owners.authority.snapshot()?;
+        let state_fence = self.snapshot.state_fence();
+        synchronize_owner_feed(
+            reads,
+            kernel,
+            snapshot,
+            &state_fence,
+            origin_ref,
+            max_records,
+            expected_revision,
+        )
+        .await
     }
 
     /// Reads one coherent semantic activation from all required owner records.

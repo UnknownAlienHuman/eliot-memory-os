@@ -40,6 +40,7 @@ mod protocol;
 mod reactive_state;
 #[cfg(test)]
 mod reactive_state_tests;
+mod owner_history;
 mod session_envelope;
 mod store_client;
 #[cfg(windows)]
@@ -162,6 +163,7 @@ pub use store_client::{
 };
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;
+pub use owner_history::serve_authority_revocation_history;
 pub use store_write_reservation::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
     RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,

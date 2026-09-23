@@ -986,6 +986,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-user-broker-core",
  "schemars",
  "serde",
  "serde_json",
@@ -1014,6 +1015,21 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-cognitive-quality"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-learning-contracts",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1647,6 +1663,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-self-query"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eliot-dreamer-structure-repair"
 version = "0.1.0"
 dependencies = [
@@ -1716,6 +1743,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-epistemic-context-provider"
+version = "0.1.0"
+dependencies = [
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-epistemic-contracts"
 version = "0.1.0"
 dependencies = [
@@ -1766,6 +1806,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-experience-projection"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eliot-experience-provider"
+version = "0.1.0"
+dependencies = [
+ "eliot-cognitive-quality",
+ "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-experience-projection",
+ "eliot-learning-contracts",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "eliot-store-api",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-finish"
 version = "0.1.0"
 dependencies = [
@@ -1809,11 +1879,14 @@ dependencies = [
  "eliot-evidence",
  "eliot-finish",
  "eliot-integration-coverage",
+ "eliot-kernel-core",
  "eliot-maintenance",
  "eliot-mcp",
  "eliot-module-registry",
  "eliot-observation",
  "eliot-observation-contracts",
+ "eliot-ors",
+ "eliot-platform",
  "eliot-problem",
  "eliot-protocol",
  "eliot-read",
@@ -2341,6 +2414,36 @@ dependencies = [
  "eliot-memory-curation-contracts",
  "eliot-receipts",
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-memory-projection-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-memory-quality"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-learning-contracts",
+ "eliot-memory-projection-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -3062,6 +3165,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-understanding-assessment"
+version = "0.1.0"
+dependencies = [
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-observation-contracts",
+ "schemars",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-user-broker"
 version = "0.1.0"
 dependencies = [
@@ -3209,6 +3326,7 @@ dependencies = [
  "eliot-agent-coordinator",
  "eliot-authority",
  "eliot-bootstrap",
+ "eliot-cognitive-quality",
  "eliot-config",
  "eliot-context-admission",
  "eliot-context-contracts",
@@ -3220,14 +3338,18 @@ dependencies = [
  "eliot-dreamer-claim-grounding",
  "eliot-dreamer-probe-plan",
  "eliot-dreamer-rival-model",
+ "eliot-epistemic-contracts",
  "eliot-evaluation-contracts",
+ "eliot-experience-provider",
  "eliot-governor",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",
+ "eliot-learning-contracts",
  "eliot-maintenance",
  "eliot-observability",
  "eliot-observation",
+ "eliot-observation-contracts",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
