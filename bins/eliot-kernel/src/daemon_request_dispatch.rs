@@ -840,78 +840,59 @@ impl KernelComposition {
                     // AgentActivationResolutionResult (unknown envelope
                     // versions are rejected before adoption), or the
                     // unenveloped P-04 typed result shape covering the same
-                    // seven closed dispositions, or the legacy success-only
-                    // decision. The v2 envelope is trial-decoded first so
+                    // seven closed dispositions. The v2 envelope is trial-decoded first so
                     // production traffic keeps its typed acknowledgement and
                     // reconcile support; the two result shapes share the
                     // ticket ledger but keep independent
-                    // exact-replay/conflict accounting. A payload carrying
-                    // both keys or neither is fail-closed.
-                    let has_decision = payload
+                    // exact-replay/conflict accounting. The legacy
+                    // success-only `decision` key is no longer accepted
+                    // (#204 v1 removal): a payload carrying it, or carrying
+                    // no `result`, is fail-closed.
+                    let has_legacy_decision = payload
                         .get("decision")
                         .is_some_and(|value| !value.is_null());
                     let has_result = payload.get("result").is_some_and(|value| !value.is_null());
-                    match (has_decision, has_result) {
-                        (true, false) => {
-                            let decision_value = payload
-                                .get("decision")
-                                .cloned()
-                                .ok_or(TransportError::SessionFenced)?;
-                            let decision: AgentActivationResolutionDecision =
-                                serde_json::from_value(decision_value)
-                                    .map_err(|_| TransportError::SessionFenced)?;
-                            match self.submit_agent_activation_decision(decision) {
-                                Ok(()) => Ok(Self::accepted_daemon_response()),
+                    if has_legacy_decision || !has_result {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    {
+                        let result_value = payload
+                            .get("result")
+                            .cloned()
+                            .ok_or(TransportError::SessionFenced)?;
+                        if let Ok(submit) = serde_json::from_value::<AgentActivationResultSubmit>(
+                            result_value.clone(),
+                        ) {
+                            match self.submit_agent_activation_result(submit) {
+                                Ok(ack) => Ok(Self::activation_result_daemon_response(&ack)),
                                 // Deadline expiry is an expected race at this
                                 // boundary, not a daemon-fatal transport failure.
                                 // Return an explicit known outcome so the caller can
                                 // retain liveness without parsing error strings.
+                                // A retained terminal result never takes this
+                                // path: exact replay stays idempotent across the
+                                // deadline.
+                                Err(TransportError::Timeout) => {
+                                    Ok(Self::expired_activation_daemon_response())
+                                }
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            let result: AgentActivationResolutionResult =
+                                serde_json::from_value(result_value)
+                                    .map_err(|_| TransportError::SessionFenced)?;
+                            match self.submit_agent_activation_resolution_result(result) {
+                                Ok(()) => Ok(Self::accepted_daemon_response()),
+                                // Same deadline-expiry race as the v2 path:
+                                // the ticket lapsed before the typed result
+                                // arrived, so the caller observes expiry without
+                                // losing daemon liveness.
                                 Err(TransportError::Timeout) => {
                                     Ok(Self::expired_activation_daemon_response())
                                 }
                                 Err(error) => Err(error),
                             }
                         }
-                        (false, true) => {
-                            let result_value = payload
-                                .get("result")
-                                .cloned()
-                                .ok_or(TransportError::SessionFenced)?;
-                            if let Ok(submit) = serde_json::from_value::<AgentActivationResultSubmit>(
-                                result_value.clone(),
-                            ) {
-                                match self.submit_agent_activation_result(submit) {
-                                    Ok(ack) => Ok(Self::activation_result_daemon_response(&ack)),
-                                    // Deadline expiry is an expected race at this
-                                    // boundary, not a daemon-fatal transport failure.
-                                    // Return an explicit known outcome so the caller can
-                                    // retain liveness without parsing error strings.
-                                    // A retained terminal result never takes this
-                                    // path: exact replay stays idempotent across the
-                                    // deadline.
-                                    Err(TransportError::Timeout) => {
-                                        Ok(Self::expired_activation_daemon_response())
-                                    }
-                                    Err(error) => Err(error),
-                                }
-                            } else {
-                                let result: AgentActivationResolutionResult =
-                                    serde_json::from_value(result_value)
-                                        .map_err(|_| TransportError::SessionFenced)?;
-                                match self.submit_agent_activation_resolution_result(result) {
-                                    Ok(()) => Ok(Self::accepted_daemon_response()),
-                                    // Same deadline-expiry race as the legacy path:
-                                    // the ticket lapsed before the typed result
-                                    // arrived, so the caller observes expiry without
-                                    // losing daemon liveness.
-                                    Err(TransportError::Timeout) => {
-                                        Ok(Self::expired_activation_daemon_response())
-                                    }
-                                    Err(error) => Err(error),
-                                }
-                            }
-                        }
-                        _ => Err(TransportError::SessionFenced),
                     }
                 }
                 #[cfg(not(windows))]

@@ -8,8 +8,8 @@ use super::{
     AGENT_BRIDGE_ACTIVATION_WINDOW_MS, ActivationDecisionDisposition, ActivationResultDisposition,
     AgentActivationPending, AgentActivationPendingState, AgentActivationResultPhase,
     AgentActivationResultRecord, AgentBridgeHandshake, AgentBridgeProfile, KernelBuildError,
-    KernelComposition, activation_deadline_expired, classify_activation_decision,
-    classify_activation_result, load_agent_bridge_declaration, sha256_json, unix_ms,
+    KernelComposition, activation_deadline_expired, classify_activation_result,
+    load_agent_bridge_declaration, sha256_json, unix_ms,
 };
 use eliot_ipc::{
     PeerIdentity, ServerFirstConnection, Session, TransportError,
@@ -21,13 +21,12 @@ use eliot_platform_windows::{
 };
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
-    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDecision,
-    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResolvedBinding, AgentActivationResultAck,
-    AgentActivationResultReconcile, AgentActivationResultSubmit, AgentBridgeActivationDenialCode,
-    AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
-    AgentBridgeAuthenticatedBinding, AgentBridgePeerChallenge, Frame, FrameKind, MessageType,
-    ProtocolPayload,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket,
+    AgentActivationResolvedBinding, AgentActivationResultAck, AgentActivationResultReconcile,
+    AgentActivationResultSubmit, AgentBridgeActivationDenialCode, AgentBridgeActivationFence,
+    AgentBridgeActivationRequest, AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding,
+    AgentBridgePeerChallenge, Frame, FrameKind, MessageType, ProtocolPayload,
 };
 
 fn observe_bridge(event: &'static str, outcome: &'static str) {
@@ -661,7 +660,6 @@ impl KernelComposition {
             AgentActivationPending {
                 ticket: ticket.clone(),
                 request,
-                decision: None,
                 claim_lease_until_unix_ms: None,
             },
         );
@@ -680,45 +678,6 @@ impl KernelComposition {
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         Ok(pending.claim_at(unix_ms()))
-    }
-
-    #[cfg(windows)]
-    pub(super) fn submit_agent_activation_decision(
-        &self,
-        decision: AgentActivationResolutionDecision,
-    ) -> Result<(), TransportError> {
-        observe_bridge("kernel.bridge_activation_submit", "attempt");
-        decision
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let _transition = self.agent_bridge_transition_read()?;
-        let mut pending = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let entry = pending
-            .entries
-            .get_mut(&decision.ticket_id)
-            .ok_or(TransportError::UnknownRequest)?;
-        decision
-            .validate_against(&entry.ticket)
-            .map_err(|_| TransportError::SessionFenced)?;
-        match classify_activation_decision(entry.decision.as_ref(), &decision) {
-            ActivationDecisionDisposition::ExactReplay => return Ok(()),
-            ActivationDecisionDisposition::Conflict => {
-                return Err(TransportError::IdentityConflict);
-            }
-            ActivationDecisionDisposition::Commit => {}
-        }
-        if activation_deadline_expired(unix_ms(), entry.ticket.kernel_deadline_unix_ms) {
-            return Err(TransportError::Timeout);
-        }
-        entry.decision = Some(decision);
-        let ticket_id = entry.ticket.ticket_id.clone();
-        pending.fifo.retain(|queued_id| queued_id != &ticket_id);
-        drop(pending);
-        self.agent_activation_changed.notify_waiters();
-        Ok(())
     }
 
     /// Validates that the ticket's bridge leg is still owned by the live
@@ -1340,11 +1299,8 @@ impl KernelComposition {
     /// `NotReady`, `StaleFence`, `FailedInternal`) share one
     /// exact-replay/conflict ledger and one Kernel ticket deadline. No
     /// disposition is mapped, selected, or completed here, and no transport
-    /// Session is created here for any disposition. A legacy success-only
-    /// decision keeps its own independent ledger on the pending entry;
-    /// whichever arrives first drives the single waiting bridge exchange, and
-    /// the bridge await path creates a Session only for a `Resolved`
-    /// disposition.
+    /// Session is created here for any disposition. The bridge await path
+    /// creates a Session only for a `Resolved` disposition.
     #[cfg(windows)]
     pub(super) fn submit_agent_activation_resolution_result(
         &self,
@@ -1407,103 +1363,6 @@ impl KernelComposition {
         drop(result);
         self.agent_activation_changed.notify_waiters();
         Ok(())
-    }
-
-    #[cfg(windows)]
-    fn activation_response_frame(
-        &self,
-        connection_id: &str,
-        original: &Frame,
-        pending: &AgentActivationPending,
-        decision: &AgentActivationResolutionDecision,
-    ) -> Result<Frame, TransportError> {
-        decision
-            .validate_against(&pending.ticket)
-            .map_err(|_| TransportError::SessionFenced)?;
-        let session_nonce = fresh_activation_nonce_material()
-            .map_err(|_| TransportError::SessionFenced)?
-            .to_string();
-        // Keep the connection owner guard through Session construction and
-        // publication. A detached connection or a poisoned map therefore
-        // cannot leave a locally-created Session without an atomic owner
-        // update; projection either commits both fields or returns fenced.
-        let mut connections = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let accepted = connections
-            .get(connection_id)
-            .ok_or(TransportError::SessionFenced)?
-            .accepted_transport
-            .as_ref()
-            .ok_or(TransportError::SessionFenced)?
-            .clone();
-        let session = Session::establish_agent_bridge(
-            connection_id,
-            accepted.peer().clone(),
-            accepted.client_hello().module_generation.clone(),
-            session_nonce.clone(),
-        )?;
-        let binding = AgentBridgeAuthenticatedBinding {
-            principal_id: decision.principal_id.clone(),
-            session_id: decision.session_id.clone(),
-            activation_generation: decision.state_fence.resource_generation,
-            state_fence: AgentBridgeActivationFence {
-                authority_epoch: decision.state_fence.authority_epoch.clone(),
-                generation: decision.state_fence.resource_generation,
-                nonce: session_nonce,
-            },
-            task_id: decision.task_id.clone(),
-            work_unit_id: decision.work_unit_id.clone(),
-            work_scope_id: decision.work_scope_id.clone(),
-            task_revision: decision.task_revision.clone(),
-            plan_id: decision.plan_id.clone(),
-            plan_revision: decision.plan_revision.clone(),
-        };
-        let response = AgentBridgeActivationResponse {
-            wire_id: eliot_protocol::AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID.to_owned(),
-            wire_version: AgentBridgeActivationResponse::CONTRACT_VERSION,
-            request_id: pending
-                .request
-                .request_identity
-                .request
-                .metadata
-                .request_id
-                .clone(),
-            request_sha256: pending.request.request_sha256.clone(),
-            disposition: eliot_protocol::AgentBridgeActivationDisposition::Authenticated {
-                binding: Box::new(binding),
-            },
-            response_sha256: String::new(),
-        }
-        .with_computed_digest()
-        .map_err(|_| TransportError::SessionFenced)?;
-        response
-            .validate_request(&pending.request)
-            .map_err(|_| TransportError::SessionFenced)?;
-        let reply = Frame {
-            protocol_version: original.protocol_version,
-            encoding_profile: original.encoding_profile,
-            connection_id: connection_id.to_owned(),
-            request_id: Some(response.request_id.clone()),
-            kind: FrameKind::Response,
-            message_type: MessageType::Result,
-            request_identity: None,
-            payload: ProtocolPayload::Json(
-                serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?,
-            ),
-            trace_context: original.trace_context.clone(),
-        };
-        reply.validate()?;
-        let state = connections
-            .get_mut(connection_id)
-            .ok_or(TransportError::SessionFenced)?;
-        if state.activation_completed || state.session.is_some() {
-            return Err(TransportError::IdentityConflict);
-        }
-        state.session = Some(session);
-        state.activation_completed = true;
-        Ok(reply)
     }
 
     /// Maps one non-`Resolved` daemon disposition to its exact agent-visible
@@ -1877,19 +1736,18 @@ impl KernelComposition {
 
     /// Queues one validated bridge request and waits for the sole eliotd
     /// resolver result. Kernel owns the final transport Session/fence and
-    /// every deadline/cancel race: an accepted v2 result (or a legacy v1
-    /// decision) is projected even if the deadline expires while it is
-    /// retained, and only a result-less expired ticket falls back to the
-    /// typed denial. The pending entry is consumed after projecting, but the
-    /// exact v2 result record stays retained for daemon replay/reconcile.
+    /// every deadline/cancel race: an accepted v2 result is projected even
+    /// if the deadline expires while it is retained, and only a result-less
+    /// expired ticket falls back to the typed denial. The pending entry is
+    /// consumed after projecting, but the exact v2 result record stays
+    /// retained for daemon replay/reconcile.
     ///
     /// Queues one validated bridge request and waits for the sole eliotd
     /// resolver outcome. Kernel owns the final transport Session/fence.
     ///
-    /// The exchange accepts either the legacy success-only decision or one
-    /// full typed resolution result, whichever the resolver submits first for
-    /// the exact ticket. A `Resolved` result yields the same Authenticated
-    /// transport binding as a legacy decision through a mechanical field copy;
+    /// The exchange accepts one full typed resolution result for the exact
+    /// ticket. A `Resolved` result yields the Authenticated transport
+    /// binding; every other disposition yields the immediate typed denial
     /// every other disposition yields the immediate typed denial carrying that
     /// disposition's exact denial code and creates no Session. The full typed
     /// result stays addressable under its ticket and result digests for
@@ -1906,7 +1764,6 @@ impl KernelComposition {
         loop {
             enum BridgeWaiterOutcome {
                 V2ResultAvailable,
-                DecisionAvailable,
                 RawResultAvailable,
                 Waiting,
                 Gone,
@@ -1918,17 +1775,14 @@ impl KernelComposition {
                     .lock()
                     .map_err(|_| TransportError::SessionFenced)?;
                 // Priority preserves each side's relative order: the v2
-                // envelope result wins over the legacy decision (v2
-                // production path), and the legacy decision wins over the
-                // unenveloped P-04 result. An accepted result on any leg
+                // envelope result wins over the unenveloped P-04 result
+                // (v2 production path). An accepted result on any leg
                 // always wins the deadline race below.
                 match pending.entries.get(&ticket.ticket_id) {
                     None => BridgeWaiterOutcome::Gone,
-                    Some(entry) => {
+                    Some(_) => {
                         if pending.results.contains_key(&ticket.ticket_id) {
                             BridgeWaiterOutcome::V2ResultAvailable
-                        } else if entry.decision.is_some() {
-                            BridgeWaiterOutcome::DecisionAvailable
                         } else {
                             drop(pending);
                             if self
@@ -1948,13 +1802,6 @@ impl KernelComposition {
             match outcome {
                 BridgeWaiterOutcome::V2ResultAvailable => {
                     return self.project_retained_activation_result(
-                        connection_id,
-                        frame,
-                        &ticket.ticket_id,
-                    );
-                }
-                BridgeWaiterOutcome::DecisionAvailable => {
-                    return self.project_legacy_activation_decision(
                         connection_id,
                         frame,
                         &ticket.ticket_id,
@@ -2040,49 +1887,9 @@ impl KernelComposition {
         Ok(reply)
     }
 
-    /// Projects one legacy v1 decision to its bridge connection and consumes
-    /// the pending entry. Compatibility path only; production traffic uses
-    /// the retained v2 result above.
-    #[cfg(windows)]
-    fn project_legacy_activation_decision(
-        &self,
-        connection_id: &str,
-        frame: &Frame,
-        ticket_id: &str,
-    ) -> Result<Frame, TransportError> {
-        let _transition = self.agent_bridge_transition_read()?;
-        self.project_legacy_activation_decision_under_transition(connection_id, frame, ticket_id)
-    }
-
-    #[cfg(windows)]
-    fn project_legacy_activation_decision_under_transition(
-        &self,
-        connection_id: &str,
-        frame: &Frame,
-        ticket_id: &str,
-    ) -> Result<Frame, TransportError> {
-        let mut pending = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let pending_entry = pending
-            .entries
-            .get(ticket_id)
-            .ok_or(TransportError::SessionFenced)?
-            .clone();
-        let decision = pending_entry
-            .decision
-            .clone()
-            .ok_or(TransportError::SessionFenced)?;
-        let reply =
-            self.activation_response_frame(connection_id, frame, &pending_entry, &decision)?;
-        pending.entries.remove(ticket_id);
-        Ok(reply)
-    }
-
     /// Consumes one result-less expired ticket: removes the pending entry,
     /// revokes the bridge leg, and returns the immediate typed denial. This
-    /// runs only when no v2 result and no legacy decision is retained; an
+    /// runs only when no v2 result is retained; an
     /// accepted result always wins the deadline race and is projected by the
     /// waiter instead.
     #[cfg(windows)]
@@ -2282,7 +2089,7 @@ impl KernelComposition {
         pending: &mut AgentActivationPendingState,
         response_valid: bool,
     ) -> Result<(), TransportError> {
-        // This cleanup is part of the legacy denial linearization point. It
+        // This cleanup is part of the denial linearization point. It
         // must still detach the bridge when validation failed because an
         // inner lock was poisoned; otherwise the caller could retry against
         // a half-validated connection. Recovering a poisoned guard permits
