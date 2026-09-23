@@ -492,6 +492,82 @@ function Get-ProjectLocalSurrealArtifact([string]$Repo, [object]$Catalog, [bool]
     }
 }
 
+function Get-SelectedSurrealReleasePolicyReceipt([string]$Repo, [object]$Catalog, [object]$SurrealArtifact, [string]$SourceCommit) {
+    if ([string]$SurrealArtifact.source -cne 'project-local-provisioner') {
+        throw 'selected-release dependency policy receipt is required only for the locked project-local candidate'
+    }
+    $artifactRelative = Assert-SafeRelativePath ([string]$SurrealArtifact.project_local_input_path) 'selected SurrealDB artifact'
+    $candidateDirectory = Split-Path -Parent $artifactRelative.Replace('/', '\')
+    $candidateDirectory = $candidateDirectory.Replace('\', '/').TrimEnd('/')
+    if (-not $candidateDirectory.StartsWith('.eliot/dependency-policy/surrealdb/', [System.StringComparison]::Ordinal)) {
+        throw 'selected SurrealDB receipt directory is outside the project-local dependency evidence root'
+    }
+    $relative = Assert-SafeRelativePath "$candidateDirectory/selected-release-policy-receipt.json" 'selected-release dependency policy receipt'
+    $receiptPath = [System.IO.Path]::GetFullPath((Join-Path $Repo $relative.Replace('/', '\')))
+    $verifierPath = [System.IO.Path]::GetFullPath((Join-Path $Repo 'scripts\verify-dependency-policy.py'))
+    if (-not (Test-Path -LiteralPath $verifierPath -PathType Leaf)) {
+        throw 'selected-release dependency policy verifier is missing'
+    }
+    $python = Get-PinnedCommandFile 'python' 'selected-release dependency policy verifier'
+    $verifyOutput = & $python.FullName $verifierPath `
+        '--root' $Repo `
+        '--selected-release-policy-receipt-out' $receiptPath `
+        '--selected-artifact-path' ([string]$SurrealArtifact.project_local_input_path) `
+        '--selected-artifact-sha256' ([string]$SurrealArtifact.sha256) `
+        '--selected-artifact-version' ([string]$SurrealArtifact.version) `
+        '--selected-catalog-sha256' ([string]$Catalog.sha256) `
+        '--selected-provisioning-receipt-sha256' ([string]$SurrealArtifact.provisioning_receipt_sha256) 2>&1 | Out-String
+    $verifyExitCode = $LASTEXITCODE
+    if ($verifyExitCode -ne 0) {
+        throw "selected-release dependency policy receipt failed with exit code ${verifyExitCode}: $verifyOutput"
+    }
+    $receiptEvidence = Read-VerifiedResidentFile $receiptPath 'selected-release dependency policy receipt'
+    try {
+        $receipt = [System.Text.Encoding]::UTF8.GetString($receiptEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+    }
+    catch {
+        throw 'selected-release dependency policy receipt is not valid JSON'
+    }
+    if ([string]$receipt.schema -cne 'eliot.selected-release-dependency-policy.v1' -or
+        [string]$receipt.binding_status -cne 'EVIDENCE_VERIFIED' -or
+        [string]$receipt.candidate_advisory_status -cne 'no_known_vulnerabilities' -or
+        [string]$receipt.release_admission -cne 'INCOMPLETE' -or
+        [string]$receipt.source_commit -cne $SourceCommit -or
+        [string]$receipt.selected_artifact.path -cne [string]$SurrealArtifact.project_local_input_path -or
+        [string]$receipt.selected_artifact.version -cne [string]$SurrealArtifact.version -or
+        [string]$receipt.selected_artifact.source_tag -cne [string]$Catalog.patched_candidate.source_tag -or
+        [string]$receipt.selected_artifact.release_asset -cne [string]$Catalog.patched_candidate.release_asset -or
+        [string]$receipt.selected_artifact.architecture -cne [string]$SurrealArtifact.architecture -or
+        [string]$receipt.selected_artifact.pe_machine -cne [string]$SurrealArtifact.pe_machine -or
+        [string]$receipt.selected_artifact.sha256 -cne [string]$SurrealArtifact.sha256 -or
+        [int64]$receipt.selected_artifact.bytes -ne [int64]$SurrealArtifact.bytes -or
+        [string]$receipt.catalogue.path -cne [string]$Catalog.relative_path -or
+        [string]$receipt.catalogue.sha256 -cne [string]$Catalog.sha256 -or
+        [string]$receipt.provisioning.path -cne [string]$SurrealArtifact.provisioning_receipt_input_path -or
+        [string]$receipt.provisioning.sha256 -cne [string]$SurrealArtifact.provisioning_receipt_sha256 -or
+        [string]$receipt.provisioning.status -cne 'verified' -or
+        [string]$receipt.advisory_snapshot.evidence_status -cne 'verified' -or
+        [string]$receipt.advisory_snapshot.source -cne 'https://api.osv.dev/v1/query' -or
+        [string]$receipt.advisory_snapshot.version -cne [string]$SurrealArtifact.version -or
+        [string]$receipt.advisory_snapshot.package -cne 'surrealdb' -or
+        [string]$receipt.advisory_snapshot.ecosystem -cne 'crates.io' -or
+        [string]$receipt.advisory_snapshot.distributed_binary_applicability -cne 'unestablished' -or
+        @($receipt.advisory_snapshot.advisory_ids).Count -ne 0) {
+        throw 'selected-release dependency policy receipt does not bind the consumed artifact, current advisory snapshot, catalogue, provisioner and source commit'
+    }
+    [pscustomobject]@{
+        path = $receiptPath
+        relative_path = $relative
+        sha256 = $receiptEvidence.sha256
+        bytes = $receiptEvidence.length
+        query_path = [string]$receipt.advisory_snapshot.query.path
+        query_sha256 = [string]$receipt.advisory_snapshot.query.sha256
+        response_path = [string]$receipt.advisory_snapshot.response.path
+        response_sha256 = [string]$receipt.advisory_snapshot.response.sha256
+        receipt = $receipt
+    }
+}
+
 function Assert-SafeRelativePath([string]$Path, [string]$Purpose) {
     $normalized = $Path.Replace('\', '/')
     $segments = @($normalized -split '/')
@@ -1171,7 +1247,7 @@ function Get-VerifiedOperatorBuildReceipt([string]$Repo, [string]$SourceCommit, 
     }
 }
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -1207,6 +1283,21 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             generation = $SourceCommit
             proof_ceiling = 'unsigned-build-evidence with project-local provisioning provenance'
             gate = $null
+        }
+        foreach ($evidenceFile in @(
+                @{ path = 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'; selection = 'candidate-specific policy receipt consumed by the Windows x64 release builder'; owner = 'scripts/verify-dependency-policy.py' },
+                @{ path = 'runtime/SURREALDB_RELEASE_OSV_QUERY.json'; selection = 'exact current OSV query for the selected SurrealDB release version'; owner = 'scripts/provision-surrealdb-release.py' },
+                @{ path = 'runtime/SURREALDB_RELEASE_OSV_RESPONSE.json'; selection = 'fresh OSV response bound to the selected SurrealDB release version'; owner = 'scripts/provision-surrealdb-release.py' }
+            )) {
+            $entries += [ordered]@{
+                path = $evidenceFile.path
+                selection = $evidenceFile.selection
+                owner = $evidenceFile.owner
+                install_destination = 'runtime/'
+                generation = $SourceCommit
+                proof_ceiling = [string]$SelectedPolicyReceipt.receipt.proof_ceiling
+                gate = $null
+            }
         }
     }
     $entries += [ordered]@{
@@ -1683,6 +1774,102 @@ function Test-ReleaseBundle([string]$Path) {
         if ($candidateRecord.Count -ne 1) {
             throw 'staged SurrealDB provisioning receipt does not bind the consumed release asset bytes'
         }
+        $selectedPolicy = $release.selected_release_dependency_policy
+        if (-not $selectedPolicy -or
+            [string]$selectedPolicy.path -cne 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json' -or
+            [string]$selectedPolicy.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$selectedPolicy.binding_status -cne 'EVIDENCE_VERIFIED' -or
+            [string]$selectedPolicy.candidate_advisory_status -cne 'no_known_vulnerabilities' -or
+            [string]$selectedPolicy.release_admission -cne 'INCOMPLETE' -or
+            [string]$selectedPolicy.source_commit -cne [string]$release.source_commit -or
+            [string]$selectedPolicy.artifact_path -cne [string]$surrealEntry.project_local_input_path -or
+            [string]$selectedPolicy.artifact_version -cne [string]$surrealEntry.version -or
+            [string]$selectedPolicy.artifact_source_tag -cne [string]$catalogBinding.source_tag -or
+            [string]$selectedPolicy.artifact_release_asset -cne [string]$catalogBinding.release_asset -or
+            [string]$selectedPolicy.artifact_sha256 -cne [string]$surrealEntry.sha256 -or
+            [string]$selectedPolicy.catalogue_sha256 -cne [string]$surrealEntry.catalog_sha256 -or
+            [string]$selectedPolicy.provisioning_receipt_sha256 -cne [string]$surrealEntry.provisioning_receipt_sha256 -or
+            [string]$selectedPolicy.distributed_binary_applicability -cne 'unestablished') {
+            throw 'RELEASE.json is missing the exact selected-release dependency policy receipt binding'
+        }
+        $policyPath = Join-Path $resolved 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'
+        $policyEvidence = Read-VerifiedResidentFile $policyPath 'staged selected-release dependency policy receipt'
+        if ($policyEvidence.sha256 -cne [string]$selectedPolicy.sha256) {
+            throw 'staged selected-release dependency policy receipt digest differs from RELEASE.json'
+        }
+        $policyReceipt = [System.Text.Encoding]::UTF8.GetString($policyEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        if ([string]$policyReceipt.schema -cne 'eliot.selected-release-dependency-policy.v1' -or
+            [string]$policyReceipt.binding_status -cne [string]$selectedPolicy.binding_status -or
+            [string]$policyReceipt.candidate_advisory_status -cne [string]$selectedPolicy.candidate_advisory_status -or
+            [string]$policyReceipt.release_admission -cne [string]$selectedPolicy.release_admission -or
+            [string]$policyReceipt.source_commit -cne [string]$release.source_commit -or
+            [string]$policyReceipt.selected_artifact.path -cne [string]$surrealEntry.project_local_input_path -or
+            [string]$policyReceipt.selected_artifact.version -cne [string]$surrealEntry.version -or
+            [string]$policyReceipt.selected_artifact.source_tag -cne [string]$catalogBinding.source_tag -or
+            [string]$policyReceipt.selected_artifact.release_asset -cne [string]$catalogBinding.release_asset -or
+            [string]$policyReceipt.selected_artifact.source_commit -cne [string]$catalogBinding.source_commit -or
+            [string]$policyReceipt.selected_artifact.architecture -cne [string]$surrealEntry.architecture -or
+            [string]$policyReceipt.selected_artifact.pe_machine -cne [string]$surrealEntry.pe_machine -or
+            [string]$policyReceipt.selected_artifact.sha256 -cne [string]$surrealEntry.sha256 -or
+            [int64]$policyReceipt.selected_artifact.bytes -ne [int64]$surrealEntry.bytes -or
+            [string]$policyReceipt.catalogue.path -cne $surrealCatalogRelativePath -or
+            [string]$policyReceipt.catalogue.sha256 -cne [string]$surrealEntry.catalog_sha256 -or
+            [string]$policyReceipt.provisioning.path -cne [string]$surrealEntry.provisioning_receipt_input_path -or
+            [string]$policyReceipt.provisioning.sha256 -cne [string]$stagedReceiptEvidence.sha256 -or
+            [string]$policyReceipt.provisioning.status -cne 'verified' -or
+            [string]$policyReceipt.advisory_snapshot.evidence_status -cne 'verified' -or
+            [string]$policyReceipt.advisory_snapshot.source -cne 'https://api.osv.dev/v1/query' -or
+            [string]$policyReceipt.advisory_snapshot.version -cne [string]$surrealEntry.version -or
+            [string]$policyReceipt.advisory_snapshot.package -cne 'surrealdb' -or
+            [string]$policyReceipt.advisory_snapshot.ecosystem -cne 'crates.io' -or
+            [string]$policyReceipt.advisory_snapshot.scope -cne 'rust-crate' -or
+            [string]$policyReceipt.advisory_snapshot.distributed_binary_applicability -cne 'unestablished' -or
+            @($policyReceipt.advisory_snapshot.advisory_ids).Count -ne 0) {
+            throw 'selected-release policy receipt does not bind the consumed artifact, advisory scope, catalogue and provisioner receipt'
+        }
+        $queryEvidence = Read-VerifiedResidentFile (Join-Path $resolved 'runtime/SURREALDB_RELEASE_OSV_QUERY.json') 'staged selected-release OSV query'
+        $responseEvidence = Read-VerifiedResidentFile (Join-Path $resolved 'runtime/SURREALDB_RELEASE_OSV_RESPONSE.json') 'staged selected-release OSV response'
+        if ($queryEvidence.sha256 -cne [string]$policyReceipt.advisory_snapshot.query.sha256 -or
+            $responseEvidence.sha256 -cne [string]$policyReceipt.advisory_snapshot.response.sha256 -or
+            [string]$selectedPolicy.advisory_query_path -cne 'runtime/SURREALDB_RELEASE_OSV_QUERY.json' -or
+            [string]$selectedPolicy.advisory_query_sha256 -cne $queryEvidence.sha256 -or
+            [string]$selectedPolicy.advisory_response_path -cne 'runtime/SURREALDB_RELEASE_OSV_RESPONSE.json' -or
+            [string]$selectedPolicy.advisory_response_sha256 -cne $responseEvidence.sha256) {
+            throw 'staged OSV query or response bytes differ from the selected-release policy receipt'
+        }
+        $candidateQuery = [System.Text.Encoding]::UTF8.GetString($queryEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        $candidateResponse = [System.Text.Encoding]::UTF8.GetString($responseEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        if ([string]$candidateQuery.package.name -cne 'surrealdb' -or
+            [string]$candidateQuery.package.ecosystem -cne 'crates.io' -or
+            [string]$candidateQuery.version -cne [string]$surrealEntry.version -or
+            @($candidateResponse.vulns).Count -ne 0) {
+            throw 'staged OSV evidence does not show an empty exact-version crates.io/surrealdb query result'
+        }
+        $querySubject = "osv.query.surrealdb.release-candidate.$([string]$catalogBinding.source_tag)"
+        $responseSubject = "osv.response.surrealdb.release-candidate.$([string]$catalogBinding.source_tag)"
+        $queryRecord = @($stagedReceipt.records | Where-Object {
+                [string]$_.subject -ceq $querySubject -and
+                [string]$_.relative_path -ceq [string]$policyReceipt.advisory_snapshot.query.path -and
+                [string]$_.sha256 -ceq [string]$queryEvidence.sha256
+            })
+        $responseRecord = @($stagedReceipt.records | Where-Object {
+                [string]$_.subject -ceq $responseSubject -and
+                [string]$_.relative_path -ceq [string]$policyReceipt.advisory_snapshot.response.path -and
+                [string]$_.sha256 -ceq [string]$responseEvidence.sha256 -and
+                $_.fetched -eq $true -and
+                [string]$_.retrieved_at_utc -ceq [string]$policyReceipt.advisory_snapshot.response.retrieved_at_utc
+            })
+        if ($queryRecord.Count -ne 1 -or $responseRecord.Count -ne 1) {
+            throw 'staged provisioner receipt does not bind exactly the selected candidate OSV query and freshly fetched response'
+        }
+        $policyAge = [double]$policyReceipt.advisory_snapshot.response.age_seconds
+        $policyMaxAge = [double]$policyReceipt.advisory_snapshot.response.maximum_age_hours * 3600
+        if ($policyAge -lt -300 -or $policyAge -gt $policyMaxAge) {
+            throw 'selected candidate OSV response was stale at receipt generation'
+        }
+    }
+    elseif ($release.selected_release_dependency_policy) {
+        throw 'a non-project-local SurrealDB artifact cannot claim the selected-candidate dependency policy receipt'
     }
     $releaseRuntimeEntries = @($release.runtime_artifacts)
     if ([string]$release.runtime_artifact_catalog_path -ne $surrealCatalogRelativePath -or
@@ -1831,6 +2018,7 @@ if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
 }
 $surrealCatalog = Get-VerifiedSurrealCatalog $repo $sourceCommit
 $projectLocalSurreal = $null
+$selectedSurrealPolicyReceipt = $null
 if ($UseProjectLocalSurreal) {
     if ($SurrealExe -or $SurrealSha256 -or $SurrealVersion) {
         throw '-UseProjectLocalSurreal cannot be combined with -SurrealExe, -SurrealSha256, or -SurrealVersion'
@@ -1906,6 +2094,18 @@ $plan = [ordered]@{
         provisioning_receipt_input_path = $verifiedPinnedSurreal.provisioning_receipt_input_path
         provisioning_receipt_sha256 = $verifiedPinnedSurreal.provisioning_receipt_sha256
     }
+    selected_release_dependency_policy = if ($UseProjectLocalSurreal) {
+        [ordered]@{
+            status = 'NOT_GENERATED_PLAN_ONLY_OR_PRE_BUILD'
+            receipt_path = 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'
+            advisory_scope = 'crates.io/surrealdb at the exact selected candidate version'
+            distributed_binary_applicability = 'unestablished'
+            proof_ceiling = 'SELECTED_RELEASE_ARTIFACT_AND_FRESH_CRATE_ADVISORY_EVIDENCE_CANDIDATE'
+        }
+    }
+    else {
+        [ordered]@{ status = 'not-selected'; receipt_path = $null }
+    }
     runtime_artifacts = @($runtimeArtifactPlan | ForEach-Object {
             [ordered]@{
                 package = $_.package
@@ -1947,6 +2147,25 @@ try {
         }
     }
     $postBuildIsolation = Assert-IsolatedSourceTree $repo $sourceCommit 'post-build'
+
+    if ($UseProjectLocalSurreal) {
+        # Refresh the candidate advisory response after the complete Windows build,
+        # then produce the receipt that the staged-bundle consumer verifies.
+        $projectLocalSurreal = Get-ProjectLocalSurrealArtifact $repo $surrealCatalog $true
+        $verifiedPinnedSurreal = $projectLocalSurreal
+        $selectedSurrealPolicyReceipt = Get-SelectedSurrealReleasePolicyReceipt $repo $surrealCatalog $verifiedPinnedSurreal $sourceCommit
+        $plan.selected_release_dependency_policy = [ordered]@{
+            status = [string]$selectedSurrealPolicyReceipt.receipt.binding_status
+            candidate_advisory_status = [string]$selectedSurrealPolicyReceipt.receipt.candidate_advisory_status
+            release_admission = [string]$selectedSurrealPolicyReceipt.receipt.release_admission
+            receipt_path = 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'
+            receipt_sha256 = [string]$selectedSurrealPolicyReceipt.sha256
+            advisory_query_sha256 = [string]$selectedSurrealPolicyReceipt.query_sha256
+            advisory_response_sha256 = [string]$selectedSurrealPolicyReceipt.response_sha256
+            distributed_binary_applicability = 'unestablished'
+            proof_ceiling = [string]$selectedSurrealPolicyReceipt.receipt.proof_ceiling
+        }
+    }
 
     $governor = $governorPath
     if (-not (Test-Path -LiteralPath $governor -PathType Leaf)) {
@@ -1991,6 +2210,36 @@ try {
         if ($stagedReceiptSha256 -cne [string]$verifiedPinnedSurreal.provisioning_receipt_sha256) {
             throw 'staged SurrealDB provisioning receipt changed while being copied'
         }
+        if (-not $selectedSurrealPolicyReceipt) {
+            throw 'selected-release dependency policy receipt was not produced after the Windows build'
+        }
+        $policySourceEvidence = Read-VerifiedResidentFile $selectedSurrealPolicyReceipt.path 'selected-release dependency policy receipt for staging'
+        if ($policySourceEvidence.sha256 -cne [string]$selectedSurrealPolicyReceipt.sha256) {
+            throw 'selected-release dependency policy receipt changed after consumption'
+        }
+        $policyDestination = Join-Path $runtimeRoot 'SURREALDB_RELEASE_POLICY_RECEIPT.json'
+        $stagedPolicy = Write-VerifiedResidentFile $policyDestination $policySourceEvidence.bytes 'staged selected-release dependency policy receipt'
+        if ($stagedPolicy.sha256 -cne [string]$selectedSurrealPolicyReceipt.sha256) {
+            throw 'selected-release dependency policy receipt changed while being staged'
+        }
+        Assert-NoSecretFile (Get-Item -LiteralPath $policyDestination) 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'
+
+        foreach ($advisoryFile in @(
+                @{ source = $selectedSurrealPolicyReceipt.query_path; expected_sha256 = $selectedSurrealPolicyReceipt.query_sha256; name = 'SURREALDB_RELEASE_OSV_QUERY.json' },
+                @{ source = $selectedSurrealPolicyReceipt.response_path; expected_sha256 = $selectedSurrealPolicyReceipt.response_sha256; name = 'SURREALDB_RELEASE_OSV_RESPONSE.json' }
+            )) {
+            $sourcePath = Join-Path $repo ([string]$advisoryFile.source).Replace('/', '\')
+            $sourceEvidence = Read-VerifiedResidentFile $sourcePath "selected SurrealDB OSV evidence $($advisoryFile.name)"
+            if ($sourceEvidence.sha256 -cne [string]$advisoryFile.expected_sha256) {
+                throw "selected SurrealDB OSV evidence changed after policy verification: $($advisoryFile.name)"
+            }
+            $destination = Join-Path $runtimeRoot $advisoryFile.name
+            $stagedEvidence = Write-VerifiedResidentFile $destination $sourceEvidence.bytes "staged selected SurrealDB OSV evidence $($advisoryFile.name)"
+            if ($stagedEvidence.sha256 -cne [string]$advisoryFile.expected_sha256) {
+                throw "selected SurrealDB OSV evidence changed while being staged: $($advisoryFile.name)"
+            }
+            Assert-NoSecretFile (Get-Item -LiteralPath $destination) "runtime/$($advisoryFile.name)"
+        }
     }
     [ordered]@{
         schema = 'eliot-runtime-artifact-set-v1'
@@ -2033,7 +2282,7 @@ try {
     $verifiedOperator = Get-VerifiedOperatorBuildReceipt $repo $sourceCommit $OperatorSource
     Copy-OperatorPayload $verifiedOperator.source (Join-Path $bundle 'operator')
     Copy-Item -LiteralPath $verifiedOperator.receipt_path -Destination (Join-Path $bundle 'operator/OPERATOR_BUILD_RECEIPT.json')
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt
     $stagedPayloadManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     [ordered]@{
@@ -2068,6 +2317,30 @@ try {
                     provisioning_receipt_sha256 = $_.provisioning_receipt_sha256
                 }
             })
+        selected_release_dependency_policy = if ($selectedSurrealPolicyReceipt) {
+            [ordered]@{
+                path = 'runtime/SURREALDB_RELEASE_POLICY_RECEIPT.json'
+                sha256 = [string]$selectedSurrealPolicyReceipt.sha256
+                binding_status = [string]$selectedSurrealPolicyReceipt.receipt.binding_status
+                candidate_advisory_status = [string]$selectedSurrealPolicyReceipt.receipt.candidate_advisory_status
+                release_admission = [string]$selectedSurrealPolicyReceipt.receipt.release_admission
+                source_commit = [string]$selectedSurrealPolicyReceipt.receipt.source_commit
+                artifact_path = [string]$selectedSurrealPolicyReceipt.receipt.selected_artifact.path
+                artifact_version = [string]$selectedSurrealPolicyReceipt.receipt.selected_artifact.version
+                artifact_source_tag = [string]$selectedSurrealPolicyReceipt.receipt.selected_artifact.source_tag
+                artifact_release_asset = [string]$selectedSurrealPolicyReceipt.receipt.selected_artifact.release_asset
+                artifact_sha256 = [string]$selectedSurrealPolicyReceipt.receipt.selected_artifact.sha256
+                catalogue_sha256 = [string]$selectedSurrealPolicyReceipt.receipt.catalogue.sha256
+                provisioning_receipt_sha256 = [string]$selectedSurrealPolicyReceipt.receipt.provisioning.sha256
+                advisory_query_path = 'runtime/SURREALDB_RELEASE_OSV_QUERY.json'
+                advisory_query_sha256 = [string]$selectedSurrealPolicyReceipt.query_sha256
+                advisory_response_path = 'runtime/SURREALDB_RELEASE_OSV_RESPONSE.json'
+                advisory_response_sha256 = [string]$selectedSurrealPolicyReceipt.response_sha256
+                distributed_binary_applicability = 'unestablished'
+                proof_ceiling = [string]$selectedSurrealPolicyReceipt.receipt.proof_ceiling
+            }
+        }
+        else { $null }
         architecture = 'windows-x64'
         signed = $false
         signature_policy = 'pre-release-unsigned'
