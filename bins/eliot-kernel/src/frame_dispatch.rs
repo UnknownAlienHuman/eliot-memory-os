@@ -1510,7 +1510,7 @@ impl KernelComposition {
     /// `admit_host_request_envelope` gate: the returned Writer-A receipt is
     /// the same-generation/fence admission decision that
     /// [`handle_wasm_port_grant`] binds, so a stale fence fails closed here
-    /// and the caller re-admits through the HostRequest path instead of
+    /// and the caller re-admits through the `HostRequest` path instead of
     /// executing against a rotated fence. The [`HandlerSession`] principal
     /// is the transport session guard's authenticated peer identity bound to
     /// the presenting connection; the [`KernelObservedGrantFacts`] are the

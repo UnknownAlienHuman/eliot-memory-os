@@ -303,7 +303,7 @@ impl WasmPortGrant {
 /// caller — never caller-asserted) and is shape-checked here; its truth is
 /// proven at resolution and launch re-hash, not by this digest. Issues no
 /// permits, no Governor observations, no keys: the grant attests transport
-/// + freshness and carries caller digests for downstream re-hashing. The
+/// and freshness, and carries caller digests for downstream re-hashing. The
 /// allow decision itself belongs to the live policy/capability owner —
 /// this constructor runs only after that owner allows.
 pub fn issue_wasm_port_grant(

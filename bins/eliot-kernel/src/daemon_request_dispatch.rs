@@ -2795,7 +2795,7 @@ impl KernelComposition {
     /// Binds one normal Notify launch grant on the admitted path (`#1780`
     /// D4b): the production caller of
     /// `eliot_kernel_service::bind_notify_launch_grant`, the
-    /// minter-to-durable-state + ApprovedLaunch invocation.
+    /// minter-to-durable-state + `ApprovedLaunch` invocation.
     ///
     /// The canonical notification reference and the installer-observed
     /// launch artifact arrive as closed payload evidence; the artifact
