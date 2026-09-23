@@ -375,6 +375,10 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_host_request_cancel" => "agent_host_request_cancel",
         "publish_owner_bundle" => "publish_owner_bundle",
         "query_owner_bundle" => "query_owner_bundle",
+        "activate_grant" => "activate_grant",
+        "revoke_grant" => "revoke_grant",
+        "activate_introduction" => "activate_introduction",
+        "revoke_introduction" => "revoke_introduction",
         "publish_wasm_dispatch_bundle" => "publish_wasm_dispatch_bundle",
         "bind_notify_launch_grant" => "bind_notify_launch_grant",
         "agent_host_request_reconcile" => "agent_host_request_reconcile",
@@ -422,6 +426,54 @@ struct StoreRecoveryOperation {
 struct OwnerPublishOperation {
     bundle: super::GovernorClosureRestore,
     expected_revision: u64,
+}
+
+/// Closed P-07 grant activation operation (`#1110`).
+///
+/// Mirrors the authenticated `KernelAuthorityClient` payload: string
+/// identities plus the exact presented authority binding. The dispatcher
+/// decodes, rechecks the binding against the authenticated session, and
+/// routes through the retained P-07 owner port; it never mints authority.
+/// Unknown fields fail closed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantActivationOperation {
+    grant_id: String,
+    snapshot_id: String,
+    binding: eliot_receipts::AuthorityBinding,
+}
+
+/// Closed P-07 grant revocation operation (`#1110`). Same shape and
+/// fail-closed contract as the activation operation; revocation fences
+/// closure through the retained port before the dispatcher acknowledges.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantRevocationOperation {
+    grant_id: String,
+    snapshot_id: String,
+    binding: eliot_receipts::AuthorityBinding,
+}
+
+/// Closed P-07 introduction activation operation (`#1110`). Same shape and
+/// fail-closed contract as the grant activation operation, keyed by
+/// introduction identity.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntroductionActivationOperation {
+    introduction_id: String,
+    snapshot_id: String,
+    binding: eliot_receipts::AuthorityBinding,
+}
+
+/// Closed P-07 introduction revocation operation (`#1110`). Same shape and
+/// fail-closed contract as the grant revocation operation, keyed by
+/// introduction identity.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntroductionRevocationOperation {
+    introduction_id: String,
+    snapshot_id: String,
+    binding: eliot_receipts::AuthorityBinding,
 }
 
 /// Canonical installed WASM-host image filename pinned by the
@@ -500,6 +552,67 @@ fn owner_bundle_agrees_with_session(
             .authority_epoch
             .is_same_authority(&session.authority_epoch)
     })
+}
+
+/// Rechecks one presented P-07 binding against the authenticated session
+/// before the dispatcher touches the retained owner: the fence must validate,
+/// the binding epoch must agree with the fence epoch, the binding authority
+/// must be the session authority, and the presented fence must be the session
+/// generation fence. Anything else fails closed before mutation.
+fn p07_binding_agrees_with_session(
+    binding: &eliot_receipts::AuthorityBinding,
+    session: &Session,
+) -> Result<(), TransportError> {
+    binding
+        .state_fence
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if binding.authority_epoch != binding.state_fence.authority_epoch
+        || !binding
+            .authority_epoch
+            .is_same_authority(&session.authority_epoch)
+        || binding.state_fence != session.module_generation.state_fence
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+/// Maps one retained-port refusal to the typed dispatch failure. Admission
+/// refusals and an unready production route fail closed as fenced without
+/// minting authority; a binding that disagrees with retained owner state under
+/// a known identity (changed payload, stale revision, disagreeing material)
+/// conflicts so the caller re-serves fresh state instead of retrying blindly —
+/// the same contract as the owner-bundle publish arm. Only a possible commit
+/// with a lost acknowledgement surfaces as an unknown outcome for exact
+/// reconciliation.
+fn map_p07_port_error(error: &eliot_authority::P07PortError) -> TransportError {
+    match error {
+        eliot_authority::P07PortError::UnknownOutcome { .. } => TransportError::UnknownOutcome,
+        eliot_authority::P07PortError::InvalidBinding => TransportError::IdentityConflict,
+        eliot_authority::P07PortError::NotAdmitted | eliot_authority::P07PortError::Unavailable => {
+            TransportError::SessionFenced
+        }
+    }
+}
+
+impl KernelComposition {
+    /// Locks the retained P-07 owner bound by the Governor feed. An unbound
+    /// composition withholds unsupported authority instead of routing to a
+    /// no-authority port: the production path never selects
+    /// `UnavailableP07AuthorityPort`.
+    fn retained_p07_owner(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<BoundCanonicalOwner>>, TransportError> {
+        let guard = self
+            .p07_owner
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if guard.is_none() {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(guard)
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1070,6 +1183,124 @@ impl KernelComposition {
                         "revision": revision,
                         "digest": digest,
                     },
+                }))
+            }
+            "activate_grant" => {
+                let operation: GrantActivationOperation =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                if operation.grant_id.trim().is_empty() || operation.snapshot_id.trim().is_empty() {
+                    return Err(TransportError::SessionFenced);
+                }
+                p07_binding_agrees_with_session(&operation.binding, session)?;
+                let request = eliot_authority::GrantActivationRequest {
+                    grant_id: eliot_authority::GrantId::new(operation.grant_id)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                    snapshot_id: eliot_authority::SnapshotId::new(operation.snapshot_id)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                    binding: operation.binding,
+                };
+                let owner = self.retained_p07_owner()?;
+                let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
+                let receipt =
+                    eliot_authority::P07AuthorityPort::activate_grant(bound.port(), &request)
+                        .map_err(|error| map_p07_port_error(&error))?;
+                let value =
+                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "kind": "authority_activation_receipt",
+                    "value": value,
+                }))
+            }
+            "revoke_grant" => {
+                let operation: GrantRevocationOperation =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                if operation.grant_id.trim().is_empty() || operation.snapshot_id.trim().is_empty() {
+                    return Err(TransportError::SessionFenced);
+                }
+                p07_binding_agrees_with_session(&operation.binding, session)?;
+                let request = eliot_authority::GrantRevocationRequest {
+                    grant_id: eliot_authority::GrantId::new(operation.grant_id)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                    snapshot_id: eliot_authority::SnapshotId::new(operation.snapshot_id)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                    binding: operation.binding,
+                };
+                let owner = self.retained_p07_owner()?;
+                let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
+                let receipt =
+                    eliot_authority::P07AuthorityPort::revoke_grant(bound.port(), &request)
+                        .map_err(|error| map_p07_port_error(&error))?;
+                let value =
+                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "kind": "authority_revocation_receipt",
+                    "value": value,
+                }))
+            }
+            "activate_introduction" => {
+                let operation: IntroductionActivationOperation =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                if operation.introduction_id.trim().is_empty()
+                    || operation.snapshot_id.trim().is_empty()
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                p07_binding_agrees_with_session(&operation.binding, session)?;
+                let request = eliot_authority::IntroductionActivationRequest {
+                    introduction_id: eliot_authority::IntroductionId::new(
+                        operation.introduction_id,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?,
+                    snapshot_id: eliot_authority::SnapshotId::new(operation.snapshot_id)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                    binding: operation.binding,
+                };
+                let owner = self.retained_p07_owner()?;
+                let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
+                let receipt = eliot_authority::P07AuthorityPort::activate_introduction(
+                    bound.port(),
+                    &request,
+                )
+                .map_err(|error| map_p07_port_error(&error))?;
+                let value =
+                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "kind": "authority_activation_receipt",
+                    "value": value,
+                }))
+            }
+            "revoke_introduction" => {
+                let operation: IntroductionRevocationOperation =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                if operation.introduction_id.trim().is_empty()
+                    || operation.snapshot_id.trim().is_empty()
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                p07_binding_agrees_with_session(&operation.binding, session)?;
+                let request = eliot_authority::IntroductionRevocationRequest {
+                    introduction_id: eliot_authority::IntroductionId::new(
+                        operation.introduction_id,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?,
+                    snapshot_id: eliot_authority::SnapshotId::new(operation.snapshot_id)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                    binding: operation.binding,
+                };
+                let owner = self.retained_p07_owner()?;
+                let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
+                let receipt =
+                    eliot_authority::P07AuthorityPort::revoke_introduction(bound.port(), &request)
+                        .map_err(|error| map_p07_port_error(&error))?;
+                let value =
+                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "kind": "authority_revocation_receipt",
+                    "value": value,
                 }))
             }
             "publish_wasm_dispatch_bundle" => {

@@ -2204,6 +2204,7 @@ dependencies = [
 name = "eliot-kernel"
 version = "0.1.0"
 dependencies = [
+ "eliot-authority",
  "eliot-contracts",
  "eliot-installation",
  "eliot-ipc",
@@ -2215,6 +2216,7 @@ dependencies = [
  "eliot-process",
  "eliot-process-executor",
  "eliot-protocol",
+ "eliot-receipts",
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-runtime-status",

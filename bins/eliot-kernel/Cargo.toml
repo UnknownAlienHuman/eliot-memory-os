@@ -19,6 +19,7 @@ name = "eliot-kernel"
 path = "src/main.rs"
 
 [dependencies]
+eliot-authority.workspace = true
 eliot-contracts.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
@@ -29,6 +30,7 @@ eliot-protocol.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-runtime.workspace = true
+eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-store-api.workspace = true
 eliot-testd-core.workspace = true
