@@ -1076,7 +1076,9 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-reactive-context-plan",
  "eliot-receipts",
+ "serde",
 ]
 
 [[package]]
