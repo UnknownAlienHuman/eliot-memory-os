@@ -39,6 +39,16 @@ pub use reactive_context_delivery::{
     ReactiveContextTransportReceipt, RestartReconciliation, SystemReactiveContextClock,
 };
 
+pub use eliot_kernel_service::{
+    USER_AUTOMATION_HOST_EXECUTION_PIPE, UserAutomationDurableJobPort,
+    UserAutomationHostChannelBinding, UserAutomationHostExecutionFailure,
+    UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
+    UserAutomationHostExecutionSession, UserAutomationHostOwnerBinding, UserAutomationRuntimeError,
+    UserAutomationWakePort, decode_user_automation_host_execution_open_frame,
+    decode_user_automation_host_execution_request_frame,
+    user_automation_host_execution_open_response_frame,
+    user_automation_host_execution_response_frame,
+};
 pub use user_automation_durable_job::{
     HostDurableJobAdapter, HostDurableJobOwner, HostDurableJobOwnerError,
 };

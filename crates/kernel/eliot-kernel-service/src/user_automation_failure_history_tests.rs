@@ -243,6 +243,7 @@ fn blocked_projection(
         workdir_ref: rev.workdir_ref.clone(),
         trigger_origin: UserAutomationTriggerOrigin::ScheduledWake,
         child_depth: 0,
+        provenance: None,
     };
     let occurrence_id = invocation.occurrence_identity().expect("occurrence");
     let wake_intent = rev
@@ -549,6 +550,7 @@ fn sealed_record(
             automation_revision: revision_id.to_owned(),
             occurrence_id,
             config_snapshot_id: "snapshot-1".to_owned(),
+            config_snapshot: projection.config_snapshot.clone(),
             configuration_state: UserAutomationConfigurationState::BlockedConfig,
             work_class: eliot_kernel_core::user_automation::AutomationWorkClass::Maintenance,
             model_access_allowed_after_admission: false,

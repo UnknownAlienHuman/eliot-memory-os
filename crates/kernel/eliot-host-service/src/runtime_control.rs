@@ -13,6 +13,10 @@ use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
     ResourceGeneration, SourceId, StateFence,
 };
+use eliot_kernel_service::{
+    UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest,
+    UserAutomationHostExecutionResponse,
+};
 use eliot_platform::PlatformHandle;
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
@@ -59,6 +63,16 @@ const UNKNOWN_REF_REASONS: &[&str] = &[
     "reactive-context-queue-full",
     "reactive-context-queue-response",
     "reactive-context",
+    "user-automation-admit-validation",
+    "user-automation-admit-queue-lock",
+    "user-automation-admit-queue-full",
+    "user-automation-admit-queue-response",
+    "user-automation-admit",
+    "user-automation-cancel-wakes-validation",
+    "user-automation-cancel-wakes-queue-lock",
+    "user-automation-cancel-wakes-queue-full",
+    "user-automation-cancel-wakes-queue-response",
+    "user-automation-cancel-wakes",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -69,6 +83,8 @@ pub enum HostRuntimeControlOperation {
     RecoverStore,
     ReconcileStoreRecovery,
     DeliverReactiveContext,
+    AdmitUserAutomationOccurrence,
+    CancelUserAutomationPendingWakes,
 }
 
 fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
@@ -78,6 +94,12 @@ fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static
         HostRuntimeControlOperation::RecoverStore => "RecoverStore",
         HostRuntimeControlOperation::ReconcileStoreRecovery => "ReconcileStoreRecovery",
         HostRuntimeControlOperation::DeliverReactiveContext => "DeliverReactiveContext",
+        HostRuntimeControlOperation::AdmitUserAutomationOccurrence => {
+            "AdmitUserAutomationOccurrence"
+        }
+        HostRuntimeControlOperation::CancelUserAutomationPendingWakes => {
+            "CancelUserAutomationPendingWakes"
+        }
     }
 }
 
@@ -88,6 +110,10 @@ fn operation_unknown_prefix(operation: &HostRuntimeControlOperation) -> &'static
         HostRuntimeControlOperation::RecoverStore
         | HostRuntimeControlOperation::ReconcileStoreRecovery => "store-recovery",
         HostRuntimeControlOperation::DeliverReactiveContext => "reactive-context",
+        HostRuntimeControlOperation::AdmitUserAutomationOccurrence => "user-automation-admit",
+        HostRuntimeControlOperation::CancelUserAutomationPendingWakes => {
+            "user-automation-cancel-wakes"
+        }
     }
 }
 
@@ -158,6 +184,22 @@ fn reactive_context_mutation_digest(
     Ok(sha256_hex(&material))
 }
 
+fn user_automation_mutation_digest(
+    operation: &HostRuntimeControlOperation,
+    source: &HostUserAutomationRuntimeRequest,
+) -> Result<String, String> {
+    let encoded = serde_json::to_vec(source)
+        .map_err(|_| "user automation source could not be encoded".to_owned())?;
+    let operation_name = canonical_operation_name(operation);
+    let mut material = Vec::with_capacity(WIRE.len() + operation_name.len() + encoded.len() + 32);
+    material.extend_from_slice(WIRE.as_bytes());
+    material.extend_from_slice(b":user-automation:");
+    material.extend_from_slice(operation_name.as_bytes());
+    material.extend_from_slice(b":");
+    material.extend_from_slice(&encoded);
+    Ok(sha256_hex(&material))
+}
+
 pub fn runtime_control_unknown_ref(
     prefix: &str,
     request: &HostRuntimeControlRequest,
@@ -204,6 +246,12 @@ fn parse_runtime_control_unknown_ref(
         "RecoverStore" => HostRuntimeControlOperation::RecoverStore,
         "ReconcileStoreRecovery" => HostRuntimeControlOperation::ReconcileStoreRecovery,
         "DeliverReactiveContext" => HostRuntimeControlOperation::DeliverReactiveContext,
+        "AdmitUserAutomationOccurrence" => {
+            HostRuntimeControlOperation::AdmitUserAutomationOccurrence
+        }
+        "CancelUserAutomationPendingWakes" => {
+            HostRuntimeControlOperation::CancelUserAutomationPendingWakes
+        }
         _ => return None,
     };
     let request = HostRuntimeControlRequest {
@@ -213,6 +261,7 @@ fn parse_runtime_control_unknown_ref(
         mutation_digest: PlatformHandle::new(mutation_digest).ok()?,
         request_digest: PlatformHandle::new(request_digest).ok()?,
         reactive_context: None,
+        user_automation: None,
     };
     request.validate_identity().ok().map(|_| request)
 }
@@ -249,6 +298,52 @@ impl HostReactiveContextRuntimeRequest {
     }
 }
 
+/// Complete owner-produced UserAutomation execution carrier accepted by the
+/// authenticated Host runtime-control front door.
+///
+/// The wrapped value is the existing typed Kernel-to-Host execution carrier;
+/// this wire adds only the authenticated runtime-control envelope and digest
+/// binding around it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostUserAutomationRuntimeRequest {
+    /// Complete typed execution carrier and authenticated channel evidence.
+    pub execution: UserAutomationHostExecutionRequest,
+}
+
+impl HostUserAutomationRuntimeRequest {
+    /// Validate the carrier handoff before it enters the Host queue.
+    pub fn validate(&self) -> Result<(), String> {
+        self.execution
+            .validate()
+            .map_err(|error| format!("user automation carrier is invalid: {error}"))
+    }
+
+    /// Validate the carrier for the occurrence-admission operation.
+    pub fn validate_for_admit(&self) -> Result<(), String> {
+        self.validate()?;
+        if !matches!(
+            self.execution.operation,
+            UserAutomationHostExecutionOperation::AdmitOccurrence { .. }
+        ) {
+            return Err("user automation admit requires an AdmitOccurrence carrier".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Validate the carrier for the pending-wake-cancellation operation.
+    pub fn validate_for_cancel(&self) -> Result<(), String> {
+        self.validate()?;
+        if !matches!(
+            self.execution.operation,
+            UserAutomationHostExecutionOperation::CancelPendingWakes { .. }
+        ) {
+            return Err("user automation cancel requires a CancelPendingWakes carrier".to_owned());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostRuntimeControlRequest {
@@ -260,6 +355,10 @@ pub struct HostRuntimeControlRequest {
     /// Complete typed input for the authenticated reactive Context operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reactive_context: Option<HostReactiveContextRuntimeRequest>,
+    /// Complete typed UserAutomation execution carrier for the authenticated
+    /// occurrence-admission and wake-cancellation operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_automation: Option<HostUserAutomationRuntimeRequest>,
 }
 
 impl HostRuntimeControlRequest {
@@ -294,6 +393,7 @@ impl HostRuntimeControlRequest {
             mutation_digest,
             request_digest,
             reactive_context: None,
+            user_automation: None,
         };
         value.validate().map_err(|e| e.to_string())?;
         Ok(value)
@@ -329,6 +429,7 @@ impl HostRuntimeControlRequest {
             mutation_digest,
             request_digest,
             reactive_context: Some(reactive_context),
+            user_automation: None,
         };
         value.validate()?;
         Ok(value)
@@ -344,7 +445,6 @@ impl HostRuntimeControlRequest {
             mutation_digest,
         )
     }
-
     pub fn new_store_reconcile(
         request_id: PlatformHandle,
         mutation_digest: PlatformHandle,
@@ -354,6 +454,78 @@ impl HostRuntimeControlRequest {
             request_id,
             mutation_digest,
         )
+    }
+
+    /// Construct an authenticated UserAutomation occurrence-admission request
+    /// whose mutation digest covers the complete typed execution carrier.
+    pub fn new_admit_user_automation_occurrence(
+        request_id: PlatformHandle,
+        execution: UserAutomationHostExecutionRequest,
+    ) -> Result<Self, String> {
+        Self::new_user_automation(
+            HostRuntimeControlOperation::AdmitUserAutomationOccurrence,
+            request_id,
+            execution,
+        )
+    }
+
+    /// Construct an authenticated UserAutomation pending-wake-cancellation
+    /// request whose mutation digest covers the complete typed carrier.
+    pub fn new_cancel_user_automation_pending_wakes(
+        request_id: PlatformHandle,
+        execution: UserAutomationHostExecutionRequest,
+    ) -> Result<Self, String> {
+        Self::new_user_automation(
+            HostRuntimeControlOperation::CancelUserAutomationPendingWakes,
+            request_id,
+            execution,
+        )
+    }
+
+    fn new_user_automation(
+        operation: HostRuntimeControlOperation,
+        request_id: PlatformHandle,
+        execution: UserAutomationHostExecutionRequest,
+    ) -> Result<Self, String> {
+        let user_automation = HostUserAutomationRuntimeRequest { execution };
+        match operation {
+            HostRuntimeControlOperation::AdmitUserAutomationOccurrence => {
+                user_automation.validate_for_admit()?;
+            }
+            HostRuntimeControlOperation::CancelUserAutomationPendingWakes => {
+                user_automation.validate_for_cancel()?;
+            }
+            _ => {
+                return Err(
+                    "user automation input is reserved for AdmitUserAutomationOccurrence and CancelUserAutomationPendingWakes"
+                        .to_owned(),
+                );
+            }
+        }
+        let wire = PlatformHandle::new(WIRE.to_owned()).map_err(|e| e.to_string())?;
+        let mutation_digest = PlatformHandle::new(user_automation_mutation_digest(
+            &operation,
+            &user_automation,
+        )?)
+        .map_err(|e| e.to_string())?;
+        let request_digest = PlatformHandle::new(request_digest_for(
+            &wire,
+            &operation,
+            &request_id,
+            &mutation_digest,
+        ))
+        .map_err(|e| e.to_string())?;
+        let value = Self {
+            wire,
+            operation,
+            request_id,
+            mutation_digest,
+            request_digest,
+            reactive_context: None,
+            user_automation: Some(user_automation),
+        };
+        value.validate()?;
+        Ok(value)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -373,6 +545,34 @@ impl HostRuntimeControlRequest {
                 return Err(
                     "reactive Context input is reserved for DeliverReactiveContext".to_owned(),
                 );
+            }
+            (_, None) => {}
+        }
+        match (&self.operation, &self.user_automation) {
+            (HostRuntimeControlOperation::AdmitUserAutomationOccurrence, Some(source)) => {
+                source.validate_for_admit()?;
+                let expected = user_automation_mutation_digest(&self.operation, source)?;
+                if self.mutation_digest.as_str() != expected {
+                    return Err("user automation mutation_digest mismatch".to_owned());
+                }
+            }
+            (HostRuntimeControlOperation::CancelUserAutomationPendingWakes, Some(source)) => {
+                source.validate_for_cancel()?;
+                let expected = user_automation_mutation_digest(&self.operation, source)?;
+                if self.mutation_digest.as_str() != expected {
+                    return Err("user automation mutation_digest mismatch".to_owned());
+                }
+            }
+            (
+                HostRuntimeControlOperation::AdmitUserAutomationOccurrence
+                | HostRuntimeControlOperation::CancelUserAutomationPendingWakes,
+                None,
+            ) => {
+                return Err("user automation input is required".to_owned());
+            }
+            (_, Some(_)) => {
+                return Err("user automation input is reserved for AdmitUserAutomationOccurrence and CancelUserAutomationPendingWakes"
+                    .to_owned());
             }
             (_, None) => {}
         }
@@ -543,9 +743,68 @@ impl HostStoreRecoveryReceipt {
     deny_unknown_fields
 )]
 pub enum HostRuntimeControlResponse {
-    Restarted { receipt: HostKernelRestartReceipt },
-    StoreRecovered { receipt: HostStoreRecoveryReceipt },
-    Unknown { pending_ref: PlatformHandle },
+    Restarted {
+        receipt: HostKernelRestartReceipt,
+    },
+    StoreRecovered {
+        receipt: HostStoreRecoveryReceipt,
+    },
+    UserAutomationOccurrenceAdmitted {
+        mutation_digest: PlatformHandle,
+        request_digest: PlatformHandle,
+        response: UserAutomationHostExecutionResponse,
+    },
+    UserAutomationPendingWakesCancelled {
+        mutation_digest: PlatformHandle,
+        request_digest: PlatformHandle,
+        response: UserAutomationHostExecutionResponse,
+    },
+    Unknown {
+        pending_ref: PlatformHandle,
+    },
+}
+
+fn is_sha256_text(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn validate_user_automation_response(
+    expect_admit: bool,
+    response: &UserAutomationHostExecutionResponse,
+) -> Result<(), String> {
+    match response {
+        UserAutomationHostExecutionResponse::Admitted { request_sha256, .. } => {
+            if !expect_admit {
+                return Err("user automation cancel response must be Cancelled".to_owned());
+            }
+            if !is_sha256_text(request_sha256) {
+                return Err("user automation request_sha256 must be sha256".to_owned());
+            }
+            Ok(())
+        }
+        UserAutomationHostExecutionResponse::Cancelled { request_sha256, .. } => {
+            if expect_admit {
+                return Err("user automation admit response must be Admitted".to_owned());
+            }
+            if !is_sha256_text(request_sha256) {
+                return Err("user automation request_sha256 must be sha256".to_owned());
+            }
+            Ok(())
+        }
+        UserAutomationHostExecutionResponse::Failed { failure, .. } => {
+            failure
+                .validate()
+                .map_err(|error| format!("user automation failure projection: {error}"))?;
+            Ok(())
+        }
+        UserAutomationHostExecutionResponse::WakeRead { .. } => Err(
+            "user automation readback travels over the execution transport, never runtime-control"
+                .to_owned(),
+        ),
+    }
 }
 
 impl HostRuntimeControlResponse {
@@ -565,6 +824,34 @@ impl HostRuntimeControlResponse {
         Self::StoreRecovered { receipt }
     }
 
+    /// Bind a typed occurrence-admission answer to its runtime-control
+    /// request. The typed carrier binding itself is checked by
+    /// [`response_matches_request`].
+    pub fn user_automation_occurrence_admitted_for(
+        request: &HostRuntimeControlRequest,
+        response: UserAutomationHostExecutionResponse,
+    ) -> Self {
+        Self::UserAutomationOccurrenceAdmitted {
+            mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            response,
+        }
+    }
+
+    /// Bind a typed wake-cancellation answer to its runtime-control request.
+    /// The typed carrier binding itself is checked by
+    /// [`response_matches_request`].
+    pub fn user_automation_pending_wakes_cancelled_for(
+        request: &HostRuntimeControlRequest,
+        response: UserAutomationHostExecutionResponse,
+    ) -> Self {
+        Self::UserAutomationPendingWakesCancelled {
+            mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            response,
+        }
+    }
+
     pub fn unknown_for(request: &HostRuntimeControlRequest, pending_ref: PlatformHandle) -> Self {
         let _ = request;
         Self::Unknown { pending_ref }
@@ -574,6 +861,34 @@ impl HostRuntimeControlResponse {
         match self {
             Self::Restarted { receipt, .. } => receipt.validate(),
             Self::StoreRecovered { receipt, .. } => receipt.validate(),
+            Self::UserAutomationOccurrenceAdmitted {
+                mutation_digest,
+                request_digest,
+                response,
+                ..
+            } => {
+                if !is_sha256_digest(mutation_digest) {
+                    return Err("mutation_digest must be sha256".to_owned());
+                }
+                if !is_sha256_digest(request_digest) {
+                    return Err("request_digest must be sha256".to_owned());
+                }
+                validate_user_automation_response(true, response)
+            }
+            Self::UserAutomationPendingWakesCancelled {
+                mutation_digest,
+                request_digest,
+                response,
+                ..
+            } => {
+                if !is_sha256_digest(mutation_digest) {
+                    return Err("mutation_digest must be sha256".to_owned());
+                }
+                if !is_sha256_digest(request_digest) {
+                    return Err("request_digest must be sha256".to_owned());
+                }
+                validate_user_automation_response(false, response)
+            }
             Self::Unknown { pending_ref, .. } => parse_runtime_control_unknown_ref(pending_ref)
                 .map(|_| ())
                 .ok_or_else(|| "pending_ref is not canonical".to_owned()),
@@ -610,10 +925,62 @@ pub fn response_matches_request(
             receipt.request_digest == request.request_digest
                 && receipt.external_control_mutation_digest == request.mutation_digest
         }
+        HostRuntimeControlResponse::UserAutomationOccurrenceAdmitted {
+            mutation_digest,
+            request_digest,
+            response,
+        } => {
+            request.operation == HostRuntimeControlOperation::AdmitUserAutomationOccurrence
+                && *mutation_digest == request.mutation_digest
+                && *request_digest == request.request_digest
+                && user_automation_response_matches_request(request, response)
+        }
+        HostRuntimeControlResponse::UserAutomationPendingWakesCancelled {
+            mutation_digest,
+            request_digest,
+            response,
+        } => {
+            request.operation == HostRuntimeControlOperation::CancelUserAutomationPendingWakes
+                && *mutation_digest == request.mutation_digest
+                && *request_digest == request.request_digest
+                && user_automation_response_matches_request(request, response)
+        }
         HostRuntimeControlResponse::Unknown { pending_ref } => {
             pending_ref_matches_request(pending_ref, request)
         }
     }
+}
+
+/// Check the typed UserAutomation answer against the exact carrier admitted
+/// by the runtime-control request. The carrier digest and fence binding are
+/// enforced by the existing typed response validation; a missing carrier or
+/// an operation mismatch fails closed.
+fn user_automation_response_matches_request(
+    request: &HostRuntimeControlRequest,
+    response: &UserAutomationHostExecutionResponse,
+) -> bool {
+    let Some(carrier) = request
+        .user_automation
+        .as_ref()
+        .map(|source| &source.execution)
+    else {
+        return false;
+    };
+    let operation_matches = match (&request.operation, &carrier.operation) {
+        (
+            HostRuntimeControlOperation::AdmitUserAutomationOccurrence,
+            UserAutomationHostExecutionOperation::AdmitOccurrence { .. },
+        )
+        | (
+            HostRuntimeControlOperation::CancelUserAutomationPendingWakes,
+            UserAutomationHostExecutionOperation::CancelPendingWakes { .. },
+        ) => true,
+        _ => false,
+    };
+    if !operation_matches {
+        return false;
+    }
+    response.validate_for(carrier).is_ok()
 }
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -733,6 +1100,10 @@ pub fn runtime_control_response_frame(
         HostRuntimeControlResponse::StoreRecovered { receipt, .. } => {
             receipt.request_digest.as_str().to_owned()
         }
+        HostRuntimeControlResponse::UserAutomationOccurrenceAdmitted { request_digest, .. }
+        | HostRuntimeControlResponse::UserAutomationPendingWakesCancelled {
+            request_digest, ..
+        } => request_digest.as_str().to_owned(),
         HostRuntimeControlResponse::Unknown { pending_ref, .. } => {
             parse_runtime_control_unknown_ref(pending_ref)
                 .ok_or_else(|| "SessionFenced".to_owned())?
@@ -798,6 +1169,14 @@ pub fn decode_runtime_control_response_frame(
         }
         HostRuntimeControlResponse::StoreRecovered { receipt, .. } => {
             if frame_request_id.as_str() != receipt.request_digest.as_str() {
+                return Err("SessionFenced".to_owned());
+            }
+        }
+        HostRuntimeControlResponse::UserAutomationOccurrenceAdmitted { request_digest, .. }
+        | HostRuntimeControlResponse::UserAutomationPendingWakesCancelled {
+            request_digest, ..
+        } => {
+            if frame_request_id.as_str() != request_digest.as_str() {
                 return Err("SessionFenced".to_owned());
             }
         }
@@ -943,5 +1322,198 @@ mod tests {
             runtime_control_response_frame("response-connection", &response).unwrap();
         let decoded_response = decode_runtime_control_response_frame(&response_frame).unwrap();
         assert_eq!(decoded_response, response);
+    }
+
+    fn test_fence() -> StateFence {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let epoch = EpochId::new(lineage, std::num::NonZeroU64::new(1).unwrap()).unwrap();
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn cancelled_wakes() -> UserAutomationHostExecutionResponse {
+        UserAutomationHostExecutionResponse::Cancelled {
+            request_sha256: sha256_hex(b"cancel-carrier"),
+            state_fence: test_fence(),
+            wake_ids: vec!["wake-1".to_owned()],
+        }
+    }
+
+    /// Identity-only request used to prove the Unknown reconciliation path.
+    /// Typed UserAutomation requests always carry a validated carrier, so this
+    /// helper covers only the digest-identity reconciliation after a lost
+    /// response, exactly like `parse_runtime_control_unknown_ref` does.
+    fn identity_only_user_automation_request(
+        operation: HostRuntimeControlOperation,
+        request_id: &str,
+    ) -> HostRuntimeControlRequest {
+        let wire = PlatformHandle::new(WIRE.to_owned()).unwrap();
+        let request_id = handle(request_id);
+        let mutation_digest =
+            PlatformHandle::new(mutation_digest_for_request_id(&wire, &request_id)).unwrap();
+        let request_digest = PlatformHandle::new(request_digest_for(
+            &wire,
+            &operation,
+            &request_id,
+            &mutation_digest,
+        ))
+        .unwrap();
+        HostRuntimeControlRequest {
+            wire,
+            operation,
+            request_id,
+            mutation_digest,
+            request_digest,
+            reactive_context: None,
+            user_automation: None,
+        }
+    }
+
+    #[test]
+    fn user_automation_requests_fail_closed_without_typed_carrier() {
+        let admit = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::AdmitUserAutomationOccurrence,
+            handle("ua-admit-no-carrier"),
+        );
+        assert_eq!(
+            admit.unwrap_err(),
+            "user automation input is required".to_owned()
+        );
+        let cancel = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::CancelUserAutomationPendingWakes,
+            handle("ua-cancel-no-carrier"),
+        );
+        assert_eq!(
+            cancel.unwrap_err(),
+            "user automation input is required".to_owned()
+        );
+    }
+
+    #[test]
+    fn user_automation_operation_wire_names_are_canonical() {
+        assert_eq!(
+            serde_json::to_value(HostRuntimeControlOperation::AdmitUserAutomationOccurrence)
+                .unwrap(),
+            serde_json::json!("ADMIT_USER_AUTOMATION_OCCURRENCE")
+        );
+        assert_eq!(
+            serde_json::to_value(HostRuntimeControlOperation::CancelUserAutomationPendingWakes)
+                .unwrap(),
+            serde_json::json!("CANCEL_USER_AUTOMATION_PENDING_WAKES")
+        );
+        assert_eq!(
+            serde_json::from_value::<HostRuntimeControlOperation>(serde_json::json!(
+                "ADMIT_USER_AUTOMATION_OCCURRENCE"
+            ))
+            .unwrap(),
+            HostRuntimeControlOperation::AdmitUserAutomationOccurrence
+        );
+        assert_eq!(
+            operation_unknown_prefix(&HostRuntimeControlOperation::AdmitUserAutomationOccurrence),
+            "user-automation-admit"
+        );
+        assert_eq!(
+            operation_unknown_prefix(
+                &HostRuntimeControlOperation::CancelUserAutomationPendingWakes
+            ),
+            "user-automation-cancel-wakes"
+        );
+    }
+
+    #[test]
+    fn user_automation_unknown_refs_roundtrip_and_reconcile_after_lost_response() {
+        for operation in [
+            HostRuntimeControlOperation::AdmitUserAutomationOccurrence,
+            HostRuntimeControlOperation::CancelUserAutomationPendingWakes,
+        ] {
+            let request = identity_only_user_automation_request(operation.clone(), "ua-reconcile");
+            for suffix in ["validation", "queue-lock", "queue-full", "queue-response"] {
+                let pending_ref = operation_unknown_ref(&operation, suffix, &request);
+                let parsed = parse_runtime_control_unknown_ref(&pending_ref).unwrap();
+                assert_eq!(parsed.operation, operation);
+                assert_eq!(parsed.request_digest, request.request_digest);
+                let unknown = HostRuntimeControlResponse::Unknown {
+                    pending_ref: pending_ref.clone(),
+                };
+                unknown.validate().unwrap();
+                assert!(response_matches_request(&request, &unknown));
+                let frame =
+                    runtime_control_response_frame("ua-reconcile-connection", &unknown).unwrap();
+                let decoded = decode_runtime_control_response_frame(&frame).unwrap();
+                assert_eq!(decoded, unknown);
+            }
+        }
+
+        let restart = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("ua-foreign"),
+        )
+        .unwrap();
+        let foreign = HostRuntimeControlResponse::Unknown {
+            pending_ref: operation_unknown_ref(
+                &HostRuntimeControlOperation::AdmitUserAutomationOccurrence,
+                "validation",
+                &restart,
+            ),
+        };
+        foreign.validate().unwrap();
+        assert!(!response_matches_request(&restart, &foreign));
+
+        let payload = serde_json::to_string(&(
+            "NoSuchOperation",
+            "id",
+            sha256_hex(b"mutation"),
+            sha256_hex(b"request"),
+        ))
+        .unwrap();
+        let unknown_operation =
+            PlatformHandle::new(format!("{WIRE}:unknown:reactive-context:{payload}")).unwrap();
+        assert!(parse_runtime_control_unknown_ref(&unknown_operation).is_none());
+        let unknown_reason =
+            PlatformHandle::new(format!("{WIRE}:unknown:no-such-reason:{payload}")).unwrap();
+        assert!(parse_runtime_control_unknown_ref(&unknown_reason).is_none());
+    }
+
+    #[test]
+    fn user_automation_responses_bind_to_exact_request_and_reject_crossed_answers() {
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("ua-crossed"),
+        )
+        .unwrap();
+        let cancelled = cancelled_wakes();
+
+        let crossed = HostRuntimeControlResponse::user_automation_occurrence_admitted_for(
+            &request,
+            cancelled.clone(),
+        );
+        assert!(crossed.validate().is_err());
+        assert!(!response_matches_request(&request, &crossed));
+
+        let bound = HostRuntimeControlResponse::user_automation_pending_wakes_cancelled_for(
+            &request, cancelled,
+        );
+        bound.validate().unwrap();
+        assert!(!response_matches_request(&request, &bound));
+    }
+
+    #[test]
+    fn user_automation_response_frames_roundtrip_and_reject_digest_substitution() {
+        let request = HostRuntimeControlRequest::new(
+            HostRuntimeControlOperation::RestartKernel,
+            handle("ua-frame"),
+        )
+        .unwrap();
+        let response = HostRuntimeControlResponse::user_automation_pending_wakes_cancelled_for(
+            &request,
+            cancelled_wakes(),
+        );
+        let frame = runtime_control_response_frame("ua-connection", &response).unwrap();
+        let decoded = decode_runtime_control_response_frame(&frame).unwrap();
+        assert_eq!(decoded, response);
+
+        let mut tampered = frame.clone();
+        tampered.request_id =
+            Some(RequestId::new(digest("wrong-ua-frame-id").as_str().to_owned()).unwrap());
+        assert!(decode_runtime_control_response_frame(&tampered).is_err());
     }
 }

@@ -718,9 +718,11 @@ static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 9] = [
 ];
 
 /// Owner-approved user-automation read selectors (issue #1779): the query
-/// discriminator, the optional exact automation selector, the retired-row
-/// inclusion flag, and the decimal page bound.
-static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 4] = [
+/// discriminator, the optional exact automation selector, the optional exact
+/// immutable revision selector for current/history reads, the retired-row
+/// inclusion flag, the decimal page bound, and the optional exact occurrence
+/// selector for invocation reads.
+static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 6] = [
     ParameterDeclaration {
         name: "query",
         shape: ParameterShape::Subject,
@@ -728,6 +730,16 @@ static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 4] = [
     },
     ParameterDeclaration {
         name: "automation_id",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "revision",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "occurrence_id",
         shape: ParameterShape::Subject,
         required: false,
     },
@@ -1004,8 +1016,9 @@ pub const fn declared_read_parameters(
         NamedReadOperation::GetReactiveInjectionState => &GET_REACTIVE_LEDGER_PARAMETERS,
         NamedReadOperation::GetResourceSnapshot => &GET_RESOURCE_SNAPSHOT_PARAMETERS,
         NamedReadOperation::GetUserAutomationState => &GET_USER_AUTOMATION_PARAMETERS,
-        NamedReadOperation::GetExperienceBankRange => &GET_EXPERIENCE_RANGE_PARAMETERS,
-        NamedReadOperation::GetAgentFeedbackRange => &GET_EXPERIENCE_RANGE_PARAMETERS,
+        NamedReadOperation::GetExperienceBankRange | NamedReadOperation::GetAgentFeedbackRange => {
+            &GET_EXPERIENCE_RANGE_PARAMETERS
+        }
         NamedReadOperation::GetAuditRange => &GET_AUDIT_RANGE_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
@@ -1082,8 +1095,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ApplyReactiveInjectionState => &APPLY_REACTIVE_LEDGER_PARAMETERS,
         NamedMutationOperation::ApplyResourceSnapshot => &APPLY_RESOURCE_SNAPSHOT_PARAMETERS,
         NamedMutationOperation::ApplyUserAutomationState => &APPLY_USER_AUTOMATION_PARAMETERS,
-        NamedMutationOperation::CommitExperienceBank => &COMMIT_EXPERIENCE_PARAMETERS,
-        NamedMutationOperation::CommitAgentFeedback => &COMMIT_EXPERIENCE_PARAMETERS,
+        NamedMutationOperation::CommitExperienceBank | NamedMutationOperation::CommitAgentFeedback => {
+            &COMMIT_EXPERIENCE_PARAMETERS
+        }
     }
 }
 
