@@ -17,6 +17,7 @@ proof_entrypoint = "cargo test -p eliot-kernel-core"
 eliot-authority.workspace = true
 eliot-config.workspace = true
 eliot-contracts.workspace = true
+eliot-influence.workspace = true
 eliot-platform.workspace = true
 eliot-protocol.workspace = true
 eliot-ors.workspace = true

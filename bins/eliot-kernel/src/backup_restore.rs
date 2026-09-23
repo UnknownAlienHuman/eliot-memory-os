@@ -85,7 +85,7 @@ use eliot_backup::{
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{canonical_json_bytes, sha256_hex, StateFence};
 use eliot_security_contracts::PurgeLedgerEntry;
-use eliot_store_api::WriteReceipt;
+use eliot_store_api::{RevocationHistoryPayload, WriteReceipt, parse_revocation_history_payload};
 use serde::Serialize;
 
 use super::backup_restore_ports::{
@@ -183,6 +183,78 @@ impl<'a> PurgeOwnerClient<'a> {
             capability: owners::PURGE_MEMBER_SUPPRESSION,
         })
     }
+}
+
+/// Revocation-ledger artifact kind: the bundle artifact slot carrying the
+/// authority revocation history accompanying the snapshot (I12.20 S1:
+///
+/// "ensure backup/restore purge/revocation ledger prevents resurrection").
+///
+/// File-local carrier only: no archive-contract field names a revocation
+/// ledger, so the accompanying history travels as an integrity-bound
+/// artifact (`BackupArtifact::validate` plus the manifest section
+/// checksums already bind its bytes) under this kind. Absence of the slot
+/// means the source carries no revocation history and restore proceeds
+/// exactly as before.
+const REVOCATION_HISTORY_ARTIFACT_KIND: &str = "revocation-history";
+
+/// Restore/import revocation-ledger gate (issue #1732).
+///
+/// Loads the revocation history accompanying the snapshot from the
+/// integrity-bound artifact slot and enforces it before any import, so a
+/// revoked lineage can never become active again after restore without
+/// clean requalification:
+///
+/// ```text
+/// no history slot ............. clean snapshot: Ok, behavior unchanged;
+/// unparseable history ......... unknown evidence: refuse, never lossy;
+/// disagreeing history views ... stale/drifted evidence: refuse;
+/// recorded revocations ........ refuse: no accepted in-tree contract maps
+///                               closure refs to archive member identities
+///                               (same backlog posture as
+///                               `PURGE_MEMBER_SUPPRESSION`), and no accepted
+///                               carrier proves clean requalification, so any
+///                               recorded revocation fails closed instead of
+///                               risking resurrection by spelling match;
+/// explicit zero revocations ... Ok: empty `closures` with a nonzero
+///                               `source_revision` is the source attesting
+///                               zero revocations (mirrors the
+///                               `GetAuthorityRevocationHistory` contract).
+/// ```
+///
+/// Fail-closed like the grant-side restore gate
+/// (`AuthorityOwner::from_snapshot_with_revocation_history`): the only
+/// passing histories are an absent slot or a valid explicit-empty view.
+/// A recorded revocation refuses until a requalification carrier and a
+/// closure-to-member matching API land; that backlog must not unblock
+/// restore in this lane.
+fn gate_revocation_ledger(bundle: &BackupBundle) -> Result<(), BackupError> {
+    let mut histories: Vec<RevocationHistoryPayload> = Vec::new();
+    for artifact in bundle
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == REVOCATION_HISTORY_ARTIFACT_KIND)
+    {
+        let payload: serde_json::Value = serde_json::from_slice(&artifact.bytes)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        histories.push(parse_revocation_history_payload(&payload).map_err(BackupError::Store)?);
+    }
+    let Some(first) = histories.first() else {
+        return Ok(());
+    };
+    if histories.iter().any(|history| {
+        history.source_revision != first.source_revision || history.origin_ref != first.origin_ref
+    }) {
+        return Err(BackupError::Security(
+            "revocation history is stale for this restore".to_owned(),
+        ));
+    }
+    if histories.iter().any(|history| !history.closures.is_empty()) {
+        return Err(BackupError::Security(
+            "restore refuses recorded revocation without clean requalification evidence".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Canonical owner client: runs the owner's accepted validation and
@@ -1254,6 +1326,10 @@ impl<'a> KernelRestoreTarget<'a> {
         intent: &RestoreIntent,
     ) -> Result<RestoreAppliedEffect, BackupError> {
         self.gate(bundle)?;
+        // Revocation-ledger barrier (I12.20 S1, issue #1732): a recorded
+        // revocation refuses before the purge ledger is staged and long
+        // before any import, so no revoked lineage can resurrect.
+        gate_revocation_ledger(bundle)?;
         self.apply_purge_ledger(&bundle.purge_ledger)?;
         let evidence_bytes = self.staged_bytes("purge_ledger.json")?;
         let applied = RestoreAppliedEffect {

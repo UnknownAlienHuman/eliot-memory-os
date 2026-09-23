@@ -138,10 +138,63 @@ pub struct AuthorizedEffect {
     pub receipt_obligations: Vec<ReceiptObligation>,
 }
 
+/// Current validity of an authorized (pending) effect under I12.20 influence
+/// revocation.
+///
+/// Historical admission records are never mutated: a revocation marks the
+/// *current* standing of a dependent pending effect as contestable (first
+/// challenge) or reopened (already contested, challenged again by a new
+/// revoked root), while the stored [`AuthorizedEffect`] and every recovery
+/// record stay byte-identical. Contested effects must be rebuilt from clean
+/// inputs before further reliance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DependentEffectState {
+    Admissible,
+    Contestable { revoked_roots: BTreeSet<String> },
+    Reopened { revoked_roots: BTreeSet<String> },
+}
+
+impl DependentEffectState {
+    /// Revoked roots currently challenging this effect, if any.
+    pub fn revoked_roots(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Self::Admissible => None,
+            Self::Contestable { revoked_roots } | Self::Reopened { revoked_roots } => {
+                Some(revoked_roots)
+            }
+        }
+    }
+
+    /// True while the current standing is challenged and must be rebuilt
+    /// from clean inputs before further reliance.
+    pub fn is_contested(&self) -> bool {
+        !matches!(self, Self::Admissible)
+    }
+}
+
+/// Append-only revocation annotation over one pending effect.
+///
+/// Each annotation supersedes — never rewrites — the historical admission
+/// record: the [`AuthorizedEffect`] stored under `idempotency_key` is left
+/// untouched and the annotation is pushed as a new record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContestedEffectAnnotation {
+    pub idempotency_key: String,
+    pub revoked_roots: BTreeSet<String>,
+    pub reopened: bool,
+}
+
 /// Pure idempotency and lease admission registry.
+///
+/// The admission ledger (`authorized_by_idempotency`) is append-only history:
+/// revocation propagation only adds current-state contest overlays
+/// (`contest_state`) and append-only [`ContestedEffectAnnotation`] records.
+/// It never mutates a stored [`AuthorizedEffect`].
 #[derive(Clone, Debug, Default)]
 pub struct EffectAuthorizer {
     authorized_by_idempotency: BTreeMap<String, AuthorizedEffect>,
+    contest_state: BTreeMap<String, DependentEffectState>,
+    contest_annotations: Vec<ContestedEffectAnnotation>,
 }
 
 pub const EFFECT_AUTHORIZER_RECOVERY_SCHEMA: &str = "eliot.authority.effect-authorizer-recovery";
@@ -288,6 +341,11 @@ impl EffectAuthorizer {
         }
         Ok(Self {
             authorized_by_idempotency,
+            // Restored history starts admissible: revocation is current-state
+            // and must be re-propagated from the live revoked set (rebuild
+            // from clean inputs per I12.20), never resurrected from backup.
+            contest_state: BTreeMap::new(),
+            contest_annotations: Vec::new(),
         })
     }
 
@@ -299,6 +357,37 @@ impl EffectAuthorizer {
         current_work_scope: &WorkScopeBinding,
         current_session: &SessionBinding,
         now: LogicalTime,
+    ) -> Result<AuthorizedEffect, AuthorityError> {
+        self.authorize_with_revoked_roots(
+            lease,
+            proposed,
+            executor_boundary,
+            current_work_scope,
+            current_session,
+            now,
+            None,
+        )
+    }
+
+    /// Authorizes one effect, then propagates I12.20 influence revocation
+    /// through the pending-effect closure in this file.
+    ///
+    /// When `revoked_roots` is `None` or empty this is exactly [`Self::authorize`]:
+    /// the admission result is unchanged and no contest state is written. When
+    /// non-empty, every current pending effect whose validity depended on a
+    /// revoked root — including the effect just admitted — is marked
+    /// contestable/reopened via [`Self::contest_dependent_effects`], while
+    /// historical admission records stay immutable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_with_revoked_roots(
+        &mut self,
+        lease: &mut ActionLease,
+        proposed: ProposedEffect,
+        executor_boundary: impl Into<String>,
+        current_work_scope: &WorkScopeBinding,
+        current_session: &SessionBinding,
+        now: LogicalTime,
+        revoked_roots: Option<&BTreeSet<String>>,
     ) -> Result<AuthorizedEffect, AuthorityError> {
         let executor_boundary = executor_boundary.into();
         validate_text(&executor_boundary, "executor_boundary")?;
@@ -322,8 +411,129 @@ impl EffectAuthorizer {
             authorized.proposal.operation.idempotency_key.clone(),
             authorized.clone(),
         );
+        // I12.20 propagation on the production authorization path: contest
+        // current dependent justifications/plans/pending effects without
+        // touching history. Empty or absent revoked sets are a no-op.
+        if let Some(revoked_roots) = revoked_roots {
+            self.contest_dependent_effects(revoked_roots);
+        }
         Ok(authorized)
     }
+
+    /// Marks every CURRENT pending effect whose validity depended on a
+    /// revoked root as contestable (first challenge) or reopened (already
+    /// contested, challenged again by a new root), per I12.20 S1.
+    ///
+    /// Historical decisions are preserved: stored [`AuthorizedEffect`]
+    /// values and recovery records are never mutated. Each newly challenged
+    /// effect gains one append-only [`ContestedEffectAnnotation`] that
+    /// supersedes without rewriting history. An empty `revoked_roots` set
+    /// is a no-op returning `0`.
+    ///
+    /// Returns the number of effects whose current standing changed.
+    pub fn contest_dependent_effects(&mut self, revoked_roots: &BTreeSet<String>) -> usize {
+        if revoked_roots.is_empty() {
+            return 0;
+        }
+        // Collect first so the contest-state mutation cannot disturb the
+        // history ledger iteration.
+        let challenged: Vec<(String, BTreeSet<String>)> = self
+            .authorized_by_idempotency
+            .iter()
+            .filter_map(|(key, authorized)| {
+                let matched = dependent_revoked_roots(authorized, revoked_roots);
+                (!matched.is_empty()).then(|| (key.clone(), matched))
+            })
+            .collect();
+        let mut changed = 0;
+        for (key, matched) in challenged {
+            let merged: BTreeSet<String> = match self.contest_state.get(&key) {
+                None => matched,
+                Some(previous) => match previous.revoked_roots() {
+                    // Unreachable: only contested states are ever stored.
+                    None => continue,
+                    Some(previous_roots) => {
+                        if matched.iter().all(|root| previous_roots.contains(root)) {
+                            continue;
+                        }
+                        previous_roots.union(&matched).cloned().collect()
+                    }
+                },
+            };
+            let reopened = self.contest_state.contains_key(&key);
+            let state = if reopened {
+                DependentEffectState::Reopened {
+                    revoked_roots: merged.clone(),
+                }
+            } else {
+                DependentEffectState::Contestable {
+                    revoked_roots: merged.clone(),
+                }
+            };
+            self.contest_state.insert(key.clone(), state);
+            self.contest_annotations.push(ContestedEffectAnnotation {
+                idempotency_key: key,
+                revoked_roots: merged,
+                reopened,
+            });
+            changed += 1;
+        }
+        changed
+    }
+
+    /// Current I12.20 standing of one pending effect. Never-contested effects
+    /// and unknown keys report [`DependentEffectState::Admissible`].
+    /// History is read-only here: this never mutates admission records.
+    pub fn dependent_effect_state(&self, idempotency_key: &str) -> DependentEffectState {
+        self.contest_state
+            .get(idempotency_key)
+            .cloned()
+            .unwrap_or(DependentEffectState::Admissible)
+    }
+
+    /// Idempotency keys currently contested or reopened, in ledger order.
+    pub fn contested_effect_keys(&self) -> Vec<String> {
+        self.contest_state.keys().cloned().collect()
+    }
+
+    /// Append-only revocation annotations. Each entry supersedes without
+    /// rewriting the historical admission record it annotates.
+    pub fn contest_annotations(&self) -> &[ContestedEffectAnnotation] {
+        &self.contest_annotations
+    }
+}
+
+/// Revoked roots a pending effect directly depends on, for I12.20
+/// revocation propagation.
+///
+/// A pending effect carries forward the influence of its action, resource,
+/// operation, lease, and executor identities: when any of those identities
+/// names a revoked root, the effect's current validity depended on the
+/// revoked source and must be contested. Lineage held outside this file
+/// (packets, plans, caches, module profiles) is the caller's closure to
+/// traverse; this predicate covers the exact identity surface admitted here.
+fn dependent_revoked_roots(
+    authorized: &AuthorizedEffect,
+    revoked_roots: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let proposal = &authorized.proposal;
+    let mut matched = BTreeSet::new();
+    for candidate in [
+        proposal.action_id.as_str(),
+        proposal.operation_name.as_str(),
+        proposal.resource_ref.as_str(),
+        proposal.operation.operation_kind.as_str(),
+        proposal.operation.idempotency_key.as_str(),
+        proposal.operation.operation_id.as_str(),
+        proposal.operation.request_id.as_str(),
+        authorized.lease_id.as_str(),
+        authorized.executor_boundary.as_str(),
+    ] {
+        if revoked_roots.contains(candidate) {
+            matched.insert(candidate.to_owned());
+        }
+    }
+    matched
 }
 
 fn same_logical_effect(left: &ProposedEffect, right: &ProposedEffect) -> bool {

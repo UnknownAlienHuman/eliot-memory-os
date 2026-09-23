@@ -1737,31 +1737,45 @@ impl GrantActivationPort {
     /// revoked grants nor revoked introductions contribute nothing, as do
     /// unknown identities; set semantics absorb cycles. No mutation, no new
     /// state.
+    ///
+    /// The traversal is the shared [`revoked_support_in_ledger`]
+    /// implementation on the held ledger, so recovery paths that already own
+    /// the port lock reuse the exact same closure without re-locking (a
+    /// `&self` query under the held guard would deadlock on the mutex).
     #[must_use]
     pub fn revoked_support_closure(&self, roots: &[String]) -> BTreeSet<String> {
-        let mut revoked = BTreeSet::new();
-        for root in roots {
-            if !self.grant_revoked(root) && !self.introduction_revoked(root) {
-                continue;
-            }
-            revoked.insert(root.clone());
-            let members: Vec<String> = {
-                let ledger = self.lock_ledger();
-                match ledger.grants.get(root) {
-                    Some(record) => {
-                        let authority_root_ref = record.authority_root_ref.clone();
-                        descendant_closure(&ledger.grants, &authority_root_ref, root)
-                    }
-                    None => vec![root.clone()],
-                }
-            };
-            for member in members {
-                if self.grant_revoked(&member) || self.introduction_revoked(&member) {
-                    revoked.insert(member);
-                }
-            }
-        }
-        revoked
+        let ledger = self.lock_ledger();
+        revoked_support_in_ledger(&ledger, roots)
+    }
+
+    /// Kernel-owned revocation fan-out from one durable root revocation
+    /// record to the revoked derived-handle set (I12.20 S1 traverse + S2
+    /// explicit-closure scope, issue #1732).
+    ///
+    /// S1 marks the revoked root from the durable record itself: the record
+    /// subject is the revoked authority root committed by the Kernel-owned
+    /// revocation workflow (`revoke_closure_core` builds one
+    /// [`CapabilityGrantRevocation`] per fenced member through
+    /// `closure_member_revocation`). S2 bounds traversal to the explicit
+    /// recorded closure: the set is the root plus every transitive
+    /// descendant that is also revoked, including revoked introductions on
+    /// those identities. The traversal is the shared
+    /// [`Self::revoked_support_closure`] implementation, so no graph logic is
+    /// duplicated here; unknown identities contribute nothing and set
+    /// semantics absorb cycles.
+    ///
+    /// The query is read-only. Compile/restore gates remove the returned
+    /// handles from derived artifacts before requalification; the
+    /// closure-activation recovery gate in this file consumes the same
+    /// traversal to refuse reinstalling revoked support before any durable
+    /// write.
+    #[must_use]
+    pub fn revoked_handles_for_compile(
+        &self,
+        root_revocation: &CapabilityGrantRevocation,
+    ) -> BTreeSet<String> {
+        let root = root_revocation.record().subject_id.as_str().to_owned();
+        self.revoked_support_closure(&[root])
     }
 
     /// Returns the greatest grant-graph revision observed for one lineage
@@ -2271,6 +2285,22 @@ impl GrantActivationPort {
                 field: "enumeration",
                 reason: "the presented closure disagrees with the owner enumeration",
             });
+        }
+        // I12.20 revocation fan-out (issue #1732): propagate durable
+        // revocation into recovery before any durable write. The re-presented
+        // affected set must carry no revoked support: the live revoked
+        // fan-out over the explicit closure — the shared
+        // `revoked_support_closure` traversal on the held ledger, so no graph
+        // logic is duplicated and no re-lock can deadlock — is removed from
+        // the reinstall set by refusing here. This runs ahead of the member
+        // row loop below, which would otherwise promote an `Applying` row for
+        // revoked support before the activation validators see it. Recovery
+        // never reactivates a path.
+        let affected = closure_affected_set(&request.enumeration);
+        if !revoked_support_in_ledger(&ledger, &affected).is_empty() {
+            return Err(KernelError::RecoveryUnavailable(
+                "closure carries revoked support; recovery never reactivates a path".to_owned(),
+            ));
         }
         // Every member row must agree with its enumerated input. An
         // `Applying` row is promoted through the exact pending-to-active
@@ -3082,6 +3112,81 @@ fn note_unknown_effects(
                 .insert(operation.clone(), context_id.to_owned());
         }
     }
+}
+
+/// Returns the revoked members of the explicit support closure under each
+/// root, read from one already-held ledger (`I12.20` traverse-explicit-
+/// closure, issue #1732).
+///
+/// This is the single shared implementation behind
+/// [`GrantActivationPort::revoked_support_closure`] and
+/// [`GrantActivationPort::revoked_handles_for_compile`]: the root itself plus
+/// every transitive descendant that is also revoked, where revoked means the
+/// `revoked_grants` tombstone, a `Revoked` live grant, or a `Revoked` live
+/// introduction. Roots that are neither revoked grants nor revoked
+/// introductions contribute nothing, as do unknown identities; set semantics
+/// absorb cycles. No mutation, no new state. Recovery paths that already own
+/// the port lock call this directly; the public queries lock, then delegate
+/// here.
+fn revoked_support_in_ledger(ledger: &PortLedger, roots: &[String]) -> BTreeSet<String> {
+    let mut revoked = BTreeSet::new();
+    for root in roots {
+        let root_revoked = ledger.revoked_grants.contains(root)
+            || ledger
+                .grants
+                .get(root)
+                .is_some_and(|record| record.status == LiveStatus::Revoked)
+            || ledger
+                .introductions
+                .get(root)
+                .is_some_and(|record| record.status == LiveStatus::Revoked);
+        if !root_revoked {
+            continue;
+        }
+        revoked.insert(root.clone());
+        let members: Vec<String> = match ledger.grants.get(root) {
+            Some(record) => {
+                // I12.20 explicit-closure traversal reuses the pure
+                // `eliot-influence` engine: edges are pre-scoped to the
+                // root's authority root (cross-root lineage is never
+                // followed), then the engine traverses multi-hop and
+                // cycle-safe. Unknown roots keep the previous direct
+                // behavior below.
+                let edges: Vec<eliot_influence::InfluenceEdge> = ledger
+                    .grants
+                    .iter()
+                    .filter(|(_, candidate)| {
+                        candidate.authority_root_ref == record.authority_root_ref
+                    })
+                    .filter_map(|(candidate_id, candidate)| {
+                        candidate.parent_grant_id.as_deref().map(|parent| {
+                            eliot_influence::InfluenceEdge {
+                                source_ref: parent.to_owned(),
+                                dependent_ref: candidate_id.clone(),
+                            }
+                        })
+                    })
+                    .collect();
+                eliot_influence::traverse_dependency_closure(root, &edges)
+            }
+            None => vec![root.clone()],
+        };
+        for member in members {
+            let member_revoked = ledger.revoked_grants.contains(&member)
+                || ledger
+                    .grants
+                    .get(&member)
+                    .is_some_and(|record| record.status == LiveStatus::Revoked)
+                || ledger
+                    .introductions
+                    .get(&member)
+                    .is_some_and(|record| record.status == LiveStatus::Revoked);
+            if member_revoked {
+                revoked.insert(member);
+            }
+        }
+    }
+    revoked
 }
 
 /// Returns the grant plus every transitive descendant on the same root, in
