@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 eliot-authority.workspace = true
+eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
@@ -32,6 +33,7 @@ eliot-platform-windows.workspace = true
 eliot-runtime.workspace = true
 eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
+eliot-security-contracts.workspace = true
 eliot-store-api.workspace = true
 eliot-testd-core.workspace = true
 eliot-process.workspace = true

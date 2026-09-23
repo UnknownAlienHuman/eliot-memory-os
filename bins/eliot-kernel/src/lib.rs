@@ -41,6 +41,8 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+mod backup_restore;
+mod backup_restore_ports;
 mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
@@ -59,6 +61,18 @@ mod testd_terminal_completion_route;
 /// Public wire-operation name for the authenticated TestD completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
 
+pub use backup_restore::{
+    BlobOwnerClient, CanonicalOwnerClient, CutoverQualification, InvalidationKind,
+    InvalidationOwnerClient, KernelBackupRestore, KernelRestoreOutcome, OrsOwnerClient,
+    PurgeOwnerClient, phase_owner,
+};
+pub use backup_restore_ports::{
+    DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
+    KernelRestoreError, MAX_DESTINATION_LABEL_LEN, PinnedDestinationAdmission,
+    RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY,
+    RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel, check_kernel_effect_fence,
+    kernel_to_backup, require_production_admitted,
+};
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
     BLOB_MANIFEST_FORMAT_VERSION, BlobCaptureOutcome, BlobDemand, BlobProbeStatus,
@@ -501,6 +515,10 @@ pub struct KernelComposition {
     /// while no approved blob manifest was injected; `Some` validates the
     /// manifest at startup without starting the generation.
     blob_store: Mutex<Option<BlobStoreController>>,
+    /// Kernel-owned production restore adapter (issue #960). Held without
+    /// effects until the #962 owner-channel turn drives restores through it;
+    /// the durable journal is injected per execution, never constructed here.
+    backup_restore: KernelBackupRestore,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
@@ -572,6 +590,17 @@ pub struct KernelComposition {
     /// from the assembly store so later owner operations never reopen the
     /// database file or invent a second recovery store.
     p07_ors: Arc<RedbRecoveryStore>,
+}
+
+impl KernelComposition {
+    /// Returns the Kernel-owned production restore adapter (issue #960).
+    ///
+    /// Invocation arrives with the #962 owner-channel turn; until then the
+    /// adapter is held without effects.
+    #[must_use]
+    pub fn backup_restore(&self) -> &KernelBackupRestore {
+        &self.backup_restore
+    }
 }
 
 #[cfg(windows)]

@@ -73,25 +73,25 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use eliot_backup::{
-    issue_restoration_receipts, suspended_recovery_entries, verify_key_coverage, BackupBlob,
-    BackupBundle, BackupError, BlobRestorationReceipt, CanonicalRecord, CutoverAuthorization,
-    DestinationRestoreAdapter, DestinationScope, OrsSnapshotFence, RestoreAppliedEffect,
-    RestoreArchiveDisposition, RestoreArchiveDispositionKind, RestoreContext, RestoreEffectReceipt,
-    RestoreEvidence, RestoreHistoricalAuthority, RestoreIntent, RestoreJournalPort,
-    RestoreObligationState, RestoreObligations, RestoreOwnerObligation, RestorePhase, RestorePlan,
-    RestoreReceipt, RestoreReconciliation, RestoreStep, RestoreTarget, RestoredFence,
-    RestoredSealedBlob, WrappedKeyManifest,
+    BackupBlob, BackupBundle, BackupError, BlobRestorationReceipt, CanonicalRecord,
+    CutoverAuthorization, DestinationRestoreAdapter, DestinationScope, OrsSnapshotFence,
+    RestoreAppliedEffect, RestoreArchiveDisposition, RestoreArchiveDispositionKind, RestoreContext,
+    RestoreEffectReceipt, RestoreEvidence, RestoreHistoricalAuthority, RestoreIntent,
+    RestoreJournalPort, RestoreObligationState, RestoreObligations, RestoreOwnerObligation,
+    RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation, RestoreStep, RestoreTarget,
+    RestoredFence, RestoredSealedBlob, WrappedKeyManifest, issue_restoration_receipts,
+    suspended_recovery_entries, verify_key_coverage,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
-use eliot_contracts::{canonical_json_bytes, sha256_hex, StateFence};
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{RevocationHistoryPayload, WriteReceipt, parse_revocation_history_payload};
 use serde::Serialize;
 
 use super::backup_restore_ports::{
-    check_kernel_effect_fence, require_production_admitted, DestinationManifestEvidence,
-    KernelIsolatedDestination, KernelRestoreError, PinnedDestinationAdmission, RestorePorts,
-    DESTINATION_ADMISSION_FILE, RESTORE_EVIDENCE_FILE,
+    DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
+    KernelRestoreError, PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RestorePorts,
+    check_kernel_effect_fence, require_production_admitted,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -547,6 +547,11 @@ impl KernelBackupRestore {
     /// never flattened into a fabricated success. Rehearsal never
     /// activates, retires, cuts over, or unblocks effects: no such code
     /// path exists here.
+    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "RestoreContext is moved into compile_plan and the isolated destination; the by-value seam keeps the single audited validation gate"
+    )]
     pub fn restore<J: RestoreJournalPort>(
         &self,
         bundle: &BackupBundle,
@@ -596,12 +601,11 @@ impl KernelBackupRestore {
                 .artifacts
                 .iter()
                 .find(|artifact| artifact.kind == "config")
+                && config.sha256 != evidence.manifest_digest
             {
-                if config.sha256 != evidence.manifest_digest {
-                    return Err(KernelRestoreError::FenceMismatch(
-                        "destination manifest".to_owned(),
-                    ));
-                }
+                return Err(KernelRestoreError::FenceMismatch(
+                    "destination manifest".to_owned(),
+                ));
             }
         }
         let plan = Self::compile_plan(bundle, target.clone())?;
@@ -922,7 +926,7 @@ struct ObservedBlobRestore {
 /// Reconcile observation for one intent: exact applied receipt, proven
 /// non-attempt, or undecidable bytes. Undecidable never becomes success.
 enum ObservedEffect {
-    Applied(RestoreAppliedEffect),
+    Applied(Box<RestoreAppliedEffect>),
     NotAttempted,
     Undecidable,
 }
@@ -1045,7 +1049,7 @@ impl<'a> KernelRestoreTarget<'a> {
         {
             return Err(BackupError::RestoreJournalCorrupt);
         }
-        Ok(ObservedEffect::Applied(applied))
+        Ok(ObservedEffect::Applied(Box::new(applied)))
     }
 
     /// Re-verifies the pinned destination admission before a post-prepare
@@ -1720,7 +1724,7 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
         match &intent.phase {
             RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
             _ => match self.load_applied(intent)? {
-                ObservedEffect::Applied(applied) => Ok(RestoreReconciliation::Applied(applied)),
+                ObservedEffect::Applied(applied) => Ok(RestoreReconciliation::Applied(*applied)),
                 ObservedEffect::NotAttempted => Ok(RestoreReconciliation::NotApplied),
                 ObservedEffect::Undecidable => Ok(RestoreReconciliation::Unknown),
             },
