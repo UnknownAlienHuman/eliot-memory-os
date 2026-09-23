@@ -2090,6 +2090,79 @@ impl CapabilityIntroductionProjection {
     }
 }
 
+/// Verifies a presented capability-introduction set against the live
+/// owner-enumerated set (issues #959/#960/#962/#975 cutover completeness).
+///
+/// Exact subject-set equality first: any omitted live subject or surprise
+/// presented subject refuses — an empty presented list passes only against
+/// a genuinely empty live set, so unjustified emptiness can never verify.
+/// Then, per subject in lifecycle order:
+/// - live `Fenced` + presented `Fenced`: requires byte-exact subject,
+///   fence snapshot, and operation order (fenced rows are immutable: the
+///   row lifecycle admits no transition out of `Fenced`, so any drift is
+///   an anomaly, never a legitimate advance);
+/// - live `Fenced` + presented `Active`: requires subject equality and
+///   live order at least the presented order (a legitimate fencing race
+///   between the presented read and this check ends in the desired state;
+///   the fence snapshot may legitimately rebind at fencing time);
+/// - live `Active` (whatever presented): refuses — prior authority is
+///   still live.
+/// When `require_all_fenced` is set (cutover), a live `Active` row refuses
+/// even on exact match; without it (restore replay), exact `Active` rows
+/// pass. `ReconciliationMismatch` covers binding failures;
+/// `IntegrityProblem` covers live-authority-still-active rows.
+pub fn verify_introduction_set(
+    presented: &[CapabilityIntroductionProjection],
+    live: &[CapabilityIntroductionProjection],
+    require_all_fenced: bool,
+) -> Result<(), OrsError> {
+    let mut presented_subjects: Vec<&str> = presented
+        .iter()
+        .map(|row| row.record().subject_id.as_str())
+        .collect();
+    presented_subjects.sort_unstable();
+    let mut live_subjects: Vec<&str> = live
+        .iter()
+        .map(|row| row.record().subject_id.as_str())
+        .collect();
+    live_subjects.sort_unstable();
+    if presented_subjects != live_subjects {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    for introduction in presented {
+        let subject = introduction.record().subject_id.as_str();
+        let current = live
+            .iter()
+            .find(|row| row.record().subject_id.as_str() == subject)
+            .ok_or(OrsError::ReconciliationMismatch)?;
+        if current.phase() != OperationalPhase::Fenced {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "capability_introduction",
+                reason: "live introduction authority is still active".to_owned(),
+            });
+        }
+        if require_all_fenced {
+            continue;
+        }
+        match introduction.phase() {
+            OperationalPhase::Fenced => {
+                if current.record().state_fence != introduction.record().state_fence
+                    || current.operation_order() != introduction.operation_order()
+                {
+                    return Err(OrsError::ReconciliationMismatch);
+                }
+            }
+            OperationalPhase::Active => {
+                if current.operation_order() < introduction.operation_order() {
+                    return Err(OrsError::ReconciliationMismatch);
+                }
+            }
+            _ => return Err(OrsError::ReconciliationMismatch),
+        }
+    }
+    Ok(())
+}
+
 /// Committed lifecycle state of one durable grant-closure row.
 ///
 /// A closure activates its members (`Active`) or fences them (`Revoked` is

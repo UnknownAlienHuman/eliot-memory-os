@@ -696,28 +696,17 @@ impl KernelComposition {
             KernelControlCommand::ReadIntroductionRows(query) => {
                 query.validate().map_err(|_| TransportError::SessionFenced)?;
                 // Pure owner read: no state gate (nothing is mutated or
-                // admitted here). Each subject resolves through the ORS
-                // owner; an absent row refuses the whole query closed so a
-                // partial view can never read as complete.
-                let fence_bytes = eliot_contracts::canonical_json_bytes(&query.state_fence)
+                // admitted here). Full enumeration in one durable snapshot;
+                // the store refuses over-bound tables explicitly, so callers
+                // never receive a silently truncated set.
+                let live = self
+                    .generation_gateway
+                    .ors
+                    .scan_capability_introductions(query.max_rows)
                     .map_err(|_| TransportError::SessionFenced)?;
-                let fence_digest =
-                    eliot_contracts::sha256_hex(&fence_bytes);
-                let mut rows = Vec::with_capacity(query.subjects.len());
-                for subject in &query.subjects {
-                    let subject_id =
-                        eliot_ors::OpaqueLabel::new(subject.clone())
-                            .map_err(|_| TransportError::SessionFenced)?;
-                    let live = self
-                        .generation_gateway
-                        .ors
-                        .load_capability_introduction(&subject_id)
-                        .map_err(|_| TransportError::SessionFenced)?
-                        .ok_or(TransportError::SessionFenced)?;
-                    if live.record().state_fence.sha256 != fence_digest {
-                        return Err(TransportError::SessionFenced);
-                    }
-                    let phase = match live.phase() {
+                let mut rows = Vec::with_capacity(live.len());
+                for row in &live {
+                    let phase = match row.phase() {
                         eliot_ors::OperationalPhase::Staged => "STAGED",
                         eliot_ors::OperationalPhase::Applying => "APPLYING",
                         eliot_ors::OperationalPhase::Active => "ACTIVE",
@@ -728,10 +717,10 @@ impl KernelComposition {
                         eliot_ors::OperationalPhase::Fenced => "FENCED",
                     };
                     rows.push(eliot_kernel_service::IntroductionRow {
-                        subject_id: live.record().subject_id.as_str().to_owned(),
+                        subject_id: row.record().subject_id.as_str().to_owned(),
                         phase: phase.to_owned(),
-                        operation_order: live.operation_order(),
-                        fence_digest: live.record().state_fence.sha256.clone(),
+                        operation_order: row.operation_order(),
+                        fence_digest: row.record().state_fence.sha256.clone(),
                     });
                 }
                 Some(rows)

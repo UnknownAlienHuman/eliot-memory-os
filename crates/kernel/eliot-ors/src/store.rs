@@ -404,6 +404,20 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         subject_id: &crate::OperationIdentity,
     ) -> Result<Option<CapabilityIntroductionProjection>, OrsError>;
+    /// Enumerates every current capability-introduction row in one durable
+    /// read snapshot (issues #959/#960/#962/#975 cutover completeness).
+    ///
+    /// The complete live set against which a presented introduction set is
+    /// compared for exact subject-set equality: omission of a live subject
+    /// (or a surprise presented subject) refuses downstream, and an empty
+    /// table yields an empty set honestly. Rows carry the same per-row
+    /// validation as [`load_capability_introduction`](Self::load_capability_introduction).
+    /// An oversize table refuses with `ProjectionLimitExceeded` before any
+    /// projection work — never a silently truncated view.
+    fn scan_capability_introductions(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<CapabilityIntroductionProjection>, OrsError>;
     fn logical_snapshot(&self, request: OrsSnapshotRequest)
     -> Result<OrsSnapshotReceipt, OrsError>;
     fn scan_pending(
@@ -7016,6 +7030,61 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             record.operation_order,
             receipt,
         )))
+    }
+
+    fn scan_capability_introductions(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<CapabilityIntroductionProjection>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        // One durable read snapshot covers the whole selected set, so the
+        // returned set is self-consistent with no paging cursor and no
+        // cross-page torn views. An oversize table refuses before
+        // receipt/projection work.
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let mut rows: Vec<CapabilityIntroductionProjection> = Vec::new();
+        for row in current.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let record: DurableOperationalRecord =
+                decode_named(value.value(), "operational_current")?;
+            if record.kind != OperationalKind::CapabilityIntroduction {
+                continue;
+            }
+            let expected =
+                Self::operational_key(OperationalKind::CapabilityIntroduction, &record.input.subject_id);
+            if key.value() != expected.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "capability_introduction",
+                    reason: "current capability-introduction key drifts from its subject"
+                        .to_owned(),
+                });
+            }
+            if !matches!(
+                record.phase,
+                OperationalPhase::Active | OperationalPhase::Fenced
+            ) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "capability_introduction",
+                    reason: "current capability-introduction key, kind, subject, or phase mismatch"
+                        .to_owned(),
+                });
+            }
+            record.input.validate()?;
+            let receipt = Self::receipt_for(&record)?;
+            rows.push(CapabilityIntroductionProjection::from_store(
+                record.input,
+                record.phase,
+                record.operation_order,
+                receipt,
+            ));
+            if rows.len() > usize::from(limit) {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+        }
+        Ok(rows)
     }
 
     #[allow(

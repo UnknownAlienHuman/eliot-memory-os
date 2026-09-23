@@ -192,13 +192,15 @@ pub async fn drive_production_restore(
         provisioning,
     })
     .map_err(OwnerChannelError::Backup)?;
-    // F-AUR-1: console-presented capability introductions are compared
-    // against live owner/ORS readback by the journal owner before any
-    // effect (subject, fence, order, phase). Shape-only checks never
-    // suffice; this gate refuses forged/stale/active rows closed.
-    journal
-        .verify_introductions_fenced(&introductions)
-        .map_err(kernel_to_backup)
+    // F-AUR-1: the presented set must EXACTLY equal the live
+    // owner-enumerated set (see commit-level gate for the invariant).
+    // An unjustified empty list against live rows refuses here.
+    let live = journal
+        .scan_live_introductions(eliot_ors::MAX_RECOVERY_PAGE)
+        .map_err(super::backup_restore_ports::map_ors_to_backup)
+        .map_err(OwnerChannelError::Backup)?;
+    eliot_ors::verify_introduction_set(&introductions, &live, false)
+        .map_err(super::backup_restore_ports::map_ors_to_backup)
         .map_err(OwnerChannelError::Backup)?;
     let decision =
         CoordinationDecision::from_admission(&admission).map_err(OwnerChannelError::Backup)?;

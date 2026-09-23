@@ -19,14 +19,16 @@ use super::{
 use eliot_contracts::StateFence;
 use eliot_kernel_service::{IntroductionReadbackQuery, IntroductionRow, KernelControlCommand};
 
-/// Reads live introduction rows for exact subjects from the Kernel ORS
+/// Reads the complete live capability-introduction set from the Kernel ORS
 /// owner through the authenticated front door.
 ///
 /// Binds the approved Kernel candidate to the cutover fence, opens the
 /// authenticated transport to the live Kernel process, sends one
-/// `ReadIntroductionRows` query, and validates the response binding
-/// (message/digest echo, no error, no unrelated receipts, rows present).
-/// Transport loss, unknown outcomes, and binding mismatches refuse closed;
+/// full-enumeration readback query, and validates the response binding
+/// (message/digest echo, no error, no unrelated receipts). Transport loss,
+/// unknown outcomes, over-bound tables, and binding mismatches refuse
+/// closed; callers compare the complete set exactly against presented
+/// evidence — partial views never verify.
 ///
 /// # Errors
 ///
@@ -36,7 +38,7 @@ use eliot_kernel_service::{IntroductionReadbackQuery, IntroductionRow, KernelCon
 pub(crate) fn read_live_introductions(
     host: &HostComposition,
     fence: &StateFence,
-    subjects: &[String],
+    max_rows: u16,
 ) -> Result<Vec<IntroductionRow>, HostError> {
     let launch = host.jobs.launch.as_ref().ok_or_else(|| {
         HostError::ProcessContour(
@@ -63,8 +65,7 @@ pub(crate) fn read_live_introductions(
         HostError::ProcessContour("approved Kernel image is missing".to_owned())
     })?;
     let query = IntroductionReadbackQuery {
-        state_fence: fence.clone(),
-        subjects: subjects.to_vec(),
+        max_rows,
     };
     query
         .validate()
