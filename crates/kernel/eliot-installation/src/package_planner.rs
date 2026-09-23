@@ -46,7 +46,7 @@ fn planner_epoch(sequence: u64) -> EpochId {
 /// are live Host-owned handoff material and cannot be represented by an
 /// installer candidate. Destination file identities are observed after
 /// Phase B materialization and are not part of this immutable inventory.
-pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 13] = [
+pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 14] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
@@ -57,10 +57,19 @@ pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 13] = [
     ("eliot-testd.exe", true),
     ("eliot-native-worker.exe", true),
     ("eliot-wasm-host.exe", true),
+    ("eliot-notify.exe", true),
     ("generation.json", false),
     ("eliotd-governor.json", false),
     ("eliotd.json", false),
 ];
+
+/// Per-user adapter staged in Phase A but never Kernel-dispatched.
+/// `eliot-notify.exe` (I1.3/I1.4: interactive user-session branch) is
+/// evidence-bound by the fourteen-file inventory while
+/// [`strict_role_bindings`] and the launch descriptor keep exactly the
+/// thirteen dispatched daemon roles.
+pub(crate) const NOTIFY_STAGED_ROLE: &str = "eliot-notify.exe";
+pub(crate) const NOTIFY_STAGED_EXECUTABLE: bool = true;
 
 fn package_plan_error(error: &PackageStagingError) -> InstallationError {
     InstallationError::InvalidField {
@@ -149,7 +158,7 @@ const CANARY_ARTIFACT_SET_EVIDENCE_DOMAIN: &[u8] =
 /// `generation.json` contains the resulting `RuntimeLaunchDescriptor`, while
 /// `eliotd.json` contains the same launch nonce.  Including either file in the
 /// derivation input would create a cryptographic self-reference.  The complete
-/// thirteen-role artifact evidence remains separate and continues to bind both
+/// fourteen-role artifact evidence remains separate and continues to bind both
 /// files byte-for-byte.
 // This is a package-planner derivation domain, not a registry wire revision:
 // RegistryWireV10 decoding and its explicit active-Phase-B migration rules
@@ -311,7 +320,7 @@ fn append_evidence_text(bytes: &mut Vec<u8>, value: &str) {
 /// Derive the Runtime Live canary artifact-set evidence reference.
 ///
 /// The reference is a domain-separated SHA-256 over the canonical generation
-/// and the complete, fixed-order thirteen-file Phase-A inventory.  Each fact contains
+/// and the complete, fixed-order fourteen-file Phase-A inventory.  Each fact contains
 /// the validated relative path, executable bit, exact byte size, and lowercase
 /// SHA-256.  Source identities and other volatile filesystem observations are
 /// deliberately excluded; the retained-source and destination receipt gates
@@ -324,7 +333,7 @@ pub(crate) fn artifact_set_evidence_digest(
         || expected.len() != REQUIRED_PACKAGE_ROLES.len()
     {
         return Err(InstallationError::IncompleteObservation(
-            "canary artifact evidence requires the complete thirteen-file Phase-A runtime inventory"
+            "canary artifact evidence requires the complete fourteen-file Phase-A runtime inventory"
                 .to_owned(),
         ));
     }
@@ -587,13 +596,26 @@ fn validate_candidate_package_binding(
         }
         return Ok(());
     }
-    if manifest.files.len() != roles.len() {
+    // `eliot-notify.exe` is staged in Phase A but never Kernel-dispatched
+    // (NOTIFY_STAGED_ROLE, I1.3/I1.4): accept exactly one such entry, then
+    // validate the remaining thirteen-role bijection below.
+    let mut notify_staged = false;
+    for spec in &manifest.files {
+        if spec.relative_path == NOTIFY_STAGED_ROLE {
+            if spec.executable != NOTIFY_STAGED_EXECUTABLE || notify_staged {
+                return Err(InstallationError::IdentityConflict);
+            }
+            notify_staged = true;
+        }
+    }
+    if manifest.files.len() != roles.len() + usize::from(notify_staged) {
         return Err(InstallationError::IdentityConflict);
     }
     let mut seen = std::collections::BTreeSet::new();
     let manifest_lower: BTreeSet<String> = manifest
         .files
         .iter()
+        .filter(|f| f.relative_path != NOTIFY_STAGED_ROLE)
         .map(|f| f.relative_path.to_ascii_lowercase())
         .collect();
     let mut role_lower: BTreeSet<String> = BTreeSet::new();
@@ -634,7 +656,11 @@ fn validate_candidate_package_binding(
     if manifest_lower != role_lower {
         return Err(InstallationError::IdentityConflict);
     }
-    let mut manifest_sorted = manifest.files.clone();
+    let mut manifest_sorted: Vec<_> = manifest
+        .files
+        .iter()
+        .filter(|spec| spec.relative_path != NOTIFY_STAGED_ROLE)
+        .collect();
     manifest_sorted.sort_by(|a, b| {
         eliot_platform_windows::ordinal_cmp_str(&a.relative_path, &b.relative_path)
     });
@@ -737,8 +763,13 @@ pub(crate) fn strict_role_bindings(
 /// Validate the complete production package bijection.
 ///
 /// This boundary is intentionally independent of the caller's manifest and
-/// expected-digest vectors. It binds all thirteen canonical Phase-A role names and
-/// requires every `CandidateManifest` path/digest to participate exactly once.
+/// expected-digest vectors. It binds all thirteen canonical Phase-A dispatch
+/// roles and requires every `CandidateManifest` path/digest to participate
+/// exactly once. The fourteenth staged role, `eliot-notify.exe`, is a
+/// per-user one-shot adapter (I1.3/I1.4: user-session branch, never a
+/// Kernel-dispatched child): it is evidence-bound by the fourteen-file
+/// inventory but deliberately has no launch-descriptor fields and no dispatch
+/// binding, so it is accepted here without participating in the bijection.
 pub(crate) fn validate_exact_candidate_package_binding(
     candidate: &CandidateManifest,
     manifest: &PackageManifest,
@@ -748,7 +779,7 @@ pub(crate) fn validate_exact_candidate_package_binding(
     }
     if manifest.files.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "package manifest must contain the complete thirteen-file Phase-A runtime inventory"
+            "package manifest must contain the complete fourteen-file Phase-A runtime inventory"
                 .to_owned(),
         ));
     }
@@ -789,6 +820,12 @@ pub(crate) fn validate_exact_candidate_package_binding(
     }
     let mut manifest_names = BTreeSet::new();
     for spec in &manifest.files {
+        if spec.relative_path == NOTIFY_STAGED_ROLE {
+            if spec.executable != NOTIFY_STAGED_EXECUTABLE || !manifest_names.insert(spec.relative_path.clone()) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            continue;
+        }
         let Some((name, executable)) = REQUIRED_PACKAGE_ROLES
             .iter()
             .find(|(name, _)| *name == spec.relative_path)
@@ -799,6 +836,7 @@ pub(crate) fn validate_exact_candidate_package_binding(
             return Err(InstallationError::IdentityConflict);
         }
     }
+    manifest_names.remove(NOTIFY_STAGED_ROLE);
     if manifest_names != expected_names {
         return Err(InstallationError::IdentityConflict);
     }
@@ -828,7 +866,7 @@ pub(crate) fn validate_exact_expected_file_digests(
     validate_exact_candidate_package_binding(candidate, manifest)?;
     if expected.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "expected package digest set must contain all thirteen Phase-A runtime files".to_owned(),
+            "expected package digest set must contain all fourteen Phase-A runtime files".to_owned(),
         ));
     }
     let bindings = strict_role_bindings(candidate);
@@ -839,6 +877,21 @@ pub(crate) fn validate_exact_expected_file_digests(
                 kind: "expected package digest".to_owned(),
                 identity: item.relative_path.clone(),
             });
+        }
+        if item.relative_path == NOTIFY_STAGED_ROLE {
+            let spec = manifest
+                .files
+                .iter()
+                .find(|spec| spec.relative_path == item.relative_path)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if !spec.executable
+                || item.expected_size == 0
+                || item.expected_size != spec.expected_size
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            crate::sha256_handle(&item.sha256, "expected package digest")?;
+            continue;
         }
         let Some((name, _, _, digest)) = bindings
             .into_iter()
@@ -991,7 +1044,7 @@ pub struct GenerationPackagePlanInput {
 pub struct GenerationPackagePlanner;
 
 impl GenerationPackagePlanner {
-    /// Computes the canonical full thirteen-role artifact evidence reference.
+    /// Computes the canonical full fourteen-role artifact evidence reference.
     ///
     /// This associated wrapper is the single public entry point for producers
     /// that materialize the retained source bundle before invoking
@@ -1046,7 +1099,7 @@ impl GenerationPackagePlanner {
     /// immutable `PLANNED` transaction.
     ///
     /// The source is opened and observed independently of every manifest claim.
-    /// The exact thirteen-file Phase-A inventory is then used to construct all
+    /// The exact fourteen-file Phase-A inventory is then used to construct all
     /// canonical destination paths, descriptor/config bindings and artifact
     /// digests before the single transaction constructor is called.
     #[allow(
@@ -1565,6 +1618,12 @@ impl GenerationPackagePlanner {
         let phase_b_static_template = phase_b_static_template_for_candidate(&candidate)?;
         validate_exact_candidate_package_binding(&candidate, &package_manifest)?;
         for digest in &expected_file_digests {
+            if digest.relative_path == NOTIFY_STAGED_ROLE {
+                // Per-user adapter digest is bound by the fourteen-file
+                // evidence digest and the manifest size match above; it has
+                // no launch-descriptor digest slot by design.
+                continue;
+            }
             let (_, _, _, expected) = strict_role_bindings(&candidate)
                 .into_iter()
                 .find(|(name, _, _, _)| *name == digest.relative_path)
@@ -1907,7 +1966,7 @@ fn validate_exact_source_inventory(
 ) -> Result<(), InstallationError> {
     if observed.files.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "trusted source must contain exactly thirteen Phase-A runtime files".to_owned(),
+            "trusted source must contain exactly fourteen Phase-A runtime files".to_owned(),
         ));
     }
     let expected = REQUIRED_PACKAGE_ROLES
@@ -2006,7 +2065,7 @@ fn validate_source_bundle_publication_binding(
         || manifest.files.len() != REQUIRED_PACKAGE_ROLES.len()
     {
         return Err(InstallationError::IncompleteObservation(
-            "source publication binding must contain the complete thirteen-role inventory".to_owned(),
+            "source publication binding must contain the complete fourteen-role inventory".to_owned(),
         ));
     }
     for (index, (role, executable)) in REQUIRED_PACKAGE_ROLES.iter().enumerate() {
@@ -2436,6 +2495,35 @@ mod tests {
     }
     fn exact_size(root: &std::path::Path, name: &str) -> u64 {
         std::fs::metadata(root.join(name)).unwrap().len()
+    }
+    /// Manifest specs for the struct-bound dispatch roles plus the staged
+    /// per-user adapter. `expected_role_map` is struct-driven (thirteen
+    /// dispatched roles); the fourteen-file inventory additionally carries
+    /// `eliot-notify.exe`, which the population helper stages on disk.
+    fn manifest_specs_with_staged_notify(
+        roles: &[(String, bool, String)],
+        source_dir: &std::path::Path,
+    ) -> Vec<eliot_platform_windows::PackageFileSpec> {
+        let mut specs: Vec<_> = roles
+            .iter()
+            .map(|(p, exe, _)| {
+                eliot_platform_windows::PackageFileSpec::new(
+                    p.as_str(),
+                    *exe,
+                    exact_size(source_dir, p),
+                )
+                .unwrap()
+            })
+            .collect();
+        specs.push(
+            eliot_platform_windows::PackageFileSpec::new(
+                NOTIFY_STAGED_ROLE,
+                NOTIFY_STAGED_EXECUTABLE,
+                exact_size(source_dir, NOTIFY_STAGED_ROLE),
+            )
+            .unwrap(),
+        );
+        specs
     }
     fn make_epoch() -> InstallationEpoch {
         InstallationEpoch {
@@ -3037,6 +3125,7 @@ mod tests {
             ("eliot-testd.exe", true),
             ("eliot-native-worker.exe", true),
             ("eliot-wasm-host.exe", true),
+            ("eliot-notify.exe", true),
             ("generation.json", false),
             ("eliotd-governor.json", false),
             ("eliotd.json", false),
@@ -3488,7 +3577,7 @@ mod tests {
         )
         .unwrap();
 
-        // Recompute the exact thirteen-role SHA/size vector and publication
+        // Recompute the exact fourteen-role SHA/size vector and publication
         // evidence after writing the valid generation document.
         let binding = test_source_publication_binding(&input).unwrap();
         GenerationPackagePlanner::plan_with_source_publication_binding(
@@ -4024,7 +4113,7 @@ mod tests {
         );
         assert_ne!(
             first.candidate_manifest.signature_ref, second.candidate_manifest.signature_ref,
-            "full thirteen-role artifact evidence must still include both nonce-bearing JSON roles"
+            "full fourteen-role artifact evidence must still include both nonce-bearing JSON roles"
         );
     }
 
@@ -4194,17 +4283,7 @@ mod tests {
         let hashes = populate_source_with_roles(source_dir.path());
         let mut candidate = build_real_candidate(portable.clone(), roots.clone(), hashes.clone());
         let roles = expected_role_map(&candidate);
-        let specs: Vec<_> = roles
-            .iter()
-            .map(|(p, exe, _)| {
-                eliot_platform_windows::PackageFileSpec::new(
-                    p.as_str(),
-                    *exe,
-                    exact_size(source_dir.path(), p),
-                )
-                .unwrap()
-            })
-            .collect();
+        let mut specs = manifest_specs_with_staged_notify(&roles, source_dir.path());
         let manifest = PackageManifest::new("candidate", specs.clone()).unwrap();
         candidate.signature_ref = artifact_evidence_for_source(&manifest, source_dir.path());
         let (changes, effects) = installer_parts(&roots);
@@ -4277,7 +4356,11 @@ mod tests {
             .is_err()
         );
         let mut missing_specs = specs.clone();
-        missing_specs.pop();
+        let kernel_position = missing_specs
+            .iter()
+            .position(|spec| spec.relative_path == "eliot-kernel.exe")
+            .expect("kernel role is staged");
+        missing_specs.remove(kernel_position);
         let missing_manifest = PackageManifest::new("candidate", missing_specs).unwrap();
         assert!(
             SealedPackagePlanner::plan(
@@ -4328,17 +4411,7 @@ mod tests {
         let hashes = populate_source_with_roles(source_dir.path());
         let mut candidate = build_real_candidate(portable.clone(), roots.clone(), hashes.clone());
         let roles = expected_role_map(&candidate);
-        let specs: Vec<_> = roles
-            .iter()
-            .map(|(p, exe, _)| {
-                eliot_platform_windows::PackageFileSpec::new(
-                    p.as_str(),
-                    *exe,
-                    exact_size(source_dir.path(), p),
-                )
-                .unwrap()
-            })
-            .collect();
+        let specs = manifest_specs_with_staged_notify(&roles, source_dir.path());
         let manifest = PackageManifest::new("candidate", specs).unwrap();
         candidate.signature_ref = artifact_evidence_for_source(&manifest, source_dir.path());
         let (changes, effects) = installer_parts(&roots);
@@ -4390,17 +4463,7 @@ mod tests {
         let mut candidate = build_real_candidate(portable.clone(), roots.clone(), hashes);
         candidate.signature_ref = h("0".repeat(64));
         let roles = expected_role_map(&candidate);
-        let specs: Vec<_> = roles
-            .iter()
-            .map(|(p, exe, _)| {
-                eliot_platform_windows::PackageFileSpec::new(
-                    p.as_str(),
-                    *exe,
-                    exact_size(source_dir.path(), p),
-                )
-                .unwrap()
-            })
-            .collect();
+        let specs = manifest_specs_with_staged_notify(&roles, source_dir.path());
         let manifest = PackageManifest::new("candidate", specs).unwrap();
         let (changes, effects) = installer_parts(&roots);
         assert!(
@@ -4431,17 +4494,7 @@ mod tests {
         let hashes = populate_source_with_roles(source_dir.path());
         let mut candidate = build_real_candidate(portable.clone(), roots.clone(), hashes);
         let roles = expected_role_map(&candidate);
-        let specs: Vec<_> = roles
-            .iter()
-            .map(|(p, exe, _)| {
-                eliot_platform_windows::PackageFileSpec::new(
-                    p.as_str(),
-                    *exe,
-                    exact_size(source_dir.path(), p),
-                )
-                .unwrap()
-            })
-            .collect();
+        let specs = manifest_specs_with_staged_notify(&roles, source_dir.path());
         let manifest = PackageManifest::new("candidate", specs).unwrap();
         candidate.signature_ref = artifact_evidence_for_source(&manifest, source_dir.path());
         let (changes, effects) = installer_parts(&roots);
