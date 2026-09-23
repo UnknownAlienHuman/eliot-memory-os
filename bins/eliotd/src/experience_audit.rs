@@ -82,9 +82,9 @@ pub fn evaluate_experience_audit(
     }
     let missing = vec![
         MissingOwner {
-            owner: "audit scope binder",
-            artifact: "ScopeId audit scope",
-            absent_read: "no audit scope bound; T11.2 position reads take an explicit scope_id, never defaulted",
+            owner: "position read scope binder",
+            artifact: "ScopeId position scope",
+            absent_read: "no position scope bound; GetCurrentEpistemicPosition takes an explicit scope_id, never defaulted (the audit range leg itself is scope-free; scope filtering stays consumer-owned)",
         },
         MissingOwner {
             owner: "position subject owner",
@@ -129,7 +129,7 @@ pub fn evaluate_experience_audit(
         MissingOwner {
             owner: "store audit handler",
             artifact: "GetAuditRange registration",
-            absent_read: "store side has not registered the GetAuditRange handler; the journal leg fails closed UnknownOperation per B design (#19 join)",
+            absent_read: "store side has not registered the GetAuditRange handler (scope-free, no parameters per catalogue row 867b962e); the journal leg fails closed UnknownOperation per B design (#19 join)",
         },
     ];
     tracing::debug!(
