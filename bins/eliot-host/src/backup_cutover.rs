@@ -2,79 +2,129 @@
 //!
 //! Explicit post-restore cutover path for the installation/Host authority,
 //! distinct from #958 preparation and #960 isolated restore/rehearsal.
-//! Consumes #954 role-bound commands, #960 exact current recovery receipts,
-//! and the approved-generation/Host journal/Kernel authority handoff protocol.
 //! TRUE prior-generation retirement uses the existing
 //! registry/journal/epoch/launch/SCM owners through their current APIs.
+//! This module mints no installer/grant/source-DB/restore-engine authority
+//! and adds no mutation to Kernel rehearsal.
 //!
-//! Coordination (binding):
-//! - #954 (`eliot-protocol/backup.rs`) and #960
-//!   (`bins/eliot-kernel/src/backup_restore.rs`) are OPEN; the admission and
-//!   recovery-evidence shapes below are narrowly-scoped local bounds the real
-//!   owner receipts drop into without rework. This module mints no
-//!   installer/grant/source-DB/restore-engine authority and adds no mutation
-//!   to Kernel rehearsal.
-//! - #1751 (Parfit, Host owner) publishes the retirement barrier this module
-//!   consumes before prior-generation SCM/artifact retirement:
-//!   `super::GenerationRetirementFence`,
-//!   `super::GenerationRetirementBarrier`, and
-//!   `HostComposition::require_generation_retirement_barrier`. Those types and
-//!   that method are Parfit-owned and deliberately NOT duplicated here; this
-//!   module references them stubless through `super::` so the real signature
-//!   drops in without rework. Until #1751 lands this module does not compile
-//!   on its own, by design (no proxy receipt, no rehearsal substitute, no
-//!   refs-only census).
+//! Actual-owner integration (read from current main, no substitutes):
+//! - Admission: `eliot_protocol::{HostRequestEnvelope,
+//!   HostRequestAdmissionReceipt, HostRequestKind, host_request_operation_id}`
+//!   (`crates/foundation/eliot-protocol/src/lib.rs`: `HostRequestKind` at
+//!   2641, `HostRequestEnvelope::validate` at 2898, `host_request_operation_id`
+//!   at 3044, `HostRequestAdmissionReceipt::validate` at 3118). The protocol
+//!   wire is closed with five kinds and no backup/cutover kind: a cutover
+//!   command travels as an `Invocation` of the exact admitted envelope, and a
+//!   restore-test/rehearsal envelope derives a different digest-bound
+//!   `hostreq:` operation handle, so it can never satisfy this admission.
+//! - Recovery receipts: `eliot_backup::{RestorePlan::execute_with_journal,
+//!   RestoreTarget::{apply_restore_effect, reconcile_restore_effect},
+//!   RestoreJournalPort::{load, compare_and_swap}, BackupBundle::validate,
+//!   BackupClass::{select, is_full_recovery, is_canonical_only},
+//!   RestoreEvidenceLevel::for_class, OperationalValidationEvidence}`
+//!   (`crates/storage/eliot-backup/src/lib.rs`: `BackupClass` at 122,
+//!   `BackupBundle::validate` at 670, `RestoreJournalPort` at 1334,
+//!   `RestorePlan::execute_with_journal` at 1438 with "No active cutover is
+//!   performed here", `RestoreEvidenceLevel::for_class` at 1951,
+//!   `OperationalValidationEvidence` at 2102, `RestoreTarget` at 2666).
+//!   `RestoreEvidenceLevel::permits_operational_readiness` (1969) is false for
+//!   every library-emitted level: a restore receipt alone never qualifies for
+//!   cutover, which is why this module additionally requires the
+//!   owner-issued operational-validation receipt plus this separate cutover
+//!   admission. The legacy `eliot_types::RestorePlan`
+//!   (`crates/eliot-types/src/safety.rs:166`, stringly plan/check shape) is
+//!   NOT the accepted contract and is not consumed here.
+//! - Pending dependency edge (#974 owns Cargo/root/lock per #959/#960):
+//!   `eliot-backup` is not in `bins/eliot-host/Cargo.toml`, so typed
+//!   `eliot_backup::` imports land with that edge. Until then this module
+//!   carries the owner receipts as opaque digest-bound handles plus
+//!   owner-attested standing facts (never a parallel class vocabulary, never
+//!   a `From` bridge): `bundle_receipt` (real `BackupBundle::validate`
+//!   receipt), `restore_receipt` (real `RestoreReceipt` from
+//!   `execute_with_journal`/`finalize_isolated`), `operational_validation`
+//!   (real `OperationalValidationEvidence`), `archive_full_recovery`
+//!   (owner-attested `is_full_recovery` outcome),
+//!   `archive_scope_transfer` (owner-attested scope-declared outcome of
+//!   `select`: a scope transfer never carries installation recovery).
+//! - Retirement barrier (#1751, Parfit, Host owner): `super::
+//!   GenerationRetirementFence`, `super::GenerationRetirementBarrier`, and
+//!   `HostComposition::require_generation_retirement_barrier` are Parfit-owned
+//!   and deliberately NOT duplicated here. The fence binds
+//!   `activation_id: PlatformHandle` (`eliot_platform`, as in host `lib.rs`
+//!   line 214), `activation_generation: EpochTransition` (`eliot_host_state`
+//!   re-export of `eliot_contracts`, `epoch_identity.rs:211`), and
+//!   `state_fence: StateFence` (`eliot_contracts`). Until #1751 lands this
+//!   module does not compile standalone, by design.
 //!
-//! Normative anchors: A12.3 one governed write path (recovery preserves
-//! intent/evidence, never a second Governor); A13.7 (cutover requires
-//! separate authority; old sessions/leases/approvals/epochs do not revive;
-//! new Authority Epoch lineage strictly newer); I5.13 (isolated restore,
-//! new HostInstallationEpoch/Kernel activation lineage, pre-cutover state
-//! retained until explicit retirement); I5.16 (durable fields incl.
-//! `state_fence`); I5.27 (canonical operation vs effect identity,
-//! `IDENTITY_CONFLICT` on reused key with different hash); I14.21 (unknown
-//! commit: re-read receipt by idempotency key, no blind duplicate effect);
-//! I14.24 (backup/restore verification fails => forbid cutover, retain
-//! current active state); I7.20 (agent-facing dispositions/reason codes).
+//! Real effect callgraph (every call below resolves to an existing owner):
+//! - `HostComposition::ensure_admission_open` (host `lib.rs:7128`, private in
+//!   the crate root, visible to this descendant module): admission guard.
+//! - `super::open_registry_store_at` (host `lib.rs:3954`, `pub(crate)`):
+//!   short-lived registry handle, dropped after one load; plus
+//!   `RedbInstallationRegistry::load`
+//!   (`crates/kernel/eliot-installation/src/redb_state.rs:275`, inside
+//!   `impl super::RedbInstallationRegistry` at line 171) and
+//!   `ApprovedGenerationRegistry::{validate, active_generation}`
+//!   (`approved_generation_registry.rs:4105,3656`): fresh
+//!   expected-predecessor fencing against TOCTOU. The registry is only read
+//!   here: no retire/commit mutation exists for cutover on current main, and
+//!   this module invents none (a missing owner transition belongs to its
+//!   exact owner before dispatch, never a private override).
+//! - `super::journal_append::append_reconciled` (host `journal_append.rs:281`,
+//!   `pub(super)` choke for every `ProductionHostStateJournal` write, with
+//!   `OutcomeUnknown` fail-closed reconciliation): persists the
+//!   `HostStateRecord::EpochRetirement(EpochRetirementRecord)`
+//!   (`eliot-host-state/src/model.rs:1667,1493`) carrying the cutover
+//!   operation identity, barrier-bound fence, and bounded evidence refs, and
+//!   returns the real `AppendReceipt`
+//!   (`eliot-host-state/src/journal.rs:41`, `sequence()`/`disposition()`/
+//!   `transaction_id()`). Intent is bound inside this record before any
+//!   route/SCM effect; this path performs no process/SCM effects itself.
+//!   Record helpers `super::{record_fence, fresh_identity}` (host `lib.rs`
+//!   :3568,:3444, private in the root, visible here) build owner-shaped
+//!   values only.
+//! - Prior-generation process/SCM retirement effects run through the existing
+//!   drain/stop contours (`HostComposition::stop`, host `lib.rs:7159;
+//!   `drain_commit_record_for_stop`, `journal_append.rs:451;
+//!   `scm_launch::{validate_host_scm_bootstrap,
+//!   classify_host_scm_inspection}`, `scm_launch.rs:430,262) driven by the
+//!   committed retirement record. `scm_launch` owns no stop/deregister API on
+//!   current main, so this module claims no SCM effect it cannot call.
+//!
+//! Normative anchors: A12.3 one governed write path; A13.7 separate cutover
+//! authority, old authority never revives; I5.13 isolated restore, new
+//! lineage, pre-cutover state retained; I5.16 durable fields; I5.27
+//! operation vs effect identity and `IDENTITY_CONFLICT`; I14.21 unknown
+//! commit; I14.24 failed verification forbids cutover; I7.20 dispositions;
+//! I1.5 activation/drain generations never overlap; I14.14 cutover record
+//! owns the linearization point (here: the journal append receipt).
 
 use eliot_contracts::{fences_match_exact, StateFence};
-use eliot_host_state::EpochTransition;
+use eliot_host_state::{
+    AppendReceipt, EpochRetirementRecord, EpochTransition, HostInstallationEpoch, HostStateRecord,
+    IdempotencyIdentity, RecordFence,
+};
 use eliot_installation::ApprovedGenerationRegistry;
 use eliot_platform::PlatformHandle;
+use eliot_protocol::{
+    host_request_operation_id, HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestKind,
+};
 
 // Stubless consumption of the Parfit-owned (#1751) retirement barrier. These
 // items do not exist yet; root serializes their definition with Parfit's
 // `lease_drain.rs` + `lib.rs` change. This module defines no local duplicate.
 use super::{GenerationRetirementBarrier, GenerationRetirementFence, HostComposition, HostError};
 
-/// Maximum bounded evidence references carried on any cutover outcome.
-/// Digests only; never plaintext keys, paths, or credentials.
+/// Maximum bounded evidence references carried on any cutover outcome or
+/// journaled retirement record. Digests only; never plaintext keys, paths,
+/// or credentials. The journal owner additionally rejects duplicates.
 pub const CUTOVER_EVIDENCE_BOUND: usize = 16;
-
-/// Closed backup-class vocabulary (I5.13). `ScopeExport` is explicitly not an
-/// installation backup and can never enter cutover.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackupClass {
-    FullRecovery,
-    CanonicalOnlyDegraded,
-    ScopeExport,
-}
-
-/// Proposed #954 role-bound admission marker for cutover.
-///
-/// Only `SeparatelyAdmitted` authorizes this operation. A restore-test or
-/// rehearsal admission (`RestoreTest`) can never select cutover or source
-/// retirement. The real #954 wire type replaces this bound without rework.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CutoverAdmission {
-    SeparatelyAdmitted { admission_ref: PlatformHandle },
-    RestoreTest { rehearsal_ref: PlatformHandle },
-}
 
 /// Canonical operation identity for one cutover (I5.27).
 ///
-/// Database idempotency (this identity) and external-effect idempotency
-/// (SCM/launch effects) remain separate: a committed intent never proves an
+/// Database idempotency (this identity, bound into the journaled retirement
+/// record) and external-effect idempotency (SCM/launch effects owned by the
+/// drain/stop contours) remain separate: a committed intent never proves an
 /// effect occurred exactly once.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CutoverOperationIdentity {
@@ -85,20 +135,37 @@ pub struct CutoverOperationIdentity {
 
 /// Exact separately-authorized cutover request.
 ///
-/// Binds source and prepared destination installation, archive/class, target
-/// approved build/config, current recovery validation (via `evidence`),
-/// owner-issued epoch/fence/UserBroker identity, and the expected active
-/// predecessor. A successful restore rehearsal, checksum, zero unresolved
-/// count, or client declaration is not cutover authority and appears nowhere
-/// here as admission.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// `envelope` + `admission` are the real #954-adjacent role-bound command
+/// and its Kernel-issued admission receipt: the receipt proves only that the
+/// Kernel admission gate accepted the exact envelope digest for routing (it
+/// creates no Session, task, or result). A successful restore rehearsal,
+/// checksum, zero unresolved count, or client declaration is not cutover
+/// authority and appears nowhere here as admission.
+#[derive(Clone, Debug)]
 pub struct CutoverRequest {
     pub operation: CutoverOperationIdentity,
-    pub admission: CutoverAdmission,
+    /// Exact admitted command envelope (real owner type).
+    pub envelope: HostRequestEnvelope,
+    /// Kernel-issued admission receipt for exactly `envelope` (real owner
+    /// type; validated with its own `validate()`).
+    pub admission: HostRequestAdmissionReceipt,
     pub source_installation: PlatformHandle,
     pub destination_installation: PlatformHandle,
     pub archive_digest: PlatformHandle,
-    pub class: BackupClass,
+    /// Opaque handle of the real `BackupBundle::validate` receipt for
+    /// `archive_digest` (typed import pending the #974 dependency edge).
+    pub bundle_receipt: PlatformHandle,
+    /// Owner-attested `BackupClass::is_full_recovery` outcome for the
+    /// validated bundle.
+    pub archive_full_recovery: bool,
+    /// Owner-attested scope-declared outcome (`BackupClass::select` with a
+    /// declared scope): a scope transfer never carries installation
+    /// recovery and can never enter cutover.
+    pub archive_scope_transfer: bool,
+    /// Explicit degraded-installation policy reference; required when the
+    /// archive is canonical-only. Degraded recovery keeps this policy and
+    /// can never silently claim `FullRecovery`.
+    pub archive_canonical_only_policy: Option<PlatformHandle>,
     pub target_build_digest: PlatformHandle,
     pub target_config_digest: PlatformHandle,
     /// Owner-issued new authority fence for the destination generation.
@@ -109,13 +176,17 @@ pub struct CutoverRequest {
     pub expected_predecessor: PlatformHandle,
 }
 
-/// Proposed #960 exact current recovery receipts, rehydrated immediately
-/// before the cutover decision.
+/// Current recovery evidence consumed from the actual owners (#960 shape).
 ///
 /// Every denominator is complete-current: partial/unknown ORS/spool/effect
-/// denominators block cutover. Degraded recovery keeps its explicit stricter
-/// policy and cannot silently claim `FullRecovery`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// denominators block cutover. `restore_receipt` is the opaque handle of the
+/// real `RestoreReceipt` from `RestorePlan::execute_with_journal` /
+/// `RestoreTarget::finalize_isolated` (which performs no cutover), and
+/// `operational_validation` is the opaque handle of the real owner-issued
+/// `OperationalValidationEvidence`: per
+/// `RestoreEvidenceLevel::permits_operational_readiness`, no
+/// library-emitted level alone qualifies, so both handles are required.
+#[derive(Clone, Debug)]
 pub struct IsolatedRecoveryEvidence {
     /// All mandatory recovery phases completed with current receipts.
     pub mandatory_phases_complete: bool,
@@ -139,34 +210,21 @@ pub struct IsolatedRecoveryEvidence {
     pub no_live_lease_carryover: bool,
     /// Fresh destination readiness observed.
     pub destination_ready: bool,
+    /// Opaque handle of the real isolated-restore `RestoreReceipt`.
+    pub restore_receipt: PlatformHandle,
+    /// Opaque handle of the real owner-issued operational-validation
+    /// evidence (typed import pending the #974 dependency edge).
+    pub operational_validation: PlatformHandle,
     /// Degraded recovery under its explicit stricter policy, if set.
     pub degraded_policy: Option<PlatformHandle>,
 }
 
-/// Validated cutover: all fail-closed gates passed, ready for
-/// intent-before-effect persistence.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Validated cutover: all fail-closed gates passed, ready for the
+/// barrier-gated durable path.
+#[derive(Clone, Debug)]
 pub struct ValidatedCutover {
     pub request: CutoverRequest,
     pub evidence: IsolatedRecoveryEvidence,
-}
-
-/// Durable intent payload persisted BEFORE any activation/route/SCM effect
-/// (A12.3, I5.13 intent-before-effect).
-///
-/// Persistence itself flows through the existing journal owner
-/// (`ProductionHostStateJournal` / `HostStateJournalService::append` via the
-/// `HostComposition` durable transitions in `journal_append`); this struct is
-/// the payload, never a private journal override.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CutoverIntent {
-    pub operation: CutoverOperationIdentity,
-    pub source_installation: PlatformHandle,
-    pub destination_installation: PlatformHandle,
-    pub archive_digest: PlatformHandle,
-    pub activation_fence: StateFence,
-    pub expected_predecessor: PlatformHandle,
-    pub admission_ref: PlatformHandle,
 }
 
 /// Exact cutover disposition. `Unknown` is the bounded reconciliation state
@@ -197,9 +255,9 @@ pub struct CutoverOutcome {
 /// agent surface; the exact `reason_code` registry owns the wire spelling.
 #[derive(Debug, thiserror::Error)]
 pub enum CutoverError {
-    #[error("cutover admission is not separately authorized")]
-    NotSeparatelyAdmitted,
-    #[error("restore-test/rehearsal cannot invoke cutover")]
+    #[error("cutover admission is not separately authorized: {0}")]
+    NotSeparatelyAdmitted(String),
+    #[error("restore-test/rehearsal envelope cannot invoke cutover")]
     RehearsalCannotCutover,
     #[error("source/destination/archive/build/fence binding mismatch")]
     BindingMismatch,
@@ -215,56 +273,92 @@ pub enum CutoverError {
     StalePurgeKeyReference,
     #[error("prior session/lease/route/generation/UI invalidation required")]
     PriorAuthorityStillActive,
-    #[error("owner-issued new authority or destination readiness required")]
+    #[error("owner-issued new authority, explicit retirement authorization, or destination readiness required")]
     AuthorityOrReadinessMissing,
-    #[error("old Host audit cannot grant active authority")]
-    ForensicAuditCannotAuthorize,
     #[error("expected-predecessor conflict; neither installation changed")]
     ExpectedPredecessorConflict,
     #[error("operation identity conflict: reused key with different request hash")]
     IdentityConflict,
     #[error("retirement barrier denied: {0}")]
     BarrierDenied(String),
-    #[error("durable intent persistence required before effects: {0}")]
-    IntentPersistence(String),
     #[error("host owner transition failed: {0}")]
     HostTransition(#[from] HostError),
     #[error("installation registry rejected cutover evidence: {0}")]
     Registry(String),
 }
 
+/// Bounds and dedupes evidence references for owner records, which reject
+/// empty and duplicate handle sets.
 fn bounded_evidence(refs: Vec<PlatformHandle>) -> Vec<PlatformHandle> {
-    refs.into_iter().take(CUTOVER_EVIDENCE_BOUND).collect()
+    let mut seen = Vec::with_capacity(CUTOVER_EVIDENCE_BOUND);
+    for item in refs.into_iter().take(CUTOVER_EVIDENCE_BOUND) {
+        if !seen.contains(&item) {
+            seen.push(item);
+        }
+    }
+    seen
+}
+
+fn admission_handle(
+    admission: &HostRequestAdmissionReceipt,
+) -> Result<PlatformHandle, CutoverError> {
+    PlatformHandle::new(admission.operation_id.clone()).map_err(|_| CutoverError::BindingMismatch)
 }
 
 /// Validates one exact cutover request against current owner evidence.
 ///
-/// Fail-closed gates (no silent fallback, no upgrade, no stub):
-/// 1. separately admitted cutover request; 2. restore-test cannot invoke;
-/// 3. source/destination/archive/build/fence bindings exact; 4. ScopeExport
-/// rejected; 5. degraded policy explicit, never upgraded; 6. every mandatory
-/// phase receipt current; 7. complete ORS/spool/effect denominators;
-/// 8. fresh purge/key/reference + external-source revalidation; 9. prior
-/// authority invalidated, no live lease carryover; 10. owner-issued new
-/// authority + destination readiness; 11. forensic audit never authorizes.
+/// Real owner calls: `envelope.validate()`, `admission.validate()`, and the
+/// digest binding through `host_request_operation_id` (a rehearsal envelope
+/// derives a different `hostreq:` handle and fails here, never as cutover).
+/// Fail-closed gates: separately admitted `Invocation` envelope whose fence
+/// exactly matches the activation fence; bindings exact; scope transfers
+/// rejected; degraded policy explicit, never upgraded; every mandatory phase
+/// receipt current; complete denominators; fresh purge/key/reference plus
+/// external-source revalidation; prior authority invalidated with no live
+/// lease carryover; owner-issued operational validation plus destination
+/// readiness; expected predecessor matches the registry projection.
 ///
 /// # Errors
 ///
-/// Returns the exact failing gate. On success the request may proceed to
-/// durable intent persistence; nothing is activated here.
+/// Returns the exact failing gate. Nothing is activated here.
 pub fn validate_cutover_request(
     request: &CutoverRequest,
     evidence: &IsolatedRecoveryEvidence,
     registry: &ApprovedGenerationRegistry,
 ) -> Result<ValidatedCutover, CutoverError> {
-    match &request.admission {
-        CutoverAdmission::SeparatelyAdmitted { .. } => {}
-        CutoverAdmission::RestoreTest { .. } => return Err(CutoverError::RehearsalCannotCutover),
+    request
+        .envelope
+        .validate()
+        .map_err(|error| CutoverError::NotSeparatelyAdmitted(error.to_string()))?;
+    request
+        .admission
+        .validate()
+        .map_err(|error| CutoverError::NotSeparatelyAdmitted(error.to_string()))?;
+    if request.envelope.kind != HostRequestKind::Invocation {
+        return Err(CutoverError::NotSeparatelyAdmitted(
+            "cutover requires an Invocation-kind admitted envelope".to_owned(),
+        ));
     }
-    if request.class == BackupClass::ScopeExport {
+    if request.admission.kind != request.envelope.kind {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if request.admission.request_sha256 != request.envelope.envelope_sha256 {
+        return Err(CutoverError::BindingMismatch);
+    }
+    let expected_operation = host_request_operation_id(&request.envelope);
+    if request.admission.operation_id != expected_operation {
+        // A restore-test/rehearsal envelope (or any changed envelope)
+        // derives a different digest-bound handle: it can never present
+        // this cutover admission.
+        return Err(CutoverError::RehearsalCannotCutover);
+    }
+    if !fences_match_exact(&request.envelope.state_fence, &request.activation_fence) {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if request.archive_scope_transfer {
         return Err(CutoverError::ScopeExportForbidden);
     }
-    if request.class == BackupClass::CanonicalOnlyDegraded && evidence.degraded_policy.is_none() {
+    if !request.archive_full_recovery && request.archive_canonical_only_policy.is_none() {
         return Err(CutoverError::DegradedPolicyViolation);
     }
     if request.source_installation == request.destination_installation {
@@ -280,11 +374,9 @@ pub fn validate_cutover_request(
     if !evidence.mandatory_phases_complete {
         return Err(CutoverError::MissingPhaseReceipt);
     }
-    let unresolved_known = match evidence.unresolved_effects {
-        Some(count) => count,
-        None => return Err(CutoverError::PartialDenominator),
-    };
-    let _ = unresolved_known;
+    if evidence.unresolved_effects.is_none() {
+        return Err(CutoverError::PartialDenominator);
+    }
     if !evidence.canonical_denominator_complete
         || !evidence.ors_denominator_complete
         || !evidence.spool_denominator_complete
@@ -305,35 +397,12 @@ pub fn validate_cutover_request(
         .map_err(|error| CutoverError::Registry(error.to_string()))?;
     match registry.active_generation() {
         Some(active) if *active == request.expected_predecessor => {}
-        Some(_) => return Err(CutoverError::ExpectedPredecessorConflict),
-        None => return Err(CutoverError::ExpectedPredecessorConflict),
+        Some(_) | None => return Err(CutoverError::ExpectedPredecessorConflict),
     }
     Ok(ValidatedCutover {
         request: request.clone(),
         evidence: evidence.clone(),
     })
-}
-
-/// Builds the durable intent payload for a validated cutover.
-///
-/// The caller persists this through the existing journal owner BEFORE any
-/// activation/route/SCM effect and binds each owner receipt to the operation
-/// identity.
-#[must_use]
-pub fn cutover_intent(validated: &ValidatedCutover) -> CutoverIntent {
-    let admission_ref = match &validated.request.admission {
-        CutoverAdmission::SeparatelyAdmitted { admission_ref } => admission_ref.clone(),
-        CutoverAdmission::RestoreTest { rehearsal_ref } => rehearsal_ref.clone(),
-    };
-    CutoverIntent {
-        operation: validated.request.operation.clone(),
-        source_installation: validated.request.source_installation.clone(),
-        destination_installation: validated.request.destination_installation.clone(),
-        archive_digest: validated.request.archive_digest.clone(),
-        activation_fence: validated.request.activation_fence.clone(),
-        expected_predecessor: validated.request.expected_predecessor.clone(),
-        admission_ref,
-    }
 }
 
 /// Exact replay guard (I5.27): the same operation identity with the same
@@ -374,23 +443,22 @@ pub fn check_replay_identity(
 
 /// Executes the cutover lifecycle against the Host owner.
 ///
-/// Ordering (intent-before-effect, single active authority):
-/// 1. durable intent already persisted via the journal owner;
-/// 2. new-generation activation committed through the existing
-///    registry/epoch/launch owners (their current compare/prepare/commit
-///    transitions; this function performs no registry mutation itself);
-/// 3. the Parfit-owned retirement barrier is REQUIRED here: it succeeds
-///    only on current Kernel/ORS readback proving NO active
-///    RuntimeLease/SupervisionLease for the prior generation plus the
-///    current durable drain/commit;
-/// 4. prior-generation SCM/artifact retirement runs only holding the
-///    barrier proof (see [`retire_prior_generation`]).
+/// Real owner calls, in order: `HostComposition::ensure_admission_open`;
+/// fresh registry readback through `super::open_registry_store_at` plus
+/// `RedbInstallationRegistry::load` with the expected-predecessor recheck
+/// (TOCTOU fence: the cached projection check in validation is not enough);
+/// exact barrier-fence bindings; then the Parfit-owned
+/// `HostComposition::require_generation_retirement_barrier`, which succeeds
+/// only on current Kernel/ORS readback proving NO active
+/// RuntimeLease/SupervisionLease for the prior generation plus the current
+/// durable drain/commit. No registry mutation is performed here: none exists
+/// for cutover on current main.
 ///
 /// Lost response, failure between registry/authority/route transitions, or
-/// cancellation after possible activation yields `Unknown`: re-read the same
-/// operation and actual owner receipts before retry; do not activate again,
-/// roll back blindly, or mark both sides active/inactive from local
-/// assumptions.
+/// cancellation after possible activation yields `Unknown` on reconcile:
+/// re-read the same operation and actual owner receipts before retry; do not
+/// activate again, roll back blindly, or mark both sides active/inactive
+/// from local assumptions.
 ///
 /// # Errors
 ///
@@ -398,12 +466,24 @@ pub fn check_replay_identity(
 /// the durable drain/commit disagrees; `Unknown`-class host failures
 /// propagate as `HostTransition` for fenced reconciliation.
 pub fn execute_cutover(
-    host: &mut HostComposition,
+    host: &HostComposition,
     validated: &ValidatedCutover,
     retirement: &GenerationRetirementFence,
     activation_id: &PlatformHandle,
     activation_generation: &EpochTransition,
 ) -> Result<(CutoverOutcome, GenerationRetirementBarrier), CutoverError> {
+    host.ensure_admission_open()?;
+    let store = super::open_registry_store_at(&host.registry_host_root)?;
+    let fresh = store
+        .load()
+        .map_err(|error| CutoverError::Registry(error.to_string()))?;
+    fresh
+        .validate()
+        .map_err(|error| CutoverError::Registry(error.to_string()))?;
+    match fresh.active_generation() {
+        Some(active) if *active == validated.request.expected_predecessor => {}
+        Some(_) | None => return Err(CutoverError::ExpectedPredecessorConflict),
+    }
     if retirement.activation_id != *activation_id {
         return Err(CutoverError::BindingMismatch);
     }
@@ -420,7 +500,10 @@ pub fn execute_cutover(
         CutoverOutcome {
             disposition: CutoverDisposition::RetirementPending,
             operation: validated.request.operation.clone(),
-            evidence_refs: bounded_evidence(vec![activation_id.clone()]),
+            evidence_refs: bounded_evidence(vec![
+                admission_handle(&validated.request.admission)?,
+                activation_id.clone(),
+            ]),
         },
         barrier,
     ))
@@ -428,66 +511,109 @@ pub fn execute_cutover(
 
 /// Retires the prior generation holding the real barrier proof.
 ///
+/// Real owner calls: `HostComposition::ensure_admission_open`, then the
+/// journal-owner write `super::journal_append::append_reconciled` persisting
+/// `HostStateRecord::EpochRetirement` with the cutover operation identity,
+/// the barrier-bound fence, and bounded evidence refs. The barrier type has
+/// private owner construction, so only the real Kernel/ORS readback path can
+/// produce it: no proxy receipt, no Kernel rehearsal, no refs-only census
+/// passes here. The returned `AppendReceipt` is the durable linearization
+/// receipt for this retirement; prior-generation process/SCM retirement
+/// effects then run through the existing drain/stop contours driven by the
+/// committed record.
+///
 /// Requires: the exact new state already committed and accepted, all source
-/// drain/retirement decisions explicitly authorized, and the live
-/// `GenerationRetirementBarrier` returned by
-/// `HostComposition::require_generation_retirement_barrier`. The barrier type
-/// has private owner construction, so only the real Kernel/ORS readback path
-/// can produce it: no proxy receipt, no Kernel rehearsal, no refs-only
-/// census passes here.
+/// drain/retirement decisions explicitly authorized
+/// (`retirement_authorization` is bound into the record; empty values are
+/// rejected, never defaulted), the prior epoch from the same installation,
+/// and a live barrier. The source installation is retained until accepted
+/// authorized retirement; source data destruction is a separate explicitly
+/// authorized retention/erasure action, never automatic cleanup here.
 ///
-/// The source installation is retained until accepted authorized retirement;
-/// source data destruction is a separate explicitly authorized
-/// retention/erasure action, never automatic cleanup here. SCM effects flow
-/// through the existing SCM owner (`scm_launch` validation/inspection) and
-/// launch owners; this function performs no arbitrary process/SCM/global
-/// configuration access.
+/// # Errors
 ///
-/// The `_intent_stored` flag is the caller's proof that durable intent was
-/// persisted before effects; `false` fails closed.
+/// Fails closed on authorization, prior-epoch binding, or journal outcome;
+/// `OutcomeUnknown` reconciles through the choke and never forges success.
 pub fn retire_prior_generation(
+    host: &HostComposition,
+    validated: &ValidatedCutover,
+    retirement: &GenerationRetirementFence,
     _barrier: &GenerationRetirementBarrier,
-    operation: &CutoverOperationIdentity,
-    prior_generation: &PlatformHandle,
+    prior_host: &HostInstallationEpoch,
     retirement_authorization: &PlatformHandle,
-    _intent_stored: bool,
 ) -> Result<CutoverOutcome, CutoverError> {
-    if !_intent_stored {
-        return Err(CutoverError::IntentPersistence(
-            "durable cutover intent must precede prior-generation retirement".to_owned(),
-        ));
+    host.ensure_admission_open()?;
+    if retirement_authorization.as_str().trim().is_empty() {
+        return Err(CutoverError::AuthorityOrReadinessMissing);
     }
+    if prior_host.installation != host.host.installation {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if prior_host.epoch == host.host.epoch {
+        return Err(CutoverError::BindingMismatch);
+    }
+    let operation = IdempotencyIdentity {
+        operation_id: validated.request.operation.operation_id.clone(),
+        idempotency_key: validated.request.operation.request_digest.clone(),
+    };
+    let record = HostStateRecord::EpochRetirement(EpochRetirementRecord {
+        // Full fence shape comes straight from the barrier-bound fence
+        // already checked in `execute_cutover` (same installation
+        // activation id + generation the barrier was issued for). The
+        // journal reducer runs the complete owner `validate()` on append,
+        // including `HostInstallationEpoch::validate`, which this crate
+        // cannot call directly (`pub(crate)` in `eliot-host-state`).
+        fence: RecordFence {
+            host: host.host.clone(),
+            activation_id: retirement.activation_id.clone(),
+            activation_generation: retirement.activation_generation.clone(),
+        },
+        operation,
+        retired_host: prior_host.clone(),
+        retirement_evidence_refs: bounded_evidence(vec![
+            admission_handle(&validated.request.admission)?,
+            validated.request.archive_digest.clone(),
+            validated.request.bundle_receipt.clone(),
+            validated.evidence.restore_receipt.clone(),
+            validated.evidence.operational_validation.clone(),
+            retirement_authorization.clone(),
+        ]),
+        retired_at: super::fresh_identity("host-cutover-retired-at")?,
+    });
+    let receipt = super::journal_append::append_reconciled(&host.journal, record)?;
     Ok(CutoverOutcome {
         disposition: CutoverDisposition::Reconciled,
-        operation: operation.clone(),
+        operation: validated.request.operation.clone(),
         evidence_refs: bounded_evidence(vec![
-            prior_generation.clone(),
+            receipt.transaction_id().clone(),
+            admission_handle(&validated.request.admission)?,
             retirement_authorization.clone(),
         ]),
     })
 }
 
-/// Reconciles a cutover after lost response or cancellation.
+/// Reconciles a cutover from real owner receipts after lost response or
+/// cancellation.
 ///
-/// Re-reads the same operation identity and actual owner receipts; never
-/// activates again from local assumptions. Cancellation/cleanup/diagnostic
-/// failure preserves the primary result and its reconciliation path.
+/// Pass the actual `AppendReceipt` read back from the journal owner for the
+/// cutover operation identity (or `None` when no such receipt exists);
+/// never a locally assumed boolean. Cancellation/cleanup/diagnostic failure
+/// preserves the primary result and its reconciliation path.
 #[must_use]
 pub fn reconcile_cutover_outcome(
     operation: &CutoverOperationIdentity,
-    committed: bool,
-    retirement_complete: bool,
+    retirement_receipt: Option<&AppendReceipt>,
 ) -> CutoverOutcome {
-    let disposition = if retirement_complete && committed {
-        CutoverDisposition::Reconciled
-    } else if committed {
-        CutoverDisposition::RetirementPending
-    } else {
-        CutoverDisposition::Unknown
-    };
-    CutoverOutcome {
-        disposition,
-        operation: operation.clone(),
-        evidence_refs: Vec::new(),
+    match retirement_receipt {
+        Some(receipt) => CutoverOutcome {
+            disposition: CutoverDisposition::Reconciled,
+            operation: operation.clone(),
+            evidence_refs: vec![receipt.transaction_id().clone()],
+        },
+        None => CutoverOutcome {
+            disposition: CutoverDisposition::Unknown,
+            operation: operation.clone(),
+            evidence_refs: Vec::new(),
+        },
     }
 }
