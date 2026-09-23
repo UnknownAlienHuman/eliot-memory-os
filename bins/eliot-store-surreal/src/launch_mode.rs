@@ -84,6 +84,17 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
                     .apply_backup_tables_migration(&clock)
                     .await
                     .map_err(|error| error.to_string())?;
+                // Restore coordination decision table (issue #975 T1):
+                // the separate coordination delta follows the backup
+                // tables so a freshly initialized database also serves
+                // coordination-anchored restores. Separate delta, same
+                // idempotent replay discipline: never folded into the
+                // backup tables, so already-provisioned backup
+                // deployments keep their exact-replay identity.
+                let coordination_receipt = composition
+                    .apply_backup_coordination_migration(&clock)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 let output = serde_json::json!({
                     "service": SERVICE_NAME,
                     "operation": "initialize_schema_only",
@@ -92,6 +103,8 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
                     "generation_after": receipt.generation_after.as_str(),
                     "backup_migration_id": backup_receipt.migration_id,
                     "backup_checksum_sha256": backup_receipt.checksum_sha256,
+                    "coordination_migration_id": coordination_receipt.migration_id,
+                    "coordination_checksum_sha256": coordination_receipt.checksum_sha256,
                 });
                 println!(
                     "{}",
