@@ -752,6 +752,18 @@ static GET_EXPERIENCE_RANGE_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDe
     required: true,
 }];
 
+/// Closed selector for the audit-range read (issue #223): the optional
+/// opaque continuation cursor minted by the store-api audit cursor
+/// issuer. Absent cursors read from the start with legacy fail-closed
+/// overflow; present cursors resume paging after owner verification.
+/// The empty-parameter request shape stays valid, so existing planners
+/// keep working.
+static GET_AUDIT_RANGE_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "cursor",
+    shape: ParameterShape::Subject,
+    required: false,
+}];
+
 /// Closed commit parameters shared by both experience legs (issue #223):
 /// the verbatim record document, the presented record/scope/fence
 /// digests, the decimal owner revision, and the idempotency key. The
@@ -967,6 +979,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// `GetExperienceBankRange` and `GetAgentFeedbackRange` declare the required
 /// decimal `max_records` bound (issue #223; scope arrives through the typed
 /// `scope_id` request field, mirroring `GetEvidencePack`);
+/// `GetAuditRange` declares the optional opaque `cursor` continuation
+/// selector (issue #223; absent cursors read from the start);
 /// every other variant declares none, so any supplied parameter fails closed. Variants without a catalogue entry never
 /// reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -992,13 +1006,13 @@ pub const fn declared_read_parameters(
         NamedReadOperation::GetUserAutomationState => &GET_USER_AUTOMATION_PARAMETERS,
         NamedReadOperation::GetExperienceBankRange => &GET_EXPERIENCE_RANGE_PARAMETERS,
         NamedReadOperation::GetAgentFeedbackRange => &GET_EXPERIENCE_RANGE_PARAMETERS,
+        NamedReadOperation::GetAuditRange => &GET_AUDIT_RANGE_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
         | NamedReadOperation::GetModuleCatalogState
         | NamedReadOperation::GetConformanceState
-        | NamedReadOperation::GetMailbox
-        | NamedReadOperation::GetAuditRange => &NO_PARAMETERS,
+        | NamedReadOperation::GetMailbox => &NO_PARAMETERS,
     }
 }
 

@@ -32,30 +32,42 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use eliot_contracts::{ArtifactId, RequestMetadata};
+use eliot_contracts::{ArtifactId, RequestMetadata, StateFence};
 use eliot_cognitive_quality::QualityAssessmentCandidate;
-use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness};
+use eliot_context_contracts::ActiveUnderstandingView;
+use eliot_dreamer_contracts::self_query::AcceptedSourceProjection;
+use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness, ProviderContribution};
 use eliot_experience_provider::{
     BankShapeInputs, ExperienceView, FeedbackShapeInputs, JournalShapeOutput, ProduceJournalInputs,
     ProviderError, RetentionContext, SelfQualityInputs, SelfQualityRecheckInputs, WithheldMember,
-    assess_and_recheck, produce_journal_read,
+    assess_and_recheck, produce_common_ground_assessment, produce_journal_read,
+    produce_memory_quality, produce_understanding_assessment,
 };
 use eliot_learning_contracts::HarnessActivationReceiptCandidate;
+use eliot_memory_quality::{MemoryEcologyAssessment, QualityRequest};
 use eliot_observation::{
     GovernorObservationError,
     bank_admission::{
         BankStoreSnapshot, ExperienceRevisionLedger, FeedbackStoreSnapshot,
         bank_records_from_range_payload, feedback_records_from_range_payload,
+        produce_bank_commit, produce_feedback_commit,
         supply_bank_projection_from_store, supply_feedback_projection_from_store,
     },
 };
 use eliot_observation_contracts::{
-    ObservationScope, ProjectionCoverage, ProjectionOmission, RetentionHold, RetentionSchedule,
+    AgentFeedbackRecord, ExperienceBankRecord, ObservationScope, ProjectionCoverage,
+    ProjectionOmission, RetentionHold, RetentionSchedule,
 };
-use eliot_receipts::WorkScopeId;
+use eliot_protocol::RequestIdentity;
+use eliot_receipts::{RequestBinding, WorkScopeId};
+use eliot_understanding_assessment::{
+    AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
+    ExperienceEvidence, OwnerContext, ScopedUnderstandingAssessment,
+};
 use eliot_store_api::{
-    CanonicalReadClient, NamedReadOperation, NamedReadRequest, ReadConsistency, RevisionKey,
-    ScopeId, StoreError, epistemic_revision::EpistemicPositionReadback,
+    CanonicalReadClient, NamedReadOperation, NamedReadRequest, OrderingHeadExpectation, ReadConsistency,
+    RevisionHeadExpectation, RevisionKey, ScopeId, StoreError, WriteReceipt,
+    epistemic_revision::EpistemicPositionReadback,
 };
 use thiserror::Error;
 
@@ -82,6 +94,15 @@ pub enum ExperienceDriverError {
         field: &'static str,
         reason: &'static str,
     },
+    /// Admitted commit ingress could not be derived from retained state.
+    #[error("commit ingress field {field}: {reason}")]
+    Ingress {
+        field: &'static str,
+        reason: &'static str,
+    },
+    /// The Governor-backed experience commit failed.
+    #[error("experience commit failed: {0}")]
+    Commit(String),
 }
 
 /// Read the TRUE admitted edge position through the real bridge client.
@@ -259,13 +280,82 @@ pub struct ExperienceFeedbackEventInputs {
 
 /// Governed trigger event for one terminal experience-quality run.
 ///
+/// Understanding leg inputs: everything except outcome-side experience.
+///
+/// The entry binds outcome-side experience evidence from its own live
+/// envelopes; all other inputs arrive edge-supplied from their owners
+/// (compiled view, accepted sources, contribution, scope, cites,
+/// closure). Product claims stay false unless the edge holds out
+/// evidence for them.
+pub struct UnderstandingEventInputs<'a> {
+    /// Already-compiled understanding view, by handle (edge-supplied).
+    pub view: &'a ActiveUnderstandingView,
+    /// Accepted-source projection for citation checks (edge-supplied).
+    pub sources: &'a AcceptedSourceProjection,
+    /// Optional admitted epistemic contribution, echoed by digest/claim.
+    pub contribution: Option<&'a ProviderContribution>,
+    /// Denominator anchor.
+    pub scope: AssessmentScope,
+    /// Subject route or coupled system.
+    pub subject: String,
+    /// Transfer boundary and requalification text.
+    pub transfer_boundary: String,
+    /// Material unknowns cites.
+    pub material_unknowns: Vec<EvidenceCite>,
+    /// Abstention precision/coverage cites, where applicable.
+    pub abstention: Vec<EvidenceCite>,
+    /// Unanswerable/stale case cites, where applicable.
+    pub unanswerable: Vec<EvidenceCite>,
+    /// Counterfactual intervention cites, where applicable.
+    pub counterfactual: Vec<EvidenceCite>,
+    /// Rival/prediction/discriminator/verifier/revision closure.
+    pub closure: AssessmentClosure,
+    /// True when the verdict backs a product claim (held-out required).
+    pub product_claims: bool,
+}
+
+/// Common-ground leg inputs: everything except outcome-side experience.
+///
+/// Same binding rule as [`UnderstandingEventInputs`]: the entry binds
+/// outcome-side experience evidence from its own live envelopes; all
+/// other inputs arrive edge-supplied from their owners.
+pub struct CommonGroundEventInputs<'a> {
+    /// Already-compiled understanding view, by handle (edge-supplied).
+    pub view: &'a ActiveUnderstandingView,
+    /// Accepted-source projection for citation checks (edge-supplied).
+    pub sources: &'a AcceptedSourceProjection,
+    /// Optional admitted epistemic contribution, echoed by digest/claim.
+    pub contribution: Option<&'a ProviderContribution>,
+    /// Denominator anchor.
+    pub scope: AssessmentScope,
+    /// Terminology compatibility cites.
+    pub terminology: Vec<EvidenceCite>,
+    /// Reference compatibility cites.
+    pub reference: Vec<EvidenceCite>,
+    /// Commitment compatibility cites.
+    pub commitment: Vec<EvidenceCite>,
+    /// Action-consequence compatibility cites.
+    pub action_consequence: Vec<EvidenceCite>,
+    /// Survival-across-change cites.
+    pub survival: Vec<EvidenceCite>,
+    /// Public inheritance transfer refs.
+    pub transfer_refs: Vec<EvidenceCite>,
+    /// Requalification scope for tacit competence.
+    pub requalification_scope: String,
+    /// Rival/prediction/discriminator/verifier/revision closure.
+    pub closure: AssessmentClosure,
+    /// True when the verdict backs a product claim (held-out required).
+    pub product_claims: bool,
+}
+
 /// The event producer (operator/planner edge, O1 trigger) assembles this
 /// from explicit owner-issued inputs only: bridge scope and position
 /// subject, journal presence inputs, durable bank/feedback documents with
 /// their read context, the owner-issued retention schedule with
-/// caller-carried holds, per-attempt receipts, obligation handles, and
-/// edge attestation. Reads stay reads: nothing here writes, persists, or
-/// submits; the entry returns the frozen candidate plus the validated
+/// caller-carried holds, per-attempt receipts, obligation handles, edge
+/// attestation, plus the memory request and understanding leg when those
+/// families run. Reads stay reads: nothing here writes, persists, or
+/// submits; the entry returns the frozen candidates plus the validated
 /// views and gap postures for the consuming review path.
 pub struct ExperienceQualityEvent<'a> {
     /// Assessment identity minted by the caller.
@@ -294,9 +384,19 @@ pub struct ExperienceQualityEvent<'a> {
     pub obligation_handles: &'a [ArtifactId],
     /// Edge-attested handles for bodies cited by handle only.
     pub attested_handles: Vec<ArtifactId>,
+    /// Memory-quality request, when the memory family runs (edge-supplied
+    /// owner batch, applicability verdict, projections, and receipts).
+    pub memory: Option<QualityRequest>,
+    /// Understanding leg inputs, when the understanding family runs
+    /// (edge-supplied owner context minus outcome experience, which the
+    /// entry binds from its own live envelopes).
+    pub understanding: Option<UnderstandingEventInputs<'a>>,
+    /// Common-ground leg inputs, when the common-ground family runs
+    /// (same outcome-experience binding rule as the scoped leg).
+    pub common_ground: Option<CommonGroundEventInputs<'a>>,
 }
 
-/// Terminal output bundle: frozen candidate plus validated views and gaps.
+/// Terminal output bundle: frozen candidates plus validated views and gaps.
 pub struct ExperienceQualityEventOutput {
     /// Frozen self-quality candidate, assessed and re-resolved.
     pub candidate: QualityAssessmentCandidate,
@@ -310,6 +410,12 @@ pub struct ExperienceQualityEventOutput {
     pub bank_withheld: Vec<WithheldMember>,
     /// Withheld feedback records with honest postures for gap emission.
     pub feedback_withheld: Vec<WithheldMember>,
+    /// Memory ecology assessment, when the memory family ran.
+    pub memory_assessment: Option<MemoryEcologyAssessment>,
+    /// Scoped understanding assessment, when the understanding family ran.
+    pub understanding: Option<ScopedUnderstandingAssessment>,
+    /// Common-ground assessment, when the common-ground family ran.
+    pub common_ground: Option<CommonGroundAssessment>,
 }
 
 /// Terminal event entry: trigger event to reviewed candidate.
@@ -434,6 +540,63 @@ pub async fn run_experience_quality_event(
         },
         attested_handles: event.attested_handles.clone(),
     })?;
+    let memory_assessment = match &event.memory {
+        Some(request) => Some(produce_memory_quality(request)?),
+        None => None,
+    };
+    let mut experience = Vec::new();
+    if let Some(journal) = journal_envelope.as_ref() {
+        experience.push(ExperienceEvidence::Journal(journal));
+    }
+    experience.push(ExperienceEvidence::Bank(&bank_live));
+    experience.push(ExperienceEvidence::Feedback(&feedback_live));
+    let understanding = match &event.understanding {
+        Some(inputs) => {
+            let scoped = eliot_understanding_assessment::ScopedInput {
+                owner: OwnerContext {
+                    view: inputs.view,
+                    sources: inputs.sources,
+                    contribution: inputs.contribution,
+                    experience: &experience,
+                },
+                scope: inputs.scope.clone(),
+                subject: inputs.subject.clone(),
+                transfer_boundary: inputs.transfer_boundary.clone(),
+                material_unknowns: inputs.material_unknowns.clone(),
+                abstention: inputs.abstention.clone(),
+                unanswerable: inputs.unanswerable.clone(),
+                counterfactual: inputs.counterfactual.clone(),
+                closure: inputs.closure.clone(),
+                product_claims: inputs.product_claims,
+            };
+            Some(produce_understanding_assessment(scoped)?)
+        }
+        None => None,
+    };
+    let common_ground = match &event.common_ground {
+        Some(inputs) => {
+            let common = CommonGroundInput {
+                owner: OwnerContext {
+                    view: inputs.view,
+                    sources: inputs.sources,
+                    contribution: inputs.contribution,
+                    experience: &experience,
+                },
+                scope: inputs.scope.clone(),
+                terminology: inputs.terminology.clone(),
+                reference: inputs.reference.clone(),
+                commitment: inputs.commitment.clone(),
+                action_consequence: inputs.action_consequence.clone(),
+                survival: inputs.survival.clone(),
+                transfer_refs: inputs.transfer_refs.clone(),
+                requalification_scope: inputs.requalification_scope.clone(),
+                closure: inputs.closure.clone(),
+                product_claims: inputs.product_claims,
+            };
+            Some(produce_common_ground_assessment(common)?)
+        }
+        None => None,
+    };
     Ok(ExperienceQualityEventOutput {
         candidate,
         journal_view,
@@ -441,5 +604,175 @@ pub async fn run_experience_quality_event(
         feedback_view: feedback_shaped.view,
         bank_withheld: bank_shaped.withheld,
         feedback_withheld: feedback_shaped.withheld,
+        memory_assessment,
+        understanding,
+        common_ground,
+    })
+}
+
+/// Daemon-edge commit lifecycle bound in milliseconds.
+///
+/// Bounds this run's commit lifecycle only, mirroring the Kernel-client
+/// ingress precedent (`daemon_kernel_client` 30s window). It bounds no
+/// identity and proves nothing: authority stays with admitted metadata,
+/// fence agreement, and the owner checks downstream.
+const COMMIT_INGRESS_DEADLINE_MS: u64 = 30_000;
+
+/// Terminal output bundle: durable commit receipts per family.
+pub struct ExperienceCommitOutput {
+    /// Owner receipts for committed bank records, in input order.
+    pub bank_receipts: Vec<WriteReceipt>,
+    /// Owner receipts for committed feedback records, in input order.
+    pub feedback_receipts: Vec<WriteReceipt>,
+}
+
+/// Derives admitted commit ingress from retained invocation state.
+///
+/// Clones the validated invocation metadata (`ctx`) verbatim — the
+/// admission contour that invoked this driver — and requires its fence
+/// to equal the retained admitted Kernel fence: invocation/Kernel fence
+/// drift fails closed here, before any identity exists. The idempotency
+/// key is the owner-derived commit key for the exact record being
+/// committed (computed by `produce_bank_commit` /
+/// `produce_feedback_commit` from admitted record content, never
+/// invented); the deadline bounds this run per
+/// [`COMMIT_INGRESS_DEADLINE_MS`]; the cancellation identity binds the
+/// commit lifecycle to that same record key. Record-fence, scope, and
+/// key agreement are re-checked by the commit caller and the owner
+/// downstream; nothing here mints identity, heads, or proofs.
+pub fn derive_commit_ingress(
+    ctx: &RequestMetadata,
+    kernel_fence: &StateFence,
+    commit_key: &str,
+) -> Result<RequestIdentity, ExperienceDriverError> {
+    ctx.validate().map_err(|_| ExperienceDriverError::Ingress {
+        field: "request_metadata",
+        reason: "retained invocation metadata is invalid",
+    })?;
+    if ctx.state_fence != *kernel_fence {
+        return Err(ExperienceDriverError::Ingress {
+            field: "request_metadata.state_fence",
+            reason: "invocation fence differs from the admitted Kernel fence",
+        });
+    }
+    if commit_key.trim().is_empty() || commit_key.chars().any(char::is_control) {
+        return Err(ExperienceDriverError::Ingress {
+            field: "idempotency_key",
+            reason: "owner-derived commit key is blank or carries control characters",
+        });
+    }
+    Ok(RequestIdentity {
+        request: RequestBinding {
+            metadata: ctx.clone(),
+            state_fence: ctx.state_fence.clone(),
+        },
+        idempotency_key: commit_key.to_owned(),
+        deadline_unix_ms: super::unix_ms().saturating_add(COMMIT_INGRESS_DEADLINE_MS),
+        cancellation_id: format!("{commit_key}:cancel"),
+    })
+}
+
+/// Terminal commit entry: admitted event records to durable rows.
+///
+/// O1 trigger seam (transcription-ready): the O1 copy transcribes this
+/// exact entry plus [`derive_commit_ingress`] and
+/// [`ExperienceCommitOutput`]; the read entry
+/// ([`run_experience_quality_event`]) is unchanged and stays read-only.
+/// Checklist for the O1 copy:
+/// - call with the SAME decoded record slices the read entry consumed
+///   (bank/feedback range payloads already digest re-proved upstream);
+/// - pass `event.scope_id` verbatim; scope/record mismatch fails closed
+///   in the commit caller with an exact owner error;
+/// - pass edge-supplied live head expectations when held, else empty
+///   vectors (no expectations are fabricated here);
+/// - per-record receipts return in input order; a mid-batch failure
+///   returns `Err` while already-durable receipts stay durable under
+///   their deterministic idempotency keys, so retry is convergent and
+///   never double-persists.
+///
+/// Runs, in source terms: ledger rebuild from the admitted slices (only
+/// the greatest admitted revision per handle passes the owner
+/// sequencing gate; older revisions fail closed, never silently
+/// skipped), per-record owner commit payload (`produce_bank_commit` /
+/// `produce_feedback_commit`), admitted ingress derivation, the
+/// canonical Governor commit caller (`commit_experience_bank` /
+/// `commit_experience_feedback`), and returns the owner `WriteReceipt`s
+/// unmodified. Proof refs are verbatim admitted refs from the
+/// edge-supplied per-attempt receipts (admission + activation-request
+/// receipt identities, blanks dropped); nothing is inferred.
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_experience_event_records(
+    composition: &mut DaemonComposition,
+    ctx: &RequestMetadata,
+    event: &ExperienceQualityEvent<'_>,
+    bank_records: &[ExperienceBankRecord],
+    feedback_records: &[AgentFeedbackRecord],
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+) -> Result<ExperienceCommitOutput, ExperienceDriverError> {
+    ctx.validate().map_err(|_| ExperienceDriverError::Ingress {
+        field: "request_metadata",
+        reason: "retained invocation metadata is invalid",
+    })?;
+    let kernel_fence = composition.kernel_snapshot().state_fence().clone();
+    let mut proof_refs: Vec<String> = Vec::new();
+    for receipt in event.receipts {
+        for identity in [
+            receipt.admission_receipt.as_str(),
+            receipt.activation_request_receipt.as_str(),
+        ] {
+            if !identity.trim().is_empty()
+                && !proof_refs.iter().any(|existing| existing == identity)
+            {
+                proof_refs.push(identity.to_owned());
+            }
+        }
+    }
+    let mut ledger = ExperienceRevisionLedger::new();
+    ledger.rebuild_bank(bank_records);
+    ledger.rebuild_feedback(feedback_records);
+    let mut bank_receipts = Vec::with_capacity(bank_records.len());
+    for record in bank_records {
+        let commit_key = produce_bank_commit(&ledger, record)
+            .map_err(ExperienceDriverError::Governor)?
+            .idempotency_key;
+        let identity = derive_commit_ingress(ctx, &kernel_fence, &commit_key)?;
+        let receipt = composition
+            .commit_experience_bank_record(
+                &identity,
+                &ledger,
+                record,
+                event.scope_id.clone(),
+                proof_refs.clone(),
+                expected_revision_heads.clone(),
+                expected_ordering_heads.clone(),
+            )
+            .await
+            .map_err(|error| ExperienceDriverError::Commit(error.to_string()))?;
+        bank_receipts.push(receipt);
+    }
+    let mut feedback_receipts = Vec::with_capacity(feedback_records.len());
+    for record in feedback_records {
+        let commit_key = produce_feedback_commit(&ledger, record)
+            .map_err(ExperienceDriverError::Governor)?
+            .idempotency_key;
+        let identity = derive_commit_ingress(ctx, &kernel_fence, &commit_key)?;
+        let receipt = composition
+            .commit_experience_feedback_record(
+                &identity,
+                &ledger,
+                record,
+                event.scope_id.clone(),
+                proof_refs.clone(),
+                expected_revision_heads.clone(),
+                expected_ordering_heads.clone(),
+            )
+            .await
+            .map_err(|error| ExperienceDriverError::Commit(error.to_string()))?;
+        feedback_receipts.push(receipt);
+    }
+    Ok(ExperienceCommitOutput {
+        bank_receipts,
+        feedback_receipts,
     })
 }
