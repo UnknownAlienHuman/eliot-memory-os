@@ -226,12 +226,12 @@ pub use platform_security::{
 };
 #[cfg(test)]
 use platform_security::{watchdog_task_readback_matches, watchdog_task_xml};
-pub use process_identity::{FileIdentity, ProcessIdentity, is_process_builtin_administrator};
 /// Stable directory identity observation for Host-owned isolated destination
 /// preparation (issue #958): the only directory-identity export. The Windows
 /// unsafe stays inside this crate's identity owner; Host calls it under
 /// `#![forbid(unsafe_code)]`.
 pub use process_identity::directory_identity_for_path;
+pub use process_identity::{FileIdentity, ProcessIdentity, is_process_builtin_administrator};
 pub(crate) use process_identity::{
     file_identity, file_identity_from_handle, inspect_process_handle, inspect_process_identity,
     process_token_identity, process_token_is_builtin_administrator, same_process_identity,
