@@ -83,6 +83,13 @@ fn main() {
             error.to_string(),
         );
     }
+    // Per-user bootstrap trigger for the optional Task Scheduler fallback:
+    // best-effort and infallible by design, so fallback setup can never fail
+    // broker startup. Absence skips explicitly; failure defers to the next
+    // start. Normal User-Broker launch is unaffected.
+    let _ = eliot_user_broker::ensure_notify_fallback_registered(
+        &eliot_user_broker::LiveNotifyFallbackEffects,
+    );
     let readiness = serde_json::to_value(composition.readiness())
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
     if !write_message(&Message::Ready { readiness }) {
