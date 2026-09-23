@@ -84,6 +84,44 @@
 //! are reused unchanged), and journal-only assessment stays valid
 //! (`assess_self_quality` requires at least one family, not all three).
 //! Durable bank/feedback bridge execution remains the #19 join.
+//!
+//! ## Seam: dreamer-memory-revision consumer (sibling lane, not duplicated)
+//!
+//! The `propose` consumer (`Result<NegativeMemoryExtinctionCandidate,
+//! RevisionError>`) lives ONLY on sibling branch
+//! `work/223-dreamer-memory-revision-scope @
+//! cdd6305ff0ab838e9e2855d5f6f0ac8b940012a79fe0`:
+//! `crates/smart/eliot-dreamer-memory-revision/src/lib.rs` (`propose` at
+//! line 290 over `RevisionIntake` at line 253). Its input types
+//! `FailureObservation` and `MemoryRevisionEvidence` exist nowhere on
+//! main (main carries only that crate's `module.toml`); the sibling
+//! crate is not a workspace member, so no path dependency may target it
+//! and vendoring its core would fork sibling-owned source. A caller here
+//! becomes compilable when the sibling crate lands on main as a member:
+//! `RevisionIntake` over owner-held observation, evidence,
+//! `TaskProjection`/`SafetyProjection` (context contracts, on main),
+//! `SelfQueryInput` (dreamer contracts, on main), `AcceptedSourceProjection`
+//! (dreamer contracts, on main), pose digest, and candidate id — then a
+//! `produce_dreamer_revision` caller mirrors the understanding legs
+//! above. Until then this seam is recorded, not fabricated.
+//!
+//! ## Seam: durable commit transition (canonical transition owner)
+//!
+//! Persisting admitted bank/feedback records requires a canonical
+//! transition the Governor canonical owner admits: an envelope carrying
+//! `CommitExperienceBank` / `CommitAgentFeedback` (built from
+//! `ExperienceCommitParameters`, already produced owner-side by
+//! `produce_bank_commit` / `produce_feedback_commit`) admitted through
+//! `CanonicalTransitionOwner::commit(envelope: CanonicalWriteEnvelope)`
+//! (`crates/governor/eliot-canonical/src/lib.rs:723`, type
+//! `PreparedTransition` at `crates/storage/eliot-store-api/src/lib.rs:1442`)
+//! to a `WriteReceipt`. The named commit legs belong to the store bridge
+//! (#19 registration); the Governor-side commit-leg driver belongs to
+//! the canonical-transition owner lane (brief names lane Pascal —
+//! confirm via the M1/root live map; code ownership is unambiguous
+//! above). This cell performs no writes and mints no transitions: the
+//! read legs here consume the same rows that path persists, bound by
+//! digest re-proof on readback.
 
 #![forbid(unsafe_code)]
 
