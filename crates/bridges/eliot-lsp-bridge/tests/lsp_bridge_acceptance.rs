@@ -23,8 +23,8 @@ use eliot_contracts::{EpochId, EpochLineageId, sha256_hex};
 use eliot_instrument_api::EvidenceAxes;
 use eliot_lsp_bridge::{
     AnalyzerConfig, Coverage, FailureDisposition, Freshness, LspBridge, LspCommand,
-    NormalizedResult, RUST_ANALYZER_EXECUTABLE, SemanticOperation, SourceCandidate,
-    finalize_diagnostics, finalize_scip, rename_candidate,
+    NormalizedResult, RUST_ANALYZER_EXECUTABLE, ScipIndexerProvenance, ScipProjectionCache,
+    SemanticOperation, SourceCandidate, finalize_diagnostics, finalize_scip, rename_candidate,
 };
 use eliot_platform::ClockObservation;
 use eliot_process::{
@@ -517,6 +517,7 @@ fn rename_returns_unapplied_candidate_and_modifies_no_files() -> TestResult {
         &index_bytes,
         "C:/Temp/ra-probe/index.scip",
         INVOKED_AT_MS,
+        None,
     );
     let NormalizedResult::Rename {
         candidate: finalized_candidate,
@@ -536,5 +537,319 @@ fn rename_returns_unapplied_candidate_and_modifies_no_files() -> TestResult {
     // No files were modified by either rename path.
     assert_eq!(std::fs::read(&witness)?, before);
     std::fs::remove_file(&witness)?;
+    Ok(())
+}
+
+/// Acceptance proof for issue #1898: derived-cache reuse on the SCIP
+/// finalize path (I2.22).
+///
+/// Fixture emission context stands in for sidecar-emitter observations: the
+/// enforcement logic (exact closure match, trust authentication, content
+/// integrity, rejection records) runs for real over real decode bytes and a
+/// real configuration hash; only the emitter labels are fixtures, exactly
+/// like registry test tool versions. No verdict exists anywhere on this
+/// path: receipts are assembled fresh per call.
+const PROOF_INDEXER: &str = "scip-indexer";
+const PROOF_INDEXER_VERSION: &str = "0.0.0-fixture-emission";
+const PROOF_PRODUCER: &str = "acceptance-sidecar-emitter";
+const PROOF_ROOT: &str = "C:/Temp/ra-probe";
+const PROOF_SIDECAR: &str = "C:/Temp/ra-probe/index.scip";
+
+fn proof_provenance() -> ScipIndexerProvenance {
+    ScipIndexerProvenance {
+        indexer_name: PROOF_INDEXER.to_owned(),
+        indexer_version: PROOF_INDEXER_VERSION.to_owned(),
+        producer_id: PROOF_PRODUCER.to_owned(),
+        producer_generation: 3,
+        root_identity: PROOF_ROOT.to_owned(),
+        root_acl_digest: sha256_hex(b"acceptance-root-acl-fixture"),
+        root_disposition: eliot_build_test_graph::RootDisposition::Direct,
+    }
+}
+
+fn proof_cache() -> TestResult<ScipProjectionCache> {
+    let trust = eliot_build_test_graph::TrustPolicy::new(
+        vec![PROOF_PRODUCER.to_owned()],
+        vec![PROOF_ROOT.to_owned()],
+    )?;
+    Ok(ScipProjectionCache::new(
+        eliot_build_test_graph::DerivedCacheStore::new(
+            eliot_build_test_graph::CacheLimits::default(),
+        ),
+        trust,
+        proof_provenance(),
+    )?)
+}
+
+fn proof_setup() -> (AnalyzerConfig, SourceCandidate, SemanticOperation, Vec<u8>) {
+    let config = AnalyzerConfig {
+        scip_output_path: Some(PROOF_SIDECAR.to_owned()),
+        ..test_config()
+    };
+    let owner = test_candidate();
+    let operation = SemanticOperation::Definitions {
+        symbol: "test-symbol".to_owned(),
+    };
+    (config, owner, operation, scripted_scip_index())
+}
+
+#[test]
+fn scip_projection_cache_hit_skips_decode_with_fresh_receipts() -> TestResult {
+    let (config, owner, operation, index_bytes) = proof_setup();
+    let mut cache = proof_cache()?;
+
+    // Cold call: genuine decode plus projection run, items publish.
+    let cold = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        &index_bytes,
+        PROOF_SIDECAR,
+        INVOKED_AT_MS,
+        Some(&mut cache),
+    );
+    let NormalizedResult::Definitions {
+        items: cold_items,
+        receipt: cold_receipt,
+    } = cold
+    else {
+        return Err("expected definitions".into());
+    };
+    assert_eq!(cold_items.len(), 1);
+    assert_eq!(cold_items[0].symbol, "test-symbol");
+    assert_eq!((cold_items[0].line, cold_items[0].column), (0, 3));
+    assert_eq!(cold_receipt.disposition, FailureDisposition::Success);
+    assert_eq!(cache.decodes_performed(), 1);
+    let Some(cold_telemetry) = cache.last_telemetry() else {
+        return Err("telemetry recorded".into());
+    };
+    assert_eq!(cold_telemetry.cache_hit, Some(false));
+    assert_eq!(cold_telemetry.target_identity, owner.reference());
+    let cold_identity = cold_telemetry.cache_identity.clone();
+    assert!(cold_identity.is_some());
+    assert!(cache.rejected().is_empty());
+
+    // Warm call: identical closure hits; decode and projection are skipped,
+    // items are identical, and the receipt is freshly assembled.
+    let warm = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        &index_bytes,
+        PROOF_SIDECAR,
+        INVOKED_AT_MS + 1,
+        Some(&mut cache),
+    );
+    let NormalizedResult::Definitions {
+        items: warm_items,
+        receipt: warm_receipt,
+    } = warm
+    else {
+        return Err("expected definitions".into());
+    };
+    assert_eq!(warm_items, cold_items);
+    assert_eq!(cache.decodes_performed(), 1);
+    assert_eq!(warm_receipt.disposition, FailureDisposition::Success);
+    assert_eq!(warm_receipt.invoked_at_unix_ms, INVOKED_AT_MS + 1);
+    assert_ne!(
+        warm_receipt.invoked_at_unix_ms,
+        cold_receipt.invoked_at_unix_ms
+    );
+    let Some(warm_telemetry) = cache.last_telemetry() else {
+        return Err("telemetry recorded".into());
+    };
+    assert_eq!(warm_telemetry.cache_hit, Some(true));
+    assert_eq!(warm_telemetry.cache_identity, cold_identity);
+    assert_eq!(warm_telemetry.target_identity, owner.reference());
+    assert_eq!(cache.counters().hits, 1);
+
+    // No-cache path behaves identically to the cold path.
+    let plain = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        &index_bytes,
+        PROOF_SIDECAR,
+        INVOKED_AT_MS + 2,
+        None,
+    );
+    let NormalizedResult::Definitions {
+        items: plain_items,
+        receipt: plain_receipt,
+    } = plain
+    else {
+        return Err("expected definitions".into());
+    };
+    assert_eq!(plain_items, cold_items);
+    assert_eq!(plain_receipt.disposition, FailureDisposition::Success);
+    assert_eq!(cache.decodes_performed(), 1);
+    Ok(())
+}
+
+#[test]
+fn scip_projection_cache_untrusted_producer_derives_for_real() -> TestResult {
+    let (config, owner, operation, index_bytes) = proof_setup();
+    let mut cache = proof_cache()?;
+
+    let cold = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        &index_bytes,
+        PROOF_SIDECAR,
+        INVOKED_AT_MS,
+        Some(&mut cache),
+    );
+    let NormalizedResult::Definitions {
+        items: cold_items, ..
+    } = cold
+    else {
+        return Err("expected definitions".into());
+    };
+    assert_eq!(cache.decodes_performed(), 1);
+    assert_eq!(cache.counters().stores, 1);
+
+    // An untrusted producer misses: the genuine derivation runs for real,
+    // fresh items return, the rejection is recorded, and correctness never
+    // depends on the cache.
+    let mut evil = proof_provenance();
+    evil.producer_id = "untrusted-emitter".to_owned();
+    cache.reattest(evil)?;
+    let outcome = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        &index_bytes,
+        PROOF_SIDECAR,
+        INVOKED_AT_MS + 1,
+        Some(&mut cache),
+    );
+    let NormalizedResult::Definitions { items, receipt } = outcome else {
+        return Err("expected definitions".into());
+    };
+    assert_eq!(items, cold_items);
+    assert_eq!(cache.decodes_performed(), 2);
+    assert_eq!(receipt.disposition, FailureDisposition::Success);
+    let Some(outcome_telemetry) = cache.last_telemetry() else {
+        return Err("telemetry recorded".into());
+    };
+    assert_eq!(outcome_telemetry.cache_hit, Some(false));
+    let Some(last) = cache.rejected().pop() else {
+        return Err("rejection recorded".into());
+    };
+    assert!(matches!(
+        last.reason,
+        eliot_build_test_graph::CacheRejectReason::UntrustedProducer
+    ));
+
+    // The valid entry survived the invalid attempt: it hits with no decode.
+    cache.reattest(proof_provenance())?;
+    let again = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        &index_bytes,
+        PROOF_SIDECAR,
+        INVOKED_AT_MS + 2,
+        Some(&mut cache),
+    );
+    let NormalizedResult::Definitions {
+        items: again_items, ..
+    } = again
+    else {
+        return Err("expected definitions".into());
+    };
+    assert_eq!(again_items, cold_items);
+    assert_eq!(cache.decodes_performed(), 2);
+    let Some(again_telemetry) = cache.last_telemetry() else {
+        return Err("telemetry recorded".into());
+    };
+    assert_eq!(again_telemetry.cache_hit, Some(true));
+    Ok(())
+}
+
+#[test]
+fn scip_projection_cache_malformed_input_never_publishes() -> TestResult {
+    let (config, owner, operation, index_bytes) = proof_setup();
+    let mut cache = proof_cache()?;
+
+    let cold = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        &index_bytes,
+        PROOF_SIDECAR,
+        INVOKED_AT_MS,
+        Some(&mut cache),
+    );
+    assert!(matches!(cold, NormalizedResult::Definitions { .. }));
+    assert_eq!(cache.decodes_performed(), 1);
+    assert_eq!(cache.counters().stores, 1);
+
+    // Malformed input is never cached: it fails honestly on every call and
+    // never publishes, so no poisoned entry can lodge.
+    let bad = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        b"\xff",
+        PROOF_SIDECAR,
+        INVOKED_AT_MS + 3,
+        Some(&mut cache),
+    );
+    let NormalizedResult::Definitions {
+        items: bad_items,
+        receipt: bad_receipt,
+    } = bad
+    else {
+        return Err("expected definitions".into());
+    };
+    assert!(bad_items.is_empty());
+    assert!(matches!(
+        bad_receipt.disposition,
+        FailureDisposition::ParseFailed { .. }
+    ));
+    assert_eq!(cache.decodes_performed(), 2);
+    assert_eq!(cache.counters().stores, 1);
+    let repeat = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        b"\xff",
+        PROOF_SIDECAR,
+        INVOKED_AT_MS + 4,
+        Some(&mut cache),
+    );
+    let NormalizedResult::Definitions {
+        items: repeat_items,
+        ..
+    } = repeat
+    else {
+        return Err("expected definitions".into());
+    };
+    assert!(repeat_items.is_empty());
+    assert_eq!(cache.decodes_performed(), 3);
+    assert_eq!(cache.counters().stores, 1);
+
+    // Any changed closure element misses even when the bytes still decode.
+    let mut changed = index_bytes.clone();
+    let tail = changed.len() - 1;
+    changed[tail] ^= 0x01;
+    let before = cache.decodes_performed();
+    let altered = finalize_scip(
+        &config,
+        &owner,
+        &operation,
+        &changed,
+        PROOF_SIDECAR,
+        INVOKED_AT_MS + 5,
+        Some(&mut cache),
+    );
+    assert!(matches!(altered, NormalizedResult::Definitions { .. }));
+    assert_eq!(cache.decodes_performed(), before + 1);
+    let Some(altered_telemetry) = cache.last_telemetry() else {
+        return Err("telemetry recorded".into());
+    };
+    assert_eq!(altered_telemetry.cache_hit, Some(false));
     Ok(())
 }

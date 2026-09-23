@@ -2379,9 +2379,11 @@ dependencies = [
 name = "eliot-lsp-bridge"
 version = "0.1.0"
 dependencies = [
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-scip",
+ "eliot-observability",
  "eliot-platform",
  "eliot-process",
  "serde",
