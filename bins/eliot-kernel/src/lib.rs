@@ -141,6 +141,7 @@ mod native_worker_replay_route;
 pub mod notify_operation_identity;
 mod provider_capability_route;
 pub mod reactive_restore_serve;
+mod request_dispatch;
 mod runtime_identity;
 mod shutdown_drain;
 mod startup_coordinator;
