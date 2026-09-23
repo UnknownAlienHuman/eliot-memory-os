@@ -86,12 +86,19 @@ fn main() {
     // Per-user bootstrap trigger for the optional Task Scheduler fallback:
     // best-effort and infallible by design, so fallback setup can never fail
     // broker startup. Absence skips explicitly; failure defers to the next
-    // start. Normal User-Broker launch is unaffected.
-    let _ = eliot_user_broker::ensure_notify_fallback_registered(
+    // start. Normal User-Broker launch is unaffected. The outcome is folded
+    // into the `Ready` diagnostic below (I11.7: a perpetually deferred
+    // fallback stays visible); only stable state/reason codes cross that
+    // boundary, never paths, digests, or payloads.
+    let fallback = eliot_user_broker::ensure_notify_fallback_registered(
         &eliot_user_broker::LiveNotifyFallbackEffects,
     );
-    let readiness = serde_json::to_value(composition.readiness())
+    let fallback_status = fallback.status_value();
+    let mut readiness = serde_json::to_value(composition.readiness())
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+    if let Value::Object(map) = &mut readiness {
+        map.insert("notify_fallback".to_owned(), fallback_status.clone());
+    }
     if !write_message(&Message::Ready { readiness }) {
         return;
     }
@@ -132,7 +139,7 @@ fn main() {
         };
         let response = match input_result {
             Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => dispatch(&mut composition, &line),
+            Ok(line) => dispatch(&mut composition, &line, &fallback_status),
             Err(error) => Message::Error {
                 code: "INPUT_FAILURE",
                 detail: error,
@@ -214,7 +221,11 @@ fn parse_root() -> Result<PathBuf, String> {
     }
 }
 
-fn dispatch(composition: &mut BrokerComposition, line: &str) -> Message {
+fn dispatch(
+    composition: &mut BrokerComposition,
+    line: &str,
+    fallback_status: &Value,
+) -> Message {
     let request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(error) => {
@@ -258,10 +269,14 @@ fn dispatch(composition: &mut BrokerComposition, line: &str) -> Message {
                     .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
             },
         ),
-        Request::Status => Message::Ready {
-            readiness: serde_json::to_value(composition.readiness())
-                .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-        },
+        Request::Status => {
+            let mut readiness = serde_json::to_value(composition.readiness())
+                .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
+            if let Value::Object(map) = &mut readiness {
+                map.insert("notify_fallback".to_owned(), fallback_status.clone());
+            }
+            Message::Ready { readiness }
+        }
         Request::Stop => Message::Stopped,
     }
 }
