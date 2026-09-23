@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -30,9 +32,76 @@ STATUS_PASS = vdp.STATUS_PASS
 
 
 class TestVerifyDependencyPolicy(unittest.TestCase):
+    def _candidate_advisory_fixture(self, query_version: str, vulnerabilities: list[dict]) -> tuple[Path, dict, dict]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        evidence_dir = root / ".eliot" / "dependency-policy" / "surrealdb" / "v3.2.0"
+        evidence_dir.mkdir(parents=True)
+        query_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-query.json"
+        response_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-response.json"
+        query_bytes = (json.dumps({
+            "package": {"ecosystem": "crates.io", "name": "surrealdb"},
+            "version": query_version,
+        }, separators=(",", ":")) + "\r\n").encode("utf-8")
+        response_bytes = (json.dumps({"vulns": vulnerabilities}, separators=(",", ":")) + "\n").encode("utf-8")
+        (root / query_path).write_bytes(query_bytes)
+        (root / response_path).write_bytes(response_bytes)
+        retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        refresh = {
+            "status": "verified",
+            "query": {"path": query_path, "sha256": hashlib.sha256(query_bytes).hexdigest()},
+            "response": {
+                "path": response_path,
+                "sha256": hashlib.sha256(response_bytes).hexdigest(),
+                "retrieved_at_utc": retrieved_at,
+                "age_seconds": 0,
+            },
+            "maximum_age_hours": 24,
+        }
+        candidate = {
+            "version": "3.2.0",
+            "advisory_package": "surrealdb",
+            "advisory_ecosystem": "crates.io",
+            "advisory_scope": "rust-crate",
+            "advisory_query_path": query_path,
+            "advisory_response_path": response_path,
+            "advisory_max_age_hours": 24,
+        }
+        return root, candidate, {"candidate_advisory_refresh": refresh}
+
     def test_self_test_runs_cleanly(self) -> None:
         exit_code = run_self_tests()
         self.assertEqual(exit_code, 0)
+
+    def test_selected_candidate_advisory_receipt_binds_exact_version(self) -> None:
+        root, candidate, provisioning = self._candidate_advisory_fixture("3.2.0", [])
+        findings: list = []
+        evidence = vdp._validate_candidate_release_advisories(root, {}, candidate, provisioning, findings)
+        self.assertEqual(findings, [])
+        self.assertEqual(evidence["evidence_status"], "verified")
+        self.assertEqual(evidence["advisory_status"], "no_known_vulnerabilities")
+        self.assertEqual(evidence["query"]["body"]["version"], "3.2.0")
+        self.assertEqual(evidence["distributed_binary_applicability"], "unestablished")
+
+    def test_selected_candidate_advisory_receipt_rejects_wrong_query_version(self) -> None:
+        root, candidate, provisioning = self._candidate_advisory_fixture("3.1.4", [])
+        findings: list = []
+        evidence = vdp._validate_candidate_release_advisories(root, {}, candidate, provisioning, findings)
+        self.assertEqual(evidence["evidence_status"], "findings")
+        self.assertTrue(any("exact package, ecosystem and version" in finding.detail for finding in findings))
+
+    def test_selected_candidate_advisory_receipt_keeps_candidate_findings(self) -> None:
+        vulnerability = {
+            "id": "RUSTSEC-2026-9999",
+            "affected": [{"package": {"ecosystem": "crates.io", "name": "surrealdb"}}],
+        }
+        root, candidate, provisioning = self._candidate_advisory_fixture("3.2.0", [vulnerability])
+        findings: list = []
+        evidence = vdp._validate_candidate_release_advisories(root, {}, candidate, provisioning, findings)
+        self.assertEqual(findings, [])
+        self.assertEqual(evidence["advisory_status"], "findings")
+        self.assertEqual(evidence["advisory_ids"], ["RUSTSEC-2026-9999"])
 
     def test_current_repository_passes_offline(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
