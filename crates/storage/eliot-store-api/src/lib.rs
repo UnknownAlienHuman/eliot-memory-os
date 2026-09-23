@@ -121,13 +121,16 @@ pub use backup_io::{
     MAX_STORE_BACKUP_DOMAIN_BYTES, MAX_STORE_BACKUP_EVIDENCE_BINDINGS,
     MAX_STORE_BACKUP_PAGE_MEMBERS, MAX_STORE_BACKUP_RESIDENCIES, RESTORE_OPERATION_CLASS,
     STORE_BACKUP_CONTRACT_VERSION,
+    COORDINATION_PARAM_ADMISSION_DIGEST, COORDINATION_PARAM_DECISION_DIGEST,
+    COORDINATION_PARAM_DESTINATION, COORDINATION_PARAM_FENCE_DIGEST,
+    COORDINATION_PARAM_OPERATION_ID, COORDINATION_PARAM_PAYLOAD_DIGEST,
     CanonicalBackupPorts, ResidencyDisposition, RestoreBinding, StoreBackupBeginRequest,
     StoreBackupCompletionReceipt, StoreBackupConsistency, StoreBackupEndRequest,
     StoreBackupPage, StoreBackupPageRequest, StoreBackupPhase, StoreBackupReconcileRequest,
     StoreBackupReconciliation, StoreBackupScope, StoreBackupStatusReport, StoreBackupStatusRequest,
     StoreBackupValidationOutcome, StoreBackupValidationReceipt, StoreBackupValidationRequest,
     StoreEvidencePack, StoreIsolatedRestoreRequest, StoreBackupMember, StoreRestoreAdmission,
-    StoreRestoreAdmissionInputs,
+    StoreRestoreAdmissionInputs, validate_coordination_mutation_params,
 };
 
 pub use request_hash::{

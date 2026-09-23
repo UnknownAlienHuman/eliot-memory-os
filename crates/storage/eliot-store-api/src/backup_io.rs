@@ -17,6 +17,8 @@
 use eliot_contracts::{ContractVersion, OperationId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::{OperationIdentity, OrderingHead, RevisionHead, StoreError, TransitionClass};
 
@@ -667,6 +669,70 @@ pub struct StoreRestoreAdmissionInputs {
     pub source_snapshot_digest: String,
     /// Fence both endpoints share.
     pub state_fence: StateFence,
+}
+
+/// Closed coordination parameter keys for the future
+/// `RecordRestoreCoordination` named operation (issue #975 T1/T3).
+///
+/// Byte-exact vocabulary shared with the Governor coordination producer:
+/// the M1B catalogue row and the bridge handler adopt these keys
+/// verbatim, so Governor-built parameters, catalogue schema, and durable
+/// rows never disagree on a name. The bridge persists the same keys as
+/// columns of the restore coordination decision row.
+pub const COORDINATION_PARAM_OPERATION_ID: &str = "coordination_operation_id";
+/// Closed coordination parameter carrying the admitted destination.
+pub const COORDINATION_PARAM_DESTINATION: &str = "coordination_destination";
+/// Closed coordination parameter carrying the admitted payload digest
+/// (the coordination transition's canonical request hash).
+pub const COORDINATION_PARAM_PAYLOAD_DIGEST: &str = "coordination_payload_digest";
+/// Closed coordination parameter carrying the admitted fence digest
+/// (sha256 over the canonical fence bytes).
+pub const COORDINATION_PARAM_FENCE_DIGEST: &str = "coordination_fence_digest";
+/// Closed coordination parameter carrying the coordination decision digest.
+pub const COORDINATION_PARAM_DECISION_DIGEST: &str = "coordination_decision_digest";
+/// Closed coordination parameter carrying the Governor admission digest
+/// the decision was built from.
+pub const COORDINATION_PARAM_ADMISSION_DIGEST: &str = "coordination_admission_digest";
+
+/// Validates closed coordination mutation parameters (issue #975 T1/T3).
+///
+/// Shared acceptance boundary for the future `RecordRestoreCoordination`
+/// catalogue arm and every backend: exact key presence with string
+/// values, operation-id shape, hex64 digests, and non-blank
+/// destination — no semantic admission, task meaning, or authority
+/// granted here. Lineage validity stays Governor-owned; durable
+/// persistence stays with the bridge handler.
+pub fn validate_coordination_mutation_params(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<(), StoreError> {
+    fn text_param(
+        parameters: &BTreeMap<String, Value>,
+        key: &'static str,
+    ) -> Result<String, StoreError> {
+        parameters
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(StoreError::InvalidField {
+                field: key,
+                reason: "coordination parameter must be a present string",
+            })
+    }
+    let operation_id = text_param(parameters, COORDINATION_PARAM_OPERATION_ID)?;
+    OperationId::new(operation_id).map_err(StoreError::Foundation)?;
+    validate_text(
+        &text_param(parameters, COORDINATION_PARAM_DESTINATION)?,
+        COORDINATION_PARAM_DESTINATION,
+    )?;
+    for key in [
+        COORDINATION_PARAM_PAYLOAD_DIGEST,
+        COORDINATION_PARAM_FENCE_DIGEST,
+        COORDINATION_PARAM_DECISION_DIGEST,
+        COORDINATION_PARAM_ADMISSION_DIGEST,
+    ] {
+        validate_digest(&text_param(parameters, key)?, key)?;
+    }
+    Ok(())
 }
 
 /// Request restoring validated canonical records into an admitted isolated
