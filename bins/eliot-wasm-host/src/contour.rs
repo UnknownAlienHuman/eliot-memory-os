@@ -27,6 +27,10 @@
 //!   against. The WASM host serves only [`Contour::WasmComponent`]; any
 //!   other admitted contour is refused with
 //!   [`ContourGateError::ContourNotServedHere`], never executed here.
+//! - [`experimental_manifest`] assembles the recorded-claim manifest for the
+//!   local-experimental describe callsite from binary-observed values only;
+//!   anything it leaves unstated must be bound by the Governor-owned
+//!   promotion path before activation.
 //!
 //! Baseline identities: pinned Wasmtime generation
 //! ([`PINNED_WASMTIME_VERSION`]), production guest target
@@ -365,6 +369,49 @@ impl fmt::Display for ContourGateError {
 }
 
 impl std::error::Error for ContourGateError {}
+
+/// Recorded-claim manifest for one local-experimental describe admission.
+///
+/// Assembles a [`GenerationManifest`] from binary-observed values only: the
+/// preflight artifact digest, the CLI-selected world name, the world-bound
+/// WIT digest, and the exact limits governing the describe call. The
+/// component identity is the content address of the observed artifact
+/// (`experimental-<artifact-digest-hex>`): no owner-published component
+/// identity exists at describe time, so the digest is the only exact
+/// observed identity, and the `experimental-` prefix keeps this
+/// describe-layer claim distinct from Governor/owner-published identities.
+/// All other
+/// fields are explicit recorded claims for the describe layer, not measured
+/// facts: the describe input is empty and stateless, so the state class is
+/// `stateless` with a `none` migration contract and no prior generation;
+/// privacy policy and shadow/canary comparator are left empty because no
+/// privacy context is established and no comparator runs at describe time.
+/// Anything unstated here must be bound by the Governor-owned promotion
+/// path before activation; this manifest never grants it.
+#[must_use]
+pub fn experimental_manifest(
+    artifact_digest: Sha256Digest,
+    world: &str,
+    wit_digest: Sha256Digest,
+    limits: &InvocationLimits,
+) -> GenerationManifest {
+    GenerationManifest {
+        component_id: format!("experimental-{}", artifact_digest.as_str()),
+        target: STANDARD_GUEST_TARGET.to_owned(),
+        artifact_digest,
+        wit_digest,
+        world: world.to_owned(),
+        allowed_imports: Vec::new(),
+        allowed_exports: Vec::new(),
+        capability_grants: Vec::new(),
+        limits: limits.clone(),
+        state_class: "stateless".to_owned(),
+        migration_contract: "none".to_owned(),
+        privacy_policy: String::new(),
+        comparator: String::new(),
+        rollback_generation: None,
+    }
+}
 
 /// Minimal admitted-prototype fact: contour, world, and target. Admission
 /// mints no authority, state, or routes; activation still requires the
@@ -1045,5 +1092,39 @@ mod tests {
             ContourGateError::AdmittedDigestMismatch("artifact".to_owned()).to_string(),
             "ADMITTED_DIGEST_MISMATCH:artifact"
         );
+    }
+
+    #[test]
+    fn experimental_manifest_binds_observed_values_only() {
+        let manifest = experimental_manifest(
+            Sha256Digest::of_bytes(b"artifact"),
+            "context-admission",
+            Sha256Digest::of_bytes(b"wit"),
+            &test_limits(),
+        );
+        assert_eq!(manifest.target, STANDARD_GUEST_TARGET);
+        assert_eq!(
+            manifest.component_id,
+            format!(
+                "experimental-{}",
+                Sha256Digest::of_bytes(b"artifact").as_str()
+            )
+        );
+        assert_eq!(
+            manifest.artifact_digest,
+            Sha256Digest::of_bytes(b"artifact")
+        );
+        assert_eq!(manifest.wit_digest, Sha256Digest::of_bytes(b"wit"));
+        assert_eq!(manifest.world, "context-admission");
+        assert!(manifest.allowed_imports.is_empty());
+        assert!(manifest.capability_grants.is_empty());
+        assert_eq!(manifest.state_class, "stateless");
+        assert_eq!(manifest.migration_contract, "none");
+        assert!(manifest.privacy_policy.is_empty());
+        assert!(manifest.comparator.is_empty());
+        assert_eq!(manifest.rollback_generation, None);
+        // The composed manifest admits under the automatic default decision.
+        let decision = PrototypeContourDecision::default_for_new_prototype();
+        assert!(admit_generation(Some(&decision), &manifest, &[]).is_ok());
     }
 }

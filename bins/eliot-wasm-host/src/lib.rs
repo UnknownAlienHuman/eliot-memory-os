@@ -49,7 +49,7 @@ pub use contour::{
     FS_CAPABILITY, GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY,
     PINNED_WASMTIME_VERSION, PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET,
     STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
-    authorize_host_call, check_activation_imports, check_admitted_request,
+    authorize_host_call, check_activation_imports, check_admitted_request, experimental_manifest,
 };
 pub use dispatch_drive::{
     DispatchDriveResponse, DriveAdmission, DriveError, GUEST_EXEC_ARGV0_HINT, LifecycleVerdicts,
