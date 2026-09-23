@@ -4973,7 +4973,7 @@ impl HostComposition {
         HostKernelUserAutomationOwner::new(candidate, activation, kernel_process)
     }
 
-    /// Drains the authenticated UserAutomation queue through the retained
+    /// Drains the authenticated `UserAutomation` queue through the retained
     /// Kernel front-door owner and the canonical Host journal Wake owner.
     ///
     /// The queue carries the channel evidence selected by the authenticated
@@ -5012,46 +5012,49 @@ impl HostComposition {
             while let Some(envelope) = pop_user_automation_execution(queue) {
                 let request = envelope.request().clone();
                 let session = envelope.session().clone();
-                let response = if let Some(owner) = kernel_owner.as_ref() {
-                    match owner.owner_binding() {
-                        Ok(owner_binding) if session.owner() == &owner_binding => {
-                            let endpoint =
-                                UserAutomationHostExecutionEndpoint::new_with_owner_binding(
-                                    owner_binding,
-                                    HostDurableJobAdapter::new(owner),
-                                    HostWakeIntentAdapter::new(&self.journal),
-                                );
-                            match endpoint {
-                                Ok(endpoint) => {
-                                    endpoint
-                                        .execute_authenticated_response(request.clone(), session)
+                let response =
+                    if let Some(owner) = kernel_owner.as_ref() {
+                        match owner.owner_binding() {
+                            Ok(owner_binding) if session.owner() == &owner_binding => {
+                                let endpoint =
+                                    UserAutomationHostExecutionEndpoint::new_with_owner_binding(
+                                        owner_binding,
+                                        HostDurableJobAdapter::new(owner),
+                                        HostWakeIntentAdapter::new(&self.journal),
+                                    );
+                                match endpoint {
+                                    Ok(endpoint) => {
+                                        Box::pin(endpoint.execute_authenticated_response(
+                                            request.clone(),
+                                            session,
+                                        ))
                                         .await
-                                }
-                                Err(error) => {
-                                    UserAutomationHostExecutionResponse::failed_for(&request, error)
+                                    }
+                                    Err(error) => UserAutomationHostExecutionResponse::failed_for(
+                                        &request, error,
+                                    ),
                                 }
                             }
+                            Ok(_) => UserAutomationHostExecutionResponse::failed_for(
+                                &request,
+                                UserAutomationRuntimeError::IdentityConflict,
+                            ),
+                            Err(error) => UserAutomationHostExecutionResponse::failed_for(
+                                &request,
+                                UserAutomationRuntimeError::Unavailable(error.to_string()),
+                            ),
                         }
-                        Ok(_) => UserAutomationHostExecutionResponse::failed_for(
+                    } else {
+                        UserAutomationHostExecutionResponse::failed_for(
                             &request,
-                            UserAutomationRuntimeError::IdentityConflict,
-                        ),
-                        Err(error) => UserAutomationHostExecutionResponse::failed_for(
-                            &request,
-                            UserAutomationRuntimeError::Unavailable(error.to_string()),
-                        ),
-                    }
-                } else {
-                    UserAutomationHostExecutionResponse::failed_for(
-                        &request,
-                        UserAutomationRuntimeError::Unavailable(
-                            unavailable_reason
-                                .as_deref()
-                                .unwrap_or("UserAutomation Kernel owner is unavailable")
-                                .to_owned(),
-                        ),
-                    )
-                };
+                            UserAutomationRuntimeError::Unavailable(
+                                unavailable_reason
+                                    .as_deref()
+                                    .unwrap_or("UserAutomation Kernel owner is unavailable")
+                                    .to_owned(),
+                            ),
+                        )
+                    };
                 let _ = envelope.respond(response);
                 processed += 1;
             }
@@ -5065,7 +5068,7 @@ impl HostComposition {
         std::sync::Arc::clone(&self.runtime_control_queue)
     }
 
-    /// Returns the bounded UserAutomation owner queue admitted by the
+    /// Returns the bounded `UserAutomation` owner queue admitted by the
     /// authenticated runtime-control endpoint.
     #[cfg(windows)]
     pub fn user_automation_execution_queue(&self) -> HostUserAutomationExecutionQueue {

@@ -1294,7 +1294,7 @@ impl WakeRecord {
     }
 }
 
-/// One compare-and-swap member of an atomic UserAutomation wake
+/// One compare-and-swap member of an atomic `UserAutomation` wake
 /// cancellation.  The expected checksum binds the transition to the exact
 /// snapshot validated by the caller; the journal reducer checks every member
 /// before changing any member.
