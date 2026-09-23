@@ -337,6 +337,9 @@ impl MemoryStore {
         // outbox references include the appended automation outbox intents.
         // Rows, receipt, and outbox still commit atomically below.
         dispatch_apply_automation_state(&mut state, &transition, &mut plan)?;
+        // Issue #223 experience state and #325 finish owner records share the
+        // canonical transaction and are applied before its receipt is finalized.
+        dispatch_apply_experience_state(&mut state, &transition, &mut plan)?;
         dispatch_apply_finish_evidence(&mut state, &transition)?;
         dispatch_apply_finish_decision(&mut state, &transition)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
@@ -1206,6 +1209,142 @@ fn dispatch_apply_automation_state(
     Ok(())
 }
 
+/// Joins one experience row address. Collision-free by the same
+/// control-character argument as the automation contour: the handle may
+/// not contain `\x1f` per the wire contract, and the revision is a fixed
+/// 20-digit decimal so key order matches revision order.
+fn experience_row_key(handle: &str, revision: u64) -> String {
+    format!("{handle}\x1f{revision:020}")
+}
+
+/// Executes admitted experience bank/feedback legs on already-locked state
+/// (issue #223).
+///
+/// Runs beside [`dispatch_apply_automation_state`] under the same lock as
+/// the receipt commit: one identity, one receipt, recoverable replay
+/// without duplicate work. Rows are immutable and create-only per joined
+/// `(handle, revision)` key (divergent rewrites fail closed; identical
+/// replays converge); the presented digests travel on the row for
+/// readback binding. Each command appends one outbox intent bound to the
+/// resulting row bytes, so rows and their outbox intents commit
+/// atomically via [`commit_transaction`]. Non-experience transitions are
+/// a no-op here.
+fn dispatch_apply_experience_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_experience_op = transition.named_operations.iter().any(|command| {
+        matches!(
+            command.operation,
+            NamedMutationOperation::CommitExperienceBank
+                | NamedMutationOperation::CommitAgentFeedback
+        )
+    });
+    if !has_experience_op {
+        return Ok(());
+    }
+    if transition.transition_class != TransitionClass::CaptureCandidate {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut experience_index = 0_usize;
+    for command in &transition.named_operations {
+        let decoded = match command.operation {
+            NamedMutationOperation::CommitExperienceBank
+            | NamedMutationOperation::CommitAgentFeedback => {
+                eliot_store_api::decode_experience_mutation(command.operation, &command.parameters)?
+            }
+            _ => continue,
+        };
+        let (handle, revision, record_json, record_digest, table_is_bank) = match decoded {
+            eliot_store_api::DecodedExperienceMutation::Bank {
+                handle,
+                revision,
+                record_json,
+                record_digest,
+                ..
+            } => (handle, revision, record_json, record_digest, true),
+            eliot_store_api::DecodedExperienceMutation::Feedback {
+                handle,
+                revision,
+                record_json,
+                record_digest,
+                ..
+            } => (handle, revision, record_json, record_digest, false),
+        };
+        let key = experience_row_key(&handle, revision);
+        let row_json = serde_json::to_value(&record_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if table_is_bank {
+            match state.experience_bank_rows.get(&key) {
+                Some(existing) if existing.record_json != record_json => {
+                    return Err(StoreError::IdentityConflict);
+                }
+                Some(_) => {}
+                None => {
+                    state.experience_bank_rows.insert(
+                        key,
+                        ExperienceBankRow {
+                            handle,
+                            revision,
+                            record_json: record_json.clone(),
+                            record_digest,
+                            state_fence: transition.state_fence.clone(),
+                            scope_id: transition.scope_id.to_string(),
+                            task_id: transition.task_id.clone(),
+                        },
+                    );
+                }
+            }
+        } else {
+            match state.experience_feedback_rows.get(&key) {
+                Some(existing) if existing.record_json != record_json => {
+                    return Err(StoreError::IdentityConflict);
+                }
+                Some(_) => {}
+                None => {
+                    state.experience_feedback_rows.insert(
+                        key,
+                        ExperienceFeedbackRow {
+                            handle,
+                            revision,
+                            record_json: record_json.clone(),
+                            record_digest,
+                            state_fence: transition.state_fence.clone(),
+                            scope_id: transition.scope_id.to_string(),
+                            task_id: transition.task_id.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        let payload_digest = sha256_hex(
+            &canonical_json_bytes(&row_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!(
+                "outbox-{operation_key}-experience-{experience_index}"
+            ))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        experience_index = experience_index.saturating_add(1);
+    }
+    Ok(())
+}
+
 /// Applies one decoded leg against the shared record model and returns the
 /// resulting canonical record JSON for outbox binding.
 ///
@@ -1553,6 +1692,127 @@ fn resource_snapshot_payload(
         "revision": revision,
         "state_fence": fence,
     }))
+}
+
+/// Builds the same-fence, same-scope experience range payload (issue #223).
+///
+/// Errors surface as serialization failures with the underlying message:
+/// parameters are pre-validated by the catalogue gate, so any failure here
+/// is defense in depth, never a distinct dispatch outcome. Rows project in
+/// key order (handle, then zero-padded revision) with verbatim record
+/// documents plus presented digests; rows past the bound set `truncated`
+/// with `matched_total` counting only returned records, never a guess at
+/// the remainder. Zero matches are an exact empty result, not an error.
+fn experience_range_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+    bank: bool,
+) -> Result<Value, serde_json::Error> {
+    let decoded = eliot_store_api::validate_experience_read_params(&query.parameters)
+        .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let scope_id = query
+        .scope_id
+        .clone()
+        .ok_or_else(|| serde_json::Error::custom("experience range read requires scope_id"))?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let mut records = Vec::new();
+    let mut truncated = false;
+    if bank {
+        for row in state.experience_bank_rows.values() {
+            if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
+                continue;
+            }
+            if records.len() > limit {
+                truncated = true;
+                break;
+            }
+            records.push(json!({
+                "handle": row.handle,
+                "revision": row.revision,
+                "record_json": row.record_json,
+                "record_digest": row.record_digest,
+            }));
+        }
+    } else {
+        for row in state.experience_feedback_rows.values() {
+            if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
+                continue;
+            }
+            if records.len() > limit {
+                truncated = true;
+                break;
+            }
+            records.push(json!({
+                "handle": row.handle,
+                "revision": row.revision,
+                "record_json": row.record_json,
+                "record_digest": row.record_digest,
+            }));
+        }
+    }
+    if records.len() > limit {
+        records.pop();
+        truncated = true;
+    }
+    let matched_total = records.len();
+    serde_json::to_value(
+        eliot_store_api::ExperienceRangePage {
+            records,
+            matched_total,
+            truncated,
+        }
+        .payload(fence),
+    )
+}
+
+/// Builds the same-fence audit-range payload (issue #223).
+///
+/// Projects durable `CaptureObservation` command records as envelope
+/// candidates through the shared [`audit_envelope_candidate`] filter:
+/// subjects that parse as JSON objects carrying a string `record_id`
+/// are carried verbatim; ordinary non-envelope captures are skipped
+/// (normal store content, never corruption). No scope filtering: command
+/// scopes need not match event scopes, and the consumer (provider
+/// presence-binding plus Governor scope revalidation) owns scope
+/// gating — store-level scope filtering here would silently drop records
+/// the consumer must see. Fence agreement is enforced by the caller: this
+/// helper runs only after `execute_named_sync` proves the query fence
+/// equals the state fence. Reads beyond
+/// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
+/// fail closed with [`StoreError::PayloadTooLarge`] instead of
+/// truncating: a truncated audit range cannot prove journal
+/// completeness. This projects candidates only — full envelope
+/// validation and live-journal presence binding stay downstream, so a
+/// carried candidate can never become a false journal record here.
+/// Projects durable capture subjects as envelope candidates. Fence
+/// agreement is enforced by the caller: this helper runs only after
+/// `execute_named_sync` proves the query fence equals the state fence.
+fn audit_range_payload(state: &MemoryState) -> Result<Value, serde_json::Error> {
+    use eliot_store_api::MAX_AUDIT_RANGE_RECORDS;
+    let mut records = Vec::new();
+    for record in &state.named_operations {
+        if record.operation.operation != NamedMutationOperation::CaptureObservation {
+            continue;
+        }
+        let Some(subject) = record
+            .operation
+            .parameters
+            .get("subject")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if let Some(candidate) = eliot_store_api::audit_envelope_candidate(subject) {
+            records.push(candidate);
+        }
+        if records.len() > MAX_AUDIT_RANGE_RECORDS as usize {
+            return Err(serde_json::Error::custom(
+                "audit range exceeds the bounded maximum",
+            ));
+        }
+    }
+    serde_json::to_value(json!({ "records": records }))
 }
 
 /// Builds the same-fence user-automation read payload (issue #1779).
@@ -2211,7 +2471,9 @@ impl MemoryStore {
     /// selectors. Issue #1941 C4 adds `GetReactiveInjectionState` with its
     /// exact `session_id` selector and `GetResourceSnapshot` with its exact
     /// `uri` selector. Issue #1779 adds `GetUserAutomationState` with its
-    /// closed query discriminator and exact selectors.
+    /// closed query discriminator and exact selectors. Issue #223 adds
+    /// `GetExperienceBankRange` and `GetAgentFeedbackRange` with the
+    /// `max_records` bound, scope-addressed through the request envelope.
     fn enforce_catalogue_gate(query: &NamedReadRequest) -> Result<(), StoreError> {
         if matches!(
             query.operation,
@@ -2225,6 +2487,9 @@ impl MemoryStore {
                 | NamedReadOperation::GetReactiveInjectionState
                 | NamedReadOperation::GetResourceSnapshot
                 | NamedReadOperation::GetUserAutomationState
+                | NamedReadOperation::GetExperienceBankRange
+                | NamedReadOperation::GetAgentFeedbackRange
+                | NamedReadOperation::GetAuditRange
         ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
@@ -2338,6 +2603,13 @@ impl MemoryStore {
             NamedReadOperation::GetUserAutomationState => {
                 automation_state_payload(&state, query, &fence)
             }
+            NamedReadOperation::GetExperienceBankRange => {
+                experience_range_payload(&state, query, &fence, true)
+            }
+            NamedReadOperation::GetAgentFeedbackRange => {
+                experience_range_payload(&state, query, &fence, false)
+            }
+            NamedReadOperation::GetAuditRange => audit_range_payload(&state),
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
                 "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
@@ -3155,6 +3427,36 @@ struct ResourceSnapshotRow {
     task_id: Option<String>,
 }
 
+/// One immutable experience-bank row: the verbatim Governor-admitted
+/// record document for one handle + owner revision with its presented
+/// digest, admission fence, and task-binding provenance (issue #223).
+/// Rows are create-only; divergent rewrites fail closed and identical
+/// replays converge.
+#[derive(Clone, Debug, PartialEq)]
+struct ExperienceBankRow {
+    handle: String,
+    revision: u64,
+    record_json: String,
+    record_digest: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
+/// One immutable agent-feedback row (issue #223). Same durable rule as
+/// the bank rows: verbatim document, presented digest, create-only keyed
+/// by joined handle and owner revision.
+#[derive(Clone, Debug, PartialEq)]
+struct ExperienceFeedbackRow {
+    handle: String,
+    revision: u64,
+    record_json: String,
+    record_digest: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
 /// One immutable automation revision row: the verbatim Kernel-owned
 /// revision document for one automation + revision with its admission
 /// fence and task-binding provenance (issue #1779).
@@ -3269,6 +3571,14 @@ struct MemoryState {
     /// only through the closed failure leg under the held transaction
     /// lock; latest write wins.
     automation_last_failure: BTreeMap<String, String>,
+    /// Immutable experience-bank rows keyed by joined `(handle, revision)`
+    /// (issue #223). Verbatim Governor-admitted record documents with
+    /// presented digests, driven only through the closed experience legs
+    /// under the held transaction lock; divergent rewrites fail closed.
+    experience_bank_rows: BTreeMap<String, ExperienceBankRow>,
+    /// Immutable agent-feedback rows keyed by joined `(handle, revision)`
+    /// (issue #223). Same durable rule as the bank rows.
+    experience_feedback_rows: BTreeMap<String, ExperienceFeedbackRow>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -3302,6 +3612,8 @@ impl PartialEq for MemoryState {
             && self.automation_invocations == other.automation_invocations
             && self.automation_failures == other.automation_failures
             && self.automation_last_failure == other.automation_last_failure
+            && self.experience_bank_rows == other.experience_bank_rows
+            && self.experience_feedback_rows == other.experience_feedback_rows
             && self.next_commit_sequence == other.next_commit_sequence
             && self.next_outbox_sequence == other.next_outbox_sequence
             && self.notifications.iter().collect::<Vec<_>>()
@@ -3335,6 +3647,8 @@ impl Default for MemoryState {
             automation_invocations: BTreeMap::new(),
             automation_failures: BTreeMap::new(),
             automation_last_failure: BTreeMap::new(),
+            experience_bank_rows: BTreeMap::new(),
+            experience_feedback_rows: BTreeMap::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }

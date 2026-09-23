@@ -1119,7 +1119,12 @@ _OSV_ENDPOINT = "https://api.osv.dev/v1/query"
 _PROVISIONING_RECEIPT_RELATIVE = ".eliot/dependency-policy/surrealdb/provisioning-receipt.json"
 
 
-def _canonical_surreal_evidence_records(surreal: dict, candidate: dict) -> list[dict]:
+def _canonical_surreal_evidence_records(
+    surreal: dict,
+    candidate: dict,
+    *,
+    include_candidate_advisories: bool = False,
+) -> list[dict]:
     """Derive evidence subjects and URLs from the official source contract.
 
     Configured URL strings are checked against these derived values; they do
@@ -1185,6 +1190,17 @@ def _canonical_surreal_evidence_records(surreal: dict, candidate: dict) -> list[
 
     add("osv.query.surrealdb", surreal.get("advisory_query_path"), _OSV_ENDPOINT, surreal.get("advisory_query_sha256"))
     add("osv.response.surrealdb", surreal.get("advisory_response_path"), _OSV_ENDPOINT, surreal.get("advisory_response_digest"))
+    if include_candidate_advisories and isinstance(candidate, dict) and isinstance(candidate_tag, str):
+        add(
+            f"osv.query.surrealdb.release-candidate.{candidate_tag}",
+            candidate.get("advisory_query_path"),
+            _OSV_ENDPOINT,
+        )
+        add(
+            f"osv.response.surrealdb.release-candidate.{candidate_tag}",
+            candidate.get("advisory_response_path"),
+            _OSV_ENDPOINT,
+        )
     return records
 
 
@@ -1193,6 +1209,8 @@ def _validate_provisioning_receipt(
     surreal: dict,
     candidate: dict,
     findings: list[Finding],
+    *,
+    require_candidate_advisories: bool = False,
 ) -> dict:
     """Consume the provisioner's canonical URL/path/bytes/digest binding."""
 
@@ -1234,7 +1252,11 @@ def _validate_provisioning_receipt(
     if receipt.get("repository") != _SURREAL_REPOSITORY or receipt.get("shared_installation_touched") is not False:
         findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "project-local provisioning receipt does not bind the official repository and no-shared-installation boundary"))
 
-    expected_records = _canonical_surreal_evidence_records(surreal, candidate)
+    expected_records = _canonical_surreal_evidence_records(
+        surreal,
+        candidate,
+        include_candidate_advisories=require_candidate_advisories,
+    )
     actual_records = receipt.get("records")
     if not isinstance(actual_records, list):
         findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "project-local provisioning receipt records must be a list"))
@@ -1247,7 +1269,20 @@ def _validate_provisioning_receipt(
 
     verified: list[dict] = []
     expected_subjects = {item["subject"] for item in expected_records}
-    if set(receipt_by_subject) != expected_subjects:
+    optional_candidate_subjects: set[str] = set()
+    if not require_candidate_advisories and isinstance(candidate, dict):
+        candidate_tag = candidate.get("source_tag")
+        if isinstance(candidate_tag, str):
+            optional_candidate_subjects = {
+                f"osv.query.surrealdb.release-candidate.{candidate_tag}",
+                f"osv.response.surrealdb.release-candidate.{candidate_tag}",
+            }
+    actual_subjects = set(receipt_by_subject)
+    if (
+        not expected_subjects.issubset(actual_subjects)
+        or not actual_subjects.issubset(expected_subjects | optional_candidate_subjects)
+        or any(len(receipt_by_subject.get(subject, [])) > 1 for subject in optional_candidate_subjects)
+    ):
         findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "project-local provisioning receipt subjects do not exactly cover the canonical evidence set"))
 
     for expected in expected_records:
@@ -1285,6 +1320,63 @@ def _validate_provisioning_receipt(
             else:
                 verified.append({**expected, "sha256": actual_sha, "bytes": len(payload)})
 
+    candidate_refresh: dict = {"status": "not_assessed"}
+    candidate_tag = candidate.get("source_tag") if isinstance(candidate, dict) else None
+    candidate_version = candidate.get("version") if isinstance(candidate, dict) else None
+    if require_candidate_advisories and isinstance(candidate_tag, str) and isinstance(candidate_version, str):
+        response_subject = f"osv.response.surrealdb.release-candidate.{candidate_tag}"
+        query_subject = f"osv.query.surrealdb.release-candidate.{candidate_tag}"
+        response_matches = receipt_by_subject.get(response_subject, [])
+        query_matches = receipt_by_subject.get(query_subject, [])
+        if len(response_matches) == 1 and len(query_matches) == 1:
+            response_record = response_matches[0]
+            query_record = query_matches[0]
+            retrieved_at = response_record.get("retrieved_at_utc")
+            max_age_hours = candidate.get("advisory_max_age_hours")
+            refresh_status = "verified"
+            if query_record.get("request") is not True:
+                refresh_status = "findings"
+                findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV query was not recorded as a provisioner request"))
+            if response_record.get("fetched") is not True or response_record.get("request") is not False:
+                refresh_status = "findings"
+                findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV response was not fetched by the provisioner"))
+            if not isinstance(max_age_hours, int) or isinstance(max_age_hours, bool) or max_age_hours <= 0:
+                refresh_status = "findings"
+                findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV maximum age is not a positive integer"))
+            try:
+                parsed_retrieved_at = datetime.fromisoformat(str(retrieved_at).replace("Z", "+00:00"))
+                if parsed_retrieved_at.tzinfo is None:
+                    raise ValueError("timestamp has no timezone")
+                age_seconds = (datetime.now(timezone.utc) - parsed_retrieved_at.astimezone(timezone.utc)).total_seconds()
+                if age_seconds < 0 or age_seconds > int(max_age_hours) * 3600:
+                    refresh_status = "stale"
+                    findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "selected-candidate OSV response is outside its locked freshness window"))
+            except (TypeError, ValueError) as exc:
+                age_seconds = None
+                refresh_status = "findings"
+                findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, f"selected-candidate OSV response timestamp is invalid: {exc}"))
+            candidate_refresh = {
+                "status": refresh_status,
+                "query": {
+                    "subject": query_subject,
+                    "path": query_record.get("relative_path"),
+                    "sha256": query_record.get("sha256"),
+                    "bytes": query_record.get("bytes"),
+                },
+                "response": {
+                    "subject": response_subject,
+                    "path": response_record.get("relative_path"),
+                    "sha256": response_record.get("sha256"),
+                    "bytes": response_record.get("bytes"),
+                    "fetched": response_record.get("fetched"),
+                    "retrieved_at_utc": retrieved_at,
+                    "age_seconds": age_seconds,
+                },
+                "maximum_age_hours": max_age_hours,
+            }
+        else:
+            findings.append(Finding(RECEIPT_PROVENANCE_FINDING, _PROVISIONING_RECEIPT_RELATIVE, 1, "provisioning receipt must contain exactly one selected-candidate OSV query and response"))
+
     return {
         "status": "verified" if len(verified) == len(expected_records) and not any(
             finding.code == RECEIPT_PROVENANCE_FINDING for finding in findings
@@ -1293,6 +1385,7 @@ def _validate_provisioning_receipt(
         "sha256": hashlib.sha256(receipt_bytes).hexdigest(),
         "bytes": len(receipt_bytes),
         "records": verified,
+        "candidate_advisory_refresh": candidate_refresh,
     }
 
 
@@ -1617,7 +1710,12 @@ def _validate_surreal_binary_evidence(
 
 
 def _validate_patched_candidate(
-    root: Path, surreal: dict, catalog: dict, advisory_fix_versions: dict, findings: list[Finding]
+    root: Path,
+    surreal: dict,
+    catalog: dict,
+    advisory_fix_versions: dict,
+    findings: list[Finding],
+    probe_executable: bool = True,
 ) -> dict:
     """Validate the project-local release bytes selected by the release lock."""
 
@@ -1647,6 +1745,10 @@ def _validate_patched_candidate(
         "release_metadata_path",
         "advisory_query_path",
         "advisory_response_path",
+        "advisory_package",
+        "advisory_ecosystem",
+        "advisory_scope",
+        "advisory_max_age_hours",
     )
     if not isinstance(candidate, dict):
         findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched_candidate must be a project-local release lock table"))
@@ -1700,6 +1802,10 @@ def _validate_patched_candidate(
 
     candidate_config_valid = len(findings) == candidate_config_start
     artifact_execution_valid = candidate_config_valid
+    version_probe: dict = {
+        "status": "not_executed",
+        "reason": "candidate artifact is absent or failed byte-and-PE validation",
+    }
     artifact_path, artifact_bytes = _read_external_evidence_file(
         root, candidate.get("artifact_path"), "SurrealDB patched candidate artifact", findings
     )
@@ -1721,7 +1827,7 @@ def _validate_patched_candidate(
         elif machine != 0x8664:
             artifact_execution_valid = False
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate PE machine is not x86_64"))
-        if artifact_execution_valid and artifact_path is not None:
+        if artifact_execution_valid and artifact_path is not None and probe_executable:
             try:
                 proc = _run_verified_executable(
                     artifact_bytes,
@@ -1731,12 +1837,29 @@ def _validate_patched_candidate(
                 )
                 combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
                 observed_candidate_version = _extract_external_version(combined)
-                if proc.returncode != 0 or observed_candidate_version != str(candidate.get("version")):
+                probe_verified = proc.returncode == 0 and observed_candidate_version == str(candidate.get("version"))
+                version_probe = {
+                    "status": "verified" if probe_verified else "failed",
+                    "execution": "verified_private_copy",
+                    "command": ["version"],
+                    "exit_code": proc.returncode,
+                    "expected_version": str(candidate.get("version")),
+                    "observed_version": observed_candidate_version,
+                }
+                if not probe_verified:
                     artifact_execution_valid = False
                     findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "surrealdb patched candidate version probe does not match the pinned release"))
             except (OSError, subprocess.TimeoutExpired) as exc:
                 artifact_execution_valid = False
+                version_probe = {
+                    "status": "failed",
+                    "execution": "verified_private_copy",
+                    "command": ["version"],
+                    "error": str(exc),
+                }
                 findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"surrealdb patched candidate version probe failed: {exc}"))
+        elif artifact_execution_valid and artifact_path is not None:
+            version_probe = {"status": "not_executed", "reason": "selected-release evidence mode is byte-and-metadata only"}
 
     release_path, _, release_data = _parse_external_json(
         root, candidate.get("release_metadata_path"), "SurrealDB patched candidate release metadata", findings
@@ -1771,8 +1894,26 @@ def _validate_patched_candidate(
         "SurrealDB patched candidate source archive",
         findings,
     )
-    if candidate.get("advisory_query_path") != surreal.get("advisory_query_path") or candidate.get("advisory_response_path") != surreal.get("advisory_response_path"):
-        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "patched candidate advisory evidence must use the actual configured OSV snapshot"))
+    candidate_directory = str(Path(str(candidate.get("artifact_path", ""))).parent).replace("\\", "/")
+    if (
+        candidate.get("advisory_query_path") != f"{candidate_directory}/osv-query.json"
+        or candidate.get("advisory_response_path") != f"{candidate_directory}/osv-response.json"
+        or candidate.get("advisory_query_path") == surreal.get("advisory_query_path")
+        or candidate.get("advisory_response_path") == surreal.get("advisory_response_path")
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "patched candidate OSV query and response must be separate files beside its exact artifact"))
+    if (
+        candidate.get("advisory_package") != "surrealdb"
+        or candidate.get("advisory_ecosystem") != "crates.io"
+        or candidate.get("advisory_scope") != "rust-crate"
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "patched candidate advisory scope must target crates.io/surrealdb as a Rust crate"))
+    if (
+        not isinstance(candidate.get("advisory_max_age_hours"), int)
+        or isinstance(candidate.get("advisory_max_age_hours"), bool)
+        or candidate.get("advisory_max_age_hours") <= 0
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "patched candidate advisory_max_age_hours must be a positive integer"))
 
     catalog_candidate = catalog.get("patched_candidate") if isinstance(catalog, dict) else None
     if not isinstance(catalog_candidate, dict):
@@ -1803,6 +1944,7 @@ def _validate_patched_candidate(
             "path": str(artifact_path.relative_to(root)).replace("\\", "/") if artifact_path else None,
             "sha256": artifact_sha,
             "bytes": len(artifact_bytes) if artifact_bytes is not None else None,
+            "version_probe": version_probe,
         },
         "release_metadata": {
             "status": "observed" if release_path and isinstance(release_data, dict) else "missing",
@@ -1814,6 +1956,114 @@ def _validate_patched_candidate(
             "sha256": hashlib.sha256(tag_payload).hexdigest() if tag_payload is not None else None,
         },
         "source_archive": candidate_source_archive,
+    }
+
+
+def _validate_candidate_release_advisories(
+    root: Path,
+    surreal: dict,
+    candidate: dict,
+    provisioning_receipt: dict,
+    findings: list[Finding],
+) -> dict:
+    """Bind a fresh OSV query/result to the exact selected candidate version."""
+
+    initial_findings = len(findings)
+    version = str(candidate.get("version", ""))
+    package = candidate.get("advisory_package")
+    ecosystem = candidate.get("advisory_ecosystem")
+    query_path, query_bytes, query_data = _parse_external_json(
+        root,
+        candidate.get("advisory_query_path"),
+        "SurrealDB selected-candidate OSV query",
+        findings,
+    )
+    response_path, response_bytes, response_data = _parse_external_json(
+        root,
+        candidate.get("advisory_response_path"),
+        "SurrealDB selected-candidate OSV response",
+        findings,
+    )
+    query_sha = hashlib.sha256(query_bytes).hexdigest() if query_bytes is not None else None
+    response_sha = hashlib.sha256(response_bytes).hexdigest() if response_bytes is not None else None
+    expected_query = {
+        "package": {"ecosystem": ecosystem, "name": package},
+        "version": version,
+    }
+    if query_data != expected_query:
+        findings.append(Finding("DEP-009", str(query_path.relative_to(root)).replace("\\", "/") if query_path else "config/dependency-policy.toml", 1, "selected-candidate OSV query does not bind its exact package, ecosystem and version"))
+
+    refresh = provisioning_receipt.get("candidate_advisory_refresh", {}) if isinstance(provisioning_receipt, dict) else {}
+    query_record = refresh.get("query", {}) if isinstance(refresh, dict) else {}
+    response_record = refresh.get("response", {}) if isinstance(refresh, dict) else {}
+    expected_query_path = str(query_path.relative_to(root)).replace("\\", "/") if query_path else None
+    expected_response_path = str(response_path.relative_to(root)).replace("\\", "/") if response_path else None
+    if (
+        refresh.get("status") != "verified"
+        or query_record.get("path") != expected_query_path
+        or query_record.get("sha256") != query_sha
+        or response_record.get("path") != expected_response_path
+        or response_record.get("sha256") != response_sha
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "selected-candidate OSV inputs do not match a fresh provisioner receipt"))
+
+    vulnerabilities = response_data.get("vulns", []) if isinstance(response_data, dict) else None
+    advisory_ids: list[str] = []
+    if isinstance(response_data, dict):
+        unexpected_response_fields = set(response_data) - {"vulns", "next_page_token"}
+        if unexpected_response_fields:
+            findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response contains unsupported fields"))
+        if "next_page_token" in response_data:
+            next_page_token = response_data["next_page_token"]
+            if not isinstance(next_page_token, str):
+                findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response next_page_token must be a string when present"))
+            elif next_page_token:
+                findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response is paginated and incomplete"))
+    if not isinstance(vulnerabilities, list):
+        findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response vulns field must be an array when present"))
+        vulnerabilities = []
+    for vulnerability in vulnerabilities:
+        if not isinstance(vulnerability, dict) or not isinstance(vulnerability.get("id"), str) or not vulnerability["id"].strip():
+            findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response contains a malformed vulnerability record"))
+            continue
+        vulnerability_id = vulnerability["id"]
+        advisory_ids.append(vulnerability_id)
+        affected = vulnerability.get("affected")
+        if not isinstance(affected, list) or not any(
+            isinstance(item, dict)
+            and isinstance(item.get("package"), dict)
+            and item["package"].get("ecosystem") == ecosystem
+            and item["package"].get("name") == package
+            for item in affected
+        ):
+            findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, f"selected-candidate OSV record {vulnerability_id} does not identify crates.io/surrealdb"))
+    if len(set(advisory_ids)) != len(advisory_ids):
+        findings.append(Finding("DEP-009", expected_response_path or "config/dependency-policy.toml", 1, "selected-candidate OSV response contains duplicate advisory identifiers"))
+
+    return {
+        "evidence_status": "verified" if len(findings) == initial_findings else "findings",
+        "advisory_status": "findings" if advisory_ids else "no_known_vulnerabilities",
+        "source": _OSV_ENDPOINT,
+        "package": package,
+        "ecosystem": ecosystem,
+        "scope": candidate.get("advisory_scope"),
+        "version": version,
+        "query": {
+            "path": expected_query_path,
+            "sha256": query_sha,
+            "bytes": len(query_bytes) if query_bytes is not None else None,
+            "body": query_data,
+        },
+        "response": {
+            "path": expected_response_path,
+            "sha256": response_sha,
+            "bytes": len(response_bytes) if response_bytes is not None else None,
+            "retrieved_at_utc": response_record.get("retrieved_at_utc"),
+            "age_seconds": response_record.get("age_seconds"),
+            "maximum_age_hours": refresh.get("maximum_age_hours") if isinstance(refresh, dict) else None,
+        },
+        "advisory_ids": sorted(advisory_ids),
+        "distributed_binary_applicability": "unestablished",
     }
 
 
@@ -2075,6 +2325,13 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
             catalog_evidence = {"status": "invalid", "path": catalog_rel}
             findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"malformed surrealdb catalog: {exc}"))
 
+    provisioning_receipt = _validate_provisioning_receipt(
+        root,
+        surreal,
+        surreal.get("patched_candidate") if isinstance(surreal.get("patched_candidate"), dict) else {},
+        findings,
+    )
+    candidate_config = surreal.get("patched_candidate") if isinstance(surreal.get("patched_candidate"), dict) else {}
     candidate_evidence = _validate_patched_candidate(
         root,
         surreal,
@@ -2082,13 +2339,6 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
         binary_evidence.get("advisory_fix_versions", {}),
         findings,
     )
-    provisioning_receipt = _validate_provisioning_receipt(
-        root,
-        surreal,
-        surreal.get("patched_candidate") if isinstance(surreal.get("patched_candidate"), dict) else {},
-        findings,
-    )
-
     evidence[name] = {
         "status": "findings" if findings else "observed",
         "configured": surreal,
@@ -2136,6 +2386,177 @@ def check_external_executables(
         root = Path(".")
     findings, _ = _collect_external_evidence(root, manifest_data)
     return findings
+
+
+def build_selected_release_receipt(
+    root: Path,
+    selected_artifact_path: str,
+    selected_artifact_sha256: str,
+    selected_artifact_version: str,
+    selected_catalog_sha256: str,
+    selected_provisioning_receipt_sha256: str,
+) -> tuple[list[Finding], dict]:
+    """Build a non-runtime receipt for the exact project-local release selection."""
+
+    findings: list[Finding] = []
+    manifest_findings, manifest_data = check_policy_manifest(root)
+    findings.extend(manifest_findings)
+    externals = manifest_data.get("external_executables", {}) if isinstance(manifest_data, dict) else {}
+    surreal = externals.get("surrealdb") if isinstance(externals, dict) else None
+    if not isinstance(surreal, dict):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "selected release receipt requires the canonical surrealdb policy table"))
+        surreal = {}
+    candidate = surreal.get("patched_candidate")
+    if not isinstance(candidate, dict):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "selected release receipt requires the canonical patched_candidate table"))
+        candidate = {}
+
+    current_source_commit = None
+    try:
+        source_proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if source_proc.returncode == 0 and _HEX40.fullmatch(source_proc.stdout.strip()):
+            current_source_commit = source_proc.stdout.strip()
+        else:
+            findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "cannot bind selected release receipt to a current Git source commit"))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, f"cannot read selected release source commit: {exc}"))
+
+    _, config_relative, config_bytes, _ = _read_validated_repo_bytes(
+        root,
+        "config/dependency-policy.toml",
+        "dependency policy manifest",
+        findings,
+        "DEP-009",
+    )
+    _, catalog_relative, catalog_bytes, _ = _read_validated_repo_bytes(
+        root,
+        surreal.get("catalog"),
+        "SurrealDB selected-release catalogue",
+        findings,
+        "DEP-009",
+    )
+    catalog: dict = {}
+    if catalog_bytes is not None:
+        try:
+            catalog_data = json.loads(catalog_bytes.decode("utf-8-sig"))
+            if isinstance(catalog_data, dict):
+                catalog = catalog_data
+            else:
+                findings.append(Finding("DEP-009", str(catalog_relative), 1, "selected-release catalogue root must be a JSON object"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            findings.append(Finding("DEP-009", str(catalog_relative), 1, f"selected-release catalogue is invalid JSON: {exc}"))
+
+    actual_candidate_path = str(candidate.get("artifact_path", "")).replace("\\", "/")
+    actual_candidate_sha256 = str(candidate.get("sha256", "")).lower()
+    actual_candidate_version = str(candidate.get("version", ""))
+    if (
+        selected_artifact_path.replace("\\", "/") != actual_candidate_path
+        or selected_artifact_sha256.lower() != actual_candidate_sha256
+        or selected_artifact_version != actual_candidate_version
+    ):
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "release consumer selection differs from the locked candidate artifact path, digest or version"))
+
+    actual_catalog_sha256 = hashlib.sha256(catalog_bytes).hexdigest() if catalog_bytes is not None else None
+    if selected_catalog_sha256.lower() != str(actual_catalog_sha256 or "").lower():
+        findings.append(Finding("DEP-009", "docs/release/SURREALDB_WINDOWS_X64.lock.json", 1, "release consumer catalogue digest differs from the safely read catalogue bytes"))
+
+    source_evidence = surreal.get("distributed_binary_evidence", {})
+    source_evidence = source_evidence if isinstance(source_evidence, dict) else {}
+    candidate_evidence = _validate_patched_candidate(
+        root,
+        surreal,
+        catalog,
+        source_evidence.get("advisory_fix_versions", {}),
+        findings,
+        probe_executable=False,
+    )
+    provisioning_receipt = _validate_provisioning_receipt(
+        root,
+        surreal,
+        candidate,
+        findings,
+        require_candidate_advisories=True,
+    )
+    actual_provisioning_sha256 = provisioning_receipt.get("sha256")
+    if selected_provisioning_receipt_sha256.lower() != str(actual_provisioning_sha256 or "").lower():
+        findings.append(Finding("DEP-009", _PROVISIONING_RECEIPT_RELATIVE, 1, "release consumer provisioning-receipt digest differs from the safely read receipt bytes"))
+    candidate_advisory = _validate_candidate_release_advisories(
+        root,
+        surreal,
+        candidate,
+        provisioning_receipt,
+        findings,
+    )
+    candidate_evidence["advisory_snapshot"] = candidate_advisory
+
+    try:
+        generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except (OSError, OverflowError, ValueError):
+        generated_at = None
+        findings.append(Finding("DEP-009", "config/dependency-policy.toml", 1, "cannot establish selected-release receipt generation time"))
+
+    validation_findings = [
+        {"code": finding.code, "path": finding.path, "line": finding.line, "detail": finding.detail}
+        for finding in findings
+    ]
+    binding_status = "EVIDENCE_VERIFIED" if not findings else "INVALID"
+    candidate_advisory_status = candidate_advisory.get("advisory_status", "incomplete")
+    receipt = {
+        "schema": "eliot.selected-release-dependency-policy.v1",
+        "binding_status": binding_status,
+        "candidate_advisory_status": candidate_advisory_status,
+        "release_admission": "INCOMPLETE",
+        "generated_at_utc": generated_at,
+        "source_commit": current_source_commit,
+        "policy_scope": "selected-release external executable: surrealdb",
+        "selected_artifact": {
+            "name": candidate.get("name"),
+            "path": actual_candidate_path,
+            "version": actual_candidate_version,
+            "source_tag": candidate.get("source_tag"),
+            "release_asset": candidate.get("release_asset"),
+            "source_commit": candidate.get("source_commit"),
+            "architecture": candidate.get("architecture"),
+            "pe_machine": candidate.get("pe_machine"),
+            "sha256": candidate_evidence.get("artifact", {}).get("sha256"),
+            "bytes": candidate_evidence.get("artifact", {}).get("bytes"),
+            "version_probe": "not_executed",
+        },
+        "policy_manifest": {
+            "path": config_relative,
+            "sha256": hashlib.sha256(config_bytes).hexdigest() if config_bytes is not None else None,
+        },
+        "catalogue": {
+            "path": catalog_relative,
+            "sha256": actual_catalog_sha256,
+        },
+        "provisioning": {
+            "path": _PROVISIONING_RECEIPT_RELATIVE,
+            "sha256": actual_provisioning_sha256,
+            "status": provisioning_receipt.get("status"),
+            "candidate_advisory_refresh": provisioning_receipt.get("candidate_advisory_refresh"),
+            "records": provisioning_receipt.get("records"),
+        },
+        "advisory_snapshot": candidate_advisory,
+        "installed_scope": {
+            "version": surreal.get("version"),
+            "status": "not_assessed_by_selected-release receipt; current-advisories retains its findings",
+        },
+        "limitations": [
+            "OSV result is scoped to crates.io/surrealdb at the selected version.",
+            "Applicability of crate advisories to the distributed Windows binary remains unestablished.",
+            "This receipt does not claim a complete dependency-policy PASS, runtime compatibility, installation approval, or product support.",
+        ],
+        "proof_ceiling": "SELECTED_RELEASE_ARTIFACT_AND_FRESH_CRATE_ADVISORY_EVIDENCE_CANDIDATE",
+        "validation_findings": validation_findings,
+    }
+    return findings, receipt
 
 
 def _scanner_version(raw_output: str) -> str | None:
@@ -3430,6 +3851,12 @@ def main() -> int:
     )
     parser.add_argument("--json-out", help="Write findings to JSON output file")
     parser.add_argument("--receipt-out", help="Write canonical receipt to JSON output file")
+    parser.add_argument("--selected-release-policy-receipt-out", help="Build a non-runtime receipt for the exact locked release candidate")
+    parser.add_argument("--selected-artifact-path", help="Repository-relative artifact path selected by the release consumer")
+    parser.add_argument("--selected-artifact-sha256", help="SHA-256 selected by the release consumer")
+    parser.add_argument("--selected-artifact-version", help="Version selected by the release consumer")
+    parser.add_argument("--selected-catalog-sha256", help="SHA-256 of the release consumer's selected catalogue")
+    parser.add_argument("--selected-provisioning-receipt-sha256", help="SHA-256 of the release consumer's selected provisioning receipt")
     parser.add_argument("--self-test", action="store_true", help="Run internal self-tests")
     args = parser.parse_args()
 
@@ -3437,6 +3864,41 @@ def main() -> int:
         return run_self_tests()
 
     root = Path(args.root).resolve()
+    if args.selected_release_policy_receipt_out:
+        selected_args = (
+            args.selected_artifact_path,
+            args.selected_artifact_sha256,
+            args.selected_artifact_version,
+            args.selected_catalog_sha256,
+            args.selected_provisioning_receipt_sha256,
+        )
+        if any(not isinstance(value, str) or not value.strip() for value in selected_args):
+            parser.error("selected-release receipt mode requires every --selected-* value")
+        findings, receipt = build_selected_release_receipt(
+            root,
+            args.selected_artifact_path,
+            args.selected_artifact_sha256,
+            args.selected_artifact_version,
+            args.selected_catalog_sha256,
+            args.selected_provisioning_receipt_sha256,
+        )
+        selected_receipt_path = Path(args.selected_release_policy_receipt_out)
+        selected_receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        selected_receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        print(
+            "SELECTED_RELEASE_DEPENDENCY_POLICY: "
+            f"{receipt['binding_status']} "
+            f"(candidate_advisories={receipt['candidate_advisory_status']}, "
+            f"release_admission={receipt['release_admission']}, "
+            f"validation_findings={len(findings)})"
+        )
+        for finding in findings:
+            print(f"  [{finding.code}] {finding.path}:{finding.line}: {finding.detail}")
+        return 0 if (
+            receipt["binding_status"] == "EVIDENCE_VERIFIED"
+            and receipt["candidate_advisory_status"] == "no_known_vulnerabilities"
+        ) else 1
+
     findings, status, receipt, _, _ = verify_all(root, args.profile)
 
     if args.json_out:

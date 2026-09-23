@@ -52,6 +52,7 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+mod experience_runtime;
 mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
@@ -154,6 +155,11 @@ pub use freshness_admission::{
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
     serve_admitted_local_read,
+};
+pub use experience_runtime::{
+    ExperienceDriverError, ExperienceJournalDriverInputs, ExperienceQualityEvent,
+    ExperienceQualityEventOutput, produce_journal_projection, read_current_position,
+    run_experience_quality_event,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};

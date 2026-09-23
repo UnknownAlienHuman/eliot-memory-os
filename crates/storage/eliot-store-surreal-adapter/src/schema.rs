@@ -70,6 +70,14 @@ pub(crate) mod table {
     /// row per `automation_id` naming the most recently committed
     /// failure key. Last write wins; no compare-and-set.
     pub(crate) const AUTOMATION_LAST_FAILURE: &str = "automation_last_failure";
+    /// Immutable experience-bank row per handle + owner revision
+    /// (issue #223). One row per joined `(handle, revision)` key
+    /// carrying the verbatim Governor-admitted bank-record document.
+    /// Create-only; divergent rewrites fail closed.
+    pub(crate) const EXPERIENCE_BANK: &str = "experience_bank";
+    /// Immutable agent-feedback row per handle + owner revision
+    /// (issue #223). Same create-only rule as the bank rows.
+    pub(crate) const EXPERIENCE_FEEDBACK: &str = "experience_feedback";
 }
 
 /// Record key of the single canonical fence/sequence row.
@@ -277,6 +285,34 @@ DEFINE FIELD state_fence ON automation_invocation TYPE object;
 DEFINE FIELD scope_id ON automation_invocation TYPE string;
 DEFINE FIELD task_id ON automation_invocation TYPE option<string>;
 DEFINE INDEX invocation_occurrence ON automation_invocation FIELDS occurrence_id UNIQUE;
+";
+
+/// Experience bank/feedback tables (issue #223).
+/// Additive delta in the automation style: `experience_bank` carries one
+/// immutable row per joined handle/revision key with the verbatim
+/// Governor-admitted bank-record document plus presented digests;
+/// `experience_feedback` carries the same shape for feedback records.
+/// Applied explicitly where the owning slice proves it; never executed
+/// implicitly by the adapter.
+#[allow(dead_code)]
+pub(crate) const EXPERIENCE_TABLES_DDL: &str = r"
+DEFINE TABLE experience_bank SCHEMALESS;
+DEFINE FIELD handle ON experience_bank TYPE string;
+DEFINE FIELD revision ON experience_bank TYPE int;
+DEFINE FIELD record_json ON experience_bank TYPE string;
+DEFINE FIELD record_digest ON experience_bank TYPE string;
+DEFINE FIELD state_fence ON experience_bank TYPE object;
+DEFINE FIELD scope_id ON experience_bank TYPE string;
+DEFINE FIELD task_id ON experience_bank TYPE option<string>;
+
+DEFINE TABLE experience_feedback SCHEMALESS;
+DEFINE FIELD handle ON experience_feedback TYPE string;
+DEFINE FIELD revision ON experience_feedback TYPE int;
+DEFINE FIELD record_json ON experience_feedback TYPE string;
+DEFINE FIELD record_digest ON experience_feedback TYPE string;
+DEFINE FIELD state_fence ON experience_feedback TYPE object;
+DEFINE FIELD scope_id ON experience_feedback TYPE string;
+DEFINE FIELD task_id ON experience_feedback TYPE option<string>;
 ";
 
 pub(crate) const SCHEMA_DDL_V2: &str = r"

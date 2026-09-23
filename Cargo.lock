@@ -1076,7 +1076,9 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-reactive-context-plan",
  "eliot-receipts",
+ "serde",
 ]
 
 [[package]]
@@ -1816,6 +1818,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-experience-provider"
+version = "0.1.0"
+dependencies = [
+ "eliot-cognitive-quality",
+ "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-experience-projection",
+ "eliot-learning-contracts",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "eliot-store-api",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-finish"
 version = "0.1.0"
 dependencies = [
@@ -1863,11 +1883,14 @@ dependencies = [
  "eliot-instrument-api",
  "eliot-instrument-nextest",
  "eliot-integration-coverage",
+ "eliot-kernel-core",
  "eliot-maintenance",
  "eliot-mcp",
  "eliot-module-registry",
  "eliot-observation",
  "eliot-observation-contracts",
+ "eliot-ors",
+ "eliot-platform",
  "eliot-problem",
  "eliot-protocol",
  "eliot-read",
@@ -3232,6 +3255,8 @@ dependencies = [
  "eliot-runtime-contracts",
  "eliot-security-contracts",
  "eliot-wasm-runtime",
+ "serde",
+ "serde_json",
  "thiserror",
  "wasmtime",
  "wat",
@@ -3310,6 +3335,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",
+ "eliot-cognitive-quality",
  "eliot-config",
  "eliot-contracts",
  "eliot-controlboard",
@@ -3319,14 +3345,18 @@ dependencies = [
  "eliot-dreamer-claim-grounding",
  "eliot-dreamer-probe-plan",
  "eliot-dreamer-rival-model",
+ "eliot-epistemic-contracts",
  "eliot-evaluation-contracts",
+ "eliot-experience-provider",
  "eliot-governor",
  "eliot-instrument-api",
  "eliot-ipc",
  "eliot-kernel-core",
+ "eliot-learning-contracts",
  "eliot-maintenance",
  "eliot-observability",
  "eliot-observation",
+ "eliot-observation-contracts",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
