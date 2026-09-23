@@ -186,6 +186,18 @@ impl GovernorClosureSource {
                 "closure owner revocation history is unavailable; unavailable history is not absence of revocation".to_owned(),
             )
         })?;
+        // Preserved-survivor graph membership (C73-F1): every preserved
+        // entry must name known lineage in the restored snapshot — the
+        // target, the survivor, and the covering grant — mirroring the
+        // provider-side admission check. Coverage currency at the closure
+        // revision is proven port-side (see `prove_survivor_membership`
+        // in the P-07 port); this gate keeps unknown identities from
+        // ever becoming admitted survivor evidence.
+        for (target, survivors) in &restore.preserved {
+            for survivor in survivors {
+                check_preserved_membership(&restore.graph_snapshot, target, survivor)?;
+            }
+        }
         let outcome =
             GrantGraph::from_recovery_snapshot_with_revocation_history(restore.graph_snapshot, Some(history))
                 .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))?;
@@ -309,6 +321,35 @@ fn verify_admitted_introduction_seal(
             reason: "admitted opaque introduction record failed seal validation",
         }
     })?;
+    Ok(())
+}
+
+/// Validates one preserved entry against the snapshot graph, mirroring
+/// the provider-side admission check (`OwnerClosureProvider` proves the
+/// same membership on its snapshot): the target, the survivor, and the
+/// covering grant must all be known lineage. Unknown identities refuse
+/// before any admitted state installs; coverage currency at the closure
+/// revision is proven port-side, never here.
+fn check_preserved_membership(
+    snapshot: &GrantGraphRecoverySnapshot,
+    target_grant_id: &str,
+    survivor: &GrantClosureSurvivor,
+) -> Result<(), KernelError> {
+    for grant_id in [
+        target_grant_id,
+        survivor.grant_id.as_str(),
+        survivor.covering_grant_id.as_str(),
+    ] {
+        if !snapshot
+            .grants
+            .iter()
+            .any(|grant| grant.grant_id == grant_id)
+        {
+            return Err(KernelError::RecoveryUnavailable(
+                "preserved admission names unknown grant lineage".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
