@@ -27,7 +27,7 @@ pub use caller::{
 };
 pub use guard::{
     GuardTrigger, GuardVerdict, IdentityLegOutcome, TriggerReport, check_at_trigger, identity_legs,
-    rebind_with_receipt,
+    produce_attach_receipt, rebind_with_receipt,
 };
 
 pub use identity::{

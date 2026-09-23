@@ -26,8 +26,9 @@
 //! explicit authorized rebind ([`rebind_with_receipt`]) completes.
 
 use super::{
-    GoverningSourceSet, PrivacyProfile, ScopeBinding, ScopeBindingDisposition,
-    ScopeBindingGuard, ScopeBindingGuardReceipt, ScopeIdentity, ScopeRelocationOrAttachReceipt,
+    GoverningSourceSet, ObservedScopeResources, PrivacyProfile, ScopeBinding,
+    ScopeBindingDisposition, ScopeBindingGuard, ScopeBindingGuardReceipt, ScopeIdentity,
+    ScopeRelocationKind, ScopeRelocationOrAttachReceipt, WorkScopeBindingOwner, WorkScopeDescriptor,
     WorkScopeError, counter, text,
 };
 use eliot_contracts::{StateFence, fences_match_exact};
@@ -166,6 +167,123 @@ impl TriggerReport {
         }
         Ok(())
     }
+}
+
+/// Produces an authorized attach receipt for one newly observed workspace instance.
+///
+/// This is the production side of the attach edge that [`rebind_with_receipt`]
+/// consumes: it binds a live mechanical observation (caller-derived from
+/// `observe_workspace_instance` facts via `derive_observed_resources` — the
+/// canonical Windows/VCS identities: canonical root, worktree git dir, VCS
+/// common dir, root commit) to the retained scope as a new instance under
+/// explicit authorization. The prior instance is preserved verbatim inside the
+/// receipt (I4.1/I4.7: a confirmed attach never rewrites the old root identity
+/// or task history); admission of the observed instance happens later through
+/// [`rebind_with_receipt`], never here.
+///
+/// Fail-closed production rules, mirroring the issuance slice:
+/// - authority comes from the live [`WorkScopeBindingOwner`] read at `fence`
+///   (a stale fence fails here) plus the retained [`WorkScopeDescriptor`]
+///   describing that binding on every identity field — never from
+///   self-asserted observation fields alone;
+/// - the retained guard receipt must already be `MATCHED`: attach extends a
+///   healthy binding, it does not repair a withheld one;
+/// - the observation must name exactly one instance of the same kind and the
+///   same repository lineage as the bound scope (attach stays within one
+///   lineage; a different lineage is a different scope, and several similar
+///   checkouts stay ambiguous per I4.1);
+/// - the observed instance must be genuinely new (both instance reference and
+///   root identity differ from the bound instance): re-attaching the bound
+///   instance, or an observation that reuses its reference under another root,
+///   fails instead of minting a no-op or alias receipt;
+/// - the observed instance generation must equal the admission fence
+///   generation, so the receipt is bound to the fence it is issued under;
+/// - branch, commit, dirty state, display names, manifest names, copied
+///   markers, and remote URLs never enter the receipt: they stay generation
+///   or supporting evidence in the observation.
+///
+/// This function performs no filesystem, process, or VCS reads: mechanical
+/// truth enters only through the caller-supplied `observed` value, which the
+/// real ingress derives from mechanical facts. Raw paths and hints are
+/// evidence, not authority (I4.3.1).
+///
+/// # Errors
+///
+/// Returns an error when references, observations, or the fence are malformed
+/// ([`WorkScopeError::InvalidStateFence`]), the owner read disagrees with the
+/// fence ([`WorkScopeError::StateFenceMismatch`]), the retained binding is not
+/// `MATCHED` ([`WorkScopeError::BindingReceiptNotMatched`]), or the
+/// observation is not exactly one new same-lineage instance of the bound scope
+/// ([`WorkScopeError::BindingReceiptMismatch`]).
+pub fn produce_attach_receipt(
+    receipt_ref: impl Into<String>,
+    descriptor: &WorkScopeDescriptor,
+    owner: &WorkScopeBindingOwner,
+    observed: &ObservedScopeResources,
+    authorizing_ref: impl Into<String>,
+    fence: &StateFence,
+) -> Result<ScopeRelocationOrAttachReceipt, WorkScopeError> {
+    let receipt_ref = receipt_ref.into();
+    let authorizing_ref = authorizing_ref.into();
+    text(&receipt_ref, "receipt_ref")?;
+    text(&authorizing_ref, "authorizing_ref")?;
+    descriptor.validate()?;
+    observed.validate()?;
+    fence
+        .validate()
+        .map_err(|_| WorkScopeError::InvalidStateFence)?;
+    let snapshot = owner
+        .read_current(fence)
+        .map_err(|_| WorkScopeError::StateFenceMismatch)?;
+    if !super::binding_matches_descriptor(&snapshot.binding, descriptor) {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    if snapshot.guard_receipt.disposition != ScopeBindingDisposition::Matched {
+        return Err(WorkScopeError::BindingReceiptNotMatched);
+    }
+    let bound = &snapshot.binding.scope;
+    if observed.kind != bound.kind {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    let observed_lineage = observed.lineage.as_ref().ok_or_else(|| {
+        WorkScopeError::BindingReceiptMismatch
+    })?;
+    if bound.lineage_ref.as_deref() != Some(observed_lineage.lineage_ref.as_str()) {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    if observed.instances.len() != 1 {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    let observed_instance = &observed.instances[0];
+    if observed_instance.generation != fence.resource_generation.value() {
+        return Err(WorkScopeError::StateFenceMismatch);
+    }
+    if observed_instance.instance_ref == bound.instance_ref
+        || observed_instance.root_identity == bound.root_identity
+    {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    let prior_instance = descriptor
+        .instances
+        .iter()
+        .find(|instance| {
+            instance.instance_ref == bound.instance_ref
+                && instance.root_identity == bound.root_identity
+        })
+        .ok_or(WorkScopeError::BindingReceiptMismatch)?;
+    let receipt = ScopeRelocationOrAttachReceipt {
+        receipt_ref,
+        kind: ScopeRelocationKind::Attach,
+        scope_ref: bound.scope_ref.clone(),
+        scope_kind: bound.kind,
+        lineage: observed_lineage.clone(),
+        prior_instance: prior_instance.clone(),
+        observed_instance: observed_instance.clone(),
+        authorizing_ref,
+        state_fence: fence.clone(),
+    };
+    receipt.validate()?;
+    Ok(receipt)
 }
 
 /// Admits an authorized relocation/attach receipt as the new expected binding.
