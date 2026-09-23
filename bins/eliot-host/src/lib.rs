@@ -29,6 +29,8 @@ mod host_composition_validation;
 pub mod host_diagnostics;
 mod host_job_launch;
 #[cfg(windows)]
+mod lease_drain;
+#[cfg(windows)]
 mod launch_artifact;
 #[cfg(windows)]
 mod launch_descriptor_validation;
@@ -41,6 +43,9 @@ mod store_kernel_launch_sequence;
 /// wrapper over #984's accepted safe port; explicitly unavailable until #984
 /// lands, never FFI inside Host.
 pub mod windows_event_log;
+
+#[cfg(windows)]
+pub use lease_drain::{GenerationRetirementBarrier, GenerationRetirementFence};
 
 // F-LOG-HOST-1 (#891) lifecycle/SCM observation helpers.
 //
