@@ -675,10 +675,15 @@ pub fn execute_cutover(
     // documented scope premise: one operational store holds one
     // installation's rows.
     let presented = &validated.evidence.fenced_introductions;
+    // B1 bound discipline: the owner refuses limits above
+    // `MAX_RECOVERY_PAGE`, so the query carries exactly that bound (never
+    // `u16::MAX`, which would refuse every cutover unconditionally).
+    // Over-bound tables refuse explicitly via the owner; silently
+    // truncated views can never verify.
     let live = super::introduction_readback::read_live_introductions(
         host,
         &validated.request.activation_fence,
-        u16::MAX,
+        eliot_ors::MAX_RECOVERY_PAGE,
     )
     .map_err(|_| CutoverError::AuthorityOrReadinessMissing)?;
     {
