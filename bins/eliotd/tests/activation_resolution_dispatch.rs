@@ -348,7 +348,9 @@ fn valid_ticket_reaches_actual_daemon_v2_dispatch_path() -> TestResult {
             "dispatch_agent_activation_result(&kernel_clone, &ticket, result)",
         ],
     )?;
-    assert!(!claim_step.contains("resolve_agent_activation("));
+    assert!(!claim_step.contains("map_activation_snapshot"));
+    assert!(!claim_step.contains("AgentActivationResolutionDecision"));
+    assert!(!claim_step.contains("submit_agent_activation_decision"));
     Ok(())
 }
 
@@ -471,23 +473,24 @@ fn ticket_peer_admission_and_connection_mismatch_fails_closed() -> TestResult {
 
 // WORK_UNIT_CASE: 839/20
 #[test]
-fn v1_compatibility_isolated_from_current_v2_resolution() -> TestResult {
+fn v1_compatibility_retired_v2_resolution_is_the_spine() -> TestResult {
     assert_fixture_case(
         20,
         "explicit v1 compatibility cannot consume current v2 accidentally",
     )?;
 
     let library = source("src/lib.rs")?;
-    let v1 = slice_between(
-        &library,
-        "pub fn resolve_agent_activation(\n",
-        "    /// Single production resolver spine:",
-    )?;
-    assert!(v1.contains("map_activation_snapshot"));
-    assert!(v1.contains("GovernorActivationOutcome::Resolved"));
-    assert!(v1.contains("outcome => Err"));
-    assert!(!v1.contains("map_governor_outcome_to_protocol"));
-    assert!(!v1.contains("AgentActivationResolutionResult"));
+    assert!(!library.contains("fn resolve_agent_activation("));
+    assert!(library.contains("resolve_agent_activation_v2"));
+    assert!(!library.contains("map_activation_snapshot"));
+    assert!(!library.contains("AgentActivationResolutionDecision"));
+    assert!(library.contains("map_governor_outcome_to_protocol"));
+    assert!(library.contains("AgentActivationResolutionResult"));
+
+    let projection = source("src/activation_projection.rs")?;
+    assert!(!projection.contains("map_activation_snapshot"));
+    assert!(!projection.contains("AgentActivationResolutionDecision"));
+    assert!(projection.contains("map_governor_outcome_to_protocol"));
 
     let runtime = source("src/daemon_runtime.rs")?;
     let claim_step = slice_between(
@@ -495,7 +498,9 @@ fn v1_compatibility_isolated_from_current_v2_resolution() -> TestResult {
         "fn start_valid_claim_step(\n",
         "/// Bounded shutdown drain for one in-flight activation",
     )?;
-    assert!(!claim_step.contains("resolve_agent_activation("));
+    assert!(!claim_step.contains("map_activation_snapshot"));
+    assert!(!claim_step.contains("AgentActivationResolutionDecision"));
+    assert!(!claim_step.contains("submit_agent_activation_decision"));
     assert!(claim_step.contains("resolve_agent_activation_v2"));
     Ok(())
 }
@@ -697,7 +702,9 @@ fn activation_source_excludes_unowned_effects_and_duplicate_paths() -> TestResul
         "fn start_valid_claim_step(",
         "/// Bounded shutdown drain for one in-flight activation",
     )?;
-    assert!(!claim_step.contains("resolve_agent_activation("));
+    assert!(!claim_step.contains("map_activation_snapshot"));
+    assert!(!claim_step.contains("AgentActivationResolutionDecision"));
+    assert!(!claim_step.contains("submit_agent_activation_decision"));
     let dispatch = slice_between(
         &runtime,
         "async fn dispatch_agent_activation_result(",

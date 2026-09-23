@@ -10,7 +10,7 @@
 //! - **I1.11 Startup algorithm** — resolution is available only after Governor/Kernel admission; no startup authority issuance here.
 //! - **I2.2 When a capability becomes a separate crate** — pure contract/test seam justifies isolated module; no placeholder proliferation.
 //! - **I2.23 Capability-family topology and crate extraction decisions** — Governor task/authority/canonical-transition family; validated via `CrateExtractionDecision`.
-//! - **Semantic-grant handle: `eliot_governor::GovernorActivationOutcome` / `eliot_protocol::AgentActivationResolutionTicket` -> `eliot_protocol::AgentActivationResolutionDecision` via `GovernorComposition::resolve_activation_outcome`** — Kernel-issued ticket resolved against the current Governor owner set.
+//! - **Semantic-grant handle: `eliot_governor::GovernorActivationOutcome` / `eliot_protocol::AgentActivationResolutionTicket` -> `eliot_protocol::AgentActivationResolutionResult` via `GovernorComposition::resolve_activation_outcome_v2`** — Kernel-issued ticket resolved against the current Governor owner set.
 //! - **Wave 2 Governor-internal outcome -> protocol v2**: `eliot_governor::GovernorActivationOutcome` -> `eliot_protocol::AgentActivationResolutionResult` is a lossless, exhaustive mapping; no resolver error is coerced to success or dropped.
 //!
 //! This is a read-only activation resolution projection and owns no authority issuance, write/effect, fence, default, retry, Kernel, Store, or lifecycle semantics.
@@ -20,9 +20,9 @@ use eliot_governor::{
     GovernorSelectionDirective,
 };
 use eliot_protocol::{
-    AgentActivationCandidateCoverage, AgentActivationResolutionDecision,
-    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResolvedBinding, AgentActivationRetryDirective,
+    AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket,
+    AgentActivationResolvedBinding, AgentActivationRetryDirective,
     AgentActivationSelectionDirective,
 };
 
@@ -189,23 +189,6 @@ pub fn terminal_for_invalid_ticket(
 /// accept caller-selected semantic IDs and does not issue transport sessions,
 /// fences, capabilities, or effects.
 pub trait AgentActivationResolver {
-    /// v1 compatibility projection: resolves one exact ticket to the legacy
-    /// `AgentActivationResolutionDecision` shape.
-    ///
-    /// v1-compat only. This method must not consume v2 typed-result data
-    /// (`AgentActivationResolutionResult` / `AgentActivationResolutionDisposition`);
-    /// v2 (`resolve_agent_activation_v2`) is the single production resolver
-    /// spine. Callers on the typed-outcome path must call v2.
-    ///
-    /// Removal: no production caller remains on this method (the runtime claim
-    /// arm resolves through v2). Final v1 retirement is tracked by #66;
-    /// this method is not removed as opportunistic cleanup.
-    fn resolve_agent_activation(
-        &self,
-        ticket: &AgentActivationResolutionTicket,
-        now: u64,
-    ) -> Result<AgentActivationResolutionDecision, DaemonError>;
-
     /// Canonical v2 production spine: resolves one exact ticket to the typed
     /// v2 result. This is the lossless projection for wave 2; every
     /// `GovernorActivationOutcome` variant maps to exactly one
@@ -220,30 +203,6 @@ pub trait AgentActivationResolver {
         ticket: &AgentActivationResolutionTicket,
         now: u64,
     ) -> Result<AgentActivationResolutionResult, DaemonError>;
-}
-
-pub(super) fn map_activation_snapshot(
-    ticket: &AgentActivationResolutionTicket,
-    snapshot: eliot_governor::GovernorActivationSnapshot,
-) -> Result<AgentActivationResolutionDecision, DaemonError> {
-    AgentActivationResolutionDecision {
-        wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID.to_owned(),
-        wire_version: AgentActivationResolutionDecision::CONTRACT_VERSION,
-        ticket_id: ticket.ticket_id.clone(),
-        ticket_sha256: ticket.ticket_sha256.clone(),
-        state_fence: snapshot.state_fence,
-        principal_id: snapshot.principal_id,
-        session_id: snapshot.session_id,
-        task_id: snapshot.task_id.to_string(),
-        work_unit_id: snapshot.work_unit_id,
-        work_scope_id: snapshot.work_scope_id,
-        task_revision: snapshot.task_revision.to_string(),
-        plan_id: snapshot.plan_id,
-        plan_revision: snapshot.plan_revision,
-        decision_sha256: String::new(),
-    }
-    .with_computed_digest()
-    .map_err(|error| DaemonError::Lifecycle(error.to_string()))
 }
 
 // ---------------------------------------------------------------------------
