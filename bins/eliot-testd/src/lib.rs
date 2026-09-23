@@ -20,9 +20,10 @@ use eliot_platform::ClockObservation;
 use eliot_platform_windows::WindowsPlatform;
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
-    FencingToken, Generation, ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance,
-    ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessRequest,
-    ProcessStartReceipt, ProcessTreeId, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
+    EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
+    KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidenceSink, ProcessExecutionError,
+    ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt, ProcessTreeId, SessionId,
+    SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
@@ -36,7 +37,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use eliot_testd_core::{
-    NormalizedEvidence, RawArtifact, VerificationReceipt, sha256_artifact, sha256_hex,
+    NormalizedEvidence, RawArtifact, TestdToolObservation, VerificationReceipt, sha256_artifact,
+    sha256_hex,
 };
 
 pub mod kernel_client;
@@ -441,48 +443,75 @@ impl TestdComposition {
         executor: &E,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, TestdError> {
-        let current = self.store.get(&job.job_id)?.ok_or(TestdError::Invalid {
-            field: "job_id",
-            reason: "unknown job",
-        })?;
-        validate_running_lease(&current, lease, now)?;
-        current.target_roots.validate()?;
-        let (request, grant) = permit.into_parts();
-        request
-            .validate()
-            .map_err(|error| TestdError::Contract(error.to_string()))?;
-        grant.validate_for_process(
-            &current.job_id,
-            current.invocation.request.request_id.as_str(),
-            &request,
-        )?;
-        if grant.contour_root() != current.target_roots.allowed_contour_root {
-            return Err(TestdError::InvalidBinding);
-        }
-        let operation_id = request.operation_id().clone();
-        let request_job_id = request.job_id().as_str().to_owned();
-        let process_tree_id = request.process_tree_id().as_str().to_owned();
-        let generation = request.generation().get();
-        let authority_epoch = request.fence().authority_epoch();
-        let digest = request.invocation_digest().to_owned();
-        let environment = request.environment().non_secret();
-        if request_job_id != current.process.job_id
-            || operation_id.as_str() != current.process.operation_id
-            || process_tree_id != current.process.process_tree_id
-            || generation != current.process.generation
-            || !authority_epoch.is_same_authority(&current.process.authority_epoch)
-            || digest != current.process.invocation_digest
-            || request.working_directory() != current.target_roots.source_root
-            || environment.get("CARGO_TARGET_DIR") != Some(&current.target_roots.target_root)
-            || environment.get("CARGO_HOME") != Some(&current.target_roots.cache_root)
-        {
-            return Err(TestdError::InvalidBinding);
-        }
-        executor
-            .start(request, sink)
-            .await
-            .map_err(|error: ProcessExecutionError| TestdError::Contract(error.to_string()))
+        start_claimed_from_store(
+            &self.store,
+            job,
+            lease,
+            now,
+            permit,
+            executor,
+            sink,
+        )
+        .await
     }
+}
+
+/// Starts one claimed process against a caller-supplied durable store.
+///
+/// The child-side dispatch path uses this same owner validation as the
+/// composition wrapper above. Keeping the store parameter explicit lets the
+/// production one-shot caller attach to the daemon's canonical job row
+/// without constructing a second composition or bypassing the store fence.
+pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
+    store: &TestdStore,
+    job: &TestJob,
+    lease: &Lease,
+    now: u64,
+    permit: ProcessAdmissionPermit,
+    executor: &E,
+    sink: Arc<dyn ProcessEvidenceSink>,
+) -> Result<ProcessStartReceipt, TestdError> {
+    let current = store.get(&job.job_id)?.ok_or(TestdError::Invalid {
+        field: "job_id",
+        reason: "unknown job",
+    })?;
+    validate_running_lease(&current, lease, now)?;
+    current.target_roots.validate()?;
+    let (request, grant) = permit.into_parts();
+    request
+        .validate()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    grant.validate_for_process(
+        &current.job_id,
+        current.invocation.request.request_id.as_str(),
+        &request,
+    )?;
+    if grant.contour_root() != current.target_roots.allowed_contour_root {
+        return Err(TestdError::InvalidBinding);
+    }
+    let operation_id = request.operation_id().clone();
+    let request_job_id = request.job_id().as_str().to_owned();
+    let process_tree_id = request.process_tree_id().as_str().to_owned();
+    let generation = request.generation().get();
+    let authority_epoch = request.fence().authority_epoch();
+    let digest = request.invocation_digest().to_owned();
+    let environment = request.environment().non_secret();
+    if request_job_id != current.process.job_id
+        || operation_id.as_str() != current.process.operation_id
+        || process_tree_id != current.process.process_tree_id
+        || generation != current.process.generation
+        || !authority_epoch.is_same_authority(&current.process.authority_epoch)
+        || digest != current.process.invocation_digest
+        || request.working_directory() != current.target_roots.source_root
+        || environment.get("CARGO_TARGET_DIR") != Some(&current.target_roots.target_root)
+        || environment.get("CARGO_HOME") != Some(&current.target_roots.cache_root)
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    executor
+        .start(request, sink)
+        .await
+        .map_err(|error: ProcessExecutionError| TestdError::Contract(error.to_string()))
 }
 
 /// Instantiates the sole concrete `ProcessExecutor` with an authority-owned
@@ -693,6 +722,8 @@ pub struct TestdDerivedIntentParams {
     pub job_id: String,
     /// Admitted operation identity.
     pub operation_id: String,
+    /// Canonical process-tree identity owned by the current TestD job.
+    pub process_tree_id: String,
     /// Admitted profile name (exactly one is admitted).
     pub profile: String,
     /// Admitted activation generation (non-zero).
@@ -706,8 +737,13 @@ pub struct TestdDerivedIntentParams {
     /// Exact owner-built environment for the productive toolchain. This is
     /// never copied from the child process ambient environment.
     pub tool_environment: Vec<(String, String)>,
-    /// Admitted generation root used as the working directory.
+    /// Canonical source root admitted for this job and used as the working
+    /// directory.
     pub generation_root: String,
+    /// Canonical external Cargo target root admitted for this job.
+    pub target_root: String,
+    /// Canonical Cargo home/cache root admitted for this job.
+    pub cache_root: String,
 }
 
 /// Derives one [`ProcessIntent`] only from the admitted profile binding
@@ -724,6 +760,7 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
     for (value, field) in [
         (params.job_id.as_str(), "job_id"),
         (params.operation_id.as_str(), "operation_id"),
+        (params.process_tree_id.as_str(), "process_tree_id"),
         (params.session_nonce.as_str(), "session_nonce"),
     ] {
         if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -763,12 +800,32 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
             reason: "must be an existing absolute generation root without parent traversal",
         });
     }
+    for (value, field) in [
+        (params.target_root.as_str(), "target_root"),
+        (params.cache_root.as_str(), "cache_root"),
+    ] {
+        let path = Path::new(value);
+        if !path.is_absolute()
+            || path.components().any(|component| matches!(component, Component::ParentDir))
+            || !path.is_dir()
+        {
+            return Err(TestdError::Invalid {
+                field,
+                reason: "must be an existing absolute root without parent traversal",
+            });
+        }
+    }
     let invalid = |error: eliot_process::ContractError| {
         TestdError::Contract(truncate_dispatch_detail(&error.to_string()))
     };
     let generation = Generation::new(params.generation).map_err(invalid)?;
     let environment = if params.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
-        validate_productive_tool_environment(&params.tool_environment, &params.executable_absolute)?
+        validate_productive_tool_environment(
+            &params.tool_environment,
+            &params.executable_absolute,
+            &params.target_root,
+            &params.cache_root,
+        )?
     } else {
         if !params.tool_environment.is_empty() {
             return Err(TestdError::Invalid {
@@ -776,11 +833,15 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
                 reason: "the probe profile admits no toolchain environment",
             });
         }
-        testd_profile_environment(&binding)?
+        let mut values = BTreeMap::new();
+        values.insert("CARGO_TARGET_DIR".to_owned(), params.target_root.clone());
+        values.insert("CARGO_HOME".to_owned(), params.cache_root.clone());
+        EnvironmentProjection::new(values, Vec::new(), EnvironmentInheritance::None)
+            .map_err(invalid)?
     };
     let intent = ProcessIntent::new(
         OperationId::new(params.operation_id.clone()).map_err(invalid)?,
-        ProcessTreeId::new(format!("{}-tree", params.job_id)).map_err(invalid)?,
+        ProcessTreeId::new(params.process_tree_id.clone()).map_err(invalid)?,
         JobId::new(params.job_id.clone()).map_err(invalid)?,
         ImageId::new(format!("testd-profile-{}", params.profile)).map_err(invalid)?,
         SessionId::new(params.session_nonce.clone()).map_err(invalid)?,
@@ -820,13 +881,13 @@ pub struct ResolvedTestdTool {
     pub environment: Vec<(String, String)>,
 }
 
-const TESTD_CARGO_TOOL: &str = "cargo";
-const TESTD_RUSTC_TOOL: &str = "rustc";
 const TESTD_ENV_NEXTEST_GATE: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON";
+const TESTD_ENV_NEXTEST_SHA256: &str = "ELIOT_TESTD_NEXTEST_SHA256";
 const TESTD_ENV_CARGO: &str = "CARGO";
 const TESTD_ENV_RUSTC: &str = "RUSTC";
 const TESTD_ENV_CARGO_SHA256: &str = "ELIOT_TESTD_CARGO_SHA256";
 const TESTD_ENV_RUSTC_SHA256: &str = "ELIOT_TESTD_RUSTC_SHA256";
+const TESTD_ENV_TOOLCHAIN: &str = "ELIOT_TESTD_TOOLCHAIN";
 const TESTD_ENV_CARGO_HOME: &str = "CARGO_HOME";
 const TESTD_ENV_RUSTUP_HOME: &str = "RUSTUP_HOME";
 const TESTD_ENV_PATH: &str = "PATH";
@@ -841,6 +902,21 @@ const TESTD_ENV_PATH: &str = "PATH";
 /// (dangling shims, directories, reparse chains that resolve to nothing
 /// usable) are skipped, and exhaustion fails closed.
 pub fn resolve_testd_tool(program_path: &str) -> Result<ResolvedTestdTool, TestdError> {
+    let source_root = std::env::current_dir().map_err(|_| TestdError::Invalid {
+        field: "source_root",
+        reason: "owner source root cannot be observed",
+    })?;
+    resolve_testd_tool_at(program_path, &source_root)
+}
+
+/// Resolves one admitted tool against the exact owner source root. Productive
+/// cargo/rustc selection comes from rustup's installed metadata and the
+/// source-root override, never from a child rustup process or an ambient
+/// shim lookup.
+pub fn resolve_testd_tool_at(
+    program_path: &str,
+    source_root: &Path,
+) -> Result<ResolvedTestdTool, TestdError> {
     if program_path != eliot_testd_core::TESTD_PROFILE_PROGRAM
         && program_path != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
     {
@@ -872,9 +948,14 @@ pub fn resolve_testd_tool(program_path: &str) -> Result<ResolvedTestdTool, Testd
             environment: Vec::new(),
         });
     }
-    let cargo = resolve_tool_file(TESTD_CARGO_TOOL, &path_var)?;
-    let rustc = resolve_tool_file(TESTD_RUSTC_TOOL, &path_var)?;
-    let environment = productive_tool_environment(&executable, &cargo, &rustc)?;
+    let rustup_home = owner_home_path("RUSTUP_HOME", ".rustup")?;
+    let selected = resolve_selected_toolchain(&rustup_home, source_root)?;
+    let environment = productive_tool_environment(
+        &executable,
+        &selected.cargo,
+        &selected.rustc,
+        &selected.toolchain,
+    )?;
     Ok(ResolvedTestdTool {
         executable_absolute: executable.path,
         executable_sha256: executable.sha256,
@@ -938,6 +1019,7 @@ fn productive_tool_environment(
     nextest: &ResolvedToolFile,
     cargo: &ResolvedToolFile,
     rustc: &ResolvedToolFile,
+    selected_toolchain: &str,
 ) -> Result<Vec<(String, String)>, TestdError> {
     let cargo_home = owner_home_path("CARGO_HOME", ".cargo")?;
     let rustup_home = owner_home_path("RUSTUP_HOME", ".rustup")?;
@@ -958,14 +1040,201 @@ fn productive_tool_environment(
         .into_owned();
     Ok(vec![
         (TESTD_ENV_NEXTEST_GATE.to_owned(), "1".to_owned()),
+        (
+            TESTD_ENV_NEXTEST_SHA256.to_owned(),
+            nextest.sha256.clone(),
+        ),
         (TESTD_ENV_CARGO.to_owned(), cargo.path.clone()),
         (TESTD_ENV_RUSTC.to_owned(), rustc.path.clone()),
         (TESTD_ENV_CARGO_SHA256.to_owned(), cargo.sha256.clone()),
         (TESTD_ENV_RUSTC_SHA256.to_owned(), rustc.sha256.clone()),
         (TESTD_ENV_CARGO_HOME.to_owned(), cargo_home),
         (TESTD_ENV_RUSTUP_HOME.to_owned(), rustup_home),
+        (
+            TESTD_ENV_TOOLCHAIN.to_owned(),
+            selected_toolchain.to_owned(),
+        ),
         (TESTD_ENV_PATH.to_owned(), path_value),
     ])
+}
+
+struct SelectedToolchain {
+    toolchain: String,
+    cargo: ResolvedToolFile,
+    rustc: ResolvedToolFile,
+}
+
+/// Resolves cargo/rustc through the selected rustup toolchain. A canonicalized
+/// rustup proxy or hardlink is not the selected compiler identity, so the
+/// owner records the exact paths and bytes returned by rustup itself.
+fn resolve_selected_toolchain(
+    rustup_home: &str,
+    source_root: &Path,
+) -> Result<SelectedToolchain, TestdError> {
+    let selected_name = selected_toolchain_name(rustup_home, source_root)?;
+    let toolchain_root = Path::new(rustup_home)
+        .join("toolchains")
+        .join(&selected_name);
+    let cargo_path = toolchain_root.join(if cfg!(windows) {
+        "bin/cargo.exe"
+    } else {
+        "bin/cargo"
+    });
+    let rustc_path = toolchain_root.join(if cfg!(windows) {
+        "bin/rustc.exe"
+    } else {
+        "bin/rustc"
+    });
+    Ok(SelectedToolchain {
+        toolchain: selected_name,
+        cargo: resolved_tool_path(&cargo_path, "cargo")?,
+        rustc: resolved_tool_path(&rustc_path, "rustc")?,
+    })
+}
+
+fn selected_toolchain_name(
+    rustup_home: &str,
+    source_root: &Path,
+) -> Result<String, TestdError> {
+    let override_name = read_toolchain_override(source_root)?;
+    let settings = read_bounded_text(&Path::new(rustup_home).join("settings.toml"), "rustup settings")?;
+    let host = toml_string_value(&settings, "default_host_triple");
+    let requested = override_name.or_else(|| toml_string_value(&settings, "default_toolchain"));
+    let requested = requested.ok_or(TestdError::Invalid {
+        field: "toolchain",
+        reason: "owner metadata has no selected rustup toolchain",
+    })?;
+    let toolchains = Path::new(rustup_home).join("toolchains");
+    let mut candidates = std::fs::read_dir(&toolchains)
+        .map_err(|_| TestdError::Invalid {
+            field: "toolchain",
+            reason: "owner rustup toolchains directory is unavailable",
+        })?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| entry.file_name().to_string_lossy().into_owned())
+        })
+        .filter(|name| name == &requested || name.starts_with(&format!("{requested}-")))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    if let Some(host) = host.as_deref() {
+        let host_candidates = candidates
+            .iter()
+            .filter(|name| name.ends_with(host))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !host_candidates.is_empty() {
+            candidates = host_candidates;
+        }
+    }
+    match candidates.as_slice() {
+        [selected] => Ok(selected.clone()),
+        [] => Err(TestdError::Invalid {
+            field: "toolchain",
+            reason: "owner rustup metadata has no installed selected toolchain",
+        }),
+        _ => Err(TestdError::Invalid {
+            field: "toolchain",
+            reason: "owner rustup metadata selected more than one toolchain",
+        }),
+    }
+}
+
+fn read_toolchain_override(source_root: &Path) -> Result<Option<String>, TestdError> {
+    for name in ["rust-toolchain.toml", "rust-toolchain"] {
+        let path = source_root.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let text = read_bounded_text(&path, "rust-toolchain override")?;
+        let value = if name.ends_with(".toml") {
+            toml_string_value(&text, "channel").or_else(|| toml_string_value(&text, "toolchain"))
+        } else {
+            text.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(ToOwned::to_owned)
+        };
+        return value
+            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+            .map(Some)
+            .ok_or(TestdError::Invalid {
+                field: "toolchain",
+                reason: "rust-toolchain override has no selected channel",
+            });
+    }
+    Ok(None)
+}
+
+fn read_bounded_text(path: &Path, field: &'static str) -> Result<String, TestdError> {
+    let bytes = std::fs::read(path).map_err(|_| TestdError::Invalid {
+        field,
+        reason: "owner metadata cannot be read",
+    })?;
+    if bytes.len() > 64 * 1024 {
+        return Err(TestdError::Invalid {
+            field,
+            reason: "owner metadata exceeds the bounded read size",
+        });
+    }
+    String::from_utf8(bytes).map_err(|_| TestdError::Invalid {
+        field,
+        reason: "owner metadata is not UTF-8",
+    })
+}
+
+fn toml_string_value(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        if name.trim() != key {
+            return None;
+        }
+        let value = value.trim().trim_matches('"');
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+fn resolved_tool_path(candidate: &Path, field: &'static str) -> Result<ResolvedToolFile, TestdError> {
+    if !candidate.is_absolute() || candidate.components().any(|component| {
+        matches!(component, Component::ParentDir)
+    }) {
+        return Err(TestdError::Invalid {
+            field,
+            reason: "rustup selected tool path is not absolute and traversal-free",
+        });
+    }
+    let canonical = std::fs::canonicalize(candidate).map_err(|_| TestdError::Invalid {
+        field,
+        reason: "rustup selected tool path cannot be canonicalized",
+    })?;
+    if !canonical.is_file() {
+        return Err(TestdError::Invalid {
+            field,
+            reason: "rustup selected tool path is not a file",
+        });
+    }
+    let metadata = std::fs::symlink_metadata(&canonical).map_err(|_| TestdError::Invalid {
+        field,
+        reason: "rustup selected tool metadata is unavailable",
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(TestdError::Invalid {
+            field,
+            reason: "rustup selected tool remains a symlink",
+        });
+    }
+    let bytes = std::fs::read(&canonical).map_err(|_| TestdError::Invalid {
+        field,
+        reason: "rustup selected tool cannot be read",
+    })?;
+    Ok(ResolvedToolFile {
+        path: canonical.to_string_lossy().into_owned(),
+        sha256: eliot_testd_core::sha256_hex(&bytes),
+    })
 }
 
 fn owner_home_path(variable: &str, suffix: &str) -> Result<String, TestdError> {
@@ -995,9 +1264,26 @@ fn owner_home_path(variable: &str, suffix: &str) -> Result<String, TestdError> {
 fn validate_productive_tool_environment(
     environment: &[(String, String)],
     nextest_path: &str,
+    target_root: &str,
+    cache_root: &str,
 ) -> Result<eliot_process::EnvironmentProjection, TestdError> {
     let values: BTreeMap<_, _> = environment.iter().cloned().collect();
+    let expected_keys = [
+        TESTD_ENV_NEXTEST_GATE,
+        TESTD_ENV_NEXTEST_SHA256,
+        TESTD_ENV_CARGO,
+        TESTD_ENV_RUSTC,
+        TESTD_ENV_CARGO_SHA256,
+        TESTD_ENV_RUSTC_SHA256,
+        TESTD_ENV_CARGO_HOME,
+        TESTD_ENV_RUSTUP_HOME,
+        TESTD_ENV_TOOLCHAIN,
+        TESTD_ENV_PATH,
+        "CARGO_TARGET_DIR",
+    ];
     if values.len() != environment.len()
+        || values.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !values.contains_key(*key))
         || values.get(TESTD_ENV_NEXTEST_GATE).map(String::as_str) != Some("1")
     {
         return Err(TestdError::Invalid {
@@ -1016,6 +1302,7 @@ fn validate_productive_tool_environment(
     let cargo = values.get(TESTD_ENV_CARGO).expect("checked above");
     let rustc = values.get(TESTD_ENV_RUSTC).expect("checked above");
     let expected_hashes = [
+        (TESTD_ENV_NEXTEST_SHA256, nextest_path),
         (TESTD_ENV_CARGO_SHA256, cargo),
         (TESTD_ENV_RUSTC_SHA256, rustc),
     ];
@@ -1035,6 +1322,15 @@ fn validate_productive_tool_environment(
             });
         }
     }
+    if values
+        .get(TESTD_ENV_TOOLCHAIN)
+        .is_none_or(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+    {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive environment is missing the owner-selected toolchain",
+        });
+    }
     for key in [TESTD_ENV_CARGO_HOME, TESTD_ENV_RUSTUP_HOME] {
         let path = values.get(key).ok_or(TestdError::Invalid {
             field: "tool_environment",
@@ -1046,6 +1342,14 @@ fn validate_productive_tool_environment(
                 reason: "productive toolchain home is not an existing absolute directory",
             });
         }
+    }
+    if values.get("CARGO_TARGET_DIR").map(String::as_str) != Some(target_root)
+        || values.get(TESTD_ENV_CARGO_HOME).map(String::as_str) != Some(cache_root)
+    {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive roots do not equal the admitted target/cache roots",
+        });
     }
     let path_value = values.get(TESTD_ENV_PATH).ok_or(TestdError::Invalid {
         field: "tool_environment",
@@ -1154,7 +1458,7 @@ pub enum ValidatedDispatchDriveOutcome {
 /// contour delivers the admitted generation root.
 pub async fn drive_validated_dispatch_material(
     material: &crate::testd_material::ValidatedTestdMaterial,
-    generation_root: &str,
+    source_root: &str,
     now_unix_ms: u64,
 ) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
     if material.cancelled {
@@ -1162,41 +1466,159 @@ pub async fn drive_validated_dispatch_material(
             job_id: material.job_id.clone(),
         });
     }
-    let program_path = if material.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+    let source_root = Path::new(source_root);
+    let store_path = testd_store_path(source_root)?;
+    let store = TestdStore::open(store_path, RetryPolicy::default())?;
+    let job = store
+        .get(&material.job_id)?
+        .ok_or_else(|| TestdError::Invalid {
+            field: "job_id",
+            reason: "admitted dispatch has no canonical TestD job row",
+        })?;
+    job.target_roots.validate()?;
+    let observed_source = std::fs::canonicalize(source_root).map_err(|_| TestdError::Invalid {
+        field: "source_root",
+        reason: "admitted source root cannot be canonicalized",
+    })?;
+    let canonical_job_source = std::fs::canonicalize(&job.target_roots.source_root).map_err(|_| {
+        TestdError::Invalid {
+            field: "source_root",
+            reason: "canonical TestD source root cannot be canonicalized",
+        }
+    })?;
+    if observed_source != canonical_job_source
+        || job.invocation.profile != material.profile
+        || job.process.generation != material.generation
+        || !job
+            .process
+            .authority_epoch
+            .is_same_authority(&material.epoch)
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    let program_path = if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
     } else {
         eliot_testd_core::TESTD_PROFILE_PROGRAM
     };
-    let tool = resolve_testd_tool(program_path)?;
+    let tool = resolve_testd_tool_at(program_path, &canonical_job_source)?;
+    let tool_environment = bind_tool_environment_to_roots(
+        &job.invocation.profile,
+        tool.environment,
+        &job.target_roots.target_root,
+        &job.target_roots.cache_root,
+    )?;
     let params = TestdDerivedIntentParams {
         job_id: material.job_id.clone(),
-        operation_id: material.operation_id.clone(),
-        profile: material.profile.clone(),
+        operation_id: job.process.operation_id.clone(),
+        process_tree_id: job.process.process_tree_id.clone(),
+        profile: job.invocation.profile.clone(),
         generation: material.generation,
         session_nonce: material.nonce.clone(),
         executable_absolute: tool.executable_absolute,
         executable_sha256: tool.executable_sha256,
-        tool_environment: tool.environment,
-        generation_root: generation_root.to_owned(),
+        tool_environment,
+        generation_root: job.target_roots.source_root.clone(),
+        target_root: job.target_roots.target_root.clone(),
+        cache_root: job.target_roots.cache_root.clone(),
     };
     let intent = derive_testd_intent(&params)?;
+    let authority_epoch = material.epoch.clone();
     let authority = TestdDispatchAuthority::new()?;
     let request = authority.issue(&intent, &material.grant, now_unix_ms)?;
+    if request.invocation_digest() != job.process.invocation_digest {
+        return Err(TestdError::InvalidBinding);
+    }
+    let invocation_digest = crate::kernel_client::canonical_invocation_digest(&job.invocation)
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let admission_request = crate::kernel_client::TestdAdmissionRequest {
+        wire_id: crate::kernel_client::TESTD_ADMISSION_OPERATION.to_owned(),
+        wire_version: crate::kernel_client::TESTD_ADMISSION_OPERATION_VERSION,
+        job_id: job.job_id.clone(),
+        invocation_id: job.invocation.request.request_id.to_string(),
+        invocation_digest,
+        authority_epoch: authority_epoch.clone(),
+        generation: material.generation,
+        request_digest: String::new(),
+    }
+    .with_computed_digest()
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let presented = crate::kernel_client::PresentedAdmission {
+        request: admission_request,
+        invocation: job.invocation.clone(),
+        process: request,
+        epoch: authority_epoch,
+        evidence_ref: material.operation_id.clone(),
+        cancelled: material.cancelled,
+    };
     let executor = compose_process_executor(Arc::new(authority));
-    let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(EvidenceCollector::default());
-    match executor.start(request, sink).await {
-        Ok(_) => Ok(ValidatedDispatchDriveOutcome::Completed {
-            job_id: material.job_id.clone(),
+    let receipt = worker::drive_admitted_one_shot_from_store(
+        &store,
+        presented,
+        &executor,
+        SERVICE_NAME,
+        ADMITTED_WORKER_LEASE_MS,
+        now_unix_ms,
+    )?;
+    match receipt.state.as_str() {
+        "Succeeded" => Ok(ValidatedDispatchDriveOutcome::Completed {
+            job_id: receipt.job_id,
         }),
-        Err(ProcessExecutionError::UnknownOutcome) => {
-            Ok(ValidatedDispatchDriveOutcome::ReconcileRequired {
-                job_id: material.job_id.clone(),
-            })
-        }
-        Err(error) => Err(TestdError::Contract(truncate_dispatch_detail(
-            &error.to_string(),
+        "Cancelled" => Ok(ValidatedDispatchDriveOutcome::Cancelled {
+            job_id: receipt.job_id,
+        }),
+        "RetryWait" => Ok(ValidatedDispatchDriveOutcome::ReconcileRequired {
+            job_id: receipt.job_id,
+        }),
+        state => Err(TestdError::Contract(format!(
+            "durable TestD worker returned non-terminal state {state}"
         ))),
     }
+}
+
+/// Returns the daemon-owned durable TestD state path for an admitted source
+/// root. The child never creates a new owner store for a missing source tree.
+pub fn testd_store_path(source_root: &Path) -> Result<PathBuf, TestdError> {
+    if !source_root.is_absolute() || !source_root.is_dir() {
+        return Err(TestdError::Invalid {
+            field: "source_root",
+            reason: "admitted source root must be an existing absolute directory",
+        });
+    }
+    let state_root = source_root.join(".eliot");
+    if !state_root.is_dir() {
+        return Err(TestdError::Invalid {
+            field: "testd_state",
+            reason: "daemon-owned .eliot state directory is unavailable",
+        });
+    }
+    Ok(state_root.join("testd-state.redb"))
+}
+
+fn bind_tool_environment_to_roots(
+    profile: &str,
+    environment: Vec<(String, String)>,
+    target_root: &str,
+    cache_root: &str,
+) -> Result<Vec<(String, String)>, TestdError> {
+    let mut values = BTreeMap::new();
+    for (key, value) in environment {
+        if values.insert(key.clone(), value).is_some() {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "owner environment contains duplicate keys",
+            });
+        }
+    }
+    if profile != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE && !values.is_empty() {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "probe profile has unexpected owner environment",
+        });
+    }
+    values.insert("CARGO_TARGET_DIR".to_owned(), target_root.to_owned());
+    values.insert("CARGO_HOME".to_owned(), cache_root.to_owned());
+    Ok(values.into_iter().collect())
 }
 
 /// Drives exactly one admitted one-shot claim through the worker.
@@ -1216,8 +1638,7 @@ pub fn run_admitted_one_shot<E: ProcessExecutor + 'static>(
     now: u64,
 ) -> Result<TestReceipt, TestdError> {
     let store = composition.store();
-    worker::drive_admitted_one_shot(
-        composition,
+    worker::drive_admitted_one_shot_from_store(
         store,
         presented,
         executor,
@@ -1227,7 +1648,7 @@ pub fn run_admitted_one_shot<E: ProcessExecutor + 'static>(
     )
 }
 
-fn receipt(job: &TestJob) -> TestReceipt {
+pub(crate) fn receipt(job: &TestJob) -> TestReceipt {
     TestReceipt {
         job_id: job.job_id.clone(),
         operation_id: job.process.operation_id.clone(),
@@ -1797,6 +2218,7 @@ mod tests {
         let params = super::TestdDerivedIntentParams {
             job_id: "job-testd-drive-1".to_owned(),
             operation_id: "testd-op-drive-1".to_owned(),
+            process_tree_id: "job-testd-drive-1-tree".to_owned(),
             profile: TESTD_ADMITTED_PROFILE.to_owned(),
             generation: 1,
             session_nonce: "testd-drive-session-01".to_owned(),
@@ -1804,13 +2226,22 @@ mod tests {
             executable_sha256: tool.executable_sha256.clone(),
             tool_environment: Vec::new(),
             generation_root: cwd.to_string_lossy().into_owned(),
+            target_root: cwd.to_string_lossy().into_owned(),
+            cache_root: cwd.to_string_lossy().into_owned(),
         };
         let intent =
             super::derive_testd_intent(&params).expect("intent must derive from the binding");
         assert_eq!(intent.executable(), tool.executable_absolute.as_str());
         assert_eq!(intent.executable_sha256(), tool.executable_sha256.as_str());
         assert_eq!(intent.argv().to_vec(), vec!["--version".to_owned()]);
-        assert!(intent.environment().non_secret().is_empty());
+        assert_eq!(
+            intent.environment().non_secret().get("CARGO_TARGET_DIR"),
+            Some(&cwd.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            intent.environment().non_secret().get("CARGO_HOME"),
+            Some(&cwd.to_string_lossy().into_owned())
+        );
         assert_eq!(
             intent.resource_limits().wall_timeout_ms(),
             TESTD_PROFILE_WALL_TIMEOUT_MS
@@ -1870,6 +2301,7 @@ mod tests {
             operation_id: "testd-op-1".to_owned(),
             profile: "cargo-test".to_owned(),
             profile_binding_digest: "a".repeat(64),
+            environment: Vec::new(),
             request_digest: "b".repeat(64),
             admission_digest: "c".repeat(64),
             epoch,

@@ -44,18 +44,21 @@ use eliot_contracts::{
 };
 use eliot_coordination::CoordinationOwner;
 use eliot_diagnostic::{
-    DiagnosticClassifier, DiagnosticInput, DiagnosticSeverity, DiagnosticStatus,
+    DiagnosticClassifier, DiagnosticEvent, DiagnosticInput, DiagnosticSeverity, DiagnosticStatus,
     CONTRACT_NAME as DIAGNOSTIC_CONTRACT,
 };
 use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
 use eliot_finish::{DescendantClosure, FinishDecisionReceipt, FinishService};
+use eliot_instrument_nextest::{
+    NextestTestEvent, NextestTestStatus, catalog_test_id, parse_test_events,
+};
 use eliot_instrument_api::{
     EvidenceAxes, EvidenceCoverage, EvidenceFreshness, EvidenceStatus, ExecutionStatus,
     InstrumentInvocation, InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource,
     VerificationOutcome, VerificationRun,
 };
 use eliot_testd_core::{
-    JobState, RawArtifactStream, ReceiptBinding, TestJob, VerificationReceipt,
+    JobState, RawArtifactStream, ReceiptBinding, TestJob, TestdStore, VerificationReceipt,
 };
 use eliot_maintenance::{
     MaintenanceController, MaintenanceError, MaintenanceJob, MaintenanceStateStore,
@@ -1153,8 +1156,8 @@ pub struct CanonicalVerifierReceiptBinding {
     pub cache_root: String,
 }
 
-impl From<&ReceiptBinding> for CanonicalVerifierReceiptBinding {
-    fn from(binding: &ReceiptBinding) -> Self {
+impl CanonicalVerifierReceiptBinding {
+    fn from_binding(binding: &ReceiptBinding, execution: ExecutionStatus) -> Self {
         Self {
             job_id: binding.job_id.clone(),
             operation_id: binding.operation_id.clone(),
@@ -1163,6 +1166,7 @@ impl From<&ReceiptBinding> for CanonicalVerifierReceiptBinding {
             authority_epoch: binding.authority_epoch.clone(),
             invocation_id: binding.invocation_id.clone(),
             invocation_digest: binding.invocation_digest.clone(),
+            execution,
             allowed_contour_root: binding.allowed_contour_root.clone(),
             source_root: binding.source_root.clone(),
             target_root: binding.target_root.clone(),
@@ -1413,8 +1417,8 @@ impl CanonicalVerifierExecutionFact {
             ));
         }
 
-        let mut canonical_receipt = CanonicalVerifierReceiptBinding::from(&receipt_binding);
-        canonical_receipt.execution = receipt.execution;
+        let canonical_receipt =
+            CanonicalVerifierReceiptBinding::from_binding(&receipt_binding, receipt.execution);
         let fact = Self {
             task_id: task_id.as_str().to_owned(),
             task_revision,
@@ -2771,20 +2775,6 @@ fn testd_finished_clock(job: &TestJob) -> ClockReading {
     }
 }
 
-fn testd_artifact_order(stream: RawArtifactStream, handle: &str) -> (u8, u64, String) {
-    let mut parts = handle.split('-');
-    let index = parts
-        .nth(3)
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(u64::MAX);
-    let stream = match stream {
-        RawArtifactStream::Stdout => 0,
-        RawArtifactStream::Stderr => 1,
-        RawArtifactStream::Unknown => 2,
-    };
-    (stream, index, handle.to_owned())
-}
-
 /// Converts the durable TestD bytes into the standard raw-evidence contract.
 /// TestD's storage digest is length-domain-separated; the verifier receives a
 /// fresh standard digest over the exact retained bytes, so no handle or
@@ -2797,7 +2787,11 @@ fn testd_raw_evidence(
         .validate(job)
         .map_err(|error| CompositionError::Recovery(format!("TestD receipt validation failed: {error}")))?;
     let mut artifacts = receipt.raw_artifacts.clone();
-    artifacts.sort_by_key(|artifact| testd_artifact_order(artifact.stream, &artifact.handle));
+    artifacts.sort_by(|left, right| {
+        left.capture_sequence
+            .cmp(&right.capture_sequence)
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
     artifacts
         .into_iter()
         .map(|artifact| {
@@ -2840,6 +2834,7 @@ fn normalize_nextest_run(
     run: &mut VerificationRun,
     job: &TestJob,
     plan: &CanonicalVerifierPlanBinding,
+    receipt: &VerificationReceipt,
     raw: &[RawEvidence],
     observed_at: ClockReading,
 ) -> Result<(), CompositionError> {
@@ -2848,112 +2843,187 @@ fn normalize_nextest_run(
             "nextest normalization has no raw artifact".to_owned(),
         ));
     }
-    let classifier = DiagnosticClassifier::default();
+    let tool = receipt.tool_observation.as_ref().ok_or_else(|| {
+        CompositionError::Recovery(
+            "productive TestD receipt has no owner-observed tool identity".to_owned(),
+        )
+    })?;
+    tool.validate()
+        .map_err(|error| CompositionError::Recovery(format!("tool observation invalid: {error}")))?;
+    let stdout = raw
+        .iter()
+        .filter(|evidence| {
+            evidence.content_type == eliot_instrument_nextest::NEXTEST_STDOUT_CONTENT_TYPE
+                || evidence.content_type == "application/json"
+        })
+        .collect::<Vec<_>>();
+    if stdout.is_empty() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer has no stdout event stream".to_owned(),
+        ));
+    }
+    let mut stream = Vec::new();
+    let mut spans = Vec::new();
+    for evidence in stdout {
+        let start = stream.len();
+        stream.extend_from_slice(&evidence.bytes);
+        spans.push((
+            start,
+            stream.len(),
+            evidence.artifact_id.clone(),
+        ));
+    }
+    let events = parse_test_events(&stream).map_err(|error| {
+        CompositionError::Recovery(format!(
+            "registered nextest normalizer rejected the joined stdout stream: {error}"
+        ))
+    })?;
     let mut normalized = Vec::new();
-    for evidence in raw {
-        for line in evidence.bytes.split(|byte| *byte == b'\n') {
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            let value: serde_json::Value = serde_json::from_slice(line).map_err(|error| {
+    let classifier = DiagnosticClassifier::default();
+    let mut line_start = 0usize;
+    let mut line_events = Vec::new();
+    for line_end in stream
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+        .chain((!stream.is_empty() && !stream.ends_with(b"\n")).then_some(stream.len()))
+    {
+        if line_end < line_start {
+            continue;
+        }
+        let line = &stream[line_start..line_end];
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            line_events.extend(parse_test_events(line).map_err(|error| {
                 CompositionError::Recovery(format!(
-                    "registered nextest normalizer rejected JSONL: {error}"
+                    "registered nextest normalizer could not map joined event: {error}"
                 ))
-            })?;
-            if value.get("type").and_then(serde_json::Value::as_str) != Some("test")
-                || !matches!(
-                    value.get("event").and_then(serde_json::Value::as_str),
-                    Some("completed" | "COMPLETED")
-                )
-            {
-                continue;
+            })?);
+        }
+        line_start = line_end.saturating_add(1);
+    }
+    if line_events.len() != events.len() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer lost an event while joining stdout chunks".to_owned(),
+        ));
+    }
+    let mut line_start = 0usize;
+    let mut event_index = 0usize;
+    for line_end in stream
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+        .chain((!stream.is_empty() && !stream.ends_with(b"\n")).then_some(stream.len()))
+    {
+        let line = &stream[line_start..line_end];
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            let line_event_count = parse_test_events(line)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?
+                .len();
+            let handles = spans
+                .iter()
+                .filter(|(start, end, _)| *start < line_end && *end > line_start)
+                .map(|(_, _, artifact_id)| artifact_id.clone())
+                .collect::<Vec<_>>();
+            if handles.is_empty() && line_event_count != 0 {
+                return Err(CompositionError::Recovery(
+                    "nextest event has no raw artifact lineage".to_owned(),
+                ));
             }
-            let name = value
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    CompositionError::Recovery(
-                        "registered nextest normalizer found a completed event without a test name"
-                            .to_owned(),
-                    )
+            for _ in 0..line_event_count {
+                let event = &line_events[event_index];
+                event_index += 1;
+                let NextestTestEvent::Completed { name, status } = event else {
+                    continue;
+                };
+                let status_label = nextest_status_label(*status);
+                let severity = match status {
+                    NextestTestStatus::Pass => DiagnosticSeverity::Information,
+                    NextestTestStatus::Fail
+                    | NextestTestStatus::Timeout
+                    | NextestTestStatus::Leak
+                    | NextestTestStatus::Cancelled => DiagnosticSeverity::Error,
+                    NextestTestStatus::Skip => DiagnosticSeverity::Warning,
+                };
+                let raw_observation_ref = handles.first().cloned().ok_or_else(|| {
+                    CompositionError::Recovery("nextest event has no raw artifact".to_owned())
                 })?;
-            let status = value
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    CompositionError::Recovery(
-                        "registered nextest normalizer found a completed event without a status"
-                            .to_owned(),
-                    )
-                })?;
-            let severity = if matches!(status, "PASS" | "pass") {
-                DiagnosticSeverity::Information
-            } else if matches!(status, "FAIL" | "fail" | "TIMEOUT" | "timeout") {
-                DiagnosticSeverity::Error
-            } else {
-                DiagnosticSeverity::Warning
-            };
-            let diagnostic = classifier
-                .admit(DiagnosticInput {
-                    project_id: job.invocation.request.product_id.to_string(),
-                    task_id: job
-                        .invocation
-                        .request
-                        .task_id
-                        .as_ref()
-                        .map(ToString::to_string),
-                    tool_id: job.invocation.instrument.to_string(),
-                    tool_version: plan.evaluator_version.to_string(),
-                    config_hash: plan.planned.verifier_config_hash.clone(),
-                    branch: job.invocation.target.clone(),
-                    commit: format!("{}:{}", plan.plan_id, plan.plan_revision),
-                    dirty_state_hash: plan.planned.verifier_config_hash.clone(),
-                    file_path: job.invocation.target.clone(),
-                    range: None,
-                    severity,
-                    rule_id: format!("nextest.test.{}", status.to_ascii_lowercase()),
-                    message: format!("nextest test {name} completed with status {status}"),
-                    raw_observation_ref: evidence.artifact_id.clone(),
-                    observed_at,
-                    status: if matches!(status, "PASS" | "pass") {
-                        DiagnosticStatus::Resolved
-                    } else {
-                        DiagnosticStatus::Active
-                    },
-                })
+                let diagnostic = DiagnosticEvent::from_input(DiagnosticInput {
+                        project_id: job.invocation.request.product_id.to_string(),
+                        task_id: job
+                            .invocation
+                            .request
+                            .task_id
+                            .as_ref()
+                            .map(ToString::to_string),
+                        tool_id: job.invocation.instrument.to_string(),
+                        tool_version: tool.nextest_identity(),
+                        config_hash: plan.planned.verifier_config_hash.clone(),
+                        branch: "unobserved".to_owned(),
+                        commit: "unobserved".to_owned(),
+                        dirty_state_hash: "unobserved".to_owned(),
+                        file_path: job.invocation.target.clone(),
+                        range: None,
+                        severity,
+                        rule_id: format!("nextest.test.{}", status_label.to_ascii_lowercase()),
+                        message: format!(
+                            "nextest test {name} completed with status {status_label}"
+                        ),
+                        raw_observation_ref: raw_observation_ref.clone(),
+                        observed_at,
+                        status: if matches!(*status, NextestTestStatus::Pass) {
+                            DiagnosticStatus::Resolved
+                        } else {
+                            DiagnosticStatus::Active
+                        },
+                    })
+                    .map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "registered diagnostic normalizer rejected nextest event: {error}"
+                        ))
+                    })?;
+                let diagnostic = classifier.admit(diagnostic).map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "registered diagnostic normalizer rejected nextest event: {error}"
+                        ))
+                    })?;
+                let evidence_id = ArtifactId::new(format!(
+                    "nextest-evidence-{}",
+                    sha256_hex(line)
+                ))
                 .map_err(|error| {
+                    CompositionError::Recovery(format!("normalized evidence id is invalid: {error}"))
+                })?;
+                let mut value = serde_json::to_value(&diagnostic).map_err(|error| {
                     CompositionError::Recovery(format!(
-                        "registered diagnostic normalizer rejected nextest event: {error}"
+                        "normalized diagnostic serialization failed: {error}"
                     ))
                 })?;
-            let evidence_id = ArtifactId::new(format!(
-                "nextest-evidence-{}",
-                sha256_hex(line)
-            ))
-            .map_err(|error| {
-                CompositionError::Recovery(format!("normalized evidence id is invalid: {error}"))
-            })?;
-            let value = serde_json::to_value(&diagnostic).map_err(|error| {
-                CompositionError::Recovery(format!("normalized diagnostic serialization failed: {error}"))
-            })?;
-            normalized.push(NormalizedEvidence {
-                evidence_id,
-                raw_artifact_id: evidence.artifact_id.clone(),
-                normalizer: ContractId::new(DIAGNOSTIC_CONTRACT).map_err(|error| {
-                    CompositionError::Recovery(format!("diagnostic contract id is invalid: {error}"))
-                })?,
-                kind: "nextest.test".to_owned(),
-                summary: format!("nextest test {name} completed with status {status}"),
-                value,
-                axes: EvidenceAxes::observed(),
-                freshness: run.freshness,
-                coverage: if plan.required_test_ids.contains(name) {
-                    run.coverage
-                } else {
-                    EvidenceCoverage::PartialForScope
-                },
-            });
+                value["raw_artifact_handles"] = serde_json::json!(handles);
+                normalized.push(NormalizedEvidence {
+                    evidence_id,
+                    raw_artifact_id: raw_observation_ref,
+                    normalizer: ContractId::new(DIAGNOSTIC_CONTRACT).map_err(|error| {
+                        CompositionError::Recovery(format!("diagnostic contract id is invalid: {error}"))
+                    })?,
+                    kind: "nextest.test".to_owned(),
+                    summary: format!("nextest test {name} completed with status {status_label}"),
+                    value,
+                    axes: EvidenceAxes::observed(),
+                    freshness: run.freshness,
+                    coverage: if plan.required_test_ids.contains(catalog_test_id(name)) {
+                        run.coverage
+                    } else {
+                        EvidenceCoverage::PartialForScope
+                    },
+                });
+            }
         }
+        line_start = line_end.saturating_add(1);
+    }
+    if event_index != line_events.len() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer did not consume every parsed event".to_owned(),
+        ));
     }
     if normalized.is_empty() {
         return Err(CompositionError::Recovery(
@@ -2964,6 +3034,17 @@ fn normalize_nextest_run(
     run.validate().map_err(|error| {
         CompositionError::Recovery(format!("normalized VerificationRun is invalid: {error}"))
     })
+}
+
+const fn nextest_status_label(status: NextestTestStatus) -> &'static str {
+    match status {
+        NextestTestStatus::Pass => "PASS",
+        NextestTestStatus::Fail => "FAIL",
+        NextestTestStatus::Skip => "SKIP",
+        NextestTestStatus::Timeout => "TIMEOUT",
+        NextestTestStatus::Leak => "LEAK",
+        NextestTestStatus::Cancelled => "CANCELLED",
+    }
 }
 
 pub(crate) fn evaluate_testd_verification_current(
@@ -2990,7 +3071,7 @@ pub(crate) fn evaluate_testd_verification_current(
             "registered nextest evaluator rejected durable TestD evidence: {error}"
         ))
     })?;
-    normalize_nextest_run(&mut run, job, plan, &raw, finished_at)?;
+    normalize_nextest_run(&mut run, job, plan, receipt, &raw, finished_at)?;
     Ok(run)
 }
 
@@ -3092,7 +3173,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let task = self.owners.task.task(task_id).ok_or_else(|| {
             CompositionError::Recovery(format!("canonical task {} is absent", task_id.as_str()))
         })?;
-        if task.task_id != *task_id || task.revision != task_revision || task.state_fence != *fence {
+        if task.task_id != *task_id || task.revision != task_revision || task.state_fence != fence {
             return Err(CompositionError::Recovery(
                 "canonical task owner is stale for verifier rehydration".to_owned(),
             ));

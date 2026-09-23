@@ -331,9 +331,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             return Err(FinishError::FenceMismatch.into());
         }
         if identity.request.metadata.task_id.as_ref() != Some(task_id) {
-            return Err(FinishAttemptError::Canonical(
+            return Err(FinishError::Canonical(
                 eliot_canonical::CanonicalError::TaskBindingMismatch,
-            ));
+            )
+            .into());
         }
         let expected_revision = fence
             .task_revision

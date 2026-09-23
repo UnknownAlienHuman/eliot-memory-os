@@ -1058,6 +1058,71 @@ pub struct NormalizedEvidence {
     pub execution: ExecutionStatus,
 }
 
+/// Owner-observed identity of the productive verifier toolchain.
+///
+/// These paths and digests are captured from the admitted process environment
+/// after the resolver has asked rustup for the selected toolchain executables.
+/// A plan/evaluator version is not a substitute for this observation, and a
+/// rustup shim digest is not accepted as the selected cargo/rustc identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdToolObservation {
+    pub nextest_path: String,
+    pub nextest_sha256: String,
+    pub cargo_path: String,
+    pub cargo_sha256: String,
+    pub rustc_path: String,
+    pub rustc_sha256: String,
+    pub selected_toolchain: String,
+}
+
+impl TestdToolObservation {
+    /// Validates the owner-observed executable identity without consulting a
+    /// caller or ambient locator.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        for (field, value) in [
+            ("nextest_path", self.nextest_path.as_str()),
+            ("cargo_path", self.cargo_path.as_str()),
+            ("rustc_path", self.rustc_path.as_str()),
+        ] {
+            validate_text(value, field)?;
+            if !Path::new(value).is_absolute()
+                || Path::new(value)
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+            {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "owner-observed tool identity must use absolute traversal-free paths",
+                });
+            }
+        }
+        validate_text(&self.selected_toolchain, "selected_toolchain")?;
+        for (field, value) in [
+            ("nextest_sha256", self.nextest_sha256.as_str()),
+            ("cargo_sha256", self.cargo_sha256.as_str()),
+            ("rustc_sha256", self.rustc_sha256.as_str()),
+        ] {
+            if !is_binding_digest(value) {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "owner-observed tool identity requires a lowercase SHA-256",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Stable diagnostic identity derived only from the observed nextest
+    /// executable, never from the evaluator contract version.
+    pub fn nextest_identity(&self) -> String {
+        format!(
+            "path={};sha256={}",
+            self.nextest_path, self.nextest_sha256
+        )
+    }
+}
+
 /// Candidate verification receipt accepted by the canonical finish boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1080,6 +1145,11 @@ pub struct VerificationReceipt {
     /// TestD-owner observation after terminal inspection and stream closure.
     #[serde(default)]
     pub finished_at: ClockReading,
+    /// Productive profile tool identity observed by the TestD owner. Probe
+    /// and refused/unknown paths may omit it; a productive succeeded attempt
+    /// cannot be accepted without it.
+    #[serde(default)]
+    pub tool_observation: Option<TestdToolObservation>,
     pub raw_artifacts: Vec<RawArtifact>,
     pub normalized: Vec<NormalizedEvidence>,
 }
@@ -1177,6 +1247,13 @@ impl VerificationReceipt {
         self.finished_at
             .validate()
             .map_err(|_| TestdError::InvalidBinding)?;
+        if let Some(observation) = &self.tool_observation {
+            observation.validate()?;
+        } else if job.invocation.profile == TESTD_PRODUCTIVE_PROFILE
+            && matches!(self.execution, ExecutionStatus::Succeeded)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
         if let (Some(start), Some(finish)) =
             (self.started_at.known_time_ms, self.finished_at.known_time_ms)
             && finish < start
@@ -1217,6 +1294,7 @@ pub struct EvidenceCollector {
     records: Arc<Mutex<Vec<eliot_process::ProcessEvidence>>>,
     raw_artifacts: Arc<Mutex<BTreeMap<String, RawArtifact>>>,
     next_capture_sequence: Arc<AtomicU64>,
+    tool_observation: Arc<Mutex<Option<TestdToolObservation>>>,
 }
 
 impl EvidenceCollector {
@@ -1259,6 +1337,27 @@ impl EvidenceCollector {
             captured_at,
         )?;
         self.insert_raw_artifact(artifact)
+    }
+
+    /// Records the exact productive tool identity observed at the owner
+    /// boundary before the consuming process starts.
+    pub fn record_tool_observation(
+        &self,
+        observation: TestdToolObservation,
+    ) -> Result<(), TestdError> {
+        observation.validate()?;
+        let mut current = self
+            .tool_observation
+            .lock()
+            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
+        if let Some(existing) = &*current {
+            if existing != &observation {
+                return Err(TestdError::InvalidBinding);
+            }
+        } else {
+            *current = Some(observation);
+        }
+        Ok(())
     }
 
     fn insert_raw_artifact(&self, artifact: RawArtifact) -> Result<(), TestdError> {
@@ -1357,6 +1456,10 @@ impl EvidenceCollector {
             execution,
             started_at,
             finished_at,
+            tool_observation: self
+                .tool_observation
+                .lock()
+                .map_or(None, |observation| observation.clone()),
             raw_artifacts,
             normalized,
         }

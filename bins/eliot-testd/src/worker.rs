@@ -72,6 +72,7 @@ use eliot_process::{
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
     Lease, NormalizedEvidence, RawArtifactStream, TestJob, TestdError, TestdStore,
+    TestdToolObservation,
     evaluate_testd_verification, issue_process_admission,
 };
 
@@ -121,7 +122,30 @@ const INLINE_STREAM_HANDLE_PREFIX: &str = "testd-inline-stream";
 /// store, so the lease is always released. Errors are fail-closed and carry
 /// no raw output.
 pub fn drive_admitted_one_shot<E: ProcessExecutor + 'static>(
-    composition: &TestdComposition,
+    _composition: &TestdComposition,
+    store: &TestdStore,
+    presented: PresentedAdmission,
+    executor: &E,
+    owner: &str,
+    lease_ms: u64,
+    now: u64,
+) -> Result<TestReceipt, TestdError> {
+    drive_admitted_one_shot_from_store(
+        store,
+        presented,
+        executor,
+        owner,
+        lease_ms,
+        now,
+    )
+}
+
+/// Drives one admitted shot against the already-open canonical TestD store.
+///
+/// The production child uses this entry after opening the daemon-owned store;
+/// it shares the exact validation, claim, supervision, and finish path with
+/// the composition wrapper above.
+pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     presented: PresentedAdmission,
     executor: &E,
@@ -177,7 +201,6 @@ pub fn drive_admitted_one_shot<E: ProcessExecutor + 'static>(
         .clone()
         .ok_or_else(|| TestdError::Corrupt("claimed job carries no lease".to_owned()))?;
     drive_claimed(
-        composition,
         store,
         &job,
         &mut lease,
@@ -196,7 +219,6 @@ pub fn drive_admitted_one_shot<E: ProcessExecutor + 'static>(
     reason = "DISPATCH-LIVE residual: one admitted-shot context (composition, store, job, lease, presented material, executor, owner, now); a params-struct refactor is deferred until the dispatch-launch seam fixes the call shape, never a bare allow"
 )]
 fn drive_claimed<E: ProcessExecutor + 'static>(
-    composition: &TestdComposition,
     store: &TestdStore,
     job: &TestJob,
     lease: &mut Lease,
@@ -213,11 +235,19 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
             &EvidenceCollector::default(),
             format!("refused foreign or stale presentation without executing: {binding}"),
         )?;
-        return composition.status(&job.job_id);
+        return Ok(crate::receipt(
+            &store
+                .get(&job.job_id)?
+                .ok_or_else(|| TestdError::Corrupt("job disappeared after refusal".to_owned()))?,
+        ));
     }
     if presented.cancelled {
         store.cancel(&job.job_id, Some(lease), owner, current_clock_ms())?;
-        return composition.status(&job.job_id);
+        return Ok(crate::receipt(
+            &store.get(&job.job_id)?.ok_or_else(|| {
+                TestdError::Corrupt("job disappeared after cancellation".to_owned())
+            })?,
+        ));
     }
     // Fresh bound admission: rebuild the Kernel request from the CLAIMED
     // durable job and seal it with the single-use replay of the presented
@@ -254,17 +284,44 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
                 &EvidenceCollector::default(),
                 format!("fresh admission refused without executing: {error}"),
             )?;
-            return composition.status(&job.job_id);
+            return Ok(crate::receipt(
+                &store.get(&job.job_id)?.ok_or_else(|| {
+                    TestdError::Corrupt("job disappeared after admission refusal".to_owned())
+                })?,
+            ));
         }
     };
     let collector = Arc::new(EvidenceCollector::default());
+    if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        let observation = match observe_tool_identity(permit.request()) {
+            Ok(observation) => observation,
+            Err(error) => {
+                finish_unknown(
+                    store,
+                    job,
+                    lease,
+                    &collector,
+                    format!(
+                        "productive tool identity was not owner-observed; no process started: {error}"
+                    ),
+                )?;
+                return Ok(crate::receipt(
+                    &store.get(&job.job_id)?.ok_or_else(|| {
+                        TestdError::Corrupt("job disappeared after tool observation".to_owned())
+                    })?,
+                ));
+            }
+        };
+        collector.record_tool_observation(observation)?;
+    }
     let sink: Arc<dyn eliot_process::ProcessEvidenceSink> = collector.clone();
     // The consuming start proves nothing about the outcome by itself:
     // `start_claimed` maps every executor failure (including the
     // executor-owned `UnknownOutcome`) onto `TestdError`, so the single
     // `inspect` in `observe_and_finish` is the only observation that
     // dispositions the attempt.
-    let start_result = block_on_one_shot(composition.start_claimed(
+    let start_result = block_on_one_shot(crate::start_claimed_from_store(
+        store,
         job,
         lease,
         current_clock_ms(),
@@ -292,7 +349,70 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         started_at,
         lease_ms,
     )?;
-    composition.status(&job.job_id)
+    Ok(crate::receipt(
+        &store
+            .get(&job.job_id)?
+            .ok_or_else(|| TestdError::Corrupt("job disappeared after finish".to_owned()))?,
+    ))
+}
+
+/// Revalidates the exact tool identity carried by the admitted productive
+/// ProcessRequest immediately before the consuming start. The resolver has
+/// already selected cargo/rustc through rustup; this readback binds the
+/// resulting files and nextest executable into the durable receipt.
+fn observe_tool_identity(
+    request: &ProcessRequest,
+) -> Result<TestdToolObservation, TestdError> {
+    let environment = request.environment().non_secret();
+    let required = |key: &'static str| {
+        environment.get(key).cloned().ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive process request is missing owner-observed tool identity",
+        })
+    };
+    let nextest_path = request.executable().to_owned();
+    let nextest_sha256 = request.executable_sha256().to_owned();
+    let cargo_path = required(crate::TESTD_ENV_CARGO)?;
+    let cargo_sha256 = required(crate::TESTD_ENV_CARGO_SHA256)?;
+    let rustc_path = required(crate::TESTD_ENV_RUSTC)?;
+    let rustc_sha256 = required(crate::TESTD_ENV_RUSTC_SHA256)?;
+    let selected_toolchain = required(crate::TESTD_ENV_TOOLCHAIN)?;
+    let observation = TestdToolObservation {
+        nextest_path,
+        nextest_sha256,
+        cargo_path,
+        cargo_sha256,
+        rustc_path,
+        rustc_sha256,
+        selected_toolchain,
+    };
+    observation.validate()?;
+    for (path, expected) in [
+        (
+            observation.nextest_path.as_str(),
+            observation.nextest_sha256.as_str(),
+        ),
+        (
+            observation.cargo_path.as_str(),
+            observation.cargo_sha256.as_str(),
+        ),
+        (
+            observation.rustc_path.as_str(),
+            observation.rustc_sha256.as_str(),
+        ),
+    ] {
+        let bytes = std::fs::read(path).map_err(|_| TestdError::Invalid {
+            field: "tool_environment",
+            reason: "owner-observed tool cannot be reread before start",
+        })?;
+        if eliot_testd_core::sha256_hex(&bytes) != expected {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "owner-observed tool changed before start",
+            });
+        }
+    }
+    Ok(observation)
 }
 
 /// Supervises the started operation to a bounded terminal observation and
@@ -948,7 +1068,11 @@ mod tests {
         assert_eq!(evidence.stderr_ref(), Some("raw:legacy-stderr"));
 
         let collector = EvidenceCollector::default();
-        let synthetic = capture_inline_previews(&collector, std::slice::from_ref(&evidence))
+        let synthetic = capture_inline_previews(
+            &collector,
+            std::slice::from_ref(&evidence),
+            observation_clock(current_clock_ms()),
+        )
             .expect("inline capture succeeds");
         assert_eq!(synthetic, vec!["testd-inline-stream-0-stdout".to_owned()]);
         assert!(

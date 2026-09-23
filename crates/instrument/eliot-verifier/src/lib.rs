@@ -14,6 +14,7 @@ use eliot_instrument_api::{
 use eliot_instrument_nextest::{
     NEXTEST_INSTRUMENT, NEXTEST_STDERR_CONTENT_TYPE, NEXTEST_STDOUT_CONTENT_TYPE,
     NextestTestEvent, NextestTestStatus, parse_jsonl, parse_test_events,
+    catalog_test_id,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -731,9 +732,9 @@ pub fn evaluate_current(
         let NextestTestEvent::Completed { name, status } = event else {
             continue;
         };
-        completed_names.insert(name.clone());
+        completed_names.insert(catalog_test_id(&name).to_owned());
         if status == NextestTestStatus::Pass {
-            passed_names.insert(name);
+            passed_names.insert(catalog_test_id(&name).to_owned());
         }
     }
     let has_missing = required_test_ids.difference(&passed_names).next().is_some();

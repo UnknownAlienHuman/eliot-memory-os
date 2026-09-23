@@ -1184,6 +1184,7 @@ pub fn reconcile_testd_admission(
     }
     let recomputed = build_testd_admission(
         request,
+        &admission.profile,
         operation_id,
         envelope.cancellation,
         admission.admitted_at_unix_nanos,

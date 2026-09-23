@@ -97,15 +97,11 @@ fn bootstrap_and_run_once() -> i32 {
             let Some(material) = presented else {
                 return deny();
             };
-            // Validated session-bound material drives the bounded admitted
-            // probe through the DISPATCH-WIRE seam
-            // (`drive_validated_dispatch_material` in `eliot-testd`): the
-            // intent derives only from the admitted profile binding plus the
-            // installed tool bytes, the single permit issues through the
-            // ephemeral dispatch authority, and the real composed executor
-            // runs exactly one start. The closed Kernel bootstrap and
-            // advertisement above still gate production until the dispatch
-            // contour lands; this arm is exercised by the module tests.
+            // Validated session-bound material drives the admitted durable
+            // worker through the DISPATCH-WIRE seam. The intent derives from
+            // the canonical job and admitted profile binding, while the
+            // supervised worker owns the durable claim, observation, capture,
+            // and finish path.
             drive_material_probe(&material)
         }
         GateDecision::DenyNotAdvertised | GateDecision::DenyNoPresentedAttempt => deny(),
@@ -128,21 +124,22 @@ fn acquire_presented_admission() -> Option<ValidatedTestdMaterial> {
     read_testd_material().unwrap_or_default()
 }
 
-/// Drives one validated dispatch file through the bounded admitted probe.
+/// Drives one validated dispatch file through the admitted durable worker.
 ///
 /// Thin binary projection over the DISPATCH-WIRE seam
 /// ([`drive_validated_dispatch_material`][eliot_testd::drive_validated_dispatch_material]):
-/// the intent derives only from the admitted profile binding plus the
-/// installed tool bytes, the single permit issues through the ephemeral
-/// dispatch authority over the validated grant, and the real composed
-/// executor runs exactly one start. Cancelled admissions project
-/// cancellation without executing. Every post-derivation outcome maps to a
-/// typed non-78 exit; a refused derivation or issuance (nothing executed)
-/// fails the shot without claiming admission semantics.
+/// the intent derives from the daemon-owned canonical job and admitted profile
+/// binding, the permit issues through the dispatch authority over the
+/// validated grant, and the supervised worker owns one durable claim and
+/// finish. Cancelled admissions project cancellation without executing. Every
+/// refused derivation or issuance fails the shot closed.
 fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
+    let Some(source_root) = generation_root_cwd() else {
+        return EXIT_ADMITTED_DRIVE_FAILED;
+    };
     match block_on_drive(drive_validated_dispatch_material(
         material,
-        &generation_root_cwd(),
+        &source_root,
         now_ms(),
     )) {
         Ok(ValidatedDispatchDriveOutcome::Completed { .. }) => EXIT_ADMITTED_COMPLETED,
@@ -154,23 +151,15 @@ fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
     }
 }
 
-/// Working directory for the bounded probe: the dispatch locator
-/// directory (the executable directory carrying the material file), which
-/// exists by construction when material was delivered.
-///
-/// Deferred: the production contour delivers the admitted generation
-/// (source) root for the working directory; the bounded `cargo --version`
-/// probe reads no working directory, so the existing locator directory is
-/// the honest closed stand-in. The derivation re-validates it as an
-/// existing directory before any start.
-fn generation_root_cwd() -> String {
-    if let Some(path) = eliot_testd::testd_material::testd_material_path()
-        && let Some(directory) = path.parent()
-        && directory.is_dir()
-    {
-        return directory.to_string_lossy().into_owned();
-    }
-    std::env::temp_dir().to_string_lossy().into_owned()
+/// Returns the inherited process working directory as the admitted source
+/// root. The canonical job row remains authoritative; this path only opens
+/// that daemon-owned state and has no locator or temporary fallback.
+fn generation_root_cwd() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| path.is_dir())
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 /// Minimal std-only driver for the single executor future, mirroring
