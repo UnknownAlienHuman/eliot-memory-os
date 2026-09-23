@@ -100,7 +100,7 @@ use eliot_observation_contracts::{
     AgentFeedbackRecord, BankProjection, CoverageDisposition, CoverageEvidence, ExperienceBankRecord,
     ExperienceRetentionReadPosture, ExperienceSourceFamily, FeedbackProjection, JournalProjection,
     ObservationError, ObservationRecordEnvelope, ObservationScope, ProjectionCoverage,
-    RetentionHold, bank_record_ref, feedback_record_ref, resolve_retention_read,
+    RetentionHold, RetentionSchedule, bank_record_ref, feedback_record_ref, resolve_retention_read,
 };
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
@@ -175,27 +175,43 @@ pub enum ProviderError {
     Foundation(#[from] eliot_contracts::ContractError),
 }
 
+/// Plan one closed audit-range read (pure, no I/O).
+///
+/// Builds the existing `GetAuditRange` catalogue read with no parameters
+/// and validates it. This is the single request-shape implementation the
+/// bridge fetch below and the daemon registration planner both resolve:
+/// the O1 planner region delegates here so only one shape exists. The
+/// store catalogue remains the authority; activation and adapter
+/// handlers stay with the store lane.
+pub fn plan_audit_range_request(
+    fence: &StateFence,
+    scope_id: &ScopeId,
+    consistency: ReadConsistency,
+) -> Result<NamedReadRequest, ProviderError> {
+    let request = NamedReadRequest {
+        operation: NamedReadOperation::GetAuditRange,
+        scope_id: Some(scope_id.clone()),
+        consistency,
+        state_fence: fence.clone(),
+        parameters: BTreeMap::new(),
+    };
+    request.validate().map_err(ProviderError::Bridge)?;
+    Ok(request)
+}
+
 /// Producer: fetch one scoped audit range through the canonical bridge.
 ///
-/// Issues the existing `GetAuditRange` catalogue read with no parameters
-/// and validates the response shape, operation echo, and fence
-/// compatibility. A bridge that reports `Unavailable` becomes
-/// [`ProviderError::RetentionBlocked`]; every other store failure travels
-/// as [`ProviderError::Bridge`].
+/// Issues the planned `GetAuditRange` read and validates the response
+/// shape, operation echo, and fence compatibility. A bridge that reports
+/// `Unavailable` becomes [`ProviderError::BridgeUnavailable`]; every
+/// other store failure travels as [`ProviderError::Bridge`].
 pub async fn fetch_audit_range<C: CanonicalReadClient + ?Sized>(
     client: &C,
     scope_id: ScopeId,
     fence: &StateFence,
     consistency: ReadConsistency,
 ) -> Result<NamedReadResponse, ProviderError> {
-    let request = NamedReadRequest {
-        operation: NamedReadOperation::GetAuditRange,
-        scope_id: Some(scope_id),
-        consistency,
-        state_fence: fence.clone(),
-        parameters: BTreeMap::new(),
-    };
-    request.validate().map_err(ProviderError::Bridge)?;
+    let request = plan_audit_range_request(fence, &scope_id, consistency)?;
     let response = match client.execute_named(request).await {
         Err(StoreError::Unavailable) => {
             return Err(ProviderError::BridgeUnavailable);
@@ -464,15 +480,16 @@ pub async fn produce_journal_read<C: CanonicalReadClient + ?Sized>(
 
 /// Retention schedule attestation for one shaping call.
 ///
-/// `policy_known` is attested by the retention-schedule owner (the
-/// Governor-published schedule in force at the governing fence), never
-/// inferred here. `holds` carries schedule-issued hold terms keyed by
-/// record-handle text; absent entries mean no hold applies. Unknown or
-/// stale refs resolve to the explicit gap posture via
-/// [`resolve_retention_read`]; no default is invented.
+/// The owner-issued [`RetentionSchedule`] carries the schedule identity,
+/// revision, fence, and exact closed policy set; knowledge is owner
+/// attestation, never caller assertion. `holds` carries schedule-issued
+/// hold terms keyed by record-handle text; absent entries mean no hold
+/// applies. Unknown or stale refs resolve to the explicit gap posture via
+/// [`resolve_retention_read`], which also verifies the schedule was in
+/// force at each record's fence; no default is invented.
 pub struct RetentionContext<'a> {
-    /// Whether the governing schedule knows the records' policy refs.
-    pub policy_known: bool,
+    /// Owner-issued retention schedule in force for this shaping call.
+    pub schedule: &'a RetentionSchedule,
     /// Schedule-issued hold terms by record-handle text.
     pub holds: &'a BTreeMap<String, RetentionHold>,
 }
@@ -533,7 +550,8 @@ fn resolve_bank_member(
 {
     let posture = resolve_retention_read(
         &record.retention,
-        retention.policy_known,
+        retention.schedule,
+        &record.fence,
         retention.holds.get(record.handle.as_str()),
     )?;
     if !matches!(
@@ -669,7 +687,8 @@ fn resolve_feedback_member(
 {
     let posture = resolve_retention_read(
         &record.retention,
-        retention.policy_known,
+        retention.schedule,
+        &record.fence,
         retention.holds.get(record.handle.as_str()),
     )?;
     if !matches!(
