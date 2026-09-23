@@ -11,6 +11,10 @@
     reason = "windows-only helpers are live on Windows; allow for cross-platform check"
 )]
 
+/// Backup configuration evidence projection (B-BACKUP-HOST-PREP #958).
+pub mod backup_config_projection;
+/// Host-owned isolated backup destination preparation (B-BACKUP-HOST-PREP #958).
+pub mod backup_preparation;
 mod credential_control;
 #[cfg(windows)]
 mod host_activation_durable;
@@ -141,7 +145,9 @@ use launch_descriptor_validation::{
 pub use launch_options::HostLaunchOptions;
 use launch_options::valid_sha256_text;
 #[cfg(windows)]
-pub use reactive_context_delivery::{HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError};
+pub use reactive_context_delivery::{
+    HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError,
+};
 pub use scm_launch::{
     HOST_SCM_CAUSE_MAX_CHARS, HostScmRegistrationCause, ValidatedHostScmLaunch,
     classify_host_scm_inspection, validate_host_scm_bootstrap,
@@ -221,8 +227,8 @@ use eliot_platform_windows::{
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerLease, HostOwnerLeaseError,
     HostOwnerLeaseReleaseError, ProtectedRootLease, ServiceAccount, ServiceRegistrationRequest,
-    ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStopOutcome,
-    TerminatedJobChild, WindowsPlatform, fresh_kernel_activation_nonce,
+    ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStopOutcome, TerminatedJobChild,
+    WindowsPlatform, fresh_kernel_activation_nonce,
 };
 #[cfg(windows)]
 use eliot_process::DispatchAuthorityId;
@@ -345,14 +351,14 @@ use phase_b_previous_authority::{
 
 #[cfg(windows)]
 mod phase_b_materialization;
+#[cfg(all(windows, test))]
+use phase_b_materialization::phase_b_template_path;
 #[cfg(windows)]
 use phase_b_materialization::{
     agent_bridge_admission_descriptor, open_agent_bridge_final_lease, phase_b_bytes_digest,
     phase_b_lease_bytes, phase_b_lease_identity, phase_b_materialize_file_with_rollback,
     phase_b_remove_rollback_backup, phase_b_restore_or_remove, phase_b_template_bytes,
 };
-#[cfg(all(windows, test))]
-use phase_b_materialization::phase_b_template_path;
 
 mod notify_fallback_setup;
 pub use notify_fallback_setup::{
@@ -404,9 +410,9 @@ mod kernel_activation_driver;
 use kernel_activation_driver::DurableKernelActivationDriver;
 
 #[cfg(windows)]
-mod kernel_front_door_client;
-#[cfg(windows)]
 mod host_startup_evidence;
+#[cfg(windows)]
+mod kernel_front_door_client;
 #[cfg(all(windows, test))]
 use kernel_front_door_client::kernel_front_door_acl_mode;
 #[cfg(windows)]
@@ -3474,16 +3480,16 @@ fn epoch_contract_error(error: &EpochContractError) -> JournalError {
 
 #[cfg(windows)]
 mod watchdog_service_start;
-#[cfg(all(test, windows))]
-use watchdog_service_start::{
-    InstalledWatchdogStartControl, WATCHDOG_START_TIMEOUT_MS, WatchdogStartClock,
-    require_running_watchdog, start_installed_watchdog_with_clock, watchdog_start_wait,
-};
 #[cfg(windows)]
 use watchdog_service_start::{
     InstalledWatchdogControl, InstalledWatchdogRuntimeInspection,
     approved_service_registration_request, select_watchdog_approval_for_inspection,
     start_installed_watchdog, verify_watchdog_scm_running,
+};
+#[cfg(all(test, windows))]
+use watchdog_service_start::{
+    InstalledWatchdogStartControl, WATCHDOG_START_TIMEOUT_MS, WatchdogStartClock,
+    require_running_watchdog, start_installed_watchdog_with_clock, watchdog_start_wait,
 };
 
 fn sha256_json(value: &impl serde::Serialize) -> Result<String, HostError> {
@@ -3589,8 +3595,7 @@ fn record_fence(
 mod journal_append;
 #[cfg(windows)]
 use journal_append::{
-    append_authenticated_kernel_readiness_with_heartbeat,
-    append_store_rebind_terminal,
+    append_authenticated_kernel_readiness_with_heartbeat, append_store_rebind_terminal,
     persist_store_rebind_disposition,
 };
 // The pre-transport append stays covered by journal tests through the
@@ -3980,6 +3985,51 @@ impl HostComposition {
                 .map_err(HostError::Installation);
         }
         open_registry_store_at(&self.registry_host_root)
+    }
+
+    /// Prepares one isolated backup destination through registry-committed
+    /// owner evidence (B-BACKUP-HOST-PREP #958).
+    ///
+    /// Binds the delegation sink to live composition authority: the
+    /// presented caller passes the
+    /// [`BackupCallerAuth`](crate::backup_preparation::BackupCallerAuth)
+    /// owner gate (held lease covers the launch installation, presented
+    /// source equals it), and the destination is prepared from inspected
+    /// owner evidence through the caller-supplied journal sink. The sink
+    /// returns alongside the destination so the caller can reconcile,
+    /// cancel, or clean up the same operation later. Durable production
+    /// journal binding awaits the Host-state owner's preparation record
+    /// variant; until then the sink stays a port. Caller-channel
+    /// authentication beyond this installation binding stays parameterized
+    /// pending role-bound control contracts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
+    /// when the caller gate, lease/installation binding, owner evidence,
+    /// admission, or journal persistence fails closed.
+    pub fn prepare_backup_destination<J: crate::backup_preparation::PreparationJournal>(
+        &self,
+        journal: J,
+        caller: &crate::backup_preparation::BackupCallerAuth,
+        request: &crate::backup_preparation::PresentedPreparationRequest,
+    ) -> Result<
+        (
+            crate::backup_preparation::DelegatedPreparation<J>,
+            crate::backup_preparation::PreparedDestination,
+        ),
+        crate::backup_preparation::PreparationError,
+    > {
+        use crate::backup_preparation::{DelegatedPreparation, OwnerEvidence};
+        caller.authenticate_for_owner(
+            &self.owner_lease,
+            self.launch_options.installation(),
+            &request.source_installation_id,
+        )?;
+        let evidence = OwnerEvidence::inspect(&self.registry_host_root)?;
+        let mut sink = DelegatedPreparation::new(journal);
+        let prepared = sink.prepare(&evidence, request)?;
+        Ok((sink, prepared))
     }
 
     /// Opens the durable Host contour for one installation identity and
@@ -5498,12 +5548,7 @@ impl HostComposition {
                 state,
                 wait_hint_ms,
                 process,
-            } => verify_watchdog_scm_running(
-                &registration,
-                state,
-                wait_hint_ms,
-                process.as_ref(),
-            )?,
+            } => verify_watchdog_scm_running(&registration, state, wait_hint_ms, process.as_ref())?,
             _ => {
                 return Err(HostError::RecoveryRequired(
                     "Watchdog is not Running for heartbeat incarnation bind".to_owned(),
@@ -5523,18 +5568,9 @@ impl HostComposition {
     fn watchdog_start_inputs_for_manifest(
         &self,
         manifest: &CandidateManifest,
-    ) -> Result<
-        Option<(
-            ServiceRegistrationRequest,
-            PathBuf,
-            PathBuf,
-        )>,
-        HostError,
-    > {
-        let Some(approval) = select_watchdog_approval_for_inspection(
-            &self.registry,
-            manifest,
-        )? else {
+    ) -> Result<Option<(ServiceRegistrationRequest, PathBuf, PathBuf)>, HostError> {
+        let Some(approval) = select_watchdog_approval_for_inspection(&self.registry, manifest)?
+        else {
             return Ok(None);
         };
         let launch = &manifest.runtime_launch;
@@ -5555,14 +5591,7 @@ impl HostComposition {
     fn pending_watchdog_start_inputs(
         &self,
         pending: &eliot_installation::PendingActivation,
-    ) -> Result<
-        Option<(
-            ServiceRegistrationRequest,
-            PathBuf,
-            PathBuf,
-        )>,
-        HostError,
-    > {
+    ) -> Result<Option<(ServiceRegistrationRequest, PathBuf, PathBuf)>, HostError> {
         self.watchdog_start_inputs_for_manifest(&pending.manifest)
     }
 
@@ -5598,81 +5627,76 @@ impl HostComposition {
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_stopped() && observation.process().is_none() => {}
             ServiceRegistrationRuntimeInspection::Matching { observation }
-                if observation.is_running() => {
-                    let Some(carrier) = carrier.as_ref() else {
-                        return Err(HostError::RecoveryRequired(
-                            "Watchdog is Running without an operation-bound start carrier"
-                                .to_owned(),
-                        ));
-                    };
-                    if !carrier.descriptor_published || !carrier.start_may_have_issued {
-                        return Err(HostError::RecoveryRequired(
-                            "Running Watchdog lacks the complete operation-bound start carrier"
-                                .to_owned(),
-                        ));
-                    }
-                    let process = observation.process().ok_or_else(|| {
-                        HostError::RecoveryRequired(
-                            "Watchdog Running state has no handle-bound process identity"
-                                .to_owned(),
-                        )
-                    })?;
-                    let current_descriptor = watchdog_heartbeat::HeartbeatTransportDescriptor::load(
-                        &heartbeat_state_root,
-                    )?
-                    .ok_or_else(|| {
-                        HostError::RecoveryRequired(
-                            "Running Watchdog has no heartbeat descriptor for rollback binding"
-                                .to_owned(),
-                        )
-                    })?;
-                    if current_descriptor.pipe_name != carrier.issued_descriptor.pipe_name
-                        || current_descriptor.host_challenge_nonce
-                            != carrier.issued_descriptor.host_challenge_nonce
-                        || current_descriptor.service_instance_guid
-                            != carrier.issued_descriptor.service_instance_guid
-                        || current_descriptor.installation_id
-                            != carrier.issued_descriptor.installation_id
-                        || current_descriptor.transaction_plan_generation
-                            != carrier.issued_descriptor.transaction_plan_generation
-                        || current_descriptor.watchdog_incarnation_pid != process.process_id
-                        || current_descriptor.watchdog_incarnation_start_100ns
-                            != process.start_time_100ns
-                    {
-                        return Err(HostError::RecoveryRequired(
-                            "Running Watchdog is not the exact heartbeat-bound start peer"
-                                .to_owned(),
-                        ));
-                    }
-                    let runtime_identity_digest = observation
-                        .runtime_identity_digest()
+                if observation.is_running() =>
+            {
+                let Some(carrier) = carrier.as_ref() else {
+                    return Err(HostError::RecoveryRequired(
+                        "Watchdog is Running without an operation-bound start carrier".to_owned(),
+                    ));
+                };
+                if !carrier.descriptor_published || !carrier.start_may_have_issued {
+                    return Err(HostError::RecoveryRequired(
+                        "Running Watchdog lacks the complete operation-bound start carrier"
+                            .to_owned(),
+                    ));
+                }
+                let process = observation.process().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Watchdog Running state has no handle-bound process identity".to_owned(),
+                    )
+                })?;
+                let current_descriptor =
+                    watchdog_heartbeat::HeartbeatTransportDescriptor::load(&heartbeat_state_root)?
                         .ok_or_else(|| {
                             HostError::RecoveryRequired(
-                                "Running Watchdog has no runtime identity digest".to_owned(),
+                                "Running Watchdog has no heartbeat descriptor for rollback binding"
+                                    .to_owned(),
                             )
                         })?;
-                    let stop_request = carrier
-                        .registration
-                        .clone()
-                        .with_expected_runtime_identity_digest(runtime_identity_digest)
-                        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-                    match platform
-                        .stop_service_registration(&stop_request)
-                        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
-                    {
-                        ServiceStopOutcome::Stopped { .. }
-                        | ServiceStopOutcome::AlreadyStopped { .. } => {
-                            stopped_process =
-                                Some((process.process_id, process.start_time_100ns));
-                        }
-                        ServiceStopOutcome::AlreadyStopping { .. }
-                        | ServiceStopOutcome::EffectUnknown => {
-                            return Err(HostError::RecoveryRequired(
-                                "Watchdog stop outcome is not durably known".to_owned(),
-                            ));
-                        }
+                if current_descriptor.pipe_name != carrier.issued_descriptor.pipe_name
+                    || current_descriptor.host_challenge_nonce
+                        != carrier.issued_descriptor.host_challenge_nonce
+                    || current_descriptor.service_instance_guid
+                        != carrier.issued_descriptor.service_instance_guid
+                    || current_descriptor.installation_id
+                        != carrier.issued_descriptor.installation_id
+                    || current_descriptor.transaction_plan_generation
+                        != carrier.issued_descriptor.transaction_plan_generation
+                    || current_descriptor.watchdog_incarnation_pid != process.process_id
+                    || current_descriptor.watchdog_incarnation_start_100ns
+                        != process.start_time_100ns
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "Running Watchdog is not the exact heartbeat-bound start peer".to_owned(),
+                    ));
+                }
+                let runtime_identity_digest =
+                    observation.runtime_identity_digest().ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "Running Watchdog has no runtime identity digest".to_owned(),
+                        )
+                    })?;
+                let stop_request = carrier
+                    .registration
+                    .clone()
+                    .with_expected_runtime_identity_digest(runtime_identity_digest)
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                match platform
+                    .stop_service_registration(&stop_request)
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+                {
+                    ServiceStopOutcome::Stopped { .. }
+                    | ServiceStopOutcome::AlreadyStopped { .. } => {
+                        stopped_process = Some((process.process_id, process.start_time_100ns));
+                    }
+                    ServiceStopOutcome::AlreadyStopping { .. }
+                    | ServiceStopOutcome::EffectUnknown => {
+                        return Err(HostError::RecoveryRequired(
+                            "Watchdog stop outcome is not durably known".to_owned(),
+                        ));
                     }
                 }
+            }
             ServiceRegistrationRuntimeInspection::Matching { observation } => {
                 return Err(HostError::RecoveryRequired(format!(
                     "Watchdog SCM state {:?} is not a safe abort boundary",
@@ -6034,7 +6058,8 @@ impl HostComposition {
                 return self.cleanup_launched_contour(error);
             }
         }
-        let (kernel_artifact, approved_store_artifact) = match manifest.host_child_artifact_digests()
+        let (kernel_artifact, approved_store_artifact) = match manifest
+            .host_child_artifact_digests()
         {
             Ok(value) => value,
             Err(error) => {
@@ -6054,9 +6079,9 @@ impl HostComposition {
                 phase_b.launch.authority_state_fence.authority_epoch.clone(),
                 None,
             ) {
-                Ok(value) => value,
-                Err(error) => return self.cleanup_launched_contour(error),
-            };
+            Ok(value) => value,
+            Err(error) => return self.cleanup_launched_contour(error),
+        };
         if let Err(error) = self.jobs.start_approved(
             kernel_executable,
             store_executable,
@@ -6840,8 +6865,9 @@ impl HostComposition {
             InstallerServiceRole::Watchdog,
             &scm_launch.watchdog_executable_path,
         )?;
-        let mut platform = WindowsPlatform::new(PathBuf::from(scm_launch.kernel_work_root.as_str()))
-            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let mut platform =
+            WindowsPlatform::new(PathBuf::from(scm_launch.kernel_work_root.as_str()))
+                .map_err(|error| HostError::Platform(error.to_string()))?;
         let scm = match platform.inspect_registration_runtime(&registration) {
             InstalledWatchdogRuntimeInspection::Matching {
                 state,
@@ -7100,10 +7126,8 @@ impl HostComposition {
 
     #[cfg(windows)]
     fn reconcile_watchdog_start_for_cleanup(&mut self) -> Result<(), HostError> {
-        let Some((registration, platform_root, heartbeat_state_root)) = self
-            .watchdog_start_recovery
-            .as_ref()
-            .map(|carrier| {
+        let Some((registration, platform_root, heartbeat_state_root)) =
+            self.watchdog_start_recovery.as_ref().map(|carrier| {
                 (
                     carrier.registration.clone(),
                     carrier.platform_root.clone(),
