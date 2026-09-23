@@ -60,16 +60,23 @@
 //! - `HostComposition::ensure_admission_open` (host `lib.rs:7128`, private in
 //!   the crate root, visible to this descendant module): admission guard.
 //! - `super::open_registry_store_at` (host `lib.rs:3954`, `pub(crate)`):
-//!   short-lived registry handle, dropped after one load; plus
+//!   short-lived registry handle, dropped after one CAS or load; plus
 //!   `RedbInstallationRegistry::load`
 //!   (`crates/kernel/eliot-installation/src/redb_state.rs:275`, inside
-//!   `impl super::RedbInstallationRegistry` at line 171) and
-//!   `ApprovedGenerationRegistry::{validate, active_generation}`
-//!   (`approved_generation_registry.rs:4105,3656`): fresh
-//!   expected-predecessor fencing against TOCTOU. The registry is only read
-//!   here: no retire/commit mutation exists for cutover on current main, and
-//!   this module invents none (a missing owner transition belongs to its
-//!   exact owner before dispatch, never a private override).
+//!   `impl super::RedbInstallationRegistry` at line 171),
+//!   `ApprovedGenerationRegistry::{validate, active_generation, generations,
+//!   revision}` (`approved_generation_registry.rs:4105,3656,3650,2775`), and
+//!   the new cutover CAS `RedbInstallationRegistry::commit_cutover_activation`
+//!   (`installation_registry.rs`, beside `commit_pending_activation` at
+//!   line 951): same-closure `mutate_atomic` onto the existing
+//!   `ApprovedGenerationRegistry::activate` (`approved_generation_registry.
+//!   rs:3953`, approved-target check, exact-replay `Ok`, predecessor-gated
+//!   flip recording the prior generation as last-known-good). No schema or
+//!   wire change, no new persisted fields: the operation audit binding lives
+//!   in the Host journal retirement record.
+//! - `HostOwnerLease::activation_capability` through
+//!   `HostComposition::owner_lease` (host `lib.rs:3724`, used by every owner
+//!   contour): live-guard capability for the CAS.
 //! - `super::journal_append::append_reconciled` (host `journal_append.rs:281`,
 //!   `pub(super)` choke for every `ProductionHostStateJournal` write, with
 //!   `OutcomeUnknown` fail-closed reconciliation): persists the
@@ -168,6 +175,10 @@ pub struct CutoverRequest {
     pub archive_canonical_only_policy: Option<PlatformHandle>,
     pub target_build_digest: PlatformHandle,
     pub target_config_digest: PlatformHandle,
+    /// Exact approved target generation to activate. It must already be
+    /// approved in the registry projection (staged by the
+    /// installer/preparation flow); cutover never approves a generation.
+    pub target_generation: PlatformHandle,
     /// Owner-issued new authority fence for the destination generation.
     pub activation_fence: StateFence,
     /// Owner-issued UserBroker identity for the destination generation.
@@ -395,6 +406,18 @@ pub fn validate_cutover_request(
     registry
         .validate()
         .map_err(|error| CutoverError::Registry(error.to_string()))?;
+    if request.target_generation == request.expected_predecessor {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if !registry
+        .generations()
+        .iter()
+        .any(|item| item.manifest.generation == request.target_generation)
+    {
+        return Err(CutoverError::Registry(
+            "cutover target generation is not approved".to_owned(),
+        ));
+    }
     match registry.active_generation() {
         Some(active) if *active == request.expected_predecessor => {}
         Some(_) | None => return Err(CutoverError::ExpectedPredecessorConflict),
@@ -445,14 +468,17 @@ pub fn check_replay_identity(
 ///
 /// Real owner calls, in order: `HostComposition::ensure_admission_open`;
 /// fresh registry readback through `super::open_registry_store_at` plus
-/// `RedbInstallationRegistry::load` with the expected-predecessor recheck
-/// (TOCTOU fence: the cached projection check in validation is not enough);
-/// exact barrier-fence bindings; then the Parfit-owned
-/// `HostComposition::require_generation_retirement_barrier`, which succeeds
-/// only on current Kernel/ORS readback proving NO active
+/// `RedbInstallationRegistry::load` with the expected-predecessor and
+/// target-approval rechecks (TOCTOU fence: the cached projection check in
+/// validation is not enough); exact barrier-fence bindings; then the
+/// Parfit-owned `HostComposition::require_generation_retirement_barrier`,
+/// which succeeds only on current Kernel/ORS readback proving NO active
 /// RuntimeLease/SupervisionLease for the prior generation plus the current
-/// durable drain/commit. No registry mutation is performed here: none exists
-/// for cutover on current main.
+/// durable drain/commit; finally the activation linearization point
+/// `RedbInstallationRegistry::commit_cutover_activation` (same-closure CAS
+/// through `mutate_atomic` onto the existing `ApprovedGenerationRegistry::
+/// activate`, expected revision + predecessor fenced, exact replay safe).
+/// The handle is dropped immediately after the CAS, never retained.
 ///
 /// Lost response, failure between registry/authority/route transitions, or
 /// cancellation after possible activation yields `Unknown` on reconcile:
@@ -463,10 +489,11 @@ pub fn check_replay_identity(
 /// # Errors
 ///
 /// Returns `BarrierDenied` when the prior generation still carries leases or
-/// the durable drain/commit disagrees; `Unknown`-class host failures
-/// propagate as `HostTransition` for fenced reconciliation.
+/// the durable drain/commit disagrees; `Registry` on CAS conflict or an
+/// unapproved target; `Unknown`-class host failures propagate as
+/// `HostTransition` for fenced reconciliation.
 pub fn execute_cutover(
-    host: &HostComposition,
+    host: &mut HostComposition,
     validated: &ValidatedCutover,
     retirement: &GenerationRetirementFence,
     activation_id: &PlatformHandle,
@@ -480,6 +507,15 @@ pub fn execute_cutover(
     fresh
         .validate()
         .map_err(|error| CutoverError::Registry(error.to_string()))?;
+    if !fresh
+        .generations()
+        .iter()
+        .any(|item| item.manifest.generation == validated.request.target_generation)
+    {
+        return Err(CutoverError::Registry(
+            "cutover target generation is not approved".to_owned(),
+        ));
+    }
     match fresh.active_generation() {
         Some(active) if *active == validated.request.expected_predecessor => {}
         Some(_) | None => return Err(CutoverError::ExpectedPredecessorConflict),
@@ -496,13 +532,24 @@ pub fn execute_cutover(
     let barrier = host
         .require_generation_retirement_barrier(retirement)
         .map_err(|error| CutoverError::BarrierDenied(error.to_string()))?;
+    let capability = host.owner_lease.activation_capability();
+    store
+        .commit_cutover_activation(
+            &capability,
+            fresh.revision(),
+            &validated.request.expected_predecessor,
+            &validated.request.target_generation,
+        )
+        .map_err(|error| CutoverError::Registry(error.to_string()))?;
+    drop(store);
     Ok((
         CutoverOutcome {
-            disposition: CutoverDisposition::RetirementPending,
+            disposition: CutoverDisposition::Committed,
             operation: validated.request.operation.clone(),
             evidence_refs: bounded_evidence(vec![
                 admission_handle(&validated.request.admission)?,
                 activation_id.clone(),
+                validated.request.target_generation.clone(),
             ]),
         },
         barrier,
@@ -556,6 +603,21 @@ pub fn retire_prior_generation(
         operation_id: validated.request.operation.operation_id.clone(),
         idempotency_key: validated.request.operation.request_digest.clone(),
     };
+    // Deterministic per cutover operation and prior epoch: the journal
+    // transaction id binds operation identity, Host epoch, and the full
+    // record checksum (`journal.rs:126-145`), so a retry after
+    // `OutcomeUnknown` must append byte-identical record bytes to replay
+    // (`Replayed`) instead of duplicating the retirement. A fresh random
+    // identity here would fork a second transaction on every retry.
+    let retired_digest = super::sha256_json(&(
+        "cutover-retired-at-v1",
+        &validated.request.operation.operation_id,
+        &validated.request.operation.request_digest,
+        &prior_host.installation,
+        &prior_host.epoch,
+    ))?;
+    let retired_at = PlatformHandle::new(format!("cutover-retired-at:{retired_digest}"))
+        .map_err(|_| CutoverError::BindingMismatch)?;
     let record = HostStateRecord::EpochRetirement(EpochRetirementRecord {
         // Full fence shape comes straight from the barrier-bound fence
         // already checked in `execute_cutover` (same installation
@@ -578,7 +640,7 @@ pub fn retire_prior_generation(
             validated.evidence.operational_validation.clone(),
             retirement_authorization.clone(),
         ]),
-        retired_at: super::fresh_identity("host-cutover-retired-at")?,
+        retired_at,
     });
     let receipt = super::journal_append::append_reconciled(&host.journal, record)?;
     Ok(CutoverOutcome {
@@ -592,28 +654,43 @@ pub fn retire_prior_generation(
     })
 }
 
-/// Reconciles a cutover from real owner receipts after lost response or
+/// Reconciles a cutover from real owner observations after lost response or
 /// cancellation.
 ///
-/// Pass the actual `AppendReceipt` read back from the journal owner for the
-/// cutover operation identity (or `None` when no such receipt exists);
-/// never a locally assumed boolean. Cancellation/cleanup/diagnostic failure
-/// preserves the primary result and its reconciliation path.
+/// `registry_active` is the active generation freshly read back from the
+/// registry owner (`RedbInstallationRegistry::load().active_generation()`)
+/// and `retirement_receipt` is the actual `AppendReceipt` read back from
+/// the journal owner for the cutover operation identity (`None` when no
+/// such receipt exists); never locally assumed booleans. A present receipt
+/// proves the durable retirement commit; a registry flip without a receipt
+/// proves the activation commit with retirement still pending; anything
+/// else stays `Unknown` for evidence-backed retry under the same identity.
+/// Cancellation/cleanup/diagnostic failure preserves the primary result and
+/// its reconciliation path.
 #[must_use]
 pub fn reconcile_cutover_outcome(
     operation: &CutoverOperationIdentity,
+    registry_active: Option<&PlatformHandle>,
+    target_generation: &PlatformHandle,
     retirement_receipt: Option<&AppendReceipt>,
 ) -> CutoverOutcome {
-    match retirement_receipt {
-        Some(receipt) => CutoverOutcome {
+    if let Some(receipt) = retirement_receipt {
+        return CutoverOutcome {
             disposition: CutoverDisposition::Reconciled,
             operation: operation.clone(),
             evidence_refs: vec![receipt.transaction_id().clone()],
-        },
-        None => CutoverOutcome {
-            disposition: CutoverDisposition::Unknown,
+        };
+    }
+    if registry_active == Some(target_generation) {
+        return CutoverOutcome {
+            disposition: CutoverDisposition::Committed,
             operation: operation.clone(),
-            evidence_refs: Vec::new(),
-        },
+            evidence_refs: vec![target_generation.clone()],
+        };
+    }
+    CutoverOutcome {
+        disposition: CutoverDisposition::Unknown,
+        operation: operation.clone(),
+        evidence_refs: Vec::new(),
     }
 }

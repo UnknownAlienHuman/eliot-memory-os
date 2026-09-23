@@ -18,24 +18,23 @@ use std::path::{Path, PathBuf};
 
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
-    HostOwnerEpochCapability, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    require_protected_program_data_path,
+    require_protected_program_data_path, HostOwnerEpochCapability, ProtectedPathLease,
+    ProtectedRootLease, ProtectedRuntimePathLease,
 };
 use redb::{Database, TableDefinition};
 
-#[cfg(test)]
-use crate::InstallationTransactionStore;
 use crate::approved_generation_registry::PendingActivationTerminalDisposition;
 #[cfg(feature = "test-support")]
 use crate::validate_approval_against_manifest;
+#[cfg(test)]
+use crate::InstallationTransactionStore;
 use crate::{
+    activation_terminal_digest, candidate_manifest_digest, valid_installation_key,
     ActivationCommitFence, ActivationCommitReceipt, ActivePhaseBRebind, ActivePhaseBRebindIntent,
     ActivePhaseBRebindReceipt, ActivePhaseBRebindRecovery, AgentBridgeStagePrepared,
     ApprovedGenerationRegistry, HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
     InstallationError, PendingActivation, PendingActivationAbortReceipt, WindowsPathIdentity,
-    activation_terminal_digest,
-    candidate_manifest_digest, valid_installation_key,
 };
 
 pub(super) const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
@@ -441,11 +440,8 @@ impl RedbInstallationRegistry {
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
     ) -> Result<ActivationCommitReceipt, InstallationError> {
-        self.load()?.read_committed_activation_receipt(
-            transaction_id,
-            plan_digest,
-            generation,
-        )
+        self.load()?
+            .read_committed_activation_receipt(transaction_id, plan_digest, generation)
     }
 
     /// Loads the sealed transaction and atomically stages its exact pending
@@ -978,6 +974,70 @@ impl RedbInstallationRegistry {
         })
     }
 
+    /// Atomically commits one exact installation cutover: flips the active
+    /// generation from the expected predecessor to an already-approved
+    /// target (#961).
+    ///
+    /// Unlike [`Self::commit_pending_activation`], cutover carries no
+    /// installer approval: the target must already be approved in the
+    /// projection (staged by the installer/preparation flow), and the caller
+    /// holds the separately-admitted cutover operation plus the Host
+    /// retirement barrier. The operation audit binding lives in the Host
+    /// journal `EpochRetirement` record; this CAS is the activation
+    /// linearization point only. Exact replay (active already equals the
+    /// approved target) succeeds without mutating; any other predecessor
+    /// mismatch is `IdentityConflict` and changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError`] when the owner capability is not live,
+    /// the generation handles are malformed, the target is not approved, or
+    /// the expected revision/predecessor disagrees with durable state.
+    pub fn commit_cutover_activation(
+        &self,
+        host: &HostOwnerEpochCapability,
+        expected_revision: u64,
+        expected_predecessor: &PlatformHandle,
+        target_generation: &PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        let _guard = host
+            .live_guard()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        crate::handle(expected_predecessor, "cutover.expected_predecessor")?;
+        crate::handle(target_generation, "cutover.target_generation")?;
+        if expected_predecessor == target_generation {
+            return Err(InstallationError::InvalidField {
+                field: "cutover.target_generation".to_owned(),
+                reason: "cutover target must differ from the expected predecessor".to_owned(),
+            });
+        }
+        let expected_predecessor = expected_predecessor.clone();
+        let target_generation = target_generation.clone();
+        self.mutate_atomic(expected_revision, |registry| {
+            if !registry
+                .generations
+                .iter()
+                .any(|item| item.manifest.generation == target_generation)
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "cutover target generation is not approved".to_owned(),
+                ));
+            }
+            if registry.active_generation.as_ref() == Some(&target_generation) {
+                // Exact replay of an already-committed cutover: the
+                // predecessor was consumed by the first commit. Succeed
+                // without mutating; Host journal reconciliation
+                // disambiguates same-operation replay from cross-operation
+                // confusion through the operation-bound retirement record.
+                return Ok(());
+            }
+            if registry.active_generation.as_ref() != Some(&expected_predecessor) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            registry.activate(&target_generation)
+        })
+    }
+
     /// Reads the current CAS revision for one exact pending activation.
     ///
     /// The intent records the registry snapshot used to stage the pending
@@ -1119,16 +1179,17 @@ impl RedbInstallationRegistry {
             if let Some(pending) = registry.pending_activation.as_ref() {
                 self.validate_host_owner_binding(host, pending)?;
                 if pending.approval != approval
-                    || pending.activation_intent_digest.as_ref()
-                        != Some(&activation_intent_digest)
+                    || pending.activation_intent_digest.as_ref() != Some(&activation_intent_digest)
                 {
                     return Err(InstallationError::IdentityConflict);
                 }
-            } else if let Some(receipt) = registry.aborted_activation_receipts.iter().find(|receipt| {
-                receipt.transaction_id == approval.transaction_id
-                    && receipt.plan_digest == approval.installer_plan_digest
-                    && receipt.generation == approval.generation
-            }) {
+            } else if let Some(receipt) =
+                registry.aborted_activation_receipts.iter().find(|receipt| {
+                    receipt.transaction_id == approval.transaction_id
+                        && receipt.plan_digest == approval.installer_plan_digest
+                        && receipt.generation == approval.generation
+                })
+            {
                 receipt.validate()?;
                 self.validate_host_owner_binding_for_abort_receipt(host, receipt)?;
                 if !receipt.approval.matches_approval(&approval)
