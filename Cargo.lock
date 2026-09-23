@@ -1816,6 +1816,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-experience-provider"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-experience-projection",
+ "eliot-observation-contracts",
+ "eliot-store-api",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-finish"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,78 @@
+schema_version = 4
+module_id = "smart.experience.provider"
+crate = "eliot-experience-provider"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 51
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.experience.provider"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Governor-admitted journal envelopes read through the canonical store bridge become frozen V1 owner projections and Smart read-aid views with honest coverage, never completeness claims."
+causal_property = "audit-bridge journal projection with live presence binding"
+old_failure_or_missing_capability = "Experience projections exist only as test fixtures: no production path reads admitted envelopes through the canonical bridge, binds them to live journal presence, and hands typed V1 envelopes to the Smart consumer edge (CC-W9-COGNITIVE-QUALITY)."
+discriminator = "every projection is assembled from bytes actually returned by a GetAuditRange bridge read with owner-issued revision heads bound into coverage; every carried record presence-checks against caller-supplied live journal handles; unavailable bridges report RETENTION_BLOCKED posture, never invented schedules"
+primary_responsibility = "Fetch one scoped GetAuditRange bridge read, shape admitted V1 journal envelopes into a frozen JournalProjection plus a journal-family ExperienceView, and revalidate both against live journal presence."
+owned_mutable_state = []
+allowed_effects = ["scoped read-only canonical store bridge reads (GetAuditRange only)"]
+inputs = ["store-neutral CanonicalReadClient", "scoped GetAuditRange read with fence and consistency", "live journal admitted-handle set read at call time", "projection identity, scope, and fence"]
+outputs = ["JournalProjection (V1, frozen digest)", "ExperienceView (journal family, Partial echo, frozen)"]
+depends_on = ["eliot-store-api", "eliot-observation-contracts", "eliot-contracts", "eliot-experience-projection"]
+providers = ["canonical Store bridge (durable audit reads)", "Governor observation owner (live presence handles)"]
+consumers = ["eliot-cognitive-quality self-quality view (candidate only)"]
+non_goals = ["experience bank ownership", "feedback record ownership", "store writes", "retention scheduling", "V2 record carriage", "completeness establishment"]
+invariants = ["V1 envelopes only: record_v2 is never collapsed into V1", "every carried record presence-checks against live handles or the read fails closed", "coverage binds owner-issued revision heads; Complete posture only on exact count with no omissions or blinds", "views echo coverage with Partial posture and never establish completeness", "unavailable bridges and stale refs report RETENTION_BLOCKED/coverage-gap posture; no expiry or permission is invented", "no new state, no writes, no second owner"]
+failure_behavior = "Reject non-audit responses, fence drift, malformed payloads, malformed members, and presence drift explicitly. Bridge Unavailable becomes RetentionBlocked with the I05-14 hold reference. Malformed bridge bytes fail closed as integrity errors, never as partial projections."
+proof_surface = ["bridge fetch over the existing named-read catalogue (no new operations)", "V1 shaping with honest Partial/Complete coverage", "live presence binding", "Smart view assembly plus owner-envelope revalidation", "RETENTION_BLOCKED posture on unavailable bridges"]
+proof_ceiling = "PACKAGE_PROOF_ONLY"
+product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/governor/eliot-read/src/lib.rs"
+disposition = "bridge contract reused: scoped GetAuditRange named read with fence/consistency gating; this package adds no operations and no facade"
+
+[[donor]]
+path = "crates/storage/eliot-store-api/src/lib.rs"
+disposition = "store-neutral bridge types reused: CanonicalReadClient, NamedReadRequest/Response, revision heads; payload bytes typed at this consumer boundary"
+
+[[donor]]
+path = "crates/foundation/eliot-observation-contracts/src/experience_projection.rs"
+disposition = "owner envelope reused unchanged: JournalProjection assembly/validation, V1 record shapes, closed omission classes; no contract edits"
+
+[[donor]]
+path = "crates/smart/eliot-experience-projection/src/lib.rs"
+disposition = "Smart consumer surface reused: ExperienceView assembly plus journal-presence revalidation; this package is its bridge-fed caller"
+
+[[donor]]
+path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+disposition = "wave authority: freeze r5 denominator doctrine; V1 envelope kept as declared, no r6 requested"
+
+[agent_task]
+objective = "Project one scoped bridge audit read into a frozen V1 journal envelope plus a revalidated Smart view."
+write_scope = ["crates/smart/eliot-experience-provider/**"]
+deliverables = ["bridge producer call", "V1 shaping with honest coverage", "Smart consumer call plus revalidation"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes", "retention schedule invention", "V2 collapse", "completeness establishment", "provider or model SDKs", "vendor or storage-vendor types in public contracts", "unbounded synchronous work", "silent truncation", "second experience bank or lifecycle ownership"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, store execution beyond read-only named reads, model work or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main rebase and integration-owner review"
+
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
