@@ -25,16 +25,18 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eliot_bootstrap::capture::observe_workspace_instance;
 use eliot_contracts::StateFence;
 use eliot_governor::{
-    GenerationEvidence, ScopeBinding, ScopeRelocationOrAttachReceipt, TaskScopeOutcome,
-    WorkScopeBindingOwner, WorkScopeDescriptor, WorkspaceInstanceIdentity, check_task_observation,
-    derive_observed_resources, produce_attach_receipt,
+    GenerationEvidence, GoverningSourceSet, PrivacyProfile, ScopeBinding,
+    ScopeRelocationOrAttachReceipt, TaskScopeOutcome, WorkScopeBindingOwner, WorkScopeDescriptor,
+    WorkspaceInstanceIdentity, check_task_observation, derive_observed_resources,
+    produce_attach_receipt,
 };
 use eliot_observation::TaskSelectionEvidence;
+use eliot_security_contracts::PrivacyClass;
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
 pub const TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
@@ -362,6 +364,118 @@ pub fn observe_and_admit_task(
         expected_fence,
         compatibility,
     )
+}
+
+/// Authenticated attach ingress payload assembled from owned evidence.
+///
+/// The O1 trigger lane builds exactly one of these per attach attempt from
+/// evidence it already owns — never inferred from the activation ticket
+/// (correlation-only by contract), the current directory, proximity, or
+/// recency:
+///
+/// - `explicit_root`: the explicit host/session workspace path the trigger
+///   was asked to attach (absolute; observed live, never a display name);
+/// - `receipt_ref`: fresh bounded receipt identity minted per attempt;
+/// - `descriptor`: the retained scope description the trigger resolves from
+///   the onboarding path (the producer requires it to describe the live
+///   owner binding on every identity field);
+/// - `authorizing_ref`: the authenticated session/host authorization evidence
+///   reference (the explicit Human/host binding token or session attach
+///   record the trigger authenticated through owned IPC/session state) — a
+///   reference only; the producer enforces non-blank, the trigger owns the
+///   authentication;
+/// - `privacy_class`, `governing_source_generation`, `sources`, `privacy`:
+///   the scope's admitted privacy class and the onboarding-retained source
+///   closure that authenticates the observed instance;
+/// - `owner_revision`: caller-sequenced durable revision for the admitted
+///   owner (same convention as the sibling admission entries).
+///
+/// [`ScopeAttachIngress::validate`] checks shape only: it never authenticates
+/// the scope, the lineage, or the authorization — the live owner read at the
+/// fence, the `MATCHED` guard, and the source closure inside
+/// `GovernorComposition::admit_observed_scope_attach` do. O1 call sequence:
+/// `validate`, then `observe_workspace_instance` on `explicit_root`,
+/// `derive_observed_resources` at the admission fence generation, then
+/// `GovernorComposition::admit_observed_scope_attach` with every field below.
+#[derive(Clone, Debug)]
+pub struct ScopeAttachIngress {
+    /// Explicit absolute workspace root to observe live and attach.
+    pub explicit_root: PathBuf,
+    /// Fresh bounded receipt identity minted per attempt.
+    pub receipt_ref: String,
+    /// Retained scope description the observed instance attaches to.
+    pub descriptor: WorkScopeDescriptor,
+    /// Trigger-authenticated session/host authorization evidence reference.
+    pub authorizing_ref: String,
+    /// Admitted privacy class for the new binding.
+    pub privacy_class: PrivacyClass,
+    /// Source generation the onboarding closure authenticates.
+    pub governing_source_generation: u64,
+    /// Onboarding-retained governing sources for the observed instance.
+    pub sources: GoverningSourceSet,
+    /// Privacy boundary the new binding must satisfy.
+    pub privacy: PrivacyProfile,
+    /// Caller-sequenced durable revision for the admitted owner.
+    pub owner_revision: u64,
+}
+
+impl ScopeAttachIngress {
+    /// Validates the payload shape without authenticating anything.
+    ///
+    /// Malformed caller fields (blank references, zero counters) fail as
+    /// `TASK_SELECTION_REQUIRED`; scope-identity disagreements (a descriptor
+    /// that does not validate, a privacy class outside the admitted
+    /// boundary) fail as `TASK_SCOPE_INCOMPATIBLE`. A non-absolute root
+    /// fails as incompatible: only an explicit absolute path may be
+    /// observed. The governing source set itself is checked at admission
+    /// against the observed scope, never here.
+    pub fn validate(&self) -> Result<(), TaskBindingError> {
+        if !self.explicit_root.is_absolute() {
+            return Err(TaskBindingError::scope_incompatible(
+                "attach ingress explicit_root must be absolute",
+            ));
+        }
+        if self.receipt_ref.trim().is_empty()
+            || self.receipt_ref.chars().any(char::is_control)
+        {
+            return Err(TaskBindingError::selection_required(
+                "attach ingress receipt_ref is blank",
+            ));
+        }
+        if self.authorizing_ref.trim().is_empty()
+            || self.authorizing_ref.chars().any(char::is_control)
+        {
+            return Err(TaskBindingError::selection_required(
+                "attach ingress authorizing_ref is blank",
+            ));
+        }
+        if self.governing_source_generation == 0 {
+            return Err(TaskBindingError::selection_required(
+                "attach ingress governing_source_generation is zero",
+            ));
+        }
+        if self.owner_revision == 0 {
+            return Err(TaskBindingError::selection_required(
+                "attach ingress owner_revision is zero",
+            ));
+        }
+        self.descriptor.validate().map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "attach ingress descriptor invalid: {error}"
+            ))
+        })?;
+        self.privacy.validate().map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "attach ingress privacy boundary invalid: {error}"
+            ))
+        })?;
+        if !self.privacy.admits(self.privacy_class) {
+            return Err(TaskBindingError::scope_incompatible(
+                "attach ingress privacy class is outside the admitted boundary",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Observes one explicit workspace root and produces an authorized attach
