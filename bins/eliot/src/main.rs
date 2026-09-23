@@ -24,11 +24,12 @@ use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
     ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
 };
+use eliot_host::{NotifyFallbackSetupInputs, setup_notify_fallback_per_user};
 use eliot_platform_windows::{
     FileIdentity, HostOwnerLease, InstallerRootError, InstallerRootObjectSnapshot,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
     PackageStagingError, PackageStagingStage, ProtectedRootLease, ProtectedRuntimePathLease,
-    TrustedSourceBundle, TrustedSourceFileLease, WindowsInstallerRootPrimitive,
+    TrustedSourceBundle, TrustedSourceFileLease, UserOwnedRootLease, WindowsInstallerRootPrimitive,
     is_eliot_governor_running, is_process_elevated, observe_current_user_config,
     windows_path_identity_digest,
 };
@@ -280,6 +281,9 @@ enum InstallationCommand {
         eliot_native_worker: PathBuf,
         #[arg(long, value_parser = absolute_path)]
         eliot_wasm_host: PathBuf,
+        /// Release per-user `eliot-notify.exe` adapter path (I1.3/I1.4).
+        #[arg(long, value_parser = absolute_path)]
+        eliot_notify: PathBuf,
         /// Optional explicit external agent-bridge executable source. Must be
         /// supplied together with `--agent-bridge-account`.
         #[arg(long, value_parser = absolute_path)]
@@ -320,6 +324,41 @@ enum InstallationCommand {
         profile_anchor_root: PathBuf,
         #[arg(long)]
         installation_key: Option<String>,
+    },
+    /// Publish the per-user Notify fallback declaration and register the
+    /// signed Task Scheduler fallback. Runs in the interactive session
+    /// matching `--sid`/`--session-id`; normal launch stays User-Broker
+    /// owned (I11.6). No process is spawned by this command.
+    SetupNotifyFallback {
+        /// Stable installation identity.
+        #[arg(long)]
+        installation: String,
+        /// Declared fallback audience.
+        #[arg(long)]
+        audience: String,
+        /// Non-zero authority epoch.
+        #[arg(long)]
+        authority_epoch: u64,
+        /// Watchdog signing key identifier.
+        #[arg(long)]
+        key_id: String,
+        /// Lowercase hex Watchdog verifying key (public half only).
+        #[arg(long)]
+        public_key: String,
+        /// Absolute installed `eliot-notify.exe` path. The image digest is
+        /// always hashed from these exact bytes at setup time; no
+        /// caller-supplied digest is accepted.
+        #[arg(long, value_parser = absolute_path)]
+        notify_exe: PathBuf,
+        /// Explicit installation profile (`system_service`, `user_mode`, or `portable_dev`).
+        #[arg(long, value_parser = parse_installation_profile)]
+        profile: InstallationProfile,
+        /// Absolute OS-validated profile anchor root.
+        #[arg(long, value_parser = absolute_path)]
+        profile_anchor_root: PathBuf,
+        /// Absolute create-new diagnostic JSON path.
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
     },
     /// Stage one update package into a new versioned directory without
     /// overwriting the running executable. `eliot-kernel` and `eliot-host`
@@ -1563,6 +1602,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_testd,
             eliot_native_worker,
             eliot_wasm_host,
+            eliot_notify,
             agent_bridge_exe,
             agent_bridge_account,
             output_bundle,
@@ -1590,6 +1630,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_testd,
             eliot_native_worker,
             eliot_wasm_host,
+            eliot_notify,
             output_bundle,
             output,
             store,
@@ -1606,6 +1647,27 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             installation_key,
             agent_bridge_exe,
             agent_bridge_account,
+        ),
+        InstallationCommand::SetupNotifyFallback {
+            installation,
+            audience,
+            authority_epoch,
+            key_id,
+            public_key,
+            notify_exe,
+            profile,
+            profile_anchor_root,
+            output,
+        } => run_installation_setup_notify_fallback(
+            installation,
+            audience,
+            authority_epoch,
+            key_id,
+            public_key,
+            notify_exe,
+            profile,
+            profile_anchor_root,
+            output,
         ),
         InstallationCommand::StageUpdate {
             install_root,
@@ -1955,6 +2017,79 @@ where
 }
 
 #[allow(
+    clippy::too_many_arguments,
+    reason = "per-user setup carries the full explicit declaration field set"
+)]
+fn run_installation_setup_notify_fallback(
+    installation: String,
+    audience: String,
+    authority_epoch: u64,
+    key_id: String,
+    public_key: String,
+    notify_exe: PathBuf,
+    profile: InstallationProfile,
+    profile_anchor_root: PathBuf,
+    output: PathBuf,
+) -> Result<i32> {
+    use eliot_host::HostError;
+    let portable_root = match profile {
+        InstallationProfile::PortableDev => Some(
+            UserOwnedRootLease::open_existing(&profile_anchor_root)
+                .map_err(|error| anyhow::anyhow!("portable setup root is not provisioned: {error}"))?,
+        ),
+        InstallationProfile::SystemService | InstallationProfile::UserMode => None,
+    };
+    let inputs = NotifyFallbackSetupInputs {
+        installation_identity: cli_handle(installation.clone(), "installation")?,
+        audience: cli_handle(audience.clone(), "audience")?,
+        authority_epoch,
+        key_id: cli_handle(key_id.clone(), "key_id")?,
+        public_key,
+        notify_executable: notify_exe,
+        profile,
+        portable_root,
+    };
+    let setup = match setup_notify_fallback_per_user(&inputs) {
+        Ok(setup) => setup,
+        Err(error) => {
+            if let HostError::RecoveryRequired(_) = &error {
+                write_installation_error(
+                    "NOTIFY_FALLBACK_SETUP_RECOVERY_REQUIRED",
+                    &error.to_string(),
+                );
+                return Ok(UNKNOWN_OUTCOME_EXIT);
+            }
+            write_installation_error("NOTIFY_FALLBACK_SETUP_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let receipt = serde_json::to_string_pretty(&json!({
+        "contract": "eliot.kernel.installation",
+        "contract_version": INSTALLATION_CONTRACT_VERSION,
+        "status": "NOTIFY_FALLBACK_SETUP_PUBLISHED",
+        "output_role": "DIAGNOSTIC_NON_IMPORTABLE",
+        "declaration_path": setup.declaration.declaration_path.display().to_string(),
+        "declaration_digest": setup.declaration.declaration_digest.as_str(),
+        "task_name": setup.registration.task_name,
+        "sid": setup.registration.sid,
+        "session_id": setup.registration.session_id,
+        "notify_artifact_sha256": setup.registration.notify_artifact_sha256,
+        "verifier_sha256": setup.registration.verifier_sha256,
+        "task_xml_sha256": setup.registration.task_xml_sha256,
+    }))?;
+    let mut output_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .map_err(|error| anyhow::anyhow!("open setup output: {error}"))?;
+    output_file
+        .write_all(receipt.as_bytes())
+        .map_err(|error| anyhow::anyhow!("write setup output: {error}"))?;
+    println!("{receipt}");
+    Ok(0)
+}
+
+#[allow(
     clippy::needless_pass_by_value,
     clippy::too_many_arguments,
     clippy::too_many_lines
@@ -1970,6 +2105,7 @@ fn run_installation_materialize_source_bundle(
     eliot_testd: PathBuf,
     eliot_native_worker: PathBuf,
     eliot_wasm_host: PathBuf,
+    eliot_notify: PathBuf,
     output_bundle: PathBuf,
     output: PathBuf,
     store: PathBuf,
@@ -1998,6 +2134,7 @@ fn run_installation_materialize_source_bundle(
         eliot_testd_exe: eliot_testd,
         eliot_native_worker_exe: eliot_native_worker,
         eliot_wasm_host_exe: eliot_wasm_host,
+        eliot_notify_exe: eliot_notify,
         agent_bridge_exe,
         agent_bridge_account,
         output_bundle: output_bundle.clone(),

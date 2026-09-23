@@ -359,7 +359,16 @@ use phase_b_materialization::{
     phase_b_remove_rollback_backup, phase_b_restore_or_remove, phase_b_template_bytes,
 };
 #[cfg(all(windows, test))]
-use phase_b_materialization::{phase_b_materialize_file, phase_b_template_path};
+use phase_b_materialization::phase_b_template_path;
+
+mod notify_fallback_setup;
+pub use notify_fallback_setup::{
+    NotifyFallbackRegistration, NotifyFallbackSetup, NotifyFallbackSetupInputs,
+    PublishedNotifyDeclaration, publish_notify_fallback_declaration, register_notify_fallback,
+    setup_notify_fallback_per_user,
+};
+#[cfg(windows)]
+pub(crate) use phase_b_materialization::phase_b_materialize_file;
 
 #[cfg(windows)]
 mod phase_b_previous_projection;
