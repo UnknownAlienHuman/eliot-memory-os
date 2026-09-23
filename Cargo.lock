@@ -2040,6 +2040,7 @@ name = "eliot-improvement"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-agent-contracts",
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",

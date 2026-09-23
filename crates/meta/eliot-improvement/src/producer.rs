@@ -75,13 +75,17 @@ pub fn produce_learning_candidate(
     // permit-bound Governor authority may be (re)produced, and the
     // presented owner and source must equal those retained identities —
     // never arbitrary caller labels.
-    let retained = request.backlog.entry_for(request.candidate_id).ok_or(
-        BoundsError::NotBacklogAdmitted,
-    )?;
+    let retained = request
+        .backlog
+        .entry_for(request.candidate_id)
+        .ok_or(BoundsError::NotBacklogAdmitted)?;
     if retained.admitted_under_authority.as_deref() != Some(permit.authority_ref()) {
         return Err(BoundsError::GovernorAuthorityUnconfirmed);
     }
-    let retained_owner = retained.owner.as_deref().ok_or(BoundsError::OwnerlessRecord)?;
+    let retained_owner = retained
+        .owner
+        .as_deref()
+        .ok_or(BoundsError::OwnerlessRecord)?;
     if request.owner.trim() != retained_owner {
         return Err(BoundsError::GovernorAuthorityUnconfirmed);
     }

@@ -31,6 +31,8 @@ use eliot_governor::{
     Governor, GovernorConfig, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
     QueueLimits, VerifiedLearningAdmission, issue_learning_admission, verify_learning_admission,
 };
+use eliot_improvement::candidate_bounds::{BoundedBacklog, GovernedOverlay, OverlayState};
+use eliot_improvement::{PresentedLearning, datetime_from_unix};
 use eliot_receipts::{ProofCeiling, WorkScopeId};
 
 const LINEAGE_1869: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -384,9 +386,49 @@ fn owner_permit(
     .expect("live owner issues")
 }
 
+fn live_overlay_1869(fence: &StateFence) -> GovernedOverlay {
+    GovernedOverlay {
+        overlay_id: OVERLAY_1869.to_string(),
+        campaign_id: CAMPAIGN_1869.to_string(),
+        task_id: TASK_1869.to_string(),
+        fence: fence.clone(),
+        compatible_recipe_ref: "recipe-1869".to_string(),
+        state: OverlayState::LocalAdmitted,
+        admission_ref: Some("admission-1869-live".to_string()),
+        expires_at: Some(datetime_from_unix(NOW_1869 + 3600).expect("overlay expiry")),
+    }
+}
+
+/// Build the governed presentation the delivery screen requires: the
+/// owner-verified permit plus its wire ticket, the live `LOCAL_ADMITTED`
+/// overlay, an (empty — no reusable subjects here) backlog, and local
+/// requesting identity with owner-sourced time.
+fn presented_1869<'a>(
+    governor: &'a Governor,
+    verified: &'a VerifiedLearningAdmission<'a>,
+    overlay: &'a GovernedOverlay,
+    backlog: &'a BoundedBacklog,
+    now: u64,
+) -> PresentedLearning<'a> {
+    PresentedLearning {
+        governor,
+        verified,
+        ticket: verified.permit().ticket(),
+        overlay: Some(overlay),
+        backlog,
+        cross_task_admission: None,
+        requesting_campaign_id: CAMPAIGN_1869,
+        requesting_task_id: TASK_1869,
+        now_unix_secs: now,
+    }
+}
+
 fn assemble_marked(
+    governor: &Governor,
     value: &AdmittedContextSet,
     verified: &VerifiedLearningAdmission<'_>,
+    overlay: &GovernedOverlay,
+    backlog: &BoundedBacklog,
     now: u64,
 ) -> Result<ActiveUnderstandingViewResult, AssemblyError> {
     let context = value.binding.clone();
@@ -396,8 +438,7 @@ fn assemble_marked(
         quality(&context),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
-        verified,
-        now,
+        presented_1869(governor, verified, overlay, backlog, now),
     )
 }
 
@@ -409,7 +450,10 @@ fn marked_atom_projects_with_owner_issued_permit() {
     let verified =
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
     let value = admitted_with_learning(permit.digest(), Some(NOW_1869 + 3600));
-    let view = assemble_marked(&value, &verified, NOW_1869).expect("covered marked atom projects");
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
+    let view = assemble_marked(&governor, &value, &verified, &overlay, &backlog, NOW_1869)
+        .expect("covered marked atom projects");
     assert_eq!(view.view.rendered.len(), 2);
     assert!(view.view.admitted_ids.contains(&id("learning-1869")));
 }
@@ -427,6 +471,8 @@ fn drifted_fence_refuses_before_render() {
     value.binding.state_fence.task_revision = Some(TaskRevision::new(2).expect("task revision"));
     let context = value.binding.clone();
     let mut calls = 0;
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
     let result = assemble_active_view_with_learning(
         &value,
         &recipe(&context),
@@ -436,8 +482,7 @@ fn drifted_fence_refuses_before_render() {
             calls += 1;
             Ok(measurement(&context, bytes))
         },
-        &verified,
-        NOW_1869,
+        presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869),
     );
     assert_eq!(calls, 0);
     assert_eq!(
@@ -474,7 +519,9 @@ fn transplanted_permit_digest_refused_at_delivery() {
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
     // Atom cites the other issuance: refused even though both are genuine.
     let value = admitted_with_learning(other.digest(), Some(NOW_1869 + 3600));
-    let result = assemble_marked(&value, &verified, NOW_1869);
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
+    let result = assemble_marked(&governor, &value, &verified, &overlay, &backlog, NOW_1869);
     assert_eq!(
         result,
         Err(AssemblyError::Contract(ContextError::IdentityConflict))
@@ -490,14 +537,15 @@ fn expired_mark_refuses_delivery_and_plain_projection_survives() {
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
     let value = admitted_with_learning(permit.digest(), Some(NOW_1869 - 1));
     let context = value.binding.clone();
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
     let result = assemble_active_view_with_learning(
         &value,
         &recipe(&context),
         quality(&context),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
-        &verified,
-        NOW_1869,
+        presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869),
     );
     assert_eq!(
         result,

@@ -63,7 +63,10 @@ impl LearningAdmissionTicket {
         if self.schema_version != LEARNING_TICKET_SCHEMA_VERSION {
             return Err(ContextError::InvalidField("learning_ticket.schema_version"));
         }
-        validate_text(&self.source_campaign_id, "learning_ticket.source_campaign_id")?;
+        validate_text(
+            &self.source_campaign_id,
+            "learning_ticket.source_campaign_id",
+        )?;
         validate_text(&self.target_task_id, "learning_ticket.target_task_id")?;
         validate_text(&self.scope_ref, "learning_ticket.scope_ref")?;
         validate_text(&self.authority_ref, "learning_ticket.authority_ref")?;
@@ -148,18 +151,13 @@ pub fn ticket_fresh_for(
     if ticket.schema_version != LEARNING_TICKET_SCHEMA_VERSION {
         return false;
     }
-    let recomputed = match learning_ticket_digest(ticket) {
-        Ok(digest) => digest,
-        Err(_) => return false,
+    let Ok(recomputed) = learning_ticket_digest(ticket) else {
+        return false;
     };
     if recomputed != ticket.digest {
         return false;
     }
-    if !ticket
-        .fence
-        .authority_epoch
-        .is_same_authority(live_epoch)
-    {
+    if !ticket.fence.authority_epoch.is_same_authority(live_epoch) {
         return false;
     }
     if ticket.fence.resource_generation != live_generation {

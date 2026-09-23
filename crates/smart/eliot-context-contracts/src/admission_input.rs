@@ -15,9 +15,9 @@ use crate::{
     AdmissionDisposition, AdmissionRecord, CONTEXT_CONTRACT_VERSION, CapacityLimits,
     ContextBinding, ContextCandidate, ContextCandidateSet, ContextEconomyReceipt, ContextError,
     ContextOutcome, ContextRecipe, DecisionContextIncomplete, DecisionRevision,
-    DecisionSafetyFloor, ExpansionHandle, LearningAdmissionTicket, LossPolicy, NonRecoverableReason, OmissionRecord,
-    RepresentationKind, StuEstimate, TokenizerObservation, canonical_digest, validate_digest,
-    validate_text,
+    DecisionSafetyFloor, ExpansionHandle, LearningAdmissionTicket, LossPolicy,
+    NonRecoverableReason, OmissionRecord, RepresentationKind, StuEstimate, TokenizerObservation,
+    canonical_digest, validate_digest, validate_text,
 };
 
 /// Closed unit used by an admission cost.  A unit is never inferred from a

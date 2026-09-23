@@ -159,7 +159,8 @@ fn ticket_mint_shares_permit_digest() {
     let permit = issue_learning_admission(&governor, &claim_1869(3)).expect("permit issues");
     let ticket = issue_learning_ticket(&governor, &claim_1869(3)).expect("ticket issues");
     assert_eq!(
-        ticket.digest, permit.digest(),
+        ticket.digest,
+        permit.digest(),
         "wire twin carries the identical binding digest"
     );
     assert_eq!(

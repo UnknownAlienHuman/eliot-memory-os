@@ -512,9 +512,9 @@ impl GovernedOverlay {
     /// screens whose clock is a `u64`. Fail-closed: out-of-range stamps
     /// report not-live.
     pub fn is_live_local_admitted_at_unix(&self, now_unix_secs: u64) -> bool {
-        let stamp = i64::try_from(now_unix_secs).ok().and_then(|secs| {
-            OffsetDateTime::from_unix_timestamp(secs).ok()
-        });
+        let stamp = i64::try_from(now_unix_secs)
+            .ok()
+            .and_then(|secs| OffsetDateTime::from_unix_timestamp(secs).ok());
         stamp.is_some_and(|now| self.is_live_local_admitted(now))
     }
 }
@@ -855,11 +855,7 @@ pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDeci
         if Some(candidate.candidate_id.as_str()) != permit.candidate_id() {
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }
-        if request
-            .backlog
-            .entry_for(&candidate.candidate_id)
-            .is_none()
-        {
+        if request.backlog.entry_for(&candidate.candidate_id).is_none() {
             return Err(BoundsError::NotBacklogAdmitted);
         }
         reusable_candidate_id = Some(candidate.candidate_id.clone());

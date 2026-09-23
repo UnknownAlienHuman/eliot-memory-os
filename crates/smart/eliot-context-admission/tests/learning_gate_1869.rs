@@ -27,8 +27,10 @@ use eliot_contracts::{
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_governor::{
     Governor, GovernorConfig, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
-    QueueLimits, issue_learning_admission, verify_learning_admission,
+    QueueLimits, VerifiedLearningAdmission, issue_learning_admission, verify_learning_admission,
 };
+use eliot_improvement::candidate_bounds::{BoundedBacklog, GovernedOverlay, OverlayState};
+use eliot_improvement::{PresentedLearning, datetime_from_unix};
 use eliot_receipts::{ProofCeiling, WorkScopeId};
 
 const LINEAGE_1869: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -374,6 +376,43 @@ fn live_permit(
         .expect("live owner issues")
 }
 
+fn live_overlay_1869(fence: &StateFence) -> GovernedOverlay {
+    GovernedOverlay {
+        overlay_id: OVERLAY_1869.to_string(),
+        campaign_id: CAMPAIGN_1869.to_string(),
+        task_id: TASK_1869.to_string(),
+        fence: fence.clone(),
+        compatible_recipe_ref: "recipe-1869".to_string(),
+        state: OverlayState::LocalAdmitted,
+        admission_ref: Some("admission-1869-live".to_string()),
+        expires_at: Some(datetime_from_unix(NOW_1869 + 3600).expect("overlay expiry")),
+    }
+}
+
+/// Build the governed presentation the retrieval screen requires: the
+/// owner-verified permit plus its wire ticket, the live `LOCAL_ADMITTED`
+/// overlay, an (empty — no reusable subjects here) backlog, and local
+/// requesting identity with owner-sourced time.
+fn presented_1869<'a>(
+    governor: &'a Governor,
+    verified: &'a VerifiedLearningAdmission<'a>,
+    overlay: &'a GovernedOverlay,
+    backlog: &'a BoundedBacklog,
+    now: u64,
+) -> PresentedLearning<'a> {
+    PresentedLearning {
+        governor,
+        verified,
+        ticket: verified.permit().ticket(),
+        overlay: Some(overlay),
+        backlog,
+        cross_task_admission: None,
+        requesting_campaign_id: CAMPAIGN_1869,
+        requesting_task_id: TASK_1869,
+        now_unix_secs: now,
+    }
+}
+
 #[test]
 fn marked_atom_admitted_with_owner_issued_permit() {
     let governor = governor_1869();
@@ -385,9 +424,14 @@ fn marked_atom_admitted_with_owner_issued_permit() {
     // Host preflight alone passes on covered input.
     screen_admission_input_learning(&input, &verified, NOW_1869)
         .expect("covered input passes preflight");
-    match admit_context_with_learning(&input, &verified, NOW_1869)
-        .expect("covered marked atom admits")
-        .outcome
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
+    match admit_context_with_learning(
+        &input,
+        presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869),
+    )
+    .expect("covered marked atom admits")
+    .outcome
     {
         ContextOutcome::Complete(admitted) => {
             assert!(
@@ -412,8 +456,13 @@ fn expired_mark_refuses_whole_retrieval_and_plain_path_survives() {
     let verified =
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
     let input = input_with_learning(TASK_1869, permit.digest(), Some(NOW_1869 - 1));
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
     assert_eq!(
-        admit_context_with_learning(&input, &verified, NOW_1869),
+        admit_context_with_learning(
+            &input,
+            presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869),
+        ),
         Err(ContextError::InvalidField("learning.expires_at"))
     );
     // Historical behavior is untouched: unmarked atoms decide as before.
@@ -447,8 +496,13 @@ fn foreign_task_permit_refused() {
         verify_learning_admission(&governor, &permit, &fence).expect("permit targets task-1869-a");
     // Compilation serves another task than the permit target.
     let input = input_with_learning("task-1869-foreign", permit.digest(), Some(NOW_1869 + 3600));
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
     assert_eq!(
-        admit_context_with_learning(&input, &verified, NOW_1869),
+        admit_context_with_learning(
+            &input,
+            presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869),
+        ),
         Err(ContextError::IdentityConflict)
     );
 }
@@ -467,8 +521,13 @@ fn stale_fence_refused() {
         candidate.binding.state_fence.task_revision =
             Some(TaskRevision::new(2).expect("task revision"));
     }
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
     assert_eq!(
-        admit_context_with_learning(&input, &verified, NOW_1869),
+        admit_context_with_learning(
+            &input,
+            presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869),
+        ),
         Err(ContextError::InvalidFence)
     );
 }
@@ -483,8 +542,13 @@ fn transplanted_permit_digest_refused() {
     let verified =
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
     let input = input_with_learning(TASK_1869, other.digest(), Some(NOW_1869 + 3600));
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
     assert_eq!(
-        admit_context_with_learning(&input, &verified, NOW_1869),
+        admit_context_with_learning(
+            &input,
+            presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869),
+        ),
         Err(ContextError::IdentityConflict)
     );
 }
@@ -525,8 +589,13 @@ fn unclosed_reusable_refused() {
                 canonical_digest(learning).expect("remarked subject");
         }
     }
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
     assert_eq!(
-        admit_context_with_learning(&input, &verified, NOW_1869),
+        admit_context_with_learning(
+            &input,
+            presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869),
+        ),
         Err(ContextError::InvalidField("learning.closure_ref"))
     );
 }

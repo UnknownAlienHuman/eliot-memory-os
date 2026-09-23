@@ -200,7 +200,7 @@ fn trim_owned(value: &str) -> String {
     value.trim().to_string()
 }
 
-fn trim_optional(value: &Option<String>) -> Option<String> {
+fn trim_optional(value: Option<&String>) -> Option<String> {
     value
         .as_ref()
         .map(|id| id.trim().to_string())
@@ -227,14 +227,16 @@ fn check_live_admission(
     Ok(())
 }
 
-fn mint_ticket(claim: &LearningAdmissionClaim) -> Result<LearningAdmissionTicket, LearningAdmissionError> {
+fn mint_ticket(
+    claim: &LearningAdmissionClaim,
+) -> Result<LearningAdmissionTicket, LearningAdmissionError> {
     let mut ticket = LearningAdmissionTicket {
         schema_version: LEARNING_TICKET_SCHEMA_VERSION,
         source_campaign_id: trim_owned(&claim.source_campaign_id),
         target_task_id: trim_owned(&claim.target_task_id),
         fence: claim.fence.clone(),
-        overlay_id: trim_optional(&claim.overlay_id),
-        candidate_id: trim_optional(&claim.candidate_id),
+        overlay_id: trim_optional(claim.overlay_id.as_ref()),
+        candidate_id: trim_optional(claim.candidate_id.as_ref()),
         scope_ref: trim_owned(&claim.scope_ref),
         authority_ref: trim_owned(&claim.authority_ref),
         retention_ref: trim_owned(&claim.retention_ref),
@@ -242,8 +244,8 @@ fn mint_ticket(claim: &LearningAdmissionClaim) -> Result<LearningAdmissionTicket
         rollback_ref: trim_owned(&claim.rollback_ref),
         digest: String::new(),
     };
-    ticket.digest = learning_ticket_digest(&ticket)
-        .map_err(|_| LearningAdmissionError::InvalidFence)?;
+    ticket.digest =
+        learning_ticket_digest(&ticket).map_err(|_| LearningAdmissionError::InvalidFence)?;
     Ok(ticket)
 }
 

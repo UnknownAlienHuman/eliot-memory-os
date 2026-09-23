@@ -91,14 +91,14 @@ fn fresh_check_binds_live_state() {
         )
     };
     let (epoch_live, gen_live, fence_live) = live();
-    assert!(ticket_fresh_for(&ticket, &epoch_live, gen_live, &fence_live));
-    // Rotated epoch: stale.
-    assert!(!ticket_fresh_for(
+    assert!(ticket_fresh_for(
         &ticket,
-        &epoch(4),
+        &epoch_live,
         gen_live,
         &fence_live
     ));
+    // Rotated epoch: stale.
+    assert!(!ticket_fresh_for(&ticket, &epoch(4), gen_live, &fence_live));
     // Drifted fence under the same epoch: stale.
     let mut drifted = fence(3);
     drifted.task_revision = Some(TaskRevision::new(2).expect("task revision"));
@@ -106,5 +106,10 @@ fn fresh_check_binds_live_state() {
     // Tampered digest: stale.
     let mut forged = ticket.clone();
     forged.digest = "f".repeat(64);
-    assert!(!ticket_fresh_for(&forged, &epoch_live, gen_live, &fence_live));
+    assert!(!ticket_fresh_for(
+        &forged,
+        &epoch_live,
+        gen_live,
+        &fence_live
+    ));
 }

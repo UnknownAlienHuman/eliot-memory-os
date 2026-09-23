@@ -64,9 +64,7 @@ where
     let mut marks = Vec::new();
     for record in &admitted.records {
         if let Some(provenance) = &record.candidate.learning {
-            provenance
-                .validate()
-                .map_err(AssemblyError::Contract)?;
+            provenance.validate().map_err(AssemblyError::Contract)?;
             marks.push(CarriageMark {
                 campaign_id: provenance.campaign_id.as_str(),
                 overlay_id: provenance.overlay_id.as_deref(),

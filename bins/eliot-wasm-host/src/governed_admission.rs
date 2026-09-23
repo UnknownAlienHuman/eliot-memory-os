@@ -37,21 +37,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_context_admission::admit_context_with_learning;
 use eliot_context_assembly::{
-    ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view_with_learning,
+    ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy,
+    assemble_active_view_with_learning,
 };
 use eliot_context_contracts::{
     AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe, QualityScorecard,
     SerializedContextMeasurement,
 };
 use eliot_governor::{Governor, LearningAdmissionClaim, issue_learning_admission};
-use eliot_improvement::{
-    LearningProduction, PresentedLearning, datetime_from_unix, produce_learning_candidate,
-};
 use eliot_improvement::candidate_bounds::{
     BoundsError, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
 };
+use eliot_improvement::{CarriageMark, bounds_to_context_error};
 use eliot_improvement::{
-    CarriageMark, bounds_to_context_error,
+    LearningProduction, PresentedLearning, datetime_from_unix, produce_learning_candidate,
 };
 
 /// One host-composed governed learning compilation: retrieval decision,
@@ -165,8 +164,8 @@ where
     };
     let overlay = presented.overlay.ok_or(HostAdmitError::OverlayRequired)?;
     let permit = presented.verified.permit();
-    let produced =
-        produce_learning_candidate(production).map_err(|error| HostAdmitError::Production(error.to_string()))?;
+    let produced = produce_learning_candidate(production)
+        .map_err(|error| HostAdmitError::Production(error.to_string()))?;
     let reusable = ReusableCandidateRef {
         candidate_id: produced
             .learning
@@ -194,7 +193,8 @@ where
         cross_task_admission: presented.cross_task_admission,
         backlog: presented.backlog,
         verified: presented.verified,
-        now: datetime_from_unix(now).map_err(|error| HostAdmitError::Retrieval(error.to_string()))?,
+        now: datetime_from_unix(now)
+            .map_err(|error| HostAdmitError::Retrieval(error.to_string()))?,
     })
     .map_err(|error| HostAdmitError::Retrieval(error.to_string()))?;
     input.candidates.candidates.push(produced);
