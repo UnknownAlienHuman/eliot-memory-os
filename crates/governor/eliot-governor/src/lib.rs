@@ -104,8 +104,8 @@ pub use scope_identity_admission::{
     ScopeResolution, SessionTaskClaim, TaskScopeCheck, TaskScopeOutcome, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor, WorkScopeResolutionReceipt,
     WorkScopeResolver, WorkspaceInstanceIdentity, check_at_trigger, check_task_observation,
-    derive_observed_resources, identity_legs, issue_resolution_receipt, rebind_with_receipt,
-    require_fresh_matched_binding,
+    derive_observed_resources, identity_legs, issue_resolution_receipt, produce_attach_receipt,
+    rebind_with_receipt, require_fresh_matched_binding,
 };
 pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;

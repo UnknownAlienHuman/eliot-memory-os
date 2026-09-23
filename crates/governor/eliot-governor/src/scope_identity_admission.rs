@@ -37,7 +37,7 @@ pub use eliot_workscope::{
     ScopeResolution, SessionTaskClaim, TriggerReport, WorkScopeBindingOwner,
     WorkScopeBindingSnapshot, WorkScopeDescriptor, WorkScopeResolutionReceipt, WorkScopeResolver,
     WorkspaceInstanceIdentity, check_at_trigger, derive_observed_resources, identity_legs,
-    issue_resolution_receipt, rebind_with_receipt,
+    issue_resolution_receipt, produce_attach_receipt, rebind_with_receipt,
 };
 
 /// Daemon-edge scope observation verdict.

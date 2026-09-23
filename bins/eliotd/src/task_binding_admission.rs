@@ -30,8 +30,9 @@ use std::path::Path;
 use eliot_bootstrap::capture::observe_workspace_instance;
 use eliot_contracts::StateFence;
 use eliot_governor::{
-    GenerationEvidence, ScopeBinding, TaskScopeOutcome, WorkspaceInstanceIdentity,
-    check_task_observation, derive_observed_resources,
+    GenerationEvidence, ScopeBinding, ScopeRelocationOrAttachReceipt, TaskScopeOutcome,
+    WorkScopeBindingOwner, WorkScopeDescriptor, WorkspaceInstanceIdentity, check_task_observation,
+    derive_observed_resources, produce_attach_receipt,
 };
 use eliot_observation::TaskSelectionEvidence;
 
@@ -361,6 +362,57 @@ pub fn observe_and_admit_task(
         expected_fence,
         compatibility,
     )
+}
+
+/// Observes one explicit workspace root and produces an authorized attach
+/// receipt for the newly observed instance.
+///
+/// This is the daemon trigger ingress for scope attach: the explicit root is
+/// observed mechanically (filesystem/VCS/project facts, never invented), the
+/// observation is derived at the admission fence generation through the same
+/// `derive_observed_resources` the CLI scope-observe ingress runs, and the
+/// owner-issued attach receipt is produced from that live observation, the
+/// retained descriptor and owner, and the explicit authorization reference.
+/// A root that cannot be observed, or an observation that is not exactly one
+/// new same-lineage instance of the bound scope, fails closed with
+/// `TASK_SCOPE_INCOMPATIBLE` carrying the exact producer detail; the retained
+/// binding, task state, and project memory are untouched.
+///
+/// The returned receipt binds nothing by itself: admission runs in the owning
+/// caller through the Governor relocation entry (`admit_scope_relocation`),
+/// which rebinds with the receipt and requires a fresh `MATCHED`
+/// source-closure check for the observed instance. The root is always
+/// explicit — the daemon never infers a workspace from cwd, proximity, or
+/// recency.
+pub fn observe_and_produce_attach_receipt(
+    workspace_root: &Path,
+    receipt_ref: &str,
+    descriptor: &WorkScopeDescriptor,
+    owner: &WorkScopeBindingOwner,
+    authorizing_ref: &str,
+    fence: &StateFence,
+) -> Result<ScopeRelocationOrAttachReceipt, TaskBindingError> {
+    let facts = observe_workspace_instance(workspace_root).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!("workspace observation failed: {error}"))
+    })?;
+    let observed = derive_observed_resources(&facts, fence.resource_generation, None).map_err(
+        |error| {
+            TaskBindingError::scope_incompatible(format!(
+                "observed workspace resources invalid: {error}"
+            ))
+        },
+    )?;
+    produce_attach_receipt(
+        receipt_ref,
+        descriptor,
+        owner,
+        &observed,
+        authorizing_ref,
+        fence,
+    )
+    .map_err(|error| {
+        TaskBindingError::scope_incompatible(format!("attach receipt production failed: {error}"))
+    })
 }
 
 #[cfg(test)]
