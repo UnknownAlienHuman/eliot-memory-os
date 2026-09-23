@@ -18,11 +18,12 @@
 //! issuance proof), refuses any mismatch, binds the presented fields to
 //! the independent canonical anchors below, executes exactly the
 //! presented plan, and repeats the digest in the restore receipt. The
-//! independent anchors are the completed live source-capture row (source
-//! snapshot and denominator the caller cannot fabricate), the
-//! deployment-provisioned destination record (destination identity the
-//! caller cannot provision), and the frame-enforced session capability
-//! plus transport identity (bound before dispatch). Replay converges
+//! independent anchors are the committed Governor coordination receipt
+//! keyed by the restore identity (issuance proof no caller can fabricate),
+//! the completed live source-capture row (source snapshot and denominator),
+//! the deployment-provisioned destination record (destination identity),
+//! and the frame-enforced session capability plus transport identity
+//! (bound before dispatch). Replay converges
 //! instead of overwriting: a present row with identical content
 //! converges, a present row with divergent content conflicts, and
 //! members named by a current purge suppression are never resurrected.
@@ -120,18 +121,18 @@ pub(crate) async fn backup_isolated_restore(
     // Pin the admitted fence against the live store: both endpoints share
     // it, and the composition already pinned it to its own fence.
     current_live_fence(db, &adapter.config, &request.scope.state_fence).await?;
-    // F1 directive anchor: the Governor's restore directive must be a
-    // committed canonical transition the bridge fetches itself — never a
-    // caller-carried receipt. Only the canonical transaction path
+    // T1 coordination anchor: the Governor's coordination transition must
+    // be a committed canonical transition the bridge fetches itself keyed
+    // by the restore operation identity — never a caller-carried receipt
+    // and never a second identity. Only the canonical transaction path
     // (fence CAS, admission, catalogue) can create such a receipt, so its
     // presence is the issuance proof the recomputed digest cannot supply.
     // The receipt must be Committed under RecoverySchema on the shared
-    // fence with the exact operation identity and canonical request hash
-    // the admission names; anything else refuses before any restore I/O.
-    // Until the #959/#960 minter commits directives, every restore
-    // refuses here with ReceiptNotFound: fail-closed, never admittable
-    // by struct alone.
-    verify_governor_directive(adapter, &request).await?;
+    // fence with the exact identity triple the admission carries; anything
+    // else refuses before any restore I/O. Until the paired minter
+    // commits coordination transitions, every restore refuses here with
+    // ReceiptNotFound: fail-closed, never admittable by struct alone.
+    verify_coordination_receipt(adapter, &request).await?;
     let restore_id = request.identity.operation_id.clone();
     if let Some(existing) = load_operation_row(
         db,
@@ -299,29 +300,27 @@ async fn current_live_fence(
     Ok(fence)
 }
 
-/// Verifies the Governor restore-directive anchor against the committed
-/// canonical receipt chain (F1).
+/// Verifies the Governor coordination anchor against the committed
+/// canonical receipt chain (T1).
 ///
-/// The bridge fetches the directive receipt itself by the operation
-/// identity the admission names and binds it field by field: the receipt
-/// must exist, validate as a terminal receipt, carry Committed status
-/// under `RecoverySchema` on the shared fence, and repeat the exact
-/// canonical request hash the admission claims. The admission decision
-/// digest (recomputed in request validation) already covers the
-/// directive reference, so a verified receipt binds directive,
-/// admission, and restore into one tuple. No committed directive means
-/// no issuance proof, and the restore refuses — including replays, which
-/// re-verify the anchor on every call.
-async fn verify_governor_directive(
+/// The bridge fetches the coordination receipt itself, keyed by the
+/// restore operation identity — there is deliberately no second identity
+/// to bind (T1 single-anchor rule). The receipt must exist, validate as
+/// a terminal receipt, carry Committed status under `RecoverySchema` on
+/// the shared fence, and repeat the exact operation identity triple
+/// (operation id by key, idempotency key, canonical request hash) the
+/// admission carries. Only the governed canonical transaction path
+/// (fence CAS, admission, catalogue) can create such a receipt, so its
+/// presence is the issuance proof the recomputed digest cannot supply.
+/// No coordination receipt means no issuance proof, and the restore
+/// refuses — including replays, which re-verify the anchor on every call.
+async fn verify_coordination_receipt(
     adapter: &crate::SurrealStoreAdapter,
     request: &StoreIsolatedRestoreRequest,
 ) -> Result<(), AdapterError> {
-    let receipt = super::read_receipt(
-        adapter,
-        request.admission.governor_directive_operation_id.clone(),
-    )
-    .await?
-    .ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
+    let receipt = super::read_receipt(adapter, request.identity.operation_id.clone())
+        .await?
+        .ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
     receipt.validate().map_err(AdapterError::Store)?;
     if receipt.status != WriteReceiptStatus::Committed {
         return Err(AdapterError::Store(StoreError::ReceiptNotFound));
@@ -329,10 +328,13 @@ async fn verify_governor_directive(
     if receipt.transition_class != TransitionClass::RecoverySchema {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "backup.transition_class",
-            reason: "restore directives commit only under RecoverySchema",
+            reason: "restore coordination commits only under RecoverySchema",
         }));
     }
-    if receipt.canonical_request_hash != request.admission.governor_directive_request_hash {
+    if receipt.operation_id != request.identity.operation_id
+        || receipt.idempotency_key != request.identity.idempotency_key
+        || receipt.canonical_request_hash != request.identity.canonical_request_hash
+    {
         return Err(AdapterError::Store(StoreError::IdentityConflict));
     }
     if receipt.state_fence != request.scope.state_fence {

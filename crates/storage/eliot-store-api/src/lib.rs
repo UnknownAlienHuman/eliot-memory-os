@@ -127,6 +127,7 @@ pub use backup_io::{
     StoreBackupReconciliation, StoreBackupScope, StoreBackupStatusReport, StoreBackupStatusRequest,
     StoreBackupValidationOutcome, StoreBackupValidationReceipt, StoreBackupValidationRequest,
     StoreEvidencePack, StoreIsolatedRestoreRequest, StoreBackupMember, StoreRestoreAdmission,
+    StoreRestoreAdmissionInputs,
 };
 
 pub use request_hash::{
