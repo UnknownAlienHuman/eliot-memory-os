@@ -42,6 +42,7 @@
 #[cfg(windows)]
 mod agent_bridge;
 mod backup_owner_clients;
+mod backup_coordination;
 mod backup_restore;
 mod backup_restore_admission;
 mod backup_restore_ports;
@@ -68,6 +69,11 @@ pub use backup_owner_clients::{
     verify_destination_authorization,
 };
 pub use backup_restore::{CutoverAuthority, CutoverLeaseInvalidation, KernelBackupRestore, KernelRestoreOutcome, phase_owner};
+pub use backup_coordination::{
+    COORD_PARAM_ADMISSION_DIGEST, COORD_PARAM_DECISION_DIGEST, COORD_PARAM_DESTINATION,
+    COORD_PARAM_FENCE_DIGEST, COORD_PARAM_OPERATION_ID, COORD_PARAM_PAYLOAD_DIGEST,
+    COORDINATION_DECISION_DOMAIN, CoordinationDecision,
+};
 pub use backup_restore_admission::{
     KernelRestoreAdmission, RESTORE_ADMISSION_CLASS_MARKER, RESTORE_ADMISSION_DECISION_DOMAIN,
     RESTORE_ADMISSION_WIRE_MARKER, RestoreAdmissionMintRequest, RestoreProvisioningProof,

@@ -73,6 +73,7 @@
 //! fixed admission), no invented Host lease (the authorization is
 //! Host-issued and verified, never minted here).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -86,12 +87,19 @@ use eliot_contracts::{OperationId, RequestMetadata, StateFence, canonical_json_b
 use eliot_ors::{SessionBindingReceipt, SessionDetach, UserBrokerFence, UserBrokerRegistrationReceipt};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{
-    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, WriteReceipt,
+    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, TransitionClass,
+    WriteReceipt, WriteReceiptStatus,
 };
+use serde_json::Value;
 
 use super::{
     KernelComposition, KernelStoreGateway, KernelSupervisionLeaseAuthority,
     SupervisionLeaseAuthorityError,
+};
+use super::backup_coordination::{
+    COORD_PARAM_ADMISSION_DIGEST, COORD_PARAM_DECISION_DIGEST, COORD_PARAM_DESTINATION,
+    COORD_PARAM_FENCE_DIGEST, COORD_PARAM_OPERATION_ID, COORD_PARAM_PAYLOAD_DIGEST,
+    CoordinationDecision,
 };
 use super::backup_restore_admission::{KernelRestoreAdmission, require_restore_transition_class};
 use super::backup_restore_ports::KernelRestoreJournal;
@@ -619,6 +627,47 @@ impl CanonicalStoreImportClient {
         Ok(())
     }
 
+    /// Enforces one Governor-minted restore admission against the exact
+    /// transition it is presented for, shared by the restore import and
+    /// coordination commit wires: same destination binding, same
+    /// transition identity, same fence, and a self-consistent decision.
+    /// Divergence conflicts here, never at the store.
+    fn check_restore_admission(
+        &self,
+        transition: &PreparedTransition,
+        admission: &KernelRestoreAdmission,
+    ) -> Result<(), BackupError> {
+        if admission.destination_binding_digest() != self.destination_binding_digest {
+            return Err(BackupError::FenceMismatch {
+                subject: "destination authorization".to_owned(),
+            });
+        }
+        if admission.identity() != &transition.identity {
+            return Err(BackupError::PlanMismatch);
+        }
+        if admission.fence() != &transition.state_fence {
+            return Err(BackupError::FenceMismatch {
+                subject: "restore admission fence is not current".to_owned(),
+            });
+        }
+        admission.validate()
+    }
+
+    /// Requires one closed coordination parameter to equal its decision
+    /// field. Divergence between parameters and decision refuses: the
+    /// bridge persists parameters verbatim, so a mismatch would admit a
+    /// row the decision never made.
+    fn check_coordination_parameter(
+        parameters: &BTreeMap<String, Value>,
+        key: &'static str,
+        expected: &str,
+    ) -> Result<(), BackupError> {
+        if parameters.get(key).and_then(Value::as_str) != Some(expected) {
+            return Err(BackupError::PlanMismatch);
+        }
+        Ok(())
+    }
+
     /// Executes one Governor-admitted restore transition through the gateway.
     ///
     /// The admitted-restore wire: restore imports run only under a
@@ -654,21 +703,7 @@ impl CanonicalStoreImportClient {
         if transition.identity.operation_id != *operation_id {
             return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
         }
-        if admission.destination_binding_digest() != self.destination_binding_digest {
-            return Err(OwnerChannelError::Backup(BackupError::FenceMismatch {
-                subject: "destination authorization".to_owned(),
-            }));
-        }
-        if admission.identity() != &transition.identity {
-            return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
-        }
-        if admission.fence() != &transition.state_fence {
-            return Err(OwnerChannelError::Backup(BackupError::FenceMismatch {
-                subject: "restore admission fence is not current".to_owned(),
-            }));
-        }
-        admission
-            .validate()
+        self.check_restore_admission(&transition, admission)
             .map_err(OwnerChannelError::Backup)?;
         Self::require_journal_anchor(journal, admission, &context.state_fence)
             .map_err(OwnerChannelError::Backup)?;
@@ -682,6 +717,170 @@ impl CanonicalStoreImportClient {
             .await
             .map_err(BackupError::Target)
             .map_err(OwnerChannelError::Backup)
+    }
+
+    /// Commits one Governor restore coordination decision as a canonical
+    /// transition and proves it re-fetchable by operation identity.
+    ///
+    /// The coordination-row writer (H1): the Governor-built transition
+    /// carrying the closed coordination parameters commits through the
+    /// single canonical write path (gateway apply with unknown-commit
+    /// recovery — never reimplemented here). The committed receipt must
+    /// bind the operation identity, and an identity readback must return
+    /// the same receipt: that readback is the mechanism the bridge uses
+    /// to fetch the anchor independently, exercised here before the row
+    /// key is handed out. Returns the committed receipt plus the row key
+    /// (operation identity string) for bridge readback. Unknown outcomes
+    /// propagate as target failures for identity reconciliation by the
+    /// caller — never a fabricated receipt, never a blind retry.
+    pub async fn commit_coordination_row(
+        &self,
+        verified: &VerifiedDestinationBinding,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        operation_id: &OperationId,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        admission: &KernelRestoreAdmission,
+        decision: &CoordinationDecision,
+    ) -> Result<(WriteReceipt, String), OwnerChannelError> {
+        self.gate(verified)?;
+        transition
+            .validate()
+            .map_err(BackupError::Store)
+            .map_err(OwnerChannelError::Backup)?;
+        require_restore_transition_class(&transition).map_err(OwnerChannelError::Backup)?;
+        if transition.identity.operation_id != *operation_id {
+            return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
+        }
+        self.check_restore_admission(&transition, admission)
+            .map_err(OwnerChannelError::Backup)?;
+        // Decision binding: the decision links this exact admission and
+        // transition — operation, payload, destination, and fence must all
+        // agree across decision, admission, and transition, or the commit
+        // would admit a row the decision never made.
+        if decision.admission_decision_digest() != admission.decision_digest() {
+            return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
+        }
+        if decision.operation_id() != &transition.identity.operation_id {
+            return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
+        }
+        if decision.payload_digest() != transition.identity.canonical_request_hash.as_str() {
+            return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
+        }
+        if decision.destination() != admission.target_id() {
+            return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
+        }
+        if decision.fence() != &transition.state_fence {
+            return Err(OwnerChannelError::Backup(BackupError::FenceMismatch {
+                subject: "restore admission fence is not current".to_owned(),
+            }));
+        }
+        decision
+            .validate()
+            .map_err(OwnerChannelError::Backup)?;
+        // Closed single-operation structure: a coordination commit carries
+        // exactly one named operation whose parameters equal the decision
+        // fields. The operation variant itself stays Store-owned (M1B);
+        // until its catalogue row activates, validation below fail-closes.
+        if transition.named_operations.len() != 1 {
+            return Err(OwnerChannelError::Backup(BackupError::InvalidField {
+                field: "restore.coordination_operations",
+                reason: "coordination commit carries exactly one named operation",
+            }));
+        }
+        let parameters = &transition.named_operations[0].parameters;
+        let fence_bytes = canonical_json_bytes(decision.fence())
+            .map_err(|error| OwnerChannelError::Backup(BackupError::Target(error.to_string())))?;
+        Self::check_coordination_parameter(
+            parameters,
+            COORD_PARAM_OPERATION_ID,
+            decision.operation_id().to_string().as_str(),
+        )
+        .map_err(OwnerChannelError::Backup)?;
+        Self::check_coordination_parameter(
+            parameters,
+            COORD_PARAM_DESTINATION,
+            decision.destination(),
+        )
+        .map_err(OwnerChannelError::Backup)?;
+        Self::check_coordination_parameter(
+            parameters,
+            COORD_PARAM_PAYLOAD_DIGEST,
+            decision.payload_digest(),
+        )
+        .map_err(OwnerChannelError::Backup)?;
+        Self::check_coordination_parameter(
+            parameters,
+            COORD_PARAM_FENCE_DIGEST,
+            sha256_hex(&fence_bytes).as_str(),
+        )
+        .map_err(OwnerChannelError::Backup)?;
+        Self::check_coordination_parameter(
+            parameters,
+            COORD_PARAM_DECISION_DIGEST,
+            decision.decision_digest(),
+        )
+        .map_err(OwnerChannelError::Backup)?;
+        Self::check_coordination_parameter(
+            parameters,
+            COORD_PARAM_ADMISSION_DIGEST,
+            decision.admission_decision_digest(),
+        )
+        .map_err(OwnerChannelError::Backup)?;
+        let receipt = self
+            .gateway
+            .apply(
+                context,
+                transition.clone(),
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await
+            .map_err(BackupError::Target)
+            .map_err(OwnerChannelError::Backup)?;
+        CanonicalOwnerClient::validate_receipt(&receipt)
+            .map_err(OwnerChannelError::Backup)?;
+        if receipt.operation_id != transition.identity.operation_id
+            || receipt.idempotency_key != transition.identity.idempotency_key
+            || receipt.canonical_request_hash != transition.identity.canonical_request_hash
+            || receipt.transition_class != TransitionClass::RecoverySchema
+            || receipt.status != WriteReceiptStatus::Committed
+        {
+            return Err(OwnerChannelError::Backup(BackupError::Target(
+                "coordination commit did not commit the admitted operation".to_owned(),
+            )));
+        }
+        if receipt.state_fence != transition.state_fence {
+            return Err(OwnerChannelError::Backup(BackupError::FenceMismatch {
+                subject: "coordination receipt fence diverged".to_owned(),
+            }));
+        }
+        // Readback proof: the committed row must be re-fetchable by exact
+        // operation identity through the same receipt mechanism the bridge
+        // uses. A successful commit the store cannot return stays
+        // unclaimed here instead of becoming an unattested row key.
+        let row_key = decision.row_key();
+        let readback = self
+            .gateway
+            .receipt(
+                &transition.state_fence,
+                transition.identity.operation_id.clone(),
+            )
+            .await
+            .map_err(|error| OwnerChannelError::Backup(BackupError::Target(error)))?;
+        match readback {
+            Some(confirmed)
+                if confirmed.operation_id == receipt.operation_id
+                    && confirmed.canonical_request_hash == receipt.canonical_request_hash
+                    && confirmed.status == WriteReceiptStatus::Committed =>
+            {
+                Ok((receipt, row_key))
+            }
+            _ => Err(OwnerChannelError::Backup(BackupError::Target(
+                "coordination receipt not re-fetchable by identity".to_owned(),
+            ))),
+        }
     }
 
     /// Reconciles one import by exact operation identity through owner
