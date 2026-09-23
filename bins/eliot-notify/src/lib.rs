@@ -24,7 +24,8 @@ use eliot_notify_core::{
     NotificationStateResponse, NotifyCore, OneShotLedgerPort, SignedWatchdogFallbackEnvelope,
     UserAutomationFailureRequest, UserAutomationInvocation, UserAutomationPreflightProjection,
     VerificationPorts, WATCHDOG_PRODUCT_ID, WATCHDOG_SIGNATURE_ALGORITHM,
-    WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID, WatchdogSignaturePort, watchdog_notification_id,
+    WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID, WatchdogSignaturePort,
+    validate_fallback_envelope_size, validate_fallback_freshness, watchdog_notification_id,
     watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
 };
 use eliot_platform::{
@@ -1221,6 +1222,9 @@ pub fn load_watchdog_fallback_request()
             "watchdog envelope is not canonical JSON".to_owned(),
         ));
     }
+    validate_fallback_envelope_size(&bytes).map_err(|error| {
+        NotifyBuildError::Fallback(format!("watchdog envelope size rejected: {error}"))
+    })?;
     let request_hash = watchdog_request_hash(&envelope)
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
     let request_id = watchdog_request_id(&envelope)
@@ -1451,6 +1455,24 @@ impl WatchdogSignaturePort for LocalFallbackWatchdog {
             || envelope.envelope.evidence_digest != request.body_digest.as_str()
             || !request_matches_fallback(request, &declaration)
         {
+            return PortOutcome::Error(fallback_provider_error(ProviderErrorCode::InvalidRequest));
+        }
+        let now_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => match u64::try_from(duration.as_millis()) {
+                Ok(now_ms) => now_ms,
+                Err(_) => {
+                    return PortOutcome::Error(fallback_provider_error(
+                        ProviderErrorCode::InvalidRequest,
+                    ));
+                }
+            },
+            Err(_) => {
+                return PortOutcome::Error(fallback_provider_error(
+                    ProviderErrorCode::InvalidRequest,
+                ));
+            }
+        };
+        if validate_fallback_freshness(envelope.envelope.timestamp_ms, now_ms).is_err() {
             return PortOutcome::Error(fallback_provider_error(ProviderErrorCode::InvalidRequest));
         }
         let Some(public_key) = decode_hex(&declaration.public_key, 32)
