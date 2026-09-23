@@ -186,7 +186,15 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 /// (`bins/eliotd/src/reactive_feed.rs`, tick in `daemon_runtime.rs`,
 /// supplier injection in `bins/eliotd/src/lib.rs`) is M2/O1-owned through
 /// root; the exact wired invocation is proven in the
-/// `work/1947-admission-decision` donor copy at `b95c0fce`.
+/// `work/1947-admission-decision` donor copy at `b95c0fce`. The O1 caller
+/// side is recorded read-only at `532a2b4e`
+/// (`bins/eliotd/src/attempt_execution_chain.rs` poll-docs hunk): plan
+/// digest plus [`check_plan_revisions`] before firing, true owner
+/// revisions threaded into expectations, warnings only as owner-minted
+/// records, revision text observed-only with fence counters compared
+/// exactly. Where that record predates this contract (assessed at
+/// `0f9b456b`: `None` entry as no-opinion), the strict rule here governs —
+/// unresolved compares reject — pending root serialization.
 pub fn admit_context_traced(
     input: &AdmissionInput,
 ) -> Result<(AdmissionResult, Vec<MaterialRankTrace>), ContextError> {
