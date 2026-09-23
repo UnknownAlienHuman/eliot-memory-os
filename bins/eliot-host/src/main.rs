@@ -863,9 +863,49 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
     report.controls_accepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
     report.check_point = 0;
     let _ = report_service_status(&handle, &report);
-    while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
+    let mut idle_drain = HostIdleDrainSupervisor::default();
+    let mut stop_pending_reported = false;
+    let mut next_stop_census = std::time::Instant::now();
+    while host.running() {
         process_phase_b_requests(&mut host, &phase_b_queue);
         process_runtime_control_requests(&mut host, &runtime_queue);
+        if STOP_REQUESTED.load(Ordering::Acquire) {
+            if !stop_pending_reported {
+                report.current_state = SERVICE_STOP_PENDING;
+                report.controls_accepted = 0;
+                report.check_point = 1;
+                report.wait_hint = 30_000;
+                let _ = report_service_status(&handle, &report);
+                stop_pending_reported = true;
+            }
+            if host.has_process_contour() {
+                if let Err(error) = host.begin_scm_drain() {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: pre-commit SCM drain could not start: {error}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    continue;
+                }
+                let now = std::time::Instant::now();
+                if now >= next_stop_census {
+                    next_stop_census = now + std::time::Duration::from_secs(5);
+                    match host.has_active_generation_runtime_leases() {
+                        Ok(false) => break,
+                        Ok(true) => {}
+                        Err(error) => {
+                            let _ = writeln!(
+                                io::stderr().lock(),
+                                "eliot-host: Kernel owner census is not ready for drain: {error}"
+                            );
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                continue;
+            }
+            break;
+        }
         match host.has_durable_branch_fence() {
             Ok(true) => {
                 // A degraded branch has fenced the shared authority in the
@@ -894,6 +934,17 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                     );
                     STOP_REQUESTED.store(true, Ordering::Release);
                     break;
+                }
+            }
+            match idle_drain.poll(&mut host, std::time::Instant::now()) {
+                Ok(true) => STOP_REQUESTED.store(true, Ordering::Release),
+                Ok(false) => {}
+                Err(error) => {
+                    idle_drain.note_probe_failure();
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: idle RuntimeLease owner census deferred drain: {error}"
+                    );
                 }
             }
         }
@@ -1155,6 +1206,125 @@ fn report_scm_tick(outcome: ScmContourTickOutcome) {
         io::stderr().lock(),
         "eliot-host: independent contour disposition: {disposition:?}"
     );
+}
+
+#[cfg(windows)]
+struct HostIdleDrainSupervisor {
+    idle_since: Option<std::time::Instant>,
+    drain_staged_at: Option<std::time::Instant>,
+    last_census_at: Option<std::time::Instant>,
+    staged_census_complete: bool,
+    last_census_had_active_owner: bool,
+}
+
+#[cfg(windows)]
+impl Default for HostIdleDrainSupervisor {
+    fn default() -> Self {
+        Self {
+            idle_since: None,
+            drain_staged_at: None,
+            last_census_at: None,
+            staged_census_complete: false,
+            last_census_had_active_owner: false,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl HostIdleDrainSupervisor {
+    const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+    const CENSUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    const PRECOMMIT_CANCEL_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Returns true once the exact-fence owner census remains idle through the
+    /// five-minute grace and a cancellable pre-commit SCM tick has completed.
+    fn poll(
+        &mut self,
+        host: &mut HostComposition,
+        now: std::time::Instant,
+    ) -> Result<bool, HostError> {
+        if !host.idle_drain_eligible()? {
+            self.reset();
+            return Ok(false);
+        }
+
+        let pending = host.precommit_drain_pending()?;
+        if pending && self.drain_staged_at.is_none() {
+            self.drain_staged_at = Some(now);
+            self.staged_census_complete = false;
+        } else if !pending && self.drain_staged_at.take().is_some() {
+            // An authenticated demand cancelled the previous attempt. The
+            // same activation stays live, and its next idle period starts now.
+            self.idle_since = None;
+            self.staged_census_complete = false;
+        }
+
+        if let Some(staged_at) = self.drain_staged_at {
+            if self.staged_census_complete
+                && !self.last_census_had_active_owner
+                && now.duration_since(staged_at) >= Self::PRECOMMIT_CANCEL_WINDOW
+            {
+                return Ok(true);
+            }
+            if self.staged_census_complete
+                && self.last_census_had_active_owner
+                && self
+                    .last_census_at
+                    .is_some_and(|last| now.duration_since(last) < Self::CENSUS_INTERVAL)
+            {
+                return Ok(false);
+            }
+        } else if self
+            .last_census_at
+            .is_some_and(|last| now.duration_since(last) < Self::CENSUS_INTERVAL)
+        {
+            return Ok(false);
+        }
+
+        let active = host.has_active_generation_runtime_leases()?;
+        self.last_census_at = Some(now);
+        self.last_census_had_active_owner = active;
+        if self.drain_staged_at.is_some() {
+            self.staged_census_complete = true;
+            if active {
+                self.idle_since = None;
+                return Ok(false);
+            }
+            return Ok(self.drain_staged_at.is_some_and(|staged| {
+                now.duration_since(staged) >= Self::PRECOMMIT_CANCEL_WINDOW
+            }));
+        }
+        if active {
+            self.idle_since = None;
+            return Ok(false);
+        }
+
+        let idle_since = *self.idle_since.get_or_insert(now);
+        if now.duration_since(idle_since) >= Self::IDLE_GRACE {
+            host.begin_idle_drain()?;
+            self.drain_staged_at = Some(now);
+            self.staged_census_complete = false;
+        }
+        Ok(false)
+    }
+
+    fn note_probe_failure(&mut self) {
+        self.last_census_at = None;
+        self.last_census_had_active_owner = true;
+        if self.drain_staged_at.is_none() {
+            self.idle_since = None;
+        } else {
+            self.staged_census_complete = false;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.idle_since = None;
+        self.drain_staged_at = None;
+        self.last_census_at = None;
+        self.staged_census_complete = false;
+        self.last_census_had_active_owner = false;
+    }
 }
 
 #[cfg(windows)]

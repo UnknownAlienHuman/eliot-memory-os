@@ -25,12 +25,12 @@ mod host_composition_validation;
 pub mod host_diagnostics;
 mod host_job_launch;
 #[cfg(windows)]
-mod lease_drain;
-#[cfg(windows)]
 mod launch_artifact;
 #[cfg(windows)]
 mod launch_descriptor_validation;
 mod launch_options;
+#[cfg(windows)]
+mod lease_drain;
 #[cfg(windows)]
 mod reactive_context_delivery;
 mod scm_launch;
@@ -148,7 +148,9 @@ use launch_descriptor_validation::{
 pub use launch_options::HostLaunchOptions;
 use launch_options::valid_sha256_text;
 #[cfg(windows)]
-pub use reactive_context_delivery::{HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError};
+pub use reactive_context_delivery::{
+    HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError,
+};
 pub use scm_launch::{
     HOST_SCM_CAUSE_MAX_CHARS, HostScmRegistrationCause, ValidatedHostScmLaunch,
     classify_host_scm_inspection, validate_host_scm_bootstrap,
@@ -171,13 +173,13 @@ use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGener
 #[cfg(windows)]
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_host_state::{
-    ActivationState, AppendReceipt, DrainRecord, DrainState, EpochIdentity, EpochLineageId,
-    EliotActivationRecord, EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
+    ActivationState, AppendReceipt, DrainRecord, DrainState, EliotActivationRecord, EpochIdentity,
+    EpochLineageId, EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
     HostStateJournalService, HostStateRecord, IdempotencyIdentity, JournalBackend, JournalError,
     KernelJobBinding, KernelRecord, NonceState, OneTimeNonceState, PriorKernelDisposition,
     ProductionHostStateJournal, ReconcileOutcome, RecordFence, RecoveryLineageEvidence,
-    RedbJournalBackend, ServiceSafetyClass, StoreRebindRecord, StoreRebindState, WakeRecord,
-    WakeDisposition, host_owner_epoch_digest, record_checksum,
+    RedbJournalBackend, ServiceSafetyClass, StoreRebindRecord, StoreRebindState, WakeDisposition,
+    WakeRecord, host_owner_epoch_digest, record_checksum,
 };
 use eliot_installation::{
     ActivationCommitFence, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
@@ -207,8 +209,7 @@ use eliot_kernel_service::{
     KernelReadyReceipt, KernelServiceState, ProcessAuthorityHandoffDescriptor, RestartBudget,
     StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
     StoreRebindReceipt, control_request_frame, decode_control_response_frame,
-    expected_runtime_lease, expected_runtime_lease_id,
-    semantic_store_config_hash_from_json,
+    expected_runtime_lease, expected_runtime_lease_id, semantic_store_config_hash_from_json,
 };
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
@@ -229,15 +230,15 @@ use eliot_platform_windows::{
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerLease, HostOwnerLeaseError,
     HostOwnerLeaseReleaseError, ProtectedRootLease, ServiceAccount, ServiceRegistrationRequest,
-    ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStopOutcome,
-    TerminatedJobChild, WindowsPlatform, fresh_kernel_activation_nonce,
+    ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStopOutcome, TerminatedJobChild,
+    WindowsPlatform, fresh_kernel_activation_nonce,
 };
 #[cfg(windows)]
 use eliot_process::DispatchAuthorityId;
 use eliot_runtime_contracts::{
-    HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord,
-    RuntimeLease, ServiceProcessState, SupervisionJournalEpoch,
-    SupervisionLeaseIncarnationBinding, WakeIntent, WakeIntentState,
+    HealthDimension, HealthVector, KernelActivationState, RuntimeLease, ServiceProcessRecord,
+    ServiceProcessState, SupervisionJournalEpoch, SupervisionLeaseIncarnationBinding, WakeIntent,
+    WakeIntentState,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -404,9 +405,9 @@ mod kernel_activation_driver;
 use kernel_activation_driver::DurableKernelActivationDriver;
 
 #[cfg(windows)]
-mod kernel_front_door_client;
-#[cfg(windows)]
 mod host_startup_evidence;
+#[cfg(windows)]
+mod kernel_front_door_client;
 #[cfg(all(windows, test))]
 use kernel_front_door_client::kernel_front_door_acl_mode;
 #[cfg(windows)]
@@ -528,8 +529,7 @@ fn validate_probe_response(
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     if response.runtime_lease.is_some() {
         return Err(HostError::ProcessContour(
-            "Kernel ProbeReady response carried a RuntimeLease before owner admission"
-                .to_owned(),
+            "Kernel ProbeReady response carried a RuntimeLease before owner admission".to_owned(),
         ));
     }
     if !matches!(&request.command, KernelControlCommand::ProbeReady)
@@ -640,19 +640,15 @@ fn validate_runtime_lease_response(
             .as_millis(),
     )
     .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let expected_lease_id = expected_runtime_lease_id(
-        &request.candidate,
-        request.generation,
-        admission,
-    )
-    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let expected_lease_id =
+        expected_runtime_lease_id(&request.candidate, request.generation, admission)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     if runtime_lease.lease_id != expected_lease_id
         || runtime_lease.state_fence != admission.state_fence
         || runtime_lease.obligation.expires_at_ms <= now_ms
     {
         return Err(HostError::ProcessContour(
-            "Kernel RuntimeLease readback is not bound to the current owner admission"
-                .to_owned(),
+            "Kernel RuntimeLease readback is not bound to the current owner admission".to_owned(),
         ));
     }
     let expected = expected_runtime_lease(
@@ -673,7 +669,8 @@ fn validate_runtime_lease_response(
         || runtime_lease.obligation.reason != expected.obligation.reason
         || runtime_lease.obligation.required_runtime_branches
             != expected.obligation.required_runtime_branches
-        || runtime_lease.obligation.required_capabilities != expected.obligation.required_capabilities
+        || runtime_lease.obligation.required_capabilities
+            != expected.obligation.required_capabilities
         || runtime_lease.obligation.obligation_refs != expected.obligation.obligation_refs
     {
         return Err(HostError::ProcessContour(
@@ -1989,8 +1986,7 @@ impl HostJobBranches {
             let runtime_lease = if let Some(demand) = demand {
                 let admission = demand.runtime_lease_admission.as_ref().ok_or_else(|| {
                     HostError::OwnerLeaseRecovery(
-                        "demand-start has no authenticated RuntimeLease owner admission"
-                            .to_owned(),
+                        "demand-start has no authenticated RuntimeLease owner admission".to_owned(),
                     )
                 })?;
                 if admission.state_fence != demand.state_fence {
@@ -3618,6 +3614,49 @@ impl HostJobBranches {
         Ok(())
     }
 
+    /// Releases the retained Kernel branch only after its exact launched
+    /// process and complete Job history show a cooperative exit.
+    #[cfg(windows)]
+    fn forget_kernel_after_observed_exit(
+        &mut self,
+        expected: &ProcessIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<bool, HostError> {
+        let Some(kernel) = self.kernel.as_ref() else {
+            return Ok(false);
+        };
+        if kernel.evidence().process() != expected {
+            return Err(HostError::ProcessContour(
+                "cooperative Kernel exit target differs from the retirement barrier".to_owned(),
+            ));
+        }
+        let history = kernel
+            .wait_for_empty_history(timeout)
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        if !history.complete()
+            || !history.job_empty()
+            || !history
+                .processes()
+                .iter()
+                .any(|observed| observed.process() == expected)
+        {
+            return Ok(false);
+        }
+        let observed = kernel
+            .observe()
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        if !matches!(
+            observed,
+            eliot_platform_windows::RunningJobObservation::Exited { .. }
+        ) {
+            return Ok(false);
+        }
+        self.kernel.take();
+        self.kernel_candidate = None;
+        self.kernel_activation_receipt = None;
+        Ok(true)
+    }
+
     /// Terminates the store branch during bounded rollback or shutdown.
     ///
     /// # Errors
@@ -3646,6 +3685,12 @@ impl HostJobBranches {
                 "Store-first termination was incomplete: store={store:?}; kernel={kernel:?}"
             ))),
         }
+    }
+
+    #[allow(dead_code)]
+    fn terminate_kernel_then_store(&mut self) -> Result<(), HostError> {
+        self.terminate_kernel()?;
+        self.terminate_store()
     }
 
     fn clear_recorded_contour(&mut self) {
@@ -3729,16 +3774,16 @@ fn epoch_contract_error(error: &EpochContractError) -> JournalError {
 
 #[cfg(windows)]
 mod watchdog_service_start;
-#[cfg(all(test, windows))]
-use watchdog_service_start::{
-    InstalledWatchdogStartControl, WATCHDOG_START_TIMEOUT_MS, WatchdogStartClock,
-    require_running_watchdog, start_installed_watchdog_with_clock, watchdog_start_wait,
-};
 #[cfg(windows)]
 use watchdog_service_start::{
     InstalledWatchdogControl, InstalledWatchdogRuntimeInspection,
     approved_service_registration_request, select_watchdog_approval_for_inspection,
     start_installed_watchdog, verify_watchdog_scm_running,
+};
+#[cfg(all(test, windows))]
+use watchdog_service_start::{
+    InstalledWatchdogStartControl, WATCHDOG_START_TIMEOUT_MS, WatchdogStartClock,
+    require_running_watchdog, start_installed_watchdog_with_clock, watchdog_start_wait,
 };
 
 fn sha256_json(value: &impl serde::Serialize) -> Result<String, HostError> {
@@ -3886,8 +3931,7 @@ fn record_fence(
 mod journal_append;
 #[cfg(windows)]
 use journal_append::{
-    append_authenticated_kernel_readiness_with_heartbeat,
-    append_store_rebind_terminal,
+    append_authenticated_kernel_readiness_with_heartbeat, append_store_rebind_terminal,
     persist_store_rebind_disposition,
 };
 // The pre-transport append stays covered by journal tests through the
@@ -5261,28 +5305,19 @@ impl HostComposition {
         &mut self,
         demand: &HostDemandStartRuntimeRequest,
     ) -> Result<(), HostError> {
-        let runtime_lease = self
-            .jobs
-            .kernel_runtime_lease
-            .as_ref()
-            .ok_or_else(|| {
-                HostError::OwnerLeaseRecovery(
-                    "Kernel did not retain a current RuntimeLease after readiness".to_owned(),
-                )
-            })?;
+        let runtime_lease = self.jobs.kernel_runtime_lease.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "Kernel did not retain a current RuntimeLease after readiness".to_owned(),
+            )
+        })?;
         runtime_lease
             .validate()
             .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
-        let supervision_lease = self
-            .jobs
-            .kernel_supervision_lease
-            .as_ref()
-            .ok_or_else(|| {
-                HostError::OwnerLeaseRecovery(
-                    "Kernel did not retain a current supervision lease after readiness"
-                        .to_owned(),
-                )
-            })?;
+        let supervision_lease = self.jobs.kernel_supervision_lease.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "Kernel did not retain a current supervision lease after readiness".to_owned(),
+            )
+        })?;
         supervision_lease
             .validate()
             .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
@@ -5325,7 +5360,9 @@ impl HostComposition {
         self.ensure_admission_open()?;
         let initial = self.journal.snapshot()?;
         let activation = initial.activation.clone().ok_or_else(|| {
-            HostError::OwnerLeaseRecovery("demand-start has no durable activation record".to_owned())
+            HostError::OwnerLeaseRecovery(
+                "demand-start has no durable activation record".to_owned(),
+            )
         })?;
         let mut drain_disposition = None;
 
@@ -5377,12 +5414,12 @@ impl HostComposition {
                         .runtime_lease_refs
                         .iter()
                         .any(|value| demand.runtime_lease_ref.as_ref() == Some(value))
-                            && demand.runtime_lease_ref.is_some()
+                        && demand.runtime_lease_ref.is_some()
                     || !activation
                         .supervision_lease_refs
                         .iter()
                         .any(|value| demand.supervision_lease_ref.as_ref() == Some(value))
-                            && demand.supervision_lease_ref.is_some()
+                        && demand.supervision_lease_ref.is_some()
                 {
                     return Err(HostError::RecoveryRequired(
                         "active activation does not carry the exact demand lease binding"
@@ -5416,24 +5453,28 @@ impl HostComposition {
                         "demand-start saw Draining activation without DrainRecord".to_owned(),
                     )
                 })?;
-                if !matches!(drain.state, DrainState::Requested | DrainState::Draining) {
+                if !matches!(
+                    drain.state,
+                    DrainState::Requested | DrainState::Draining | DrainState::Cancelled
+                ) {
                     return Err(HostError::RecoveryRequired(
                         "demand-start cannot cancel a terminal drain".to_owned(),
                     ));
                 }
-                let mut cancelled = drain;
-                cancelled.state = DrainState::Cancelled;
-                cancelled.operation = demand_operation(request, "cancel-drain")?;
-                cancelled
-                    .evidence_refs
-                    .push(PlatformHandle::new("authenticated-demand-start")
-                        .map_err(|error| HostError::Platform(error.to_string()))?);
-                self.append_record(HostStateRecord::Drain(cancelled))?;
+                if drain.state != DrainState::Cancelled {
+                    let mut cancelled = drain;
+                    cancelled.state = DrainState::Cancelled;
+                    cancelled.operation = demand_operation(request, "cancel-drain")?;
+                    cancelled.evidence_refs.push(
+                        PlatformHandle::new("authenticated-demand-start")
+                            .map_err(|error| HostError::Platform(error.to_string()))?,
+                    );
+                    self.append_record(HostStateRecord::Drain(cancelled))?;
+                }
                 let disposition = self.reconcile_approved_contour()?;
                 if disposition != HostBranchDisposition::Healthy {
                     return Err(HostError::RecoveryRequired(
-                        "demand-start drain cancellation could not revalidate readiness"
-                            .to_owned(),
+                        "demand-start drain cancellation could not revalidate readiness".to_owned(),
                     ));
                 }
                 self.jobs.acquire_runtime_lease_for_demand(demand)?;
@@ -5475,25 +5516,22 @@ impl HostComposition {
             current.fence.activation_generation.current.sequence
         ))
         .map_err(|error| HostError::Platform(error.to_string()))?;
-        let runtime_lease_ref = current
-            .runtime_lease_refs
-            .first()
-            .cloned()
-            .ok_or_else(|| {
-                HostError::OwnerLeaseRecovery(
-                    "demand-start completion has no current RuntimeLease reference".to_owned(),
-                )
-            })?;
-        let supervision_lease_ref = current
-            .supervision_lease_refs
-            .first()
-            .cloned()
-            .ok_or_else(|| {
-                HostError::OwnerLeaseRecovery(
-                    "demand-start completion has no current supervision lease reference"
-                        .to_owned(),
-                )
-            })?;
+        let runtime_lease_ref = current.runtime_lease_refs.first().cloned().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "demand-start completion has no current RuntimeLease reference".to_owned(),
+            )
+        })?;
+        let supervision_lease_ref =
+            current
+                .supervision_lease_refs
+                .first()
+                .cloned()
+                .ok_or_else(|| {
+                    HostError::OwnerLeaseRecovery(
+                        "demand-start completion has no current supervision lease reference"
+                            .to_owned(),
+                    )
+                })?;
         let mut receipt = HostDemandStartReceipt {
             mutation_digest: request.mutation_digest.clone(),
             request_digest: request.request_digest.clone(),
@@ -6205,12 +6243,7 @@ impl HostComposition {
                 state,
                 wait_hint_ms,
                 process,
-            } => verify_watchdog_scm_running(
-                &registration,
-                state,
-                wait_hint_ms,
-                process.as_ref(),
-            )?,
+            } => verify_watchdog_scm_running(&registration, state, wait_hint_ms, process.as_ref())?,
             _ => {
                 return Err(HostError::RecoveryRequired(
                     "Watchdog is not Running for heartbeat incarnation bind".to_owned(),
@@ -6230,18 +6263,9 @@ impl HostComposition {
     fn watchdog_start_inputs_for_manifest(
         &self,
         manifest: &CandidateManifest,
-    ) -> Result<
-        Option<(
-            ServiceRegistrationRequest,
-            PathBuf,
-            PathBuf,
-        )>,
-        HostError,
-    > {
-        let Some(approval) = select_watchdog_approval_for_inspection(
-            &self.registry,
-            manifest,
-        )? else {
+    ) -> Result<Option<(ServiceRegistrationRequest, PathBuf, PathBuf)>, HostError> {
+        let Some(approval) = select_watchdog_approval_for_inspection(&self.registry, manifest)?
+        else {
             return Ok(None);
         };
         let launch = &manifest.runtime_launch;
@@ -6262,14 +6286,7 @@ impl HostComposition {
     fn pending_watchdog_start_inputs(
         &self,
         pending: &eliot_installation::PendingActivation,
-    ) -> Result<
-        Option<(
-            ServiceRegistrationRequest,
-            PathBuf,
-            PathBuf,
-        )>,
-        HostError,
-    > {
+    ) -> Result<Option<(ServiceRegistrationRequest, PathBuf, PathBuf)>, HostError> {
         self.watchdog_start_inputs_for_manifest(&pending.manifest)
     }
 
@@ -6305,81 +6322,76 @@ impl HostComposition {
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_stopped() && observation.process().is_none() => {}
             ServiceRegistrationRuntimeInspection::Matching { observation }
-                if observation.is_running() => {
-                    let Some(carrier) = carrier.as_ref() else {
-                        return Err(HostError::RecoveryRequired(
-                            "Watchdog is Running without an operation-bound start carrier"
-                                .to_owned(),
-                        ));
-                    };
-                    if !carrier.descriptor_published || !carrier.start_may_have_issued {
-                        return Err(HostError::RecoveryRequired(
-                            "Running Watchdog lacks the complete operation-bound start carrier"
-                                .to_owned(),
-                        ));
-                    }
-                    let process = observation.process().ok_or_else(|| {
-                        HostError::RecoveryRequired(
-                            "Watchdog Running state has no handle-bound process identity"
-                                .to_owned(),
-                        )
-                    })?;
-                    let current_descriptor = watchdog_heartbeat::HeartbeatTransportDescriptor::load(
-                        &heartbeat_state_root,
-                    )?
-                    .ok_or_else(|| {
-                        HostError::RecoveryRequired(
-                            "Running Watchdog has no heartbeat descriptor for rollback binding"
-                                .to_owned(),
-                        )
-                    })?;
-                    if current_descriptor.pipe_name != carrier.issued_descriptor.pipe_name
-                        || current_descriptor.host_challenge_nonce
-                            != carrier.issued_descriptor.host_challenge_nonce
-                        || current_descriptor.service_instance_guid
-                            != carrier.issued_descriptor.service_instance_guid
-                        || current_descriptor.installation_id
-                            != carrier.issued_descriptor.installation_id
-                        || current_descriptor.transaction_plan_generation
-                            != carrier.issued_descriptor.transaction_plan_generation
-                        || current_descriptor.watchdog_incarnation_pid != process.process_id
-                        || current_descriptor.watchdog_incarnation_start_100ns
-                            != process.start_time_100ns
-                    {
-                        return Err(HostError::RecoveryRequired(
-                            "Running Watchdog is not the exact heartbeat-bound start peer"
-                                .to_owned(),
-                        ));
-                    }
-                    let runtime_identity_digest = observation
-                        .runtime_identity_digest()
+                if observation.is_running() =>
+            {
+                let Some(carrier) = carrier.as_ref() else {
+                    return Err(HostError::RecoveryRequired(
+                        "Watchdog is Running without an operation-bound start carrier".to_owned(),
+                    ));
+                };
+                if !carrier.descriptor_published || !carrier.start_may_have_issued {
+                    return Err(HostError::RecoveryRequired(
+                        "Running Watchdog lacks the complete operation-bound start carrier"
+                            .to_owned(),
+                    ));
+                }
+                let process = observation.process().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Watchdog Running state has no handle-bound process identity".to_owned(),
+                    )
+                })?;
+                let current_descriptor =
+                    watchdog_heartbeat::HeartbeatTransportDescriptor::load(&heartbeat_state_root)?
                         .ok_or_else(|| {
                             HostError::RecoveryRequired(
-                                "Running Watchdog has no runtime identity digest".to_owned(),
+                                "Running Watchdog has no heartbeat descriptor for rollback binding"
+                                    .to_owned(),
                             )
                         })?;
-                    let stop_request = carrier
-                        .registration
-                        .clone()
-                        .with_expected_runtime_identity_digest(runtime_identity_digest)
-                        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-                    match platform
-                        .stop_service_registration(&stop_request)
-                        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
-                    {
-                        ServiceStopOutcome::Stopped { .. }
-                        | ServiceStopOutcome::AlreadyStopped { .. } => {
-                            stopped_process =
-                                Some((process.process_id, process.start_time_100ns));
-                        }
-                        ServiceStopOutcome::AlreadyStopping { .. }
-                        | ServiceStopOutcome::EffectUnknown => {
-                            return Err(HostError::RecoveryRequired(
-                                "Watchdog stop outcome is not durably known".to_owned(),
-                            ));
-                        }
+                if current_descriptor.pipe_name != carrier.issued_descriptor.pipe_name
+                    || current_descriptor.host_challenge_nonce
+                        != carrier.issued_descriptor.host_challenge_nonce
+                    || current_descriptor.service_instance_guid
+                        != carrier.issued_descriptor.service_instance_guid
+                    || current_descriptor.installation_id
+                        != carrier.issued_descriptor.installation_id
+                    || current_descriptor.transaction_plan_generation
+                        != carrier.issued_descriptor.transaction_plan_generation
+                    || current_descriptor.watchdog_incarnation_pid != process.process_id
+                    || current_descriptor.watchdog_incarnation_start_100ns
+                        != process.start_time_100ns
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "Running Watchdog is not the exact heartbeat-bound start peer".to_owned(),
+                    ));
+                }
+                let runtime_identity_digest =
+                    observation.runtime_identity_digest().ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "Running Watchdog has no runtime identity digest".to_owned(),
+                        )
+                    })?;
+                let stop_request = carrier
+                    .registration
+                    .clone()
+                    .with_expected_runtime_identity_digest(runtime_identity_digest)
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                match platform
+                    .stop_service_registration(&stop_request)
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+                {
+                    ServiceStopOutcome::Stopped { .. }
+                    | ServiceStopOutcome::AlreadyStopped { .. } => {
+                        stopped_process = Some((process.process_id, process.start_time_100ns));
+                    }
+                    ServiceStopOutcome::AlreadyStopping { .. }
+                    | ServiceStopOutcome::EffectUnknown => {
+                        return Err(HostError::RecoveryRequired(
+                            "Watchdog stop outcome is not durably known".to_owned(),
+                        ));
                     }
                 }
+            }
             ServiceRegistrationRuntimeInspection::Matching { observation } => {
                 return Err(HostError::RecoveryRequired(format!(
                     "Watchdog SCM state {:?} is not a safe abort boundary",
@@ -6612,9 +6624,10 @@ impl HostComposition {
         demand: &HostDemandStartRuntimeRequest,
     ) -> Result<(), HostError> {
         self.ensure_admission_open()?;
-        let active = self.registry.active().cloned().ok_or_else(|| {
-            HostError::ProcessContour("no approved active generation".to_owned())
-        })?;
+        let active =
+            self.registry.active().cloned().ok_or_else(|| {
+                HostError::ProcessContour("no approved active generation".to_owned())
+            })?;
         let (_, store_artifact) = active
             .manifest
             .host_child_artifact_digests()
@@ -6773,7 +6786,8 @@ impl HostComposition {
                 return self.cleanup_launched_contour(error);
             }
         }
-        let (kernel_artifact, approved_store_artifact) = match manifest.host_child_artifact_digests()
+        let (kernel_artifact, approved_store_artifact) = match manifest
+            .host_child_artifact_digests()
         {
             Ok(value) => value,
             Err(error) => {
@@ -6793,9 +6807,9 @@ impl HostComposition {
                 phase_b.launch.authority_state_fence.authority_epoch.clone(),
                 None,
             ) {
-                Ok(value) => value,
-                Err(error) => return self.cleanup_launched_contour(error),
-            };
+            Ok(value) => value,
+            Err(error) => return self.cleanup_launched_contour(error),
+        };
         if let Err(error) = self.jobs.start_approved(
             kernel_executable,
             store_executable,
@@ -7583,8 +7597,9 @@ impl HostComposition {
             InstallerServiceRole::Watchdog,
             &scm_launch.watchdog_executable_path,
         )?;
-        let mut platform = WindowsPlatform::new(PathBuf::from(scm_launch.kernel_work_root.as_str()))
-            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let mut platform =
+            WindowsPlatform::new(PathBuf::from(scm_launch.kernel_work_root.as_str()))
+                .map_err(|error| HostError::Platform(error.to_string()))?;
         let scm = match platform.inspect_registration_runtime(&registration) {
             InstalledWatchdogRuntimeInspection::Matching {
                 state,
@@ -7843,10 +7858,8 @@ impl HostComposition {
 
     #[cfg(windows)]
     fn reconcile_watchdog_start_for_cleanup(&mut self) -> Result<(), HostError> {
-        let Some((registration, platform_root, heartbeat_state_root)) = self
-            .watchdog_start_recovery
-            .as_ref()
-            .map(|carrier| {
+        let Some((registration, platform_root, heartbeat_state_root)) =
+            self.watchdog_start_recovery.as_ref().map(|carrier| {
                 (
                     carrier.registration.clone(),
                     carrier.platform_root.clone(),
@@ -7930,80 +7943,93 @@ impl HostComposition {
         }
         self.resume_pending_record()?;
         if !self.durable_finalized {
-            let state = self.journal.snapshot()?;
-            let activation = state.activation.clone().ok_or_else(|| {
+            let activation = self.journal.snapshot()?.activation.ok_or_else(|| {
                 HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
             })?;
+            #[cfg(not(windows))]
+            let state = self.journal.snapshot()?;
             match activation.state {
                 ActivationState::Stopped => {}
-                ActivationState::Active => {
-                    let drain_generation = activation.fence.activation_generation.clone();
-                    if state.drain.is_none() {
-                        self.append_record(HostStateRecord::Drain(DrainRecord {
-                            fence: activation.fence.clone(),
-                            operation: operation("host-drain-request")?,
-                            drain_generation: drain_generation.clone(),
-                            state: DrainState::Requested,
-                            evidence_refs: vec![
-                                PlatformHandle::new("scm-stop-request")
-                                    .map_err(|error| HostError::Platform(error.to_string()))?,
-                            ],
-                        }))?;
-                        // F-LOG-HOST-1: drain Requested is distinct from
-                        // Draining; shares one drain_generation correlation.
-                        host_lifecycle_observe_drain("host.drain requested");
-                    }
-                    if self
-                        .journal
-                        .snapshot()?
-                        .drain
-                        .as_ref()
-                        .is_some_and(|drain| drain.state == DrainState::Requested)
+                ActivationState::Active | ActivationState::Draining => {
+                    #[cfg(windows)]
                     {
-                        self.append_record(HostStateRecord::Drain(DrainRecord {
-                            fence: activation.fence.clone(),
-                            operation: operation("host-drain-start")?,
-                            drain_generation: drain_generation.clone(),
-                            state: DrainState::Draining,
-                            evidence_refs: vec![
-                                PlatformHandle::new("host-admission-closed")
-                                    .map_err(|error| HostError::Platform(error.to_string()))?,
-                            ],
-                        }))?;
-                        // F-LOG-HOST-1: Draining is distinct from Requested and
-                        // from drained/StoppedClean; one correlation.
-                        host_lifecycle_observe_drain("host.drain draining");
+                        self.begin_scm_drain()?;
+                        if self.journal.snapshot()?.drain_commit.is_none() {
+                            // Census the complete exact StateFence through the
+                            // authenticated Kernel/ORS owner before the Host
+                            // writes the irreversible DrainCommit. An active
+                            // owner leaves the drain cancellable and Kernel Ready.
+                            if self.has_active_generation_runtime_leases()? {
+                                return Err(HostError::RecoveryRequired(
+                                    "active RuntimeLease prevents pre-commit drain".to_owned(),
+                                ));
+                            }
+                            let snapshot = self.journal.snapshot()?;
+                            let activation = snapshot.activation.as_ref().ok_or_else(|| {
+                                HostError::OwnerLeaseRecovery(
+                                    "activation record is absent during drain commit".to_owned(),
+                                )
+                            })?;
+                            let commit = drain_commit_record_for_stop(
+                                &snapshot,
+                                activation,
+                                &activation.fence.activation_generation,
+                            )?;
+                            host_lifecycle_observe_drain("host.drain commit");
+                            self.append_record(HostStateRecord::DrainCommit(commit))?;
+                        }
                     }
-                    if self
-                        .journal
-                        .snapshot()?
-                        .activation
-                        .as_ref()
-                        .is_some_and(|current| current.state == ActivationState::Active)
+                    #[cfg(not(windows))]
                     {
-                        self.transition_activation(ActivationState::Draining, "host-draining")?;
-                    }
-                    if self.journal.snapshot()?.drain_commit.is_none() {
-                        // I14.23/I1.5: the commit carries the exact Kernel
-                        // lease/receipt snapshot observed in the journal, so
-                        // recovery can prove which authority was fenced. The
-                        // snapshot rule is owned by the journal helper; an
-                        // empty snapshot is admitted only when the journal
-                        // proves nothing remains to fence.
-                        let snapshot = self.journal.snapshot()?;
-                        let commit = drain_commit_record_for_stop(
-                            &snapshot,
-                            &activation,
-                            &drain_generation,
-                        )?;
-                        // F-LOG-HOST-1: drain commit is distinct from
-                        // Requested/Draining; one drain_generation
-                        // correlation.
-                        host_lifecycle_observe_drain("host.drain commit");
-                        self.append_record(HostStateRecord::DrainCommit(commit))?;
+                        let drain_generation = activation.fence.activation_generation.clone();
+                        if state
+                            .drain
+                            .as_ref()
+                            .is_none_or(|drain| drain.state == DrainState::Cancelled)
+                        {
+                            self.append_record(HostStateRecord::Drain(DrainRecord {
+                                fence: activation.fence.clone(),
+                                operation: operation("host-drain-request")?,
+                                drain_generation: drain_generation.clone(),
+                                state: DrainState::Requested,
+                                evidence_refs: vec![
+                                    PlatformHandle::new("scm-stop-request")
+                                        .map_err(|error| HostError::Platform(error.to_string()))?,
+                                ],
+                            }))?;
+                        }
+                        if self
+                            .journal
+                            .snapshot()?
+                            .drain
+                            .as_ref()
+                            .is_some_and(|drain| drain.state == DrainState::Requested)
+                        {
+                            self.append_record(HostStateRecord::Drain(DrainRecord {
+                                fence: activation.fence.clone(),
+                                operation: operation("host-drain-start")?,
+                                drain_generation: drain_generation.clone(),
+                                state: DrainState::Draining,
+                                evidence_refs: vec![
+                                    PlatformHandle::new("host-admission-closed")
+                                        .map_err(|error| HostError::Platform(error.to_string()))?,
+                                ],
+                            }))?;
+                        }
+                        if activation.state == ActivationState::Active {
+                            self.transition_activation(ActivationState::Draining, "host-draining")?;
+                        }
+                        if self.journal.snapshot()?.drain_commit.is_none() {
+                            let snapshot = self.journal.snapshot()?;
+                            let commit = drain_commit_record_for_stop(
+                                &snapshot,
+                                &activation,
+                                &drain_generation,
+                            )?;
+                            self.append_record(HostStateRecord::DrainCommit(commit))?;
+                        }
                     }
                 }
-                ActivationState::Draining if state.drain_commit.is_some() => {}
                 other => {
                     return Err(HostError::OwnerLeaseRecovery(format!(
                         "Host activation {other:?} cannot enter clean shutdown"
@@ -8012,12 +8038,96 @@ impl HostComposition {
             }
             #[cfg(windows)]
             {
-                let store = self.jobs.terminate_store();
-                let kernel = self.jobs.terminate_kernel();
-                if store.is_err() || kernel.is_err() {
+                let state = self.journal.snapshot()?;
+                let activation = state.activation.as_ref().ok_or_else(|| {
+                    HostError::OwnerLeaseRecovery(
+                        "activation record is absent during retirement proof".to_owned(),
+                    )
+                })?;
+                if activation.state != ActivationState::Draining || state.drain_commit.is_none() {
+                    self.shutdown_failed = true;
+                    return Err(HostError::RecoveryRequired(
+                        "durable Host drain did not reach the exact commit boundary".to_owned(),
+                    ));
+                }
+                let launch = self.jobs.launch.as_ref().ok_or_else(|| {
+                    HostError::ProcessContour(
+                        "retirement proof has no current Kernel launch".to_owned(),
+                    )
+                })?;
+                let expected = GenerationRetirementFence {
+                    activation_id: activation.activation_id.clone(),
+                    activation_generation: activation.fence.activation_generation.clone(),
+                    state_fence: StateFence::new(
+                        activation.lineage.kernel_epoch.clone(),
+                        launch.authority_generation,
+                    ),
+                };
+                let barrier = match self.require_generation_retirement_barrier(&expected) {
+                    Ok(barrier) => barrier,
+                    Err(error) => {
+                        self.shutdown_failed = true;
+                        return Err(error);
+                    }
+                };
+                let commit_operation = state
+                    .drain_commit
+                    .as_ref()
+                    .map(|commit| &commit.operation)
+                    .ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "retirement barrier lost its durable DrainCommit".to_owned(),
+                        )
+                    })?;
+                let kernel_process = self
+                    .jobs
+                    .kernel
+                    .as_ref()
+                    .map(|kernel| kernel.evidence().process().clone())
+                    .ok_or_else(|| {
+                        HostError::ProcessContour(
+                            "retirement barrier lost its Kernel process handle".to_owned(),
+                        )
+                    })?;
+                if barrier.fence() != &expected
+                    || barrier.drain_commit_operation() != commit_operation
+                    || barrier.runtime_lease_census().state_fence != expected.state_fence
+                    || barrier.kernel_process_id() != kernel_process.process_id
+                    || barrier.kernel_process_start_time_100ns() != kernel_process.start_time_100ns
+                {
+                    self.shutdown_failed = true;
+                    return Err(HostError::RecoveryRequired(
+                        "retirement barrier does not match the exact current Kernel termination target"
+                            .to_owned(),
+                    ));
+                }
+                let graceful_request = self
+                    .request_kernel_shutdown_after_retirement(&barrier)
+                    .is_ok();
+                let kernel_reaped = graceful_request
+                    && matches!(
+                        self.jobs.forget_kernel_after_observed_exit(
+                            &kernel_process,
+                            std::time::Duration::from_secs(20),
+                        ),
+                        Ok(true)
+                    );
+                if !kernel_reaped {
+                    // The exact retirement barrier remains the authority for
+                    // this bounded fallback. Kernel's complete Job is closed
+                    // before the Store dependency is stopped.
+                    host_lifecycle_observe_drain("host.kernel-shutdown bounded fallback");
+                    if let Err(error) = self.jobs.terminate_kernel() {
+                        self.shutdown_failed = true;
+                        return Err(HostError::RecoveryRequired(format!(
+                            "Kernel termination after exact retirement barrier failed: {error}"
+                        )));
+                    }
+                }
+                if let Err(error) = self.jobs.terminate_store() {
                     self.shutdown_failed = true;
                     return Err(HostError::RecoveryRequired(format!(
-                        "Store-first stop requires recovery: store={store:?}; kernel={kernel:?}"
+                        "Store termination after Kernel shutdown requires recovery: {error}"
                     )));
                 }
             }

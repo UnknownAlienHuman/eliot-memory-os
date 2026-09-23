@@ -2339,7 +2339,7 @@ pub(crate) fn drain_transition(
         ) | (
             DrainState::Draining,
             DrainState::Cancelled | DrainState::Failed
-        )
+        ) | (DrainState::Cancelled, DrainState::Requested)
     );
     if legal {
         Ok(())

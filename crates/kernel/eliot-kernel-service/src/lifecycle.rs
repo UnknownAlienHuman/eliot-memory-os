@@ -581,7 +581,9 @@ impl KernelService {
             | KernelControlCommand::ExpireRuntimeLease(_)
             | KernelControlCommand::CloseRuntimeLease(_)
             | KernelControlCommand::ReconcileRuntimeLease(_)
-            | KernelControlCommand::ReadRuntimeLeaseCensus(_) => {
+            | KernelControlCommand::ReadRuntimeLeaseCensus(_)
+            | KernelControlCommand::ReconcileRuntimeLeaseCensus(_)
+            | KernelControlCommand::RequestShutdownAfterDrain(_) => {
                 return Err(KernelServiceError::InvalidField {
                     field: "runtime_lease",
                     reason: "RuntimeLease commands require the authenticated Kernel composition boundary",
@@ -1266,9 +1268,11 @@ impl KernelService {
             .as_ref()
             .ok_or(KernelServiceError::AdmissionClosed(self.state))?;
         let owner = candidate.activation_id.as_str();
-        let permit = self
-            .front_door
-            .acquire_normal(NormalWorkClass::CanonicalWrite, owner, NORMAL_ADMISSION_OPERATION)?;
+        let permit = self.front_door.acquire_normal(
+            NormalWorkClass::CanonicalWrite,
+            owner,
+            NORMAL_ADMISSION_OPERATION,
+        )?;
         Ok(AdmissionLease {
             permit,
             activation_id: owner.to_owned(),
@@ -2669,8 +2673,8 @@ mod tests {
     }
 
     #[test]
-    fn normal_admission_never_consumes_protected_reserve(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn normal_admission_never_consumes_protected_reserve() -> Result<(), Box<dyn std::error::Error>>
+    {
         use eliot_kernel_core::CapacityClass;
 
         // Slices A+B enforcement (Implements #65): normal Store/daemon
@@ -2691,10 +2695,7 @@ mod tests {
             CapacityClass::NormalWorkload
         );
         assert_eq!(service.available_control(), 1);
-        assert_eq!(
-            normal_one.activation_id(),
-            candidate.activation_id.as_str()
-        );
+        assert_eq!(normal_one.activation_id(), candidate.activation_id.as_str());
         assert!(
             normal_one
                 .authority_epoch()

@@ -104,7 +104,9 @@ fn runtime_lease_owner_ref_string(owner: &RuntimeLeaseOwnerRef) -> String {
     }
 }
 
-fn runtime_lease_owner_kind(owner: &RuntimeLeaseOwnerRef) -> eliot_kernel_service::RuntimeLeaseOwnerKind {
+fn runtime_lease_owner_kind(
+    owner: &RuntimeLeaseOwnerRef,
+) -> eliot_kernel_service::RuntimeLeaseOwnerKind {
     match owner {
         RuntimeLeaseOwnerRef::HostRequest { .. } => {
             eliot_kernel_service::RuntimeLeaseOwnerKind::Session
@@ -143,8 +145,8 @@ fn runtime_lease_digest(value: &str) -> Result<(), TransportError> {
 }
 
 fn runtime_lease_state_fence_digest(fence: &StateFence) -> Result<String, TransportError> {
-    let bytes = eliot_contracts::canonical_json_bytes(fence)
-        .map_err(|_| TransportError::SessionFenced)?;
+    let bytes =
+        eliot_contracts::canonical_json_bytes(fence).map_err(|_| TransportError::SessionFenced)?;
     Ok(eliot_contracts::sha256_hex(&bytes))
 }
 
@@ -196,8 +198,7 @@ fn runtime_lease_effect_active(state: eliot_ors::DoctorEffectState) -> bool {
 fn runtime_lease_claim_active(state: eliot_ors::NativeWorkerClaimState) -> bool {
     !matches!(
         state,
-        eliot_ors::NativeWorkerClaimState::Requested
-            | eliot_ors::NativeWorkerClaimState::Terminal
+        eliot_ors::NativeWorkerClaimState::Requested | eliot_ors::NativeWorkerClaimState::Terminal
     )
 }
 
@@ -459,7 +460,7 @@ impl KernelComposition {
                         && candidate.lineage_id == policy_epoch.lineage_id
                         && candidate.sequence.get() > policy_epoch.sequence.get()))
             };
-        if request.generation != policy.module_generation.generation
+            if request.generation != policy.module_generation.generation
                 || epoch_mismatch
                 || self
                     .kernel_artifact_sha256
@@ -510,6 +511,8 @@ impl KernelComposition {
                 | KernelControlCommand::CloseRuntimeLease(_)
                 | KernelControlCommand::ReconcileRuntimeLease(_)
                 | KernelControlCommand::ReadRuntimeLeaseCensus(_)
+                | KernelControlCommand::ReconcileRuntimeLeaseCensus(_)
+                | KernelControlCommand::RequestShutdownAfterDrain(_)
                 | KernelControlCommand::Degrade(_)
                 | KernelControlCommand::Drain
                 | KernelControlCommand::Stop
@@ -823,11 +826,21 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?
                     .reconcile(request.candidate.clone())
                     .map_err(|_| TransportError::SessionFenced)?,
-                KernelControlCommand::Drain
-                    if self
+                KernelControlCommand::Drain => {
+                    #[cfg(windows)]
+                    self.terminalize_generation_leases_for_drain(&request)?;
+                    match self
                         .service_state()
                         .map_err(|_| TransportError::SessionFenced)?
-                        == KernelServiceState::Draining => {}
+                    {
+                        KernelServiceState::Ready => {
+                            self.apply_control(KernelControlCommand::Drain)
+                                .map_err(|_| TransportError::SessionFenced)?;
+                        }
+                        KernelServiceState::Draining => {}
+                        _ => return Err(TransportError::SessionFenced),
+                    }
+                }
                 KernelControlCommand::BootstrapStore(_)
                 | KernelControlCommand::Activate(_)
                 | KernelControlCommand::ReconcileActivation(_)
@@ -840,7 +853,9 @@ impl KernelComposition {
                 | KernelControlCommand::ExpireRuntimeLease(_)
                 | KernelControlCommand::CloseRuntimeLease(_)
                 | KernelControlCommand::ReconcileRuntimeLease(_)
-                | KernelControlCommand::ReadRuntimeLeaseCensus(_) => {}
+                | KernelControlCommand::ReadRuntimeLeaseCensus(_)
+                | KernelControlCommand::ReconcileRuntimeLeaseCensus(_)
+                | KernelControlCommand::RequestShutdownAfterDrain(_) => {}
                 command => {
                     self.apply_control(command.clone())
                         .map_err(|_| TransportError::SessionFenced)?;
@@ -860,15 +875,15 @@ impl KernelComposition {
             KernelControlCommand::RenewRuntimeLease(renewal) => {
                 Some(self.renew_runtime_lease(&request, renewal)?)
             }
-            KernelControlCommand::RevokeRuntimeLease(terminal) => Some(
-                self.transition_runtime_lease(&request, terminal, LeaseState::Revoked)?,
-            ),
-            KernelControlCommand::ExpireRuntimeLease(terminal) => Some(
-                self.transition_runtime_lease(&request, terminal, LeaseState::Expired)?,
-            ),
-            KernelControlCommand::CloseRuntimeLease(terminal) => Some(
-                self.transition_runtime_lease(&request, terminal, LeaseState::Closed)?,
-            ),
+            KernelControlCommand::RevokeRuntimeLease(terminal) => {
+                Some(self.transition_runtime_lease(&request, terminal, LeaseState::Revoked)?)
+            }
+            KernelControlCommand::ExpireRuntimeLease(terminal) => {
+                Some(self.transition_runtime_lease(&request, terminal, LeaseState::Expired)?)
+            }
+            KernelControlCommand::CloseRuntimeLease(terminal) => {
+                Some(self.transition_runtime_lease(&request, terminal, LeaseState::Closed)?)
+            }
             KernelControlCommand::ReconcileRuntimeLease(reconcile) => {
                 self.reconcile_runtime_lease(&request, reconcile)?
             }
@@ -884,10 +899,9 @@ impl KernelComposition {
                 {
                     return Err(TransportError::SessionFenced);
                 }
-                let supervision_lease_id = eliot_ors::OperationIdentity::new(
-                    query.supervision_lease_id.clone(),
-                )
-                .map_err(|_| TransportError::SessionFenced)?;
+                let supervision_lease_id =
+                    eliot_ors::OperationIdentity::new(query.supervision_lease_id.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
                 let (runtime_leases, supervision_lease) = self
                     .generation_gateway
                     .ors
@@ -896,8 +910,7 @@ impl KernelComposition {
                         Some(&supervision_lease_id),
                     )
                     .map_err(|_| TransportError::SessionFenced)?;
-                let supervision_lease =
-                    supervision_lease.ok_or(TransportError::SessionFenced)?;
+                let supervision_lease = supervision_lease.ok_or(TransportError::SessionFenced)?;
                 let census = eliot_kernel_service::RuntimeLeaseCensus {
                     state_fence: query.state_fence.clone(),
                     supervision_lease_id: query.supervision_lease_id.clone(),
@@ -907,6 +920,55 @@ impl KernelComposition {
                 census
                     .validate()
                     .map_err(|_| TransportError::SessionFenced)?;
+                Some(census)
+            }
+            KernelControlCommand::ReconcileRuntimeLeaseCensus(query) => {
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                Some(self.reconcile_runtime_lease_census(&request, query)?)
+            }
+            KernelControlCommand::RequestShutdownAfterDrain(query) => {
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Draining
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let supervision_lease_id =
+                    eliot_ors::OperationIdentity::new(query.supervision_lease_id.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                let (runtime_leases, supervision_lease) = self
+                    .generation_gateway
+                    .ors
+                    .load_runtime_lease_census_by_state_fence(
+                        &query.state_fence,
+                        Some(&supervision_lease_id),
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let supervision_lease = supervision_lease.ok_or(TransportError::SessionFenced)?;
+                let census = eliot_kernel_service::RuntimeLeaseCensus {
+                    state_fence: query.state_fence.clone(),
+                    supervision_lease_id: query.supervision_lease_id.clone(),
+                    runtime_leases,
+                    supervision_lease,
+                };
+                census
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if !census.is_fully_retired() {
+                    return Err(TransportError::SessionFenced);
+                }
+                // The Host has already persisted DrainCommit and presented the
+                // exact activation fence. Re-readback above is the Kernel
+                // owner gate; this signal enters the existing composition
+                // shutdown/drain path instead of terminating the Job directly.
+                let _ = self.request_shutdown();
                 Some(census)
             }
             _ => None,
@@ -985,12 +1047,8 @@ impl KernelComposition {
         if lease.obligation.obligation_refs.len() != 1 {
             return Err(TransportError::SessionFenced);
         }
-        let observed = self.resolve_runtime_lease_owner(
-            request,
-            &owner_ref,
-            None,
-            Some(&lease.state_fence),
-        )?;
+        let observed =
+            self.resolve_runtime_lease_owner(request, &owner_ref, None, Some(&lease.state_fence))?;
         let canonical = &observed.admission;
         if lease.lease_id
             != eliot_kernel_service::expected_runtime_lease_id(
@@ -1000,7 +1058,10 @@ impl KernelComposition {
             )
             .map_err(|_| TransportError::SessionFenced)?
             || lease.scope_ref
-                != format!("eliot-runtime-scope:v1:{}", lease.lease_id.trim_start_matches("eliot-runtime-lease:v1:"))
+                != format!(
+                    "eliot-runtime-scope:v1:{}",
+                    lease.lease_id.trim_start_matches("eliot-runtime-lease:v1:")
+                )
             || lease.obligation.holder != canonical.holder.as_str()
             || lease.obligation.reason != canonical.reason.as_str()
             || lease.obligation.required_runtime_branches
@@ -1043,10 +1104,7 @@ impl KernelComposition {
         }
         let ref_string = runtime_lease_owner_ref_string(&parsed);
         let state_fence = expected_fence.cloned().unwrap_or_else(|| {
-            StateFence::new(
-                request.candidate.kernel_epoch.clone(),
-                request.generation,
-            )
+            StateFence::new(request.candidate.kernel_epoch.clone(), request.generation)
         });
         if state_fence.resource_generation != request.generation
             || !state_fence
@@ -1099,14 +1157,15 @@ impl KernelComposition {
                 };
                 let deadline_fresh = record.deadline_unix_ms > unix_ms();
                 active = deadline_fresh && runtime_lease_host_request_active(record.state);
-                renewable = active && matches!(
-                    record.state,
-                    eliot_ors::HostRequestState::Routed
-                        | eliot_ors::HostRequestState::Submitted
-                        | eliot_ors::HostRequestState::PossiblyEffected
-                        | eliot_ors::HostRequestState::Unknown
-                        | eliot_ors::HostRequestState::Reconciling
-                );
+                renewable = active
+                    && matches!(
+                        record.state,
+                        eliot_ors::HostRequestState::Routed
+                            | eliot_ors::HostRequestState::Submitted
+                            | eliot_ors::HostRequestState::PossiblyEffected
+                            | eliot_ors::HostRequestState::Unknown
+                            | eliot_ors::HostRequestState::Reconciling
+                    );
                 admitted_wait = matches!(
                     record.state,
                     eliot_ors::HostRequestState::Admitted
@@ -1166,12 +1225,13 @@ impl KernelComposition {
                 let deadline_fresh = record.deadline_unix_nanos > now_nanos
                     && record.lease_expires_unix_nanos > now_nanos;
                 active = deadline_fresh && runtime_lease_attempt_active(record.state);
-                renewable = active && matches!(
-                    record.state,
-                    eliot_ors::DoctorAttemptState::EffectIntended
-                        | eliot_ors::DoctorAttemptState::Unknown
-                        | eliot_ors::DoctorAttemptState::Reconciling
-                );
+                renewable = active
+                    && matches!(
+                        record.state,
+                        eliot_ors::DoctorAttemptState::EffectIntended
+                            | eliot_ors::DoctorAttemptState::Unknown
+                            | eliot_ors::DoctorAttemptState::Reconciling
+                    );
                 admitted_wait = matches!(
                     record.state,
                     eliot_ors::DoctorAttemptState::Admitted
@@ -1213,10 +1273,9 @@ impl KernelComposition {
                     .load_doctor_effect(&identity)
                     .map_err(|_| TransportError::SessionFenced)?
                     .ok_or(TransportError::SessionFenced)?;
-                let attempt_identity = eliot_ors::OperationIdentity::new(
-                    record.attempt_digest.clone(),
-                )
-                .map_err(|_| TransportError::SessionFenced)?;
+                let attempt_identity =
+                    eliot_ors::OperationIdentity::new(record.attempt_digest.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
                 let attempt = self
                     .generation_gateway
                     .ors
@@ -1287,15 +1346,16 @@ impl KernelComposition {
                 }
                 let deadline_fresh = record.deadline_unix_ms > unix_ms();
                 active = deadline_fresh && runtime_lease_claim_active(record.state);
-                renewable = active && matches!(
-                    record.state,
-                    eliot_ors::NativeWorkerClaimState::Ready
-                        | eliot_ors::NativeWorkerClaimState::Active
-                        | eliot_ors::NativeWorkerClaimState::Cancelling
-                        | eliot_ors::NativeWorkerClaimState::Submitted
-                        | eliot_ors::NativeWorkerClaimState::Unknown
-                        | eliot_ors::NativeWorkerClaimState::Reconciling
-                );
+                renewable = active
+                    && matches!(
+                        record.state,
+                        eliot_ors::NativeWorkerClaimState::Ready
+                            | eliot_ors::NativeWorkerClaimState::Active
+                            | eliot_ors::NativeWorkerClaimState::Cancelling
+                            | eliot_ors::NativeWorkerClaimState::Submitted
+                            | eliot_ors::NativeWorkerClaimState::Unknown
+                            | eliot_ors::NativeWorkerClaimState::Reconciling
+                    );
                 admitted_wait = matches!(
                     record.state,
                     eliot_ors::NativeWorkerClaimState::Admitted
@@ -1315,10 +1375,7 @@ impl KernelComposition {
                         "native-claim-registration:{}",
                         record.registration_id.as_str()
                     ),
-                    format!(
-                        "native-claim-resource:{}",
-                        record.resource_envelope_digest
-                    ),
+                    format!("native-claim-resource:{}", record.resource_envelope_digest),
                     format!("native-claim-deadline:{}", record.deadline_unix_ms),
                 ]);
                 renewal_evidence.extend(immutable_evidence.iter().cloned());
@@ -1405,6 +1462,365 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         Ok(observed)
+    }
+
+    /// Reconciles one complete exact-fence RuntimeLease set from the canonical
+    /// ORS owner. Active owners retain their lease; fresh durable progress may
+    /// renew it, while owner-inactive rows are terminalized with the current
+    /// owner readback evidence. This is the Kernel-owned lifecycle sweep used
+    /// by Host idle supervision before DrainCommit.
+    fn reconcile_runtime_lease_census(
+        &self,
+        request: &KernelControlRequest,
+        query: &eliot_kernel_service::RuntimeLeaseCensusQuery,
+    ) -> Result<eliot_kernel_service::RuntimeLeaseCensus, TransportError> {
+        let state_fence =
+            StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+        if query.state_fence != state_fence
+            || query.supervision_lease_id
+                != request
+                    .candidate
+                    .supervision_incarnation
+                    .supervision_lease_id
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let supervision_lease_id =
+            eliot_ors::OperationIdentity::new(query.supervision_lease_id.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+        let (leases, supervision) = self
+            .generation_gateway
+            .ors
+            .load_runtime_lease_census_by_state_fence(&state_fence, Some(&supervision_lease_id))
+            .map_err(|_| TransportError::SessionFenced)?;
+        let supervision = supervision.ok_or(TransportError::SessionFenced)?;
+        let incarnation = &request.candidate.supervision_incarnation;
+        let binding = &supervision.record.binding;
+        if binding.activation_id.as_str() != incarnation.activation_id
+            || binding.activation_generation != state_fence.resource_generation
+            || binding.kernel_epoch != state_fence.authority_epoch
+            || binding.watchdog_epoch.value() != incarnation.watchdog_epoch.sequence
+            || binding.state_fence != state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        for lease in leases {
+            match lease.state {
+                LeaseState::Released
+                | LeaseState::Revoked
+                | LeaseState::Superseded
+                | LeaseState::Closed => continue,
+                LeaseState::Expired => {
+                    // An expired lease cannot authorize work. Still retain a
+                    // live owner as a recovery obligation so Host cannot
+                    // mistake an expired-but-running operation for idle.
+                    self.validate_runtime_lease_owner(request, &lease)?;
+                    let owner_ref = runtime_lease_handle(
+                        lease
+                            .obligation
+                            .obligation_refs
+                            .first()
+                            .ok_or(TransportError::SessionFenced)?
+                            .clone(),
+                    )?;
+                    let owner = self.resolve_runtime_lease_owner(
+                        request,
+                        &owner_ref,
+                        None,
+                        Some(&state_fence),
+                    )?;
+                    if owner.active {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    continue;
+                }
+                LeaseState::Active | LeaseState::Expiring | LeaseState::Reconciling => {}
+                LeaseState::Requested => return Err(TransportError::SessionFenced),
+            }
+            if lease.state_fence != state_fence {
+                return Err(TransportError::SessionFenced);
+            }
+            self.validate_runtime_lease_owner(request, &lease)?;
+            let owner_ref = runtime_lease_handle(
+                lease
+                    .obligation
+                    .obligation_refs
+                    .first()
+                    .ok_or(TransportError::SessionFenced)?
+                    .clone(),
+            )?;
+            let owner =
+                self.resolve_runtime_lease_owner(request, &owner_ref, None, Some(&state_fence))?;
+            if owner.active {
+                if lease.state == LeaseState::Active
+                    && unix_ms() >= lease.obligation.renew_before_ms
+                    && (owner.renewable || owner.admitted_wait)
+                {
+                    if owner.renewal_evidence.is_empty()
+                        || (!owner.admitted_wait
+                            && owner.renewal_evidence == lease.obligation.renewal_evidence)
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.renew_runtime_lease(
+                        request,
+                        &eliot_kernel_service::RuntimeLeaseRenewal {
+                            lease_id: lease.lease_id.clone(),
+                            expected_revision: lease.revision,
+                            state_fence: state_fence.clone(),
+                            evidence_refs: owner.renewal_evidence_refs.clone(),
+                            admitted_wait: owner.admitted_wait,
+                        },
+                    )?;
+                } else if lease.obligation.expires_at_ms <= unix_ms() {
+                    self.reconcile_runtime_lease(
+                        request,
+                        &eliot_kernel_service::RuntimeLeaseReconcile {
+                            lease_id: lease.lease_id.clone(),
+                            state_fence: state_fence.clone(),
+                        },
+                    )?;
+                    return Err(TransportError::SessionFenced);
+                }
+                continue;
+            }
+
+            let evidence_refs = owner.renewal_evidence_refs;
+            if evidence_refs.is_empty() {
+                return Err(TransportError::SessionFenced);
+            }
+            let next_state = match lease.state {
+                LeaseState::Active => LeaseState::Released,
+                LeaseState::Expiring | LeaseState::Reconciling => LeaseState::Closed,
+                _ => return Err(TransportError::SessionFenced),
+            };
+            let terminal = RuntimeLeaseTerminal {
+                lease_id: lease.lease_id.clone(),
+                expected_revision: lease.revision,
+                state_fence: state_fence.clone(),
+                disposition: runtime_lease_handle("kernel-owner-obligation-complete")?,
+                evidence_refs,
+            };
+            terminal
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            self.transition_runtime_lease(request, &terminal, next_state)?;
+        }
+
+        let (runtime_leases, supervision_lease) = self
+            .generation_gateway
+            .ors
+            .load_runtime_lease_census_by_state_fence(&state_fence, Some(&supervision_lease_id))
+            .map_err(|_| TransportError::SessionFenced)?;
+        let census = eliot_kernel_service::RuntimeLeaseCensus {
+            state_fence,
+            supervision_lease_id: query.supervision_lease_id.clone(),
+            runtime_leases,
+            supervision_lease: supervision_lease.ok_or(TransportError::SessionFenced)?,
+        };
+        census
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(census)
+    }
+
+    /// Terminalizes only owner-inactive lease rows from this exact Kernel
+    /// StateFence before the service enters Draining. An active owner leaves
+    /// Kernel Ready and makes the Host keep the drain recoverable pre-commit.
+    #[cfg(windows)]
+    fn terminalize_generation_leases_for_drain(
+        &self,
+        request: &KernelControlRequest,
+    ) -> Result<(), TransportError> {
+        if !matches!(
+            self.service_state()
+                .map_err(|_| TransportError::SessionFenced)?,
+            KernelServiceState::Ready | KernelServiceState::Draining
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        let state_fence =
+            StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+        let supervision_lease_id = eliot_ors::OperationIdentity::new(
+            request
+                .candidate
+                .supervision_incarnation
+                .supervision_lease_id
+                .clone(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let (leases, supervision) = self
+            .generation_gateway
+            .ors
+            .load_runtime_lease_census_by_state_fence(&state_fence, Some(&supervision_lease_id))
+            .map_err(|_| TransportError::SessionFenced)?;
+        let supervision = supervision.ok_or(TransportError::SessionFenced)?;
+
+        // Complete the owner readback pass before the first ORS write. This
+        // prevents a mixed census from partially retiring leases while another
+        // exact-fence owner is still active.
+        let mut pending = Vec::new();
+        for lease in leases {
+            match lease.state {
+                LeaseState::Active | LeaseState::Expiring | LeaseState::Reconciling => {}
+                LeaseState::Released
+                | LeaseState::Expired
+                | LeaseState::Revoked
+                | LeaseState::Superseded
+                | LeaseState::Closed => continue,
+                LeaseState::Requested => return Err(TransportError::SessionFenced),
+            }
+            if lease.state_fence != state_fence {
+                return Err(TransportError::SessionFenced);
+            }
+            self.validate_runtime_lease_owner(request, &lease)?;
+            let owner_ref = runtime_lease_handle(
+                lease
+                    .obligation
+                    .obligation_refs
+                    .first()
+                    .ok_or(TransportError::SessionFenced)?
+                    .clone(),
+            )?;
+            let observation =
+                self.resolve_runtime_lease_owner(request, &owner_ref, None, Some(&state_fence))?;
+            if observation.active {
+                return Err(TransportError::SessionFenced);
+            }
+            pending.push((lease, owner_ref));
+        }
+
+        for (observed_lease, owner_ref) in pending {
+            let current = self
+                .generation_gateway
+                .ors
+                .load_current_runtime_lease(&observed_lease.lease_id)
+                .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::SessionFenced)?;
+            if current != observed_lease {
+                return Err(TransportError::SessionFenced);
+            }
+            let owner =
+                self.resolve_runtime_lease_owner(request, &owner_ref, None, Some(&state_fence))?;
+            if owner.active {
+                return Err(TransportError::SessionFenced);
+            }
+            let evidence_refs = owner.renewal_evidence_refs;
+            if evidence_refs.is_empty() {
+                return Err(TransportError::SessionFenced);
+            }
+            let terminal = RuntimeLeaseTerminal {
+                lease_id: current.lease_id.clone(),
+                expected_revision: current.revision,
+                state_fence: state_fence.clone(),
+                disposition: runtime_lease_handle("kernel-generation-drain-owner-inactive")?,
+                evidence_refs,
+            };
+            terminal
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let next_state = match current.state {
+                LeaseState::Active => LeaseState::Released,
+                LeaseState::Expiring | LeaseState::Reconciling => LeaseState::Closed,
+                _ => continue,
+            };
+            self.transition_runtime_lease(request, &terminal, next_state)?;
+        }
+
+        self.revoke_current_supervision_lease_for_drain(request, &state_fence, &supervision)
+    }
+
+    #[cfg(windows)]
+    fn revoke_current_supervision_lease_for_drain(
+        &self,
+        request: &KernelControlRequest,
+        state_fence: &StateFence,
+        observed: &eliot_ors::SupervisionLeaseSnapshot,
+    ) -> Result<(), TransportError> {
+        let incarnation = &request.candidate.supervision_incarnation;
+        let lease_id = incarnation.supervision_lease_id.as_str();
+        let authority = self
+            .supervision_lease_authority
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let current = authority
+            .current_snapshot(lease_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        let binding = &current.record.binding;
+        let expected_scope = incarnation
+            .derived_scope_ref()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if current != *observed
+            || binding.scope_ref.as_str() != expected_scope
+            || binding.installation_id.as_str() != incarnation.installation_id
+            || binding.host_epoch.value() != incarnation.host_epoch.sequence
+            || binding.activation_id.as_str() != incarnation.activation_id
+            || binding.activation_generation != request.generation
+            || binding.kernel_epoch != request.candidate.kernel_epoch
+            || binding.watchdog_epoch.value() != incarnation.watchdog_epoch.sequence
+            || binding.observation_scope != incarnation.observation_scope
+            || binding.wake_policy != incarnation.wake_policy
+            || binding.state_fence != *state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if current.record.projection == eliot_ors::SupervisionLeaseProjection::Terminal
+            && current.record.state != LeaseState::Active
+        {
+            return Ok(());
+        }
+        if current.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+            || current.record.state != LeaseState::Active
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let predecessor_receipt = current.receipt.receipt_sha256.as_str();
+        let operation_id = supervision_operation_identity(
+            "generation-drain-revoke-operation",
+            lease_id,
+            Some(predecessor_receipt),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let ticket_id = supervision_operation_identity(
+            "generation-drain-revoke-ticket",
+            lease_id,
+            Some(predecessor_receipt),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let mut terminal_binding = current.record.binding.clone();
+        terminal_binding.state = LeaseState::Revoked;
+        terminal_binding.terminal_disposition = Some(SupervisionLeaseTerminalDisposition::Revoked);
+        terminal_binding.revocation_reason = Some("host-generation-drain".to_owned());
+        terminal_binding.revocation_id = Some(operation_id.as_str().to_owned());
+        terminal_binding.revocation_epoch = Some(
+            AuthorityEpoch::new(terminal_binding.kernel_epoch.sequence.get())
+                .map_err(|_| TransportError::SessionFenced)?,
+        );
+        let stage = authority
+            .prepare(eliot_ors::SupervisionLeasePrepareRequest {
+                ticket_id,
+                operation_id: operation_id.clone(),
+                lease_id: eliot_ors::OperationIdentity::new(lease_id)
+                    .map_err(|_| TransportError::SessionFenced)?,
+                expected_revision: Some(current.record.revision),
+                operation: eliot_ors::SupervisionLeaseOperation::Revoke,
+                binding: terminal_binding,
+            })
+            .map_err(|_| TransportError::SessionFenced)?;
+        let terminal = authority
+            .commit_terminal(&stage.ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if terminal.record.state != LeaseState::Revoked
+            || terminal.record.projection != eliot_ors::SupervisionLeaseProjection::Terminal
+            || terminal.record.binding.state_fence != *state_fence
+            || terminal.record.binding.revocation_id.as_deref() != Some(operation_id.as_str())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
     }
 
     fn acquire_runtime_lease(
@@ -1516,11 +1932,11 @@ impl KernelComposition {
         self.validate_runtime_lease_owner(request, &current)?;
         let owner_ref = runtime_lease_handle(
             current
-            .obligation
-            .obligation_refs
-            .first()
-            .ok_or(TransportError::SessionFenced)?
-            .clone(),
+                .obligation
+                .obligation_refs
+                .first()
+                .ok_or(TransportError::SessionFenced)?
+                .clone(),
         )?;
         let observed = self.resolve_runtime_lease_owner(
             request,

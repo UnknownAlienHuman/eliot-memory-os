@@ -1096,7 +1096,10 @@ impl DaemonStartupEvidence {
                 field: "daemon_evidence.fence",
             });
         }
-        handle(&self.config_mirror_digest, "daemon_evidence.config_mirror_digest")?;
+        handle(
+            &self.config_mirror_digest,
+            "daemon_evidence.config_mirror_digest",
+        )?;
         if let Some(policy) = &self.policy_mirror_digest {
             handle(policy, "daemon_evidence.policy_mirror_digest")?;
         }
@@ -1392,8 +1395,35 @@ impl KernelControlRequest {
                 });
             }
         }
-        if let KernelControlCommand::ReadRuntimeLeaseCensus(query) = &self.command {
+        if let KernelControlCommand::ReadRuntimeLeaseCensus(query)
+        | KernelControlCommand::RequestShutdownAfterDrain(query) = &self.command
+        {
             query.validate()?;
+            if query.state_fence.resource_generation != self.generation
+                || !query
+                    .state_fence
+                    .authority_epoch
+                    .is_same_authority(&self.candidate.kernel_epoch)
+                || query.supervision_lease_id
+                    != self.candidate.supervision_incarnation.supervision_lease_id
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "runtime_lease_census.fence",
+                });
+            }
+        }
+        if let KernelControlCommand::ReconcileRuntimeLeaseCensus(query) = &self.command {
+            query.validate()?;
+            if query.state_fence.resource_generation != self.generation
+                || !query
+                    .state_fence
+                    .authority_epoch
+                    .is_same_authority(&self.candidate.kernel_epoch)
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "runtime_lease_census.fence",
+                });
+            }
         }
         if let KernelControlCommand::Activate(permit) = &self.command {
             permit.validate(&self.candidate, self.generation)?;
@@ -1578,10 +1608,12 @@ impl KernelControlResponse {
                 })?;
         }
         if let Some(census) = &self.runtime_lease_census {
-            census.validate().map_err(|_| KernelServiceError::InvalidField {
-                field: "control.runtime_lease_census",
-                reason: "must be a validated exact-fence ORS census",
-            })?;
+            census
+                .validate()
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "control.runtime_lease_census",
+                    reason: "must be a validated exact-fence ORS census",
+                })?;
             if self.receipt.is_some()
                 || self.runtime_health.is_some()
                 || self.activation_receipt.is_some()
@@ -2720,12 +2752,8 @@ pub fn expected_runtime_lease(
     renew_before_ms: u64,
 ) -> Result<RuntimeLease, KernelServiceError> {
     let candidate_digest = candidate.compute_digest()?;
-    let digest = runtime_lease_identity_digest(
-        &candidate_digest,
-        candidate,
-        generation,
-        admission,
-    )?;
+    let digest =
+        runtime_lease_identity_digest(&candidate_digest, candidate, generation, admission)?;
     let lease = RuntimeLease {
         lease_id: format!("eliot-runtime-lease:v1:{digest}"),
         scope_ref: format!("eliot-runtime-scope:v1:{digest}"),
@@ -3154,10 +3182,7 @@ impl HostStartupEvidence {
     /// generation binding) is checked by the request boundary and the Kernel
     /// consumer; this rejects malformed carriers fail-closed.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
-        validate_digest(
-            &self.candidate_digest,
-            "startup_evidence.candidate_digest",
-        )?;
+        validate_digest(&self.candidate_digest, "startup_evidence.candidate_digest")?;
         self.state_fence
             .validate()
             .map_err(|_| KernelServiceError::InvalidField {
@@ -3496,13 +3521,14 @@ impl RuntimeLeaseCensus {
         };
         query.validate()?;
         for (index, lease) in self.runtime_leases.iter().enumerate() {
-            lease.validate().map_err(|_| KernelServiceError::InvalidField {
-                field: "runtime_lease_census.runtime_leases",
-                reason: "contains an invalid RuntimeLease",
-            })?;
+            lease
+                .validate()
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "runtime_lease_census.runtime_leases",
+                    reason: "contains an invalid RuntimeLease",
+                })?;
             if lease.state_fence != self.state_fence
-                || (index > 0
-                    && self.runtime_leases[index - 1].lease_id >= lease.lease_id)
+                || (index > 0 && self.runtime_leases[index - 1].lease_id >= lease.lease_id)
             {
                 return Err(KernelServiceError::HandshakeMismatch {
                     field: "runtime_lease_census.runtime_lease_fence_or_order",
@@ -3523,6 +3549,30 @@ impl RuntimeLeaseCensus {
             });
         }
         Ok(())
+    }
+
+    /// Returns whether every RuntimeLease and the current SupervisionLease
+    /// are terminal in this exact-fence ORS snapshot.
+    #[must_use]
+    pub fn is_fully_retired(&self) -> bool {
+        fn terminal(state: eliot_runtime_contracts::LeaseState) -> bool {
+            matches!(
+                state,
+                eliot_runtime_contracts::LeaseState::Released
+                    | eliot_runtime_contracts::LeaseState::Expired
+                    | eliot_runtime_contracts::LeaseState::Revoked
+                    | eliot_runtime_contracts::LeaseState::Superseded
+                    | eliot_runtime_contracts::LeaseState::Closed
+            )
+        }
+
+        self.validate().is_ok()
+            && self
+                .runtime_leases
+                .iter()
+                .all(|lease| terminal(lease.state))
+            && terminal(self.supervision_lease.record.state)
+            && self.supervision_lease.record.projection == SupervisionLeaseProjection::Terminal
     }
 }
 
@@ -3571,12 +3621,22 @@ pub enum KernelControlCommand {
     /// Read or reconcile one exact lease without issuing a replacement.
     ReconcileRuntimeLease(RuntimeLeaseReconcile),
     /// Read the exact-fence RuntimeLease set and current supervision row from
-    /// the canonical ORS owner. This cannot issue or renew authority.
+    /// the canonical ORS owner after Kernel has entered Draining. This cannot
+    /// issue or renew authority and supports committed retirement proof.
     ReadRuntimeLeaseCensus(RuntimeLeaseCensusQuery),
+    /// Rehydrate every exact-fence obligation through its canonical owner,
+    /// renew only on fresh owner progress, terminalize completed obligations,
+    /// and return the resulting Kernel-authored census.
+    ReconcileRuntimeLeaseCensus(RuntimeLeaseCensusQuery),
     /// Close normal admission while retaining recovery control.
     Degrade(PlatformHandle),
     /// Drain normal work before stopping.
     Drain,
+    /// Request the Kernel-owned persisted shutdown path after Host has
+    /// committed this generation drain and the exact-fence ORS census is
+    /// fully terminal. The Kernel re-reads the canonical census before
+    /// accepting the request.
+    RequestShutdownAfterDrain(RuntimeLeaseCensusQuery),
     /// Record a clean stop.
     Stop,
     /// Record a bounded failure and its recovery reference.
@@ -4544,8 +4604,7 @@ mod tests {
             "host-scm-watchdog:4242".to_owned(),
         ] {
             let mut bad = good.clone();
-            bad.scm_watchdog_observation_digest =
-                handle_value(&bad_scm);
+            bad.scm_watchdog_observation_digest = handle_value(&bad_scm);
             assert!(
                 bad.validate().is_err(),
                 "malformed SCM digest must fail: {bad_scm}"
@@ -4951,10 +5010,7 @@ mod tests {
             config_mirror_digest: handle_value("config-mirror-1"),
             policy_mirror_digest: Some(handle_value("policy-mirror-1")),
             capability_registry_digest: Some(registry),
-            required_capabilities: Some(vec![
-                "blob.read".to_owned(),
-                "config.read".to_owned(),
-            ]),
+            required_capabilities: Some(vec!["blob.read".to_owned(), "config.read".to_owned()]),
             capability_outcomes: Some(outcomes),
             evidence_refs: vec![handle_value("daemon-evidence-ref-1")],
         }
@@ -4962,10 +5018,7 @@ mod tests {
 
     #[test]
     fn daemon_startup_evidence_validates_shaped_fields() {
-        assert_eq!(
-            DAEMON_STARTUP_EVIDENCE_OPERATION,
-            "daemon_startup_evidence"
-        );
+        assert_eq!(DAEMON_STARTUP_EVIDENCE_OPERATION, "daemon_startup_evidence");
         daemon_evidence()
             .validate()
             .expect("absence-marked evidence must validate");
@@ -5042,8 +5095,9 @@ mod tests {
         assert_eq!(forward, reversed, "digest must not depend on outcome order");
         assert_eq!(forward.len(), 64, "digest must be SHA-256 hex");
         assert!(
-            forward.bytes().all(|byte| byte.is_ascii_hexdigit()
-                && !byte.is_ascii_uppercase()),
+            forward
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
             "digest must be lowercase hex"
         );
         let altered = daemon_capability_registry_digest(&[
