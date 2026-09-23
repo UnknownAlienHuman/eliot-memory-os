@@ -1957,11 +1957,15 @@ async fn automation_failure_payload(
 /// Projects durable `CaptureObservation` evidence subjects as envelope
 /// candidates through the shared `audit_envelope_candidate` filter
 /// (memory-contour parity: fence-gated, scope-agnostic, ordinary
-/// non-envelope captures skipped, never failed). Each candidate row
-/// re-validates its bytes/digest provenance before shaping, so
-/// substituted or truncated evidence fails closed instead of projecting.
-/// Reads beyond `MAX_AUDIT_RANGE_RECORDS` fail closed with
-/// `PayloadTooLarge` instead of truncating. Candidate-only: full
+/// non-envelope captures skipped, never failed). F2 resolution: no
+/// store-level scope filtering, per the `GetMailbox` precedent (facade
+/// caller scope required, catalogue rows scope-free) with scope gating
+/// at the decision layer per I12-26 — filtering here would diverge the
+/// contours and drop scope-free records the consumer must see. Each
+/// candidate row re-validates its bytes/digest provenance before
+/// shaping, so substituted or truncated evidence fails closed instead
+/// of projecting. Reads beyond `MAX_AUDIT_RANGE_RECORDS` fail closed
+/// with `PayloadTooLarge` instead of truncating. Candidate-only: full
 /// envelope validation and live-journal presence binding stay
 /// downstream, so a carried candidate can never become a false journal
 /// record here.

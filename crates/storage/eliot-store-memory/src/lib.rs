@@ -1619,12 +1619,15 @@ fn experience_range_payload(
 /// subjects that parse as JSON objects carrying a string `record_id`
 /// are carried verbatim; ordinary non-envelope captures are skipped
 /// (normal store content, never corruption). No scope filtering: command
-/// scopes need not match event scopes, and the consumer (provider
-/// presence-binding plus Governor scope revalidation) owns scope
-/// gating — store-level scope filtering here would silently drop records
-/// the consumer must see. Fence agreement is enforced by the caller: this
-/// helper runs only after `execute_named_sync` proves the query fence
-/// equals the state fence. Reads beyond
+/// scopes need not match event scopes, and the coordinated consumer
+/// carries scope-free gap/control records regardless of scope, so
+/// store-level scope filtering here would silently drop records the
+/// consumer must see (F2 resolution: scope-free catalogue rows per the
+/// `GetMailbox` precedent — facade caller scope required, catalogue
+/// rows scope-free — with scope gating at the decision layer per
+/// I12-26). Fence agreement is enforced by the caller: this helper runs
+/// only after `execute_named_sync` proves the query fence equals the
+/// state fence. Reads beyond
 /// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
 /// fail closed with [`StoreError::PayloadTooLarge`] instead of
 /// truncating: a truncated audit range cannot prove journal

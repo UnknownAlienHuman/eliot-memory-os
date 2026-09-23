@@ -260,7 +260,11 @@ struct ActivatedReadDescriptor {
 /// `cursor` parameters; `GetReactiveInjectionState` addresses no scope and
 /// selects through the declared exact `session_id` parameter;
 /// `GetResourceSnapshot` addresses no scope and selects through the
-/// declared exact `uri` parameter.
+/// declared exact `uri` parameter; `GetAuditRange` addresses no scope
+/// (issue #223: fence-gated journal-global scan; scope filtering lives
+/// consumer-side per I12-26, mirroring the `GetMailbox` split where the
+/// Governor facade requires a caller scope while catalogue rows stay
+/// scope-free).
 const ACTIVATED_READS: [ActivatedReadDescriptor; 17] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
