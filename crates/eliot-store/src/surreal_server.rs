@@ -37,6 +37,10 @@ pub struct ReadySurrealServer {
     started_pid: Option<u32>,
     lease_path: Option<PathBuf>,
     supervisor: SurrealServerSupervisor,
+    // Probe handle on the bridge data-root lease, held for the session so a
+    // bridge generation cannot claim the same production root mid-session
+    // (I5.2/A5). `std::fs::File` is `Send + Debug`; released on drop.
+    _data_root_guard: Option<std::fs::File>,
 }
 
 /// Outcome of releasing this runtime's handle on the canonical `SurrealDB` server.
@@ -216,13 +220,18 @@ impl SurrealServerSupervisor {
     pub async fn start_or_connect(&self) -> Result<ReadySurrealServer, StoreError> {
         self.validate_admission()?;
         self.executable_path()?;
+        // Refuse a bridge-owned production data root before any
+        // password/connect/spawn touch (I5.2/A5).
+        let mut data_root_guard = self.deny_bridge_owned_data_root()?;
 
         let existing_password = self.read_existing_password()?;
         if !self.start_lock_path().is_file()
             && let Some(password) = existing_password.as_ref()
         {
             match self.connect_and_auth(password, 750).await {
-                Ok(transport) => return self.ready_server(transport, None),
+                Ok(transport) => {
+                    return self.ready_server(transport, None, data_root_guard.take());
+                }
                 Err(error @ StoreError::ServerAuthFailed(_)) => return Err(error),
                 Err(_connection_error) => {}
             }
@@ -235,16 +244,20 @@ impl SurrealServerSupervisor {
             if let Some(_lock) = self.try_acquire_start_lock()? {
                 let password = self.read_or_create_password()?;
                 match self.connect_and_auth(&password, 750).await {
-                    Ok(transport) => return self.ready_server(transport, None),
+                    Ok(transport) => {
+                        return self.ready_server(transport, None, data_root_guard.take());
+                    }
                     Err(error @ StoreError::ServerAuthFailed(_)) => return Err(error),
                     Err(_connection_error) => {}
                 }
-                return Box::pin(self.spawn_and_wait(password)).await;
+                return Box::pin(self.spawn_and_wait(password, data_root_guard.take())).await;
             }
 
             match self.read_existing_password()? {
                 Some(password) => match self.connect_and_auth(&password, 750).await {
-                    Ok(transport) => return self.ready_server(transport, None),
+                    Ok(transport) => {
+                        return self.ready_server(transport, None, data_root_guard.take());
+                    }
                     Err(error @ StoreError::ServerAuthFailed(_)) => return Err(error),
                     Err(error) => last_error = error.to_string(),
                 },
@@ -381,6 +394,7 @@ impl SurrealServerSupervisor {
     async fn spawn_and_wait(
         &self,
         password: SecretString,
+        data_root_guard: Option<std::fs::File>,
     ) -> Result<ReadySurrealServer, StoreError> {
         let child = self.spawn_server(&password)?;
         let pid = child.id();
@@ -446,13 +460,15 @@ impl SurrealServerSupervisor {
         .await;
 
         match startup {
-            Ok((transport, pid)) => match self.ready_server(transport, Some(pid)) {
-                Ok(ready) => {
-                    spawned.disarm();
-                    Ok(ready)
+            Ok((transport, pid)) => {
+                match self.ready_server(transport, Some(pid), data_root_guard) {
+                    Ok(ready) => {
+                        spawned.disarm();
+                        Ok(ready)
+                    }
+                    Err(error) => Err(spawned.finalize_error(error).await),
                 }
-                Err(error) => Err(spawned.finalize_error(error).await),
-            },
+            }
             Err(error) => Err(spawned.finalize_error(error).await),
         }
     }
@@ -769,13 +785,49 @@ impl SurrealServerSupervisor {
         &self,
         transport: SurrealRpcTransport,
         started_pid: Option<u32>,
+        data_root_guard: Option<std::fs::File>,
     ) -> Result<ReadySurrealServer, StoreError> {
         Ok(ReadySurrealServer {
             transport: Some(Arc::new(transport)),
             started_pid,
             lease_path: Some(self.create_client_lease()?),
             supervisor: self.clone(),
+            _data_root_guard: data_root_guard,
         })
+    }
+
+    /// Refuses a bridge-owned production data root before the facade touches
+    /// it (I5.2/A5). Mirrors the bridge-side exclusion protocol in
+    /// `crates/storage/eliot-store-surreal-adapter/src/config.rs`
+    /// (`claim` at :472, `open_data_root_lease` at :594-630) without writing
+    /// a record or unlinking the lease path: a live bridge holder denies the
+    /// probe open, while a stale record is taken over as a hold for the
+    /// facade session. Non-path storage URIs bypass the probe (no dir to own).
+    /// Returns `Ok(None)` only then; every resolvable data root leaves with a
+    /// held exclusion handle or a live-owner refusal.
+    fn deny_bridge_owned_data_root(&self) -> Result<Option<std::fs::File>, StoreError> {
+        let Some(dir) = storage_path(&self.config.storage) else {
+            return Ok(None);
+        };
+        // Claim-style resolution (mirror bridge resolve_data_root create=true
+        // in adapter config.rs:507): create the dir so the probe below always
+        // either takes a hold or meets a live holder. Probing only an existing
+        // dir would leave a create-race where a bridge claim lands after the
+        // probe and both generations run on one root.
+        fs::create_dir_all(&dir)?;
+        let canonical = fs::canonicalize(&dir)?;
+        if !canonical.is_dir() {
+            return Ok(None);
+        }
+        let lock_path = canonical.join(BRIDGE_DATA_ROOT_LEASE_FILE);
+        if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+            && is_bridge_lease_reparse(&metadata)
+        {
+            return Err(StoreError::PolicyViolation(
+                "store data root lease reparse points are not permitted".to_owned(),
+            ));
+        }
+        probe_bridge_lease_exclusion(&lock_path)
     }
 
     fn remove_pid_file_if_matches(&self, pid: u32) -> Result<(), StoreError> {
@@ -1183,6 +1235,104 @@ impl Drop for StartLock {
 impl Drop for ReadySurrealServer {
     fn drop(&mut self) {
         let _ = self.release_client_lease();
+    }
+}
+
+/// Bridge-side live-owner lease file. Mirrors `STORE_DATA_ROOT_LEASE_FILE` in
+/// `crates/storage/eliot-store-surreal-adapter/src/config.rs:269`; the facade
+/// only probes exclusion on this path and never writes a record or unlinks it.
+const BRIDGE_DATA_ROOT_LEASE_FILE: &str = ".eliot-store-data-root.lock";
+
+/// Probes the bridge lease with the adapter's exclusion protocol (adapter
+/// `config.rs:594-630`): a live holder denies the open, a stale record is
+/// taken over as a hold. Messages carry no paths.
+#[cfg(windows)]
+fn probe_bridge_lease_exclusion(lock_path: &Path) -> Result<Option<std::fs::File>, StoreError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut exclusive = std::fs::OpenOptions::new();
+    exclusive
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .share_mode(0);
+    match exclusive.open(lock_path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            // A crashed owner leaves the record but not the handle.
+            // Reopening with zero sharing takes over, while a live owner
+            // denies this open with a sharing violation.
+            let mut takeover = std::fs::OpenOptions::new();
+            takeover.read(true).write(true).share_mode(0);
+            match takeover.open(lock_path) {
+                Ok(file) => Ok(Some(file)),
+                Err(reopen) if is_bridge_lease_denial(&reopen) => {
+                    Err(StoreError::PolicyViolation(
+                        "store data root is already owned by a live bridge generation; two processes can never open the same production data root"
+                            .to_owned(),
+                    ))
+                }
+                Err(_) => Err(StoreError::PolicyViolation(
+                    "store data root lease could not be reopened after a prior owner record"
+                        .to_owned(),
+                )),
+            }
+        }
+        Err(_) => Err(StoreError::PolicyViolation(
+            "store data root lease file could not be created".to_owned(),
+        )),
+    }
+}
+
+/// Non-Windows targets fail closed on an existing lease path (adapter
+/// `config.rs:632-654`); portable `std::fs` semantics are not equivalent
+/// cross-process exclusion.
+#[cfg(not(windows))]
+fn probe_bridge_lease_exclusion(lock_path: &Path) -> Result<Option<std::fs::File>, StoreError> {
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map(Some)
+        .map_err(|error| {
+            if error.kind() == ErrorKind::AlreadyExists {
+                StoreError::PolicyViolation(
+                    "store data root is already owned by a live bridge generation; two processes can never open the same production data root"
+                        .to_owned(),
+                )
+            } else {
+                StoreError::PolicyViolation(
+                    "store data root lease file could not be created".to_owned(),
+                )
+            }
+        })
+}
+
+/// Mirrors the adapter's sharing-denial test (adapter `config.rs:656-664`).
+#[cfg(windows)]
+fn is_bridge_lease_denial(error: &std::io::Error) -> bool {
+    // `32` is the Windows sharing-violation code (`WINDOWS_SHARING_VIOLATION`
+    // in adapter `config.rs:406`).
+    matches!(
+        error.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::WouldBlock | ErrorKind::AlreadyExists
+    ) || error.raw_os_error() == Some(32)
+}
+
+/// Mirrors the adapter's reparse test (adapter `config.rs:580-592`; `0x400` is
+/// `WINDOWS_REPARSE_POINT` in adapter `config.rs:401`).
+fn is_bridge_lease_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::MetadataExt::file_attributes(metadata) & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
