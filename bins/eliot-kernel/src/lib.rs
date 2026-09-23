@@ -41,7 +41,11 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+mod backup_coordination;
+mod backup_owner_clients;
 mod backup_restore;
+mod backup_restore_admission;
+mod backup_restore_driver;
 mod backup_restore_ports;
 mod blob_store_controller;
 mod canonical_store_runtime;
@@ -64,10 +68,36 @@ pub use backup_restore::{
 };
 pub use backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
-    KernelRestoreError, MAX_DESTINATION_LABEL_LEN, PinnedDestinationAdmission,
+    KernelRestoreError, KernelRestoreJournal, MAX_DESTINATION_LABEL_LEN, PinnedDestinationAdmission,
     RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY,
-    RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel, check_kernel_effect_fence,
-    kernel_to_backup, require_production_admitted,
+    RESTORE_JOURNAL_KEEP_RESOLVED, RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel,
+    check_kernel_effect_fence, kernel_to_backup, require_production_admitted,
+};
+// Restore-lane owner channels (issues #962/#959): public re-export carries
+// only names unique to this module. The six owner-client types also defined
+// in `backup_restore.rs` (E-960 active path, wired into the registered
+// composition adapter) are intentionally NOT re-exported here —
+// `backup_owner_clients` internals keep working through module paths, and
+// root unifies the parallel client families at main integration.
+pub use backup_owner_clients::{
+    AuthorizationExpectation, BackupOwnerChannels, BrokerOwnerClient, CanonicalStoreImportClient,
+    ImportReconciliation, OwnerChannelError, SessionOwnerClient, VerifiedDestinationBinding,
+    DESTINATION_AUTHORIZATION_ISSUER, DESTINATION_AUTHORIZATION_WIRE, PURGE_MEMBER_SUPPRESSION,
+    STORE_IMPORT_CHANNEL, verify_destination_authorization,
+};
+pub use backup_coordination::{
+    COORD_PARAM_ADMISSION_DIGEST, COORD_PARAM_DECISION_DIGEST, COORD_PARAM_DESTINATION,
+    COORD_PARAM_FENCE_DIGEST, COORD_PARAM_OPERATION_ID, COORD_PARAM_PAYLOAD_DIGEST,
+    COORDINATION_DECISION_DOMAIN, CoordinationDecision,
+};
+pub use backup_restore_admission::{
+    KernelRestoreAdmission, RESTORE_ADMISSION_CLASS_MARKER, RESTORE_ADMISSION_DECISION_DOMAIN,
+    RESTORE_ADMISSION_WIRE_MARKER, RestoreAdmissionMintRequest, RestoreProvisioningProof,
+    mint_restore_admission, require_restore_transition_class,
+};
+pub use backup_restore_driver::{
+    CoordinationCommit, ProductionRestoreOutcome, ProductionRestoreRequest, RestoreImport,
+    RestoreImportOutcome, drive_production_restore,
 };
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
