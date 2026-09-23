@@ -11,6 +11,9 @@ use serde_json::{Map, Value, json};
 
 use super::surreal_automation::{AutomationWrites, automation_write_statements};
 use super::surreal_experience::{ExperienceWrites, experience_write_statements};
+use super::surreal_coordination::{
+    SurrealCoordinationWrite, coordination_write_statements,
+};
 use super::surreal_reactive::{ReactiveWrites, reactive_write_statements};
 use crate::client;
 use crate::config::SurrealAdapterConfig;
@@ -206,6 +209,7 @@ pub(super) async fn write_transaction(
     reactive: &ReactiveWrites,
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
+    coordination: &[SurrealCoordinationWrite],
 ) -> Result<(), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let (sql, bindings) = build_apply_statements(
@@ -221,6 +225,7 @@ pub(super) async fn write_transaction(
         reactive,
         automation,
         experience,
+        coordination,
     )?;
     // 688-B classifies provider replies after the atomic RPC: deterministic
     // fence/head markers are conflicts, while an unavailable or unclassified
@@ -282,6 +287,7 @@ fn build_apply_statements(
     reactive: &ReactiveWrites,
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
+    coordination: &[SurrealCoordinationWrite],
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let revision = plan.next_revision_heads.first().ok_or_else(|| {
@@ -499,6 +505,7 @@ fn build_apply_statements(
     append_automation_statements(&mut sql, &mut bindings, automation)?;
 
     append_experience_statements(&mut sql, &mut bindings, experience)?;
+    append_coordination_statements(&mut sql, &mut bindings, coordination)?;
 
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
@@ -628,6 +635,30 @@ fn append_reactive_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "reactive binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Appends canonical restore-coordination row writes (issues #959/#960/
+/// #962/#975).
+///
+/// Same atomicity contract as the sibling fragments: sealed compare-and-set
+/// rows commit in the same transaction as the receipt and outbox rows, so
+/// decision row, receipt, and outbox stay atomic. Binding collisions fail
+/// closed instead of silently overwriting a canonical binding.
+fn append_coordination_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    coordination: &[SurrealCoordinationWrite],
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) = coordination_write_statements(coordination);
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "coordination binding collided with a canonical binding".to_owned(),
             ));
         }
     }

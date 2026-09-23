@@ -1551,6 +1551,26 @@ impl PreparedTransition {
                 });
             }
         }
+        // Issues #959/#960/#962/#975 (#954 caller control): restore
+        // coordination travels only with explicit Governor-issued
+        // proof/approval refs. The refs are verified present, unique, and
+        // non-blank here; automatic maintenance, curation, Dreamer, and
+        // scheduler paths furnish none, so they can never reach the
+        // coordination transaction. Lineage validity itself stays
+        // Governor-owned (decision digest recomputed against the fetched
+        // coordination receipt, never from caller bytes alone).
+        if self
+            .named_operations
+            .iter()
+            .any(|operation| operation.operation == NamedMutationOperation::RecordRestoreCoordination)
+        {
+            if self.required_proof_and_approval_refs.is_empty() {
+                return Err(StoreError::InvalidField {
+                    field: "proof_or_approval_ref",
+                    reason: "restore coordination requires Governor-issued proof refs",
+                });
+            }
+        }
         validate_digest(
             &self.admission_contract_set_digest,
             "admission_contract_set_digest",

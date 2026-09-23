@@ -27,6 +27,9 @@ use eliot_store_api::{
     AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
     AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_STATE_RETIRED,
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
+    COORDINATION_PARAM_ADMISSION_DIGEST, COORDINATION_PARAM_DECISION_DIGEST,
+    COORDINATION_PARAM_DESTINATION, COORDINATION_PARAM_FENCE_DIGEST,
+    COORDINATION_PARAM_OPERATION_ID, COORDINATION_PARAM_PAYLOAD_DIGEST,
     DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
     ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
     EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, NamedMutationOperation,
@@ -41,9 +44,10 @@ use eliot_store_api::{
     decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
     decode_resource_content, generated_operation_manifests, genesis_manifest, is_genesis_fence,
     issue_genesis_receipt_envelope, issue_store_receipt_envelope, named_mutation_operation_name,
-    sha256_hex, validate_automation_read_params, validate_genesis_receipt_envelope,
-    validate_reactive_ledger_read_params, validate_resource_snapshot_read_params,
-    validate_store_receipt_envelope, verify_canonical_request_hash,
+    sha256_hex, validate_automation_read_params, validate_coordination_mutation_params,
+    validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
+    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
+    verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -341,6 +345,11 @@ impl MemoryStore {
         // receipt's outbox references include the appended experience outbox
         // intents. Rows, receipt, and outbox still commit atomically below.
         dispatch_apply_experience_state(&mut state, &transition, &mut plan)?;
+        // Issues #959/#960/#962/#975: admitted restore-coordination legs
+        // persist their decision rows here, beside the automation legs and
+        // before the receipt is built, so rows, receipt, and outbox still
+        // commit atomically below.
+        dispatch_apply_coordination_state(&mut state, &transition)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
         if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
             commit.readback(&receipt)?;
@@ -1187,6 +1196,89 @@ fn dispatch_apply_experience_state(
         outbox.validate()?;
         plan.outbox_records.push(outbox);
         experience_index = experience_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// One durable restore-coordination decision row: the six admitted
+/// coordination bindings for one restore operation with its admission fence
+/// and the Governor-issued proof refs bound as audit evidence (issues
+/// #959/#960/#962/#975).
+#[derive(Clone, Debug, PartialEq)]
+struct CoordinationRow {
+    operation_id: String,
+    destination: String,
+    payload_digest: String,
+    fence_digest: String,
+    decision_digest: String,
+    admission_digest: String,
+    state_fence: StateFence,
+    proof_refs: Vec<String>,
+}
+
+/// Persists admitted restore-coordination decision rows on already-locked
+/// state.
+///
+/// Same behavior as the surreal contour: sealed compare-and-set keyed by
+/// `coordination_operation_id` — creates converge on byte-identical replay,
+/// divergent rewrites refuse with `IdentityConflict` (F6), and legs run
+/// only with Governor-issued proof refs on the transition (#954 caller
+/// control at the execution boundary). Non-coordination transitions are a
+/// no-op here.
+fn dispatch_apply_coordination_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    let has_coordination_op = transition.named_operations.iter().any(|command| {
+        command.operation == NamedMutationOperation::RecordRestoreCoordination
+    });
+    if !has_coordination_op {
+        return Ok(());
+    }
+    if transition.transition_class != TransitionClass::RecoverySchema {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    if transition.required_proof_and_approval_refs.is_empty() {
+        return Err(StoreError::InvalidField {
+            field: "proof_or_approval_ref",
+            reason: "restore coordination requires Governor-issued proof refs",
+        });
+    }
+    for command in &transition.named_operations {
+        if command.operation != NamedMutationOperation::RecordRestoreCoordination {
+            continue;
+        }
+        validate_coordination_mutation_params(&command.parameters)?;
+        let text = |key: &str| -> Result<String, StoreError> {
+            command
+                .parameters
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(StoreError::InvalidField {
+                    field: "coordination.parameter",
+                    reason: "coordination parameter must be a present string",
+                })
+        };
+        let row = CoordinationRow {
+            operation_id: text(COORDINATION_PARAM_OPERATION_ID)?,
+            destination: text(COORDINATION_PARAM_DESTINATION)?,
+            payload_digest: text(COORDINATION_PARAM_PAYLOAD_DIGEST)?,
+            fence_digest: text(COORDINATION_PARAM_FENCE_DIGEST)?,
+            decision_digest: text(COORDINATION_PARAM_DECISION_DIGEST)?,
+            admission_digest: text(COORDINATION_PARAM_ADMISSION_DIGEST)?,
+            state_fence: transition.state_fence.clone(),
+            proof_refs: transition.required_proof_and_approval_refs.clone(),
+        };
+        match state.coordination_rows.get(&row.operation_id) {
+            Some(existing) if *existing == row => {}
+            Some(_) => return Err(StoreError::IdentityConflict),
+            None => {
+                state
+                    .coordination_rows
+                    .insert(row.operation_id.clone(), row);
+            }
+        }
     }
     Ok(())
 }
@@ -3415,6 +3507,12 @@ struct MemoryState {
     /// Immutable agent-feedback rows keyed by joined `(handle, revision)`
     /// (issue #223). Same durable rule as the bank rows.
     experience_feedback_rows: BTreeMap<String, ExperienceFeedbackRow>,
+    /// Durable restore-coordination decision rows keyed by restore
+    /// operation identity (issues #959/#960/#962/#975). Sealed
+    /// compare-and-set rows with Governor proof-ref audit binding, driven
+    /// only through the closed coordination leg under the held transaction
+    /// lock; byte-identical replay converges.
+    coordination_rows: BTreeMap<String, CoordinationRow>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -3450,6 +3548,7 @@ impl PartialEq for MemoryState {
             && self.automation_last_failure == other.automation_last_failure
             && self.experience_bank_rows == other.experience_bank_rows
             && self.experience_feedback_rows == other.experience_feedback_rows
+            && self.coordination_rows == other.coordination_rows
             && self.next_commit_sequence == other.next_commit_sequence
             && self.next_outbox_sequence == other.next_outbox_sequence
             && self.notifications.iter().collect::<Vec<_>>()
@@ -3485,6 +3584,7 @@ impl Default for MemoryState {
             automation_last_failure: BTreeMap::new(),
             experience_bank_rows: BTreeMap::new(),
             experience_feedback_rows: BTreeMap::new(),
+            coordination_rows: BTreeMap::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
@@ -3511,6 +3611,7 @@ impl MemoryState {
             && self.automation_revisions.is_empty()
             && self.automation_currents.is_empty()
             && self.automation_invocations.is_empty()
+            && self.coordination_rows.is_empty()
     }
 
     fn snapshot(&self) -> MemorySnapshot {
