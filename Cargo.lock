@@ -3245,6 +3245,8 @@ dependencies = [
  "eliot-runtime-contracts",
  "eliot-security-contracts",
  "eliot-wasm-runtime",
+ "serde",
+ "serde_json",
  "thiserror",
  "wasmtime",
  "wat",
