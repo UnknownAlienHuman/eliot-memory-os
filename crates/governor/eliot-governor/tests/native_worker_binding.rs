@@ -302,7 +302,10 @@ fn activation_canonical_snapshot(fence: &StateFence) -> CanonicalAdmissionSnapsh
             plan_revision: "1".to_owned(),
             task_id: TaskId::new("task-1").expect("task id"),
             work_scope_id: "scope:work".to_owned(),
+            verifier: None,
         }),
+        verifier_execution_fact: None,
+        finish_evidence: None,
     }
 }
 

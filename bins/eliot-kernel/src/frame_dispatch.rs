@@ -895,15 +895,12 @@ pub(crate) fn is_doctor_operation(operation: &str) -> bool {
     operation == DOCTOR_REPAIR_WIRE_ID
 }
 
-/// Returns whether the operation string selects the P-07 testd admission route.
-///
-/// The operation string is the stable wire identity itself
-/// (`TESTD_ADMISSION_WIRE_ID`); there is no second dispatch vocabulary and no
-/// generic JSON command routing. Callers must still prove the exact
-/// (`wire_id`, `wire_version`) pair through `route_testd_admission` on the
-/// decoded typed request: the operation string only selects this closed entry.
+/// Returns whether the operation string selects one of the closed TestD
+/// admission or terminal-completion routes. Each entry still validates its
+/// own exact wire id/version and typed payload.
 pub(crate) fn is_testd_operation(operation: &str) -> bool {
     operation == TESTD_ADMISSION_WIRE_ID
+        || operation == super::testd_terminal_completion_route::OPERATION
 }
 
 impl KernelComposition {
@@ -1218,14 +1215,27 @@ impl KernelComposition {
         if !is_testd_operation(operation) {
             return Err(TransportError::SessionFenced);
         }
-        let request = testd_request_from_payload(&payload)?;
-        if operation != request.wire_id
-            || !route_testd_admission(&request.wire_id, request.wire_version)
-        {
+        if operation == TESTD_ADMISSION_WIRE_ID {
+            let request = testd_request_from_payload(&payload)?;
+            if operation != request.wire_id
+                || !route_testd_admission(&request.wire_id, request.wire_version)
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        } else if operation == super::testd_terminal_completion_route::OPERATION {
+            let request = super::testd_terminal_completion_route::request_from_payload(&payload)
+                .map_err(|_| TransportError::SessionFenced)?;
+            if operation != request.wire_id
+                || request.wire_version != super::testd_terminal_completion_route::WIRE_VERSION
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        } else {
             return Err(TransportError::SessionFenced);
         }
         Ok(KernelFrameAction::Testd {
             request_id,
+            identity: identity.clone(),
             operation: operation.to_owned(),
             payload,
         })
@@ -1297,6 +1307,9 @@ impl KernelComposition {
         if !is_testd_operation(operation) {
             return Err(TransportError::SessionFenced);
         }
+        if operation != TESTD_ADMISSION_WIRE_ID {
+            return Err(TransportError::SessionFenced);
+        }
         if session.module_generation.module_id.as_str() != TESTD_MODULE_ID {
             return Err(TransportError::SessionFenced);
         }
@@ -1331,6 +1344,62 @@ impl KernelComposition {
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
             super::dispatch_launch::admit_testd_attempt(&service, &request, now_unix_nanos)
+                .map_err(|_| TransportError::SessionFenced)?
+        };
+        let mut reply = status_frame(
+            session,
+            FrameKind::Response,
+            MessageType::Result,
+            serde_json::to_value(&response).map_err(|_| TransportError::SessionFenced)?,
+        )?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(reply)
+    }
+}
+
+impl KernelComposition {
+    /// Rehydrates one TestD terminal notice through the existing authenticated
+    /// worker session and retained launch owner. Pending is returned until the
+    /// daemon has persisted its committed Governor WriteReceipt.
+    pub async fn execute_testd_terminal_completion(
+        &self,
+        session: &Session,
+        request_id: super::RequestId,
+        identity: &super::RequestIdentity,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<Frame, TransportError> {
+        observe_frame("kernel.frame_testd_terminal_execute", "attempt");
+        if operation != super::testd_terminal_completion_route::OPERATION
+            || session.module_generation.module_id.as_str() != TESTD_MODULE_ID
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let request = super::testd_terminal_completion_route::request_from_payload(&payload)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let response = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            super::dispatch_launch::read_testd_terminal_completion(&service, &request)
                 .map_err(|_| TransportError::SessionFenced)?
         };
         let mut reply = status_frame(

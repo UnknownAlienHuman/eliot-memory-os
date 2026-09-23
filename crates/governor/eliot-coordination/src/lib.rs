@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{ClockReading, EpochId, StateFence};
+use eliot_contracts::{ClockReading, EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -256,6 +256,22 @@ pub struct WorkItem {
     pub attempt: u32,
     pub checkpoint_ref: Option<String>,
     pub result_ref: Option<String>,
+}
+
+/// Coherent finish material read from the coordination owner.
+///
+/// This projection is deliberately read-only.  A submitted result is an
+/// artifact handle, while live or missing work remains an unresolved
+/// descendant reference.  The projection never treats a worker's result as a
+/// verifier outcome.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FinishCoordinationProjection {
+    pub task_id: String,
+    pub state_fence: StateFence,
+    pub artifact_refs: Vec<String>,
+    pub unresolved_refs: Vec<String>,
+    pub descendant_receipt_ref: Option<String>,
 }
 
 /// The bounded authority to advance one work item.
@@ -925,6 +941,126 @@ impl CoordinationOwner {
                 Err(CoordinationError::AmbiguousActiveBinding)
             }
         }
+    }
+
+    /// Reads the exact descendant/artifact projection used by FinishAttempt.
+    ///
+    /// The owner only reports a complete descendant receipt when at least one
+    /// work item for the task exists and every such item is terminal.  A
+    /// submitted item must carry its canonical result reference; an absent
+    /// reference is malformed owner state and fails closed.  This method does
+    /// not admit a result, alter a work item, or infer a verifier decision.
+    pub fn finish_projection(
+        &self,
+        task_id: &str,
+        state_fence: &StateFence,
+    ) -> Result<FinishCoordinationProjection, CoordinationError> {
+        text(task_id, "finish.task_id")?;
+        state_fence
+            .validate()
+            .map_err(|_| CoordinationError::FenceMismatch)?;
+
+        let mut found = false;
+        let mut artifact_refs = Vec::new();
+        let mut unresolved_refs = Vec::new();
+        let mut terminal_event_bindings = Vec::new();
+        for item in self.work.values().filter(|item| item.task_id == task_id) {
+            found = true;
+            if item.state_fence != *state_fence {
+                return Err(CoordinationError::FenceMismatch);
+            }
+            if let Some(checkpoint_ref) = item.checkpoint_ref.as_deref() {
+                if checkpoint_ref.trim().is_empty() {
+                    return Err(CoordinationError::InvalidState);
+                }
+                artifact_refs.push(checkpoint_ref.to_owned());
+            }
+            match item.state {
+                WorkState::Submitted => {
+                    let result_ref = item
+                        .result_ref
+                        .as_deref()
+                        .filter(|reference| !reference.trim().is_empty())
+                        .ok_or(CoordinationError::InvalidState)?;
+                    let latest_event = self
+                        .events
+                        .iter()
+                        .filter(|event| event.subject_id == item.work_item_id)
+                        .max_by_key(|event| event.sequence);
+                    match latest_event.filter(|event| {
+                        event.kind == CoordinationEventKind::ResultSubmitted
+                            && event.state_fence == *state_fence
+                            && event.authority_epoch == state_fence.authority_epoch
+                            && event.payload_digest == result_ref
+                            && event.sequence != 0
+                    }) {
+                        Some(event) => {
+                            artifact_refs.push(result_ref.to_owned());
+                            artifact_refs.push(format!("coordination:event:{}", event.event_id));
+                            terminal_event_bindings.push((
+                                item.work_item_id.as_str(),
+                                event.sequence,
+                                event.event_id.as_str(),
+                                event.payload_digest.as_str(),
+                            ));
+                        }
+                        None => unresolved_refs.push(format!(
+                            "work:{}:result-not-joined-to-current-terminal-event",
+                            item.work_item_id
+                        )),
+                    }
+                }
+                WorkState::Cancelled | WorkState::Failed => {
+                    // These states have no canonical terminal event kind yet.
+                    // A state label alone cannot close a descendant.
+                    unresolved_refs.push(format!(
+                        "work:{}:terminal-state-has-no-owner-receipt",
+                        item.work_item_id
+                    ));
+                }
+                WorkState::Ready
+                | WorkState::Claimed
+                | WorkState::Running
+                | WorkState::Checkpointed
+                | WorkState::Reassigned => {
+                    unresolved_refs.push(format!(
+                        "work:{}:{:?}",
+                        item.work_item_id, item.state
+                    ));
+                }
+            }
+        }
+
+        artifact_refs.sort();
+        artifact_refs.dedup();
+        unresolved_refs.sort();
+        unresolved_refs.dedup();
+        terminal_event_bindings.sort();
+        terminal_event_bindings.dedup();
+        let descendant_receipt_ref = if found
+            && unresolved_refs.is_empty()
+            && !terminal_event_bindings.is_empty()
+        {
+            // Content-address the joined immutable owner events, rather than
+            // terminal state labels or result strings. Their event references
+            // are also retained in artifact_refs for direct readback.
+            let digest_input = (task_id, state_fence, &terminal_event_bindings);
+            let bytes = canonical_json_bytes(&digest_input)
+                .map_err(|_| CoordinationError::InvalidState)?;
+            Some(format!("coordination:descendants:{}", sha256_hex(&bytes)))
+        } else {
+            None
+        };
+        if !found {
+            unresolved_refs.push(format!("coordination:no-descendants:{task_id}"));
+        }
+        Ok(FinishCoordinationProjection {
+            task_id: task_id.to_owned(),
+            state_fence: state_fence.clone(),
+            artifact_refs,
+            unresolved_refs,
+            descendant_receipt_ref,
+        })
     }
 
     #[allow(clippy::unused_self)]

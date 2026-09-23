@@ -208,6 +208,8 @@ pub struct TestdMaterialAdmission {
     /// fields. The per-host installed artifact digest binds later at Drive
     /// time through the intent's `executable_sha256`.
     pub profile_binding_digest: String,
+    /// Exact non-secret environment bindings carried by the Kernel receipt.
+    pub environment: Vec<(String, String)>,
     /// Whether the job was admitted cancelled; cancelled admissions never
     /// stage execution work.
     pub cancelled: bool,
@@ -249,6 +251,8 @@ pub struct ValidatedTestdMaterial {
     pub profile: String,
     /// Canonical definition digest over the static admitted profile fields.
     pub profile_binding_digest: String,
+    /// Exact non-secret environment bindings admitted for this profile.
+    pub environment: Vec<(String, String)>,
     /// Canonical digest of the exact admitted request envelope.
     pub request_digest: String,
     /// Canonical digest of the admission receipt.
@@ -441,6 +445,7 @@ fn validate_material(
         operation_id: file.admission.operation_id.clone(),
         profile: file.admission.profile.clone(),
         profile_binding_digest: file.admission.profile_binding_digest.clone(),
+        environment: file.admission.environment.clone(),
         request_digest: file.admission.request_digest,
         admission_digest: file.admission.admission_digest,
         epoch: file.epoch,
@@ -503,20 +508,34 @@ fn validate_admission(
     // Admitted profile record: exactly one profile is admitted, and its
     // definition digest must equal the closed registry digest. A
     // substituted profile or widened binding fails here, before any drive.
-    if admission.profile != eliot_testd_core::TESTD_ADMITTED_PROFILE {
+    if !eliot_testd_core::is_admitted_testd_profile(&admission.profile) {
         return Err(TestdMaterialError::Contract(
-            "testd admits only the closed cargo-test tool-probe profile".to_owned(),
+            "testd admits only registered probe or productive nextest profiles".to_owned(),
         ));
     }
     validate_wire_digest(
         &admission.profile_binding_digest,
         "testd_material.profile_binding_digest",
     )?;
-    let expected_binding = eliot_testd_core::testd_definition_digest()
-        .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
+    let expected_binding =
+        eliot_testd_core::testd_definition_digest_for_profile(&admission.profile)
+            .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
     if admission.profile_binding_digest != expected_binding {
         return Err(TestdMaterialError::Contract(
             "testd_material.profile_binding_digest mismatch".to_owned(),
+        ));
+    }
+    let expected_environment = if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if admission.environment != expected_environment {
+        return Err(TestdMaterialError::Contract(
+            "testd_material.environment does not match the registered profile".to_owned(),
         ));
     }
     if admission.job_id != request.job_id {
@@ -704,6 +723,7 @@ impl TestdMaterialAdmission {
             operation_id: &'a str,
             profile: &'a str,
             profile_binding_digest: &'a str,
+            environment: &'a [(String, String)],
             cancelled: bool,
             admitted_at_unix_nanos: u64,
         }
@@ -715,6 +735,7 @@ impl TestdMaterialAdmission {
             operation_id: &self.operation_id,
             profile: &self.profile,
             profile_binding_digest: &self.profile_binding_digest,
+            environment: &self.environment,
             cancelled: self.cancelled,
             admitted_at_unix_nanos: self.admitted_at_unix_nanos,
         };

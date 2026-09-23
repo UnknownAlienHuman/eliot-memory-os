@@ -892,6 +892,9 @@ pub struct FinishEvidence {
     pub task_id: String,
     /// Current canonical task revision.
     pub current_task_revision: u64,
+    /// Artifact handles rehydrated from canonical state.
+    #[serde(default)]
+    pub artifact_refs: Vec<String>,
     /// Per-acceptance evidence and verifier bindings.
     pub acceptance: Vec<AcceptanceCoverage>,
     /// Executed verifier handles in the exact current scope.
@@ -914,6 +917,13 @@ impl FinishEvidence {
                 field: "finish.evidence.current_task_revision",
                 reason: "must be non-zero",
             });
+        }
+        unique(
+            self.artifact_refs.iter(),
+            "finish.evidence.artifact_refs",
+        )?;
+        for reference in &self.artifact_refs {
+            text(reference, "finish.evidence.artifact_ref")?;
         }
         if self.acceptance.is_empty() {
             return Err(CanonicalError::Empty {
@@ -1037,9 +1047,25 @@ pub fn derive_finish_decision(
         .map(String::as_str)
         .collect();
     let mut verifier_gap = false;
+    let mut artifact_gap = false;
     let mut all_satisfied = true;
-    let mut bindings = draft.artifact_refs.clone();
-    bindings.extend(draft.verifier_run_refs.iter().cloned());
+    let mut bindings = evidence.artifact_refs.clone();
+    bindings.extend(evidence.executed_verifier_run_refs.iter().cloned());
+    for artifact in &draft.artifact_refs {
+        if !evidence.artifact_refs.iter().any(|known| known == artifact) {
+            artifact_gap = true;
+            missing.push(format!("artifact:{artifact}"));
+        }
+    }
+    for verifier in &draft.verifier_run_refs {
+        if !evidence
+            .executed_verifier_run_refs
+            .iter()
+            .any(|known| known == verifier)
+        {
+            verifier_gap = true;
+        }
+    }
     for verifier in &draft.verifier_run_refs {
         if !executed.contains(verifier.as_str()) || stale.contains(verifier.as_str()) {
             verifier_gap = true;
@@ -1074,7 +1100,7 @@ pub fn derive_finish_decision(
     unresolved.dedup();
     let outcome = match draft.requested_outcome {
         RequestedFinishOutcome::CompleteCandidate
-            if all_satisfied && !verifier_gap && unresolved.is_empty() =>
+            if all_satisfied && !verifier_gap && !artifact_gap && unresolved.is_empty() =>
         {
             FinishDecisionOutcome::VerifiedComplete
         }

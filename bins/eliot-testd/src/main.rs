@@ -8,6 +8,7 @@ use eliot_process::ProcessExecutor;
 use eliot_testd::{
     ADMITTED_WORKER_LEASE_MS, PROTOCOL_VERSION, SERVICE_NAME, TestReceipt, TestdComposition,
     ValidatedDispatchDriveOutcome, drive_validated_dispatch_material,
+    drive_validated_dispatch_material_with_terminal_publisher,
     kernel_client::{KernelTestdIpcClient, PresentedAdmission},
     run_admitted_one_shot,
     testd_material::{ValidatedTestdMaterial, read_testd_material},
@@ -97,16 +98,12 @@ fn bootstrap_and_run_once() -> i32 {
             let Some(material) = presented else {
                 return deny();
             };
-            // Validated session-bound material drives the bounded admitted
-            // probe through the DISPATCH-WIRE seam
-            // (`drive_validated_dispatch_material` in `eliot-testd`): the
-            // intent derives only from the admitted profile binding plus the
-            // installed tool bytes, the single permit issues through the
-            // ephemeral dispatch authority, and the real composed executor
-            // runs exactly one start. The closed Kernel bootstrap and
-            // advertisement above still gate production until the dispatch
-            // contour lands; this arm is exercised by the module tests.
-            drive_material_probe(&material)
+            // Validated session-bound material drives the admitted durable
+            // worker through the DISPATCH-WIRE seam. The intent derives from
+            // the canonical job and admitted profile binding, while the
+            // supervised worker owns the durable claim, observation, capture,
+            // and finish path.
+            drive_material_probe_with_terminal_publisher(&material, &mut client)
         }
         GateDecision::DenyNotAdvertised | GateDecision::DenyNoPresentedAttempt => deny(),
     }
@@ -128,24 +125,30 @@ fn acquire_presented_admission() -> Option<ValidatedTestdMaterial> {
     read_testd_material().unwrap_or_default()
 }
 
-/// Drives one validated dispatch file through the bounded admitted probe.
+/// Drives one validated dispatch file through the admitted durable worker.
 ///
 /// Thin binary projection over the DISPATCH-WIRE seam
 /// ([`drive_validated_dispatch_material`][eliot_testd::drive_validated_dispatch_material]):
-/// the intent derives only from the admitted profile binding plus the
-/// installed tool bytes, the single permit issues through the ephemeral
-/// dispatch authority over the validated grant, and the real composed
-/// executor runs exactly one start. Cancelled admissions project
-/// cancellation without executing. Every post-derivation outcome maps to a
-/// typed non-78 exit; a refused derivation or issuance (nothing executed)
-/// fails the shot without claiming admission semantics.
-fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
-    match block_on_drive(drive_validated_dispatch_material(
+/// the intent derives from the daemon-owned canonical job and admitted profile
+/// binding, the permit issues through the dispatch authority over the
+/// validated grant, and the supervised worker owns one durable claim and
+/// finish. Cancelled admissions project cancellation without executing. Every
+/// refused derivation or issuance fails the shot closed.
+fn drive_material_probe_with_terminal_publisher(
+    material: &ValidatedTestdMaterial,
+    client: &mut KernelTestdIpcClient,
+) -> i32 {
+    let Some(source_root) = generation_root_cwd() else {
+        return EXIT_ADMITTED_DRIVE_FAILED;
+    };
+    match block_on_drive(drive_validated_dispatch_material_with_terminal_publisher(
         material,
-        &generation_root_cwd(),
+        &source_root,
         now_ms(),
+        client,
     )) {
         Ok(ValidatedDispatchDriveOutcome::Completed { .. }) => EXIT_ADMITTED_COMPLETED,
+        Ok(ValidatedDispatchDriveOutcome::Failed { .. }) => EXIT_ADMITTED_DRIVE_FAILED,
         Ok(ValidatedDispatchDriveOutcome::Cancelled { .. }) => EXIT_ADMITTED_CANCELLED,
         Ok(ValidatedDispatchDriveOutcome::ReconcileRequired { .. }) => {
             EXIT_ADMITTED_RECONCILE_REQUIRED
@@ -154,23 +157,36 @@ fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
     }
 }
 
-/// Working directory for the bounded probe: the dispatch locator
-/// directory (the executable directory carrying the material file), which
-/// exists by construction when material was delivered.
-///
-/// Deferred: the production contour delivers the admitted generation
-/// (source) root for the working directory; the bounded `cargo --version`
-/// probe reads no working directory, so the existing locator directory is
-/// the honest closed stand-in. The derivation re-validates it as an
-/// existing directory before any start.
-fn generation_root_cwd() -> String {
-    if let Some(path) = eliot_testd::testd_material::testd_material_path()
-        && let Some(directory) = path.parent()
-        && directory.is_dir()
-    {
-        return directory.to_string_lossy().into_owned();
+/// Returns the inherited process working directory as the admitted source
+/// root. The canonical job row remains authoritative; this path only opens
+/// that daemon-owned state and has no locator or temporary fallback.
+fn generation_root_cwd() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| path.is_dir())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Worker-only projection retained for non-production unit fixtures. The
+/// executable path above always uses the authenticated terminal publisher.
+fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
+    let Some(source_root) = generation_root_cwd() else {
+        return EXIT_ADMITTED_DRIVE_FAILED;
+    };
+    match block_on_drive(drive_validated_dispatch_material(
+        material,
+        &source_root,
+        now_ms(),
+    )) {
+        Ok(ValidatedDispatchDriveOutcome::Completed { .. }) => EXIT_ADMITTED_COMPLETED,
+        Ok(ValidatedDispatchDriveOutcome::Failed { .. }) => EXIT_ADMITTED_DRIVE_FAILED,
+        Ok(ValidatedDispatchDriveOutcome::Cancelled { .. }) => EXIT_ADMITTED_CANCELLED,
+        Ok(ValidatedDispatchDriveOutcome::ReconcileRequired { .. }) => {
+            EXIT_ADMITTED_RECONCILE_REQUIRED
+        }
+        Err(_) => EXIT_ADMITTED_DRIVE_FAILED,
     }
-    std::env::temp_dir().to_string_lossy().into_owned()
 }
 
 /// Minimal std-only driver for the single executor future, mirroring
