@@ -134,7 +134,7 @@ pub struct DispatchGrant {
     pub idempotency_key: String,
     /// Grant expiry in Unix milliseconds for `PermitIssuance::new`.
     pub expires_at: u64,
-    /// Kernel-selected TestD owner database protected by the grant digest.
+    /// Kernel-selected `TestD` owner database protected by the grant digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub testd_owner_store_path: Option<String>,
 }
@@ -273,8 +273,8 @@ pub struct ValidatedTestdMaterial {
     /// Validated Kernel-issued launch grant; the dispatch authority
     /// consumes exactly this value at issuance time.
     pub grant: DispatchGrant,
-    /// Canonical TestD database owned by Kernel work_root and bound into the
-    /// grant digest; never inferred from source_root or process cwd.
+    /// Canonical `TestD` database owned by Kernel `work_root` and bound into the
+    /// grant digest; never inferred from `source_root` or process cwd.
     pub owner_store_path: PathBuf,
     /// Rebuilt fence from the validated grant (broker constructors).
     pub fence: FencingToken,

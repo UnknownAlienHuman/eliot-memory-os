@@ -1146,7 +1146,10 @@ pub(crate) fn bind_testd_owner_session(
 /// observation; Kernel rehydrates RequestIdentity from the frame, chooses
 /// job/build/store paths, rereads tool bytes, issues the process request, and
 /// commits the identity and job together before any dispatcher can see it.
-#[allow(clippy::too_many_lines, reason = "single owner pipeline: validate, bind, issue, commit")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single owner pipeline: validate, bind, issue, commit"
+)]
 pub(crate) async fn submit_testd_owner_job(
     kernel: &KernelComposition,
     identity: &RequestIdentity,

@@ -24,6 +24,7 @@ use eliot_protocol::{
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
     AgentActivationResultReconcile,
 };
+use eliotd::testd_terminal_completion::TestdOwnerDrainOutcome;
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
     LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME, forward_admitted_local_read,
@@ -31,6 +32,14 @@ use eliotd::{
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
+
+/// Shared daemon composition handle for the run loop. The loop holds no
+/// long-lived borrow: every flight future locks briefly (readers) or for
+/// one bounded drain (the TestD owner finish driver, the only writer), so
+/// health, shutdown, and concurrent readers stay pollable. A poisoned row
+/// never fails the daemon closed; transport failures do, mirroring the
+/// local-read poller.
+type SharedComposition = Arc<tokio::sync::Mutex<DaemonComposition>>;
 
 const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -377,11 +386,19 @@ pub(super) fn run() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
+    // The run loop is the only writer of the composition (TestD owner
+    // finish drain); readers lock briefly per step. Wrap here: every
+    // pre-loop exclusive use above is complete.
+    let composition = SharedComposition::new(tokio::sync::Mutex::new(
+        Arc::try_unwrap(composition)
+            .map_err(|_| "daemon composition shared before run loop".to_owned())?,
+    ));
     let loop_result = runtime.block_on(run_loop(Arc::clone(&kernel), Arc::clone(&composition)));
     // The loop dropped its handle on return, so this unwrap is deterministic;
     // the error arm documents the invariant instead of panicking on it.
     let shutdown_result = Arc::try_unwrap(composition)
         .map_err(|_| "daemon composition still shared at shutdown".to_owned())?
+        .into_inner()
         .shutdown()
         .map_err(|error| error.to_string());
     // #740: shutdown disposition record. The terminal-failure reports below
@@ -631,7 +648,7 @@ impl LoopCadence {
 
 async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
-    composition: Arc<DaemonComposition>,
+    composition: SharedComposition,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
     // Sole owner of activation state. No second owner and no second
@@ -652,12 +669,20 @@ async fn run_loop(
     // Recovery re-presentation at loop start: rebind the Kernel P-07 owner
     // from live Governor state before any activation work is claimed.
     sync_owner_feed(&kernel, &composition, &mut owner_feed).await;
+    // Sole owner of TestD owner drain state (issue #325). The same tick
+    // drives it independently of the other flights: one bounded drain step
+    // binds pending verifier dispatches, publishes terminal verifier facts,
+    // submits finish candidates, and acknowledges terminals, all through
+    // the Kernel owner routes. The drain holds the composition lock for
+    // one bounded step; every other arm locks briefly.
+    let mut testd_owner_flight = TestdOwnerFlight::Idle;
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("daemon shutdown signal: {error}"))?;
                 let exit = drain_activation_on_shutdown(&mut flight).await?;
                 drain_local_read_on_shutdown(&mut local_read_flight).await?;
+                drain_testd_owner_on_shutdown(&mut testd_owner_flight).await?;
                 return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
@@ -665,6 +690,10 @@ async fn run_loop(
                 // gate: it must start even while an activation is in flight,
                 // so its gate is checked before the activation early-continue.
                 maybe_start_local_read_poll(&kernel, &composition, &mut local_read_flight);
+                // The TestD owner drain rides the same tick under its own
+                // gate for the same reason: terminal evidence must publish
+                // while activations are in flight.
+                maybe_start_testd_owner_drain(&kernel, &composition, &mut testd_owner_flight);
                 if decide_activation_tick(&flight) == ActivationTickDecision::StartClaim {
                     flight = ActivationFlight::InFlight(ActivationFlightState {
                         future: start_activation_claim(&kernel),
@@ -708,7 +737,8 @@ async fn run_loop(
                             ActivationClaim::Valid(ticket) => *ticket,
                         };
                         let now = unix_ms(SystemTime::now())?;
-                        match start_valid_claim_step(&kernel, composition.as_ref(), ticket, now)? {
+                        let guard = composition.lock().await;
+                        match start_valid_claim_step(&kernel, &guard, ticket, now)? {
                             Some(state) => {
                                 flight = ActivationFlight::InFlight(state);
                             }
@@ -730,6 +760,9 @@ async fn run_loop(
             }
             local_read_completion = next_local_read_completion(&mut local_read_flight) => {
                 settle_local_read_completion(local_read_completion, &mut local_read_flight)?;
+            }
+            testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
+                settle_testd_owner_completion(testd_owner_completion, &mut testd_owner_flight)?;
             }
             _ = cadence.health_heartbeat.tick() => {
                 KernelTransitionPort::health(&*kernel)
@@ -866,10 +899,11 @@ async fn drain_activation_on_shutdown(
 /// pending, exactly like an absent P-07 port.
 async fn sync_owner_feed(
     kernel: &Arc<DaemonKernelClient>,
-    composition: &Arc<DaemonComposition>,
+    composition: &SharedComposition,
     trigger: &mut eliotd::OwnerFeedTrigger,
 ) {
-    match eliotd::maintain_owner_feed(composition, kernel, trigger).await {
+    let guard = composition.lock().await;
+    match eliotd::maintain_owner_feed(&guard, kernel, trigger).await {
         Ok(Some(revision)) => {
             tracing::info!(
                 target: "eliotd::diagnostics",
@@ -895,7 +929,7 @@ async fn sync_owner_feed(
 /// per tick; a null claim backs off until the next tick.
 fn start_local_read_poll(
     kernel: &Arc<DaemonKernelClient>,
-    composition: Arc<DaemonComposition>,
+    composition: SharedComposition,
 ) -> Pin<Box<dyn std::future::Future<Output = LocalReadCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
     Box::pin(async move {
@@ -908,7 +942,7 @@ fn start_local_read_poll(
 /// activation is in flight.
 fn maybe_start_local_read_poll(
     kernel: &Arc<DaemonKernelClient>,
-    composition: &Arc<DaemonComposition>,
+    composition: &SharedComposition,
     flight: &mut LocalReadFlight,
 ) {
     if decide_local_read_tick(flight) == LocalReadTickDecision::StartPoll {
@@ -956,7 +990,7 @@ fn settle_local_read_completion(
 /// and the next tick claims the current generation anew.
 async fn run_local_read_poll(
     kernel: &DaemonKernelClient,
-    composition: Arc<DaemonComposition>,
+    composition: SharedComposition,
 ) -> Result<LocalReadPollOutcome, String> {
     // #740: receipt span over the claim/forward/submit poll step. Pair
     // presence and submit outcome are named; payload bytes never are.
@@ -968,6 +1002,7 @@ async fn run_local_read_poll(
     let Some((envelope, tool, attempt)) = pair else {
         return Ok(LocalReadPollOutcome::IdleBackoff);
     };
+    let guard = composition.lock().await;
     // #1882: Skill pairs serve locally through the composition Skill driver
     // instead of forwarding on the Kernel `local_read` leg (which serves
     // store reads only). Recognition is the shared Skill tool predicate over
@@ -976,8 +1011,7 @@ async fn run_local_read_poll(
     // idempotent leg below, so claimed skill pairs settle exactly like
     // forwarded ones.
     if eliotd::skill_dispatch::is_skill_tool(&tool) {
-        let body =
-            eliotd::skill_dispatch::serve_skill_pair(&composition, &envelope, &tool, &attempt);
+        let body = eliotd::skill_dispatch::serve_skill_pair(&guard, &envelope, &tool, &attempt);
         return match submit_local_read_result_idempotent(kernel, &body).await? {
             LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
             LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
@@ -1033,6 +1067,136 @@ async fn drain_local_read_on_shutdown(flight: &mut LocalReadFlight) -> Result<Ru
     };
     match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
         Ok(LocalReadCompletion::Settled(Err(error))) => Err(error),
+        _ => Ok(RunLoopExit::Shutdown),
+    }
+}
+
+/// Completion of one in-flight TestD owner drain step. Bind, terminal
+/// publish, finish submit, and ack share one flight branch so health and
+/// shutdown stay pollable while the bounded step is outstanding; the step
+/// handles at most one bounded poll per queue per tick.
+enum TestdOwnerCompletion {
+    Settled(Result<TestdOwnerDrainOutcome, String>),
+}
+
+struct TestdOwnerFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = TestdOwnerCompletion>>>,
+}
+
+/// Sole owner of TestD owner drain state in `run_loop`, mirroring
+/// [`LocalReadFlight`]. `Idle` means no drain work is outstanding;
+/// `InFlight` holds the one pending drain step. No second owner and no
+/// second concurrent drain step exist.
+enum TestdOwnerFlight {
+    Idle,
+    InFlight(TestdOwnerFlightState),
+}
+
+/// Pure tick gate: the TestD owner timer starts work only when the flight
+/// is idle. The in-flight step is polled in its own `select!` branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestdOwnerTickDecision {
+    StartDrain,
+    SkipInFlight,
+}
+
+fn decide_testd_owner_tick(flight: &TestdOwnerFlight) -> TestdOwnerTickDecision {
+    match flight {
+        TestdOwnerFlight::Idle => TestdOwnerTickDecision::StartDrain,
+        TestdOwnerFlight::InFlight(_) => TestdOwnerTickDecision::SkipInFlight,
+    }
+}
+
+/// Starts one TestD owner drain step for the finish cadence (issue #325):
+/// bind pending verifier dispatches, publish terminal verifier facts,
+/// submit finish candidates, and acknowledge terminals, all through the
+/// Kernel owner routes. At most one bounded step per tick; an empty poll
+/// backs off until the next tick.
+fn start_testd_owner_drain(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Pin<Box<dyn std::future::Future<Output = TestdOwnerCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move {
+        TestdOwnerCompletion::Settled(run_testd_owner_drain(&kernel_clone, composition).await)
+    })
+}
+
+/// Starts the TestD owner drain step when its flight is idle. Checked on
+/// every tick alongside the other pollers so terminal evidence publishes
+/// while activations are in flight.
+fn maybe_start_testd_owner_drain(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut TestdOwnerFlight,
+) {
+    if decide_testd_owner_tick(flight) == TestdOwnerTickDecision::StartDrain {
+        *flight = TestdOwnerFlight::InFlight(TestdOwnerFlightState {
+            future: start_testd_owner_drain(kernel, Arc::clone(composition)),
+        });
+    }
+}
+
+/// Polls the one in-flight TestD owner drain step, pending forever while
+/// idle so health and shutdown stay pollable with no step outstanding.
+async fn next_testd_owner_completion(flight: &mut TestdOwnerFlight) -> TestdOwnerCompletion {
+    match flight {
+        TestdOwnerFlight::Idle => std::future::pending::<TestdOwnerCompletion>().await,
+        TestdOwnerFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed TestD owner drain step back to idle. A drained
+/// step idles until the next tick; only a step failure fails the daemon
+/// closed — a poisoned row that cannot drain is recorded as a diagnostic
+/// and skipped inside the step, never silently discarded and never fatal.
+fn settle_testd_owner_completion(
+    completion: TestdOwnerCompletion,
+    flight: &mut TestdOwnerFlight,
+) -> Result<(), String> {
+    match completion {
+        TestdOwnerCompletion::Settled(Ok(_)) => {
+            *flight = TestdOwnerFlight::Idle;
+            Ok(())
+        }
+        TestdOwnerCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// Runs one TestD owner drain step through the production finish caller:
+/// the composition lock is held for exactly one bounded step while the
+/// driver binds dispatches, publishes verifier facts, submits finish
+/// candidates through `FinishService::evaluate`, persists the decisions,
+/// and acknowledges terminals owner-side.
+async fn run_testd_owner_drain(
+    kernel: &DaemonKernelClient,
+    composition: SharedComposition,
+) -> Result<TestdOwnerDrainOutcome, String> {
+    // #740-style receipt span over the bind/publish/submit/ack drain step.
+    // Row counts are named; digests and payload bytes never are.
+    let _span = tracing::info_span!("eliotd.testd_owner_drain").entered();
+    let mut guard = composition.lock().await;
+    guard
+        .drive_testd_owner_finish_once(kernel)
+        .await
+        .map_err(|error| format!("TestD owner drain: {error}"))
+}
+
+/// Bounded shutdown drain for one in-flight TestD owner step. Never starts
+/// new work: an in-flight step runs to its bounded end (its rows are
+/// idempotent owner-side, so a repeated poll replays rather than
+/// duplicates), while an already-persisted decision exact-replays on the
+/// next submit — so the drain always settles as plain `Shutdown`, never
+/// unknown.
+async fn drain_testd_owner_on_shutdown(
+    flight: &mut TestdOwnerFlight,
+) -> Result<RunLoopExit, String> {
+    let previous = std::mem::replace(flight, TestdOwnerFlight::Idle);
+    let TestdOwnerFlight::InFlight(state) = previous else {
+        return Ok(RunLoopExit::Shutdown);
+    };
+    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
+        Ok(TestdOwnerCompletion::Settled(Err(error))) => Err(error),
         _ => Ok(RunLoopExit::Shutdown),
     }
 }
