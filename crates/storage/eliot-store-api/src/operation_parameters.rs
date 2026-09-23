@@ -1095,9 +1095,8 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ApplyReactiveInjectionState => &APPLY_REACTIVE_LEDGER_PARAMETERS,
         NamedMutationOperation::ApplyResourceSnapshot => &APPLY_RESOURCE_SNAPSHOT_PARAMETERS,
         NamedMutationOperation::ApplyUserAutomationState => &APPLY_USER_AUTOMATION_PARAMETERS,
-        NamedMutationOperation::CommitExperienceBank | NamedMutationOperation::CommitAgentFeedback => {
-            &COMMIT_EXPERIENCE_PARAMETERS
-        }
+        NamedMutationOperation::CommitExperienceBank
+        | NamedMutationOperation::CommitAgentFeedback => &COMMIT_EXPERIENCE_PARAMETERS,
     }
 }
 

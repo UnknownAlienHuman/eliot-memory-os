@@ -631,7 +631,10 @@ pub fn decode_automation_mutation(
 }
 
 /// Validates the closed read selectors and decodes the query.
-#[allow(clippy::too_many_lines, reason = "closed query-discriminator table; one arm per read kind")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "closed query-discriminator table; one arm per read kind"
+)]
 pub fn validate_automation_read_params(
     parameters: &BTreeMap<String, Value>,
 ) -> Result<DecodedAutomationRead, StoreError> {

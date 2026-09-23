@@ -681,7 +681,7 @@ pub enum UserAutomationTriggerOrigin {
 
 /// Persisted evidence for the request that first admitted this invocation.
 ///
-/// The Store writes this alongside a RunNow invocation. It retains the exact
+/// The Store writes this alongside a `RunNow` invocation. It retains the exact
 /// task/session metadata, closed operator payload, and canonical write
 /// identity that produced the invocation; a later daemon selector cannot
 /// replace or manufacture these fields.
@@ -776,7 +776,7 @@ pub struct UserAutomationInvocation {
     pub trigger_origin: UserAutomationTriggerOrigin,
     /// Child depth carried by the admitted lineage.
     pub child_depth: u16,
-    /// Original owner-admitted request and exact RunNow receipt identity.
+    /// Original owner-admitted request and exact `RunNow` receipt identity.
     /// Older persisted invocations deserialize without provenance but are
     /// rejected by production admission until reconciled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -794,7 +794,7 @@ impl UserAutomationInvocation {
         text(&self.workdir_ref, "workdir_ref")
     }
 
-    /// Requires task/session and exact RunNow receipt provenance at the
+    /// Requires task/session and exact `RunNow` receipt provenance at the
     /// production owner-admission boundary.
     pub fn require_run_now_provenance(
         &self,
