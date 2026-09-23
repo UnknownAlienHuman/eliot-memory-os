@@ -76,6 +76,19 @@
 //! Never: store/vendor I/O, credential handling, lifecycle/support/
 //! influence mutation, epistemic promotion, score/verdict emission, or
 //! retention-policy invention (see `resolve_retention_read`).
+//!
+//! ContractChallenge note (F2, scope-free store reads): the range
+//! handlers in both backends gate on fence only and deliberately do not
+//! filter rows by scope, because memory command rows carry scope while
+//! surreal evidence rows do not — store-level scope filtering would
+//! diverge the contours and silently drop scope-free gap/control
+//! material the consumer must see. Scope gating lives with the consumer
+//! (provider event-scope filter plus Governor envelope-scope
+//! revalidation). If a future Governor-facade rule requires store-level
+//! scope filtering, that rule and its row-shape changes belong to the
+//! facade owner (eliot-read, #1119 lineage) with a contour-parity proof
+//! across both backends — this package silently adopting or editing the
+//! facade is explicitly out of scope.
 
 use std::collections::BTreeMap;
 
@@ -915,14 +928,26 @@ pub fn produce_feedback_commit(
 
 /// Decode bridge range-payload records into admitted bank records.
 ///
-/// Parses each element of the payload `records` array through
-/// [`parse_bank_record`] (deserialize plus full digest re-proof). A
-/// missing or non-array `records` member fails closed: a malformed
-/// bridge payload is corruption evidence, never an empty read. A single
-/// undecodable element fails the whole read for the same reason —
-/// malformed material has no omission class in the frozen contract, so
-/// it cannot travel as a gap. The caller (terminal invocation loop)
-/// preserves element position for diagnostics from its own iteration.
+/// Each element is either a wrapper row as projected by the store range
+/// backends (`{handle, revision, record_json, record_digest}`) or — for
+/// owner-held fixtures only — a bare record document. Wrappers unwrap to
+/// `record_json` after three fail-closed bindings: the wrapper `handle`
+/// and `revision` must echo the document's own fields, and the wrapper
+/// `record_digest` must equal the document's embedded digest; the
+/// document then passes through [`parse_bank_record`] (deserialize plus
+/// full digest re-proof from fields). A missing or non-array `records`
+/// member fails closed: a malformed bridge payload is corruption
+/// evidence, never an empty read. A single undecodable element fails the
+/// whole read for the same reason — malformed material has no omission
+/// class in the frozen contract, so it cannot travel as a gap. The
+/// caller (terminal invocation loop) preserves element position for
+/// diagnostics from its own iteration.
+///
+/// Producer contract (store side, both contours): range rows MUST carry
+/// the four wrapper fields with `record_json` holding the verbatim
+/// admitted document and `record_digest` repeating its digest. Bare
+/// documents are accepted only as owner-held fixture input, never as a
+/// substitute for the wrapper shape on the bridge path.
 pub fn bank_records_from_range_payload(
     payload: &Value,
 ) -> Result<Vec<ExperienceBankRecord>, GovernorObservationError> {
@@ -935,19 +960,15 @@ pub fn bank_records_from_range_payload(
         })?;
     let mut records = Vec::with_capacity(members.len());
     for member in members {
-        let document = serde_json::to_string(member).map_err(|_| {
-            GovernorObservationError::InvalidField {
-                field: "audit_range.records",
-                reason: "range record must re-encode canonically",
-            }
-        })?;
+        let document = unwrap_range_member(member, "bank_revision")?;
         records.push(parse_bank_record(&document)?);
     }
     Ok(records)
 }
 
 /// Decode bridge range-payload records into admitted feedback records.
-/// Same fail-closed array rule as [`bank_records_from_range_payload`].
+/// Same wrapper-or-bare rule as [`bank_records_from_range_payload`],
+/// binding the `feedback_revision` document field.
 pub fn feedback_records_from_range_payload(
     payload: &Value,
 ) -> Result<Vec<AgentFeedbackRecord>, GovernorObservationError> {
@@ -960,15 +981,84 @@ pub fn feedback_records_from_range_payload(
         })?;
     let mut records = Vec::with_capacity(members.len());
     for member in members {
-        let document = serde_json::to_string(member).map_err(|_| {
+        let document = unwrap_range_member(member, "feedback_revision")?;
+        records.push(parse_feedback_record(&document)?);
+    }
+    Ok(records)
+}
+
+/// Unwrap one range-payload element to its verbatim record document.
+///
+/// Wrapper rows (`record_json` string present) bind handle, revision,
+/// and digest echoes against the embedded document before release; bare
+/// record documents (no `record_json` member) pass through for
+/// owner-held fixture input. Every mismatch is a typed envelope-mismatch
+/// refusal, never a silent default.
+fn unwrap_range_member(
+    member: &Value,
+    revision_field: &'static str,
+) -> Result<String, GovernorObservationError> {
+    let object = member.as_object().ok_or(GovernorObservationError::InvalidField {
+        field: "audit_range.records",
+        reason: "range record must be an object",
+    })?;
+    let Some(document) = object.get("record_json").and_then(Value::as_str) else {
+        return serde_json::to_string(member).map_err(|_| {
             GovernorObservationError::InvalidField {
                 field: "audit_range.records",
                 reason: "range record must re-encode canonically",
             }
+        });
+    };
+    let parsed: Value =
+        serde_json::from_str(document).map_err(|_| GovernorObservationError::InvalidField {
+            field: "audit_range.record_json",
+            reason: "wrapped record document must decode",
         })?;
-        records.push(parse_feedback_record(&document)?);
+    let body = parsed.as_object().ok_or(GovernorObservationError::InvalidField {
+        field: "audit_range.record_json",
+        reason: "wrapped record document must be an object",
+    })?;
+    let handle = object
+        .get("handle")
+        .and_then(Value::as_str)
+        .ok_or(GovernorObservationError::InvalidField {
+            field: "audit_range.handle",
+            reason: "wrapper handle must be present text",
+        })?;
+    let revision = object
+        .get("revision")
+        .and_then(Value::as_u64)
+        .ok_or(GovernorObservationError::InvalidField {
+            field: "audit_range.revision",
+            reason: "wrapper revision must be a count",
+        })?;
+    let digest = object
+        .get("record_digest")
+        .and_then(Value::as_str)
+        .ok_or(GovernorObservationError::InvalidField {
+            field: "audit_range.record_digest",
+            reason: "wrapper digest must be present text",
+        })?;
+    if body.get("handle").and_then(Value::as_str) != Some(handle) {
+        return Err(GovernorObservationError::InvalidField {
+            field: "audit_range.handle",
+            reason: "wrapper handle must echo the document handle",
+        });
     }
-    Ok(records)
+    if body.get(revision_field).and_then(Value::as_u64) != Some(revision) {
+        return Err(GovernorObservationError::InvalidField {
+            field: "audit_range.revision",
+            reason: "wrapper revision must echo the document revision",
+        });
+    }
+    if body.get("digest").and_then(Value::as_str) != Some(digest) {
+        return Err(GovernorObservationError::InvalidField {
+            field: "audit_range.record_digest",
+            reason: "wrapper digest must echo the document digest",
+        });
+    }
+    Ok(document.to_owned())
 }
 
 /// Consume one bank range payload into a validated bank projection.
