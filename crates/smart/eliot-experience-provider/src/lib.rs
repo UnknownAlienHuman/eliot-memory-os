@@ -89,12 +89,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use eliot_experience_projection::ExperienceView;
+
 use eliot_contracts::{ArtifactId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_cognitive_quality::{
-    ExperienceProjections, QualityAssessmentCandidate, QualityError, assess_self_quality,
+    ExperienceProjections, OwnerSnapshot, QualityAssessmentCandidate, QualityError,
+    assess_self_quality, recheck_candidate,
 };
 use eliot_epistemic_contracts::CurrentEpistemicPosition;
-use eliot_experience_projection::{ExperienceView, revalidate_bank_refs, revalidate_feedback_refs};
+use eliot_experience_projection::{revalidate_bank_refs, revalidate_feedback_refs};
 use eliot_learning_contracts::HarnessActivationReceiptCandidate;
 use eliot_observation_contracts::{
     AgentFeedbackRecord, BankProjection, CoverageDisposition, CoverageEvidence, ExperienceBankRecord,
@@ -833,4 +836,44 @@ pub fn produce_self_quality(
         inputs.obligation_handles,
     )
     .map_err(ProviderError::Quality)
+}
+
+/// Self-quality assess-plus-recheck inputs: the assess closure plus the
+/// edge attestation the recheck resolves handles against.
+pub struct SelfQualityRecheckInputs<'a> {
+    /// Assess inputs: owner envelopes plus edge position/receipts/handles.
+    pub assess: SelfQualityInputs<'a>,
+    /// Edge-attested handles for owner-held bodies cited by handle only
+    /// (including every omission handle the assess closure names that no
+    /// supplied envelope carries as a member).
+    pub attested_handles: Vec<ArtifactId>,
+}
+
+/// Consuming call: assess self-quality, then re-resolve the candidate.
+///
+/// Runs [`produce_self_quality`] and immediately re-resolves the frozen
+/// closure through [`recheck_candidate`] against the same owner inputs:
+/// every echoed digest, denominator, and cited handle must resolve
+/// against the supplied envelopes, receipts, position, and edge
+/// attestation, or drift fails the read closed. A passing recheck states
+/// that the frozen closure still resolves against current owner inputs,
+/// nothing more: no score, verdict, or completeness is adjudicated.
+pub fn assess_and_recheck(
+    inputs: SelfQualityRecheckInputs<'_>,
+) -> Result<QualityAssessmentCandidate, ProviderError> {
+    let candidate = produce_self_quality(&inputs.assess)?;
+    let journals = inputs.assess.journal.into_iter().collect::<Vec<_>>();
+    let banks = inputs.assess.bank.into_iter().collect::<Vec<_>>();
+    let feedbacks = inputs.assess.feedback.into_iter().collect::<Vec<_>>();
+    let snapshot = OwnerSnapshot {
+        statuses: Vec::new(),
+        receipts: inputs.assess.receipts.iter().collect::<Vec<_>>(),
+        journals,
+        banks,
+        feedbacks,
+        positions: vec![inputs.assess.position],
+        attested_handles: inputs.attested_handles,
+    };
+    recheck_candidate(&candidate, &snapshot).map_err(ProviderError::Quality)?;
+    Ok(candidate)
 }

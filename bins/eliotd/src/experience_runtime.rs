@@ -36,12 +36,21 @@ use eliot_contracts::{ArtifactId, RequestMetadata};
 use eliot_cognitive_quality::QualityAssessmentCandidate;
 use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness};
 use eliot_experience_provider::{
-    JournalShapeOutput, ProduceJournalInputs, ProviderError, SelfQualityInputs,
-    produce_journal_read, produce_self_quality,
+    BankShapeInputs, ExperienceView, FeedbackShapeInputs, JournalShapeOutput, ProduceJournalInputs,
+    ProviderError, RetentionContext, SelfQualityInputs, SelfQualityRecheckInputs, WithheldMember,
+    assess_and_recheck, produce_journal_read, produce_self_quality,
 };
 use eliot_learning_contracts::HarnessActivationReceiptCandidate;
+use eliot_observation::{
+    GovernorObservationError,
+    bank_admission::{
+        assemble_bank_projection, assemble_feedback_projection, parse_bank_record,
+        parse_feedback_record,
+    },
+};
 use eliot_observation_contracts::{
-    BankProjection, FeedbackProjection, JournalProjection, ObservationScope,
+    BankProjection, FeedbackProjection, JournalProjection, ObservationScope, ProjectionCoverage,
+    ProjectionOmission, RetentionHold, RetentionSchedule,
 };
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
@@ -64,6 +73,9 @@ pub enum ExperienceDriverError {
     /// The provider chain rejected the read.
     #[error("experience provider: {0}")]
     Provider(#[from] ProviderError),
+    /// The Governor owner rejected admission, supply, or readback parsing.
+    #[error("governor observation owner: {0}")]
+    Governor(#[from] GovernorObservationError),
     /// The position readback holds no usable current position.
     #[error("position field {field}: {reason}")]
     Position {
@@ -273,4 +285,219 @@ pub async fn assess_experience_quality(
         obligation_handles: inputs.obligation_handles,
     })
     .map_err(ExperienceDriverError::Provider)
+}
+
+/// Bank-family event inputs: verbatim durable documents plus the read
+/// context the edge owns.
+pub struct ExperienceBankEventInputs {
+    /// Verbatim record documents from the durable bank read payload.
+    pub documents: Vec<String>,
+    /// Stable identity minted by the caller for the bank envelope.
+    pub projection_id: ArtifactId,
+    /// Owner revision marker read at, supplied with the durable read.
+    pub source_revision: String,
+    /// Owner coverage binding for the durable read.
+    pub coverage: ProjectionCoverage,
+    /// Owner omissions for the durable read.
+    pub omissions: Vec<ProjectionOmission>,
+    /// Owner source identity cursors resolve under (edge passes the
+    /// Governor bank source identity); never invented here.
+    pub source_id: String,
+}
+
+/// Feedback-family event inputs. Same durable-read rule as bank.
+pub struct ExperienceFeedbackEventInputs {
+    /// Verbatim record documents from the durable feedback read payload.
+    pub documents: Vec<String>,
+    /// Stable identity minted by the caller for the feedback envelope.
+    pub projection_id: ArtifactId,
+    /// Owner revision marker read at, supplied with the durable read.
+    pub source_revision: String,
+    /// Owner coverage binding for the durable read.
+    pub coverage: ProjectionCoverage,
+    /// Owner omissions for the durable read.
+    pub omissions: Vec<ProjectionOmission>,
+    /// Owner source identity cursors resolve under (edge passes the
+    /// Governor feedback source identity); never invented here.
+    pub source_id: String,
+}
+
+/// Governed trigger event for one terminal experience-quality run.
+///
+/// The event producer (operator/planner edge, O1 trigger) assembles this
+/// from explicit owner-issued inputs only: bridge scope and position
+/// subject, journal presence inputs, durable bank/feedback documents with
+/// their read context, the owner-issued retention schedule with
+/// caller-carried holds, per-attempt receipts, obligation handles, and
+/// edge attestation. Reads stay reads: nothing here writes, persists, or
+/// submits; the entry returns the frozen candidate plus the validated
+/// views and gap postures for the consuming review path.
+pub struct ExperienceQualityEvent<'a> {
+    /// Assessment identity minted by the caller.
+    pub assessment_id: ArtifactId,
+    /// Work scope governing the assessment.
+    pub assessment_scope: WorkScopeId,
+    /// Read scope governing projections and views.
+    pub scope: ObservationScope,
+    /// Store scope bridge reads run in.
+    pub scope_id: ScopeId,
+    /// Exact position subject the bridge position read selects.
+    pub position_subject: String,
+    /// Journal leg inputs, when the journal family is cited.
+    pub journal: Option<ExperienceJournalDriverInputs<'a>>,
+    /// Bank-family durable inputs.
+    pub bank: ExperienceBankEventInputs,
+    /// Feedback-family durable inputs.
+    pub feedback: ExperienceFeedbackEventInputs,
+    /// Owner-issued retention schedule in force for this run.
+    pub schedule: &'a RetentionSchedule,
+    /// Schedule-issued hold terms by record-handle text.
+    pub holds: &'a BTreeMap<String, RetentionHold>,
+    /// Per-attempt receipt candidates (at least one; edge-supplied).
+    pub receipts: &'a [HarnessActivationReceiptCandidate],
+    /// Obligation-profile handles cited by handle only (edge-supplied).
+    pub obligation_handles: &'a [ArtifactId],
+    /// Edge-attested handles for bodies cited by handle only.
+    pub attested_handles: Vec<ArtifactId>,
+}
+
+/// Terminal output bundle: frozen candidate plus validated views and gaps.
+pub struct ExperienceQualityEventOutput {
+    /// Frozen self-quality candidate, assessed and re-resolved.
+    pub candidate: QualityAssessmentCandidate,
+    /// Validated journal view, when the journal family was cited.
+    pub journal_view: Option<ExperienceView>,
+    /// Validated bank view over owner-issued refs.
+    pub bank_view: ExperienceView,
+    /// Validated feedback view over owner-issued refs.
+    pub feedback_view: ExperienceView,
+    /// Withheld bank records with honest postures for gap emission.
+    pub bank_withheld: Vec<WithheldMember>,
+    /// Withheld feedback records with honest postures for gap emission.
+    pub feedback_withheld: Vec<WithheldMember>,
+}
+
+/// Terminal event entry: trigger event to reviewed candidate.
+///
+/// Runs the full connected runtime path in source terms: TRUE position
+/// bridge read, optional journal bridge leg with live presence binding,
+/// bank/feedback document parse with digest re-proof
+/// ([`parse_bank_record`] / [`parse_feedback_record`]), owner envelope
+/// assembly ([`assemble_bank_projection`] /
+/// [`assemble_feedback_projection`]), provider view shaping with
+/// retention postures and live revalidation, then the consuming call
+/// ([`assess_and_recheck`](eliot_experience_provider::assess_and_recheck)):
+/// assess over true owner envelopes plus edge receipts, immediately
+/// re-resolved against the same inputs plus edge attestation. Any drift,
+/// malformation, withheld-but-uncited material, or missing family fails
+/// closed; nothing partial is emitted as complete and nothing is
+/// persisted or submitted by this entry.
+#[allow(clippy::too_many_lines)]
+pub async fn run_experience_quality_event(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    ctx: &RequestMetadata,
+    event: &ExperienceQualityEvent<'_>,
+) -> Result<ExperienceQualityEventOutput, ExperienceDriverError> {
+    ctx.validate().map_err(|_| ExperienceDriverError::Position {
+        field: "request_metadata",
+        reason: "invalid request metadata",
+    })?;
+    if let Some(journal) = &event.journal
+        && journal.scope != event.scope
+    {
+        return Err(ExperienceDriverError::Position {
+            field: "event.journal.scope",
+            reason: "journal leg scope does not match event scope",
+        });
+    }
+    let position = read_current_position(
+        composition,
+        kernel,
+        ctx,
+        event.scope_id.clone(),
+        event.position_subject.clone(),
+    )
+    .await?;
+    let (journal_envelope, journal_view) = match &event.journal {
+        Some(inputs) => {
+            let shaped = produce_journal_projection(composition, kernel, ctx, inputs).await?;
+            (Some(shaped.projection), Some(shaped.view))
+        }
+        None => (None, None),
+    };
+    let mut bank_records = Vec::with_capacity(event.bank.documents.len());
+    for document in &event.bank.documents {
+        bank_records.push(parse_bank_record(document)?);
+    }
+    let bank_live = assemble_bank_projection(
+        event.bank.projection_id.clone(),
+        event.scope.clone(),
+        ctx.state_fence.clone(),
+        event.bank.source_revision.clone(),
+        &bank_records,
+        event.bank.coverage.clone(),
+        event.bank.omissions.clone(),
+    )?;
+    let bank_shaped = eliot_experience_provider::shape_bank_view(
+        &BankShapeInputs {
+            scope: event.scope.clone(),
+            fence: ctx.state_fence.clone(),
+            records: &bank_records,
+            live: &bank_live,
+            source_id: event.bank.source_id.as_str(),
+            retention: &RetentionContext {
+                schedule: event.schedule,
+                holds: event.holds,
+            },
+        },
+    )?;
+    let mut feedback_records = Vec::with_capacity(event.feedback.documents.len());
+    for document in &event.feedback.documents {
+        feedback_records.push(parse_feedback_record(document)?);
+    }
+    let feedback_live = assemble_feedback_projection(
+        event.feedback.projection_id.clone(),
+        event.scope.clone(),
+        ctx.state_fence.clone(),
+        event.feedback.source_revision.clone(),
+        &feedback_records,
+        event.feedback.coverage.clone(),
+        event.feedback.omissions.clone(),
+    )?;
+    let feedback_shaped = eliot_experience_provider::shape_feedback_view(
+        &FeedbackShapeInputs {
+            scope: event.scope.clone(),
+            fence: ctx.state_fence.clone(),
+            records: &feedback_records,
+            live: &feedback_live,
+            source_id: event.feedback.source_id.as_str(),
+            retention: &RetentionContext {
+                schedule: event.schedule,
+                holds: event.holds,
+            },
+        },
+    )?;
+    let candidate = assess_and_recheck(SelfQualityRecheckInputs {
+        assess: SelfQualityInputs {
+            assessment_id: event.assessment_id.clone(),
+            scope: event.assessment_scope.clone(),
+            fence: ctx.state_fence.clone(),
+            journal: journal_envelope.as_ref(),
+            bank: Some(&bank_live),
+            feedback: Some(&feedback_live),
+            position: &position,
+            receipts: event.receipts,
+            obligation_handles: event.obligation_handles,
+        },
+        attested_handles: event.attested_handles.clone(),
+    })?;
+    Ok(ExperienceQualityEventOutput {
+        candidate,
+        journal_view,
+        bank_view: bank_shaped.view,
+        feedback_view: feedback_shaped.view,
+        bank_withheld: bank_shaped.withheld,
+        feedback_withheld: feedback_shaped.withheld,
+    })
 }
