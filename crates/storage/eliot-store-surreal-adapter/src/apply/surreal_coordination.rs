@@ -184,7 +184,10 @@ fn write_for(
     })
 }
 
-/// Reports whether the stored row carries byte-exactly the computed bindings.
+/// Reports whether the stored row carries byte-exactly the computed bindings,
+/// admission fence, and proof refs — the same whole-row equality the memory
+/// contour enforces, so fence-rotated replay converges on both contours or
+/// on neither.
 fn stored_matches(stored: &StoredCoordinationRow, write: &SurrealCoordinationWrite) -> bool {
     stored.operation_id == write.operation_id
         && stored.destination == write.destination
@@ -192,6 +195,8 @@ fn stored_matches(stored: &StoredCoordinationRow, write: &SurrealCoordinationWri
         && stored.fence_digest == write.fence_digest
         && stored.decision_digest == write.decision_digest
         && stored.admission_digest == write.admission_digest
+        && stored.state_fence == write.state_fence
+        && stored.proof_refs == write.proof_refs
 }
 
 /// Reads one stored coordination row by exact operation identity.
@@ -297,8 +302,13 @@ pub(crate) fn coordination_write_statements(
     let mut bindings = Map::new();
     for (index, write) in writes.iter().enumerate() {
         let suffix = index.to_string();
+        // Full-row compare: all six coordination bindings plus the admission
+        // fence and the bound proof refs, matching the memory contour's
+        // whole-row equality. A fence-rotated replay converges only when the
+        // stored row is byte-exact; any divergence throws for identity-based
+        // reconciliation.
         sql.push_str(
-            "LET $coord_current_{s} = (SELECT operation_id, destination, payload_digest, fence_digest, decision_digest, admission_digest FROM ONLY type::record($coord_table_{s}, $coord_key_{s})); IF type::is_object($coord_current_{s}) { IF $coord_current_{s}.operation_id != $coord_operation_{s} OR $coord_current_{s}.destination != $coord_destination_{s} OR $coord_current_{s}.payload_digest != $coord_payload_{s} OR $coord_current_{s}.fence_digest != $coord_fence_{s} OR $coord_current_{s}.decision_digest != $coord_decision_{s} OR $coord_current_{s}.admission_digest != $coord_admission_{s} { THROW 'coordination_identity_conflict'; }; } ELSE { CREATE type::record($coord_table_{s}, $coord_key_{s}) CONTENT $coord_record_{s}; };"
+            "LET $coord_current_{s} = (SELECT operation_id, destination, payload_digest, fence_digest, decision_digest, admission_digest, state_fence, proof_refs FROM ONLY type::record($coord_table_{s}, $coord_key_{s})); IF type::is_object($coord_current_{s}) { IF $coord_current_{s}.operation_id != $coord_operation_{s} OR $coord_current_{s}.destination != $coord_destination_{s} OR $coord_current_{s}.payload_digest != $coord_payload_{s} OR $coord_current_{s}.fence_digest != $coord_fence_{s} OR $coord_current_{s}.decision_digest != $coord_decision_{s} OR $coord_current_{s}.admission_digest != $coord_admission_{s} OR $coord_current_{s}.state_fence != $coord_state_fence_{s} OR $coord_current_{s}.proof_refs != $coord_proof_refs_{s} { THROW 'coordination_identity_conflict'; }; } ELSE { CREATE type::record($coord_table_{s}, $coord_key_{s}) CONTENT $coord_record_{s}; };"
                 .replace("{s}", &suffix)
                 .as_str(),
         );
@@ -327,6 +337,14 @@ pub(crate) fn coordination_write_statements(
         bindings.insert(
             format!("coord_admission_{suffix}"),
             json!(&write.admission_digest),
+        );
+        bindings.insert(
+            format!("coord_state_fence_{suffix}"),
+            json!(&write.state_fence),
+        );
+        bindings.insert(
+            format!("coord_proof_refs_{suffix}"),
+            json!(&write.proof_refs),
         );
         bindings.insert(
             format!("coord_record_{suffix}"),
