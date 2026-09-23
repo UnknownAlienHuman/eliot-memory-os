@@ -909,15 +909,17 @@ const STRUCTURAL_ONLY_PROOF_CEILING: &str = "STRUCTURAL_ONLY";
 /// constants, so any future identity change automatically stale-marks
 /// previously recorded fingerprint sets through
 /// [`EvalIntegrityFingerprintSet::is_stale_against`] instead of silently
-/// comparing across identities.
+/// comparing across identities. `EVALUATOR_PATH` is compiler-provided
+/// (`module_path!`), so a module move re-identifies automatically;
+/// descriptive strings below it name review-verified behavior, not
+/// observed runtime effects.
 const HARNESS_FINGERPRINT: &str = "eliot-engine-eval-case-schema";
-const EVALUATOR_FINGERPRINT: &str = "eliot-engine::EvalMeasurementService";
+const EVALUATOR_PATH: &str = concat!(module_path!(), "::EvalMeasurementService");
 const ENVIRONMENT_FINGERPRINT: &str = "not-captured:structural-evaluator-process";
-const ACTUAL_ROUTE: &str = "eliot-engine::EvalMeasurementService::evaluate_case";
+const ACTUAL_ROUTE: &str = concat!(module_path!(), "::evaluate_case");
 const REQUESTED_ROUTE: &str = "runtime artifact/effect observation";
 const ACCEPTANCE_RELATION: &str = "required criterion matches a measurement result";
-const PRODUCT_IDENTITY: &str = "eliot-memory-os/eliot-engine-eval";
-const ORACLE_OWNER: &str = "eliot-engine::EvalMeasurementService";
+const ORACLE_OWNER: &str = concat!(module_path!(), "::EvalMeasurementService");
 
 /// Capture the current evaluator identity as a comparable set.
 /// Pure snapshot of the constants above; performs no observation and
@@ -925,12 +927,11 @@ const ORACLE_OWNER: &str = "eliot-engine::EvalMeasurementService";
 pub fn current_eval_fingerprints() -> EvalIntegrityFingerprintSet {
     EvalIntegrityFingerprintSet {
         harness_fingerprint: HARNESS_FINGERPRINT.to_owned(),
-        evaluator_fingerprint: EVALUATOR_FINGERPRINT.to_owned(),
+        evaluator_fingerprint: EVALUATOR_PATH.to_owned(),
         environment_fingerprint: ENVIRONMENT_FINGERPRINT.to_owned(),
         actual_route: ACTUAL_ROUTE.to_owned(),
         requested_route: REQUESTED_ROUTE.to_owned(),
         acceptance_relation: ACCEPTANCE_RELATION.to_owned(),
-        product_identity: PRODUCT_IDENTITY.to_owned(),
         oracle_owner: ORACLE_OWNER.to_owned(),
     }
 }
@@ -1038,7 +1039,7 @@ impl EvalMeasurementService {
                 checksum_text(&receipt_binding)
             ),
             property: case.description.clone(),
-            product_identity: PRODUCT_IDENTITY.to_owned(),
+            product_identity: format!("eliot-memory-os/eliot-engine-eval:product:{pid}", pid = case.project_id),
             oracle_owner: ORACLE_OWNER.to_owned(),
             acceptance_relation: ACCEPTANCE_RELATION.to_owned(),
             task_subset: vec![case.eval_case_id.to_string()],
@@ -1047,7 +1048,7 @@ impl EvalMeasurementService {
             model_fingerprint: "not-applicable:no-model-invocation".to_owned(),
             harness_fingerprint: HARNESS_FINGERPRINT.to_owned(),
             tools_fingerprint: "not-applicable:no-runtime-tools".to_owned(),
-            evaluator_fingerprint: EVALUATOR_FINGERPRINT.to_owned(),
+            evaluator_fingerprint: EVALUATOR_PATH.to_owned(),
             environment_fingerprint: ENVIRONMENT_FINGERPRINT.to_owned(),
             budget_fingerprint: format!(
                 "declared:max_runtime_ms={};max_input_tokens={};max_output_tokens={};max_tool_calls={}",

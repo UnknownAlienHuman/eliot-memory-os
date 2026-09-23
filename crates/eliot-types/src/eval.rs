@@ -168,7 +168,6 @@ pub struct EvalIntegrityFingerprintSet {
     pub actual_route: String,
     pub requested_route: String,
     pub acceptance_relation: String,
-    pub product_identity: String,
     pub oracle_owner: String,
 }
 
