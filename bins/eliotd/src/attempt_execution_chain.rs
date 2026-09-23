@@ -960,9 +960,14 @@ fn check_activation_admission(
 /// (`eliot-reactive-context-plan/src/compiler.rs::compile_retrieval_plan`)
 /// and the input through the closure assembler, threading the TRUE
 /// projection-owner revision into each
-/// `source_projection_fences[].expected_revision` (retrieval_plan.rs) — a
-/// `None` entry carries no revision opinion and an unknown revision is
-/// never defaulted into a final delivery; validate the plan through its
+/// `source_projection_fences[].expected_revision` (retrieval_plan.rs) under
+/// the FINAL strict rule: revision strings are an opaque source-owner
+/// namespace compared by exact equality (never task counters, never
+/// rendered numerics — no text-to-counter equivalence exists); a
+/// fence-matching candidate with no plan entry, no expectation, or a
+/// mismatch refuses as floor-stale or optional-probe instead of admitting,
+/// and fence disagreement routes to packet refresh first. Unknown revisions
+/// are never defaulted into a final delivery; validate the plan through its
 /// canonical digest, then run `check_plan_revisions` (decision.rs: floor
 /// mismatch yields `StaleProjection`, optional yields `ProbeRequired`)
 /// before firing; admit plus traces exactly once per changed bundle and
