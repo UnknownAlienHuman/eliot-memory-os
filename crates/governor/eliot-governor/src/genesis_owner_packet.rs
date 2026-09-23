@@ -287,6 +287,8 @@ fn genesis_payload(
             state_fence: state_fence.clone(),
             owner_revision: revision,
             current_plan: None,
+            verifier_execution_fact: None,
+            finish_evidence: None,
         })
         .map_err(|e| CompositionError::Recovery(e.to_string()))?,
         RecoveryOwner::Task => serde_json::to_value(TaskLifecycleSnapshot {

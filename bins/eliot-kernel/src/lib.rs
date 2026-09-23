@@ -54,6 +54,10 @@ pub mod kernel_diagnostics;
 mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
+mod testd_terminal_completion_route;
+
+/// Public wire-operation name for the authenticated TestD completion route.
+pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
 
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
@@ -325,7 +329,7 @@ use eliot_protocol::{
     AgentBridgeActivationDisposition, AgentBridgeActivationFence, AgentBridgeActivationRequest,
     AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration,
     AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind,
-    MessageType, ProtocolPayload,
+    MessageType, ProtocolPayload, RequestIdentity,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 #[cfg(test)]
@@ -902,6 +906,9 @@ pub enum KernelFrameAction {
     Testd {
         /// Correlation identity to echo in the response.
         request_id: RequestId,
+        /// Exact authenticated owner identity from the EBP frame. The
+        /// terminal route compares it with the durable pre-dispatch binding.
+        identity: RequestIdentity,
         /// Closed operation name; must equal `TESTD_ADMISSION_WIRE_ID`.
         operation: String,
         /// Bounded operation payload carrying the typed admission request.

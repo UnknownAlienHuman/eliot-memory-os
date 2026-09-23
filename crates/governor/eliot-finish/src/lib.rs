@@ -718,6 +718,7 @@ mod tests {
         FinishEvidence {
             task_id: "task-1".to_owned(),
             current_task_revision: 1,
+            artifact_refs: vec!["artifact-1".to_owned()],
             acceptance: vec![AcceptanceCoverage {
                 item_id: "acceptance-1".to_owned(),
                 satisfied: true,
@@ -838,6 +839,7 @@ mod tests {
 
         let gapped_context = FinishContext {
             evidence: FinishEvidence {
+                artifact_refs: vec!["artifact-1".to_owned()],
                 acceptance: vec![AcceptanceCoverage {
                     item_id: "acceptance-1".to_owned(),
                     satisfied: true,
@@ -879,6 +881,7 @@ mod tests {
         // provider claim must not clear it, so derivation blocks.
         let effected_context = FinishContext {
             evidence: FinishEvidence {
+                artifact_refs: vec!["artifact-1".to_owned()],
                 unresolved_effect_refs: vec!["effect-provider-claim-1".to_owned()],
                 ..evidence()
             },
