@@ -962,7 +962,45 @@ fn check_activation_admission(
 /// read only from owner signals (the task record's `is_active`, record and
 /// resolution fence agreement), never inferred.
 ///
-/// Unknown/replay/cancellation preservation: the poll mutates nothing
+/// Retrieval-join caller obligations (issue #1947; O1 binds these for the
+/// retrieval drive once root serializes the supplier modules — donor
+/// `work/1947-owner-warning-revision @ 0f9b456b` is read-only assessment,
+/// never imported). Against the exact callee
+/// `eliot-context-admission/src/lib.rs::admit_context_traced[_with_warnings]`
+/// the drive must: resolve the plan through the retrieval-plan compiler
+/// (`eliot-reactive-context-plan/src/compiler.rs::compile_retrieval_plan`)
+/// and the input through the closure assembler, threading the TRUE
+/// projection-owner revision into each
+/// `source_projection_fences[].expected_revision` (retrieval_plan.rs) — a
+/// `None` entry carries no revision opinion and an unknown revision is
+/// never defaulted into a final delivery; validate the plan through its
+/// canonical digest, then run `check_plan_revisions` (decision.rs: floor
+/// mismatch yields `StaleProjection`, optional yields `ProbeRequired`)
+/// before firing; admit plus traces exactly once per changed bundle and
+/// bind the pair verbatim; map `ContextError::InvalidFence` to the
+/// packet-refresh arm (`RetrievalStaleness::PacketRefreshRequired`); read
+/// staleness, capacity pressure, suppression, and warning text only from
+/// the trace fields (`MaterialRankTrace::{staleness, capacity_constrained,
+/// suppression_reason, warning}`), never reclassifying the outcome; and
+/// thread warnings only as owner-minted `SuppliedWarning{atom_id, text}`
+/// records (Governor risk, conflict-analysis, or projection owners —
+/// warning minting is M1-owned), never synthesized at the call site.
+///
+/// Execution-path revision precondition (M1-owned join keys): the retained
+/// triple's task/plan revision TEXT stays observed-only here because fence
+/// revisions are numeric counters (`TaskRevision(u64)` et al., compared
+/// exactly inside [`fences_match_exact`]) with no canonical text rendering
+/// in-tree. Presented-vintage consistency is owner-enforced instead
+/// (`AgentCoordinator::validate_candidate_binding` requires receipt text
+/// revisions to equal candidate text revisions; bind-time checks re-pin
+/// attempt against context). O1 must not invent the text↔counter rendering:
+/// the join key declaring how Governor-minted revision text relates to the
+/// numeric owner counters is M1/Governor-owner work; until it lands, an
+/// uncompared revision is never treated as agreement — dispatch stands on
+/// the fence, session, and active gates above, and no `None`/empty revision
+/// state is ever delivered as final.
+///
+ /// Unknown/replay/cancellation preservation: the poll mutates nothing
 /// itself; the coordinator bind stays idempotent under canonical-input
 /// replay; cancellation paths are untouched; unknown outcomes keep their
 /// identities in `Failed` without collapse into decline. Session provenance
