@@ -34,7 +34,7 @@ use eliot_process::{
 };
 
 use crate::dispatch_drive::DriveError;
-use crate::dispatch_material::ValidatedDispatchMaterial;
+use crate::dispatch_material::{ValidatedDispatchGrant, ValidatedDispatchMaterial};
 
 /// Parent dispatch authority fronting the real executor.
 ///
@@ -43,6 +43,21 @@ use crate::dispatch_material::ValidatedDispatchMaterial;
 pub struct ParentDispatchAuthority {
     authority: Mutex<DispatchPermitAuthority>,
     context: Mutex<Option<DispatchValidationContext>>,
+    bound: BoundOwnerValues,
+}
+
+/// Owner values bound ONCE at activation and reused for issuance.
+///
+/// Computing the derivation once (instead of re-deriving in both
+/// `activate` and `issue_permit` from separately passed inputs) makes
+/// input desync structurally impossible: issuance can only ever use the
+/// exact values the authority was activated with (F2).
+struct BoundOwnerValues {
+    derived: OwnerDerivation,
+    epoch: EpochId,
+    grant: ValidatedDispatchGrant,
+    launch_nonce: String,
+    admitted_at_unix_ms: u64,
 }
 
 fn contract_denied(field: &'static str) -> DriveError {
@@ -110,13 +125,20 @@ impl ParentDispatchAuthority {
         epoch: &EpochId,
     ) -> Result<Self, DriveError> {
         let derived = owner_derivation(material, epoch)?;
-        let authority_id = DispatchAuthorityId::new(derived.authority_id)
+        let authority_id = DispatchAuthorityId::new(derived.authority_id.clone())
             .map_err(|_| contract_denied("authority-id"))?;
         let key = KernelDispatchKey::from_secret_bytes(derived.key_bytes)
             .map_err(|_| contract_denied("authority-key"))?;
         Ok(Self {
             authority: Mutex::new(DispatchPermitAuthority::activate(authority_id, key)),
             context: Mutex::new(None),
+            bound: BoundOwnerValues {
+                derived,
+                epoch: epoch.clone(),
+                grant: material.grant.clone(),
+                launch_nonce: material.launch_nonce.clone(),
+                admitted_at_unix_ms: material.admitted_at_unix_ms,
+            },
         })
     }
 }
@@ -130,6 +152,7 @@ impl ParentDispatchAuthority {
 /// The epoch JSON round-trips through the TYPED [`EpochId`] (parse then
 /// `to_value`), exactly like the owner pipeline, so struct field order —
 /// and therefore every digest — agrees by construction.
+#[derive(Clone)]
 struct OwnerDerivation {
     authority_id: String,
     key_bytes: [u8; 32],
@@ -172,7 +195,7 @@ fn owner_derivation(
 
 impl ParentDispatchAuthority {
     /// Issues the single permit-bound process request for one admitted
-    /// intent, one owner grant, and one owner-typed epoch.
+    /// intent, using the owner values bound at activation.
     ///
     /// Owner-issuance parity with `wasm_join_gate`: heads
     /// `{"wasm-launch-grant": head}`, one-shot nonce = claim launch nonce,
@@ -182,29 +205,34 @@ impl ParentDispatchAuthority {
     /// revision the owner does not carry would diverge the permit bytes and
     /// re-break join identity (D3, explicitly declined for interop; a
     /// Store-bound revision needs an owner-side semantic first).
+    ///
+    /// Because every issuance input comes from `self.bound` (fixed at
+    /// `activate`), a later caller cannot desync material/epoch between
+    /// activation and issuance (F2, by construction).
     pub fn issue_permit(
         &self,
         intent: &ProcessIntent,
-        material: &ValidatedDispatchMaterial,
-        epoch: &EpochId,
         now_ms: u64,
     ) -> Result<ProcessRequest, DriveError> {
-        let grant = &material.grant;
-        let derived = owner_derivation(material, epoch)?;
+        let bound = &self.bound;
+        let grant = &bound.grant;
         let generation = Generation::new(grant.fence_generation)
             .map_err(|_| contract_denied("permit-generation"))?;
-        let fence = FencingToken::new(epoch.clone(), generation, grant.fence_nonce.clone())
+        let fence = FencingToken::new(bound.epoch.clone(), generation, grant.fence_nonce.clone())
             .map_err(|_| contract_denied("permit-fence"))?;
         let lease = ActionLeaseRef::new(grant.idempotency_key.clone())
             .map_err(|_| contract_denied("permit-lease"))?;
-        let heads = BTreeMap::from([(OWNER_LAUNCH_GRANT_HEAD.to_owned(), derived.head_digest)]);
+        let heads = BTreeMap::from([(
+            OWNER_LAUNCH_GRANT_HEAD.to_owned(),
+            bound.derived.head_digest.clone(),
+        )]);
         let issuance = PermitIssuance::new(
             lease,
             fence.clone(),
             heads.clone(),
-            material.admitted_at_unix_ms,
+            bound.admitted_at_unix_ms,
             grant.expires_at,
-            material.launch_nonce.clone(),
+            bound.launch_nonce.clone(),
         )
         .map_err(|_| contract_denied("permit-issuance"))?;
         let permit = self
@@ -221,7 +249,7 @@ impl ParentDispatchAuthority {
                 monotonic_ns: Some(1),
             },
             fence,
-            epoch.clone(),
+            bound.epoch.clone(),
             heads,
             1,
         )

@@ -964,6 +964,9 @@ pub fn bind_dispatch_material(
     if snapshot.generation != grant.fence_generation {
         return Err(invalid("snapshot-generation"));
     }
+    if input.generation != grant.fence_generation {
+        return Err(invalid("generation-agreement"));
+    }
     if input.artifact_bytes.is_empty() || input.input_bytes.is_empty() {
         return Err(invalid("guest-bytes"));
     }
