@@ -2162,6 +2162,7 @@ dependencies = [
 name = "eliot-kernel"
 version = "0.1.0"
 dependencies = [
+ "eliot-backup",
  "eliot-contracts",
  "eliot-installation",
  "eliot-ipc",
@@ -2176,6 +2177,7 @@ dependencies = [
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-runtime-status",
+ "eliot-security-contracts",
  "eliot-store-api",
  "eliot-store-memory",
  "eliot-store-surreal-adapter",

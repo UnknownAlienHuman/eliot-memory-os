@@ -19,6 +19,11 @@ name = "eliot-kernel"
 path = "src/main.rs"
 
 [dependencies]
+# M2 integration (#960/#974 slice): eliot-backup is a workspace member
+# without a [workspace.dependencies] entry, so a path+version edge keeps
+# root Cargo.toml and workspace membership byte-identical (same precedent
+# as bins/eliot/Cargo.toml:22 and the eliot-store-memory edge below).
+eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
@@ -30,6 +35,9 @@ eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-runtime.workspace = true
 eliot-runtime-contracts.workspace = true
+# M2 integration (#960/#974 slice): eliot-security-contracts carries a
+# [workspace.dependencies] entry, so a plain workspace edge suffices.
+eliot-security-contracts.workspace = true
 eliot-store-api.workspace = true
 eliot-process.workspace = true
 serde_json.workspace = true
