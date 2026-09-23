@@ -1475,8 +1475,8 @@ impl KernelComposition {
         Ok(reply)
     }
 
-    /// Executes one authenticated TestD owner-submit operation. The frame's
-    /// RequestIdentity is the sole task/operation identity source; the owner
+    /// Executes one authenticated `TestD` owner-submit operation. The frame's
+    /// `RequestIdentity` is the sole task/operation identity source; the owner
     /// rehydrates and commits it with the durable job before replying.
     pub async fn execute_testd_owner_submit(
         &self,
