@@ -1725,6 +1725,45 @@ impl GrantActivationPort {
             .is_some_and(|record| record.status == LiveStatus::Revoked)
     }
 
+    /// Returns the revoked members of the explicit support closure under each
+    /// root: the root itself plus every transitive descendant that is also
+    /// revoked (I12.20 traverse-explicit-closure).
+    ///
+    /// This is the read-only query companion of the recovery
+    /// never-resurrects precedent (`recover_introduction`,
+    /// `recover_grant_closure_activation`): restore/compile gates use it to
+    /// remove revoked support before requalification, so revoked lineage can
+    /// never become active again after restore. Roots that are neither
+    /// revoked grants nor revoked introductions contribute nothing, as do
+    /// unknown identities; set semantics absorb cycles. No mutation, no new
+    /// state.
+    #[must_use]
+    pub fn revoked_support_closure(&self, roots: &[String]) -> BTreeSet<String> {
+        let mut revoked = BTreeSet::new();
+        for root in roots {
+            if !self.grant_revoked(root) && !self.introduction_revoked(root) {
+                continue;
+            }
+            revoked.insert(root.clone());
+            let members: Vec<String> = {
+                let ledger = self.lock_ledger();
+                match ledger.grants.get(root) {
+                    Some(record) => {
+                        let authority_root_ref = record.authority_root_ref.clone();
+                        descendant_closure(&ledger.grants, &authority_root_ref, root)
+                    }
+                    None => vec![root.clone()],
+                }
+            };
+            for member in members {
+                if self.grant_revoked(&member) || self.introduction_revoked(&member) {
+                    revoked.insert(member);
+                }
+            }
+        }
+        revoked
+    }
+
     /// Returns the greatest grant-graph revision observed for one lineage
     /// root, or `None` when no intent has been recorded under that root.
     ///
