@@ -15,7 +15,7 @@ use eliot_protocol::{
     HostRequestEnvelope, MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
 };
 use eliot_runtime_contracts::{
-    HealthVector, ServiceProcessState, SupervisionLeaseIncarnationBinding,
+    HealthVector, RuntimeLease, ServiceProcessState, SupervisionLeaseIncarnationBinding,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1336,6 +1336,9 @@ impl KernelControlRequest {
         if let KernelControlCommand::ReconcileRebindStore(query) = &self.command {
             query.validate()?;
         }
+        if let KernelControlCommand::ReadRuntimeLeaseCensus(query) = &self.command {
+            query.validate()?;
+        }
         if let KernelControlCommand::Activate(permit) = &self.command {
             permit.validate(&self.candidate, self.generation)?;
         }
@@ -1410,6 +1413,8 @@ pub struct KernelControlResponse {
     /// signing authority; Host must compare it with the manifest-selected ORS
     /// head before publishing its signed artifact to Watchdog.
     pub supervision_lease: Option<SupervisionLeaseSnapshot>,
+    /// Exact-fence ORS census returned only for a read-only retirement query.
+    pub runtime_lease_census: Option<RuntimeLeaseCensus>,
     /// Stable rejection detail, when the command was not accepted.
     pub error: Option<String>,
     /// Digest over all fields except this digest.
@@ -1431,6 +1436,7 @@ impl KernelControlResponse {
             activation_receipt: &'a Option<KernelActivationReceipt>,
             store_rebind_receipt: &'a Option<StoreRebindReceipt>,
             supervision_lease: &'a Option<SupervisionLeaseSnapshot>,
+            runtime_lease_census: &'a Option<RuntimeLeaseCensus>,
             error: &'a Option<String>,
         }
         serde_json::to_vec(&Unsigned {
@@ -1444,6 +1450,7 @@ impl KernelControlResponse {
             activation_receipt: &self.activation_receipt,
             store_rebind_receipt: &self.store_rebind_receipt,
             supervision_lease: &self.supervision_lease,
+            runtime_lease_census: &self.runtime_lease_census,
             error: &self.error,
         })
         .map_err(|_| KernelServiceError::InvalidField {
@@ -1530,6 +1537,24 @@ impl KernelControlResponse {
                 return Err(KernelServiceError::InvalidField {
                     field: "control.supervision_lease",
                     reason: "must be the active ORS projection",
+                });
+            }
+        }
+        if let Some(census) = &self.runtime_lease_census {
+            census.validate().map_err(|_| KernelServiceError::InvalidField {
+                field: "control.runtime_lease_census",
+                reason: "must be a validated exact-fence ORS census",
+            })?;
+            if self.receipt.is_some()
+                || self.runtime_health.is_some()
+                || self.activation_receipt.is_some()
+                || self.store_rebind_receipt.is_some()
+                || self.supervision_lease.is_some()
+                || self.error.is_some()
+            {
+                return Err(KernelServiceError::InvalidField {
+                    field: "control.runtime_lease_census",
+                    reason: "must be returned without unrelated control receipts",
                 });
             }
         }
@@ -3016,6 +3041,93 @@ impl HostStartupEvidence {
     }
 }
 
+/// Authenticated read-only query for one complete StateFence. The lease id
+/// identifies the current ORS supervision row whose readback closes the
+/// generation-retirement proof; it is not a caller-authored lease claim.
+///
+/// Ported from #1751 donor 552ee79a (M2 integration copy; no authorship
+/// change, no duplicate owner).
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLeaseCensusQuery {
+    /// Complete fence selecting the census rows.
+    pub state_fence: StateFence,
+    /// Current ORS supervision row closing the proof.
+    pub supervision_lease_id: String,
+}
+
+impl RuntimeLeaseCensusQuery {
+    /// Validates the query shape without performing any read.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "runtime_lease_census.state_fence",
+                reason: "must be valid",
+            })?;
+        validate_text(
+            &self.supervision_lease_id,
+            "runtime_lease_census.supervision_lease_id",
+        )
+    }
+}
+
+/// One Kernel-authored census read from the canonical ORS current tables.
+///
+/// Ported from #1751 donor 552ee79a (M2 integration copy; no authorship
+/// change, no duplicate owner).
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLeaseCensus {
+    /// Complete fence every returned row was selected by.
+    pub state_fence: StateFence,
+    /// Supervision row identity closing the proof.
+    pub supervision_lease_id: String,
+    /// Exact-fence RuntimeLease rows ordered by lease id.
+    pub runtime_leases: Vec<RuntimeLease>,
+    /// Current supervision row bound to the same fence.
+    pub supervision_lease: SupervisionLeaseSnapshot,
+}
+
+impl RuntimeLeaseCensus {
+    /// Validates fence agreement, lease ordering, and supervision binding.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        let query = RuntimeLeaseCensusQuery {
+            state_fence: self.state_fence.clone(),
+            supervision_lease_id: self.supervision_lease_id.clone(),
+        };
+        query.validate()?;
+        for (index, lease) in self.runtime_leases.iter().enumerate() {
+            lease.validate().map_err(|_| KernelServiceError::InvalidField {
+                field: "runtime_lease_census.runtime_leases",
+                reason: "contains an invalid RuntimeLease",
+            })?;
+            if lease.state_fence != self.state_fence
+                || (index > 0
+                    && self.runtime_leases[index - 1].lease_id >= lease.lease_id)
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "runtime_lease_census.runtime_lease_fence_or_order",
+                });
+            }
+        }
+        self.supervision_lease
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "runtime_lease_census.supervision_lease",
+                reason: "must be a validated current ORS row",
+            })?;
+        if self.supervision_lease.record.lease_id.as_str() != self.supervision_lease_id
+            || self.supervision_lease.record.binding.state_fence != self.state_fence
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "runtime_lease_census.supervision_lease_binding",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Control messages accepted by the Kernel service boundary.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -3047,6 +3159,9 @@ pub enum KernelControlCommand {
     /// Ask Kernel to prove readiness from live observations and self-author a
     /// receipt.  No caller-shaped receipt is accepted on this wire.
     ProbeReady,
+    /// Read the exact-fence RuntimeLease set and current supervision row from
+    /// the canonical ORS owner. This cannot issue or renew authority.
+    ReadRuntimeLeaseCensus(RuntimeLeaseCensusQuery),
     /// Close normal admission while retaining recovery control.
     Degrade(PlatformHandle),
     /// Drain normal work before stopping.

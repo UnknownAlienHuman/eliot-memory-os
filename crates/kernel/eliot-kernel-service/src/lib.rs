@@ -146,7 +146,7 @@ pub use protocol::{
     ProcessAuthorityHandoffDescriptor, ProcessExecutionRejection, ProcessExecutionRequest,
     ProcessExecutionResponse, ProcessObservation, ProviderCapabilityError,
     ProviderCapabilityExpectation, ProviderCapabilityRequest, ProviderProofKind, RestartBudget,
-    StoreBootstrapDescriptor, StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff,
+    RuntimeLeaseCensus, RuntimeLeaseCensusQuery, StoreBootstrapDescriptor, StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff,
     StoreRebindQuery, StoreRebindReceipt, admit_replay_request, control_request_frame,
     control_response_frame, daemon_capability_registry_digest, decode_control_request_frame,
     decode_control_response_frame,
