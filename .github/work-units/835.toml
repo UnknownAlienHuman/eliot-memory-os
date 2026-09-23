@@ -1,0 +1,17 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-835"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 835}
+unit = {value = "F-CUE-RETIRE"}
+mode = "python-unittest"
+source_roots = [{value = "crates/eliot-types"}, {value = "scripts/testdata/cue-kind-retirement"}]
+test_roots = [{value = "scripts/tests/test_cue_kind_retirement.py"}]
+matrix_cases = 28
+proof_ceiling = {value = "assignment-source-only"}
+revision = 1
+body_sha256 = "497f99189db29463eb342fcf2e4e4f30a440858402fd082fc8e3b6ce8a989b4f"
+matrix_sha256 = "0a6d7bffe6929844a7184e6b6d79c2ee441987303d2d5d7e8ab0f3458762b664"
+require_workspace_member = false
+package = {name = "cue-retirement-coordinator"}
+module = {value = "scripts.tests.test_cue_kind_retirement"}
+requirements = {source_floor = 1, public_floor = 0, test_floor = 28, required_guards = []}
+bounds = {wall_ms = 900000, idle_ms = 120000, output_bytes = 1048576, line_bytes = 65536, discovery_tests = 1000, child_processes = 4}

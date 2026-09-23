@@ -1039,10 +1039,10 @@ fn case_11_no_production_alias_use() -> TestResult {
         }
     }
     assert_eq!(
-        bare, 1,
-        "only the frozen alias definition may name bare CueKind"
+        bare, 0,
+        "retired alias must leave no bare CueKind use in production code"
     );
-    assert!(prod.contains("pub type CueKind = LegacyCueKindV1;"));
+    assert!(!prod.contains("pub type CueKind = LegacyCueKindV1;"));
     Ok(())
 }
 
@@ -1050,7 +1050,7 @@ fn case_11_no_production_alias_use() -> TestResult {
 #[test]
 fn case_12_at_most_one_transitional_alias() -> TestResult {
     let prod = production_code()?;
-    assert_eq!(prod.matches("type CueKind").count(), 1);
+    assert_eq!(prod.matches("type CueKind").count(), 0);
     Ok(())
 }
 
@@ -1058,20 +1058,14 @@ fn case_12_at_most_one_transitional_alias() -> TestResult {
 #[test]
 fn case_13_alias_names_migrations_and_removal() -> TestResult {
     let source = cue_rs_source()?;
-    let marker = "note = \"";
-    let start = source
-        .find(marker)
-        .ok_or_else(|| boxed(std::io::Error::other("deprecated note missing")))?
-        + marker.len();
-    let rest = &source[start..];
-    let end = rest
-        .find('"')
-        .ok_or_else(|| boxed(std::io::Error::other("deprecated note unterminated")))?;
-    let note = &rest[..end];
-    for issue in ["#831", "#832", "#833", "#834", "#835"] {
-        assert!(note.contains(issue), "alias note omits {issue}");
-    }
-    assert!(note.contains("removal"), "alias note omits removal");
+    assert!(
+        !source.contains("pub type CueKind"),
+        "transitional alias definition still present"
+    );
+    assert!(
+        !source.contains("#[deprecated"),
+        "transitional deprecation still present in cue.rs"
+    );
     Ok(())
 }
 
@@ -1079,7 +1073,7 @@ fn case_13_alias_names_migrations_and_removal() -> TestResult {
 #[test]
 fn case_14_alias_adds_no_alternate_wire() -> TestResult {
     let prod = production_code()?;
-    assert!(prod.contains("pub type CueKind = LegacyCueKindV1;"));
+    assert!(!prod.contains("pub type CueKind = LegacyCueKindV1;"));
     assert!(!prod.contains("impl CueKind"));
     let schema = schemars::schema_for!(LegacyCueKindV1);
     let schema_value = serde_json::to_value(&schema).map_err(boxed)?;
@@ -1513,8 +1507,7 @@ fn case_29_oracle_detects_forbidden_local_alias_use() -> TestResult {
             hits.push(line.trim().to_owned());
         }
     }
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0], "pub type CueKind = LegacyCueKindV1;");
+    assert_eq!(hits.len(), 0);
     Ok(())
 }
 

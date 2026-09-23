@@ -1,0 +1,5 @@
+{
+  "schema": "eliot-835-freshness-policy-v1",
+  "max_age_seconds": 86400,
+  "basis": "work_unit_gate default bound; re-capture with fresh timestamps after expiry"
+}

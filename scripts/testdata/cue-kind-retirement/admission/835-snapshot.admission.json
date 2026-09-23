@@ -1,0 +1,7 @@
+{
+  "snapshot_sha256": "93a6f9a9b087162aeccc6de198737ccecb872f173d8df5ed3ee5bf44043d82ef",
+  "producer": "F-CUE-RETIRE",
+  "capture_receipt_sha256": "6a7a53c2f62969e68afe6b67caefeb0597b70a1e44941154b3781e4c0a4e6459",
+  "freshness_policy_sha256": "0a43ce18b3f092c40ff08156be6d030ed7817c424c05e4f29ef1b9330f4061ae",
+  "max_age_seconds": 86400
+}

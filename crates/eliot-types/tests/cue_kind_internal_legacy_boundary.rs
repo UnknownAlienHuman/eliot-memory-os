@@ -543,14 +543,16 @@ fn case_10_retained_source_alias_explicitly_legacy_and_wire_neutral() -> TestRes
         stripped
             .matches("pub type CueKind = LegacyCueKindV1;")
             .count(),
-        1,
-        "exactly one retained transitional alias"
+        0,
+        "transitional alias must be fully retired"
     );
     assert!(
-        source.contains("removal issue #835") || source.contains("removal issue: #835"),
-        "alias lacks #835 removal owner"
+        source.contains("removal issue #835")
+            || source.contains("removal issue: #835")
+            || source.contains("alias removal: #835"),
+        "seam lacks #835 removal record"
     );
-    assert!(source.contains("#831"), "alias lacks #831 migration owner");
+    assert!(source.contains("#831"), "seam lacks #831 migration owner");
     // Wire neutrality without importing the deprecated alias: the legacy
     // spelling on the wire equals the historical golden spelling.
     assert_eq!(
@@ -1155,10 +1157,11 @@ fn case_19_exact_scope_plus_reservation_removal_and_seam_handoff() -> TestResult
         ],
         "tests/data holds a reservation or stray file"
     );
-    // Seam handoff markers intact (read-only coherence with #706).
+    // Seam handoff markers intact (read-only coherence with #706); the
+    // transitional alias itself is retired under #835.
     let seam = read_workspace("crates/eliot-types/src/ul/cue.rs")?;
     assert!(seam.contains("pub enum LegacyCueKindV1"));
-    assert!(seam.contains("pub type CueKind = LegacyCueKindV1;"));
+    assert!(!seam.contains("pub type CueKind = LegacyCueKindV1;"));
     assert!(seam.contains("SOURCE_SEAM_ISSUE"));
     Ok(())
 }
