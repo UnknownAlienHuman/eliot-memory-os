@@ -2243,6 +2243,7 @@ dependencies = [
  "eliot-authority",
  "eliot-config",
  "eliot-contracts",
+ "eliot-influence",
  "eliot-ors",
  "eliot-platform",
  "eliot-process",

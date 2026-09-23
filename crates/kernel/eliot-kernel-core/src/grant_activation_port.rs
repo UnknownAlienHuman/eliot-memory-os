@@ -3145,7 +3145,30 @@ fn revoked_support_in_ledger(ledger: &PortLedger, roots: &[String]) -> BTreeSet<
         }
         revoked.insert(root.clone());
         let members: Vec<String> = match ledger.grants.get(root) {
-            Some(record) => descendant_closure(&ledger.grants, &record.authority_root_ref, root),
+            Some(record) => {
+                // I12.20 explicit-closure traversal reuses the pure
+                // `eliot-influence` engine: edges are pre-scoped to the
+                // root's authority root (cross-root lineage is never
+                // followed), then the engine traverses multi-hop and
+                // cycle-safe. Unknown roots keep the previous direct
+                // behavior below.
+                let edges: Vec<eliot_influence::InfluenceEdge> = ledger
+                    .grants
+                    .iter()
+                    .filter(|(_, candidate)| {
+                        candidate.authority_root_ref == record.authority_root_ref
+                    })
+                    .filter_map(|(candidate_id, candidate)| {
+                        candidate.parent_grant_id.as_deref().map(|parent| {
+                            eliot_influence::InfluenceEdge {
+                                source_ref: parent.to_owned(),
+                                dependent_ref: candidate_id.clone(),
+                            }
+                        })
+                    })
+                    .collect();
+                eliot_influence::traverse_dependency_closure(root, &edges)
+            }
             None => vec![root.clone()],
         };
         for member in members {
