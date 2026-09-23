@@ -127,6 +127,21 @@ required_files = []
 optional_files = []
 
 [[route]]
+id = "memory-admission-trace"
+description = "Memory admission decisions, retrieval plans, and per-material retrieval trace linkage (I12.26)."
+path_globs = [
+  "crates/smart/eliot-context-admission/**",
+  "crates/smart/eliot-reactive-context-plan/src/retrieval_plan.rs",
+  "crates/smart/eliot-reactive-context-plan/src/compiler.rs",
+  "crates/governor/eliot-governor/src/reactive_admission.rs",
+]
+topic_keywords = ["memory admission", "retrieval plan", "retrieval trace", "recall disposition"]
+required_handles = ["I12.26"]
+optional_handles = ["I12.*", "I13"]
+required_files = []
+optional_files = []
+
+[[route]]
 id = "dreamer"
 description = "Dreamer orientation, reflection, hypotheses, sleep-like processing, and bounded cognitive improvement."
 path_globs = ["bins/eliot-dreamer/**", "crates/**/*dream*/**"]
