@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Verify the provider-free ELIOT cross-route swarm Product Pulse."""
+"""Verify the provider-free ELIOT cross-route swarm Product Pulse.
+
+provider-free swarm control-plane FIXTURE; validates fixture consistency only,
+never observed processes/providers; receipt ceiling
+DETERMINISTIC_CONTROL_PLANE_SHAPE_ONLY, provider_executions=0,
+eligible_for_route_promotion=false; NOT live swarm or Product-Pulse (#11)
+evidence; execution status NOT_EXECUTED.
+"""
 from __future__ import annotations
 
 import argparse
 import copy
 import json
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -116,6 +124,48 @@ def verify_current(root: Path) -> dict:
     return receipt
 
 
+def _emit_receipt_create_new(root: Path, candidate: Path, payload: bytes) -> None:
+    evidence_root = (root / ".eliot").resolve()
+    absolute_candidate = candidate if candidate.is_absolute() else (root / candidate)
+    if os.path.islink(absolute_candidate):
+        raise SwarmPulseError("refusing swarm pulse receipt over symlink final path")
+    for ancestor in [absolute_candidate, *absolute_candidate.parents]:
+        if os.path.islink(ancestor):
+            raise SwarmPulseError("refusing swarm pulse receipt through symlink path")
+        if ancestor == ancestor.parent:
+            break
+    resolved_candidate = absolute_candidate.resolve()
+    try:
+        resolved_candidate.relative_to(evidence_root)
+    except ValueError:
+        raise SwarmPulseError("swarm pulse receipt path escapes <root>/.eliot/") from None
+    parent = resolved_candidate.parent
+    try:
+        parent.relative_to(evidence_root)
+    except ValueError:
+        raise SwarmPulseError("swarm pulse receipt parent escapes <root>/.eliot/") from None
+    parent.mkdir(parents=True, exist_ok=True)
+    current: Path = parent
+    while True:
+        if os.path.islink(current):
+            raise SwarmPulseError("refusing swarm pulse receipt through symlink parent")
+        try:
+            current.relative_to(evidence_root)
+        except ValueError:
+            raise SwarmPulseError("swarm pulse receipt parent escapes <root>/.eliot/") from None
+        if current == evidence_root or current == current.parent:
+            break
+        current = current.parent
+    if os.path.islink(resolved_candidate) or os.path.lexists(resolved_candidate):
+        # lexists covers dangling symlink/reparse without following it.
+        raise SwarmPulseError("swarm pulse receipt already exists (create-new only, no overwrite)")
+    try:
+        with open(resolved_candidate, "xb") as handle:
+            handle.write(payload)
+    except FileExistsError:
+        raise SwarmPulseError("swarm pulse receipt already exists (create-new only, no overwrite)") from None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -131,8 +181,7 @@ def main() -> int:
 
     receipt = verify_current(root)
     if arguments.emit_receipt:
-        arguments.emit_receipt.parent.mkdir(parents=True, exist_ok=True)
-        arguments.emit_receipt.write_bytes(canonical_json_bytes(receipt) + b"\n")
+        _emit_receipt_create_new(root, arguments.emit_receipt, canonical_json_bytes(receipt) + b"\n")
     else:
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
