@@ -43,28 +43,26 @@ use eliot_security_contracts::RevocationReason;
 /// state.
 ///
 /// `origin_ref` names a lineage root or one closure target grant;
-/// `max_records` bounds the served closures. Session agreement is proven
-/// by the dispatch site on the actual call path
-/// (`validate_store_session_fence` in
-/// `bins/eliot-kernel/src/daemon_request_dispatch.rs` compares the
-/// admitted request fence against the live
-/// `session.module_generation.state_fence` before serving here), so this
-/// projector requires that proof as a precondition instead of comparing
-/// the request against itself. The admitted fence is echoed verbatim
-/// into the response; the Governor feed caller re-checks it against its
-/// expected fence on decode.
+/// `max_records` bounds the served closures. `session_fence` is the live
+/// fence owned by the dispatch site (the authenticated
+/// `session.module_generation.state_fence` proven by
+/// `validate_store_session_fence` in
+/// `bins/eliot-kernel/src/daemon_request_dispatch.rs` before this call):
+/// the admitted request fence must agree with it, and the live fence is
+/// echoed verbatim into the response; the Governor feed caller re-checks
+/// it against its expected fence on decode.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::InvalidField`] for a malformed selector,
 /// [`StoreError::PayloadTooLarge`] for an over-bound request or an
-/// overflowing matched set, [`StoreError::InvalidProjection`] for
-/// incoherent durable rows, [`StoreError::ReceiptNotFound`] when no
-/// history exists for the origin, [`StoreError::Unavailable`] for a
-/// concurrent mutation that moves the per-root watermark mid-read, and
-/// [`StoreError::UnknownOperation`] for any other operation. Fencing
-/// disagreement never reaches this projector: the dispatch site refuses
-/// it before the call.
+/// overflowing matched set, [`StoreError::FenceMismatch`] for a request
+/// fence that disagrees with the live session fence,
+/// [`StoreError::InvalidProjection`] for incoherent durable rows,
+/// [`StoreError::ReceiptNotFound`] when no history exists for the
+/// origin, [`StoreError::Unavailable`] for a concurrent mutation that
+/// moves the per-root watermark mid-read, and
+/// [`StoreError::UnknownOperation`] for any other operation.
 #[allow(
     clippy::too_many_lines,
     reason = "the history projector keeps selectors, scan, filter, currency, overflow, and envelope in one audited sequence"
@@ -72,11 +70,15 @@ use eliot_security_contracts::RevocationReason;
 pub fn serve_authority_revocation_history(
     store: &dyn OperationalRecoveryStore,
     request: &NamedReadRequest,
+    session_fence: &eliot_contracts::StateFence,
 ) -> Result<NamedReadResponse, StoreError> {
     if request.operation != NamedReadOperation::GetAuthorityRevocationHistory {
         return Err(StoreError::UnknownOperation);
     }
-    let fence = &request.state_fence;
+    if request.state_fence != *session_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let fence = session_fence;
     let origin_ref = request
         .parameters
         .get("origin_ref")

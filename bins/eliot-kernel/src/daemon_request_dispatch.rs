@@ -1435,13 +1435,16 @@ impl KernelComposition {
         // serve durable closure-fence history from the retained ORS instead
         // of forwarding to the store bridge. The store catalogue truthfully
         // still lists the operation unsupported because the store never
-        // serves it; every other named read forwards unchanged below.
+        // serves it; every other named read forwards unchanged below. The
+        // live session fence binds the served view: the projector refuses
+        // a request fence that disagrees with it.
         if operation.request.operation
             == eliot_store_api::NamedReadOperation::GetAuthorityRevocationHistory
         {
             return match eliot_kernel_service::serve_authority_revocation_history(
                 self.p07_ors.as_ref(),
                 &operation.request,
+                &session.module_generation.state_fence,
             ) {
                 Ok(response) => Ok(store_named_response(&response)),
                 Err(error) => Ok(Self::store_error_response_text(
