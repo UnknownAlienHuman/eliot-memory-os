@@ -52,8 +52,8 @@ use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationRec
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
-    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, ScopeRevisionView,
-    StoreHealth, WriteReceipt,
+    CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
+    ScopeRevisionView, StoreHealth, WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
 use eliot_workscope::{WorkScopeBindingOwner, WorkScopeBindingSnapshot};
@@ -2566,6 +2566,33 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let retained = self.retain_presentation(presented)?;
         retained.note_unknown_outcome(snapshot_id)
     }
+
+/// Restores the authority owner with live revocation-history evidence
+/// (`#2100` owner-closure join).
+///
+/// Builds the closed `GetAuthorityRevocationHistory` read for one exact
+/// origin, executes it through the canonical read client (the Kernel
+/// serves its durable fence state on the `store_named` route), decodes
+/// the reply against the expected fence, and restores the authority
+/// owner with that evidence. A transport failure, a fence disagreement,
+/// an absent history, or a stale/invalid view refuses before any owner
+/// state is installed: unavailable history is never absence of
+/// revocation.
+pub async fn restore_authority_with_live_history<R: CanonicalReadClient + ?Sized>(
+    reads: &R,
+    snapshot: &AuthorityOwnerSnapshot,
+    state_fence: &StateFence,
+    origin_ref: &str,
+    max_records: u32,
+) -> Result<AuthorityRestoreOutcome, CompositionError> {
+    let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
+    let response = reads
+        .execute_named(request)
+        .await
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let evidence = decode_revocation_history_evidence(&response, state_fence)?;
+    AuthorityOwner::from_snapshot_with_revocation_history(snapshot, state_fence, Some(&evidence))
+}
 
     /// Reads one coherent semantic activation from all required owner records.
     ///

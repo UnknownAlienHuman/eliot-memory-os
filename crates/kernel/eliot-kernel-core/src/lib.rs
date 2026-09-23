@@ -55,9 +55,11 @@ pub use governor_closure_source::{
     GovernorClosureRestore, GovernorClosureSource, GovernorClosureSourceHandle,
 };
 pub use grant_activation_port::{
-    CommittedReceipt, GrantActivationIntent, GrantActivationPort, GrantRevocationIntent,
-    IntentDisposition, IntroductionActivationIntent, IntroductionRevocationIntent,
-    ROOT_GRANT_HYDRATION_FIELDS, RootGrantHydration, RootGrantHydrationSource,
+    CommittedReceipt, GrantActivationIntent, GrantActivationPort, GrantClosureActivationIntent,
+    GrantClosureEnumeration, GrantClosureMember, GrantClosureReceipt, GrantClosureRevocationIntent,
+    GrantClosureSurvivor, GrantRevocationIntent, IntentDisposition, IntroductionActivationIntent,
+    IntroductionRevocationIntent, GRANT_CLOSURE_ENUMERATION_FIELDS, ROOT_GRANT_HYDRATION_FIELDS,
+    RootGrantHydration, RootGrantHydrationSource, verify_grant_seal, verify_introduction_seal,
 };
 pub use introduction_lifecycle::{
     INTRODUCTION_HYDRATION_FIELDS, IntroductionHydration, introduction_fence_input,

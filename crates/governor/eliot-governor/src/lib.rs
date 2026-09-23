@@ -52,6 +52,7 @@ pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicP
 mod controlboard_projection;
 mod observation_reconciliation;
 mod operator_reconciliation;
+mod owner_closure_provider;
 mod owner_projection_refresh;
 mod reactive_admission;
 mod skill_lifecycle;
@@ -90,6 +91,10 @@ pub use observation_reconciliation::{
     WatchdogEntryKind,
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
+pub use owner_closure_provider::{
+    GrantAdmissionParams, IntroductionAdmissionParams, OWNER_HYDRATION_SNAPSHOT_SCHEMA,
+    OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider, PreservedAdmission,
+};
 pub use reactive_admission::{
     ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier, assess_reactive_risk,
 };
