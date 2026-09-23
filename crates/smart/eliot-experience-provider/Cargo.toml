@@ -20,9 +20,13 @@ source_layer = "C1"
 agent_order = 51
 
 [dependencies]
+eliot-cognitive-quality = { path = "../eliot-cognitive-quality", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-epistemic-contracts.workspace = true
 eliot-experience-projection = { path = "../eliot-experience-projection", version = "0.1.0" }
+eliot-learning-contracts.workspace = true
 eliot-observation-contracts.workspace = true
+eliot-receipts.workspace = true
 eliot-store-api = { path = "../../storage/eliot-store-api", version = "0.1.0" }
 schemars.workspace = true
 serde.workspace = true

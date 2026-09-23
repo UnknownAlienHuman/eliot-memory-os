@@ -1819,9 +1819,13 @@ dependencies = [
 name = "eliot-experience-provider"
 version = "0.1.0"
 dependencies = [
+ "eliot-cognitive-quality",
  "eliot-contracts",
+ "eliot-epistemic-contracts",
  "eliot-experience-projection",
+ "eliot-learning-contracts",
  "eliot-observation-contracts",
+ "eliot-receipts",
  "eliot-store-api",
  "schemars",
  "serde",
