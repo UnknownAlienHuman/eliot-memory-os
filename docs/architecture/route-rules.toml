@@ -226,6 +226,21 @@ optional_handles = ["I20"]
 required_files = []
 optional_files = []
 
+[[route]]
+id = "governor-skill-drive"
+description = "Daemon-side Skill candidate materialization drive: canonical acceptance lookup, owner-bound procedure rehydration, and Hotset install-to-receipt composition (issue #1191)."
+path_globs = [
+  "bins/eliotd/src/skill_dispatch.rs",
+  "bins/eliotd/src/skill_acceptance_read.rs",
+  "bins/eliotd/src/skill_lifecycle_adapters.rs",
+]
+topic_keywords = ["skill validation and promotion", "skill lifecycle", "candidate materialization", "canonical acceptance", "hotset delivery"]
+required_handles = ["I7.13", "I7.25"]
+optional_handles = ["I7.12"]
+required_files = ["bins/AGENTS.md"]
+optional_files = []
+max_required_bytes = 458752
+
 [coverage]
 
 [[coverage.example]]
@@ -282,3 +297,8 @@ expect_routes = ["documentation-authority", "doctor-operations"]
 path = "README.md"
 topic = "repository root"
 expect_routes = ["repository-root"]
+
+[[coverage.example]]
+path = "bins/eliotd/src/skill_dispatch.rs"
+topic = "skill validation and promotion with canonical acceptance for candidate materialization and hotset delivery"
+expect_routes = ["generic-source", "governor-skill-drive"]
