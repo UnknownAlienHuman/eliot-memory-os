@@ -8,7 +8,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::{cmp::Ordering, collections::BTreeSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use eliot_contracts::{
     ArtifactId, ContractVersion, DecisionId, StateFence, TaskRevision, fences_match_exact,
@@ -371,33 +374,76 @@ impl ContextCompiler {
 
     /// Compile a bounded view while treating `revoked_handles` as removed support.
     ///
-    /// Behaves exactly like [`compile`](Self::compile) with an empty set,
-    /// except any candidate atom with at least one source handle in
-    /// `revoked_handles` is quarantined with reason
-    /// `revoked_source_support_removed`, regardless of budget, required, or
-    /// protected status. Quarantined atoms stay in `admissions` history and
-    /// contribute a rebuild unknown.
+    /// Behaves exactly like [`compile`](Self::compile) with an empty set.
+    /// With a non-empty set, three pure I12.20 revocation-closure projections
+    /// apply on top of the identical budget admission:
+    ///
+    /// * any candidate atom with at least one source handle in
+    ///   `revoked_handles` is quarantined with reason
+    ///   `revoked_source_support_removed`, regardless of budget, required, or
+    ///   protected status. Quarantined atoms stay in `admissions` history and
+    ///   contribute a rebuild unknown;
+    /// * atoms with incomplete lineage (empty source handles, or blank handle
+    ///   text where lineage is required) are quarantined as a bounded scope
+    ///   covering only the affected atoms — the clean remainder still
+    ///   compiles — with an explicit rebuild-from-clean-inputs unknown (see
+    ///   [`bounded_quarantine_scope_for_incomplete_lineage`]);
+    /// * mixed-lineage atoms (more than one distinct source handle) inherit
+    ///   the minimum assertability across their material sources, downgraded
+    ///   and never upgraded (see [`minimum_assertability_for_lineage`]);
+    /// * the invalidated-derivative key set for the revoked roots (see
+    ///   [`revoked_derivative_invalidation_set`]) is threaded into `unknowns`
+    ///   as one stable marker; external cache/context-profile owners recover
+    ///   the exact keys through that function.
+    ///
+    /// All three projections are deterministic, bounded, stateless and
+    /// side-effect free: no retrieval, no canonical writes, no Problem State
+    /// or store/effects wiring. Opening Problem State, purging stores, and
+    /// scheduling rebuild effects belong to other owners; this function only
+    /// emits the typed quarantine dispositions and rebuild unknowns they
+    /// must consume.
     pub fn compile_with_revocation(
         input: &ContextInput,
         recipe: &ContextRecipe,
         revoked_handles: &BTreeSet<ArtifactId>,
     ) -> Result<CompiledContext, ContextError> {
-        input.validate()?;
+        // Bounded incomplete-lineage scope (I12.20). Empty for the empty-set
+        // path, so `compile` keeps its fail-closed whole-input validation.
+        let incomplete_scope = if revoked_handles.is_empty() {
+            BTreeSet::new()
+        } else {
+            bounded_quarantine_scope_for_incomplete_lineage(&input.atoms)
+        };
+        // Compile the clean remainder; the quarantined scope is seeded into
+        // `admissions` below and never silently dropped.
+        let scoped = scoped_input_without_quarantined_scope(input, &incomplete_scope);
+        scoped.validate()?;
         recipe.validate()?;
-        if recipe.recipe_revision != input.task_revision {
+        if recipe.recipe_revision != scoped.task_revision {
             return Err(ContextError::RecipeRevisionMismatch {
                 recipe_revision: recipe.recipe_revision,
-                task_revision: input.task_revision,
+                task_revision: scoped.task_revision,
             });
         }
-        let mut candidates = input.atoms.clone();
+        // Per-source assertability floors for the minimum-inheritance cap.
+        // Built only for revocation passes so the empty-set `compile` path
+        // is untouched.
+        let source_floor = if revoked_handles.is_empty() {
+            None
+        } else {
+            Some(source_assertability_floors(&scoped.atoms))
+        };
+        let mut candidates = scoped.atoms.clone();
         candidates.sort_by(Self::candidate_order);
         let mut units = Vec::new();
         let mut handles = Vec::new();
-        let mut admissions = Vec::with_capacity(candidates.len());
-        let mut spent_total = 0_u32;
-        let mut spent_roles: Vec<(ContextRole, u32)> = Vec::new();
+        let mut ledger = BudgetLedger::default();
+        // Seed the bounded quarantine first, in deterministic atom-id order:
+        // only the affected atoms, never a broad suppression of the read set.
+        let mut admissions = seed_incomplete_lineage_quarantines(&input.atoms, &incomplete_scope);
+        admissions.reserve(candidates.len());
         let mut revoked_seen = false;
+        let mut revoked_quarantined: BTreeSet<ArtifactId> = BTreeSet::new();
 
         for atom in candidates {
             if !atom.source_handles.is_empty()
@@ -407,6 +453,7 @@ impl ContextCompiler {
                     .any(|h| revoked_handles.contains(h))
             {
                 revoked_seen = true;
+                revoked_quarantined.insert(atom.atom_id.clone());
                 admissions.push(AdmissionDecision {
                     atom_id: atom.atom_id,
                     protected: atom.protected,
@@ -415,54 +462,36 @@ impl ContextCompiler {
                 });
                 continue;
             }
-            let role_spent = spent_roles
-                .iter()
-                .find(|(role, _)| *role == atom.role)
-                .map_or(0, |(_, spent)| *spent);
-            let role_limit = recipe.budget_for(atom.role);
-            let fits = spent_total.saturating_add(atom.cost) <= recipe.total_cost
-                && role_spent.saturating_add(atom.cost) <= role_limit;
-            let freshness_ok = matches!(
-                atom.freshness,
-                EvidenceFreshness::ExactCandidate
-                    | EvidenceFreshness::ExactCommit
-                    | EvidenceFreshness::ExactQuiescedWorktree
-            );
-            let safe = atom.assertability != Assertability::AbstainOrFence
-                && !matches!(atom.status, EpistemicStatus::Rejected);
-            let disposition = if !safe {
-                AdmissionDisposition::Quarantined
-            } else if !freshness_ok {
-                AdmissionDisposition::Revalidate
-            } else if fits {
-                units.push(atom.clone());
-                spent_total = spent_total.saturating_add(atom.cost);
-                if let Some((_, spent)) =
-                    spent_roles.iter_mut().find(|(role, _)| *role == atom.role)
-                {
-                    *spent = spent.saturating_add(atom.cost);
-                } else {
-                    spent_roles.push((atom.role, atom.cost));
-                }
-                AdmissionDisposition::Included
-            } else if atom.required || atom.protected {
-                handles.push(atom.atom_id.clone());
-                AdmissionDisposition::HandleOnly
-            } else {
-                AdmissionDisposition::Suppressed
-            };
-            admissions.push(AdmissionDecision {
-                atom_id: atom.atom_id,
-                protected: atom.protected,
-                reason: reason_for(disposition),
-                disposition,
-            });
+            // Minimum-inheritance cap (I12.20): a mixed-lineage atom inherits
+            // the minimum ceiling across its material sources. `None` on the
+            // empty-set path, so `compile` output is untouched.
+            let (effective, capped) = capped_assertability_for_atom(&atom, source_floor.as_ref());
+            admissions.push(admit_with_budget(
+                &atom,
+                recipe,
+                &mut ledger,
+                effective,
+                capped,
+                &mut units,
+                &mut handles,
+            ));
         }
 
-        let mut unknowns = input.unknowns.clone();
+        let mut unknowns = scoped.unknowns.clone();
+        if !incomplete_scope.is_empty() {
+            unknowns.push(INCOMPLETE_LINEAGE_REBUILD_UNKNOWN.to_owned());
+        }
         if revoked_seen {
             unknowns.push("revoked_support_removed_rebuild_from_clean_inputs_required".to_owned());
         }
+        // Thread the invalidated-derivative key set into the output as one
+        // stable marker; the exact keys stay available to external
+        // cache/context-profile owners via
+        // `revoked_derivative_invalidation_set`. Empty on the empty-set path.
+        unknowns.extend(derivative_invalidation_unknown(
+            revoked_handles,
+            &revoked_quarantined,
+        ));
         if admissions
             .iter()
             .any(|item| item.disposition != AdmissionDisposition::Included)
@@ -497,6 +526,317 @@ impl ContextCompiler {
             })
             .then_with(|| left.risk.cmp(&right.risk).reverse())
             .then_with(|| left.atom_id.cmp(&right.atom_id))
+    }
+}
+
+/// Admission reason for bounded incomplete-lineage quarantine (I12.20).
+const INCOMPLETE_LINEAGE_QUARANTINE_REASON: &str = "incomplete_lineage_bounded_quarantine";
+/// Admission reason for mixed-lineage atoms capped to the minimum source ceiling.
+const LINEAGE_ASSERTABILITY_CAP_REASON: &str =
+    "admitted_within_fence_and_budget_minimum_lineage_assertability_applied";
+/// Unknown marking invalidated derivative caches/profiles after revocation.
+const REVOKED_DERIVATIVE_INVALIDATION_UNKNOWN: &str =
+    "revoked_derivative_cache_invalidation_required_rebuild_from_clean_inputs";
+/// Unknown marking bounded incomplete-lineage quarantine.
+const INCOMPLETE_LINEAGE_REBUILD_UNKNOWN: &str =
+    "incomplete_lineage_bounded_quarantine_rebuild_from_clean_inputs_required";
+
+/// Rank of one assertability ceiling: lower is more restrictive.
+///
+/// Ordering is `AbstainOrFence < NonAssertableUnverified < Assertable`, so a
+/// minimum over ranks is always the weakest (most restrictive) ceiling.
+const fn assertability_rank(level: Assertability) -> u8 {
+    match level {
+        Assertability::AbstainOrFence => 0,
+        Assertability::NonAssertableUnverified => 1,
+        Assertability::Assertable => 2,
+    }
+}
+
+/// Ceiling for one rank, inverse to [`assertability_rank`].
+const fn assertability_for_rank(rank: u8) -> Assertability {
+    match rank {
+        0 => Assertability::AbstainOrFence,
+        1 => Assertability::NonAssertableUnverified,
+        _ => Assertability::Assertable,
+    }
+}
+
+/// Minimum allowed assertability across a set of material source ceilings.
+///
+/// I12.20 requires that any mixed-lineage derived item inherits the minimum
+/// allowed influence/assertability of its material supporting sources. This
+/// is the pure projection of that rule: the result is the most restrictive
+/// input ceiling, so a derived item is downgraded but never upgraded. An
+/// empty set carries no support and fails closed to
+/// [`Assertability::AbstainOrFence`].
+///
+/// Performs no retrieval and changes no epistemic status or authority; it
+/// only projects the minimum over caller-supplied ceilings. Deterministic,
+/// bounded, stateless and side-effect free.
+pub fn minimum_assertability_for_lineage(levels: &[Assertability]) -> Assertability {
+    let mut rank = u8::MAX;
+    for level in levels {
+        rank = rank.min(assertability_rank(*level));
+    }
+    if rank == u8::MAX {
+        Assertability::AbstainOrFence
+    } else {
+        assertability_for_rank(rank)
+    }
+}
+
+/// Invalidated derivative key set for revoked roots.
+///
+/// I12.20 requires removing revoked support from derived artifacts, including
+/// Context Compiler outputs and caches. This is the pure projection of that
+/// rule for external cache/context-profile owners: one
+/// `revoked_source_support:{handle}` key per revoked root handle plus one
+/// `quarantined_derivative:{atom}` key per revocation-quarantined atom, in
+/// deterministic order. Owners match their derivative keys against this set,
+/// invalidate without resurrecting revoked influence, and rebuild from clean
+/// inputs.
+///
+/// Performs no I/O and owns no cache; deterministic, bounded, stateless and
+/// side-effect free.
+pub fn revoked_derivative_invalidation_set(
+    revoked_handles: &BTreeSet<ArtifactId>,
+    quarantined_atom_ids: &BTreeSet<ArtifactId>,
+) -> BTreeSet<String> {
+    let mut invalidated = BTreeSet::new();
+    for handle in revoked_handles {
+        invalidated.insert(format!("revoked_source_support:{handle}"));
+    }
+    for atom_id in quarantined_atom_ids {
+        invalidated.insert(format!("quarantined_derivative:{atom_id}"));
+    }
+    invalidated
+}
+
+/// Bounded quarantine scope for incomplete lineage.
+///
+/// I12.20 requires that when lineage is incomplete, only the bounded affected
+/// scope is quarantined: Problem State is opened and a rebuild from clean
+/// inputs is scheduled instead of purging memory by similarity. This is the
+/// pure compiler slice of that rule: it returns exactly the atom ids whose
+/// lineage is incomplete — an empty source-handle vector, or any blank
+/// handle text where lineage is required — in deterministic order. Clean
+/// atoms are never included, so callers quarantine the bounded scope instead
+/// of failing or suppressing the whole read set, and emit no similarity
+/// purge.
+///
+/// Opening Problem State and scheduling rebuild effects belong to other
+/// owners; deterministic, bounded, stateless and side-effect free.
+pub fn bounded_quarantine_scope_for_incomplete_lineage(
+    atoms: &[ContextAtom],
+) -> BTreeSet<ArtifactId> {
+    let mut scope = BTreeSet::new();
+    for atom in atoms {
+        let incomplete = atom.source_handles.is_empty()
+            || atom
+                .source_handles
+                .iter()
+                .any(|handle| handle.as_str().trim().is_empty());
+        if incomplete {
+            scope.insert(atom.atom_id.clone());
+        }
+    }
+    scope
+}
+
+/// Read set with a quarantine scope removed, preserving all other fields.
+///
+/// Pure projection used to compile the clean remainder while the quarantined
+/// scope is seeded into `admissions` separately; never silently drops atoms.
+fn scoped_input_without_quarantined_scope(
+    input: &ContextInput,
+    scope: &BTreeSet<ArtifactId>,
+) -> ContextInput {
+    ContextInput {
+        scope: input.scope.clone(),
+        task_id: input.task_id.clone(),
+        task_revision: input.task_revision,
+        state_fence: input.state_fence.clone(),
+        atoms: input
+            .atoms
+            .iter()
+            .filter(|atom| !scope.contains(&atom.atom_id))
+            .cloned()
+            .collect(),
+        unknowns: input.unknowns.clone(),
+    }
+}
+
+/// Per-source assertability floors observed across one read set.
+///
+/// This stateless package can only observe the read set itself, so each
+/// handle's floor is the minimum declared ceiling across the atoms projecting
+/// it (see [`minimum_assertability_for_lineage`]). Deterministic and bounded.
+fn source_assertability_floors(atoms: &[ContextAtom]) -> BTreeMap<&ArtifactId, Assertability> {
+    let mut floors: BTreeMap<&ArtifactId, Assertability> = BTreeMap::new();
+    for atom in atoms {
+        for handle in &atom.source_handles {
+            floors
+                .entry(handle)
+                .and_modify(|floor| {
+                    *floor = minimum_assertability_for_lineage(&[*floor, atom.assertability]);
+                })
+                .or_insert(atom.assertability);
+        }
+    }
+    floors
+}
+
+/// Effective assertability for one atom under the minimum-inheritance cap.
+///
+/// With `None` floors (the empty-set `compile` path) the declared ceiling
+/// passes through untouched. Otherwise a mixed-lineage atom — more than one
+/// distinct source handle — is downgraded to the minimum ceiling across its
+/// material sources, never upgraded; single-lineage atoms keep their declared
+/// ceiling. Returns the effective ceiling and whether a downgrade applied.
+fn capped_assertability_for_atom(
+    atom: &ContextAtom,
+    source_floors: Option<&BTreeMap<&ArtifactId, Assertability>>,
+) -> (Assertability, bool) {
+    let Some(floors) = source_floors else {
+        return (atom.assertability, false);
+    };
+    let distinct: BTreeSet<&ArtifactId> = atom.source_handles.iter().collect();
+    if distinct.len() < 2 {
+        return (atom.assertability, false);
+    }
+    let mut ceilings = Vec::with_capacity(distinct.len() + 1);
+    ceilings.push(atom.assertability);
+    for handle in distinct {
+        if let Some(floor) = floors.get(handle) {
+            ceilings.push(*floor);
+        }
+    }
+    let minimum = minimum_assertability_for_lineage(&ceilings);
+    if assertability_rank(minimum) < assertability_rank(atom.assertability) {
+        (minimum, true)
+    } else {
+        (atom.assertability, false)
+    }
+}
+
+/// Whole-unit budget ledger threaded through candidate admission.
+#[derive(Clone, Debug, Default)]
+struct BudgetLedger {
+    spent_total: u32,
+    spent_roles: Vec<(ContextRole, u32)>,
+}
+
+/// Whole-unit budget admission for one candidate.
+///
+/// Identical admission semantics to the historical compiler loop: unsafe
+/// material is quarantined, stale material revalidates, fitting units are
+/// included whole (emitted with their effective assertability ceiling),
+/// required/protected overflow degrades to exact handles, and optional
+/// overflow is suppressed. Emitted reasons name the minimum-inheritance cap
+/// whenever it downgraded an included unit.
+fn admit_with_budget(
+    atom: &ContextAtom,
+    recipe: &ContextRecipe,
+    ledger: &mut BudgetLedger,
+    effective: Assertability,
+    capped: bool,
+    units: &mut Vec<ContextAtom>,
+    handles: &mut Vec<ArtifactId>,
+) -> AdmissionDecision {
+    let role_spent = ledger
+        .spent_roles
+        .iter()
+        .find(|(role, _)| *role == atom.role)
+        .map_or(0, |(_, spent)| *spent);
+    let role_limit = recipe.budget_for(atom.role);
+    let fits = ledger.spent_total.saturating_add(atom.cost) <= recipe.total_cost
+        && role_spent.saturating_add(atom.cost) <= role_limit;
+    let freshness_ok = matches!(
+        atom.freshness,
+        EvidenceFreshness::ExactCandidate
+            | EvidenceFreshness::ExactCommit
+            | EvidenceFreshness::ExactQuiescedWorktree
+    );
+    let safe = effective != Assertability::AbstainOrFence
+        && !matches!(atom.status, EpistemicStatus::Rejected);
+    let disposition = if !safe {
+        AdmissionDisposition::Quarantined
+    } else if !freshness_ok {
+        AdmissionDisposition::Revalidate
+    } else if fits {
+        let mut emitted = atom.clone();
+        emitted.assertability = effective;
+        units.push(emitted);
+        ledger.spent_total = ledger.spent_total.saturating_add(atom.cost);
+        if let Some((_, spent)) = ledger
+            .spent_roles
+            .iter_mut()
+            .find(|(role, _)| *role == atom.role)
+        {
+            *spent = spent.saturating_add(atom.cost);
+        } else {
+            ledger.spent_roles.push((atom.role, atom.cost));
+        }
+        AdmissionDisposition::Included
+    } else if atom.required || atom.protected {
+        handles.push(atom.atom_id.clone());
+        AdmissionDisposition::HandleOnly
+    } else {
+        AdmissionDisposition::Suppressed
+    };
+    let reason = if capped && disposition == AdmissionDisposition::Included {
+        LINEAGE_ASSERTABILITY_CAP_REASON.to_owned()
+    } else {
+        reason_for(disposition)
+    };
+    AdmissionDecision {
+        atom_id: atom.atom_id.clone(),
+        protected: atom.protected,
+        reason,
+        disposition,
+    }
+}
+
+/// Bounded quarantine admissions for an incomplete-lineage scope.
+///
+/// Returns one `Quarantined` decision per affected atom in deterministic
+/// atom-id order; clean atoms never appear, so the scope stays bounded.
+/// Rebuild-from-clean-inputs signalling is emitted by the caller as an
+/// unknown alongside these decisions.
+fn seed_incomplete_lineage_quarantines(
+    atoms: &[ContextAtom],
+    scope: &BTreeSet<ArtifactId>,
+) -> Vec<AdmissionDecision> {
+    let mut seeded = Vec::with_capacity(scope.len());
+    for atom_id in scope {
+        let protected = match atoms.iter().find(|atom| &atom.atom_id == atom_id) {
+            Some(atom) => atom.protected,
+            None => false,
+        };
+        seeded.push(AdmissionDecision {
+            atom_id: atom_id.clone(),
+            disposition: AdmissionDisposition::Quarantined,
+            reason: INCOMPLETE_LINEAGE_QUARANTINE_REASON.to_owned(),
+            protected,
+        });
+    }
+    seeded
+}
+
+/// Rebuild unknown threading the invalidated-derivative key set into output.
+///
+/// Returns one stable marker when [`revoked_derivative_invalidation_set`]
+/// is non-empty for the revoked roots, and nothing otherwise — in particular
+/// nothing on the empty-set `compile` path.
+fn derivative_invalidation_unknown(
+    revoked_handles: &BTreeSet<ArtifactId>,
+    revoked_quarantined: &BTreeSet<ArtifactId>,
+) -> Option<String> {
+    if revoked_derivative_invalidation_set(revoked_handles, revoked_quarantined).is_empty() {
+        None
+    } else {
+        Some(REVOKED_DERIVATIVE_INVALIDATION_UNKNOWN.to_owned())
     }
 }
 
