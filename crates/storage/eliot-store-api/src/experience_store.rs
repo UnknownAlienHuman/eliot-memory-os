@@ -531,3 +531,22 @@ impl ExperienceRangePage {
         })
     }
 }
+
+/// Extracts one audit-range envelope candidate from a capture subject.
+///
+/// Syntactic filter only, shared by every backend so contours agree:
+/// the subject must parse as JSON, must be an object, and must carry a
+/// string `record_id`. Anything else yields `None` and the caller skips
+/// it — ordinary non-envelope captures are normal store content, never
+/// corruption. This performs NO semantic validation and confers NO
+/// admission: full envelope validation happens at the consumer edge
+/// (`ObservationRecordEnvelope::validate`), and only records the live
+/// Governor journal actually admitted may be carried downstream. A
+/// subject that parses but is not an envelope can therefore never become
+/// a false journal record.
+pub fn audit_envelope_candidate(subject: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(subject).ok()?;
+    let object = value.as_object()?;
+    object.get("record_id")?.as_str()?;
+    Some(value)
+}

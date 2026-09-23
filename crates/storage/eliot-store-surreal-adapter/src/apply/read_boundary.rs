@@ -378,6 +378,9 @@ async fn named_read_payload(
         NamedReadOperation::GetAgentFeedbackRange => {
             experience_feedback_range_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetAuditRange => {
+            audit_range_payload(db, &adapter.config, query, state_fence).await
+        }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
@@ -1946,6 +1949,59 @@ async fn automation_failure_payload(
         "revision": revision,
         "state_fence": state_fence,
     }))
+}
+
+/// Reads capture rows and projects the bounded same-fence audit range
+/// (issue #223).
+///
+/// Projects durable `CaptureObservation` evidence subjects as envelope
+/// candidates through the shared `audit_envelope_candidate` filter
+/// (memory-contour parity: fence-gated, scope-agnostic, ordinary
+/// non-envelope captures skipped, never failed). Each candidate row
+/// re-validates its bytes/digest provenance before shaping, so
+/// substituted or truncated evidence fails closed instead of projecting.
+/// Reads beyond `MAX_AUDIT_RANGE_RECORDS` fail closed with
+/// `PayloadTooLarge` instead of truncating. Candidate-only: full
+/// envelope validation and live-journal presence binding stay
+/// downstream, so a carried candidate can never become a false journal
+/// record here.
+async fn audit_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetAuditRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let rows = read_evidence_records(db, config).await?;
+    let mut records = Vec::new();
+    for row in &rows {
+        let fenced = match &row.receipt {
+            Some(receipt) if receipt.state_fence == *state_fence => true,
+            _ => false,
+        };
+        if !fenced {
+            continue;
+        }
+        for evidence in row.evidence_records.iter().flatten() {
+            validate_evidence_record(row, evidence).map_err(AdapterError::Store)?;
+            if let Some(candidate) =
+                eliot_store_api::audit_envelope_candidate(&evidence.subject)
+            {
+                records.push(candidate);
+            }
+            if records.len() > eliot_store_api::MAX_AUDIT_RANGE_RECORDS as usize {
+                return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+            }
+        }
+    }
+    Ok(json!({ "records": records }))
 }
 
 /// Reads bank rows and projects the bounded same-fence, same-scope

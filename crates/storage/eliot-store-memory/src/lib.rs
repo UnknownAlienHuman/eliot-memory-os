@@ -1612,6 +1612,55 @@ fn experience_range_payload(
     )
 }
 
+/// Builds the same-fence audit-range payload (issue #223).
+///
+/// Projects durable `CaptureObservation` command records as envelope
+/// candidates through the shared [`audit_envelope_candidate`] filter:
+/// subjects that parse as JSON objects carrying a string `record_id`
+/// are carried verbatim; ordinary non-envelope captures are skipped
+/// (normal store content, never corruption). No scope filtering: command
+/// scopes need not match event scopes, and the consumer (provider
+/// presence-binding plus Governor scope revalidation) owns scope
+/// gating — store-level scope filtering here would silently drop records
+/// the consumer must see. Fence agreement is enforced by the caller: this
+/// helper runs only after `execute_named_sync` proves the query fence
+/// equals the state fence. Reads beyond
+/// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
+/// fail closed with [`StoreError::PayloadTooLarge`] instead of
+/// truncating: a truncated audit range cannot prove journal
+/// completeness. This projects candidates only — full envelope
+/// validation and live-journal presence binding stay downstream, so a
+/// carried candidate can never become a false journal record here.
+/// Projects durable capture subjects as envelope candidates. Fence
+/// agreement is enforced by the caller: this helper runs only after
+/// `execute_named_sync` proves the query fence equals the state fence.
+fn audit_range_payload(state: &MemoryState) -> Result<Value, serde_json::Error> {
+    use eliot_store_api::MAX_AUDIT_RANGE_RECORDS;
+    let mut records = Vec::new();
+    for record in &state.named_operations {
+        if record.operation.operation != NamedMutationOperation::CaptureObservation {
+            continue;
+        }
+        let Some(subject) = record
+            .operation
+            .parameters
+            .get("subject")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if let Some(candidate) = eliot_store_api::audit_envelope_candidate(subject) {
+            records.push(candidate);
+        }
+        if records.len() > MAX_AUDIT_RANGE_RECORDS as usize {
+            return Err(serde_json::Error::custom(
+                "audit range exceeds the bounded maximum",
+            ));
+        }
+    }
+    serde_json::to_value(json!({ "records": records }))
+}
+
 /// Builds the same-fence user-automation read payload (issue #1779).
 ///
 /// Errors surface as serialization failures with the underlying message:
@@ -2276,6 +2325,7 @@ impl MemoryStore {
                 | NamedReadOperation::GetUserAutomationState
                 | NamedReadOperation::GetExperienceBankRange
                 | NamedReadOperation::GetAgentFeedbackRange
+                | NamedReadOperation::GetAuditRange
         ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
@@ -2395,6 +2445,7 @@ impl MemoryStore {
             NamedReadOperation::GetAgentFeedbackRange => {
                 experience_range_payload(&state, query, &fence, false)
             }
+            NamedReadOperation::GetAuditRange => audit_range_payload(&state),
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
                 "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),

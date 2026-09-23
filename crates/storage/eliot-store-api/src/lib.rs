@@ -168,8 +168,8 @@ pub use experience_store::{
     EXPERIENCE_PARAM_RECORD_REVISION, EXPERIENCE_PARAM_SCOPE_DIGEST, EXPERIENCE_STORE_SCHEMA_V1,
     ExperienceContractError, ExperienceRangePage, MAX_EXPERIENCE_HANDLE_BYTES,
     MAX_EXPERIENCE_IDEMPOTENCY_BYTES, MAX_EXPERIENCE_PAGE_RECORDS,
-    MAX_EXPERIENCE_RECORD_JSON_BYTES, decode_experience_mutation, experience_bank_commit_params,
-    experience_bank_mutation_request, experience_bank_read_request,
+    MAX_EXPERIENCE_RECORD_JSON_BYTES, audit_envelope_candidate, decode_experience_mutation,
+    experience_bank_commit_params, experience_bank_mutation_request, experience_bank_read_request,
     experience_feedback_commit_params, experience_feedback_mutation_request,
     experience_feedback_read_request, validate_experience_mutation_params,
     validate_experience_read_params,
@@ -183,10 +183,10 @@ pub use write_admission::{
 
 pub use operation_catalogue::{
     ACTIVATED_READ_OWNING_SECTION, EVIDENCE_PACK_MAX_RECORDS, GENESIS_OWNING_SECTION,
-    MINIMUM_COMPATIBLE_VERSION, OPERATION_CATALOGUE_PROFILE, OperationKind, READ_MAX_INPUT_BYTES,
-    READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS, SCOPE_KIND_NONE, SCOPE_KIND_SCOPE,
-    SINGLE_MANIFEST_OWNING_SECTION, activated_read_operations, generated_operation_manifests,
-    operation_manifest_set_digest,
+    MAX_AUDIT_RANGE_RECORDS, MINIMUM_COMPATIBLE_VERSION, OPERATION_CATALOGUE_PROFILE,
+    OperationKind, READ_MAX_INPUT_BYTES, READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS, SCOPE_KIND_NONE,
+    SCOPE_KIND_SCOPE, SINGLE_MANIFEST_OWNING_SECTION, activated_read_operations,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 
 pub use operation_parameters::{
