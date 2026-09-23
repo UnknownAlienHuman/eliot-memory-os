@@ -101,7 +101,8 @@ pub fn entries_since(
 /// recomputable digest over admitted request digests in key order.
 ///
 /// The digest binds exactly what was read and lets a later read prove
-/// change-or-same; it establishes no completeness beyond the read itself.
+/// change-or-same via [`verify_journal_coverage`]; it establishes no
+/// completeness beyond the read itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JournalCoverage {
@@ -170,4 +171,31 @@ pub fn journal_coverage(journal: &ObservationJournal) -> JournalCoverage {
         rejected,
         coverage_digest,
     }
+}
+
+/// Prove change-or-same for a held coverage against the live journal.
+///
+/// Recomputes coverage from the current owner snapshot ([`journal_coverage`])
+/// and fails closed when the live journal advanced past the held read:
+/// counts or digest drift means new admissions, new rejections, or a
+/// rebuild, and the held coverage no longer describes the owner. A match
+/// proves the journal is unchanged since the held read; it establishes no
+/// completeness beyond the two compared reads.
+///
+/// # Errors
+///
+/// Returns [`ObservationError`] when the held coverage shape is invalid or
+/// when the live recomputation differs from it.
+pub fn verify_journal_coverage(
+    journal: &ObservationJournal,
+    coverage: &JournalCoverage,
+) -> Result<(), ObservationError> {
+    coverage.validate()?;
+    let live = journal_coverage(journal);
+    if live != *coverage {
+        return Err(ObservationError::CoverageIncomplete {
+            reason: "live owner state advanced",
+        });
+    }
+    Ok(())
 }

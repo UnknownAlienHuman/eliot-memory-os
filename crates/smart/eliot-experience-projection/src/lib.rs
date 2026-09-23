@@ -31,7 +31,10 @@ use eliot_observation_contracts::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub use cursor::{JournalCoverage, JournalCursor, entries_since, journal_coverage, journal_cursor};
+pub use cursor::{
+    JournalCoverage, JournalCursor, entries_since, journal_coverage, journal_cursor,
+    verify_journal_coverage,
+};
 
 /// Freeze identity this package builds against.
 ///
