@@ -53,7 +53,7 @@ fn materializer_genesis_epoch() -> Result<EpochId, MaterializeError> {
 ///
 /// `authority.json` and `store-bootstrap.json` are intentionally absent. They
 /// are Host-owned Phase-B material and can never be supplied by this command.
-pub const REQUIRED_ROLES: [(&str, bool); 13] = [
+pub const REQUIRED_ROLES: [(&str, bool); 14] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
@@ -64,6 +64,7 @@ pub const REQUIRED_ROLES: [(&str, bool); 13] = [
     ("eliot-testd.exe", true),
     ("eliot-native-worker.exe", true),
     ("eliot-wasm-host.exe", true),
+    ("eliot-notify.exe", true),
     ("generation.json", false),
     ("eliotd-governor.json", false),
     ("eliotd.json", false),
@@ -92,6 +93,8 @@ pub struct CanarySourceBundleMaterializeInput {
     pub eliot_native_worker_exe: PathBuf,
     /// Release `eliot-wasm-host.exe` path.
     pub eliot_wasm_host_exe: PathBuf,
+    /// Release `eliot-notify.exe` path (per-user one-shot adapter, I1.3).
+    pub eliot_notify_exe: PathBuf,
     /// Optional explicit external agent-bridge executable source.
     pub agent_bridge_exe: Option<PathBuf>,
     /// Optional account name resolved by Windows to the approved stable SID.
@@ -170,7 +173,7 @@ pub struct CanarySourceBundleReceipt {
     pub bundle_path: String,
     /// Canonical relative generation identity.
     pub generation: String,
-    /// Full thirteen-role canonical artifact evidence digest.
+    /// Full fourteen-role canonical artifact evidence digest.
     pub evidence_digest: String,
     /// Exact role inventory, identities and byte facts.
     pub files: Vec<MaterializedRoleReceipt>,
@@ -181,7 +184,7 @@ pub struct CanarySourceBundleReceipt {
 }
 
 /// The non-wire proof handed directly to the generation planner.  It carries
-/// only the exact published root identity, ordered thirteen-role byte facts and
+/// only the exact published root identity, ordered fourteen-role byte facts and
 /// full evidence digest; the planner independently reopens and observes the
 /// path before accepting these facts.
 #[derive(Clone, Debug)]
@@ -200,7 +203,7 @@ impl CanarySourceBundleReceipt {
             || self.source_identity != self.directory_publication.destination_identity
         {
             return Err(MaterializeError::Invalid(
-                "published source receipt is not an exact thirteen-role directory publication"
+                "published source receipt is not an exact fourteen-role directory publication"
                     .to_owned(),
             ));
         }
@@ -239,7 +242,7 @@ pub enum CanarySourceBundleReconciliationReason {
     /// The platform move committed but exact directory receipt readback was
     /// unavailable.
     DirectoryPublicationUnknown,
-    /// Directory publication was exact, but the complete thirteen-role
+    /// Directory publication was exact, but the complete fourteen-role
     /// post-commit source-bundle readback was rejected.
     #[allow(
         dead_code,
@@ -256,7 +259,7 @@ pub struct CanarySourceBundleReconciliation {
     pub bundle_path: String,
     /// Canonical relative generation identity.
     pub generation: String,
-    /// Full thirteen-role canonical artifact evidence digest.
+    /// Full fourteen-role canonical artifact evidence digest.
     pub evidence_digest: String,
     /// Complete role facts measured before the atomic commit.
     pub precommit_files: Vec<MaterializedRolePrecommitReceipt>,
@@ -494,7 +497,7 @@ fn validate_role_inventory(roles: &[(&str, bool)]) -> Result<(), MaterializeErro
     for (actual, expected) in roles.iter().zip(REQUIRED_ROLES) {
         if actual != &expected {
             return Err(MaterializeError::Invalid(format!(
-                "role inventory must be the exact ordered thirteen-role Phase-A set; got {}",
+                "role inventory must be the exact ordered fourteen-role Phase-A set; got {}",
                 actual.0
             )));
         }
@@ -1221,7 +1224,7 @@ fn typed_bundle_from_journal(
 > {
     if journal.precommit_files.len() != REQUIRED_ROLES.len() {
         return Err(MaterializeError::Invalid(
-            "publication journal does not retain the complete thirteen-role inventory".to_owned(),
+            "publication journal does not retain the complete fourteen-role inventory".to_owned(),
         ));
     }
     let mut manifest_files = Vec::with_capacity(REQUIRED_ROLES.len());
@@ -1683,9 +1686,9 @@ fn materialize_with_executables(
         .installation_epoch
         .validate()
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    if executables.len() != 10 {
+    if executables.len() != 11 {
         return Err(MaterializeError::Invalid(
-            "exactly ten validated executables are required".to_owned(),
+            "exactly eleven validated executables are required".to_owned(),
         ));
     }
 
@@ -1892,6 +1895,7 @@ pub fn materialize_canary_source_bundle(
             "eliot-native-worker.exe",
         ),
         (input.eliot_wasm_host_exe.clone(), "eliot-wasm-host.exe"),
+        (input.eliot_notify_exe.clone(), "eliot-notify.exe"),
     ];
     let executables = executable_inputs
         .into_iter()
@@ -1951,6 +1955,7 @@ mod tests {
             "eliot-testd.exe",
             "eliot-native-worker.exe",
             "eliot-wasm-host.exe",
+            "eliot-notify.exe",
         ]
         .into_iter()
         .enumerate()
@@ -2006,6 +2011,7 @@ mod tests {
             eliot_testd_exe: PathBuf::new(),
             eliot_native_worker_exe: PathBuf::new(),
             eliot_wasm_host_exe: PathBuf::new(),
+            eliot_notify_exe: PathBuf::new(),
             agent_bridge_exe: None,
             agent_bridge_account: None,
             output_bundle: source_parent.path().join("bundle"),
@@ -2177,7 +2183,7 @@ mod tests {
         let CanarySourceBundleMaterializeOutcome::Published(receipt) = outcome else {
             panic!("exact materializer publication unexpectedly requires reconciliation");
         };
-        assert_eq!(receipt.files.len(), 13);
+        assert_eq!(receipt.files.len(), 14);
         assert_eq!(
             receipt.directory_publication.source_identity,
             receipt.directory_publication.destination_identity
