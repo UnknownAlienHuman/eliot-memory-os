@@ -1589,6 +1589,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-memory-revision"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-context-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-observation-contracts",
+ "schemars",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-dreamer-orientation"
 version = "0.1.0"
 dependencies = [
