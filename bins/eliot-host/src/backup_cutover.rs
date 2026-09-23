@@ -143,6 +143,7 @@ use eliot_platform::PlatformHandle;
 use eliot_protocol::{
     host_request_operation_id, HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestKind,
 };
+use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use serde::Deserialize;
 
 // Stubless consumption of the Parfit-owned (#1751) retirement barrier,
@@ -263,11 +264,23 @@ pub struct IsolatedRecoveryEvidence {
     /// `model.rs:2043` on current main past #2388; empty when the restored
     /// generation carries no prior introductions). Every row must read
     /// `OperationalPhase::Fenced`: a fenced introduction can never read as
-    /// usable again, while any `Active` row blocks cutover. Readback
-    /// completeness is the admitted contour's obligation; lease quiescence
-    /// is independently proven by the barrier, whose ORS enumeration is
-    /// Parfit's (#1751) domain.
+    /// usable again, while any `Active` row blocks cutover. Shape alone
+    /// never suffices: the coordination receipt below proves these rows
+    /// passed the journal-owner live readback gate at restore time.
     pub fenced_introductions: Vec<CapabilityIntroductionProjection>,
+    /// Committed Governor coordination receipt for this restore (F-AUR-1).
+    ///
+    /// The bridge-issued receipt for the coordination row keyed by the
+    /// restore operation identity. Coordination rows commit only through
+    /// the gated restore dispatch, which live-verifies every presented
+    /// introduction against owner/ORS readback before any effect — so a
+    /// structurally valid receipt bound to this restore proves its
+    /// introductions passed the live gate. Only the canonical store bridge
+    /// can mint such a receipt; console bytes alone never suffice.
+    pub coordination_receipt: WriteReceipt,
+    /// Restore operation identity keying the coordination row (must equal
+    /// both the request operation identity and the receipt's operation).
+    pub coordination_row_key: String,
     /// Degraded recovery under its explicit stricter policy, if set.
     pub degraded_policy: Option<PlatformHandle>,
 }
@@ -498,16 +511,36 @@ pub fn validate_cutover_request(
     {
         return Err(CutoverError::PriorAuthorityStillActive);
     }
-    // F-AUR-1 architectural split (documented, not a relabel): the shape
-    // check above rejects malformed evidence early, but console-presented
-    // rows are NEVER trusted from spelling. The authoritative live compare
-    // (subject identity, fence snapshot, operation order, Fenced phase
-    // against owner/ORS readback) runs kernel-side in the restore dispatch
-    // (`KernelRestoreJournal::verify_introductions_fenced`, called by
-    // `drive_production_restore` after mint and before any effect); cutover
-    // additionally requires the restore receipt chain binding that verified
-    // restore. A rest presented here without that chain fails below at the
-    // receipt/denominator gates.
+    // F-AUR-1 cutover-side binding (no relabel bypass): the presented
+    // introductions above are shape-checked only. The authoritative live
+    // compare ran kernel-side at restore time
+    // (`KernelRestoreJournal::verify_introductions_fenced`, mandatory in
+    // the gated restore dispatch before any effect), and coordination rows
+    // commit only through that gated dispatch. This gate therefore requires
+    // the bridge-issued coordination receipt bound to THIS restore: a
+    // structurally valid, committed receipt whose operation identity, row
+    // key, and fence all match. Only the canonical store bridge can mint
+    // such a receipt, so its presence proves the introductions passed the
+    // live gate; console bytes alone never suffice.
+    evidence
+        .coordination_receipt
+        .validate()
+        .map_err(|error| CutoverError::InvalidRecoveryReceipt(error.to_string()))?;
+    if evidence.coordination_receipt.status != WriteReceiptStatus::Committed {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if evidence.coordination_receipt.operation_id.as_str()
+        != request.operation.operation_id.as_str()
+        || evidence.coordination_row_key != request.operation.operation_id.as_str()
+    {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if !fences_match_exact(
+        &evidence.coordination_receipt.state_fence,
+        &request.activation_fence,
+    ) {
+        return Err(CutoverError::BindingMismatch);
+    }
     if !evidence.destination_ready {
         return Err(CutoverError::AuthorityOrReadinessMissing);
     }
