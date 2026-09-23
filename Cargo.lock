@@ -3318,11 +3318,15 @@ dependencies = [
 name = "eliot-watchdog"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "eliot-contracts",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-notify-core",
  "eliot-ors",
+ "eliot-platform",
  "eliot-platform-windows",
+ "eliot-receipts",
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-watchdog-core",

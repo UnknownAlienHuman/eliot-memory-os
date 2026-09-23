@@ -67,6 +67,7 @@ mod supervision_lease_load;
 mod watchdog_admission;
 mod watchdog_composition;
 mod watchdog_config;
+mod watchdog_fallback_envelope;
 mod watchdog_publication_readback;
 mod watchdog_spool;
 
@@ -84,14 +85,14 @@ use watchdog_publication_readback::{
     observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
     verify_against_durable_current,
 };
+pub use watchdog_spool::export_driver::{
+    WatchdogEntryView, WatchdogExportSink, export_once, watchdog_entry_views, watchog_entry_views,
+};
 pub(crate) use watchdog_spool::{
     SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, WatchdogSpool, watchdog_spool_path,
 };
 pub use watchdog_spool::{
     SpoolAppendOutcome, WatchdogSpoolEntry, WatchdogSpoolExportLimits, WatchdogSpoolPayload,
-};
-pub use watchdog_spool::export_driver::{
-    WatchdogEntryView, WatchdogExportSink, export_once, watchog_entry_views, watchdog_entry_views,
 };
 
 #[cfg(test)]
@@ -123,6 +124,9 @@ pub(crate) use service_registration_projection::{
     read_approved_service_registration, validate_bound_service_registrations,
 };
 
+pub use heartbeat_transport::{
+    FENCE_SEQUENCE, HeartbeatTransport, HeartbeatTransportDescriptor, HeartbeatTransportError,
+};
 #[cfg(test)]
 use runtime_manifest_selection::manifest_matches_bootstrap;
 use runtime_manifest_selection::{read_registry_for_bootstrap, select_runtime_manifest};
@@ -143,8 +147,9 @@ use watchdog_admission::validate_runtime_binding;
 pub use watchdog_admission::{FileWatchdogAdmission, WatchdogRuntimeBinding};
 pub use watchdog_composition::{WatchdogAuthorityState, WatchdogComposition, WatchdogReadiness};
 pub use watchdog_config::WatchdogConfig;
-pub use heartbeat_transport::{
-    FENCE_SEQUENCE, HeartbeatTransport, HeartbeatTransportDescriptor, HeartbeatTransportError,
+pub use watchdog_fallback_envelope::{
+    WatchdogFallbackMintError, WatchdogFallbackMintInputs, mint_watchdog_fallback_envelope,
+    publish_watchdog_fallback_envelope,
 };
 
 /// Canonical public admission template shared with Host/runtime-status.
@@ -1965,8 +1970,8 @@ mod tests {
         assert!(monitor.canonical_identity().is_some());
     }
 
-    mod self_admission_and_gap;
     mod s08w_recovery_containment;
+    mod self_admission_and_gap;
 
     fn heartbeat(sequence: u64) -> WatchdogSpoolEntry {
         WatchdogSpoolEntry {
