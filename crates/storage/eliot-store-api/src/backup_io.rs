@@ -25,7 +25,10 @@ use crate::{OperationIdentity, OrderingHead, RevisionHead, StoreError, Transitio
 /// 1.1.0: isolated restore carries the provisional restore admission
 /// slot (issues #952/#975 R2/R3) and completion receipts repeat the
 /// presented decision digest.
-pub const STORE_BACKUP_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
+/// 1.2.0: the admission binds the Governor restore-directive reference
+/// (operation identity plus canonical request hash) that the bridge
+/// reads back against the committed canonical receipt chain (F1).
+pub const STORE_BACKUP_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 2, 0);
 /// Largest member population admitted in one backup page.
 pub const MAX_STORE_BACKUP_PAGE_MEMBERS: usize = 256;
 /// Largest residency disposition set admitted on one completion receipt.
@@ -468,36 +471,43 @@ pub const RESTORE_OPERATION_CLASS: &str = "backup.restore";
 /// This is the operation-class admission slot the restore executes under:
 /// it binds the stable restore identity, the fixed `RecoverySchema`
 /// transition class, the fixed [`RESTORE_OPERATION_CLASS`], the admitted
-/// isolated destination, the shared fence, the capture denominator, and
-/// the source snapshot. The store bridge recomputes
-/// [`Self::decision_digest`] and refuses any mismatch, then executes
-/// exactly the presented plan and repeats the digest in the restore
-/// receipt. The bridge never mints, widens, or reinterprets this
-/// admission.
+/// isolated destination, the shared fence, the capture denominator, the
+/// source snapshot, and the Governor restore-directive reference below.
+/// The store bridge recomputes [`Self::decision_digest`] and refuses any
+/// mismatch, binds the directive reference against the committed
+/// canonical receipt it fetches itself, executes exactly the presented
+/// plan, and repeats the digest in the restore receipt. The bridge never
+/// mints, widens, or reinterprets this admission.
 ///
 /// PROVISIONAL — not proof of Governor issuance: recomputation verifies
 /// self-consistency only. Any transport peer can mint a fully consistent
 /// struct, so this admission alone authorizes nothing; the bridge
-/// additionally binds it to independent canonical anchors (the completed
-/// live source-capture row, the deployment-provisioned destination
-/// record, the frame-enforced session capability and transport identity)
-/// and refuses replays under a rotated digest. The future Governor
-/// minter (#959/#960) replaces provisional minting with a durable
-/// admission anchor the bridge reads back: a committed coordination row
-/// keyed by the restore operation identity carrying the Governor's
-/// decision digest over the exact operation/destination/payload-digest/
-/// fence tuple below. Until that anchor exists, no restore is admittable
-/// by this struct, and no claim in this module asserts otherwise.
+/// additionally binds it to independent canonical anchors (the committed
+/// Governor-directive receipt, the completed live source-capture row,
+/// the deployment-provisioned destination record, the frame-enforced
+/// session capability and transport identity) and refuses replays under
+/// a rotated digest. The future Governor minter (#959/#960) mints
+/// instances of this exact shape whose directive reference names a
+/// committed `RecoverySchema` directive transition covering the restore;
+/// until such directives exist, restores refuse at the directive
+/// readback, and no claim in this module asserts otherwise.
 ///
-/// Minter gap (exact): the Governor-side minter does not exist yet, so
-/// no caller can honestly produce an admitted instance today. What this
-/// contract verifies: closed shape, fixed class markers,
-/// identity/destination/fence/denominator/snapshot cross-bindings against
-/// the request and scope, and equality of the recomputed decision digest.
-/// What it cannot supply: issuance itself — which must arrive through the
-/// Governor owner, never through session capability, reserved-write
-/// relabeling, or a caller-fabricated digest. Verification here is
-/// deliberately not weakened to fake admittability.
+/// Minter contract (exact, store-side acceptance): to admit a restore,
+/// the Governor owner commits a canonical transition under
+/// `TransitionClass::RecoverySchema` on the shared fence whose receipt
+/// carries the restore-covering decision; the admission's directive
+/// reference must name that receipt's operation identity and canonical
+/// request hash byte-for-byte, and the admission decision digest covers
+/// the reference, binding directive, admission, and restore into one
+/// tuple the bridge re-verifies end to end.
+///
+/// What this contract verifies today: closed shape, fixed class markers,
+/// identity/destination/fence/denominator/snapshot/directive
+/// cross-bindings against the request and scope, and equality of the
+/// recomputed decision digest. What it cannot supply: issuance itself —
+/// which must arrive through the Governor owner, never through session
+/// capability, reserved-write relabeling, or a caller-fabricated digest.
+/// Verification here is deliberately not weakened to fake admittability.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreRestoreAdmission {
@@ -518,6 +528,14 @@ pub struct StoreRestoreAdmission {
     pub residency_denominator_digest: String,
     /// Source snapshot digest; must equal the request source digest.
     pub source_snapshot_digest: String,
+    /// Governor restore-directive operation identity: the committed
+    /// canonical `RecoverySchema` transition whose receipt the bridge
+    /// reads back as the issuance anchor (see the minter contract above).
+    /// Valid by construction; bound into [`Self::decision_digest`].
+    pub governor_directive_operation_id: OperationId,
+    /// Canonical request hash of the Governor directive, bound
+    /// byte-for-byte to the directive receipt read back by the bridge.
+    pub governor_directive_request_hash: String,
     /// Decision digest over every field above, recomputed by
     /// [`Self::decision_digest`] and compared for equality downstream.
     /// Recomputation proves self-consistency, never issuance.
@@ -558,6 +576,12 @@ impl StoreRestoreAdmission {
         material.extend_from_slice(self.residency_denominator_digest.as_bytes());
         material.push(b'\n');
         material.extend_from_slice(self.source_snapshot_digest.as_bytes());
+        material.push(b'\n');
+        material.extend_from_slice(
+            self.governor_directive_operation_id.to_string().as_bytes(),
+        );
+        material.push(b'\n');
+        material.extend_from_slice(self.governor_directive_request_hash.as_bytes());
         Ok(sha256_hex(&material))
     }
 
@@ -588,6 +612,10 @@ impl StoreRestoreAdmission {
         validate_digest(
             &self.source_snapshot_digest,
             "backup.source_snapshot_digest",
+        )?;
+        validate_digest(
+            &self.governor_directive_request_hash,
+            "backup.governor_directive_request_hash",
         )?;
         let recomputed = self.decision_digest()?;
         if recomputed != self.admission_decision_digest {

@@ -49,7 +49,7 @@ use eliot_store_api::{
     StoreBackupPhase, StoreBackupReconcileRequest, StoreBackupReconciliation,
     StoreBackupStatusReport, StoreBackupStatusRequest, StoreBackupValidationOutcome,
     StoreBackupValidationReceipt, StoreBackupValidationRequest, StoreError,
-    StoreIsolatedRestoreRequest, sha256_hex,
+    StoreIsolatedRestoreRequest, TransitionClass, WriteReceiptStatus, sha256_hex,
 };
 
 use super::backup_snapshot::{
@@ -120,6 +120,18 @@ pub(crate) async fn backup_isolated_restore(
     // Pin the admitted fence against the live store: both endpoints share
     // it, and the composition already pinned it to its own fence.
     current_live_fence(db, &adapter.config, &request.scope.state_fence).await?;
+    // F1 directive anchor: the Governor's restore directive must be a
+    // committed canonical transition the bridge fetches itself — never a
+    // caller-carried receipt. Only the canonical transaction path
+    // (fence CAS, admission, catalogue) can create such a receipt, so its
+    // presence is the issuance proof the recomputed digest cannot supply.
+    // The receipt must be Committed under RecoverySchema on the shared
+    // fence with the exact operation identity and canonical request hash
+    // the admission names; anything else refuses before any restore I/O.
+    // Until the #959/#960 minter commits directives, every restore
+    // refuses here with ReceiptNotFound: fail-closed, never admittable
+    // by struct alone.
+    verify_governor_directive(adapter, &request).await?;
     let restore_id = request.identity.operation_id.clone();
     if let Some(existing) = load_operation_row(
         db,
@@ -285,6 +297,48 @@ async fn current_live_fence(
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
     Ok(fence)
+}
+
+/// Verifies the Governor restore-directive anchor against the committed
+/// canonical receipt chain (F1).
+///
+/// The bridge fetches the directive receipt itself by the operation
+/// identity the admission names and binds it field by field: the receipt
+/// must exist, validate as a terminal receipt, carry Committed status
+/// under `RecoverySchema` on the shared fence, and repeat the exact
+/// canonical request hash the admission claims. The admission decision
+/// digest (recomputed in request validation) already covers the
+/// directive reference, so a verified receipt binds directive,
+/// admission, and restore into one tuple. No committed directive means
+/// no issuance proof, and the restore refuses — including replays, which
+/// re-verify the anchor on every call.
+async fn verify_governor_directive(
+    adapter: &crate::SurrealStoreAdapter,
+    request: &StoreIsolatedRestoreRequest,
+) -> Result<(), AdapterError> {
+    let receipt = super::read_receipt(
+        adapter,
+        request.admission.governor_directive_operation_id.clone(),
+    )
+    .await?
+    .ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
+    receipt.validate().map_err(AdapterError::Store)?;
+    if receipt.status != WriteReceiptStatus::Committed {
+        return Err(AdapterError::Store(StoreError::ReceiptNotFound));
+    }
+    if receipt.transition_class != TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "backup.transition_class",
+            reason: "restore directives commit only under RecoverySchema",
+        }));
+    }
+    if receipt.canonical_request_hash != request.admission.governor_directive_request_hash {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    if receipt.state_fence != request.scope.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    Ok(())
 }
 
 /// Reconciles a repeated restore against the durable row. An identical
