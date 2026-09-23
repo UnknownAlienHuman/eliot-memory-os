@@ -37,6 +37,42 @@
 //! commit, exact ORS read-back, and only then live installation. Restart
 //! recovery installs an active root only when the hydrated canonical record,
 //! ORS row, and ORS-issued read-back receipt agree exactly.
+//!
+//! Delegated descendant closure (lane C, `#2100`, remainder of `#1110`) builds
+//! on the same rules without inventing a second graph owner:
+//!
+//! - the complete closure enumeration always comes from the injected Governor
+//!   boundary ([`RootGrantHydrationSource::enumerate_grant_closure`]), never
+//!   from the caller and never from process memory alone. Activation fetches
+//!   the owner enumeration and requires byte equality with the presented one;
+//!   revocation derives its fence set from the owner enumeration. A
+//!   caller-supplied affected list, an empty-closure default, or an
+//!   incomplete enumeration cannot commit a receipt;
+//! - the thin P07 revocation never falls back to root-only fencing on a
+//!   missing or singleton owner answer: a bound enumeration always takes the
+//!   closure gate (a singleton is the owner's leaf attestation), and without
+//!   the owner the port fences only when its own live lineage proves no live
+//!   descendants, refusing otherwise;
+//! - one exact graph revision binds the whole closure, enforced durably: the
+//!   per-root revision watermark in ORS advances atomically with the stale
+//!   check, so a superseded presentation fails closed even across restarts.
+//!   The ORS per-row `Active`-to-`Fenced` transition stays the member-level
+//!   compare-and-swap (exact replay returns the same receipt, a changed
+//!   opaque payload under one record identity is
+//!   [`KernelError::IdempotencyConflict`] at ORS, a fence from any other
+//!   phase is refused);
+//! - activation never resurrects: a `Fenced` or `Released` durable member row
+//!   refuses before any mutation, on every activation path including the
+//!   legacy single-root one;
+//! - revocation commits one ORS fence per affected member with an exact
+//!   read-back, then commits one durable closure row binding the operation,
+//!   revision, digest, complete affected set, survivors, and receipt. A
+//!   member already fenced under a previous closure with identical authority
+//!   bytes is reconfirmed, never recommitted, so a fresh operation identity
+//!   (new snapshot or epoch) re-confirms the fence instead of forking one.
+//!   Restart rehydrates the same receipt and disposition by re-presentation
+//!   through the owner enumeration; a missing, mixed-phase, or disagreeing
+//!   ORS row stays fail-closed instead of restoring descendant authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -45,8 +81,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_ors::{
     CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
-    OperationIdentity, OperationalPhase, OperationalRecordInput, OperationalRecoveryStore,
-    StateFenceSnapshot,
+    CapabilityIntroductionActivation, GrantClosureCommit, GrantClosurePreserved, GrantClosureState,
+    OpaqueLabel, OperationIdentity, OperationalPhase, OperationalRecordInput,
+    OperationalRecoveryStore, StateFenceSnapshot,
 };
 use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
 use eliot_runtime_contracts::{
@@ -55,13 +92,15 @@ use eliot_runtime_contracts::{
 use serde::Serialize;
 
 use crate::error::{KernelError, validate_id, validate_text};
+use crate::introduction_lifecycle::{IntroductionHydration, introduction_fence_input};
 
 /// Live grant-activation intent presented to the one P-07 port.
 ///
 /// The port validates every field before mutation and binds the full payload
 /// into the idempotency digest, so any change under one operation identity is
 /// an identity conflict rather than a second activation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantActivationIntent {
     /// Idempotency identity. Ledger key and receipt-derivation root.
     pub operation_id: String,
@@ -129,7 +168,8 @@ pub struct GrantRevocationIntent {
 /// Complete Governor-owned material needed to activate one authority-root
 /// grant. The hydration source must provide every field; the Kernel supplies
 /// no semantic default and rejects child/delegated lineage in this slice.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RootGrantHydration {
     /// Complete semantic activation intent from the canonical Governor owner.
     pub intent: GrantActivationIntent,
@@ -193,7 +233,9 @@ impl RootGrantHydration {
                 "hydrated opaque root-grant record has a different identity".to_owned(),
             ));
         }
-        check_opaque_record_binding(self.durable_record.record(), &request.binding, active_epoch)
+        // Opaque↔intent seal: contour, shape/integrity reconstruction, and
+        // epoch/fence agreement before the record becomes the trust anchor.
+        verify_grant_seal(&self.durable_record, &self.intent, active_epoch)
     }
 
     fn validate_fields(&self, active_epoch: &EpochId) -> Result<(), KernelError> {
@@ -262,6 +304,41 @@ pub trait RootGrantHydrationSource: Send + Sync {
         &self,
         projection: &CapabilityGrantProjection,
     ) -> Result<RootGrantHydration, KernelError>;
+
+    /// Enumerates the complete durable descendant closure for one grant at
+    /// the owner graph revision.
+    ///
+    /// The Governor owner reads its durable `GrantGraph` at one exact revision
+    /// and returns every affected member plus the owner-declared
+    /// alternate-path survivors. The port validates the enumeration (exact
+    /// revision, root, fence, epoch, acyclic parents, completeness against
+    /// live lineage) before any mutation. The default implementation reports
+    /// the missing owner so callers fail closed without fabricating a fence.
+    fn enumerate_grant_closure(
+        &self,
+        _grant_id: &str,
+    ) -> Result<GrantClosureEnumeration, KernelError> {
+        Err(KernelError::DependencyUnavailable(
+            "grant-closure enumeration owner is not bound".to_owned(),
+        ))
+    }
+
+    /// Resolves a thin introduction-activation request to the complete
+    /// canonical introduction hydration.
+    ///
+    /// The Governor introduction-hydration owner serves the admitted intent
+    /// plus its opaque ORS record; the port validates identity, fence, and
+    /// lifecycle agreement before any mutation, mirroring the grant
+    /// hydration gate. The default implementation reports the missing owner
+    /// so callers fail closed without fabricating an introduction.
+    fn hydrate_introduction(
+        &self,
+        _request: &eliot_authority::IntroductionActivationRequest,
+    ) -> Result<IntroductionHydration, KernelError> {
+        Err(KernelError::DependencyUnavailable(
+            "introduction-hydration owner is not bound".to_owned(),
+        ))
+    }
 }
 
 /// Live introduction-activation intent presented to the one P-07 port.
@@ -269,7 +346,8 @@ pub trait RootGrantHydrationSource: Send + Sync {
 /// Every supporting grant must be recorded, active, unexpired, on the same
 /// root and fence, and its recorded ceilings must cover the requested
 /// effect and proof ceiling.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntroductionActivationIntent {
     /// Idempotency identity. Ledger key and receipt-derivation root.
     pub operation_id: String,
@@ -321,6 +399,275 @@ pub struct IntroductionRevocationIntent {
     /// Introduction identity to fence.
     pub introduction_id: String,
     /// Lineage domain. Must match the recorded introduction root.
+    pub authority_root_ref: String,
+    /// Governor snapshot this revocation is presented under.
+    pub snapshot_id: String,
+    /// Grant-graph revision. Zero is invalid; below the greatest revision
+    /// observed for this root is stale.
+    pub grant_graph_revision: u64,
+    /// Authority binding pinning owner, epoch and fence for this revocation.
+    pub binding: AuthorityBinding,
+    /// Effect operation identities whose outcome is unknown. They are
+    /// recorded as reconciling and never closed or retried by this port.
+    pub unknown_outcome_operations: Vec<String>,
+    /// Receipt obligations the revocation path must discharge.
+    pub receipt_obligations: Vec<String>,
+}
+
+/// One delegated member of a Governor-enumerated durable grant closure.
+///
+/// The member carries the complete semantic activation intent plus its opaque
+/// ORS record, exactly like [`RootGrantHydration`] does for the authority
+/// root. Unlike the first durable slice, `intent.parent_grant_id` may name the
+/// delegating parent: the parent must appear earlier in the same enumeration
+/// or already be recorded, active, and on the exact same root and fence.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureMember {
+    /// Complete semantic activation intent from the canonical Governor owner.
+    pub intent: GrantActivationIntent,
+    /// Opaque ORS input bound to the same member identity and fence.
+    pub durable_record: CapabilityGrantActivation,
+    /// Caller-supplied observation time for the member activation gate.
+    pub observed_at_ms: i64,
+}
+
+/// Complete delegated closure declared by the canonical Governor owner at one
+/// exact graph revision.
+///
+/// The enumeration is the only closure authority this port accepts: the fence
+/// set is derived from these members, never from caller material and never
+/// from process memory alone. `preserved` names descendants the owner keeps
+/// usable under a surviving alternate authority path; every other recorded
+/// descendant of the closure root must appear in `members` or revocation
+/// refuses as an incomplete enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureEnumeration {
+    /// Lineage domain. Every member must share it.
+    pub authority_root_ref: String,
+    /// Exact graph revision the closure was enumerated at. Zero is invalid;
+    /// below the greatest revision observed for this root is stale.
+    pub grant_graph_revision: u64,
+    /// Closure members in parent-before-child order, root first. Exactly one
+    /// member must be the authority root (`parent_grant_id` is `None`).
+    pub members: Vec<GrantClosureMember>,
+    /// Owner-declared alternate-path survivors. They are recorded, never
+    /// fenced, and must be disjoint from `members`.
+    pub preserved: Vec<GrantClosureSurvivor>,
+}
+
+/// One descendant the Governor owner keeps usable under a surviving alternate
+/// authority path while the rest of the closure is fenced.
+///
+/// The covering path is Governor semantic evidence recorded verbatim: the
+/// Kernel never evaluates, widens, or re-derives it. It only checks identity
+/// shape and disjointness from the fenced set.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantClosureSurvivor {
+    /// Preserved descendant grant identity.
+    pub grant_id: String,
+    /// Covering grant identity on the surviving alternate path.
+    pub covering_grant_id: String,
+    /// Lineage domain of the surviving alternate path.
+    pub covering_root_ref: String,
+}
+
+/// Durable receipt for one committed grant closure.
+///
+/// The receipt binds one operation identity to one exact revision, one fence
+/// contour, and the complete affected set. It is recorded in the intent ledger
+/// beside the single canonical revocation (or activation) receipt and is
+/// rehydrated on restart by re-presentation through the owner enumeration, so
+/// `closure_receipt`, `revocation_closure`, and `disposition` read back
+/// restart-identical values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureReceipt {
+    /// Idempotency identity of the closure operation.
+    pub operation_id: String,
+    /// Lineage domain of the closure.
+    pub authority_root_ref: String,
+    /// Closure target: the revoked (or activated) delegation root.
+    pub target_grant_id: String,
+    /// Exact graph revision the closure committed at.
+    pub grant_graph_revision: u64,
+    /// Complete affected set: the target plus every fenced descendant, in
+    /// sorted order.
+    pub affected_grants: Vec<String>,
+    /// Owner-declared alternate-path survivors, in sorted order. Empty for an
+    /// activation closure.
+    pub preserved_grants: Vec<GrantClosureSurvivor>,
+    /// Introductions fenced live when the closure committed, in sorted
+    /// order. They carry no supporting set here: the fence was verified
+    /// against live supporters at commit time, and this list only reinstalls
+    /// the fence after a restart so a fenced introduction can never read as
+    /// usable again. Empty for an activation closure.
+    pub fenced_introductions: Vec<String>,
+    /// Committed closure state: `Active` for an activation closure,
+    /// `Revoked` for a revocation closure.
+    pub state: AuthorityState,
+}
+
+impl GrantClosureReceipt {
+    /// Re-validates the recorded closure receipt shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::InvalidField`] when any identity is blank, the
+    /// revision is zero, the affected set is empty, unsorted, duplicated, or
+    /// misses the target, a survivor overlaps the affected set, or the state
+    /// is neither `Active` nor `Revoked`.
+    pub fn validate(&self) -> Result<(), KernelError> {
+        validate_id(&self.operation_id, "closure_receipt.operation_id")?;
+        validate_id(&self.authority_root_ref, "closure_receipt.authority_root_ref")?;
+        validate_id(&self.target_grant_id, "closure_receipt.target_grant_id")?;
+        if self.grant_graph_revision == 0 {
+            return Err(KernelError::InvalidField {
+                field: "closure_receipt.grant_graph_revision",
+                reason: "grant graph revision must be nonzero",
+            });
+        }
+        if self.affected_grants.is_empty() {
+            return Err(KernelError::InvalidField {
+                field: "closure_receipt.affected_grants",
+                reason: "a committed closure affects at least its target",
+            });
+        }
+        let mut previous: Option<&str> = None;
+        for grant_id in &self.affected_grants {
+            validate_id(grant_id, "closure_receipt.affected_grant")?;
+            if let Some(previous) = previous
+                && previous >= grant_id.as_str()
+            {
+                return Err(KernelError::InvalidField {
+                    field: "closure_receipt.affected_grants",
+                    reason: "affected grants must be sorted and unique",
+                });
+            }
+            previous = Some(grant_id.as_str());
+        }
+        if !self.affected_grants.contains(&self.target_grant_id) {
+            return Err(KernelError::InvalidField {
+                field: "closure_receipt.target_grant_id",
+                reason: "the closure target must be in the affected set",
+            });
+        }
+        let mut previous_survivor: Option<(&str, &str, &str)> = None;
+        for survivor in &self.preserved_grants {
+            validate_id(&survivor.grant_id, "closure_receipt.survivor_grant")?;
+            validate_id(
+                &survivor.covering_grant_id,
+                "closure_receipt.survivor_covering_grant",
+            )?;
+            validate_id(
+                &survivor.covering_root_ref,
+                "closure_receipt.survivor_covering_root",
+            )?;
+            if self.affected_grants.contains(&survivor.grant_id) {
+                return Err(KernelError::InvalidField {
+                    field: "closure_receipt.preserved_grants",
+                    reason: "a survivor must be disjoint from the affected set",
+                });
+            }
+            let key = (
+                survivor.grant_id.as_str(),
+                survivor.covering_grant_id.as_str(),
+                survivor.covering_root_ref.as_str(),
+            );
+            if let Some(previous) = previous_survivor
+                && previous >= key
+            {
+                return Err(KernelError::InvalidField {
+                    field: "closure_receipt.preserved_grants",
+                    reason: "survivors must be sorted and unique",
+                });
+            }
+            previous_survivor = Some(key);
+        }
+        let mut previous_introduction: Option<&str> = None;
+        for introduction_id in &self.fenced_introductions {
+            validate_id(introduction_id, "closure_receipt.fenced_introduction")?;
+            if let Some(previous) = previous_introduction
+                && previous >= introduction_id.as_str()
+            {
+                return Err(KernelError::InvalidField {
+                    field: "closure_receipt.fenced_introductions",
+                    reason: "fenced introductions must be sorted and unique",
+                });
+            }
+            previous_introduction = Some(introduction_id.as_str());
+        }
+        if !matches!(
+            self.state,
+            AuthorityState::Active | AuthorityState::Revoked
+        ) {
+            return Err(KernelError::InvalidField {
+                field: "closure_receipt.state",
+                reason: "a closure receipt is Active or Revoked",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The complete field set a Governor closure enumeration must return.
+///
+/// This is kept beside [`GrantClosureEnumeration`] so an auditor can compare
+/// the accepted issue brief with the port boundary without inferring
+/// completeness from a constructor.
+pub const GRANT_CLOSURE_ENUMERATION_FIELDS: &[&str] = &[
+    "authority_root_ref",
+    "grant_graph_revision",
+    "members[].intent.operation_id",
+    "members[].intent.grant_id",
+    "members[].intent.parent_grant_id",
+    "members[].intent.authority_root_ref",
+    "members[].intent.snapshot_id",
+    "members[].intent.grant_graph_revision",
+    "members[].intent.holder_principal",
+    "members[].intent.session_id",
+    "members[].intent.scope_id",
+    "members[].intent.binding",
+    "members[].intent.allowed_effect",
+    "members[].intent.proof_ceiling",
+    "members[].intent.issued_at_ms",
+    "members[].intent.expires_at_ms",
+    "members[].intent.receipt_obligations",
+    "members[].durable_record",
+    "members[].observed_at_ms",
+    "preserved[].grant_id",
+    "preserved[].covering_grant_id",
+    "preserved[].covering_root_ref",
+];
+
+/// Durable multi-descendant activation intent presented to the one P-07 port.
+///
+/// The closure members come from the injected Governor enumeration carried in
+/// this intent; validation, idempotency, ORS commit, read-back, and live
+/// installation follow the same gate order as the single-root durable path,
+/// applied member by member in parent-before-child order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureActivationIntent {
+    /// Idempotency identity for the whole closure. Ledger key and
+    /// receipt-derivation root.
+    pub operation_id: String,
+    /// Complete owner-enumerated closure at one exact graph revision.
+    pub enumeration: GrantClosureEnumeration,
+}
+
+/// Durable multi-descendant revocation intent presented to the one P-07 port.
+///
+/// The intent carries no member list: the fence set is derived from the live
+/// lineage plus the injected Governor enumeration, which must agree exactly.
+/// Anything less than the complete declared closure refuses as incomplete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureRevocationIntent {
+    /// Idempotency identity for the whole closure. Ledger key and
+    /// receipt-derivation root.
+    pub operation_id: String,
+    /// Closure target: the delegation root to fence with its descendants.
+    pub grant_id: String,
+    /// Lineage domain. Must match the recorded target root.
     pub authority_root_ref: String,
     /// Governor snapshot this revocation is presented under.
     pub snapshot_id: String,
@@ -553,6 +900,8 @@ impl GrantActivationPort {
                     receipt.clone(),
                 )),
                 fenced: Vec::new(),
+                closure_receipt: None,
+                closure_member_receipts: Vec::new(),
             },
         );
         Ok(receipt)
@@ -614,6 +963,8 @@ impl GrantActivationPort {
                             reason: "unknown grant lineage; reconcile by receipt before retry",
                         },
                         fenced: Vec::new(),
+                        closure_receipt: None,
+                        closure_member_receipts: Vec::new(),
                     },
                 );
                 return Err(KernelError::InvalidField {
@@ -672,6 +1023,8 @@ impl GrantActivationPort {
                     receipt.clone(),
                 )),
                 fenced,
+                closure_receipt: None,
+                closure_member_receipts: Vec::new(),
             },
         );
         Ok(receipt)
@@ -736,6 +1089,8 @@ impl GrantActivationPort {
                     receipt.clone(),
                 )),
                 fenced: Vec::new(),
+                closure_receipt: None,
+                closure_member_receipts: Vec::new(),
             },
         );
         Ok(receipt)
@@ -791,6 +1146,8 @@ impl GrantActivationPort {
                             reason: "unknown introduction lineage; reconcile by receipt before retry",
                         },
                         fenced: Vec::new(),
+                        closure_receipt: None,
+                        closure_member_receipts: Vec::new(),
                     },
                 );
                 return Err(KernelError::InvalidField {
@@ -831,6 +1188,448 @@ impl GrantActivationPort {
                     receipt.clone(),
                 )),
                 fenced: vec![request.introduction_id.clone()],
+                closure_receipt: None,
+                closure_member_receipts: Vec::new(),
+            },
+        );
+        Ok(receipt)
+    }
+
+    /// Activates one Governor-hydrated introduction durably and returns its
+    /// canonical receipt.
+    ///
+    /// The owner-presented hydration carries the complete semantic intent
+    /// plus its opaque ORS record; the port validates both, commits the row
+    /// verbatim, requires exact read-back, advances the durable revision
+    /// watermark, and only then installs live state. Exact replay under one
+    /// operation identity returns the same receipt; a changed payload under
+    /// one identity, a duplicate introduction identity, or a `Fenced`
+    /// durable row fails before any mutation — restore never reactivates a
+    /// fenced introduction.
+    ///
+    /// Supporting grants must already be recorded live (activation order:
+    /// grants first, then introductions; after a restart the grants are
+    /// rehydrated through the grant recovery paths before this call).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::IdempotencyConflict`] for a changed payload,
+    /// [`KernelError::IllegalTransition`] for a `Fenced` row presented for
+    /// activation, [`KernelError::FenceMismatch`] for a stale, future or
+    /// cross-lineage epoch or fence, [`KernelError::Expired`] for an expired
+    /// intent, [`KernelError::RecoveryUnavailable`] when the durable
+    /// boundary is missing or the read-back disagrees, and
+    /// [`KernelError::InvalidField`] for any other invalid identity,
+    /// revision, binding, ceiling, lineage, or disagreeing row value.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the durable introduction gate keeps validation, ORS commit, read-back, watermark, and install together"
+    )]
+    pub fn activate_introduction_durable(
+        &self,
+        hydration: &IntroductionHydration,
+        active_epoch: &EpochId,
+        now_ms: i64,
+    ) -> Result<AuthorityActivationReceipt, KernelError> {
+        let boundary = self.durable_boundary().ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "introduction activation needs the durable root-grant boundary".to_owned(),
+            )
+        })?;
+        hydration.validate_complete()?;
+        let request = &hydration.intent;
+        // The replay identity binds the exact opaque record in addition to
+        // the semantic intent, so a changed encrypted payload under one
+        // introduction identity is a conflict rather than a replay.
+        let digest = hydrated_introduction_digest(hydration)?;
+        let mut ledger = self.lock_ledger();
+        match ledger.resolve(&request.operation_id, &digest) {
+            IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
+            IntentResolve::Replay(disposition) => {
+                return disposition.into_activation_receipt();
+            }
+            IntentResolve::New => {}
+        }
+        validate_introduction_activation(request, &ledger, active_epoch, now_ms)?;
+        verify_introduction_seal(&hydration.durable_record, request, active_epoch)?;
+        // Durable row gate: only an absent row may be committed. An `Active`
+        // row must carry the exact presented input (exact replay installs
+        // through the idempotent ORS transition); a `Fenced` row is fence
+        // evidence and refuses with the explicit state-machine guard.
+        let subject = OperationIdentity::new(&request.introduction_id)
+            .map_err(KernelError::RecoveryState)?;
+        match boundary
+            .store
+            .load_capability_introduction(&subject)
+            .map_err(|error| map_ors_recovery_error(&error))?
+        {
+            Some(existing) if existing.phase() == OperationalPhase::Fenced => {
+                return Err(KernelError::IllegalTransition {
+                    machine: "capability-introduction",
+                    from: "Fenced".to_owned(),
+                    to: "Active".to_owned(),
+                });
+            }
+            Some(existing)
+                if existing.phase() == OperationalPhase::Active
+                    && existing.record() != hydration.durable_record.record() =>
+            {
+                return Err(KernelError::InvalidField {
+                    field: "introduction_id",
+                    reason: "introduction identity is already recorded under a different input",
+                });
+            }
+            Some(_) | None => {}
+        }
+        let durable_receipt = boundary
+            .store
+            .activate_capability_introduction(hydration.durable_record.clone())
+            .map_err(|error| {
+                map_introduction_transition_error(&error, &subject, boundary, "Active")
+            })?;
+        let projection = boundary
+            .store
+            .load_capability_introduction(&subject)
+            .map_err(|error| map_ors_recovery_error(&error))?
+            .ok_or_else(|| {
+                KernelError::RecoveryUnavailable(
+                    "introduction projection disappeared during activation".to_owned(),
+                )
+            })?;
+        if projection.phase() != OperationalPhase::Active
+            || projection.record() != hydration.durable_record.record()
+            || projection.receipt() != durable_receipt.receipt()
+        {
+            return Err(KernelError::RecoveryUnavailable(
+                "introduction activation ORS receipt/read-back disagreed".to_owned(),
+            ));
+        }
+        check_closure_watermark(
+            boundary,
+            &request.authority_root_ref,
+            request.grant_graph_revision,
+        )?;
+        let mut supporting = BTreeSet::new();
+        for id in &request.supporting_grant_ids {
+            supporting.insert(id.clone());
+        }
+        let operation_id = request.operation_id.clone();
+        let receipt = AuthorityActivationReceipt {
+            activation_id: format!("activation-{operation_id}"),
+            snapshot_id: request.snapshot_id.clone(),
+            authority_epoch: active_epoch.clone(),
+            state: AuthorityState::Active,
+        };
+        receipt.validate()?;
+        ledger.introductions.insert(
+            request.introduction_id.clone(),
+            LiveIntroductionRecord {
+                authority_root_ref: request.authority_root_ref.clone(),
+                supporting_grant_ids: supporting,
+                status: LiveStatus::Active,
+            },
+        );
+        ledger.note_revision(&request.authority_root_ref, request.grant_graph_revision);
+        ledger.intents.insert(
+            operation_id.clone(),
+            PortIntentRecord {
+                operation_id,
+                digest,
+                kind: IntentKind::IntroductionActivation,
+                disposition: IntentDisposition::Committed(CommittedReceipt::Activation(
+                    receipt.clone(),
+                )),
+                fenced: Vec::new(),
+                closure_receipt: None,
+                closure_member_receipts: Vec::new(),
+            },
+        );
+        Ok(receipt)
+    }
+
+    /// Revokes one introduction durably and returns the canonical revocation
+    /// receipt.
+    ///
+    /// The live record names the lineage root; the durable row must read
+    /// back `Active` and agree with the fence derived from its committed
+    /// activation bytes. Revocation of an unknown introduction records a
+    /// reconciling intent instead of fabricating a fence, mirroring the live
+    /// path. Re-fencing an already-`Fenced` row refuses with the explicit
+    /// state-machine guard instead of recommitting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::IdempotencyConflict`] for a changed payload,
+    /// [`KernelError::IllegalTransition`] for a `Fenced` row presented for
+    /// fencing, [`KernelError::FenceMismatch`] for a stale, future or
+    /// cross-lineage epoch or fence, [`KernelError::RecoveryUnavailable`]
+    /// when the durable boundary or row is missing or the read-back
+    /// disagrees, and [`KernelError::InvalidField`] for any other invalid
+    /// identity or unknown lineage value.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the durable introduction fence keeps derivation, idempotency, ORS CAS, read-back, watermark, and install together"
+    )]
+    pub fn revoke_introduction_durable(
+        &self,
+        request: &IntroductionRevocationIntent,
+        active_epoch: &EpochId,
+    ) -> Result<AuthorityRevocationReceipt, KernelError> {
+        let boundary = self.durable_boundary().ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "introduction revocation needs the durable root-grant boundary".to_owned(),
+            )
+        })?;
+        let mut ledger = self.lock_ledger();
+        validate_id(&request.operation_id, "operation_id")?;
+        let digest = request.digest()?;
+        match ledger.resolve(&request.operation_id, &digest) {
+            IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
+            IntentResolve::Replay(disposition) => {
+                return disposition.into_revocation_receipt();
+            }
+            IntentResolve::New => {}
+        }
+        validate_id(&request.introduction_id, "introduction_id")?;
+        validate_id(&request.authority_root_ref, "authority_root_ref")?;
+        validate_id(&request.snapshot_id, "snapshot_id")?;
+        for obligation in &request.receipt_obligations {
+            validate_id(obligation, "receipt_obligation")?;
+        }
+        let mut unknown_effects = BTreeSet::new();
+        for operation in &request.unknown_outcome_operations {
+            validate_id(operation, "unknown_outcome_operation")?;
+            unknown_effects.insert(operation.clone());
+        }
+        check_binding(&request.binding, active_epoch)?;
+        let recorded_root = match ledger.introductions.get(&request.introduction_id) {
+            None => {
+                ledger.intents.insert(
+                    request.operation_id.clone(),
+                    PortIntentRecord {
+                        operation_id: request.operation_id.clone(),
+                        digest,
+                        kind: IntentKind::IntroductionRevocation,
+                        disposition: IntentDisposition::Reconciling {
+                            field: "introduction_id",
+                            reason: "unknown introduction lineage; reconcile by receipt before retry",
+                        },
+                        fenced: Vec::new(),
+                        closure_receipt: None,
+                        closure_member_receipts: Vec::new(),
+                    },
+                );
+                return Err(KernelError::InvalidField {
+                    field: "introduction_id",
+                    reason: "unknown introduction lineage; reconcile by receipt before retry",
+                });
+            }
+            Some(record) => record.authority_root_ref.clone(),
+        };
+        if recorded_root != request.authority_root_ref {
+            return Err(KernelError::FenceMismatch);
+        }
+        check_revision(
+            &ledger,
+            &request.authority_root_ref,
+            request.grant_graph_revision,
+        )?;
+        // Durable fence gate: the row must read back `Active`. A `Fenced`
+        // row is already fence evidence — re-fencing it through the
+        // Active-only transition refuses with the explicit guard; an absent
+        // row is live-only state that cannot take the durable fence path.
+        let subject = OperationIdentity::new(&request.introduction_id)
+            .map_err(KernelError::RecoveryState)?;
+        let activation_input = match boundary
+            .store
+            .load_capability_introduction(&subject)
+            .map_err(|error| map_ors_recovery_error(&error))?
+        {
+            None => {
+                return Err(KernelError::RecoveryUnavailable(
+                    "introduction projection is absent; no durable row to fence".to_owned(),
+                ));
+            }
+            Some(existing) if existing.phase() == OperationalPhase::Fenced => {
+                return Err(KernelError::IllegalTransition {
+                    machine: "capability-introduction",
+                    from: "Fenced".to_owned(),
+                    to: "Fenced".to_owned(),
+                });
+            }
+            Some(existing) => existing.record().clone(),
+        };
+        let fence_record =
+            introduction_fence_input(&activation_input, &request.operation_id)?;
+        let durable_receipt = boundary
+            .store
+            .fence_capability_introduction(fence_record.clone())
+            .map_err(|error| {
+                map_introduction_transition_error(&error, &subject, boundary, "Fenced")
+            })?;
+        let projection = boundary
+            .store
+            .load_capability_introduction(&subject)
+            .map_err(|error| map_ors_recovery_error(&error))?
+            .ok_or_else(|| {
+                KernelError::RecoveryUnavailable(
+                    "introduction projection disappeared during revocation".to_owned(),
+                )
+            })?;
+        if projection.phase() != OperationalPhase::Fenced
+            || projection.record() != fence_record.record()
+            || projection.receipt() != durable_receipt.receipt()
+        {
+            return Err(KernelError::RecoveryUnavailable(
+                "introduction revocation ORS receipt/read-back disagreed".to_owned(),
+            ));
+        }
+        check_closure_watermark(
+            boundary,
+            &request.authority_root_ref,
+            request.grant_graph_revision,
+        )?;
+        if let Some(target) = ledger.introductions.get_mut(&request.introduction_id) {
+            target.status = LiveStatus::Revoked;
+        }
+        note_unknown_effects(&mut ledger, &unknown_effects, &request.introduction_id);
+        let operation_id = request.operation_id.clone();
+        let receipt = AuthorityRevocationReceipt {
+            revocation_id: format!("revocation-{operation_id}"),
+            snapshot_id: request.snapshot_id.clone(),
+            authority_epoch: active_epoch.clone(),
+            state: AuthorityState::Revoked,
+        };
+        receipt.validate()?;
+        ledger.note_revision(&request.authority_root_ref, request.grant_graph_revision);
+        ledger.intents.insert(
+            operation_id.clone(),
+            PortIntentRecord {
+                operation_id,
+                digest,
+                kind: IntentKind::IntroductionRevocation,
+                disposition: IntentDisposition::Committed(CommittedReceipt::Revocation(
+                    receipt.clone(),
+                )),
+                fenced: vec![request.introduction_id.clone()],
+                closure_receipt: None,
+                closure_member_receipts: Vec::new(),
+            },
+        );
+        Ok(receipt)
+    }
+
+    /// Rehydrates one committed introduction activation after a restart.
+    ///
+    /// The caller re-presents the Governor hydration; the port requires the
+    /// durable row to read back `Active` with exact record agreement and the
+    /// presented revision to bind the durable watermark before reinstalling
+    /// live state. A missing row, a `Fenced` row, or a disagreeing row stays
+    /// fail-closed: absence of the durable introduction never restores
+    /// introduction authority, and a fence is never resurrected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::IdempotencyConflict`] for a changed payload,
+    /// [`KernelError::IllegalTransition`] for a `Fenced` row presented for
+    /// rehydration, [`KernelError::FenceMismatch`] for a stale, future or
+    /// cross-lineage epoch or fence, [`KernelError::Expired`] for an expired
+    /// intent, [`KernelError::RecoveryUnavailable`] when the durable
+    /// boundary or row is missing or disagrees, and
+    /// [`KernelError::InvalidField`] for any other invalid identity,
+    /// revision, binding, ceiling, or lineage value.
+    pub fn recover_introduction(
+        &self,
+        hydration: &IntroductionHydration,
+        active_epoch: &EpochId,
+        now_ms: i64,
+    ) -> Result<AuthorityActivationReceipt, KernelError> {
+        let boundary = self.durable_boundary().ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "introduction recovery needs the durable root-grant boundary".to_owned(),
+            )
+        })?;
+        hydration.validate_complete()?;
+        let request = &hydration.intent;
+        let digest = hydrated_introduction_digest(hydration)?;
+        let mut ledger = self.lock_ledger();
+        match ledger.resolve(&request.operation_id, &digest) {
+            IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
+            IntentResolve::Replay(disposition) => {
+                return disposition.into_activation_receipt();
+            }
+            IntentResolve::New => {}
+        }
+        // Restore agreement first: only an `Active` row carrying the exact
+        // presented input may be reinstalled. A `Fenced` row refuses with
+        // the explicit guard; recovery never resurrects revoked authority.
+        let subject = OperationIdentity::new(&request.introduction_id)
+            .map_err(KernelError::RecoveryState)?;
+        match boundary
+            .store
+            .load_capability_introduction(&subject)
+            .map_err(|error| map_ors_recovery_error(&error))?
+        {
+            None => {
+                return Err(KernelError::RecoveryUnavailable(
+                    "introduction projection is absent during recovery".to_owned(),
+                ));
+            }
+            Some(existing) if existing.phase() == OperationalPhase::Fenced => {
+                return Err(KernelError::IllegalTransition {
+                    machine: "capability-introduction",
+                    from: "Fenced".to_owned(),
+                    to: "Active".to_owned(),
+                });
+            }
+            Some(existing) if existing.record() != hydration.durable_record.record() => {
+                return Err(KernelError::InvalidField {
+                    field: "introduction_id",
+                    reason: "durable introduction row disagrees with the re-presented input",
+                });
+            }
+            Some(_) => {}
+        }
+        validate_introduction_activation(request, &ledger, active_epoch, now_ms)?;
+        verify_introduction_seal(&hydration.durable_record, request, active_epoch)?;
+        check_closure_watermark(
+            boundary,
+            &request.authority_root_ref,
+            request.grant_graph_revision,
+        )?;
+        let mut supporting = BTreeSet::new();
+        for id in &request.supporting_grant_ids {
+            supporting.insert(id.clone());
+        }
+        let operation_id = request.operation_id.clone();
+        let receipt = AuthorityActivationReceipt {
+            activation_id: format!("activation-{operation_id}"),
+            snapshot_id: request.snapshot_id.clone(),
+            authority_epoch: active_epoch.clone(),
+            state: AuthorityState::Active,
+        };
+        receipt.validate()?;
+        ledger.introductions.insert(
+            request.introduction_id.clone(),
+            LiveIntroductionRecord {
+                authority_root_ref: request.authority_root_ref.clone(),
+                supporting_grant_ids: supporting,
+                status: LiveStatus::Active,
+            },
+        );
+        ledger.note_revision(&request.authority_root_ref, request.grant_graph_revision);
+        ledger.intents.insert(
+            operation_id.clone(),
+            PortIntentRecord {
+                operation_id,
+                digest,
+                kind: IntentKind::IntroductionActivation,
+                disposition: IntentDisposition::Committed(CommittedReceipt::Activation(
+                    receipt.clone(),
+                )),
+                fenced: Vec::new(),
+                closure_receipt: None,
+                closure_member_receipts: Vec::new(),
             },
         );
         Ok(receipt)
@@ -911,6 +1710,70 @@ impl GrantActivationPort {
             .is_some_and(|record| record.status == LiveStatus::Revoked)
     }
 
+    /// Returns the greatest grant-graph revision observed for one lineage
+    /// root, or `None` when no intent has been recorded under that root.
+    ///
+    /// This is the port-side half of exact revision enumeration: every
+    /// activation, introduction, and revocation notes its presented revision,
+    /// and any revision below the returned value fails closed as stale. ORS
+    /// projections carry no semantic revision (the record stays opaque to
+    /// ORS), so the revision itself always arrives bound inside the Governor
+    /// hydration digest; this query only exposes the monotonic watermark the
+    /// port enforces.
+    #[must_use]
+    pub fn grant_graph_revision(&self, authority_root_ref: &str) -> Option<u64> {
+        let ledger = self.lock_ledger();
+        ledger.max_revision.get(authority_root_ref).copied()
+    }
+
+    /// Returns the durable closure receipt committed by one closure
+    /// operation, if any.
+    ///
+    /// Returns `None` for an unknown operation identity and for operations
+    /// that are not closure activations or revocations. Restart rehydration
+    /// repopulates the receipt so the query reads back restart-identical
+    /// values.
+    #[must_use]
+    pub fn closure_receipt(&self, operation_id: &str) -> Option<GrantClosureReceipt> {
+        let ledger = self.lock_ledger();
+        ledger
+            .intents
+            .get(operation_id)
+            .and_then(|record| record.closure_receipt.clone())
+    }
+
+    /// Returns the durable closure receipt committed for one closure target
+    /// grant, if any.
+    ///
+    /// This is the restart-rehydration companion of [`Self::closure_receipt`]:
+    /// after [`Self::recover_grant_closure_activation`] or
+    /// [`Self::recover_grant_closure_revocation`] reinstalls the committed
+    /// closure, the receipt is reachable by target identity without holding
+    /// the closure operation identity.
+    #[must_use]
+    pub fn closure_receipt_for_target(&self, grant_id: &str) -> Option<GrantClosureReceipt> {
+        let ledger = self.lock_ledger();
+        let operation_id = ledger.closure_targets.get(grant_id)?;
+        ledger
+            .intents
+            .get(operation_id)
+            .and_then(|record| record.closure_receipt.clone())
+    }
+
+    /// Returns the sorted introduction identities fenced by one closure
+    /// revocation, if any.
+    ///
+    /// The list is committed in the durable closure row and reinstalled on
+    /// restart, so a fenced introduction never reads as usable again even
+    /// though its supporting set is only recorded live at fence time.
+    /// Returns `None` for an unknown operation identity and for operations
+    /// that are not closure revocations.
+    #[must_use]
+    pub fn revocation_introductions(&self, operation_id: &str) -> Option<Vec<String>> {
+        self.closure_receipt(operation_id)
+            .map(|receipt| receipt.fenced_introductions)
+    }
+
     /// Recovers one durable active authority-root grant after a restart.
     ///
     /// Recovery reads only an ORS `ACTIVE` projection, asks the injected
@@ -989,9 +1852,777 @@ impl GrantActivationPort {
             IntentResolve::New => {}
         }
         validate_grant_activation(&hydration.intent, &ledger, active_epoch, now_ms)?;
+        // Durable revision gate (`#2100`): recovery re-presents a superseded
+        // revision only through a current owner enumeration, never by replaying
+        // an older one after the watermark moved.
+        check_closure_watermark(
+            boundary,
+            &hydration.intent.authority_root_ref,
+            hydration.intent.grant_graph_revision,
+        )?;
         let receipt = runtime_activation_receipt(&hydration.intent, active_epoch)?;
         install_root_activation(&mut ledger, &hydration.intent, &receipt, digest);
         Ok(receipt)
+    }
+
+    /// Activates one owner-enumerated grant closure and returns one receipt
+    /// per member in enumeration order.
+    ///
+    /// The presented enumeration must equal the injected Governor owner's
+    /// enumeration for the closure root: the owner attests the exact closure
+    /// the durable graph admitted, and caller material alone never commits.
+    /// Every member is validated (identities, exact shared revision, binding,
+    /// fence, epoch, ceilings, expiry, opaque record agreement,
+    /// parent-before-child order) before any mutation; a `Fenced` or
+    /// `Released` durable row refuses, because restore never reactivates a
+    /// path. Each member then follows the single-root durable gate (ORS
+    /// commit, exact read-back), the per-root revision watermark advances
+    /// atomically with the stale check, and one closure row binds the
+    /// operation, revision, digest, and receipt before live installation.
+    /// Exact replay under one operation identity returns the same receipts;
+    /// a changed payload under one identity, a stale revision, or a
+    /// duplicate grant identity fails before any mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::IdempotencyConflict`] for a changed payload,
+    /// [`KernelError::FenceMismatch`] for a stale, future or cross-lineage
+    /// epoch or fence, [`KernelError::Expired`] for an expired member, and
+    /// [`KernelError::InvalidField`] or [`KernelError::RecoveryUnavailable`]
+    /// for any other invalid, incomplete, or disagreeing enumeration value.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closure activation gate keeps per-member validation, ORS commit, read-back, and install together"
+    )]
+    pub fn activate_grant_closure(
+        &self,
+        request: &GrantClosureActivationIntent,
+        active_epoch: &EpochId,
+    ) -> Result<Vec<AuthorityActivationReceipt>, KernelError> {
+        let boundary = self.durable_boundary().ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "grant-closure activation needs the durable root-grant boundary".to_owned(),
+            )
+        })?;
+        validate_id(&request.operation_id, "operation_id")?;
+        validate_closure_enumeration(&request.enumeration, active_epoch)?;
+        if !request.enumeration.preserved.is_empty() {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.preserved",
+                reason: "an activation closure fences nothing to survive",
+            });
+        }
+        let digest = closure_activation_digest(&request.operation_id, &request.enumeration)?;
+
+        let mut ledger = self.lock_ledger();
+        match ledger.resolve(&request.operation_id, &digest) {
+            IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
+            IntentResolve::Replay(_) => {
+                let record = ledger.intents.get(&request.operation_id).ok_or_else(|| {
+                    KernelError::RecoveryUnavailable(
+                        "closure activation intent disappeared during replay".to_owned(),
+                    )
+                })?;
+                if record.closure_member_receipts.is_empty() {
+                    return Err(KernelError::IdempotencyConflict);
+                }
+                return Ok(record.closure_member_receipts.clone());
+            }
+            IntentResolve::New => {}
+        }
+        // Owner attestation, after the idempotency gate so a changed payload
+        // under one identity keeps its typed conflict: the presented closure
+        // must equal the Governor enumeration for the closure root.
+        // Structural checks reject malformed material, but only the owner
+        // proves the durable graph selected this exact closure at this
+        // revision. A caller that can present acceptable ORS inputs cannot
+        // drive an activation the owner never admitted. Exact replay returns
+        // above without re-fetching: the owner attested the same bytes at
+        // first commit.
+        let closure_anchor = closure_anchor_grant(&request.enumeration)?;
+        let owner_enumeration = boundary
+            .hydration
+            .enumerate_grant_closure(&closure_anchor)?;
+        validate_closure_enumeration(&owner_enumeration, active_epoch).map_err(|_| {
+            KernelError::RecoveryUnavailable(
+                "closure owner enumeration failed validation".to_owned(),
+            )
+        })?;
+        if owner_enumeration != request.enumeration {
+            return Err(KernelError::InvalidField {
+                field: "enumeration",
+                reason: "the presented closure disagrees with the owner enumeration",
+            });
+        }
+        check_revision(
+            &ledger,
+            &request.enumeration.authority_root_ref,
+            request.enumeration.grant_graph_revision,
+        )?;
+        validate_closure_activation_members(&request.enumeration, &ledger, Some(boundary), active_epoch)?;
+        // Restore never reactivates: a `Fenced` or `Released` durable row
+        // refuses before any mutation, and any other existing row must carry
+        // the exact presented input.
+        for member in &request.enumeration.members {
+            match check_activation_row(
+                boundary,
+                &member.intent.grant_id,
+                member.durable_record.record(),
+            )? {
+                ActivationRow::Fenced => {
+                    return Err(KernelError::InvalidField {
+                        field: "grant_id",
+                        reason: "grant identity is fenced; restore never reactivates a path",
+                    });
+                }
+                ActivationRow::Absent | ActivationRow::Active | ActivationRow::Applying => {}
+            }
+        }
+        // Durable revision gate: the watermark advance is atomic with the
+        // stale check, so a re-presented revision after a crash proceeds
+        // while any lower revision fails closed even across restarts.
+        check_closure_watermark(
+            boundary,
+            &request.enumeration.authority_root_ref,
+            request.enumeration.grant_graph_revision,
+        )?;
+
+        // Durable linearization, member by member in parent-before-child
+        // order: each ORS commit is atomic with an exact read-back, and a
+        // crash between members is recovered by exact re-presentation (an
+        // already-Active member replays its receipt; an Applying member is
+        // promoted; nothing is installed live until every read-back agrees).
+        // No ledger mutation happens above this point.
+        let mut read_back: Vec<CapabilityGrantProjection> = Vec::new();
+        for member in &request.enumeration.members {
+            let durable_receipt = boundary
+                .store
+                .activate_capability_grant(member.durable_record.clone())
+                .map_err(|error| map_ors_recovery_error(&error))?;
+            let subject = OperationIdentity::new(&member.intent.grant_id)
+                .map_err(KernelError::RecoveryState)?;
+            let projection = boundary
+                .store
+                .load_capability_grant(&subject)
+                .map_err(|error| map_ors_recovery_error(&error))?
+                .ok_or_else(|| {
+                    KernelError::RecoveryUnavailable(
+                        "closure member projection disappeared during activation".to_owned(),
+                    )
+                })?;
+            if projection.phase() != OperationalPhase::Active
+                || projection.record() != member.durable_record.record()
+                || projection.receipt() != durable_receipt.receipt()
+            {
+                return Err(KernelError::RecoveryUnavailable(
+                    "closure member activation ORS receipt/read-back disagreed".to_owned(),
+                ));
+            }
+            read_back.push(projection);
+        }
+        debug_assert_eq!(read_back.len(), request.enumeration.members.len());
+        // The closure row makes the operation, revision, digest, and receipt
+        // durable as one committed object: a crash before the ledger insert
+        // replays here instead of losing the closure identity.
+        ensure_closure_row(
+            boundary,
+            &closure_commit_for(
+                &request.operation_id,
+                &closure_anchor,
+                &request.enumeration.authority_root_ref,
+                request.enumeration.grant_graph_revision,
+                &digest,
+                &closure_affected_set(&request.enumeration),
+                &[],
+                &[],
+                GrantClosureState::Active,
+            )?,
+        )?;
+
+        let mut receipts = Vec::with_capacity(request.enumeration.members.len());
+        for member in &request.enumeration.members {
+            let receipt = runtime_activation_receipt(&member.intent, active_epoch)?;
+            ledger.grants.insert(
+                member.intent.grant_id.clone(),
+                LiveGrantRecord {
+                    parent_grant_id: member.intent.parent_grant_id.clone(),
+                    authority_root_ref: member.intent.authority_root_ref.clone(),
+                    binding: member.intent.binding.clone(),
+                    allowed_effect: member.intent.allowed_effect,
+                    proof_ceiling: member.intent.proof_ceiling,
+                    expires_at_ms: member.intent.expires_at_ms,
+                    status: LiveStatus::Active,
+                },
+            );
+            receipts.push(receipt);
+        }
+        let anchor_grant_id = closure_anchor.clone();
+        let affected = closure_affected_set(&request.enumeration);
+        let closure_receipt = GrantClosureReceipt {
+            operation_id: request.operation_id.clone(),
+            authority_root_ref: request.enumeration.authority_root_ref.clone(),
+            target_grant_id: anchor_grant_id.clone(),
+            grant_graph_revision: request.enumeration.grant_graph_revision,
+            affected_grants: affected,
+            preserved_grants: Vec::new(),
+            fenced_introductions: Vec::new(),
+            state: AuthorityState::Active,
+        };
+        closure_receipt.validate()?;
+        let first = receipts.first().cloned().ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "closure enumeration lost its receipts during activation".to_owned(),
+            )
+        })?;
+        ledger.note_revision(
+            &request.enumeration.authority_root_ref,
+            request.enumeration.grant_graph_revision,
+        );
+        ledger.intents.insert(
+            request.operation_id.clone(),
+            PortIntentRecord {
+                operation_id: request.operation_id.clone(),
+                digest,
+                kind: IntentKind::GrantActivation,
+                disposition: IntentDisposition::Committed(CommittedReceipt::Activation(
+                    first,
+                )),
+                fenced: Vec::new(),
+                closure_receipt: Some(closure_receipt),
+                closure_member_receipts: receipts.clone(),
+            },
+        );
+        ledger
+            .closure_targets
+            .insert(anchor_grant_id, request.operation_id.clone());
+        Ok(receipts)
+    }
+
+    /// Revokes one owner-enumerated grant closure and returns its durable
+    /// closure receipt.
+    ///
+    /// The fence set is derived from the live lineage plus the injected
+    /// Governor enumeration, which must agree exactly: every recorded live
+    /// descendant of the target is either fenced or owner-declared preserved,
+    /// and every fenced member carries a durable ORS row. Each unfenced
+    /// member follows the single-root durable fence gate (ORS `Active`-to-
+    /// `Fenced` compare-and-swap with exact read-back); a member already
+    /// fenced under a previous closure with identical authority bytes is
+    /// reconfirmed, never recommitted, so a fresh operation identity
+    /// re-confirms the fence. The durable revision watermark advances
+    /// atomically with the stale check, and one closure row binds the
+    /// operation, revision, digest, affected set, survivors, and receipt
+    /// before anything is installed live. Dependent introductions are fenced
+    /// live. Exact replay returns the same receipt; a changed payload under
+    /// one identity or a stale revision fails before any mutation.
+    ///
+    /// Without the durable boundary this stays ledger-only: the fence set is
+    /// the recorded live descendant closure and no alternate-path survivor
+    /// can be declared, because no Governor owner is bound to attest it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::IdempotencyConflict`] for a changed payload,
+    /// [`KernelError::FenceMismatch`] for a stale, future or cross-lineage
+    /// epoch or fence, and [`KernelError::InvalidField`] or
+    /// [`KernelError::RecoveryUnavailable`] for an unknown target, an
+    /// incomplete enumeration, a missing or disagreeing durable row, or any
+    /// other invalid value.
+    pub fn revoke_grant_closure(
+        &self,
+        request: &GrantClosureRevocationIntent,
+        active_epoch: &EpochId,
+    ) -> Result<GrantClosureReceipt, KernelError> {
+        let boundary = self.durable_boundary();
+        let owner_enumeration = boundary
+            .map(|boundary| {
+                validate_id(&request.grant_id, "grant_id")?;
+                boundary.hydration.enumerate_grant_closure(&request.grant_id)
+            })
+            .transpose()?;
+        self.revoke_closure_core(request, active_epoch, boundary, owner_enumeration.as_ref())
+    }
+
+    /// Rehydrates one committed activation closure after a restart.
+    ///
+    /// The caller re-presents the closure intent; the port re-enumerates
+    /// through the injected Governor owner and requires the owner
+    /// enumeration to equal the presented one, every member ORS row to agree
+    /// with its enumerated input (`Applying` rows are promoted through the
+    /// exact pending-to-active transition; `Fenced` rows refuse, because
+    /// recovery never resurrects revoked authority), and every member gate
+    /// to hold at the observation time. The durable revision watermark and
+    /// the closure row are re-verified (or completed when the crash landed
+    /// between the member commits and the closure commit) before live state
+    /// plus the original disposition is installed. A missing, incomplete, or
+    /// disagreeing row stays fail-closed and admits nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::activate_grant_closure`], with
+    /// [`KernelError::RecoveryUnavailable`] naming the exact rehydration
+    /// disagreement.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closure recovery gate keeps re-enumeration, ORS agreement, validation, and install together"
+    )]
+    pub fn recover_grant_closure_activation(
+        &self,
+        request: &GrantClosureActivationIntent,
+        active_epoch: &EpochId,
+        now_ms: i64,
+    ) -> Result<Vec<AuthorityActivationReceipt>, KernelError> {
+        let boundary = self.durable_boundary().ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "grant-closure recovery needs the durable root-grant boundary".to_owned(),
+            )
+        })?;
+        validate_id(&request.operation_id, "operation_id")?;
+        validate_closure_enumeration(&request.enumeration, active_epoch)?;
+        if !request.enumeration.preserved.is_empty() {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.preserved",
+                reason: "an activation closure fences nothing to survive",
+            });
+        }
+        let digest = closure_activation_digest(&request.operation_id, &request.enumeration)?;
+
+        let mut ledger = self.lock_ledger();
+        match ledger.resolve(&request.operation_id, &digest) {
+            IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
+            IntentResolve::Replay(_) => {
+                let record = ledger.intents.get(&request.operation_id).ok_or_else(|| {
+                    KernelError::RecoveryUnavailable(
+                        "closure activation intent disappeared during recovery".to_owned(),
+                    )
+                })?;
+                if record.closure_member_receipts.is_empty() {
+                    return Err(KernelError::IdempotencyConflict);
+                }
+                return Ok(record.closure_member_receipts.clone());
+            }
+            IntentResolve::New => {}
+        }
+        // Owner attestation after the idempotency gate, mirroring activation:
+        // the re-presented closure must equal the current owner enumeration.
+        let anchor_grant_id = closure_anchor_grant(&request.enumeration)?;
+        let owner_enumeration = boundary.hydration.enumerate_grant_closure(&anchor_grant_id)?;
+        validate_closure_enumeration(&owner_enumeration, active_epoch).map_err(|_| {
+            KernelError::RecoveryUnavailable(
+                "closure owner enumeration failed validation".to_owned(),
+            )
+        })?;
+        if owner_enumeration != request.enumeration {
+            return Err(KernelError::InvalidField {
+                field: "enumeration",
+                reason: "the presented closure disagrees with the owner enumeration",
+            });
+        }
+        // Every member row must agree with its enumerated input. An
+        // `Applying` row is promoted through the exact pending-to-active
+        // transition (the declared crash protocol); a `Fenced` or `Released`
+        // row refuses, because recovery must never resurrect revoked
+        // authority; any other phase or absence stays fail-closed.
+        for member in &request.enumeration.members {
+            match check_activation_row(
+                boundary,
+                &member.intent.grant_id,
+                member.durable_record.record(),
+            )? {
+                ActivationRow::Absent => {
+                    return Err(KernelError::RecoveryUnavailable(
+                        "closure member projection is absent during recovery".to_owned(),
+                    ));
+                }
+                ActivationRow::Fenced => {
+                    return Err(KernelError::RecoveryUnavailable(
+                        "closure member is fenced; recovery never reactivates a path".to_owned(),
+                    ));
+                }
+                ActivationRow::Active => {}
+                ActivationRow::Applying => {
+                    let durable_receipt = boundary
+                        .store
+                        .activate_capability_grant(member.durable_record.clone())
+                        .map_err(|error| map_ors_recovery_error(&error))?;
+                    let subject = OperationIdentity::new(&member.intent.grant_id)
+                        .map_err(KernelError::RecoveryState)?;
+                    let projection = boundary
+                        .store
+                        .load_capability_grant(&subject)
+                        .map_err(|error| map_ors_recovery_error(&error))?
+                        .ok_or_else(|| {
+                            KernelError::RecoveryUnavailable(
+                                "closure member projection disappeared during recovery".to_owned(),
+                            )
+                        })?;
+                    if projection.phase() != OperationalPhase::Active
+                        || projection.record() != member.durable_record.record()
+                        || projection.receipt() != durable_receipt.receipt()
+                    {
+                        return Err(KernelError::RecoveryUnavailable(
+                            "closure member recovery ORS receipt/read-back disagreed".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        check_revision(
+            &ledger,
+            &request.enumeration.authority_root_ref,
+            request.enumeration.grant_graph_revision,
+        )?;
+        validate_closure_activation_members(&request.enumeration, &ledger, Some(boundary), active_epoch)?;
+        // Member expiry is checked at the recovery observation time, exactly
+        // like the single-root recovery path: a member expired at `now_ms`
+        // cannot be reinstalled as live authority.
+        for member in &request.enumeration.members {
+            check_expiry(member.intent.issued_at_ms, member.intent.expires_at_ms, now_ms)?;
+        }
+        check_closure_watermark(
+            boundary,
+            &request.enumeration.authority_root_ref,
+            request.enumeration.grant_graph_revision,
+        )?;
+        // A crash between the member commits and the closure commit completes
+        // here: the row is committed (or replayed when already present) before
+        // any live state is installed.
+        ensure_closure_row(
+            boundary,
+            &closure_commit_for(
+                &request.operation_id,
+                &anchor_grant_id,
+                &request.enumeration.authority_root_ref,
+                request.enumeration.grant_graph_revision,
+                &digest,
+                &closure_affected_set(&request.enumeration),
+                &[],
+                &[],
+                GrantClosureState::Active,
+            )?,
+        )?;
+
+        let mut receipts = Vec::with_capacity(request.enumeration.members.len());
+        for member in &request.enumeration.members {
+            let receipt = runtime_activation_receipt(&member.intent, active_epoch)?;
+            ledger.grants.insert(
+                member.intent.grant_id.clone(),
+                LiveGrantRecord {
+                    parent_grant_id: member.intent.parent_grant_id.clone(),
+                    authority_root_ref: member.intent.authority_root_ref.clone(),
+                    binding: member.intent.binding.clone(),
+                    allowed_effect: member.intent.allowed_effect,
+                    proof_ceiling: member.intent.proof_ceiling,
+                    expires_at_ms: member.intent.expires_at_ms,
+                    status: LiveStatus::Active,
+                },
+            );
+            receipts.push(receipt);
+        }
+        let affected = closure_affected_set(&request.enumeration);
+        let closure_receipt = GrantClosureReceipt {
+            operation_id: request.operation_id.clone(),
+            authority_root_ref: request.enumeration.authority_root_ref.clone(),
+            target_grant_id: anchor_grant_id.clone(),
+            grant_graph_revision: request.enumeration.grant_graph_revision,
+            affected_grants: affected,
+            preserved_grants: Vec::new(),
+            fenced_introductions: Vec::new(),
+            state: AuthorityState::Active,
+        };
+        closure_receipt.validate()?;
+        let first = receipts.first().cloned().ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "closure enumeration lost its receipts during recovery".to_owned(),
+            )
+        })?;
+        ledger.note_revision(
+            &request.enumeration.authority_root_ref,
+            request.enumeration.grant_graph_revision,
+        );
+        ledger.intents.insert(
+            request.operation_id.clone(),
+            PortIntentRecord {
+                operation_id: request.operation_id.clone(),
+                digest,
+                kind: IntentKind::GrantActivation,
+                disposition: IntentDisposition::Committed(CommittedReceipt::Activation(
+                    first,
+                )),
+                fenced: Vec::new(),
+                closure_receipt: Some(closure_receipt),
+                closure_member_receipts: receipts.clone(),
+            },
+        );
+        ledger
+            .closure_targets
+            .insert(anchor_grant_id, request.operation_id.clone());
+        Ok(receipts)
+    }
+
+    /// Rehydrates one committed revocation closure after a restart.
+    ///
+    /// The caller re-presents the revocation intent; the port re-enumerates
+    /// through the injected Governor owner, re-derives the exact fence set,
+    /// and requires every member ORS row to read back `Fenced` with exact
+    /// revocation-record agreement before reinstalling the live fence, the
+    /// original disposition, and the closure receipt. A missing,
+    /// non-`Fenced`, incomplete, or disagreeing row stays fail-closed:
+    /// absence of the durable closure never restores descendant authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::revoke_grant_closure`], with
+    /// [`KernelError::RecoveryUnavailable`] naming the exact rehydration
+    /// disagreement.
+    pub fn recover_grant_closure_revocation(
+        &self,
+        request: &GrantClosureRevocationIntent,
+        active_epoch: &EpochId,
+    ) -> Result<GrantClosureReceipt, KernelError> {
+        let boundary = self.durable_boundary().ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "grant-closure recovery needs the durable root-grant boundary".to_owned(),
+            )
+        })?;
+        validate_id(&request.operation_id, "operation_id")?;
+        validate_id(&request.grant_id, "grant_id")?;
+        let owner_enumeration = boundary.hydration.enumerate_grant_closure(&request.grant_id)?;
+        self.revoke_closure_core(request, active_epoch, Some(boundary), Some(&owner_enumeration))
+    }
+
+    /// Shared revocation-closure core behind the rich, thin, and recovery
+    /// entry points. The owner enumeration is `Some` on every durable path
+    /// (fetched by the caller or re-presented for recovery) and `None` only
+    /// for the ledger-only path with no durable boundary.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closure revocation gate keeps derivation, idempotency, per-member CAS, read-back, and install together"
+    )]
+    fn revoke_closure_core(
+        &self,
+        request: &GrantClosureRevocationIntent,
+        active_epoch: &EpochId,
+        boundary: Option<&DurableRootGrantBoundary>,
+        owner_enumeration: Option<&GrantClosureEnumeration>,
+    ) -> Result<GrantClosureReceipt, KernelError> {
+        validate_id(&request.operation_id, "operation_id")?;
+        validate_id(&request.grant_id, "grant_id")?;
+        validate_id(&request.authority_root_ref, "authority_root_ref")?;
+        validate_id(&request.snapshot_id, "snapshot_id")?;
+        for obligation in &request.receipt_obligations {
+            validate_id(obligation, "receipt_obligation")?;
+        }
+        let mut unknown_effects = BTreeSet::new();
+        for operation in &request.unknown_outcome_operations {
+            validate_id(operation, "unknown_outcome_operation")?;
+            unknown_effects.insert(operation.clone());
+        }
+        check_binding(&request.binding, active_epoch)?;
+
+        let mut ledger = self.lock_ledger();
+        // Derive the fence set before the idempotency gate: the digest binds
+        // the complete affected set, so exact replay re-derives the same
+        // digest while any changed member is a typed conflict. These are
+        // read-only derivations; no mutation happens above the gate.
+        let derived = derive_closure_fence(
+            &ledger,
+            request,
+            boundary,
+            owner_enumeration,
+            active_epoch,
+        )?;
+        let digest = closure_revocation_digest(request, &derived)?;
+        match ledger.resolve(&request.operation_id, &digest) {
+            IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
+            IntentResolve::Replay(_) => {
+                let record = ledger.intents.get(&request.operation_id).ok_or_else(|| {
+                    KernelError::RecoveryUnavailable(
+                        "closure revocation intent disappeared during replay".to_owned(),
+                    )
+                })?;
+                return record.closure_receipt.clone().ok_or(KernelError::IdempotencyConflict);
+            }
+            IntentResolve::New => {}
+        }
+        check_revision(
+            &ledger,
+            &request.authority_root_ref,
+            request.grant_graph_revision,
+        )?;
+        if derived.unknown_target {
+            ledger.intents.insert(
+                request.operation_id.clone(),
+                PortIntentRecord {
+                    operation_id: request.operation_id.clone(),
+                    digest,
+                    kind: IntentKind::GrantRevocation,
+                    disposition: IntentDisposition::Reconciling {
+                        field: "grant_id",
+                        reason: "unknown grant lineage; reconcile by receipt before retry",
+                    },
+                    fenced: Vec::new(),
+                    closure_receipt: None,
+                    closure_member_receipts: Vec::new(),
+                },
+            );
+            return Err(KernelError::InvalidField {
+                field: "grant_id",
+                reason: "unknown grant lineage; reconcile by receipt before retry",
+            });
+        }
+
+        // Durable linearization: one ORS `Active`-to-`Fenced`
+        // compare-and-swap per affected member with an exact read-back. A
+        // crash between members is recovered by exact re-presentation (an
+        // already-`Fenced` member replays its receipt; a reconfirmed member
+        // is skipped because its fence already covers the exact authority;
+        // nothing is installed live until every read-back agrees).
+        //
+        // Live fencing runs before the closure-row commit so the row records
+        // the exact fenced introduction set; a retry re-fences idempotently
+        // and recommits the same row.
+        let mut fenced_introductions: BTreeSet<String> = BTreeSet::new();
+        if let Some(boundary) = boundary {
+            check_closure_watermark(
+                boundary,
+                &request.authority_root_ref,
+                request.grant_graph_revision,
+            )?;
+            for member in &derived.members {
+                if member.reconfirmed {
+                    continue;
+                }
+                let revocation_record =
+                    closure_member_revocation(&member.activation_input, &request.operation_id)?;
+                let durable_receipt = boundary
+                    .store
+                    .revoke_capability_grant(revocation_record.clone())
+                    .map_err(|error| map_ors_recovery_error(&error))?;
+                let subject = OperationIdentity::new(&member.grant_id)
+                    .map_err(KernelError::RecoveryState)?;
+                let projection = boundary
+                    .store
+                    .load_capability_grant(&subject)
+                    .map_err(|error| map_ors_recovery_error(&error))?
+                    .ok_or_else(|| {
+                        KernelError::RecoveryUnavailable(
+                            "closure member projection disappeared during revocation".to_owned(),
+                        )
+                    })?;
+                if projection.phase() != OperationalPhase::Fenced
+                    || projection.record() != revocation_record.record()
+                    || projection.receipt() != durable_receipt.receipt()
+                {
+                    return Err(KernelError::RecoveryUnavailable(
+                        "closure member revocation ORS receipt/read-back disagreed".to_owned(),
+                    ));
+                }
+            }
+            for introduction_id in fence_live_closure_members(&mut ledger, &derived.affected) {
+                fenced_introductions.insert(introduction_id);
+            }
+            // A present row (crash between commit and install, or recovery
+            // re-presentation) already recorded the fenced introduction set
+            // when live supporters existed. Union it before committing so the
+            // exact row replays instead of mismatching on evidence the fresh
+            // live map can no longer derive.
+            let operation_id = OperationIdentity::new(&request.operation_id)
+                .map_err(KernelError::RecoveryState)?;
+            if let Some(present) = boundary
+                .store
+                .load_grant_closure(&operation_id)
+                .map_err(|error| map_ors_recovery_error(&error))?
+            {
+                for introduction_id in &present.commit().fenced_introductions {
+                    fenced_introductions.insert(introduction_id.as_str().to_owned());
+                }
+            }
+            // The closure row makes the operation, revision, digest, affected
+            // set, survivors, fenced introductions, and receipt durable as
+            // one committed object: a crash before the ledger insert replays
+            // here instead of losing the closure identity. The union above
+            // guarantees the candidate reproduces the stored row exactly, so
+            // the reinstall below restores the same evidence on every path.
+            let stored_commit = ensure_closure_row(
+                boundary,
+                &closure_commit_for(
+                    &request.operation_id,
+                    &request.grant_id,
+                    &request.authority_root_ref,
+                    request.grant_graph_revision,
+                    &digest,
+                    &derived.affected,
+                    &derived.preserved,
+                    &fenced_introductions.iter().cloned().collect::<Vec<_>>(),
+                    GrantClosureState::Fenced,
+                )?,
+            )?;
+            // Reinstall fenced-introduction evidence: after a restart the live
+            // map is empty, so the union above (live fence plus stored row)
+            // is the only record that these introductions were fenced and
+            // must never read as usable again.
+            for introduction_id in &stored_commit.fenced_introductions {
+                fenced_introductions.insert(introduction_id.as_str().to_owned());
+            }
+        } else {
+            // Ledger-only mode: no durable row exists, so only the live
+            // fence is recorded.
+            for introduction_id in fence_live_closure_members(&mut ledger, &derived.affected) {
+                fenced_introductions.insert(introduction_id);
+            }
+        }
+        for introduction_id in &fenced_introductions {
+            ledger.introductions.entry(introduction_id.clone()).or_insert(
+                LiveIntroductionRecord {
+                    authority_root_ref: request.authority_root_ref.clone(),
+                    supporting_grant_ids: BTreeSet::new(),
+                    status: LiveStatus::Revoked,
+                },
+            );
+        }
+        let fenced_introductions: Vec<String> = fenced_introductions.into_iter().collect();
+        let receipt = AuthorityRevocationReceipt {
+            revocation_id: format!("revocation-{}", request.operation_id),
+            snapshot_id: request.snapshot_id.clone(),
+            authority_epoch: active_epoch.clone(),
+            state: AuthorityState::Revoked,
+        };
+        receipt.validate()?;
+        let closure_receipt = GrantClosureReceipt {
+            operation_id: request.operation_id.clone(),
+            authority_root_ref: request.authority_root_ref.clone(),
+            target_grant_id: request.grant_id.clone(),
+            grant_graph_revision: request.grant_graph_revision,
+            affected_grants: derived.affected.clone(),
+            preserved_grants: derived.preserved.clone(),
+            fenced_introductions,
+            state: AuthorityState::Revoked,
+        };
+        closure_receipt.validate()?;
+        ledger.note_revision(
+            &request.authority_root_ref,
+            request.grant_graph_revision,
+        );
+        ledger.intents.insert(
+            request.operation_id.clone(),
+            PortIntentRecord {
+                operation_id: request.operation_id.clone(),
+                digest,
+                kind: IntentKind::GrantRevocation,
+                disposition: IntentDisposition::Committed(CommittedReceipt::Revocation(
+                    receipt.clone(),
+                )),
+                fenced: derived.affected.clone(),
+                closure_receipt: Some(closure_receipt.clone()),
+                closure_member_receipts: Vec::new(),
+            },
+        );
+        ledger
+            .closure_targets
+            .insert(request.grant_id.clone(), request.operation_id.clone());
+        Ok(closure_receipt)
     }
 
     fn activate_root_grant_durable(
@@ -1033,6 +2664,12 @@ impl GrantActivationPort {
             hydration.observed_at_ms,
         )
         .map_err(|error| map_thin_error(&error))?;
+        // Durable revision gate (`#2100`): the same per-root watermark the
+        // closure paths enforce. A stale presentation fails closed here
+        // instead of committing under a superseded revision.
+        // Restore never reactivates: refuse a `Fenced` or `Released` durable
+        // row before any mutation.
+        check_root_activation_durability(boundary, &hydration)?;
         let pending = PendingActivation {
             operation_id: operation_id.clone(),
             digest: digest.clone(),
@@ -1088,164 +2725,53 @@ impl GrantActivationPort {
         result
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the durable revocation protocol keeps gate, commit, read-back, and install together"
-    )]
-    fn revoke_root_grant_durable(
+    /// Thin multi-descendant revocation: the Governor owner already declared
+    /// the complete closure, so the thin request only supplies the target,
+    /// snapshot, and binding. The operation identity reuses the single-root
+    /// derivation (kind, target, snapshot, epoch tuple); a changed closure
+    /// under one derived identity is a typed conflict, and a new snapshot or
+    /// epoch derives a fresh identity that re-confirms the fence.
+    fn revoke_grant_closure_durable_thin(
         &self,
         request: &eliot_authority::GrantRevocationRequest,
         active_epoch: &EpochId,
         boundary: &DurableRootGrantBoundary,
+        enumeration: &GrantClosureEnumeration,
     ) -> Result<AuthorityRevocationReceipt, eliot_authority::P07PortError> {
         check_binding(&request.binding, active_epoch).map_err(|error| map_thin_error(&error))?;
+        let rich = GrantClosureRevocationIntent {
+            operation_id: thin_operation_id(
+                "revoke-grant",
+                request.grant_id.as_str(),
+                request.snapshot_id.as_str(),
+                active_epoch,
+            ),
+            grant_id: request.grant_id.as_str().to_owned(),
+            authority_root_ref: enumeration.authority_root_ref.clone(),
+            snapshot_id: request.snapshot_id.as_str().to_owned(),
+            grant_graph_revision: enumeration.grant_graph_revision,
+            binding: request.binding.clone(),
+            // The thin request expresses no unknown effects and declares no
+            // receipt obligations: both are faithful absences, not defaults.
+            unknown_outcome_operations: Vec::new(),
+            receipt_obligations: Vec::new(),
+        };
+        let receipt = self
+            .revoke_closure_core(&rich, active_epoch, Some(boundary), Some(enumeration))
+            .map_err(|error| map_thin_error(&error))?;
         let operation_id = thin_operation_id(
             "revoke-grant",
             request.grant_id.as_str(),
             request.snapshot_id.as_str(),
             active_epoch,
         );
-        let subject_id = OperationIdentity::new(request.grant_id.as_str())
-            .map_err(|_| eliot_authority::P07PortError::InvalidBinding)?;
-        let prior = boundary
-            .store
-            .load_capability_grant(&subject_id)
-            .map_err(|error| map_ors_error(&error))?
-            .ok_or(eliot_authority::P07PortError::Unavailable)?;
-        check_opaque_record_binding(prior.record(), &request.binding, active_epoch)
-            .map_err(|error| map_thin_error(&error))?;
-
-        let (hydration, revocation_record) =
-            prepare_root_revocation(&prior, operation_id.as_str(), active_epoch, boundary)?;
-        if let Some(hydration) = hydration.as_ref()
-            && (hydration.intent.grant_id != request.grant_id.as_str()
-                || hydration.intent.snapshot_id != request.snapshot_id.as_str()
-                || hydration.intent.binding != request.binding)
+        if receipt.operation_id != operation_id
+            || receipt.target_grant_id != request.grant_id.as_str()
+            || receipt.state != AuthorityState::Revoked
         {
-            return Err(eliot_authority::P07PortError::InvalidBinding);
+            return Err(eliot_authority::P07PortError::Unavailable);
         }
-
-        let mut ledger = self.lock_ledger();
-        let digest = root_revocation_digest(hydration.as_ref(), request, operation_id.as_str())?;
-        if let Some(digest) = digest.as_ref() {
-            match ledger.resolve(&operation_id, digest) {
-                IntentResolve::Conflict => {
-                    return Err(eliot_authority::P07PortError::InvalidBinding);
-                }
-                IntentResolve::Replay(disposition) => {
-                    return disposition
-                        .into_revocation_receipt()
-                        .map_err(|error| map_thin_error(&error));
-                }
-                IntentResolve::New => {}
-            }
-        }
-        if let Some(hydration) = hydration.as_ref() {
-            validate_root_intent_for_revocation(&hydration.intent, &ledger, active_epoch)
-                .map_err(|error| map_thin_error(&error))?;
-        }
-        let pending_key = hydration
-            .as_ref()
-            .map(|hydration| {
-                let Some(digest) = digest.as_ref() else {
-                    return Err(eliot_authority::P07PortError::Unavailable);
-                };
-                let pending = PendingRevocation {
-                    operation_id: operation_id.clone(),
-                    digest: digest.clone(),
-                    grant_id: hydration.intent.grant_id.clone(),
-                    durable_record: revocation_record.clone(),
-                };
-                if ledger
-                    .pending_revocations
-                    .insert(operation_id.clone(), pending)
-                    .is_some()
-                {
-                    return Err(eliot_authority::P07PortError::InvalidBinding);
-                }
-                let pending_is_exact =
-                    ledger
-                        .pending_revocations
-                        .get(&operation_id)
-                        .is_some_and(|pending| {
-                            pending.operation_id == operation_id
-                                && pending.digest == *digest
-                                && pending.grant_id == hydration.intent.grant_id
-                                && pending.durable_record == revocation_record
-                        });
-                if !pending_is_exact {
-                    ledger.pending_revocations.remove(&operation_id);
-                    return Err(eliot_authority::P07PortError::InvalidBinding);
-                }
-                Ok(operation_id.clone())
-            })
-            .transpose()?;
-        let result = (|| {
-            let durable_receipt = boundary
-                .store
-                .revoke_capability_grant(revocation_record.clone())
-                .map_err(|error| map_ors_error(&error))?;
-            let projection = boundary
-                .store
-                .load_capability_grant(&subject_id)
-                .map_err(|error| map_ors_error(&error))?
-                .ok_or(eliot_authority::P07PortError::Unavailable)?;
-            if projection.phase() != OperationalPhase::Fenced
-                || projection.record() != revocation_record.record()
-                || projection.receipt() != durable_receipt.receipt()
-            {
-                return Err(eliot_authority::P07PortError::Unavailable);
-            }
-            let receipt = runtime_revocation_receipt(request, active_epoch)
-                .map_err(|error| map_thin_error(&error))?;
-            if let Some(hydration) = hydration {
-                if let Some(grant) = ledger.grants.get_mut(request.grant_id.as_str()) {
-                    grant.status = LiveStatus::Revoked;
-                } else {
-                    ledger
-                        .revoked_grants
-                        .insert(request.grant_id.as_str().to_owned());
-                }
-                let Some(digest) = digest else {
-                    return Err(eliot_authority::P07PortError::Unavailable);
-                };
-                ledger.intents.insert(
-                    operation_id.clone(),
-                    PortIntentRecord {
-                        operation_id: operation_id.clone(),
-                        digest,
-                        kind: IntentKind::GrantRevocation,
-                        disposition: IntentDisposition::Committed(CommittedReceipt::Revocation(
-                            receipt.clone(),
-                        )),
-                        fenced: vec![hydration.intent.grant_id],
-                    },
-                );
-            } else {
-                ledger
-                    .revoked_grants
-                    .insert(request.grant_id.as_str().to_owned());
-                let digest = fenced_root_revocation_digest(&operation_id, request, &projection)
-                    .map_err(|error| map_thin_error(&error))?;
-                ledger.intents.insert(
-                    operation_id.clone(),
-                    PortIntentRecord {
-                        operation_id: operation_id.clone(),
-                        digest,
-                        kind: IntentKind::GrantRevocation,
-                        disposition: IntentDisposition::Committed(CommittedReceipt::Revocation(
-                            receipt.clone(),
-                        )),
-                        fenced: vec![request.grant_id.as_str().to_owned()],
-                    },
-                );
-            }
-            Ok(receipt)
-        })();
-        if let Some(pending_key) = pending_key {
-            ledger.pending_revocations.remove(&pending_key);
-        }
-        result
+        runtime_revocation_receipt(request, active_epoch).map_err(|error| map_thin_error(&error))
     }
 
     fn lock_ledger(&self) -> MutexGuard<'_, PortLedger> {
@@ -1253,83 +2779,6 @@ impl GrantActivationPort {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-}
-
-fn prepare_root_revocation(
-    prior: &CapabilityGrantProjection,
-    operation_id: &str,
-    active_epoch: &EpochId,
-    boundary: &DurableRootGrantBoundary,
-) -> Result<(Option<RootGrantHydration>, CapabilityGrantRevocation), eliot_authority::P07PortError>
-{
-    let hydration = if prior.phase() == OperationalPhase::Active {
-        let hydration = boundary
-            .hydration
-            .rehydrate_root_grant(prior)
-            .map_err(|error| map_thin_error(&error))?;
-        validate_rehydrated_root_grant(&hydration, prior, active_epoch)
-            .map_err(|error| map_thin_error(&error))?;
-        Some(hydration)
-    } else {
-        if prior.record().record_id.as_str() != operation_id {
-            return Err(eliot_authority::P07PortError::NotAdmitted);
-        }
-        None
-    };
-    let revocation_record = if prior.phase() == OperationalPhase::Active {
-        let mut input = prior.record().clone();
-        input.record_id = OperationIdentity::new(operation_id)
-            .map_err(|_| eliot_authority::P07PortError::InvalidBinding)?;
-        CapabilityGrantRevocation::new(input)
-            .map_err(|_| eliot_authority::P07PortError::InvalidBinding)?
-    } else {
-        CapabilityGrantRevocation::new(prior.record().clone())
-            .map_err(|_| eliot_authority::P07PortError::InvalidBinding)?
-    };
-    Ok((hydration, revocation_record))
-}
-
-fn root_revocation_digest(
-    hydration: Option<&RootGrantHydration>,
-    request: &eliot_authority::GrantRevocationRequest,
-    operation_id: &str,
-) -> Result<Option<String>, eliot_authority::P07PortError> {
-    let Some(hydration) = hydration else {
-        return Ok(None);
-    };
-    GrantRevocationIntent {
-        operation_id: operation_id.to_owned(),
-        grant_id: request.grant_id.as_str().to_owned(),
-        authority_root_ref: hydration.intent.authority_root_ref.clone(),
-        snapshot_id: request.snapshot_id.as_str().to_owned(),
-        grant_graph_revision: hydration.intent.grant_graph_revision,
-        binding: request.binding.clone(),
-        unknown_outcome_operations: Vec::new(),
-        receipt_obligations: Vec::new(),
-    }
-    .digest()
-    .map(Some)
-    .map_err(|error| map_thin_error(&error))
-}
-
-/// Reconstructs the live idempotency key for a revocation whose Fenced ORS
-/// projection is the only durable semantic evidence available after restart.
-/// The store projection and receipt are included so a changed opaque record
-/// cannot be treated as the same recovered intent.
-fn fenced_root_revocation_digest(
-    operation_id: &str,
-    request: &eliot_authority::GrantRevocationRequest,
-    projection: &CapabilityGrantProjection,
-) -> Result<String, KernelError> {
-    finalize_digest(&(
-        "grant-revocation",
-        operation_id,
-        request.grant_id.as_str(),
-        request.snapshot_id.as_str(),
-        &request.binding,
-        projection.record(),
-        projection.receipt(),
-    ))
 }
 
 /// Boundary crossed by one recorded operation identity.
@@ -1359,6 +2808,13 @@ struct PortIntentRecord {
     kind: IntentKind,
     disposition: IntentDisposition,
     fenced: Vec<String>,
+    /// Durable closure receipt committed by a closure operation, if any.
+    /// Restart rehydration repopulates this alongside `disposition` and
+    /// `fenced` so closure queries read back restart-identical values.
+    closure_receipt: Option<GrantClosureReceipt>,
+    /// Per-member activation receipts committed by a closure activation, in
+    /// enumeration order. Empty for every non-closure operation.
+    closure_member_receipts: Vec<AuthorityActivationReceipt>,
 }
 
 /// Live enforcement state of one recorded grant.
@@ -1391,16 +2847,6 @@ struct PendingActivation {
     durable_record: CapabilityGrantActivation,
 }
 
-/// Gate-owned revocation state retained until the opaque ORS fence is read
-/// back and the live lineage fence is installed.
-#[derive(Clone, Debug)]
-struct PendingRevocation {
-    operation_id: String,
-    digest: String,
-    grant_id: String,
-    durable_record: CapabilityGrantRevocation,
-}
-
 /// Whether one recorded grant or introduction still carries live authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LiveStatus {
@@ -1413,12 +2859,14 @@ enum LiveStatus {
 struct PortLedger {
     intents: BTreeMap<String, PortIntentRecord>,
     pending_activations: BTreeMap<String, PendingActivation>,
-    pending_revocations: BTreeMap<String, PendingRevocation>,
     grants: BTreeMap<String, LiveGrantRecord>,
     revoked_grants: BTreeSet<String>,
     introductions: BTreeMap<String, LiveIntroductionRecord>,
     max_revision: BTreeMap<String, u64>,
     reconciling_effects: BTreeMap<String, String>,
+    /// Closure target grant identity to closure operation identity, so a
+    /// committed closure stays reachable by target after restart rehydration.
+    closure_targets: BTreeMap<String, String>,
 }
 
 impl PortLedger {
@@ -1604,6 +3052,857 @@ fn descendant_closure(
         }
     }
     fenced.into_iter().collect()
+}
+
+/// Returns the unique delegation anchor of one enumeration: the member
+/// whose parent is `None` (a delegation root) or names a grant outside the
+/// enumeration (a mid-chain subtree or an incremental delegation onto a
+/// recorded parent). Structure validation requires exactly one.
+fn closure_anchor_grant(enumeration: &GrantClosureEnumeration) -> Result<String, KernelError> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut anchor: Option<&str> = None;
+    for member in &enumeration.members {
+        let is_anchor = member.intent.parent_grant_id.as_deref().is_none_or(|parent| {
+            !seen.contains(parent)
+        });
+        if is_anchor {
+            if anchor.is_some() {
+                return Err(KernelError::InvalidField {
+                    field: "enumeration.members",
+                    reason: "the closure enumeration must name exactly one delegation anchor",
+                });
+            }
+            anchor = Some(member.intent.grant_id.as_str());
+        }
+        seen.insert(member.intent.grant_id.as_str());
+    }
+    anchor.map(str::to_owned).ok_or(KernelError::InvalidField {
+        field: "enumeration.members",
+        reason: "the closure enumeration must name exactly one delegation anchor",
+    })
+}
+
+/// Returns the sorted affected set of one enumeration: every member identity.
+fn closure_affected_set(enumeration: &GrantClosureEnumeration) -> Vec<String> {
+    let mut affected = BTreeSet::new();
+    for member in &enumeration.members {
+        affected.insert(member.intent.grant_id.clone());
+    }
+    affected.into_iter().collect()
+}
+
+/// Validates one Governor-enumerated closure structurally, before any
+/// mutation and without consulting live state.
+///
+/// Every member must share the exact enumeration revision, root, and fence
+/// contour; parents must appear earlier in parent-before-child order; opaque
+/// records must agree triple-wise (record identity, subject identity, and
+/// binding) with their semantic intent. The fence set itself is never taken
+/// from caller material: only this validated enumeration feeds the fence
+/// derivation.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the enumeration structural gate keeps revision, root, order, binding, and opaque agreement together"
+)]
+fn validate_closure_enumeration(
+    enumeration: &GrantClosureEnumeration,
+    active_epoch: &EpochId,
+) -> Result<(), KernelError> {
+    validate_id(
+        &enumeration.authority_root_ref,
+        "enumeration.authority_root_ref",
+    )?;
+    if enumeration.grant_graph_revision == 0 {
+        return Err(KernelError::InvalidField {
+            field: "enumeration.grant_graph_revision",
+            reason: "grant graph revision must be nonzero",
+        });
+    }
+    if enumeration.members.is_empty() {
+        return Err(KernelError::InvalidField {
+            field: "enumeration.members",
+            reason: "a closure enumeration affects at least its target",
+        });
+    }
+    let mut previous_survivor: Option<(&str, &str, &str)> = None;
+    for survivor in &enumeration.preserved {
+        validate_id(&survivor.grant_id, "enumeration.survivor_grant")?;
+        validate_id(
+            &survivor.covering_grant_id,
+            "enumeration.survivor_covering_grant",
+        )?;
+        validate_id(
+            &survivor.covering_root_ref,
+            "enumeration.survivor_covering_root",
+        )?;
+        let key = (
+            survivor.grant_id.as_str(),
+            survivor.covering_grant_id.as_str(),
+            survivor.covering_root_ref.as_str(),
+        );
+        if let Some(previous) = previous_survivor
+            && previous >= key
+        {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.preserved",
+                reason: "survivors must be sorted and unique",
+            });
+        }
+        previous_survivor = Some(key);
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut anchor_count = 0u32;
+    let mut contour: Option<&AuthorityBinding> = None;
+    for member in &enumeration.members {
+        let intent = &member.intent;
+        validate_id(&intent.operation_id, "enumeration.member.operation_id")?;
+        validate_id(&intent.grant_id, "enumeration.member.grant_id")?;
+        if let Some(parent) = &intent.parent_grant_id {
+            validate_id(parent, "enumeration.member.parent_grant_id")?;
+            // A parent outside the enumeration is the closure anchor's
+            // external delegator (mid-chain subtree or incremental
+            // delegation): it must appear at most once and is resolved
+            // against live lineage or a durable row by the caller, never
+            // assumed here.
+            if !seen.contains(parent.as_str()) {
+                anchor_count += 1;
+            }
+        } else {
+            anchor_count += 1;
+        }
+        validate_id(&intent.authority_root_ref, "enumeration.member.authority_root_ref")?;
+        validate_id(&intent.snapshot_id, "enumeration.member.snapshot_id")?;
+        validate_id(&intent.holder_principal, "enumeration.member.holder_principal")?;
+        validate_id(&intent.session_id, "enumeration.member.session_id")?;
+        validate_id(&intent.scope_id, "enumeration.member.scope_id")?;
+        for obligation in &intent.receipt_obligations {
+            validate_id(obligation, "enumeration.member.receipt_obligation")?;
+        }
+        if !seen.insert(intent.grant_id.as_str()) {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.member.grant_id",
+                reason: "duplicate closure member identity",
+            });
+        }
+        if intent.authority_root_ref != enumeration.authority_root_ref {
+            return Err(KernelError::FenceMismatch);
+        }
+        if intent.grant_graph_revision != enumeration.grant_graph_revision {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.member.grant_graph_revision",
+                reason: "every closure member carries the exact enumeration revision",
+            });
+        }
+        check_binding(&intent.binding, active_epoch)?;
+        check_ceiling(
+            intent.allowed_effect,
+            intent.proof_ceiling,
+            &intent.binding,
+        )?;
+        check_expiry(
+            intent.issued_at_ms,
+            intent.expires_at_ms,
+            member.observed_at_ms,
+        )?;
+        if let Some(contour) = contour {
+            if contour.state_fence != intent.binding.state_fence
+                || !contour
+                    .authority_epoch
+                    .is_same_authority(&intent.binding.authority_epoch)
+            {
+                return Err(KernelError::FenceMismatch);
+            }
+        } else {
+            contour = Some(&intent.binding);
+        }
+        if member.durable_record.record().record_id.as_str() != intent.operation_id
+            || member.durable_record.record().subject_id.as_str() != intent.grant_id
+        {
+            return Err(KernelError::RecoveryUnavailable(
+                "closure member opaque record disagrees with its semantic intent".to_owned(),
+            ));
+        }
+        check_opaque_record_binding(
+            member.durable_record.record(),
+            &intent.binding,
+            active_epoch,
+        )?;
+    }
+    if anchor_count != 1 {
+        return Err(KernelError::InvalidField {
+            field: "enumeration.members",
+            reason: "the closure enumeration must name exactly one delegation anchor",
+        });
+    }
+    for survivor in &enumeration.preserved {
+        if seen.contains(survivor.grant_id.as_str()) {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.preserved",
+                reason: "a survivor must be disjoint from the fenced members",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates every closure member for activation against the recorded lineage
+/// plus the earlier enumeration members, before any mutation.
+///
+/// The enumeration must already be structurally valid. A member identity that
+/// is already recorded (live or fenced) is rejected: restore never
+/// reactivates a path. An anchor parent outside the enumeration (mid-chain
+/// subtree or incremental delegation onto a recorded parent) resolves
+/// through live lineage or a durable row instead.
+fn validate_closure_activation_members(
+    enumeration: &GrantClosureEnumeration,
+    ledger: &PortLedger,
+    boundary: Option<&DurableRootGrantBoundary>,
+    active_epoch: &EpochId,
+) -> Result<(), KernelError> {
+    let mut working: BTreeMap<String, LiveGrantRecord> = ledger.grants.clone();
+    // Member grant identities inside one enumeration, for external-parent
+    // detection without re-walking the whole enumeration per member.
+    let internal: BTreeSet<&str> = enumeration
+        .members
+        .iter()
+        .map(|member| member.intent.grant_id.as_str())
+        .collect();
+    for member in &enumeration.members {
+        let intent = &member.intent;
+        if working.contains_key(&intent.grant_id)
+            || ledger.revoked_grants.contains(&intent.grant_id)
+        {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.member.grant_id",
+                reason: "grant identity is already recorded; restore never reactivates a path",
+            });
+        }
+        if let Some(parent_id) = &intent.parent_grant_id {
+            if internal.contains(parent_id.as_str()) {
+                let Some(parent) = working.get(parent_id) else {
+                    return Err(KernelError::InvalidField {
+                        field: "enumeration.member.parent_grant_id",
+                        reason: "unknown parent lineage",
+                    });
+                };
+                if parent.status != LiveStatus::Active {
+                    return Err(KernelError::InvalidField {
+                        field: "enumeration.member.parent_grant_id",
+                        reason: "parent lineage is fenced",
+                    });
+                }
+                if let Some(expires) = parent.expires_at_ms
+                    && expires <= member.observed_at_ms
+                {
+                    return Err(KernelError::InvalidField {
+                        field: "enumeration.member.parent_grant_id",
+                        reason: "parent lineage is expired",
+                    });
+                }
+            } else {
+                resolve_external_parent(
+                    ledger,
+                    boundary,
+                    active_epoch,
+                    &intent.authority_root_ref,
+                    &intent.binding,
+                    parent_id,
+                    Some(member.observed_at_ms),
+                )?;
+            }
+        }
+        working.insert(
+            intent.grant_id.clone(),
+            LiveGrantRecord {
+                parent_grant_id: intent.parent_grant_id.clone(),
+                authority_root_ref: intent.authority_root_ref.clone(),
+                binding: intent.binding.clone(),
+                allowed_effect: intent.allowed_effect,
+                proof_ceiling: intent.proof_ceiling,
+                expires_at_ms: intent.expires_at_ms,
+                status: LiveStatus::Active,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// One affected member with the exact opaque activation input its durable
+/// fence is derived from.
+struct ClosureFenceMember {
+    grant_id: String,
+    activation_input: OperationalRecordInput,
+    /// A `Fenced` row already covers the same authority under a different
+    /// closure operation: the fence is reconfirmed, never recommitted.
+    reconfirmed: bool,
+}
+
+/// Read-only fence derivation for one closure revocation: the complete
+/// affected set, the owner-declared survivors, and the per-member opaque
+/// inputs. No mutation happens here; the caller commits after the idempotency
+/// gate.
+struct DerivedClosureFence {
+    affected: Vec<String>,
+    preserved: Vec<GrantClosureSurvivor>,
+    members: Vec<ClosureFenceMember>,
+    unknown_target: bool,
+}
+
+/// Derives the exact fence set for one closure revocation without mutating
+/// anything.
+///
+/// On the durable path the injected Governor enumeration is the fence
+/// authority: it must validate structurally, bind the exact presented root
+/// and revision, root at the requested target, and cover every recorded live
+/// descendant (fenced or owner-declared preserved) — anything less refuses as
+/// an incomplete enumeration. Every fenced member must carry a durable ORS
+/// row: an `Active` row must match its enumerated activation input, a
+/// `Fenced` row must match the derived revocation input, and any other phase
+/// or absence stays fail-closed.
+///
+/// Without the durable boundary the fence set is the recorded live
+/// descendant closure and no survivor can be declared. An unrecorded target
+/// reports `unknown_target` so the caller records a reconciling intent
+/// instead of fabricating a fence.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fence derivation keeps enumeration, completeness, and per-member ORS agreement together"
+)]
+fn derive_closure_fence(
+    ledger: &PortLedger,
+    request: &GrantClosureRevocationIntent,
+    boundary: Option<&DurableRootGrantBoundary>,
+    owner_enumeration: Option<&GrantClosureEnumeration>,
+    active_epoch: &EpochId,
+) -> Result<DerivedClosureFence, KernelError> {
+    let Some(boundary) = boundary else {
+        return derive_ledger_closure_fence(ledger, request);
+    };
+    let Some(enumeration) = owner_enumeration else {
+        return Err(KernelError::RecoveryUnavailable(
+            "grant-closure enumeration owner is not bound".to_owned(),
+        ));
+    };
+    validate_closure_enumeration(enumeration, active_epoch)?;
+    if enumeration.authority_root_ref != request.authority_root_ref {
+        return Err(KernelError::FenceMismatch);
+    }
+    if enumeration.grant_graph_revision != request.grant_graph_revision {
+        return Err(KernelError::InvalidField {
+            field: "grant_graph_revision",
+            reason: "the presented revision disagrees with the enumerated revision",
+        });
+    }
+    let anchor_grant_id = closure_anchor_grant(enumeration)?;
+    if anchor_grant_id != request.grant_id {
+        return Err(KernelError::InvalidField {
+            field: "grant_id",
+            reason: "the closure target must be the enumerated delegation anchor",
+        });
+    }
+    // A mid-chain anchor delegates under an external parent outside the
+    // enumeration. That parent must carry live authority on the same root
+    // and fence contour: a recorded active grant, or (on the durable path,
+    // e.g. after a restart) an `Active` durable row bound to the presented
+    // fence and epoch. Anything else refuses instead of fencing or
+    // activating under a fenced, expired, or unknown parent.
+    let anchor = enumeration
+        .members
+        .iter()
+        .find(|member| member.intent.grant_id == anchor_grant_id)
+        .ok_or(KernelError::InvalidField {
+            field: "grant_id",
+            reason: "the closure target must be the enumerated delegation anchor",
+        })?;
+    if let Some(external_parent) = anchor
+        .intent
+        .parent_grant_id
+        .as_deref()
+        .filter(|parent| {
+            !enumeration
+                .members
+                .iter()
+                .any(|member| member.intent.grant_id.as_str() == *parent)
+        })
+    {
+        resolve_external_parent(
+            ledger,
+            Some(boundary),
+            active_epoch,
+            &request.authority_root_ref,
+            &request.binding,
+            external_parent,
+            None,
+        )?;
+    }
+    let affected = closure_affected_set(enumeration);
+    let affected_set: BTreeSet<&str> = affected.iter().map(String::as_str).collect();
+    for survivor in &enumeration.preserved {
+        if let Some(record) = ledger.grants.get(&survivor.grant_id)
+            && record.status != LiveStatus::Active
+        {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.preserved",
+                reason: "a declared survivor is not live authority",
+            });
+        }
+    }
+    let preserved_set: BTreeSet<&str> = enumeration
+        .preserved
+        .iter()
+        .map(|survivor| survivor.grant_id.as_str())
+        .collect();
+    for descendant in descendant_closure(&ledger.grants, &request.authority_root_ref, &request.grant_id)
+    {
+        if !affected_set.contains(descendant.as_str())
+            && !preserved_set.contains(descendant.as_str())
+        {
+            return Err(KernelError::InvalidField {
+                field: "grant_id",
+                reason: "incomplete durable enumeration; a recorded descendant is neither fenced nor preserved",
+            });
+        }
+    }
+    let mut members = Vec::with_capacity(enumeration.members.len());
+    for member in &enumeration.members {
+        if let Some(record) = ledger.grants.get(&member.intent.grant_id) {
+            if record.authority_root_ref != request.authority_root_ref {
+                return Err(KernelError::FenceMismatch);
+            }
+            if record.binding.state_fence != request.binding.state_fence {
+                return Err(KernelError::FenceMismatch);
+            }
+        }
+        let subject = OperationIdentity::new(&member.intent.grant_id)
+            .map_err(KernelError::RecoveryState)?;
+        let projection = boundary
+            .store
+            .load_capability_grant(&subject)
+            .map_err(|error| map_ors_recovery_error(&error))?
+            .ok_or_else(|| {
+                KernelError::RecoveryUnavailable(
+                    "closure member projection is absent; no durable row to fence".to_owned(),
+                )
+            })?;
+        let revocation_record =
+            closure_member_revocation(member.durable_record.record(), &request.operation_id)?;
+        let reconfirmed = match projection.phase() {
+            OperationalPhase::Active => {
+                if projection.record() != member.durable_record.record() {
+                    return Err(KernelError::RecoveryUnavailable(
+                        "closure member ORS row disagrees with its enumerated input".to_owned(),
+                    ));
+                }
+                false
+            }
+            OperationalPhase::Fenced => {
+                if projection.record() == revocation_record.record() {
+                    false
+                } else if activation_bytes_equal(
+                    projection.record(),
+                    member.durable_record.record(),
+                ) {
+                    // A previous closure already fenced the exact authority:
+                    // reconfirm it under this operation instead of forking a
+                    // second fence. A fence over different authority stays
+                    // fail-closed.
+                    true
+                } else {
+                    return Err(KernelError::RecoveryUnavailable(
+                        "closure member fence evidence disagrees with the derived revocation"
+                            .to_owned(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(KernelError::RecoveryUnavailable(
+                    "closure member ORS row is not fenceable".to_owned(),
+                ));
+            }
+        };
+        members.push(ClosureFenceMember {
+            grant_id: member.intent.grant_id.clone(),
+            activation_input: member.durable_record.record().clone(),
+            reconfirmed,
+        });
+    }
+    Ok(DerivedClosureFence {
+        affected,
+        preserved: enumeration.preserved.clone(),
+        members,
+        unknown_target: false,
+    })
+}
+
+/// Ledger-only fence derivation: the recorded live descendant closure, or an
+/// unknown-target marker that the caller records as reconciling.
+fn derive_ledger_closure_fence(
+    ledger: &PortLedger,
+    request: &GrantClosureRevocationIntent,
+) -> Result<DerivedClosureFence, KernelError> {
+    let known = ledger.grants.contains_key(&request.grant_id)
+        || ledger.revoked_grants.contains(&request.grant_id);
+    if !known {
+        return Ok(DerivedClosureFence {
+            affected: Vec::new(),
+            preserved: Vec::new(),
+            members: Vec::new(),
+            unknown_target: true,
+        });
+    }
+    if let Some(record) = ledger.grants.get(&request.grant_id)
+        && record.authority_root_ref != request.authority_root_ref
+    {
+        return Err(KernelError::FenceMismatch);
+    }
+    Ok(DerivedClosureFence {
+        affected: descendant_closure(&ledger.grants, &request.authority_root_ref, &request.grant_id),
+        preserved: Vec::new(),
+        members: Vec::new(),
+        unknown_target: false,
+    })
+}
+
+/// Derives the deterministic ORS revocation record identity for one closure
+/// member: the closure operation identity plus the member grant identity.
+/// Re-presentation after a crash re-derives the same identity, so an
+/// already-`Fenced` member replays its receipt instead of forking a fence.
+fn closure_member_revocation_id(operation_id: &str, grant_id: &str) -> String {
+    format!("{operation_id}/revoke/{grant_id}")
+}
+
+/// Builds one member revocation record from its enumerated activation input:
+/// the exact opaque bytes with only the revocation record identity swapped
+/// in, mirroring the single-root revocation construction.
+fn closure_member_revocation(
+    activation_input: &OperationalRecordInput,
+    operation_id: &str,
+) -> Result<CapabilityGrantRevocation, KernelError> {
+    let grant_id = activation_input.subject_id.as_str().to_owned();
+    let mut input = activation_input.clone();
+    input.record_id =
+        OperationIdentity::new(closure_member_revocation_id(operation_id, &grant_id))
+            .map_err(KernelError::RecoveryState)?;
+    CapabilityGrantRevocation::new(input).map_err(KernelError::RecoveryState)
+}
+
+/// Compares two opaque activation inputs field by field except the mutable
+/// record identity: the same subject, epoch lineage, fence, payload bytes,
+/// and times is the same fenced authority, even when a previous closure
+/// operation fenced it first.
+fn activation_bytes_equal(
+    stored: &OperationalRecordInput,
+    expected: &OperationalRecordInput,
+) -> bool {
+    stored.subject_id == expected.subject_id
+        && stored.authority_epoch == expected.authority_epoch
+        && stored.state_fence == expected.state_fence
+        && stored.payload == expected.payload
+        && stored.payload_sha256 == expected.payload_sha256
+        && stored.payload_length == expected.payload_length
+        && stored.created_at_ms == expected.created_at_ms
+        && stored.cleanup_after_ms == expected.cleanup_after_ms
+}
+
+/// Durable shape of one member row that may still be activated.
+enum ActivationRow {
+    Absent,
+    Active,
+    Applying,
+    /// A `Fenced` or `Released` row: restore never reactivates it. The
+    /// caller decides the refusal kind (fresh activation rejects the
+    /// re-presented identity; recovery refuses the resurrection).
+    Fenced,
+}
+
+/// Durable pre-check before any activation commit: any existing row must
+/// carry the exact presented input, and a `Fenced` or `Released` row is
+/// reported (never reactivated) instead of overwritten.
+fn check_activation_row(
+    boundary: &DurableRootGrantBoundary,
+    grant_id: &str,
+    record: &OperationalRecordInput,
+) -> Result<ActivationRow, KernelError> {
+    let subject =
+        OperationIdentity::new(grant_id).map_err(KernelError::RecoveryState)?;
+    let existing = boundary
+        .store
+        .load_capability_grant(&subject)
+        .map_err(|error| map_ors_recovery_error(&error))?;
+    let Some(existing) = existing else {
+        return Ok(ActivationRow::Absent);
+    };
+    match existing.phase() {
+        OperationalPhase::Fenced | OperationalPhase::Released => Ok(ActivationRow::Fenced),
+        OperationalPhase::Applying | OperationalPhase::Active => {
+            if existing.record() != record {
+                return Err(KernelError::InvalidField {
+                    field: "grant_id",
+                    reason: "grant identity is already recorded under a different input",
+                });
+            }
+            if existing.phase() == OperationalPhase::Applying {
+                Ok(ActivationRow::Applying)
+            } else {
+                Ok(ActivationRow::Active)
+            }
+        }
+        _ => Err(KernelError::RecoveryUnavailable(
+            "closure member ORS row is not activatable".to_owned(),
+        )),
+    }
+}
+
+/// Durable revision gate: advances the per-root watermark and refuses when a
+/// newer revision already moved it further. The returned-watermark check
+/// makes the stale refusal atomic with the advance: a re-presented revision
+/// after a crash proceeds, while any lower revision fails closed even across
+/// restarts.
+fn check_closure_watermark(
+    boundary: &DurableRootGrantBoundary,
+    authority_root_ref: &str,
+    grant_graph_revision: u64,
+) -> Result<(), KernelError> {
+    let root =
+        OpaqueLabel::new(authority_root_ref).map_err(KernelError::RecoveryState)?;
+    let stored = boundary
+        .store
+        .note_grant_graph_revision(&root, grant_graph_revision)
+        .map_err(|error| map_ors_recovery_error(&error))?;
+    if stored != grant_graph_revision {
+        return Err(KernelError::InvalidField {
+            field: "grant_graph_revision",
+            reason: "stale grant-graph revision",
+        });
+    }
+    Ok(())
+}
+
+/// Builds the durable closure commit from validated request material and the
+/// derived fence. Every identity is already validated port-side; ORS
+/// revalidates shape on commit.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the closure commit binds every validated closure coordinate explicitly"
+)]
+fn closure_commit_for(
+    operation_id: &str,
+    target_grant_id: &str,
+    authority_root_ref: &str,
+    grant_graph_revision: u64,
+    digest: &str,
+    affected: &[String],
+    preserved: &[GrantClosureSurvivor],
+    fenced_introductions: &[String],
+    state: GrantClosureState,
+) -> Result<GrantClosureCommit, KernelError> {
+    let affected = affected
+        .iter()
+        .map(|grant_id| OperationIdentity::new(grant_id).map_err(KernelError::RecoveryState))
+        .collect::<Result<Vec<_>, _>>()?;
+    let preserved = preserved
+        .iter()
+        .map(|survivor| {
+            Ok::<_, KernelError>(GrantClosurePreserved {
+                grant_id: OperationIdentity::new(&survivor.grant_id)
+                    .map_err(KernelError::RecoveryState)?,
+                covering_grant_id: OperationIdentity::new(&survivor.covering_grant_id)
+                    .map_err(KernelError::RecoveryState)?,
+                covering_root: OpaqueLabel::new(&survivor.covering_root_ref)
+                    .map_err(KernelError::RecoveryState)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fenced_introductions = fenced_introductions
+        .iter()
+        .map(|introduction_id| {
+            OperationIdentity::new(introduction_id).map_err(KernelError::RecoveryState)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GrantClosureCommit {
+        operation_id: OperationIdentity::new(operation_id).map_err(KernelError::RecoveryState)?,
+        target_id: OperationIdentity::new(target_grant_id).map_err(KernelError::RecoveryState)?,
+        authority_root: OpaqueLabel::new(authority_root_ref).map_err(KernelError::RecoveryState)?,
+        revision: grant_graph_revision,
+        digest: digest.to_owned(),
+        affected,
+        preserved,
+        fenced_introductions,
+        state,
+    })
+}
+
+/// Commits one closure row and verifies the exact read-back: the stored row
+/// must reproduce the presented commit. A present row with the same commit
+/// is an exact replay (crash between commit and install) and its stored
+/// commit is returned; a present row with different content stays
+/// fail-closed instead of overwriting.
+fn ensure_closure_row(
+    boundary: &DurableRootGrantBoundary,
+    commit: &GrantClosureCommit,
+) -> Result<GrantClosureCommit, KernelError> {
+    if let Some(existing) = boundary
+        .store
+        .load_grant_closure(&commit.operation_id)
+        .map_err(|error| map_ors_recovery_error(&error))?
+    {
+        if existing.commit() != commit {
+            return Err(KernelError::RecoveryUnavailable(
+                "durable closure row disagrees with the presented closure".to_owned(),
+            ));
+        }
+        return Ok(existing.commit().clone());
+    }
+    let receipt = boundary
+        .store
+        .commit_grant_closure(commit.clone())
+        .map_err(|error| map_ors_recovery_error(&error))?;
+    let projection = boundary
+        .store
+        .load_grant_closure(&commit.operation_id)
+        .map_err(|error| map_ors_recovery_error(&error))?
+        .ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "durable closure row disappeared during commit".to_owned(),
+            )
+        })?;
+    if projection.commit() != commit || projection.receipt() != &receipt {
+        return Err(KernelError::RecoveryUnavailable(
+            "durable closure receipt/read-back disagreed".to_owned(),
+        ));
+    }
+    Ok(commit.clone())
+}
+
+/// Durable pre-commit gates for the single-root activation path: the
+/// per-root revision watermark and the restore-never-reactivates row check
+/// (`#2100`). Both fail closed before the pending entry is staged.
+fn check_root_activation_durability(
+    boundary: &DurableRootGrantBoundary,
+    hydration: &RootGrantHydration,
+) -> Result<(), eliot_authority::P07PortError> {
+    check_closure_watermark(
+        boundary,
+        &hydration.intent.authority_root_ref,
+        hydration.intent.grant_graph_revision,
+    )
+    .map_err(|error| map_thin_error(&error))?;
+    match check_activation_row(
+        boundary,
+        &hydration.intent.grant_id,
+        hydration.durable_record.record(),
+    ) {
+        Ok(ActivationRow::Fenced) => Err(eliot_authority::P07PortError::InvalidBinding),
+        Ok(_) => Ok(()),
+        Err(error) => Err(map_thin_error(&error)),
+    }
+}
+
+/// Resolves an external delegation parent (a mid-chain anchor's parent
+/// outside the enumeration, or an incremental delegation onto a recorded
+/// parent) against live lineage or a durable row.
+///
+/// A recorded live grant must be active on the exact root and fence contour.
+/// Otherwise, on the durable path, an `Active` durable row bound to the
+/// presented fence and epoch attests the parent authority (e.g. after a
+/// restart, before live rehydration). Fenced, released, expired (when an
+/// observation time is given), missing, or contour-mismatched parents
+/// refuse instead of fencing or activating underneath them.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the external parent gate binds ledger, store, epoch, root, fence, and identity explicitly"
+)]
+fn resolve_external_parent(
+    ledger: &PortLedger,
+    boundary: Option<&DurableRootGrantBoundary>,
+    active_epoch: &EpochId,
+    authority_root_ref: &str,
+    binding: &AuthorityBinding,
+    parent_grant_id: &str,
+    observation_ms: Option<i64>,
+) -> Result<(), KernelError> {
+    if let Some(record) = ledger.grants.get(parent_grant_id) {
+        if record.authority_root_ref != authority_root_ref {
+            return Err(KernelError::FenceMismatch);
+        }
+        if record.binding.state_fence != binding.state_fence {
+            return Err(KernelError::FenceMismatch);
+        }
+        if record.status != LiveStatus::Active {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.member.parent_grant_id",
+                reason: "parent lineage is fenced",
+            });
+        }
+        if let (Some(expires), Some(now_ms)) = (record.expires_at_ms, observation_ms)
+            && expires <= now_ms
+        {
+            return Err(KernelError::InvalidField {
+                field: "enumeration.member.parent_grant_id",
+                reason: "parent lineage is expired",
+            });
+        }
+        return Ok(());
+    }
+    if ledger.revoked_grants.contains(parent_grant_id) {
+        return Err(KernelError::InvalidField {
+            field: "enumeration.member.parent_grant_id",
+            reason: "parent lineage is fenced",
+        });
+    }
+    let Some(boundary) = boundary else {
+        return Err(KernelError::InvalidField {
+            field: "enumeration.member.parent_grant_id",
+            reason: "unknown parent lineage",
+        });
+    };
+    let subject =
+        OperationIdentity::new(parent_grant_id).map_err(KernelError::RecoveryState)?;
+    let projection = boundary
+        .store
+        .load_capability_grant(&subject)
+        .map_err(|error| map_ors_recovery_error(&error))?
+        .ok_or(KernelError::InvalidField {
+            field: "enumeration.member.parent_grant_id",
+            reason: "unknown parent lineage",
+        })?;
+    if projection.phase() != OperationalPhase::Active {
+        return Err(KernelError::InvalidField {
+            field: "enumeration.member.parent_grant_id",
+            reason: "parent lineage is fenced",
+        });
+    }
+    check_opaque_record_binding(projection.record(), binding, active_epoch)?;
+    Ok(())
+}
+
+/// Fences every affected member in live state plus every dependent
+/// introduction whose supporting path crosses the fence, and returns the
+/// sorted fenced introduction identities for the durable closure row.
+/// Members with no live record (restart-rehydrated fences) join the revoked
+/// set so they can never be mistaken for live authority.
+fn fence_live_closure_members(ledger: &mut PortLedger, affected: &[String]) -> Vec<String> {
+    for grant_id in affected {
+        if let Some(target) = ledger.grants.get_mut(grant_id) {
+            target.status = LiveStatus::Revoked;
+        } else {
+            ledger.revoked_grants.insert(grant_id.clone());
+        }
+    }
+    let fenced_set: BTreeSet<&str> = affected.iter().map(String::as_str).collect();
+    let mut fenced_introductions = BTreeSet::new();
+    for (introduction_id, introduction) in &mut ledger.introductions {
+        if introduction.status == LiveStatus::Active
+            && introduction
+                .supporting_grant_ids
+                .iter()
+                .any(|id| fenced_set.contains(id.as_str()))
+        {
+            introduction.status = LiveStatus::Revoked;
+            fenced_introductions.insert(introduction_id.clone());
+        }
+    }
+    fenced_introductions.into_iter().collect()
 }
 
 /// Validates one grant activation against the recorded lineage before any
@@ -1850,6 +4149,47 @@ struct IntroductionRevocationDigestView<'a> {
     receipt_obligations: BTreeSet<&'a str>,
 }
 
+/// Canonical digest bytes for one closure member: the semantic intent plus
+/// the exact opaque ORS record, so a changed encrypted payload under one
+/// member identity is a conflict rather than a replay.
+#[derive(Serialize)]
+struct GrantClosureMemberDigestView<'a> {
+    intent: GrantActivationDigestView<'a>,
+    durable_record: &'a OperationalRecordInput,
+    observed_at_ms: i64,
+}
+
+/// Canonical digest bytes for one closure-activation payload. Members enter
+/// in enumeration (parent-before-child) order, so a reordered enumeration is
+/// a different payload.
+#[derive(Serialize)]
+struct GrantClosureActivationDigestView<'a> {
+    kind: &'static str,
+    operation_id: &'a str,
+    authority_root_ref: &'a str,
+    grant_graph_revision: u64,
+    members: Vec<GrantClosureMemberDigestView<'a>>,
+    preserved: BTreeSet<(&'a str, &'a str, &'a str)>,
+}
+
+/// Canonical digest bytes for one closure-revocation payload. The affected
+/// set and survivors enter as sorted sets, so re-derivation after a restart
+/// reproduces the same digest while any changed member is a typed conflict.
+#[derive(Serialize)]
+struct GrantClosureRevocationDigestView<'a> {
+    kind: &'static str,
+    operation_id: &'a str,
+    target_grant_id: &'a str,
+    authority_root_ref: &'a str,
+    snapshot_id: &'a str,
+    grant_graph_revision: u64,
+    binding: &'a AuthorityBinding,
+    affected: BTreeSet<&'a str>,
+    preserved: BTreeSet<(&'a str, &'a str, &'a str)>,
+    unknown_outcome_operations: BTreeSet<&'a str>,
+    receipt_obligations: BTreeSet<&'a str>,
+}
+
 /// Hashes canonical view bytes into the stable idempotency digest.
 fn finalize_digest(view: &impl Serialize) -> Result<String, KernelError> {
     let bytes = canonical_json_bytes(view).map_err(|_| KernelError::InvalidField {
@@ -1897,6 +4237,82 @@ fn hydrated_root_grant_digest(hydration: &RootGrantHydration) -> Result<String, 
     })
 }
 
+/// Binds one closure operation identity to the complete owner-enumerated
+/// closure: every member intent, every opaque ORS record, and the survivor
+/// set. Reordered members, changed payloads, or a changed survivor set under
+/// one identity are conflicts, never replays.
+fn closure_activation_digest(
+    operation_id: &str,
+    enumeration: &GrantClosureEnumeration,
+) -> Result<String, KernelError> {
+    finalize_digest(&GrantClosureActivationDigestView {
+        kind: "grant-closure-activation",
+        operation_id,
+        authority_root_ref: &enumeration.authority_root_ref,
+        grant_graph_revision: enumeration.grant_graph_revision,
+        members: enumeration
+            .members
+            .iter()
+            .map(|member| GrantClosureMemberDigestView {
+                intent: member.intent.digest_view(),
+                durable_record: member.durable_record.record(),
+                observed_at_ms: member.observed_at_ms,
+            })
+            .collect(),
+        preserved: enumeration
+            .preserved
+            .iter()
+            .map(|survivor| {
+                (
+                    survivor.grant_id.as_str(),
+                    survivor.covering_grant_id.as_str(),
+                    survivor.covering_root_ref.as_str(),
+                )
+            })
+            .collect(),
+    })
+}
+
+/// Binds one closure revocation identity to the target, the exact revision,
+/// the complete affected set, and the survivor set. Re-derivation through the
+/// owner enumeration after a restart reproduces the same digest.
+fn closure_revocation_digest(
+    request: &GrantClosureRevocationIntent,
+    derived: &DerivedClosureFence,
+) -> Result<String, KernelError> {
+    finalize_digest(&GrantClosureRevocationDigestView {
+        kind: "grant-closure-revocation",
+        operation_id: &request.operation_id,
+        target_grant_id: &request.grant_id,
+        authority_root_ref: &request.authority_root_ref,
+        snapshot_id: &request.snapshot_id,
+        grant_graph_revision: request.grant_graph_revision,
+        binding: &request.binding,
+        affected: derived.affected.iter().map(String::as_str).collect(),
+        preserved: derived
+            .preserved
+            .iter()
+            .map(|survivor| {
+                (
+                    survivor.grant_id.as_str(),
+                    survivor.covering_grant_id.as_str(),
+                    survivor.covering_root_ref.as_str(),
+                )
+            })
+            .collect(),
+        unknown_outcome_operations: request
+            .unknown_outcome_operations
+            .iter()
+            .map(String::as_str)
+            .collect(),
+        receipt_obligations: request
+            .receipt_obligations
+            .iter()
+            .map(String::as_str)
+            .collect(),
+    })
+}
+
 impl GrantRevocationIntent {
     fn digest(&self) -> Result<String, KernelError> {
         finalize_digest(&GrantRevocationDigestView {
@@ -1922,8 +4338,8 @@ impl GrantRevocationIntent {
 }
 
 impl IntroductionActivationIntent {
-    fn digest(&self) -> Result<String, KernelError> {
-        finalize_digest(&IntroductionActivationDigestView {
+    fn digest_view(&self) -> IntroductionActivationDigestView<'_> {
+        IntroductionActivationDigestView {
             kind: "introduction-activation",
             operation_id: &self.operation_id,
             introduction_id: &self.introduction_id,
@@ -1950,8 +4366,29 @@ impl IntroductionActivationIntent {
                 .iter()
                 .map(String::as_str)
                 .collect(),
-        })
+        }
     }
+
+    fn digest(&self) -> Result<String, KernelError> {
+        finalize_digest(&self.digest_view())
+    }
+}
+
+/// The durable introduction replay identity includes the exact opaque ORS
+/// input in addition to the semantic intent, mirroring the root-grant
+/// durable digest: a changed encrypted payload under one introduction
+/// identity is a conflict rather than a replay.
+#[derive(Serialize)]
+struct IntroductionDurableDigestView<'a> {
+    intent: IntroductionActivationDigestView<'a>,
+    durable_record: &'a OperationalRecordInput,
+}
+
+fn hydrated_introduction_digest(hydration: &IntroductionHydration) -> Result<String, KernelError> {
+    finalize_digest(&IntroductionDurableDigestView {
+        intent: hydration.intent.digest_view(),
+        durable_record: hydration.durable_record.record(),
+    })
 }
 
 impl IntroductionRevocationIntent {
@@ -1997,7 +4434,9 @@ impl IntroductionRevocationIntent {
 //   read-back, and only then installs live state. Restart recovery rehydrates
 //   the canonical root and requires agreement with the ORS projection and
 //   receipt. Durable revoke follows the same read-back and exact-replay rules.
-//   Child/delegated grants and introductions remain outside this durable slice.
+//   Delegated-descendant activation and revocation flow through the closure
+//   wave (`#2100`) in this same file; delegated introductions remain outside
+//   the durable slice.
 // - The active epoch is always the caller-presented binding epoch: this port
 //   holds no epoch and queries no second epoch owner. Revocation is
 //   authority-removing, so fencing at the presented epoch is fail-closed;
@@ -2013,9 +4452,15 @@ impl IntroductionRevocationIntent {
 // validated inputs plus ledger plus revision, and each passes `validate()`
 // before it is returned: no canned receipt value exists here. Durable
 // root-grant persistence, restart rehydration, and ORS read-back are covered
-// here. Child/delegated grants, introductions, and descendant closure beyond
-// the recorded in-memory lineage remain explicit residuals for follow-up
-// waves; nothing here claims them.
+// here. The durable descendant-closure wave (`#2100`, lane C) lives in this
+// same file beside Slice A: `activate_grant_closure`,
+// `revoke_grant_closure`, `recover_grant_closure_activation`, and
+// `recover_grant_closure_revocation` enumerate the complete closure through
+// the injected Governor boundary at one exact revision, fence per member
+// through ORS with read-back, and record one `GrantClosureReceipt`.
+// Child/delegated introductions and incremental delegation onto already
+// recorded parents remain explicit residuals for follow-up waves; nothing
+// here claims them.
 // ---------------------------------------------------------------------------
 
 /// Derives the thin-port operation identity for one target/snapshot/epoch.
@@ -2101,6 +4546,8 @@ fn install_root_activation(
                 receipt.clone(),
             )),
             fenced: Vec::new(),
+            closure_receipt: None,
+            closure_member_receipts: Vec::new(),
         },
     );
 }
@@ -2161,6 +4608,75 @@ fn check_opaque_record_binding(
     Ok(())
 }
 
+/// Proves the opaque↔intent seal for one presented grant record: the exact
+/// identity contour plus full shape/integrity revalidation.
+///
+/// The contour binds the opaque bytes to the admitted intent (record and
+/// subject identities must name the intent's operation and grant).
+/// Integrity and shape re-run exactly the ORS construction validation
+/// (epoch/fence agreement, payload length/SHA-256, secret-reference shape,
+/// expiry) by reconstructing the typed record: presented bytes are proven
+/// before they become the trust anchor, and ORS revalidates again on every
+/// read. Epoch/fence agreement against the active epoch follows.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] for a contour disagreement or a
+/// malformed record, and [`KernelError::FenceMismatch`] for a stale,
+/// future, or cross-lineage epoch or fence.
+pub fn verify_grant_seal(
+    record: &CapabilityGrantActivation,
+    intent: &GrantActivationIntent,
+    active_epoch: &EpochId,
+) -> Result<(), KernelError> {
+    if record.record().record_id.as_str() != intent.operation_id
+        || record.record().subject_id.as_str() != intent.grant_id
+    {
+        return Err(KernelError::InvalidField {
+            field: "durable_record",
+            reason: "opaque record identity disagrees with the admitted grant intent",
+        });
+    }
+    CapabilityGrantActivation::new(record.record().clone()).map_err(|_| {
+        KernelError::InvalidField {
+            field: "durable_record",
+            reason: "opaque grant record failed seal validation",
+        }
+    })?;
+    check_opaque_record_binding(record.record(), &intent.binding, active_epoch)
+}
+
+/// Proves the opaque↔intent seal for one presented introduction record,
+/// mirroring [`verify_grant_seal`]: exact identity contour, full
+/// shape/integrity reconstruction, then epoch/fence agreement.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] for a contour disagreement or a
+/// malformed record, and [`KernelError::FenceMismatch`] for a stale,
+/// future, or cross-lineage epoch or fence.
+pub fn verify_introduction_seal(
+    record: &CapabilityIntroductionActivation,
+    intent: &IntroductionActivationIntent,
+    active_epoch: &EpochId,
+) -> Result<(), KernelError> {
+    if record.record().record_id.as_str() != intent.operation_id
+        || record.record().subject_id.as_str() != intent.introduction_id
+    {
+        return Err(KernelError::InvalidField {
+            field: "durable_record",
+            reason: "opaque record identity disagrees with the admitted introduction intent",
+        });
+    }
+    CapabilityIntroductionActivation::new(record.record().clone()).map_err(|_| {
+        KernelError::InvalidField {
+            field: "durable_record",
+            reason: "opaque introduction record failed seal validation",
+        }
+    })?;
+    check_opaque_record_binding(record.record(), &intent.binding, active_epoch)
+}
+
 /// Binds the persisted ORS lineage contour to both the canonical binding and
 /// the caller's current epoch.  The predecessor is validated as part of the
 /// same structured lineage; comparing only the current string/sequence pair
@@ -2177,36 +4693,6 @@ fn check_exact_epoch_lineage(
         return Err(KernelError::FenceMismatch);
     }
     Ok(())
-}
-
-fn validate_root_intent_for_revocation(
-    intent: &GrantActivationIntent,
-    ledger: &PortLedger,
-    active_epoch: &EpochId,
-) -> Result<(), KernelError> {
-    validate_id(&intent.grant_id, "grant_id")?;
-    validate_id(&intent.operation_id, "operation_id")?;
-    validate_id(&intent.authority_root_ref, "authority_root_ref")?;
-    validate_id(&intent.snapshot_id, "snapshot_id")?;
-    validate_id(&intent.holder_principal, "holder_principal")?;
-    validate_id(&intent.session_id, "session_id")?;
-    validate_id(&intent.scope_id, "scope_id")?;
-    for obligation in &intent.receipt_obligations {
-        validate_id(obligation, "receipt_obligation")?;
-    }
-    if intent.parent_grant_id.is_some() {
-        return Err(KernelError::InvalidField {
-            field: "parent_grant_id",
-            reason: "the first durable slice accepts authority roots only",
-        });
-    }
-    check_revision(
-        ledger,
-        &intent.authority_root_ref,
-        intent.grant_graph_revision,
-    )?;
-    check_binding(&intent.binding, active_epoch)?;
-    check_ceiling(intent.allowed_effect, intent.proof_ceiling, &intent.binding)
 }
 
 fn map_ors_error(error: &eliot_ors::OrsError) -> eliot_authority::P07PortError {
@@ -2227,6 +4713,40 @@ fn map_ors_recovery_error(error: &eliot_ors::OrsError) -> KernelError {
         eliot_ors::OrsError::DuplicateConflict => KernelError::IdempotencyConflict,
         _ => KernelError::RecoveryUnavailable(error.to_string()),
     }
+}
+
+/// Maps an introduction-row ORS failure to the typed port refusal.
+///
+/// An [`OrsError::InvalidTransition`](eliot_ors::OrsError::InvalidTransition)
+/// is the explicit state-machine guard: the row exists under different
+/// authority, so the transition refuses with its exact machine and phase
+/// names instead of a generic recovery error. The `from` phase is re-read
+/// from the row so a raced duplicate reports the phase that actually won.
+/// Every other failure keeps the recovery mapping.
+fn map_introduction_transition_error(
+    error: &eliot_ors::OrsError,
+    subject: &OperationIdentity,
+    boundary: &DurableRootGrantBoundary,
+    to: &'static str,
+) -> KernelError {
+    if matches!(error, eliot_ors::OrsError::InvalidTransition) {
+        let from = boundary
+            .store
+            .load_capability_introduction(subject)
+            .ok()
+            .flatten()
+            .map_or("committed", |row| match row.phase() {
+                eliot_ors::OperationalPhase::Active => "Active",
+                eliot_ors::OperationalPhase::Fenced => "Fenced",
+                _ => "committed",
+            });
+        return KernelError::IllegalTransition {
+            machine: "capability-introduction",
+            from: from.to_owned(),
+            to: to.to_owned(),
+        };
+    }
+    map_ors_recovery_error(error)
 }
 
 /// Maps a rich-call rejection to the thin-port typed error.
@@ -2303,7 +4823,24 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         use eliot_authority::P07PortError;
         let active_epoch = request.binding.authority_epoch.clone();
         if let Some(boundary) = self.durable_boundary() {
-            return self.revoke_root_grant_durable(request, &active_epoch, boundary);
+            // Owner-governed dispatch (`#2100`): the Governor enumeration
+            // owner always governs — a singleton is the owner's leaf
+            // attestation, so every bound enumeration takes the closure gate.
+            // An unavailable enumeration is a typed refusal: the root-only
+            // fallback is removed because a root fence can never prove
+            // descendant completeness without the owner, and the port cannot
+            // read descendant lineage from opaque ORS rows. The caller
+            // re-presents through a bound canonical owner.
+            let enumeration = boundary
+                .hydration
+                .enumerate_grant_closure(request.grant_id.as_str())
+                .map_err(|error| map_thin_error(&error))?;
+            return self.revoke_grant_closure_durable_thin(
+                request,
+                &active_epoch,
+                boundary,
+                &enumeration,
+            );
         }
         #[cfg(not(test))]
         return Err(P07PortError::Unavailable);
@@ -2392,15 +4929,28 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
                 return Err(P07PortError::InvalidBinding);
             }
         }
-        // Missing owners: durable GrantGraph CAS plus the thin-request
-        // hydration source for supporting grants, resource handle, facet
-        // manifest, holder principal/session/scope, graph revision,
-        // issuance/expiry times and receipt obligations. A thin introduction
-        // request carries none of them, and I6.15 forbids this port from
-        // creating lineage, so Slice A fail-closes instead of fabricating a
-        // supporting path, facet or holder. Durability/restart rehydration is
-        // an explicit follow-up residual.
-        Err(P07PortError::Unavailable)
+        // Owner-hydrated durable activation (`#2100`/`#1110`): the Governor
+        // introduction-hydration owner resolves the thin request to the
+        // complete admitted intent plus its opaque ORS record, and the
+        // durable gate validates identity, fence, and lifecycle agreement
+        // before any mutation — mirroring the grant hydration gate with the
+        // hydration's own observation time. Without the owner the request
+        // stays fail-closed: a thin introduction request carries no
+        // supporting grants, facet, holder, or revision, and I6.15 forbids
+        // this port from creating lineage.
+        let Some(boundary) = self.durable_boundary() else {
+            return Err(P07PortError::Unavailable);
+        };
+        let hydration = boundary
+            .hydration
+            .hydrate_introduction(request)
+            .map_err(|error| map_thin_error(&error))?;
+        self.activate_introduction_durable(
+            &hydration,
+            &active_epoch,
+            hydration.observed_at_ms,
+        )
+        .map_err(|error| map_thin_error(&error))
     }
 
     fn revoke_introduction(
@@ -2460,6 +5010,26 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         // ledger plus revision. A racing fence between the hydration read
         // above and this call can only fail closed, never grant, because
         // validation re-runs under the mutation lock.
+        //
+        // Thin-request durable corroboration (`#2100`): when the durable
+        // boundary is bound, the live record alone is not enough to fence —
+        // the durable row must corroborate fencable authority. A `Fenced`
+        // durable row contradicts the live record, so the fence refuses
+        // instead of double-fencing or fabricating recovery; the durable
+        // recovery path owns the repair. An absent row is the legacy
+        // live-only flow and proceeds unchanged; durable introduction
+        // adoption moves those flows onto `revoke_introduction_durable`.
+        if let Some(boundary) = self.durable_boundary() {
+            let subject = OperationIdentity::new(request.introduction_id.as_str())
+                .map_err(|_| P07PortError::InvalidBinding)?;
+            let row = boundary
+                .store
+                .load_capability_introduction(&subject)
+                .map_err(|_| P07PortError::Unavailable)?;
+            if row.is_some_and(|projection| projection.phase() != OperationalPhase::Active) {
+                return Err(P07PortError::Unavailable);
+            }
+        }
         self.revoke_introduction(&rich, active_epoch)
             .map_err(|error| {
                 // Typed refusal: fence/epoch/expiry is a Kernel admission
@@ -2468,854 +5038,5 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
                 // re-presents through a current Governor snapshot.
                 map_thin_error(&error)
             })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use eliot_contracts::EpochLineageId;
-    use std::num::NonZeroU64;
-
-    fn canonical_epoch(lineage: &str, sequence: u64) -> Result<EpochId, KernelError> {
-        let lineage_id = EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
-            field: "lineage_id",
-            reason: "must be a canonical UUID lineage",
-        })?;
-        let sequence = NonZeroU64::new(sequence).ok_or(KernelError::InvalidField {
-            field: "sequence",
-            reason: "must be greater than zero",
-        })?;
-        EpochId::new(lineage_id, sequence).map_err(|_| KernelError::InvalidField {
-            field: "epoch_id",
-            reason: "invalid canonical epoch",
-        })
-    }
-
-    #[test]
-    fn canonical_binding_rejects_cross_lineage_same_sequence() -> Result<(), KernelError> {
-        let active = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
-        let same = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
-        let cross_lineage_same_sequence =
-            canonical_epoch("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 7)?;
-        assert!(check_canonical_epoch_binding(&same, &active).is_ok());
-        assert!(matches!(
-            check_canonical_epoch_binding(&cross_lineage_same_sequence, &active),
-            Err(KernelError::FenceMismatch)
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn thin_error_mapping_keeps_typed_refusal() {
-        use eliot_authority::P07PortError;
-        assert!(matches!(
-            map_thin_error(&KernelError::FenceMismatch),
-            P07PortError::NotAdmitted
-        ));
-        assert!(matches!(
-            map_thin_error(&KernelError::Expired { expires_at_ms: 1 }),
-            P07PortError::NotAdmitted
-        ));
-        assert!(matches!(
-            map_thin_error(&KernelError::InvalidField {
-                field: "binding.authority_owner",
-                reason: "must be non-blank",
-            }),
-            P07PortError::InvalidBinding
-        ));
-        assert!(matches!(
-            map_thin_error(&KernelError::IdempotencyConflict),
-            P07PortError::InvalidBinding
-        ));
-        assert!(matches!(
-            map_thin_error(&KernelError::DependencyUnavailable("ors".to_owned())),
-            P07PortError::Unavailable
-        ));
-        assert!(matches!(
-            map_thin_error(&KernelError::RecoveryUnavailable("view".to_owned())),
-            P07PortError::Unavailable
-        ));
-    }
-
-    #[test]
-    fn thin_port_types_caller_and_missing_owner_failures() -> Result<(), KernelError> {
-        use eliot_authority::{
-            GrantActivationRequest, GrantRevocationRequest, P07AuthorityPort, P07PortError,
-        };
-        use eliot_contracts::{ContractId, ResourceGeneration};
-        use eliot_receipts::{EffectClass, ProofCeiling};
-
-        fn grant_id(value: &str) -> Result<eliot_authority::GrantId, KernelError> {
-            eliot_authority::GrantId::new(value).map_err(|_| KernelError::InvalidField {
-                field: "grant_id",
-                reason: "test grant identity must validate",
-            })
-        }
-        fn snapshot_id(value: &str) -> Result<eliot_authority::SnapshotId, KernelError> {
-            eliot_authority::SnapshotId::new(value).map_err(|_| KernelError::InvalidField {
-                field: "snapshot_id",
-                reason: "test snapshot identity must validate",
-            })
-        }
-
-        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
-        let fence = eliot_contracts::StateFence::new(epoch.clone(), ResourceGeneration::new(1)?);
-        let binding = AuthorityBinding {
-            authority_id: ContractId::new("authority:test")?,
-            authority_owner: "test-owner".to_owned(),
-            authority_epoch: epoch.clone(),
-            state_fence: fence,
-            allowed_effect: EffectClass::ExternalEffect,
-            proof_ceiling: ProofCeiling::ObservedExternalEffect,
-        };
-        let port = GrantActivationPort::new();
-
-        // Split binding epoch: fenced against the presented fence epoch, so
-        // the Kernel refuses admission rather than reporting unavailable.
-        let mut split = binding.clone();
-        split.authority_epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 8)?;
-        let split_request = GrantActivationRequest {
-            grant_id: grant_id("grant-split")?,
-            snapshot_id: snapshot_id("snap-1")?,
-            binding: split,
-        };
-        assert!(matches!(
-            P07AuthorityPort::activate_grant(&port, &split_request),
-            Err(P07PortError::NotAdmitted)
-        ));
-
-        // Blank owner: caller-material failure, never Unavailable.
-        let mut blank = binding.clone();
-        blank.authority_owner = "  ".to_owned();
-        let blank_request = GrantActivationRequest {
-            grant_id: grant_id("grant-blank")?,
-            snapshot_id: snapshot_id("snap-1")?,
-            binding: blank,
-        };
-        assert!(matches!(
-            P07AuthorityPort::activate_grant(&port, &blank_request),
-            Err(P07PortError::InvalidBinding)
-        ));
-
-        // Valid binding but no hydration owner: activation stays Unavailable,
-        // unknown revocation stays Unavailable (no lineage is fabricated).
-        let activation = GrantActivationRequest {
-            grant_id: grant_id("grant-new")?,
-            snapshot_id: snapshot_id("snap-1")?,
-            binding: binding.clone(),
-        };
-        assert!(matches!(
-            P07AuthorityPort::activate_grant(&port, &activation),
-            Err(P07PortError::Unavailable)
-        ));
-        let revocation = GrantRevocationRequest {
-            grant_id: grant_id("grant-unknown")?,
-            snapshot_id: snapshot_id("snap-1")?,
-            binding,
-        };
-        assert!(matches!(
-            P07AuthorityPort::revoke_grant(&port, &revocation),
-            Err(P07PortError::Unavailable)
-        ));
-        Ok(())
-    }
-
-    fn restart_test_binding(epoch: &EpochId) -> Result<AuthorityBinding, KernelError> {
-        use eliot_contracts::{ContractId, ResourceGeneration};
-        let fence = eliot_contracts::StateFence::new(epoch.clone(), ResourceGeneration::new(1)?);
-        Ok(AuthorityBinding {
-            authority_id: ContractId::new("authority:test")?,
-            authority_owner: "test-owner".to_owned(),
-            authority_epoch: epoch.clone(),
-            state_fence: fence,
-            allowed_effect: EffectClass::ExternalEffect,
-            proof_ceiling: ProofCeiling::ObservedExternalEffect,
-        })
-    }
-
-    fn restart_root_intent(binding: &AuthorityBinding) -> GrantActivationIntent {
-        GrantActivationIntent {
-            operation_id: "op-activate-root".to_owned(),
-            grant_id: "grant-restart-root".to_owned(),
-            parent_grant_id: None,
-            authority_root_ref: "root-test".to_owned(),
-            snapshot_id: "snap-1".to_owned(),
-            grant_graph_revision: 2,
-            holder_principal: "holder-1".to_owned(),
-            session_id: "session-1".to_owned(),
-            scope_id: "scope-1".to_owned(),
-            binding: binding.clone(),
-            allowed_effect: EffectClass::Read,
-            proof_ceiling: ProofCeiling::ScopedVerification,
-            issued_at_ms: 1_000,
-            expires_at_ms: None,
-            receipt_obligations: vec!["obligation-1".to_owned()],
-        }
-    }
-
-    #[test]
-    fn rich_activation_replay_conflict_and_stale_revision_fail_closed() -> Result<(), KernelError> {
-        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
-        let binding = restart_test_binding(&epoch)?;
-        let port = GrantActivationPort::new();
-        let intent = restart_root_intent(&binding);
-
-        let first = port.activate_grant(&intent, epoch.clone(), 1_000)?;
-        assert!(matches!(
-            first.state,
-            eliot_runtime_contracts::AuthorityState::Active
-        ));
-        assert_eq!(first.activation_id, "activation-op-activate-root");
-        // Exact replay returns the same receipt without a second activation.
-        let replay = port.activate_grant(&intent, epoch.clone(), 1_000)?;
-        assert_eq!(replay, first);
-        // Changed payload under one operation identity conflicts.
-        let mut changed = intent.clone();
-        changed.holder_principal = "holder-2".to_owned();
-        assert!(matches!(
-            port.activate_grant(&changed, epoch.clone(), 1_000),
-            Err(KernelError::IdempotencyConflict)
-        ));
-        // A recorded grant identity cannot activate again under a fresh
-        // identity: restore never reactivates a path.
-        let mut second = intent.clone();
-        second.operation_id = "op-activate-root-again".to_owned();
-        assert!(matches!(
-            port.activate_grant(&second, epoch.clone(), 1_000),
-            Err(KernelError::InvalidField { .. })
-        ));
-        // A revision older than the greatest observed for this root is stale.
-        let stale_revoke = GrantRevocationIntent {
-            operation_id: "op-revoke-stale".to_owned(),
-            grant_id: "grant-restart-root".to_owned(),
-            authority_root_ref: "root-test".to_owned(),
-            snapshot_id: "snap-1".to_owned(),
-            grant_graph_revision: 1,
-            binding: binding.clone(),
-            unknown_outcome_operations: Vec::new(),
-            receipt_obligations: Vec::new(),
-        };
-        assert!(matches!(
-            port.revoke_grant(&stale_revoke, epoch.clone()),
-            Err(KernelError::InvalidField { .. })
-        ));
-        // Current-revision revocation fences the grant and commits one receipt.
-        let revoke = GrantRevocationIntent {
-            operation_id: "op-revoke-root".to_owned(),
-            grant_graph_revision: 2,
-            ..stale_revoke
-        };
-        let receipt = port.revoke_grant(&revoke, epoch.clone())?;
-        assert!(matches!(
-            receipt.state,
-            eliot_runtime_contracts::AuthorityState::Revoked
-        ));
-        assert!(port.grant_revoked("grant-restart-root"));
-        assert_eq!(
-            port.revocation_closure("op-revoke-root"),
-            Some(vec!["grant-restart-root".to_owned()])
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn restart_hydrates_nothing_and_reconciles_by_representation() -> Result<(), KernelError> {
-        use eliot_authority::{
-            GrantId, GrantRevocationRequest, P07AuthorityPort, P07PortError, SnapshotId,
-        };
-
-        fn thin_grant_id(value: &str) -> Result<GrantId, KernelError> {
-            GrantId::new(value).map_err(|_| KernelError::InvalidField {
-                field: "grant_id",
-                reason: "test grant identity must validate",
-            })
-        }
-        fn thin_snapshot_id(value: &str) -> Result<SnapshotId, KernelError> {
-            SnapshotId::new(value).map_err(|_| KernelError::InvalidField {
-                field: "snapshot_id",
-                reason: "test snapshot identity must validate",
-            })
-        }
-
-        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
-        let binding = restart_test_binding(&epoch)?;
-        let intent = restart_root_intent(&binding);
-
-        // Simulated restart: a fresh port holds no ledger lineage.
-        let restarted = GrantActivationPort::new();
-        assert!(!restarted.grant_revoked("grant-restart-root"));
-        // Thin revocation of unhydrated lineage fail-closes without
-        // fabricating a fence.
-        let thin_unknown = GrantRevocationRequest {
-            grant_id: thin_grant_id("grant-restart-root")?,
-            snapshot_id: thin_snapshot_id("snap-1")?,
-            binding: binding.clone(),
-        };
-        assert!(matches!(
-            P07AuthorityPort::revoke_grant(&restarted, &thin_unknown),
-            Err(P07PortError::Unavailable)
-        ));
-        // Rich revocation of an unknown grant records a reconciling intent
-        // instead of assuming a fence.
-        let unknown_revoke = GrantRevocationIntent {
-            operation_id: "op-revoke-unknown".to_owned(),
-            grant_id: "grant-restart-root".to_owned(),
-            authority_root_ref: "root-test".to_owned(),
-            snapshot_id: "snap-1".to_owned(),
-            grant_graph_revision: 2,
-            binding: binding.clone(),
-            unknown_outcome_operations: Vec::new(),
-            receipt_obligations: Vec::new(),
-        };
-        assert!(matches!(
-            restarted.revoke_grant(&unknown_revoke, epoch.clone()),
-            Err(KernelError::InvalidField { .. })
-        ));
-        assert!(
-            restarted
-                .reconciling_operations()
-                .contains(&"op-revoke-unknown".to_owned())
-        );
-        // Re-presenting the exact intent restores the same receipt root, and
-        // the thin revocation path hydrates from that lineage.
-        let restored = restarted.activate_grant(&intent, epoch.clone(), 1_000)?;
-        assert_eq!(restored.activation_id, "activation-op-activate-root");
-        assert!(matches!(
-            restarted.disposition("op-activate-root"),
-            Some(IntentDisposition::Committed(_))
-        ));
-        let thin_revoke = GrantRevocationRequest {
-            grant_id: thin_grant_id("grant-restart-root")?,
-            snapshot_id: thin_snapshot_id("snap-1")?,
-            binding,
-        };
-        let fenced = P07AuthorityPort::revoke_grant(&restarted, &thin_revoke).map_err(|_| {
-            KernelError::InvalidField {
-                field: "binding",
-                reason: "re-presented lineage must hydrate the thin revocation",
-            }
-        })?;
-        assert!(matches!(
-            fenced.state,
-            eliot_runtime_contracts::AuthorityState::Revoked
-        ));
-        assert!(restarted.grant_revoked("grant-restart-root"));
-        Ok(())
-    }
-
-    struct TestRootHydration {
-        value: RootGrantHydration,
-    }
-
-    impl RootGrantHydrationSource for TestRootHydration {
-        fn hydrate_root_grant(
-            &self,
-            _request: &eliot_authority::GrantActivationRequest,
-        ) -> Result<RootGrantHydration, KernelError> {
-            Ok(self.value.clone())
-        }
-
-        fn rehydrate_root_grant(
-            &self,
-            _projection: &CapabilityGrantProjection,
-        ) -> Result<RootGrantHydration, KernelError> {
-            Ok(self.value.clone())
-        }
-    }
-
-    fn durable_root_fixture(
-        epoch: &EpochId,
-        binding: &AuthorityBinding,
-    ) -> Result<(eliot_authority::GrantActivationRequest, RootGrantHydration), KernelError> {
-        let operation_id = thin_operation_id("activate-grant", "grant-root", "snap-1", epoch);
-        let intent = GrantActivationIntent {
-            operation_id: operation_id.clone(),
-            grant_id: "grant-root".to_owned(),
-            parent_grant_id: None,
-            authority_root_ref: "root-authority".to_owned(),
-            snapshot_id: "snap-1".to_owned(),
-            grant_graph_revision: 3,
-            holder_principal: "holder-1".to_owned(),
-            session_id: "session-1".to_owned(),
-            scope_id: "scope-1".to_owned(),
-            binding: binding.clone(),
-            allowed_effect: EffectClass::Read,
-            proof_ceiling: ProofCeiling::ScopedVerification,
-            issued_at_ms: 1_000,
-            expires_at_ms: Some(10_000),
-            receipt_obligations: vec!["obligation-1".to_owned()],
-        };
-        let authority_epoch = eliot_ors::EpochLineage {
-            current: eliot_ors::EpochIdentity {
-                lineage_id: eliot_ors::OpaqueLabel::new(epoch.lineage_id.as_str())?,
-                epoch: epoch.sequence.get(),
-            },
-            predecessor: None,
-        };
-        let state_fence =
-            eliot_ors::StateFenceSnapshot::capture(&binding.state_fence, epoch.sequence.get())?;
-        let input = eliot_ors::OperationalRecordInput::encrypted(
-            eliot_ors::OperationalRecordContext {
-                record_id: eliot_ors::OperationIdentity::new(operation_id)?,
-                subject_id: eliot_ors::OperationIdentity::new("grant-root")?,
-                authority_epoch,
-                state_fence,
-                created_at_ms: 1_000,
-                cleanup_after_ms: None,
-            },
-            eliot_platform::SecretReference::new("test-provider", "root-grant-key").map_err(
-                |_error| KernelError::InvalidField {
-                    field: "test_secret_reference",
-                    reason: "fixture reference must validate",
-                },
-            )?,
-            b"opaque-root-grant-record".to_vec(),
-        )?;
-        let durable_record = CapabilityGrantActivation::new(input)?;
-        Ok((
-            eliot_authority::GrantActivationRequest {
-                grant_id: eliot_authority::GrantId::new("grant-root").map_err(|_| {
-                    KernelError::InvalidField {
-                        field: "grant_id",
-                        reason: "fixture grant id must validate",
-                    }
-                })?,
-                snapshot_id: eliot_authority::SnapshotId::new("snap-1").map_err(|_| {
-                    KernelError::InvalidField {
-                        field: "snapshot_id",
-                        reason: "fixture snapshot id must validate",
-                    }
-                })?,
-                binding: binding.clone(),
-            },
-            RootGrantHydration {
-                intent,
-                durable_record,
-                observed_at_ms: 1_000,
-            },
-        ))
-    }
-
-    #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the mismatch, absence, and exact single-grant fence proof keeps its sequence visible"
-    )]
-    fn durable_root_revocation_refuses_mismatch_without_live_mutation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        use eliot_authority::{P07AuthorityPort, P07PortError};
-        use std::sync::{Arc, Mutex};
-
-        struct MutableRootHydration {
-            value: Mutex<RootGrantHydration>,
-        }
-
-        impl MutableRootHydration {
-            fn replace(&self, value: RootGrantHydration) {
-                *self
-                    .value
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
-            }
-        }
-
-        impl RootGrantHydrationSource for MutableRootHydration {
-            fn hydrate_root_grant(
-                &self,
-                _request: &eliot_authority::GrantActivationRequest,
-            ) -> Result<RootGrantHydration, KernelError> {
-                Ok(self
-                    .value
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone())
-            }
-
-            fn rehydrate_root_grant(
-                &self,
-                _projection: &CapabilityGrantProjection,
-            ) -> Result<RootGrantHydration, KernelError> {
-                Ok(self
-                    .value
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone())
-            }
-        }
-
-        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
-        let binding = restart_test_binding(&epoch)?;
-        let (request, hydration) = durable_root_fixture(&epoch, &binding)?;
-        let revoke = eliot_authority::GrantRevocationRequest {
-            grant_id: request.grant_id.clone(),
-            snapshot_id: request.snapshot_id.clone(),
-            binding: request.binding.clone(),
-        };
-        let revoke_operation_id = thin_operation_id(
-            "revoke-grant",
-            revoke.grant_id.as_str(),
-            revoke.snapshot_id.as_str(),
-            &epoch,
-        );
-        let path = std::env::temp_dir().join(format!(
-            "eliot-kernel-root-grant-revoke-mismatch-{}-{}.redb",
-            std::process::id(),
-            epoch.sequence
-        ));
-        let _ = std::fs::remove_file(&path);
-        let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
-        let hydration_source = Arc::new(MutableRootHydration {
-            value: Mutex::new(hydration.clone()),
-        });
-        let port =
-            GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
-
-        P07AuthorityPort::activate_grant(&port, &request)
-            .map_err(|error| format!("durable activation failed: {error:?}"))?;
-        let subject = eliot_ors::OperationIdentity::new("grant-root")?;
-        let active = store
-            .load_capability_grant(&subject)?
-            .ok_or("active capability projection missing")?;
-        assert_eq!(active.phase(), OperationalPhase::Active);
-
-        let mut tampered = hydration.clone();
-        let key = match &tampered.durable_record.record().payload {
-            eliot_ors::RecoveryPayload::Encrypted { key, .. } => key.clone(),
-            eliot_ors::RecoveryPayload::ImmutableLocator { .. } => {
-                return Err("fixture must use an encrypted root-grant payload".into());
-            }
-        };
-        let ciphertext = b"changed-root-grant-revocation-record".to_vec();
-        let mut record = tampered.durable_record.record().clone();
-        record.payload = eliot_ors::RecoveryPayload::Encrypted {
-            key,
-            ciphertext: ciphertext.clone(),
-        };
-        record.payload_length = ciphertext.len() as u64;
-        record.payload_sha256 = eliot_contracts::sha256_hex(&ciphertext);
-        tampered.durable_record = CapabilityGrantActivation::new(record)?;
-        hydration_source.replace(tampered);
-
-        assert!(matches!(
-            P07AuthorityPort::revoke_grant(&port, &revoke),
-            Err(P07PortError::Unavailable | P07PortError::InvalidBinding)
-        ));
-        assert!(!port.grant_revoked("grant-root"));
-        assert!(port.disposition(&revoke_operation_id).is_none());
-        assert!(port.revocation_closure(&revoke_operation_id).is_none());
-        assert!(port.reconciling_operations().is_empty());
-        let active_after_mismatch = store
-            .load_capability_grant(&subject)?
-            .ok_or("mismatch refusal removed the capability projection")?;
-        assert_eq!(active_after_mismatch.phase(), OperationalPhase::Active);
-        assert_eq!(active_after_mismatch.record(), active.record());
-        assert_eq!(active_after_mismatch.receipt(), active.receipt());
-
-        let missing_path = std::env::temp_dir().join(format!(
-            "eliot-kernel-root-grant-revoke-missing-{}-{}.redb",
-            std::process::id(),
-            epoch.sequence
-        ));
-        let _ = std::fs::remove_file(&missing_path);
-        let missing_store = Arc::new(eliot_ors::RedbRecoveryStore::open(&missing_path)?);
-        let missing_port = GrantActivationPort::with_durable_root_grant(
-            hydration_source.clone(),
-            missing_store.clone(),
-        );
-        assert!(matches!(
-            P07AuthorityPort::revoke_grant(&missing_port, &revoke),
-            Err(P07PortError::Unavailable)
-        ));
-        assert!(!missing_port.grant_revoked("grant-root"));
-        assert!(missing_port.disposition(&revoke_operation_id).is_none());
-        assert!(
-            missing_port
-                .revocation_closure(&revoke_operation_id)
-                .is_none()
-        );
-        assert!(missing_port.reconciling_operations().is_empty());
-        assert!(missing_store.load_capability_grant(&subject)?.is_none());
-
-        hydration_source.replace(hydration);
-        let revoked = P07AuthorityPort::revoke_grant(&port, &revoke)
-            .map_err(|error| format!("durable revoke failed: {error:?}"))?;
-        assert!(matches!(revoked.state, AuthorityState::Revoked));
-        assert!(port.grant_revoked("grant-root"));
-        assert_eq!(
-            port.revocation_closure(&revoke_operation_id),
-            Some(vec!["grant-root".to_owned()])
-        );
-        assert_eq!(
-            store
-                .load_capability_grant(&subject)?
-                .ok_or("successful revoke removed the capability projection")?
-                .phase(),
-            OperationalPhase::Fenced
-        );
-
-        let revoked_state = revoked.state;
-        let fenced_projection = store
-            .load_capability_grant(&subject)?
-            .ok_or("fenced capability projection missing after revoke")?;
-        let fenced_record = fenced_projection.record().clone();
-        let fenced_receipt = fenced_projection.receipt().clone();
-        let fenced_closure = port
-            .revocation_closure(&revoke_operation_id)
-            .ok_or("successful revoke closure missing")?;
-        let fenced_disposition = port
-            .disposition(&revoke_operation_id)
-            .ok_or("successful revoke disposition missing")?;
-
-        let revoke_replay = P07AuthorityPort::revoke_grant(&port, &revoke)
-            .map_err(|error| format!("in-process revoke replay failed: {error:?}"))?;
-        assert_eq!(revoke_replay, revoked);
-        assert_eq!(revoke_replay.state, revoked_state);
-        let replayed_projection = store
-            .load_capability_grant(&subject)?
-            .ok_or("revoke replay removed the capability projection")?;
-        assert_eq!(replayed_projection, fenced_projection);
-        assert_eq!(replayed_projection.record(), &fenced_record);
-        assert_eq!(replayed_projection.receipt(), &fenced_receipt);
-        assert_eq!(
-            port.revocation_closure(&revoke_operation_id),
-            Some(fenced_closure.clone())
-        );
-        assert_eq!(
-            port.disposition(&revoke_operation_id),
-            Some(fenced_disposition.clone())
-        );
-        assert!(port.reconciling_operations().is_empty());
-
-        drop(missing_port);
-        drop(missing_store);
-        drop(port);
-        drop(store);
-
-        let reopened_store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
-        let reopened_port =
-            GrantActivationPort::with_durable_root_grant(hydration_source, reopened_store.clone());
-        let restart_replay = P07AuthorityPort::revoke_grant(&reopened_port, &revoke)
-            .map_err(|error| format!("restart revoke replay failed: {error:?}"))?;
-        assert_eq!(restart_replay, revoked);
-        assert!(matches!(restart_replay.state, AuthorityState::Revoked));
-        assert!(reopened_port.grant_revoked("grant-root"));
-        let restarted_projection = reopened_store
-            .load_capability_grant(&subject)?
-            .ok_or("restart revoke replay removed the capability projection")?;
-        assert_eq!(restarted_projection, fenced_projection);
-        assert_eq!(restarted_projection.phase(), OperationalPhase::Fenced);
-        assert_eq!(restarted_projection.record(), &fenced_record);
-        assert_eq!(restarted_projection.receipt(), &fenced_receipt);
-        assert_eq!(fenced_closure, vec!["grant-root".to_owned()]);
-        assert_eq!(
-            reopened_port.revocation_closure(&revoke_operation_id),
-            Some(fenced_closure.clone())
-        );
-        assert_eq!(
-            reopened_port.disposition(&revoke_operation_id),
-            Some(fenced_disposition.clone())
-        );
-        assert!(reopened_port.reconciling_operations().is_empty());
-
-        drop(reopened_port);
-        drop(reopened_store);
-        let _ = std::fs::remove_file(missing_path);
-        let _ = std::fs::remove_file(path);
-        Ok(())
-    }
-
-    #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the restart/replay/revocation edge proof keeps its exact sequence visible"
-    )]
-    fn durable_root_activation_replay_recovery_and_revoke_are_exact()
-    -> Result<(), Box<dyn std::error::Error>> {
-        use eliot_authority::{P07AuthorityPort, P07PortError};
-        use std::sync::Arc;
-
-        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
-        let binding = restart_test_binding(&epoch)?;
-        let (request, hydration) = durable_root_fixture(&epoch, &binding)?;
-        assert_eq!(
-            ROOT_GRANT_HYDRATION_FIELDS,
-            [
-                "intent.operation_id",
-                "intent.grant_id",
-                "intent.parent_grant_id",
-                "intent.authority_root_ref",
-                "intent.snapshot_id",
-                "intent.grant_graph_revision",
-                "intent.holder_principal",
-                "intent.session_id",
-                "intent.scope_id",
-                "intent.binding",
-                "intent.allowed_effect",
-                "intent.proof_ceiling",
-                "intent.issued_at_ms",
-                "intent.expires_at_ms",
-                "intent.receipt_obligations",
-                "durable_record",
-                "observed_at_ms",
-            ]
-        );
-        let path = std::env::temp_dir().join(format!(
-            "eliot-kernel-root-grant-{}-{}.redb",
-            std::process::id(),
-            epoch.sequence
-        ));
-        let _ = std::fs::remove_file(&path);
-
-        let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
-        let mut incomplete = hydration.clone();
-        incomplete.intent.holder_principal.clear();
-        let incomplete_port = GrantActivationPort::with_durable_root_grant(
-            Arc::new(TestRootHydration { value: incomplete }),
-            store.clone(),
-        );
-        assert!(matches!(
-            P07AuthorityPort::activate_grant(&incomplete_port, &request),
-            Err(P07PortError::InvalidBinding)
-        ));
-        assert!(
-            store
-                .load_capability_grant(&eliot_ors::OperationIdentity::new("grant-root")?)?
-                .is_none()
-        );
-        drop(incomplete_port);
-
-        let hydration_source = Arc::new(TestRootHydration {
-            value: hydration.clone(),
-        });
-        let port =
-            GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
-        let first = P07AuthorityPort::activate_grant(&port, &request)
-            .map_err(|error| format!("durable activation failed: {error:?}"))?;
-        let replay = P07AuthorityPort::activate_grant(&port, &request)
-            .map_err(|error| format!("in-process replay failed: {error:?}"))?;
-        assert_eq!(replay, first);
-        let subject = eliot_ors::OperationIdentity::new("grant-root")?;
-        let projection = store
-            .load_capability_grant(&subject)?
-            .ok_or("active capability projection missing")?;
-        assert_eq!(projection.phase(), OperationalPhase::Active);
-        assert!(projection.operation_order() > 0);
-
-        drop(port);
-        drop(store);
-        let reopened = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
-        let restarted = GrantActivationPort::with_durable_root_grant(
-            hydration_source.clone(),
-            reopened.clone(),
-        );
-        let recovered = restarted.recover_root_grant("grant-root", &epoch, 1_000)?;
-        assert_eq!(recovered, first);
-        assert!(!restarted.grant_revoked("grant-root"));
-        let restarted_replay = P07AuthorityPort::activate_grant(&restarted, &request)
-            .map_err(|error| format!("restart replay failed: {error:?}"))?;
-        assert_eq!(restarted_replay, first);
-
-        // A changed opaque payload under the same durable operation/subject
-        // identity is a conflict after restart and leaves the ORS row intact.
-        let mut changed_payload = hydration.clone();
-        let mut changed_record = changed_payload.durable_record.record().clone();
-        let key = match &changed_record.payload {
-            eliot_ors::RecoveryPayload::Encrypted { key, .. } => key.clone(),
-            eliot_ors::RecoveryPayload::ImmutableLocator { .. } => {
-                return Err("fixture must use an encrypted root-grant payload".into());
-            }
-        };
-        let ciphertext = b"changed-root-grant-record".to_vec();
-        changed_record.payload = eliot_ors::RecoveryPayload::Encrypted {
-            key,
-            ciphertext: ciphertext.clone(),
-        };
-        changed_record.payload_length = ciphertext.len() as u64;
-        changed_record.payload_sha256 = eliot_contracts::sha256_hex(&ciphertext);
-        changed_payload.durable_record = CapabilityGrantActivation::new(changed_record)?;
-        let changed_port = GrantActivationPort::with_durable_root_grant(
-            Arc::new(TestRootHydration {
-                value: changed_payload,
-            }),
-            reopened.clone(),
-        );
-        assert!(matches!(
-            P07AuthorityPort::activate_grant(&changed_port, &request),
-            Err(P07PortError::InvalidBinding)
-        ));
-        assert_eq!(
-            reopened
-                .load_capability_grant(&subject)?
-                .ok_or("changed replay removed the active projection")?
-                .record(),
-            hydration.durable_record.record()
-        );
-
-        // Expiry remains a semantic admission refusal after restart; it does
-        // not become an unavailable/no-result recovery outcome and does not
-        // mutate the committed ORS projection.
-        let expired_port = GrantActivationPort::with_durable_root_grant(
-            Arc::new(TestRootHydration {
-                value: hydration.clone(),
-            }),
-            reopened.clone(),
-        );
-        assert!(matches!(
-            expired_port.recover_root_grant("grant-root", &epoch, 10_000),
-            Err(KernelError::Expired {
-                expires_at_ms: 10_000
-            })
-        ));
-        drop(changed_port);
-        drop(expired_port);
-
-        let revoke = eliot_authority::GrantRevocationRequest {
-            grant_id: request.grant_id.clone(),
-            snapshot_id: request.snapshot_id.clone(),
-            binding: request.binding.clone(),
-        };
-        let revoked = P07AuthorityPort::revoke_grant(&restarted, &revoke)
-            .map_err(|error| format!("durable revoke failed: {error:?}"))?;
-        assert!(matches!(revoked.state, AuthorityState::Revoked));
-        assert!(restarted.grant_revoked("grant-root"));
-        assert_eq!(
-            reopened
-                .load_capability_grant(&subject)?
-                .ok_or("fenced capability projection missing")?
-                .phase(),
-            OperationalPhase::Fenced
-        );
-        let revoke_replay = P07AuthorityPort::revoke_grant(&restarted, &revoke)
-            .map_err(|error| format!("revoke replay failed: {error:?}"))?;
-        assert_eq!(revoke_replay, revoked);
-
-        drop(restarted);
-        drop(reopened);
-        let reopened_again = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
-        let after_revoke_restart =
-            GrantActivationPort::with_durable_root_grant(hydration_source, reopened_again.clone());
-        let revoke_after_restart =
-            P07AuthorityPort::revoke_grant(&after_revoke_restart, &revoke)
-                .map_err(|error| format!("durable revoke after restart failed: {error:?}"))?;
-        assert_eq!(revoke_after_restart, revoked);
-        assert!(after_revoke_restart.grant_revoked("grant-root"));
-
-        let mut child_hydration = durable_root_fixture(&epoch, &binding)?.1;
-        child_hydration.intent.parent_grant_id = Some("parent".to_owned());
-        let child_source = Arc::new(TestRootHydration {
-            value: child_hydration,
-        });
-        let child_port =
-            GrantActivationPort::with_durable_root_grant(child_source, reopened_again.clone());
-        assert!(matches!(
-            P07AuthorityPort::activate_grant(&child_port, &request),
-            Err(P07PortError::InvalidBinding)
-        ));
-
-        drop(child_port);
-        drop(reopened_again);
-        let _ = std::fs::remove_file(&path);
-        Ok(())
     }
 }

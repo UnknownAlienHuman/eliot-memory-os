@@ -32,8 +32,11 @@
 pub mod authority;
 pub mod authority_controller;
 mod authority_snapshot;
+pub mod durable_owner_bootstrap;
 pub mod error;
+pub mod governor_closure_source;
 pub mod grant_activation_port;
+pub mod introduction_lifecycle;
 pub mod module;
 pub mod user_automation;
 
@@ -47,10 +50,18 @@ pub use authority_controller::{
     SealedAuthoritySnapshot, process_admission_digest,
 };
 pub use error::{KernelError, KernelResult};
+pub use durable_owner_bootstrap::{BoundCanonicalOwner, bind_canonical_owner, owner_bundle_digest};
+pub use governor_closure_source::{
+    GovernorClosureRestore, GovernorClosureSource, GovernorClosureSourceHandle,
+};
 pub use grant_activation_port::{
     CommittedReceipt, GrantActivationIntent, GrantActivationPort, GrantRevocationIntent,
     IntentDisposition, IntroductionActivationIntent, IntroductionRevocationIntent,
     ROOT_GRANT_HYDRATION_FIELDS, RootGrantHydration, RootGrantHydrationSource,
+};
+pub use introduction_lifecycle::{
+    INTRODUCTION_HYDRATION_FIELDS, IntroductionHydration, introduction_fence_input,
+    introduction_fence_record_id,
 };
 pub use module::compatibility_handshake::{
     AcceptedCompatibilityEvidence, CompatibilityEnvelope, CompatibilityMismatch,
