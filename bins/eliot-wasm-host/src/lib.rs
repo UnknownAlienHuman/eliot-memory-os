@@ -29,6 +29,9 @@ mod dispatch_drive;
 mod dispatch_material;
 mod guest_exec;
 mod installed_binary;
+mod parent_authority;
+mod parent_dispatch;
+mod parent_runtime;
 mod shadow;
 mod typed_bindings;
 mod typed_execution;
@@ -71,6 +74,9 @@ pub use guest_exec::{
 pub use installed_binary::{
     InstalledBinary, InstalledBinaryError, WasmHostBinaryBinding, resolve_installed_binary,
 };
+pub use parent_dispatch::drive_parent_dispatch;
+pub use parent_authority::{ParentDispatchAuthority, edge_now_ms};
+pub use parent_runtime::{GovernorPorts, drive_parent_runtime};
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
     LEGACY_EXPORT, LEGACY_WORLD, TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld,

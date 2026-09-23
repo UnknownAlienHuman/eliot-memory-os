@@ -628,7 +628,7 @@ pub fn assemble_owner_records(material: &ValidatedDispatchMaterial) -> Result<Ow
 /// # Errors
 ///
 /// Returns [`DriveError`] when the result is not a measured success.
-fn map_invocation_result(
+pub(crate) fn map_invocation_result(
     result: &InvocationResult,
     material: &ValidatedDispatchMaterial,
 ) -> Result<DispatchDriveResponse, DriveError> {
