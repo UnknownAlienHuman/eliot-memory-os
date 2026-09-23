@@ -1,0 +1,48 @@
+{
+  "handle": {
+    "consistency_point": "consistency-950-1",
+    "snapshot_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "operation_id": "op-950-1",
+    "idempotency_key": "idem-950-1"
+  },
+  "cursor": {
+    "handle_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "page_index": 0,
+    "cumulative_members": 2,
+    "cumulative_bytes": 3072
+  },
+  "members": [
+    {
+      "member_id": "member-950-1",
+      "member_type": "RECORD",
+      "content_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "residency": {
+        "domain": "INLINE_CANONICAL",
+        "residency_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "byte_count": 1024
+      },
+      "reference_digest": null
+    },
+    {
+      "member_id": "member-950-2",
+      "member_type": "BLOB",
+      "content_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "residency": {
+        "domain": "CONTENT_BLOB",
+        "residency_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "byte_count": 2048
+      },
+      "reference_digest": null
+    }
+  ],
+  "cumulative_bytes": 3072,
+  "cumulative_work": 50,
+  "is_last": false,
+  "predecessor_digest": "6666666666666666666666666666666666666666666666666666666666666666",
+  "next_cursor": {
+    "handle_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "page_index": 1,
+    "cumulative_members": 3,
+    "cumulative_bytes": 3136
+  }
+}
