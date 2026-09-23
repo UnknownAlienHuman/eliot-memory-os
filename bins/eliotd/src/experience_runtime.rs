@@ -687,8 +687,10 @@ pub fn derive_commit_ingress(
 ///   vectors (no expectations are fabricated here);
 /// - per-record receipts return in input order; a mid-batch failure
 ///   returns `Err` while already-durable receipts stay durable under
-///   their deterministic idempotency keys, so retry is convergent and
-///   never double-persists.
+///   their deterministic idempotency keys. Every success is retained on
+///   the composition as it happens and retained keys are skipped on
+///   retry without re-deriving expectations (P1-1, #1942), so retry is
+///   convergent and never double-persists.
 ///
 /// Runs, in source terms: ledger rebuild from the admitted slices (only
 /// the greatest admitted revision per handle passes the owner
@@ -736,6 +738,16 @@ pub async fn commit_experience_event_records(
         let commit_key = produce_bank_commit(&ledger, record)
             .map_err(ExperienceDriverError::Governor)?
             .idempotency_key;
+        // P1-1 (#1942): a key this composition already committed is durable
+        // under that key. Reuse the retained receipt without re-deriving
+        // ingress or re-submitting: a retry under freshly derived expected
+        // heads would hash differently and wedge permanently in
+        // `IdentityConflict`. The store triple rule is untouched and no new
+        // operation identity is minted.
+        if let Some(receipt) = composition.committed_experience_receipt(&commit_key) {
+            bank_receipts.push(receipt);
+            continue;
+        }
         let identity = derive_commit_ingress(ctx, &kernel_fence, &commit_key)?;
         let receipt = composition
             .commit_experience_bank_record(
@@ -749,6 +761,7 @@ pub async fn commit_experience_event_records(
             )
             .await
             .map_err(|error| ExperienceDriverError::Commit(error.to_string()))?;
+        composition.note_experience_committed(commit_key, receipt.clone());
         bank_receipts.push(receipt);
     }
     let mut feedback_receipts = Vec::with_capacity(feedback_records.len());
@@ -756,6 +769,11 @@ pub async fn commit_experience_event_records(
         let commit_key = produce_feedback_commit(&ledger, record)
             .map_err(ExperienceDriverError::Governor)?
             .idempotency_key;
+        // P1-1 (#1942): same convergent-retry rule as the bank leg above.
+        if let Some(receipt) = composition.committed_experience_receipt(&commit_key) {
+            feedback_receipts.push(receipt);
+            continue;
+        }
         let identity = derive_commit_ingress(ctx, &kernel_fence, &commit_key)?;
         let receipt = composition
             .commit_experience_feedback_record(
@@ -769,6 +787,7 @@ pub async fn commit_experience_event_records(
             )
             .await
             .map_err(|error| ExperienceDriverError::Commit(error.to_string()))?;
+        composition.note_experience_committed(commit_key, receipt.clone());
         feedback_receipts.push(receipt);
     }
     Ok(ExperienceCommitOutput {

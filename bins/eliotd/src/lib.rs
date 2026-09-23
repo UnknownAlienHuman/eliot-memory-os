@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -64,6 +65,7 @@ pub mod notification_board_attach;
 mod observation_adapters;
 mod owner_feed;
 mod process_origin;
+mod reactive_feed;
 mod route_receipts;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -174,6 +176,7 @@ pub use process_origin::{
     ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
     request_origin_control,
 };
+pub use reactive_feed::{ReactiveFeedError, ReactiveFeedOutcome, drive_reactive_delivery_once};
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
@@ -311,6 +314,20 @@ pub struct DaemonComposition {
     /// already durable. The dependent view is stale/pending until the caller
     /// drops this composition and re-runs authenticated connect+start.
     view_stale: bool,
+    /// Owner receipts for experience-bank/feedback records this composition
+    /// already committed, keyed by deterministic idempotency key (P1-1,
+    /// issue #1942).
+    ///
+    /// The store idempotency rule matches on the operation+key+hash triple:
+    /// re-submitting a committed key under freshly derived expected heads
+    /// builds a different hash and wedges permanently in `IdentityConflict`.
+    /// The commit entry therefore consults this map first and reuses the
+    /// retained receipt instead of re-deriving expectations for an
+    /// already-attempted key, so retry converges by construction without
+    /// weakening the triple rule and without minting new operation
+    /// identities. Volatile fast path only, like `operator_replay`: durable
+    /// truth stays with the owner receipts, never with this map.
+    committed_experience: BTreeMap<String, eliot_store_api::WriteReceipt>,
     /// Already-validated Kernel-issued owner session facts threaded once by
     /// the daemon runtime where the concrete client and this composition meet
     /// (AUD-C02-B, Implements #1187). Facts only, never the client itself:
@@ -393,6 +410,7 @@ impl DaemonComposition {
             state_root: config.state_root,
             started: true,
             view_stale: false,
+            committed_experience: BTreeMap::new(),
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
             notification_snapshot: Vec::new(),
@@ -512,6 +530,40 @@ impl DaemonComposition {
         }
         Ok(receipt)
     }
+    /// Returns the retained owner receipt for an already-committed
+    /// experience record, if this composition committed its idempotency
+    /// key (P1-1, issue #1942).
+    ///
+    /// The commit entry consults this map before deriving ingress: a hit
+    /// means the record is durable under its deterministic key, so the
+    /// caller must reuse the receipt instead of re-submitting under fresh
+    /// expected heads (which would build a different request hash and
+    /// wedge in `IdentityConflict`). A miss carries no opinion — including
+    /// no claim that the record is absent downstream.
+    #[must_use]
+    pub fn committed_experience_receipt(
+        &self,
+        idempotency_key: &str,
+    ) -> Option<eliot_store_api::WriteReceipt> {
+        self.committed_experience.get(idempotency_key).cloned()
+    }
+
+    /// Retains the owner receipt for a newly committed experience record
+    /// under its deterministic idempotency key (P1-1, issue #1942).
+    ///
+    /// Called by the commit entry immediately after the owner returns the
+    /// receipt, before any later record in the batch is attempted, so a
+    /// mid-batch failure followed by retry skips exactly the durable
+    /// prefix. Keys and receipts are owner-derived; nothing here mints
+    /// identity, heads, or proofs.
+    pub fn note_experience_committed(
+        &mut self,
+        idempotency_key: String,
+        receipt: eliot_store_api::WriteReceipt,
+    ) {
+        self.committed_experience.insert(idempotency_key, receipt);
+    }
+
     /// Submits one candidate finish through the Governor owner, commits the
     /// derived decision through the canonical `RecordFinishDecision` path,
     /// and rehydrates the daemon projection before returning the decision
