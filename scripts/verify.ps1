@@ -274,8 +274,11 @@ try {
     Pop-Location
 }
 
-# Report only the scanner identity observed by the digest-pinned policy runner.
-# This deliberately performs no cargo-deny PATH lookup or version execution.
+# Report scanner identity only from the policy verifier's checked receipt.
+# This script does not choose trust from PATH. The verifier may use PATH to
+# locate a candidate, but executes only digest-pinned bytes after identity
+# checks, through a private verified copy.
+$receiptCleanupState = 'pass'
 try {
     if (Test-Path -LiteralPath $dependencyPolicyReceiptPath -PathType Leaf) {
         $dependencyReceipt = Get-Content -LiteralPath $dependencyPolicyReceiptPath -Raw | ConvertFrom-Json
@@ -299,6 +302,23 @@ try {
     }
 } catch {
     $denyIdentity = 'unverified-by-pinned-policy-runner'
+} finally {
+    try {
+        if (Test-Path -LiteralPath $dependencyPolicyReceiptPath) {
+            if (-not (Test-Path -LiteralPath $dependencyPolicyReceiptPath -PathType Leaf)) {
+                throw 'dependency-policy temporary receipt path is not a file'
+            }
+            Remove-Item -LiteralPath $dependencyPolicyReceiptPath -Force -ErrorAction Stop
+        }
+    } catch {
+        $receiptCleanupState = 'fail'
+        $harnessState = 'harness-error'
+        if ([string]::IsNullOrWhiteSpace($harnessError)) {
+            $harnessError = 'dependency-policy temporary receipt cleanup failed'
+        } else {
+            $harnessError += '; dependency-policy temporary receipt cleanup failed'
+        }
+    }
 }
 
 $passedCount = @($results | Where-Object { $_.State -eq 'pass' }).Count
@@ -318,6 +338,7 @@ $summaryLines = @(
     "VERIFY_RESULT: $overall profile=$Profile source=$sourceSha gates=$($selectedGates.Count) passed=$passedCount failed=$failedCount not-run=$notRunCount",
     "VERIFY_WORKSPACE_MEMBERS: $workspaceMembers (cargo metadata --locked --no-deps)",
     "VERIFY_TOOLCHAIN: $cargoIdentity / $pythonIdentity / deny=$denyIdentity",
+    "VERIFY_POLICY_RECEIPT_CLEANUP: $receiptCleanupState",
     'VERIFY_CACHE: workflow-owned only; this script implements no gate cache, so a cache hit cannot skip a gate or supply a pass receipt',
     "VERIFY_PROOF_CEILING: $proofCeiling",
     'VERIFY_DINT_CEILING: ignored/stateful/live-provider tests are outside the normal Quick/Review profiles (D-INT family issues 905/907/909/911/913/915); this result covers none of them'

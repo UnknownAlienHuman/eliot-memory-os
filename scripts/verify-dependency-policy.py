@@ -75,6 +75,15 @@ _SUMMARY_CHECKS = {"advisories", "bans", "licenses", "sources"}
 _SUMMARY_COUNTERS = {"errors", "warnings", "notes", "helps"}
 _REPARSE_POINT = 0x400
 
+def _has_exact_scanner_checks(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and all(isinstance(check, str) for check in value)
+        and len(value) == len(_SUMMARY_CHECKS)
+        and set(value) == _SUMMARY_CHECKS
+    )
+
+
 
 def _stable_file_identity(stat_result: os.stat_result) -> tuple[object, ...]:
     return (
@@ -251,13 +260,13 @@ def check_policy_manifest(root: Path) -> tuple[list[Finding], dict]:
         findings.append(Finding("DEP-002", rel_path, 1, "[scanner].sha256 must be a 64-character hexadecimal digest"))
 
     scanner_checks = scanner.get("checks", [])
-    if not isinstance(scanner_checks, list) or not {"advisories", "bans", "licenses", "sources"}.issubset(scanner_checks):
+    if not _has_exact_scanner_checks(scanner_checks):
         findings.append(
             Finding(
                 "DEP-002",
                 rel_path,
                 1,
-                "[scanner].checks must include advisories, bans, licenses and sources",
+                "[scanner].checks must contain advisories, bans, licenses and sources exactly once",
             )
         )
 
@@ -3942,12 +3951,7 @@ def run_cargo_deny(
     if not _HEX64.fullmatch(expected_digest):
         scanner_config_errors.append("[scanner].sha256 must be a 64-character hexadecimal digest")
     configured_checks = scanner_info.get("checks")
-    required_checks = {"advisories", "bans", "licenses", "sources"}
-    if (
-        not isinstance(configured_checks, list)
-        or any(not isinstance(check, str) for check in configured_checks)
-        or set(configured_checks) != required_checks
-    ):
+    if not _has_exact_scanner_checks(configured_checks):
         scanner_config_errors.append("[scanner].checks must contain advisories, bans, licenses and sources exactly once")
 
     option_args, option_evidence, config_errors = _rust_policy_options(root, rust_policy)
@@ -4559,11 +4563,10 @@ def _collect_ecosystem_denominator(
         edge for edge in rust_dependency_edges
         if isinstance(edge, dict) and edge.get("root_workspace_member") is False
     ]
-    incomplete_nonmember_edges = [
-        edge for edge in nonmember_edges
-        if isinstance(edge.get("resolver_identity"), dict)
-        and edge["resolver_identity"].get("status") == "source_only_incomplete"
-    ]
+    # No resolver-backed join is implemented for non-member workspaces yet.
+    # Count every such edge as incomplete, including a missing or malformed
+    # identity record; absence of evidence must never make the denominator green.
+    incomplete_nonmember_edges = list(nonmember_edges)
     workspace_disposition_findings = check_workspace_dependency_dispositions(
         manifest_data, rust_dependency_edges
     )
@@ -4571,9 +4574,14 @@ def _collect_ecosystem_denominator(
     findings.extend(rust_inventory_findings)
     findings.extend(workspace_disposition_findings)
     rust_denominator = {
-        "status": "complete"
-        if not rust_findings and not rust_inventory_findings and not workspace_disposition_findings
-        else "incomplete",
+        "status": (
+            "complete"
+            if not rust_findings
+            and not rust_inventory_findings
+            and not workspace_disposition_findings
+            and not incomplete_nonmember_edges
+            else "incomplete"
+        ),
         "direct_dependencies_count": len(direct_rust_dependencies),
         "direct_dependencies": sorted(direct_rust_dependencies),
         "direct_dependency_identities": direct_rust_identity,
