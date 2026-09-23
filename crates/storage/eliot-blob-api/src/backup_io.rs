@@ -521,19 +521,21 @@ impl BlobBackupPage {
                 reason: "page does not belong to this fence",
             });
         }
-        if self.member_count == 0 || self.member_count as u64 > u64::from(fence.max_members_per_page)
+        if self.member_count == 0
+            || self.member_count as u64 > u64::from(fence.max_members_per_page)
         {
             return Err(BlobError::InvalidField {
                 field: "backup_page.window",
                 reason: "page must be non-empty and within the fenced page bound",
             });
         }
-        let end = self.start_index.checked_add(self.member_count).ok_or(
-            BlobError::InvalidField {
-                field: "backup_page.window",
-                reason: "page window overflows",
-            },
-        )?;
+        let end =
+            self.start_index
+                .checked_add(self.member_count)
+                .ok_or(BlobError::InvalidField {
+                    field: "backup_page.window",
+                    reason: "page window overflows",
+                })?;
         if end > fence.member_count() {
             return Err(BlobError::InvalidField {
                 field: "backup_page.window",
@@ -623,10 +625,7 @@ impl BlobBackupPage {
             .iter()
             .map(|index| {
                 let locator = &fence.members[*index];
-                Ok((
-                    locator.hash.as_str(),
-                    locator.residency_key_digest()?,
-                ))
+                Ok((locator.hash.as_str(), locator.residency_key_digest()?))
             })
             .collect::<Result<_, BlobError>>()?;
         let canonical = serde_json::to_vec(&serde_json::json!({
@@ -737,11 +736,12 @@ fn verify_completion_chain(completions: &[PageCompletion]) -> Result<(), BlobErr
                 reason: "page completions must form a contiguous zero-based chain",
             });
         }
-        validate_hex_field(completion.page_digest.as_str(), "backup_pages.page_digest")
-            .map_err(|_| BlobError::InvalidField {
+        validate_hex_field(completion.page_digest.as_str(), "backup_pages.page_digest").map_err(
+            |_| BlobError::InvalidField {
                 field: "backup_pages.page_digest",
                 reason: "page digests must be lowercase hex",
-            })?;
+            },
+        )?;
         if position == 0 {
             if completion.predecessor != BLOB_BACKUP_GENESIS {
                 return Err(BlobError::InvalidField {
@@ -792,19 +792,18 @@ impl BlobBackupPartial {
                     field: "backup_partial.totals",
                     reason: "member totals overflow",
                 })?;
-            completed_bytes = completed_bytes
-                .checked_add(completion.sealed_bytes)
-                .ok_or(BlobError::InvalidField {
+            completed_bytes = completed_bytes.checked_add(completion.sealed_bytes).ok_or(
+                BlobError::InvalidField {
                     field: "backup_partial.totals",
                     reason: "byte totals overflow",
-                })?;
+                },
+            )?;
         }
-        let next_start_index = usize::try_from(completed_members).map_err(|_| {
-            BlobError::InvalidField {
+        let next_start_index =
+            usize::try_from(completed_members).map_err(|_| BlobError::InvalidField {
                 field: "backup_partial.totals",
                 reason: "member totals overflow",
-            }
-        })?;
+            })?;
         if next_start_index > fence.member_count() {
             return Err(BlobError::InvalidField {
                 field: "backup_partial.window",

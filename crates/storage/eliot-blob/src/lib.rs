@@ -44,15 +44,18 @@ pub use eliot_blob_api::{
     PublishState,
 };
 pub mod backup_io;
+pub use backup_io::{
+    BACKUP_MAX_PLAINTEXT_BYTES, CaptureOutcome, CapturePorts, ConsumerEvidencePack, ExportedPage,
+    PageInterrupt, PlaintextFetch, RestoreBinding, SealedMember, SealedStage, bind_restore_set,
+    complete_export, export_page, open_member, run_capture, seal_associated_data, seal_member,
+    seal_nonce_context, verify_capture_record, verify_destination_scope,
+};
 pub mod demand;
 pub mod key_ports;
 pub use demand::{
     ApprovedBlobView, BlobGenerationProbe, BlobProbeError, StoreBlobDemand,
     classify_capture_payload, garbage_collection_demand, probe_blob_generation,
     staged_recovery_demand,
-};
-pub use key_ports::{
-    DpapiUserAeadPort, DpapiUserKeyPort, KEY_PORT_ALGORITHM, KEY_PORT_VERSION,
 };
 use eliot_blob_api::{
     BlobCasCapability, BlobCasDurability, BlobCasFailure, BlobCasOutcome, BlobCasReceipt,
@@ -69,6 +72,7 @@ use eliot_receipts::{
     ArtifactBinding, OperationId, ProofCeiling, Receipt, ReceiptCore, ReceiptDisposition,
     ReceiptKind, contract_identity,
 };
+pub use key_ports::{DpapiUserAeadPort, DpapiUserKeyPort, KEY_PORT_ALGORITHM, KEY_PORT_VERSION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -5159,8 +5163,7 @@ mod tests {
         // Epoch wire shape follows the current contract: EpochId is the exact
         // (lineage_id, sequence) tuple, never a scalar. Fence and authority
         // epochs match (AuthorityBinding::validate enforces sameness).
-        let epoch =
-            r#"{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":4}"#;
+        let epoch = r#"{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":4}"#;
         let fence = format!(
             "{{\"authority_epoch\":{epoch},\"resource_generation\":7,\"task_revision\":null,\"policy_revision\":null,\"integration_revision\":null}}"
         );
@@ -5398,8 +5401,8 @@ mod tests {
         let root = unique_test_root();
         let platform_root = std::env::temp_dir().join(format!("eliot-1873k-svc-{root}"));
         std::fs::create_dir_all(&platform_root).expect("isolated platform root");
-        let platform = eliot_platform_windows::WindowsPlatform::new(platform_root.clone())
-            .expect("platform");
+        let platform =
+            eliot_platform_windows::WindowsPlatform::new(platform_root.clone()).expect("platform");
         let lineage = BlobId::new("dpapi-user-1873k-svc").expect("lineage");
         let bootstrap = stage_request("bootstrap", b"", &root);
         let store = BlobStoreService::new(
@@ -5418,8 +5421,7 @@ mod tests {
             BlobId::new("dpapi-user-1873k-svc").expect("key domain");
         let ready = block_on(client.stage(request)).expect("stage");
         assert_eq!(ready.plaintext_length(), 13);
-        let chunk =
-            block_on(client.read(read_request(&ready, "dpapi-read", &root))).expect("read");
+        let chunk = block_on(client.read(read_request(&ready, "dpapi-read", &root))).expect("read");
         assert_eq!(chunk.bytes(), b"payload-1873k");
         assert!(chunk.is_complete());
         std::fs::remove_dir_all(&platform_root).ok();
