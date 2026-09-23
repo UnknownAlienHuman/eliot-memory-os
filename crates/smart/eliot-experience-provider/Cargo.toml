@@ -25,9 +25,11 @@ eliot-contracts.workspace = true
 eliot-epistemic-contracts.workspace = true
 eliot-experience-projection = { path = "../eliot-experience-projection", version = "0.1.0" }
 eliot-learning-contracts.workspace = true
+eliot-memory-quality = { path = "../eliot-memory-quality", version = "0.1.0" }
 eliot-observation-contracts.workspace = true
 eliot-receipts.workspace = true
 eliot-store-api = { path = "../../storage/eliot-store-api", version = "0.1.0" }
+eliot-understanding-assessment.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

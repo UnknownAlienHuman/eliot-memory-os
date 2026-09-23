@@ -99,6 +99,12 @@ use eliot_cognitive_quality::{
 use eliot_epistemic_contracts::CurrentEpistemicPosition;
 use eliot_experience_projection::{revalidate_bank_refs, revalidate_feedback_refs};
 use eliot_learning_contracts::HarnessActivationReceiptCandidate;
+use eliot_memory_quality::{MemoryEcologyAssessment, QualityRequest, assess_quality};
+use eliot_memory_quality::QualityError as MemoryQualityError;
+use eliot_understanding_assessment::{
+    ScopedInput, ScopedUnderstandingAssessment, assess_scoped,
+};
+use eliot_understanding_assessment::AssessmentError as UnderstandingError;
 use eliot_observation_contracts::{
     AgentFeedbackRecord, BankProjection, CoverageDisposition, CoverageEvidence, ExperienceBankRecord,
     ExperienceRetentionReadPosture, ExperienceSourceFamily, FeedbackProjection, JournalProjection,
@@ -170,6 +176,12 @@ pub enum ProviderError {
     /// A Smart consumer assessment rejected the supplied owner inputs.
     #[error("quality consumer: {0}")]
     Quality(#[from] QualityError),
+    /// A memory-quality consumer rejected the supplied owner inputs.
+    #[error("memory quality consumer: {0}")]
+    MemoryQuality(#[from] MemoryQualityError),
+    /// An understanding-assessment consumer rejected the supplied inputs.
+    #[error("understanding consumer: {0}")]
+    Understanding(#[from] UnderstandingError),
     /// A projection or view contract rejected the shaped read.
     #[error("projection contract: {0}")]
     Contract(#[from] ObservationError),
@@ -867,4 +879,34 @@ pub fn assess_and_recheck(
     };
     recheck_candidate(&candidate, &snapshot).map_err(ProviderError::Quality)?;
     Ok(candidate)
+}
+
+/// Memory-quality consumer invocation: assess one owner batch.
+///
+/// Calls the released [`assess_quality`](eliot_memory_quality::assess_quality)
+/// consumer with the edge-supplied owner request (bounded batch, owner
+/// applicability verdict, admitted projections, advisory receipts). The
+/// memory family has no provider read path in this lane: every member
+/// arrives as an owner value through the request, validated there. The
+/// returned assessment carries gravity, maintenance, and counter-metric
+/// sections with explicit coverage; no score, rank, or lifecycle
+/// transition is emitted.
+pub fn produce_memory_quality(
+    request: &QualityRequest,
+) -> Result<MemoryEcologyAssessment, ProviderError> {
+    assess_quality(request).map_err(ProviderError::MemoryQuality)
+}
+
+/// Understanding consumer invocation: assess one subject scope.
+///
+/// Calls the released [`assess_scoped`](eliot_understanding_assessment::assess_scoped)
+/// consumer with the edge-supplied scoped input (owner context with
+/// experience envelopes, scope, cites, closure). The caller binds
+/// outcome-side experience evidence; this function performs no binding
+/// of its own. The returned assessment is finding-free candidate
+/// material for Governor/Human review, never a verdict.
+pub fn produce_understanding_assessment(
+    input: ScopedInput<'_>,
+) -> Result<ScopedUnderstandingAssessment, ProviderError> {
+    assess_scoped(input).map_err(ProviderError::Understanding)
 }

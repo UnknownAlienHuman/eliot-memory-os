@@ -34,13 +34,17 @@ use std::sync::Arc;
 
 use eliot_contracts::{ArtifactId, RequestMetadata};
 use eliot_cognitive_quality::QualityAssessmentCandidate;
-use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness};
+use eliot_context_contracts::ActiveUnderstandingView;
+use eliot_dreamer_contracts::self_query::AcceptedSourceProjection;
+use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness, ProviderContribution};
 use eliot_experience_provider::{
     BankShapeInputs, ExperienceView, FeedbackShapeInputs, JournalShapeOutput, ProduceJournalInputs,
     ProviderError, RetentionContext, SelfQualityInputs, SelfQualityRecheckInputs, WithheldMember,
-    assess_and_recheck, produce_journal_read,
+    assess_and_recheck, produce_journal_read, produce_memory_quality,
+    produce_understanding_assessment,
 };
 use eliot_learning_contracts::HarnessActivationReceiptCandidate;
+use eliot_memory_quality::{MemoryEcologyAssessment, QualityRequest};
 use eliot_observation::{
     GovernorObservationError,
     bank_admission::{
@@ -51,6 +55,10 @@ use eliot_observation::{
 };
 use eliot_observation_contracts::{
     ObservationScope, ProjectionCoverage, ProjectionOmission, RetentionHold, RetentionSchedule,
+};
+use eliot_understanding_assessment::{
+    AssessmentClosure, AssessmentScope, EvidenceCite, ExperienceEvidence, OwnerContext,
+    ScopedUnderstandingAssessment,
 };
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
@@ -259,13 +267,48 @@ pub struct ExperienceFeedbackEventInputs {
 
 /// Governed trigger event for one terminal experience-quality run.
 ///
+/// Understanding leg inputs: everything except outcome-side experience.
+///
+/// The entry binds outcome-side experience evidence from its own live
+/// envelopes; all other inputs arrive edge-supplied from their owners
+/// (compiled view, accepted sources, contribution, scope, cites,
+/// closure). Product claims stay false unless the edge holds out
+/// evidence for them.
+pub struct UnderstandingEventInputs<'a> {
+    /// Already-compiled understanding view, by handle (edge-supplied).
+    pub view: &'a ActiveUnderstandingView,
+    /// Accepted-source projection for citation checks (edge-supplied).
+    pub sources: &'a AcceptedSourceProjection,
+    /// Optional admitted epistemic contribution, echoed by digest/claim.
+    pub contribution: Option<&'a ProviderContribution>,
+    /// Denominator anchor.
+    pub scope: AssessmentScope,
+    /// Subject route or coupled system.
+    pub subject: String,
+    /// Transfer boundary and requalification text.
+    pub transfer_boundary: String,
+    /// Material unknowns cites.
+    pub material_unknowns: Vec<EvidenceCite>,
+    /// Abstention precision/coverage cites, where applicable.
+    pub abstention: Vec<EvidenceCite>,
+    /// Unanswerable/stale case cites, where applicable.
+    pub unanswerable: Vec<EvidenceCite>,
+    /// Counterfactual intervention cites, where applicable.
+    pub counterfactual: Vec<EvidenceCite>,
+    /// Rival/prediction/discriminator/verifier/revision closure.
+    pub closure: AssessmentClosure,
+    /// True when the verdict backs a product claim (held-out required).
+    pub product_claims: bool,
+}
+
 /// The event producer (operator/planner edge, O1 trigger) assembles this
 /// from explicit owner-issued inputs only: bridge scope and position
 /// subject, journal presence inputs, durable bank/feedback documents with
 /// their read context, the owner-issued retention schedule with
-/// caller-carried holds, per-attempt receipts, obligation handles, and
-/// edge attestation. Reads stay reads: nothing here writes, persists, or
-/// submits; the entry returns the frozen candidate plus the validated
+/// caller-carried holds, per-attempt receipts, obligation handles, edge
+/// attestation, plus the memory request and understanding leg when those
+/// families run. Reads stay reads: nothing here writes, persists, or
+/// submits; the entry returns the frozen candidates plus the validated
 /// views and gap postures for the consuming review path.
 pub struct ExperienceQualityEvent<'a> {
     /// Assessment identity minted by the caller.
@@ -294,9 +337,16 @@ pub struct ExperienceQualityEvent<'a> {
     pub obligation_handles: &'a [ArtifactId],
     /// Edge-attested handles for bodies cited by handle only.
     pub attested_handles: Vec<ArtifactId>,
+    /// Memory-quality request, when the memory family runs (edge-supplied
+    /// owner batch, applicability verdict, projections, and receipts).
+    pub memory: Option<QualityRequest>,
+    /// Understanding leg inputs, when the understanding family runs
+    /// (edge-supplied owner context minus outcome experience, which the
+    /// entry binds from its own live envelopes).
+    pub understanding: Option<UnderstandingEventInputs<'a>>,
 }
 
-/// Terminal output bundle: frozen candidate plus validated views and gaps.
+/// Terminal output bundle: frozen candidates plus validated views and gaps.
 pub struct ExperienceQualityEventOutput {
     /// Frozen self-quality candidate, assessed and re-resolved.
     pub candidate: QualityAssessmentCandidate,
@@ -310,6 +360,10 @@ pub struct ExperienceQualityEventOutput {
     pub bank_withheld: Vec<WithheldMember>,
     /// Withheld feedback records with honest postures for gap emission.
     pub feedback_withheld: Vec<WithheldMember>,
+    /// Memory ecology assessment, when the memory family ran.
+    pub memory_assessment: Option<MemoryEcologyAssessment>,
+    /// Scoped understanding assessment, when the understanding family ran.
+    pub understanding: Option<ScopedUnderstandingAssessment>,
 }
 
 /// Terminal event entry: trigger event to reviewed candidate.
@@ -434,6 +488,39 @@ pub async fn run_experience_quality_event(
         },
         attested_handles: event.attested_handles.clone(),
     })?;
+    let memory_assessment = match &event.memory {
+        Some(request) => Some(produce_memory_quality(request)?),
+        None => None,
+    };
+    let understanding = match &event.understanding {
+        Some(inputs) => {
+            let mut experience = Vec::new();
+            if let Some(journal) = journal_envelope.as_ref() {
+                experience.push(ExperienceEvidence::Journal(journal));
+            }
+            experience.push(ExperienceEvidence::Bank(&bank_live));
+            experience.push(ExperienceEvidence::Feedback(&feedback_live));
+            let scoped = eliot_understanding_assessment::ScopedInput {
+                owner: OwnerContext {
+                    view: inputs.view,
+                    sources: inputs.sources,
+                    contribution: inputs.contribution,
+                    experience: &experience,
+                },
+                scope: inputs.scope.clone(),
+                subject: inputs.subject.clone(),
+                transfer_boundary: inputs.transfer_boundary.clone(),
+                material_unknowns: inputs.material_unknowns.clone(),
+                abstention: inputs.abstention.clone(),
+                unanswerable: inputs.unanswerable.clone(),
+                counterfactual: inputs.counterfactual.clone(),
+                closure: inputs.closure.clone(),
+                product_claims: inputs.product_claims,
+            };
+            Some(produce_understanding_assessment(scoped)?)
+        }
+        None => None,
+    };
     Ok(ExperienceQualityEventOutput {
         candidate,
         journal_view,
@@ -441,5 +528,7 @@ pub async fn run_experience_quality_event(
         feedback_view: feedback_shaped.view,
         bank_withheld: bank_shaped.withheld,
         feedback_withheld: feedback_shaped.withheld,
+        memory_assessment,
+        understanding,
     })
 }
