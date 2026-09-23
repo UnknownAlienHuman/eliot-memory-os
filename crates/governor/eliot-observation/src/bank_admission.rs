@@ -47,6 +47,31 @@
 //!   scope equality, fence compatibility, frozen digest). This runs without
 //!   importing any Smart crate: Smart depends on Governor contracts, never
 //!   the reverse.
+//! - [`consume_bank_range_payload`] / [`consume_feedback_range_payload`]:
+//!   the payload-to-projection callers. Decode a bridge range payload and
+//!   run the full snapshot join, so every helper below gains a real
+//!   in-copy caller. Owner coverage/omissions/revision stay
+//!   caller-supplied owner evidence.
+//!
+//! Cross-copy seams (no in-copy caller by design; exact consumers named):
+//!
+//! ```text
+//! produce_feedback_from_journal
+//!   → terminal daemon/observation edge, B-lane O1 trigger wiring;
+//! assemble_experience_for_consumer, consume_*_range_payload,
+//!   supply_*_projection_from_store
+//!   → B terminal bank/feedback invocation: bridge range read → parse →
+//!     supply → assess/recheck (owner coverage built B-side from heads);
+//! produce_bank_commit, produce_feedback_commit
+//!   → #18 PreparedTransition contour (reserved 325/C lane) as the typed
+//!     named-operation inputs;
+//! parse_bank_record, parse_feedback_record
+//!   → B terminal loop per document, plus the consume drivers above;
+//! RetentionSchedule::issue
+//!   → Governor configuration owner;
+//! BANK/FEEDBACK_COMMIT_OPERATION strings
+//!   → store-api operation_parameters name maps (byte-identical spelling).
+//! ```
 //!
 //! Never: store/vendor I/O, credential handling, lifecycle/support/
 //! influence mutation, epistemic promotion, score/verdict emission, or
@@ -63,6 +88,8 @@ use eliot_observation_contracts::{
     RetentionSchedule, SystemObservationJournalRecord, bank_record_ref, feedback_record_ref,
     resolve_bank_ref, resolve_feedback_ref, resolve_retention_read,
 };
+
+use serde_json::Value;
 
 use crate::GovernorObservationError;
 
@@ -884,4 +911,136 @@ pub fn produce_feedback_commit(
         }
     }
     ExperienceCommitParameters::for_feedback(record).map_err(GovernorObservationError::Observation)
+}
+
+/// Decode bridge range-payload records into admitted bank records.
+///
+/// Parses each element of the payload `records` array through
+/// [`parse_bank_record`] (deserialize plus full digest re-proof). A
+/// missing or non-array `records` member fails closed: a malformed
+/// bridge payload is corruption evidence, never an empty read. A single
+/// undecodable element fails the whole read for the same reason —
+/// malformed material has no omission class in the frozen contract, so
+/// it cannot travel as a gap. The caller (terminal invocation loop)
+/// preserves element position for diagnostics from its own iteration.
+pub fn bank_records_from_range_payload(
+    payload: &Value,
+) -> Result<Vec<ExperienceBankRecord>, GovernorObservationError> {
+    let members = payload
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or(GovernorObservationError::InvalidField {
+            field: "audit_range.records",
+            reason: "range payload must carry a records array",
+        })?;
+    let mut records = Vec::with_capacity(members.len());
+    for member in members {
+        let document = serde_json::to_string(member).map_err(|_| {
+            GovernorObservationError::InvalidField {
+                field: "audit_range.records",
+                reason: "range record must re-encode canonically",
+            }
+        })?;
+        records.push(parse_bank_record(&document)?);
+    }
+    Ok(records)
+}
+
+/// Decode bridge range-payload records into admitted feedback records.
+/// Same fail-closed array rule as [`bank_records_from_range_payload`].
+pub fn feedback_records_from_range_payload(
+    payload: &Value,
+) -> Result<Vec<AgentFeedbackRecord>, GovernorObservationError> {
+    let members = payload
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or(GovernorObservationError::InvalidField {
+            field: "audit_range.records",
+            reason: "range payload must carry a records array",
+        })?;
+    let mut records = Vec::with_capacity(members.len());
+    for member in members {
+        let document = serde_json::to_string(member).map_err(|_| {
+            GovernorObservationError::InvalidField {
+                field: "audit_range.records",
+                reason: "range record must re-encode canonically",
+            }
+        })?;
+        records.push(parse_feedback_record(&document)?);
+    }
+    Ok(records)
+}
+
+/// Consume one bank range payload into a validated bank projection.
+///
+/// The payload-to-projection caller: decodes the bridge payload, then
+/// runs the full store-snapshot join
+/// ([`supply_bank_projection_from_store`]: ledger rebuild, retention
+/// gating, snapshot ref resolution, consumer revalidation). Owner
+/// coverage, omissions, and the source-revision marker stay
+/// caller-supplied owner evidence — this driver never invents them.
+/// Cross-copy seam: the B terminal bank invocation calls this with the
+/// bridge payload plus owner coverage for one scope and fence.
+#[allow(clippy::too_many_arguments)]
+pub fn consume_bank_range_payload(
+    ledger: &mut ExperienceRevisionLedger,
+    projection_id: ArtifactId,
+    scope: ObservationScope,
+    fence: StateFence,
+    schedule: &RetentionSchedule,
+    holds: &BTreeMap<String, RetentionHold>,
+    payload: &Value,
+    source_revision: String,
+    coverage: ProjectionCoverage,
+    omissions: Vec<ProjectionOmission>,
+) -> Result<BankProjection, GovernorObservationError> {
+    let records = bank_records_from_range_payload(payload)?;
+    supply_bank_projection_from_store(
+        ledger,
+        BankStoreSnapshot {
+            records: &records,
+            source_revision,
+            coverage,
+            omissions,
+        },
+        projection_id,
+        scope,
+        fence,
+        schedule,
+        holds,
+    )
+}
+
+/// Consume one feedback range payload into a validated feedback
+/// projection. Same payload-to-projection rule as
+/// [`consume_bank_range_payload`]; cross-copy seam for the B terminal
+/// feedback invocation.
+#[allow(clippy::too_many_arguments)]
+pub fn consume_feedback_range_payload(
+    ledger: &mut ExperienceRevisionLedger,
+    projection_id: ArtifactId,
+    scope: ObservationScope,
+    fence: StateFence,
+    schedule: &RetentionSchedule,
+    holds: &BTreeMap<String, RetentionHold>,
+    payload: &Value,
+    source_revision: String,
+    coverage: ProjectionCoverage,
+    omissions: Vec<ProjectionOmission>,
+) -> Result<FeedbackProjection, GovernorObservationError> {
+    let records = feedback_records_from_range_payload(payload)?;
+    supply_feedback_projection_from_store(
+        ledger,
+        FeedbackStoreSnapshot {
+            records: &records,
+            source_revision,
+            coverage,
+            omissions,
+        },
+        projection_id,
+        scope,
+        fence,
+        schedule,
+        holds,
+    )
 }
