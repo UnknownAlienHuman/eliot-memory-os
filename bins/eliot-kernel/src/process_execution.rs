@@ -988,6 +988,66 @@ impl ProcessExecutionGateway {
         }
     }
 
+    /// Issues one Kernel-authenticated `ProcessRequest` for `TestD` durable
+    /// productive-job admission without starting the process. `TestD` core
+    /// consumes the request into its non-serializable admission permit; the
+    /// worker later derives the exact same closed-profile intent and runs it
+    /// through its one-shot executor.
+    pub(crate) async fn issue_testd_process_request(
+        &self,
+        owner: &ProcessOwnerBinding,
+        admission: ProcessExecutionAdmissionRequest,
+    ) -> Result<ProcessRequest, ProcessExecutionError> {
+        admission.validate()?;
+        self.validate_admission(&admission, owner)?;
+        let now = self.now();
+        if admission.deadline_unix_ms() <= now {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::ExpiredDispatchPermit,
+            ));
+        }
+        let snapshot = self.snapshot().await?;
+        snapshot
+            .validate()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        if !admission
+            .state_fence()
+            .authority_epoch()
+            .is_same_authority(&snapshot.state_fence.authority_epoch)
+            || admission.state_fence().generation().get()
+                != snapshot.state_fence.resource_generation.value()
+        {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::StaleStateFence,
+            ));
+        }
+        let (store_fence, revision_heads) = project_store_snapshot(&snapshot)?;
+        let context = self.build_context(
+            ClockObservation {
+                valid_time_ms: Some(snapshot.observed_at_unix_ms),
+                known_time_ms: Some(snapshot.observed_at_unix_ms),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            store_fence.clone(),
+            snapshot.state_fence.authority_epoch.clone(),
+            revision_heads.clone(),
+            snapshot.validation_revision,
+        )?;
+        let operation_id = admission.intent().operation_id().clone();
+        let context_guard = self.insert_context(operation_id, context)?;
+        let request = self.issue(
+            &admission,
+            store_fence,
+            revision_heads,
+            now,
+            snapshot.validation_revision,
+        )?;
+        request.validate()?;
+        drop(context_guard);
+        Ok(request)
+    }
+
     pub(crate) async fn inspect(
         &self,
         owner: &ProcessOwnerBinding,

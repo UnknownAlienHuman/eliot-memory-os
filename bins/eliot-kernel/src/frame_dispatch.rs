@@ -950,6 +950,7 @@ pub(crate) fn is_doctor_operation(operation: &str) -> bool {
 pub(crate) fn is_testd_operation(operation: &str) -> bool {
     operation == TESTD_ADMISSION_WIRE_ID
         || operation == super::testd_terminal_completion_route::OPERATION
+        || operation == super::testd_terminal_completion_route::OWNER_SUBMIT_OPERATION
 }
 
 impl KernelComposition {
@@ -1279,6 +1280,16 @@ impl KernelComposition {
             {
                 return Err(TransportError::SessionFenced);
             }
+        } else if operation == super::testd_terminal_completion_route::OWNER_SUBMIT_OPERATION {
+            let request =
+                super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
+                    .map_err(|_| TransportError::SessionFenced)?;
+            if operation != request.wire_id
+                || request.wire_version
+                    != super::testd_terminal_completion_route::OWNER_WIRE_VERSION
+            {
+                return Err(TransportError::SessionFenced);
+            }
         } else {
             return Err(TransportError::SessionFenced);
         }
@@ -1456,6 +1467,61 @@ impl KernelComposition {
             FrameKind::Response,
             MessageType::Result,
             serde_json::to_value(&response).map_err(|_| TransportError::SessionFenced)?,
+        )?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(reply)
+    }
+
+    /// Executes one authenticated TestD owner-submit operation. The frame's
+    /// RequestIdentity is the sole task/operation identity source; the owner
+    /// rehydrates and commits it with the durable job before replying.
+    pub async fn execute_testd_owner_submit(
+        &self,
+        session: &Session,
+        request_id: super::RequestId,
+        identity: &super::RequestIdentity,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<Frame, TransportError> {
+        observe_frame("kernel.frame_testd_owner_submit", "attempt");
+        if operation != super::testd_terminal_completion_route::OWNER_SUBMIT_OPERATION
+            || session.module_generation.module_id.as_str() != TESTD_MODULE_ID
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+            || self
+                .service_state()
+                .map_err(|_| TransportError::SessionFenced)?
+                != KernelServiceState::Ready
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let request =
+            super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let response =
+            super::dispatch_launch::submit_testd_owner_job(self, identity, &request, unix_ms())
+                .await
+                .map_err(|_| TransportError::SessionFenced)?;
+        let mut reply = status_frame(
+            session,
+            FrameKind::Response,
+            MessageType::Result,
+            serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?,
         )?;
         reply.request_id = Some(request_id);
         reply
