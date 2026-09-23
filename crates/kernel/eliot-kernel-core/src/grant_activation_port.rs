@@ -459,6 +459,18 @@ pub struct GrantClosureEnumeration {
 /// One descendant the Governor owner keeps usable under a surviving alternate
 /// authority path while the rest of the closure is fenced.
 ///
+/// A covering path MAY live on a different lineage root than the closure:
+/// I06-15 preserves "a descendant only if another valid root path covers
+/// the exact use", and issue #2100 records "a second independent valid
+/// root path" explicitly — hence the separate `covering_root_ref`
+/// (mirrored by `GrantClosurePreserved.covering_root` in ORS). Same-root
+/// covers are the common case, not a requirement: no pin compares the
+/// covering root to the closure root. What is always required is CURRENT
+/// membership evidence — the covering grant must prove live or durable
+/// `Active` authority on the declared covering root and fence contour at
+/// the closure revision (see `prove_survivor_membership`) — never a
+/// carried-over declaration.
+///
 /// The covering path is Governor semantic evidence recorded verbatim: the
 /// Kernel never evaluates, widens, or re-derives it. It only checks identity
 /// shape and disjointness from the fenced set.
@@ -6680,6 +6692,36 @@ mod tests {
         )?;
         assert_eq!(activated.len(), 5);
 
+        // Provision REAL covering authority for the declared survivor: a
+        // live alt-root grant outside the affected set, committed durably
+        // through the port (not a bare declaration). The survivor gate
+        // proves this cover at revocation time; an unactivated cover
+        // would (correctly) refuse.
+        let alt_member = closure_member_fixture(
+            &epoch,
+            &binding,
+            "op-alt-root",
+            "grant-alt",
+            None,
+            "root-alt",
+            5,
+        )?;
+        let alt_enumeration = GrantClosureEnumeration {
+            authority_root_ref: "root-alt".to_owned(),
+            grant_graph_revision: 5,
+            members: vec![alt_member],
+            preserved: Vec::new(),
+        };
+        hydration_source.replace(alt_enumeration.clone());
+        let alt_activated = port.activate_grant_closure(
+            &GrantClosureActivationIntent {
+                operation_id: "op-alt-activate".to_owned(),
+                enumeration: alt_enumeration,
+            },
+            &epoch,
+        )?;
+        assert_eq!(alt_activated.len(), 1);
+
         // Revocation fences the full chain and keeps the side branch usable
         // under its surviving alternate path.
         let mut fenced_enumeration = chain_enumeration(&epoch, &binding, 6, Vec::new())?;
@@ -6728,6 +6770,216 @@ mod tests {
         assert!(port.disposition("op-side-incomplete").is_none());
 
         drop(port);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn closure_revocation_refuses_stale_survivor_cover(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::Arc;
+
+        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let binding = restart_test_binding(&epoch)?;
+        let path = std::env::temp_dir().join(format!(
+            "eliot-kernel-grant-closure-stale-cover-{}-{}.redb",
+            std::process::id(),
+            epoch.sequence
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
+
+        // Chain plus side branch plus a live alt-root cover, all committed.
+        let mut full = chain_enumeration(&epoch, &binding, 5, Vec::new())?;
+        let side = closure_member_fixture(
+            &epoch,
+            &binding,
+            "op-chain-side",
+            "grant-chain-side",
+            Some("grant-chain-mid"),
+            "root-chain",
+            5,
+        )?;
+        full.members.insert(2, side);
+        let hydration_source = Arc::new(TestClosureHydration {
+            enumeration: Mutex::new(full.clone()),
+        });
+        let port =
+            GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
+        port.activate_grant_closure(
+            &GrantClosureActivationIntent {
+                operation_id: "op-stale-activate".to_owned(),
+                enumeration: full,
+            },
+            &epoch,
+        )?;
+        let alt_member = closure_member_fixture(
+            &epoch,
+            &binding,
+            "op-alt-root",
+            "grant-alt",
+            None,
+            "root-alt",
+            5,
+        )?;
+        let alt_enumeration = GrantClosureEnumeration {
+            authority_root_ref: "root-alt".to_owned(),
+            grant_graph_revision: 5,
+            members: vec![alt_member],
+            preserved: Vec::new(),
+        };
+        hydration_source.replace(alt_enumeration.clone());
+        port.activate_grant_closure(
+            &GrantClosureActivationIntent {
+                operation_id: "op-alt-activate".to_owned(),
+                enumeration: alt_enumeration,
+            },
+            &epoch,
+        )?;
+
+        // Fence the cover through its own closure: the surviving path it
+        // anchored is gone, so any later declaration preserving through it
+        // is stale evidence and must refuse.
+        let alt_revoke_members = vec![closure_member_fixture(
+            &epoch,
+            &binding,
+            "op-alt-root",
+            "grant-alt",
+            None,
+            "root-alt",
+            6,
+        )?];
+        hydration_source.replace(GrantClosureEnumeration {
+            authority_root_ref: "root-alt".to_owned(),
+            grant_graph_revision: 6,
+            members: alt_revoke_members,
+            preserved: Vec::new(),
+        });
+        let alt_revoke = GrantClosureRevocationIntent {
+            operation_id: "op-alt-revoke".to_owned(),
+            grant_id: "grant-alt".to_owned(),
+            authority_root_ref: "root-alt".to_owned(),
+            snapshot_id: "snap-1".to_owned(),
+            grant_graph_revision: 6,
+            binding: binding.clone(),
+            unknown_outcome_operations: Vec::new(),
+            receipt_obligations: Vec::new(),
+        };
+        port.revoke_grant_closure(&alt_revoke, &epoch)?;
+        assert!(port.grant_revoked("grant-alt"));
+
+        let mut fenced_enumeration = chain_enumeration(&epoch, &binding, 7, Vec::new())?;
+        fenced_enumeration.preserved.push(GrantClosureSurvivor {
+            grant_id: "grant-chain-side".to_owned(),
+            covering_grant_id: "grant-alt".to_owned(),
+            covering_root_ref: "root-alt".to_owned(),
+        });
+        hydration_source.replace(fenced_enumeration);
+        let revocation = chain_revocation_intent(&binding, "op-stale-revoke", 7);
+        assert!(matches!(
+            port.revoke_grant_closure(&revocation, &epoch),
+            Err(KernelError::InvalidField { .. })
+        ));
+        assert!(port.disposition("op-stale-revoke").is_none());
+
+        drop(port);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn closure_revocation_proves_cover_from_durable_row(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::Arc;
+
+        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let binding = restart_test_binding(&epoch)?;
+        let path = std::env::temp_dir().join(format!(
+            "eliot-kernel-grant-closure-durable-cover-{}-{}.redb",
+            std::process::id(),
+            epoch.sequence
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
+
+        // Same committed state as the survivor fixture: chain plus side
+        // plus alt-root cover, all with durable Active rows.
+        let mut full = chain_enumeration(&epoch, &binding, 5, Vec::new())?;
+        let side = closure_member_fixture(
+            &epoch,
+            &binding,
+            "op-chain-side",
+            "grant-chain-side",
+            Some("grant-chain-mid"),
+            "root-chain",
+            5,
+        )?;
+        full.members.insert(2, side);
+        let hydration_source = Arc::new(TestClosureHydration {
+            enumeration: Mutex::new(full.clone()),
+        });
+        let port =
+            GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
+        port.activate_grant_closure(
+            &GrantClosureActivationIntent {
+                operation_id: "op-durable-activate".to_owned(),
+                enumeration: full,
+            },
+            &epoch,
+        )?;
+        let alt_member = closure_member_fixture(
+            &epoch,
+            &binding,
+            "op-alt-root",
+            "grant-alt",
+            None,
+            "root-alt",
+            5,
+        )?;
+        let alt_enumeration = GrantClosureEnumeration {
+            authority_root_ref: "root-alt".to_owned(),
+            grant_graph_revision: 5,
+            members: vec![alt_member],
+            preserved: Vec::new(),
+        };
+        hydration_source.replace(alt_enumeration.clone());
+        port.activate_grant_closure(
+            &GrantClosureActivationIntent {
+                operation_id: "op-alt-activate".to_owned(),
+                enumeration: alt_enumeration,
+            },
+            &epoch,
+        )?;
+
+        // Restart: an empty live ledger over the same durable store. The
+        // survivor and its cover have no live records, so the gate must
+        // prove the cover from its durable Active row bound to the
+        // presented fence — never from a carried declaration.
+        drop(port);
+        let mut fenced_enumeration = chain_enumeration(&epoch, &binding, 6, Vec::new())?;
+        fenced_enumeration.preserved.push(GrantClosureSurvivor {
+            grant_id: "grant-chain-side".to_owned(),
+            covering_grant_id: "grant-alt".to_owned(),
+            covering_root_ref: "root-alt".to_owned(),
+        });
+        hydration_source.replace(fenced_enumeration);
+        let reopened = GrantActivationPort::with_durable_root_grant(
+            hydration_source.clone(),
+            store.clone(),
+        );
+        let revocation = chain_revocation_intent(&binding, "op-durable-revoke", 6);
+        let receipt = reopened.revoke_grant_closure(&revocation, &epoch)?;
+        assert_eq!(receipt.preserved_grants.len(), 1);
+        assert_eq!(receipt.preserved_grants[0].grant_id, "grant-chain-side");
+        assert_eq!(
+            receipt.preserved_grants[0].covering_grant_id,
+            "grant-alt"
+        );
+        assert!(reopened.grant_revoked("grant-chain-root"));
+
+        drop(reopened);
         drop(store);
         let _ = std::fs::remove_file(&path);
         Ok(())
