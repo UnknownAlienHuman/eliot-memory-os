@@ -157,9 +157,10 @@ pub use governor_local_read::{
     serve_admitted_local_read,
 };
 pub use experience_runtime::{
-    ExperienceDriverError, ExperienceJournalDriverInputs, ExperienceQualityEvent,
-    ExperienceQualityEventOutput, produce_journal_projection, read_current_position,
-    run_experience_quality_event,
+    CommonGroundEventInputs, ExperienceCommitOutput, ExperienceDriverError,
+    ExperienceJournalDriverInputs, ExperienceQualityEvent, ExperienceQualityEventOutput,
+    UnderstandingEventInputs, commit_experience_event_records, derive_commit_ingress,
+    produce_journal_projection, read_current_position, run_experience_quality_event,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
@@ -441,6 +442,74 @@ impl DaemonComposition {
         Ok(receipt)
     }
 
+    /// Commits one ledger-sequenced experience-bank record through the
+    /// canonical Governor experience-commit caller, then publishes the
+    /// resulting owner change.
+    ///
+    /// Same refresh/stale discipline as
+    /// [`Self::commit_canonical_and_refresh`]: the receipt is returned
+    /// unmodified and a failed refresh marks the dependent view
+    /// stale/pending instead of hiding divergence. The identity must be
+    /// admitted ingress agreeing with the record (fence, scope,
+    /// idempotency); the owner re-validates everything downstream.
+    pub async fn commit_experience_bank_record(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        ledger: &eliot_observation::bank_admission::ExperienceRevisionLedger,
+        record: &eliot_observation_contracts::ExperienceBankRecord,
+        scope_id: eliot_store_api::ScopeId,
+        proof_refs: Vec<String>,
+        expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        let receipt = eliot_governor::commit_experience_bank(
+            &self.governor,
+            identity,
+            ledger,
+            record,
+            scope_id,
+            proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+        .map_err(DaemonError::Composition)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok(receipt)
+    }
+
+    /// Commits one ledger-sequenced agent-feedback record through the
+    /// canonical Governor experience-commit caller. Same refresh/stale
+    /// rule as [`Self::commit_experience_bank_record`].
+    pub async fn commit_experience_feedback_record(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        ledger: &eliot_observation::bank_admission::ExperienceRevisionLedger,
+        record: &eliot_observation_contracts::AgentFeedbackRecord,
+        scope_id: eliot_store_api::ScopeId,
+        proof_refs: Vec<String>,
+        expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        let receipt = eliot_governor::commit_experience_feedback(
+            &self.governor,
+            identity,
+            ledger,
+            record,
+            scope_id,
+            proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+        .map_err(DaemonError::Composition)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok(receipt)
+    }
     /// Submits one candidate finish through the Governor owner, commits the
     /// derived decision through the canonical `RecordFinishDecision` path,
     /// and rehydrates the daemon projection before returning the decision
