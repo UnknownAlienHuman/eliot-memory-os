@@ -21,9 +21,10 @@ pub use break_glass::{
     BreakGlassAuthorization, BreakGlassAuthorizationId, BreakGlassPermit, BreakGlassState,
 };
 pub use effects::{
-    ActionContract, AuthorizedEffect, AuthorizedEffectRecoveryRecord,
-    EFFECT_AUTHORIZER_RECOVERY_SCHEMA, EFFECT_AUTHORIZER_RECOVERY_VERSION, EffectAuthorizer,
-    EffectAuthorizerRecoverySnapshot, EffectOutcome, EffectReceipt, ProposedEffect,
+    ActionContract, AuthorizedEffect, AuthorizedEffectRecoveryRecord, ContestedEffectAnnotation,
+    DependentEffectState, EFFECT_AUTHORIZER_RECOVERY_SCHEMA, EFFECT_AUTHORIZER_RECOVERY_VERSION,
+    EffectAuthorizer, EffectAuthorizerRecoverySnapshot, EffectOutcome, EffectReceipt,
+    ProposedEffect,
 };
 pub use grants::{
     AuthoritySet, CapabilityGrant, CapabilityIntroduction, EffectiveCapabilityPath,

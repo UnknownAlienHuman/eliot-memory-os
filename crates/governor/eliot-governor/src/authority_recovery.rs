@@ -24,6 +24,7 @@ use eliot_receipts::AuthorityBinding;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Versioned semantic owner payload retained by Governor recovery.
 pub const AUTHORITY_OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.authority-owner.v1";
@@ -194,8 +195,19 @@ impl AuthorityOwner {
             Some(evidence),
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let effects = EffectAuthorizer::from_snapshot(snapshot.effect_authorizer.clone())
+        let mut effects = EffectAuthorizer::from_snapshot(snapshot.effect_authorizer.clone())
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        // I12.20: revoked lineage must not reactivate through restored
+        // pending effects. Every history-suppressed grant (and its
+        // suppressing closure) is a revoked root: current dependent
+        // justifications/plans/pending effects are contested/reopened while
+        // restored history stays immutable.
+        let revoked_roots: BTreeSet<String> = outcome
+            .suppressed
+            .iter()
+            .flat_map(|suppressed| [suppressed.grant_id.clone(), suppressed.closure_id.clone()])
+            .collect();
+        effects.contest_dependent_effects(&revoked_roots);
         Ok(AuthorityRestoreOutcome {
             owner: Self {
                 state_fence: snapshot.state_fence.clone(),
