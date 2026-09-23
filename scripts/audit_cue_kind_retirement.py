@@ -37,6 +37,7 @@ call). No network, no brief edits, no verdict files.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import os
 import re
@@ -70,17 +71,37 @@ LEGACY_ONLY_SPELLINGS = ("path", "error", "command", "service", "problem")
 
 
 def read_text(relative: str) -> str:
-    return (ROOT / relative).read_text(encoding="utf-8")
+    return _read_bytes_cached(relative).decode("utf-8")
 
 
 def file_sha256(relative: str) -> str:
-    return sha256((ROOT / relative).read_bytes()).hexdigest()
+    return sha256(_read_bytes_cached(relative)).hexdigest()
+
+
+# ---- per-process memoization of the pure scan layer (issue #835 repair) ----
+#
+# Every cached function below is a pure function of working-tree bytes. The
+# cache keeps the 28-case coordinator denominator (evaluated in both the
+# parent suite and the owned gate child) inside the declared wall bound
+# without changing any verdict: the accepted gate snapshots protected source
+# before and after execution and fails closed on any mutation
+# (compare_snapshots in run_accepted_gate), so a mid-run source change
+# invalidates the run instead of being masked by this cache. Live git state
+# (git_diff_names, protected_snapshot) is deliberately NOT cached.
+@functools.lru_cache(maxsize=None)
+def _read_bytes_cached(relative: str) -> bytes:
+    return (ROOT / relative).read_bytes()
 
 
 SCAN_ROOTS = ("crates", "bins", "apps", "workers", "workspace")
 
 
 def iter_rs_files() -> list[str]:
+    return list(_iter_rs_files_cached())
+
+
+@functools.lru_cache(maxsize=None)
+def _iter_rs_files_cached() -> tuple[str, ...]:
     out: list[str] = []
     for root in SCAN_ROOTS:
         candidate = ROOT / root
@@ -88,17 +109,21 @@ def iter_rs_files() -> list[str]:
             continue
         for path in sorted(candidate.rglob("*.rs")):
             out.append(path.relative_to(ROOT).as_posix())
-    return out
+    return tuple(out)
 
 
 def candidate_files(needle: str) -> list[str]:
     """Raw-substring prefilter (C speed); only these are stripped/scanned."""
+    return list(_candidate_files_cached(needle))
+
+
+@functools.lru_cache(maxsize=None)
+def _candidate_files_cached(needle: str) -> tuple[str, ...]:
     out: list[str] = []
-    for rel in iter_rs_files():
-        text = read_text(rel)
-        if needle in text:
+    for rel in _iter_rs_files_cached():
+        if needle in _read_bytes_cached(rel).decode("utf-8"):
             out.append(rel)
-    return out
+    return tuple(out)
 
 
 def _consume_block_comment(data: bytes, index: int, out: list[str]) -> int:
@@ -243,8 +268,22 @@ def _strip_core(text: str) -> tuple[str, bool]:
 
 
 def strip_rust(text: str) -> str:
-    stripped, _ = _strip_core(text)
+    stripped, _ = _strip_core_cached(text)
     return stripped
+
+
+@functools.lru_cache(maxsize=None)
+def _strip_core_cached(text: str) -> tuple[str, bool]:
+    """Cached faithful port of the accepted stripper (single canonical copy).
+
+    The module retains exactly one `_consume_char_or_lifetime` definition:
+    it mirrors the accepted Rust oracle byte for byte, including the
+    double-quote character literal (`'"'`) fix that keeps a stray quote from
+    opening phantom string state. A second divergent copy previously shadowed
+    it; removal restores the documented faithful-port behavior with no
+    detector-semantics change.
+    """
+    return _strip_core(text)
 
 
 def _raw_prefix_len(rest: bytes) -> int | None:
@@ -256,32 +295,6 @@ def _raw_prefix_len(rest: bytes) -> int | None:
     if 1 + hashes < len(rest) and rest[1 + hashes] == 0x22:
         return hashes
     return None
-
-
-def _consume_char_or_lifetime(data: bytes, index: int, out: list[str]) -> int:
-    size = len(data)
-    out.append(" ")
-    index += 1
-    if index < size and data[index] == 0x5C:
-        out.append(" ")
-        index += 2
-        if index < size and data[index] == 0x27:
-            out.append(" ")
-            index += 1
-        return index
-    while index < size and data[index] != 0x0A and data[index] != 0x27:
-        if data[index] == 0x5C:
-            out.append(" ")
-            index += 2
-        else:
-            out.append(" " if data[index] != 0x3B else " ")
-            index += 1
-    if index < size and data[index] == 0x27:
-        nxt = index + 1
-        if nxt >= size or not (chr(data[nxt]).isalnum() or data[nxt] == 0x5F):
-            out.append(" ")
-            return nxt
-    return index
 
 
 def _is_ident(cell: str) -> bool:
@@ -603,7 +616,7 @@ class ScanVerdict:
 
 def lexical_closure(text: str) -> list[str]:
     """Unclosed lexical states at end of input (else [])."""
-    _, unclosed = _strip_core(text)
+    _, unclosed = _strip_core_cached(text)
     return [INCOMPLETE_UNCLOSED] if unclosed else []
 
 def scan_file_status(relative: str) -> tuple[str, str]:
@@ -637,6 +650,11 @@ def include_targets(relative: str) -> list[str]:
 
 def unknown_root_kind_files() -> list[str]:
     """`.rs` files outside SCAN_ROOTS carrying kind tokens (else [])."""
+    return list(_unknown_root_kind_files_cached())
+
+
+@functools.lru_cache(maxsize=None)
+def _unknown_root_kind_files_cached() -> tuple[str, ...]:
     roots = set(SCAN_ROOTS)
     out: list[str] = []
     for path in sorted(ROOT.rglob("*.rs")):
@@ -649,7 +667,7 @@ def unknown_root_kind_files() -> list[str]:
             continue
         if "CueKind" in text:
             out.append(rel)
-    return out
+    return tuple(out)
 
 
 def denominator_status() -> ScanVerdict:
