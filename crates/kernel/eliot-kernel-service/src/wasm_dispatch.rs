@@ -1611,7 +1611,7 @@ mod tests {
     /// R1 join vector: fixed claim + registry values produce a stable
     /// owner-side gate. The A3 child lane asserts the identical
     /// invocation digest from the same admitted values
-    /// (`bins/eliot-wasm-host/src/dispatch_authority.rs`, join issuance
+    /// (`bins/eliot-wasm-host/src/parent_authority.rs`, join issuance
     /// pin); agreement is the join interop proof — the owner-published
     /// join closes if and only if the child re-derives these values. The
     /// exact-literal pin lands at that integration with test execution;
