@@ -1,0 +1,116 @@
+{
+  "contract_version": {
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  },
+  "operation": {
+    "operation_id": "op-950-1",
+    "idempotency_key": "idem-950-1",
+    "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "source": {
+    "installation_id": "install-950-1",
+    "store_id": "store-950-1",
+    "schema": "eliot.storage.snapshot.v1",
+    "generation": 1
+  },
+  "scope": {
+    "scope_id": "scope-950-1",
+    "revision_heads": [
+      {
+        "key": "scope-950-1",
+        "revision": 9,
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        }
+      }
+    ],
+    "ordering_heads": [
+      {
+        "scope": "order-950-1",
+        "sequence": 4,
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        }
+      }
+    ],
+    "state_fence": {
+      "authority_epoch": {
+        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 1
+      },
+      "resource_generation": 1,
+      "task_revision": null,
+      "policy_revision": null,
+      "integration_revision": null
+    }
+  },
+  "event_interval": {
+    "first_sequence": 101,
+    "last_sequence": 140
+  },
+  "denominator": {
+    "members": [
+      {
+        "member_id": "member-950-1",
+        "member_type": "RECORD",
+        "content_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "residency": {
+          "domain": "INLINE_CANONICAL",
+          "residency_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "byte_count": 1024
+        },
+        "reference_digest": null
+      },
+      {
+        "member_id": "member-950-2",
+        "member_type": "BLOB",
+        "content_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "residency": {
+          "domain": "CONTENT_BLOB",
+          "residency_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "byte_count": 2048
+        },
+        "reference_digest": null
+      },
+      {
+        "member_id": "member-950-3",
+        "member_type": "REFERENCE",
+        "content_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "residency": {
+          "domain": "EXTERNAL_REFERENCE",
+          "residency_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+          "byte_count": 64
+        },
+        "reference_digest": "2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    ],
+    "is_complete": true
+  },
+  "bounds": {
+    "max_members": 512,
+    "max_bytes": 8388608,
+    "max_pages": 64,
+    "max_work": 100000,
+    "max_duration_ms": 60000
+  },
+  "expires_at_unix_ms": 1893456000000,
+  "privacy_proof_refs": [
+    "proof-950-1"
+  ]
+}

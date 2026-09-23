@@ -1,0 +1,16 @@
+{
+  "note": "backup-io redaction probe: digests only, no payload or secrets",
+  "digests": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ],
+  "member_ids": [
+    "member-950-1"
+  ],
+  "free_of": [
+    "password",
+    "secret",
+    "credential",
+    "private_key"
+  ]
+}

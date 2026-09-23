@@ -1,0 +1,10 @@
+{
+  "max_members": 512,
+  "max_bytes": 8388608,
+  "max_pages": 64,
+  "max_work": 100000,
+  "max_duration_ms": 60000,
+  "denominator_members": 3,
+  "denominator_bytes": 3136,
+  "pages_used": 1
+}

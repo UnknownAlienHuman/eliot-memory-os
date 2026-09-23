@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod backup_io;
 mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
@@ -42,6 +43,23 @@ mod store_failure;
 mod user_automation_state;
 mod wire;
 pub mod write_admission;
+
+pub use backup_io::{
+    ALL_BACKUP_IO_CAPABILITIES, BACKUP_IO_CAPABILITY_COHERENT_SNAPSHOT,
+    BACKUP_IO_CAPABILITY_ISOLATED_RESTORE, BACKUP_IO_CAPABILITY_OPERATION_RECONCILIATION,
+    BACKUP_IO_CAPABILITY_PURGE_VALIDATION, BACKUP_IO_CAPABILITY_REBUILD_VALIDATION,
+    BACKUP_IO_CAPABILITY_REFERENCE_VALIDATION, BACKUP_IO_CONTRACT_NAME,
+    BACKUP_IO_RESTORE_SCHEMA_V1, BACKUP_IO_SNAPSHOT_SCHEMA_V1, BackupIoCapability,
+    BackupOperationReconciliation, BlobResidency, BlobResidencyDomain, CanonicalRestoreBatch,
+    CanonicalSnapshotPort, DestinationClass, EventInterval, IsolatedDestination,
+    IsolatedRestorePort, IsolationEvidence, MAX_DENOMINATOR_REFERENCES, MAX_PROOF_HANDLES,
+    MAX_RESTORE_MEMBERS, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS, MAX_SNAPSHOT_PAGE_MEMBERS,
+    MAX_SNAPSHOT_PAGES, ReconciliationOutcome, RestoreConflictKind, RestoreValidationReceipt,
+    SnapshotBeginRequest, SnapshotBounds, SnapshotCompleteness, SnapshotCursor,
+    SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType,
+    SnapshotPage, SnapshotSourceIdentity, SnapshotValidationReceipt, classify_restore_conflict,
+    is_backup_io_capability, reconcile_same_operation,
+};
 
 pub use dreamer_job::{
     DREAMER_JOB_LEDGER_SCHEMA, DreamerJobExpectedState, DreamerJobLedgerEvent,

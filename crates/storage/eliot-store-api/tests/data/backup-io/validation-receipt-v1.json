@@ -1,0 +1,55 @@
+{
+  "operation": {
+    "operation_id": "op-950-1",
+    "idempotency_key": "idem-950-1",
+    "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "handle": {
+    "consistency_point": "consistency-950-1",
+    "snapshot_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "operation_id": "op-950-1",
+    "idempotency_key": "idem-950-1"
+  },
+  "denominator": {
+    "members": [
+      {
+        "member_id": "member-950-1",
+        "member_type": "RECORD",
+        "content_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "residency": {
+          "domain": "INLINE_CANONICAL",
+          "residency_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "byte_count": 1024
+        },
+        "reference_digest": null
+      },
+      {
+        "member_id": "member-950-2",
+        "member_type": "BLOB",
+        "content_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "residency": {
+          "domain": "CONTENT_BLOB",
+          "residency_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "byte_count": 2048
+        },
+        "reference_digest": null
+      },
+      {
+        "member_id": "member-950-3",
+        "member_type": "REFERENCE",
+        "content_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "residency": {
+          "domain": "EXTERNAL_REFERENCE",
+          "residency_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+          "byte_count": 64
+        },
+        "reference_digest": "2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    ],
+    "is_complete": true
+  },
+  "resolved_members": 3,
+  "unresolved_members": 0,
+  "completeness": "COMPLETE",
+  "disposition": "COMMITTED"
+}
