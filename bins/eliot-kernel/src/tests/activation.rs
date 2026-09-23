@@ -1274,10 +1274,262 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
         .submit_agent_activation_resolution_result(changed)
         .expect_err("raw changed replay after restart must conflict");
     assert!(
-        matches!(raw_conflict, TransportError::IdentityConflict),
+        matches!(&raw_conflict, TransportError::IdentityConflict),
         "unexpected raw changed replay error: {raw_conflict:?}"
     );
 
     drop(kernel);
     let _ = std::fs::remove_dir_all(retained_root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_result_cross_shape_conflicts_fail_closed_in_both_submission_orders() {
+    use eliot_protocol::{
+        AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+        AgentActivationResultAckOutcome, AgentActivationResultSubmit,
+    };
+
+    // Canonical v2 wins first. The raw P-04 compatibility leg may replay the
+    // exact result, but a changed result must fail before either ledger changes.
+    let (canonical_root, canonical_kernel, canonical_ticket) =
+        activation_kernel_with_live_bridge_ticket("cross-shape-canonical-first-1115");
+    let canonical_at = unix_ms();
+    let canonical_winner = activation_v2_failed(&canonical_ticket, canonical_at);
+    let raw_changed = AgentActivationResolutionResult::new(
+        &canonical_ticket,
+        canonical_at,
+        AgentActivationResolutionDisposition::FailedInternal {
+            failure_handle: "raw-cross-shape-conflict".to_owned(),
+        },
+    )
+    .expect("changed raw result");
+    let canonical_ack = canonical_kernel
+        .submit_agent_activation_result(
+            AgentActivationResultSubmit::new(canonical_winner.clone())
+                .expect("canonical result submit"),
+        )
+        .expect("canonical submit wins");
+    assert_eq!(
+        canonical_ack.outcome,
+        AgentActivationResultAckOutcome::Accepted
+    );
+    assert_eq!(canonical_ack.result, Some(canonical_winner.clone()));
+    canonical_kernel
+        .submit_agent_activation_resolution_result(canonical_winner.clone())
+        .expect("raw exact replay is idempotent");
+    let raw_conflict = canonical_kernel
+        .submit_agent_activation_resolution_result(raw_changed)
+        .expect_err("changed raw payload under the retained ticket must conflict");
+    assert!(
+        matches!(&raw_conflict, TransportError::IdentityConflict),
+        "unexpected canonical-first conflict: {raw_conflict:?}"
+    );
+    {
+        let pending = canonical_kernel
+            .agent_activation_pending
+            .lock()
+            .expect("canonical-first pending lock");
+        let raw = canonical_kernel
+            .agent_activation_results
+            .lock()
+            .expect("canonical-first raw ledger lock");
+        assert_eq!(
+            pending
+                .results
+                .get(&canonical_ticket.ticket_id)
+                .map(|record| &record.result),
+            Some(&canonical_winner),
+            "the canonical winner remains unchanged"
+        );
+        assert_eq!(
+            raw.get(&canonical_ticket.ticket_id)
+                .map(|record| &record.result),
+            Some(&canonical_winner),
+            "the raw ledger mirrors the canonical winner"
+        );
+    }
+    drop(canonical_kernel);
+    let _ = std::fs::remove_dir_all(canonical_root);
+
+    // Raw P-04 wins first. Canonical v2 sees that retained identity, replays
+    // it exactly, and rejects a different payload without creating a v2 row.
+    let (raw_root, raw_kernel, raw_ticket) =
+        activation_kernel_with_live_bridge_ticket("cross-shape-raw-first-1115");
+    let raw_at = unix_ms();
+    let raw_winner = activation_v2_failed(&raw_ticket, raw_at);
+    let canonical_changed = AgentActivationResolutionResult::new(
+        &raw_ticket,
+        raw_at,
+        AgentActivationResolutionDisposition::FailedInternal {
+            failure_handle: "canonical-cross-shape-conflict".to_owned(),
+        },
+    )
+    .expect("changed canonical result");
+    raw_kernel
+        .submit_agent_activation_resolution_result(raw_winner.clone())
+        .expect("raw submit wins");
+    let canonical_replay = raw_kernel
+        .submit_agent_activation_result(
+            AgentActivationResultSubmit::new(raw_winner.clone())
+                .expect("canonical exact replay submit"),
+        )
+        .expect("canonical leg replays the raw winner");
+    assert_eq!(
+        canonical_replay.outcome,
+        AgentActivationResultAckOutcome::ExactReplay
+    );
+    assert_eq!(canonical_replay.result, Some(raw_winner.clone()));
+    let canonical_conflict = raw_kernel
+        .submit_agent_activation_result(
+            AgentActivationResultSubmit::new(canonical_changed).expect("changed canonical submit"),
+        )
+        .expect_err("changed canonical payload under the retained ticket must conflict");
+    assert!(
+        matches!(&canonical_conflict, TransportError::IdentityConflict),
+        "unexpected raw-first conflict: {canonical_conflict:?}"
+    );
+    {
+        let pending = raw_kernel
+            .agent_activation_pending
+            .lock()
+            .expect("raw-first pending lock");
+        let raw = raw_kernel
+            .agent_activation_results
+            .lock()
+            .expect("raw-first ledger lock");
+        assert!(
+            !pending.results.contains_key(&raw_ticket.ticket_id),
+            "a rejected canonical payload must not create a canonical ledger row"
+        );
+        assert_eq!(
+            raw.get(&raw_ticket.ticket_id).map(|record| &record.result),
+            Some(&raw_winner),
+            "the raw winner remains unchanged"
+        );
+    }
+    drop(raw_kernel);
+    let _ = std::fs::remove_dir_all(raw_root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_result_cross_shape_concurrent_conflict_has_one_durable_winner() {
+    use eliot_protocol::{
+        AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+        AgentActivationResultAckOutcome, AgentActivationResultSubmit,
+    };
+    use std::sync::{Arc, Barrier};
+
+    let (root, kernel, ticket) =
+        activation_kernel_with_live_bridge_ticket("cross-shape-concurrent-1115");
+    let submitted_at = unix_ms();
+    let canonical_result = AgentActivationResolutionResult::new(
+        &ticket,
+        submitted_at,
+        AgentActivationResolutionDisposition::FailedInternal {
+            failure_handle: "canonical-race-result".to_owned(),
+        },
+    )
+    .expect("canonical race result");
+    let raw_result = AgentActivationResolutionResult::new(
+        &ticket,
+        submitted_at,
+        AgentActivationResolutionDisposition::FailedInternal {
+            failure_handle: "raw-race-result".to_owned(),
+        },
+    )
+    .expect("raw race result");
+    let canonical_submit =
+        AgentActivationResultSubmit::new(canonical_result.clone()).expect("canonical race submit");
+    let kernel = Arc::new(kernel);
+    let start = Arc::new(Barrier::new(3));
+
+    let canonical_kernel = Arc::clone(&kernel);
+    let canonical_start = Arc::clone(&start);
+    let canonical_join = std::thread::spawn(move || {
+        canonical_start.wait();
+        canonical_kernel.submit_agent_activation_result(canonical_submit)
+    });
+
+    let raw_kernel = Arc::clone(&kernel);
+    let raw_start = Arc::clone(&start);
+    let raw_race_result = raw_result.clone();
+    let raw_join = std::thread::spawn(move || {
+        raw_start.wait();
+        raw_kernel.submit_agent_activation_resolution_result(raw_race_result)
+    });
+
+    start.wait();
+    let canonical_outcome = canonical_join.join().expect("canonical submit thread");
+    let raw_outcome = raw_join.join().expect("raw submit thread");
+    let canonical_won = canonical_outcome.is_ok();
+    let raw_won = raw_outcome.is_ok();
+    assert_ne!(
+        canonical_won, raw_won,
+        "one same-ticket result must win and the other must conflict"
+    );
+    if canonical_won {
+        let acknowledgement = canonical_outcome.expect("canonical winner ack");
+        assert_eq!(
+            acknowledgement.outcome,
+            AgentActivationResultAckOutcome::Accepted
+        );
+        assert_eq!(acknowledgement.result, Some(canonical_result.clone()));
+        assert!(
+            matches!(&raw_outcome, Err(TransportError::IdentityConflict)),
+            "the raw loser must fail with IdentityConflict: {raw_outcome:?}"
+        );
+    } else {
+        assert!(
+            matches!(&canonical_outcome, Err(TransportError::IdentityConflict)),
+            "the canonical loser must fail with IdentityConflict: {canonical_outcome:?}"
+        );
+        raw_outcome.expect("raw winner");
+    }
+
+    let winner = if canonical_won {
+        canonical_result.clone()
+    } else {
+        raw_result.clone()
+    };
+    {
+        let pending = kernel
+            .agent_activation_pending
+            .lock()
+            .expect("race pending lock");
+        let raw = kernel
+            .agent_activation_results
+            .lock()
+            .expect("race raw ledger lock");
+        assert_eq!(
+            raw.get(&ticket.ticket_id).map(|record| &record.result),
+            Some(&winner),
+            "the durable/raw winner is the only retained raw identity"
+        );
+        assert_eq!(
+            pending
+                .results
+                .get(&ticket.ticket_id)
+                .map(|record| &record.result),
+            canonical_won.then_some(&canonical_result),
+            "only a canonical winner may publish the canonical-v2 row"
+        );
+    }
+
+    drop(kernel);
+    let restarted = KernelComposition::new(KernelConfig::new(&root))
+        .expect("restart after concurrent cross-shape submit");
+    let retained = restarted
+        .agent_activation_results
+        .lock()
+        .expect("restarted raw ledger lock");
+    assert_eq!(
+        retained.get(&ticket.ticket_id).map(|record| &record.result),
+        Some(&winner),
+        "restart preserves the single race winner"
+    );
+    drop(retained);
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(root);
 }
