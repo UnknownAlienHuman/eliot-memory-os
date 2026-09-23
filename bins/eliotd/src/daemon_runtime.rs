@@ -812,17 +812,21 @@ async fn run_loop(
                             }
                             // O1 experience audit scheduling (issue #223,
                             // B-terminal): one evaluation per activation
-                            // completion over live fence currency plus the
-                            // exact missing audit inputs. The B-consumer
-                            // entry (run_experience_quality_event) is
-                            // branch-only and not authorized for import, so
-                            // no call is wired yet; this evaluation runs
-                            // live (reads fences, reports pending) and
-                            // never fails the activation loop.
+                            // completion over the audit request context
+                            // plus an explicit admitted event bundle. The
+                            // bundle arrives over owner-issued suppliers;
+                            // until one exists the evaluation idles as
+                            // Pending with exact owners. Admitted bundles
+                            // run the B-consumer entry with output
+                            // projected observably. Evaluation outcomes
+                            // never fail this activation loop.
                             match eliotd::experience_audit::evaluate_experience_audit(
-                                kernel.as_ref(),
+                                &kernel,
                                 composition.as_ref(),
-                            ) {
+                                None,
+                            )
+                            .await
+                            {
                                 eliotd::experience_audit::ExperienceAuditOutcome::Failed(
                                     error,
                                 ) => {
@@ -833,7 +837,8 @@ async fn run_loop(
                                     )
                                     .emit();
                                 }
-                                eliotd::experience_audit::ExperienceAuditOutcome::Pending {
+                                eliotd::experience_audit::ExperienceAuditOutcome::Completed
+                                | eliotd::experience_audit::ExperienceAuditOutcome::Pending {
                                     ..
                                 } => {}
                             }

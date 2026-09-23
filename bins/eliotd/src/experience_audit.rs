@@ -2,41 +2,30 @@
 //! missing audit inputs, evaluated per activation completion (issue #223,
 //! B-terminal lane).
 //!
-//! Division (root-serialized, B-consumer lane owns the producer side): the
-//! B consumer owns `experience_runtime` plus actual quality invocation
-//! (`produce_self_quality`, validated views, `run_experience_quality_event`
-//! at approved work/223-integration-candidate @22f57172 — branch-only,
-//! never imported here); O1 owns this scheduling entrypoint. This module
+//! Division: `experience_runtime` is the in-candidate B-owned thin driver
+//! over the real owner modules (range planning, range consume,
+//! retention-gated shaping, assess plus recheck); O1 owns this scheduling
+//! entrypoint plus its trigger application. This module
 //! therefore evaluates only what O1 owns with live types: the audit
 //! request context it can genuinely bind (live fence agreement, live
 //! session when the handshake holds one, validated metadata), then the
 //! exact missing-input inventory. It builds no event, synthesizes no
 //! scope, subject, records, schedule, receipts, or handles, duplicates no
-//! B-owned type, holds no supplier state, and invents no Session or
-//! authority. When B's entry is authorized for import, the arm below grows
-//! the real call; until then every evaluation reports
+//! owner type, holds no supplier state, and invents no Session or
+//! authority. Without a supplied bundle every evaluation reports
 //! [`Pending`](ExperienceAuditOutcome::Pending) with exact owners — never
 //! fabricated, never defaulted into delivery.
 //!
-//! Proposed registration hunk (exact shape, NOT applied — B module absent
-//! in-candidate, import unauthorized):
-//!
-//! ```text
-//! use eliotd::experience_runtime::run_experience_quality_event; // B-owned
-//! match run_experience_quality_event(composition, kernel, &ctx, &event).await {
-//!     Ok(output) => project candidate + validated views + gap postures,
-//!     Err(error) => record with identities preserved, loop never fails,
-//! }
-//! ```
-//!
-//! with `ctx`: `RequestMetadata` bound to the live fence (session/task from
-//! live activation bindings, product/source `SERVICE_NAME`, validated);
-//! `event`: `ExperienceQualityEvent` assembled from owner-issued inputs
-//! only (assessment identity minted per run as caller correlation;
-//! scopes, subjects, records, schedule, holds, receipts, and handles from
-//! their owners, never synthesized). Failures record with identities
-//! preserved and never fail the activation loop that hosts this
+//! Proposed registration hunk (exact shape, applied): the arm below passes
+//! an explicit admitted bundle (None until the onboarding/transport
+//! suppliers deliver one) into the evaluated call
+//! `eliotd::experience_runtime::run_experience_quality_event(composition,
+//! kernel, &ctx, &event)`, with `ctx` from [`audit_request_context`] and
+//! the event assembled from owner-issued inputs only. Failures record with
+//! identities preserved and never fail the activation loop that hosts this
 //! evaluation.
+
+use std::sync::Arc;
 
 use eliot_contracts::{
     ClockReading, ProductId, RequestId, RequestMetadata, SourceId, fences_match_exact,
@@ -46,15 +35,18 @@ use crate::attempt_execution_chain::{
     ExecutionChainError, MissingOwner, supply_governor_fence, supply_live_kernel_fence,
     supply_owner_session,
 };
+use crate::experience_runtime::{ExperienceQualityEvent, run_experience_quality_event};
 use crate::{DaemonComposition, DaemonKernelClient};
 
-/// Outcome of one experience audit scheduling evaluation: pended with the
-/// exact missing inputs, or failed on live fence disagreement with the
-/// fence preserved. Debug-only: the `Failed` payload carries owner errors
-/// without clone/equality semantics. No `Ready` variant exists yet: nothing
-/// can deliver until the B-consumer entry and its inputs land.
+/// Outcome of one experience audit scheduling evaluation: completed with a
+/// reviewed candidate, pended with the exact missing inputs, or failed on
+/// live fence disagreement with the fence preserved. Debug-only: the
+/// `Failed` payload carries owner errors without clone/equality semantics.
 #[derive(Debug)]
 pub enum ExperienceAuditOutcome {
+    /// The admitted event ran to a reviewed candidate with validated views
+    /// and gap postures, projected observably below.
+    Completed,
     /// No audit: the exact inputs absent at evaluation time, in
     /// deterministic input order. Normal idle, never an error.
     Pending {
@@ -119,14 +111,18 @@ pub fn audit_request_context(
 ///
 /// Binds the audit request context first (fence currency, session when
 /// held, validated metadata — a corrupt context fails closed with its
-/// exact error instead of evaluating against stale bindings), then reports
-/// every audit input missing with its exact owner: nothing on this path
-/// exists live in-candidate, and this evaluation fabricates none of it.
-/// Deterministic and side-effect free except for the live owner reads;
-/// mutates nothing.
-pub fn evaluate_experience_audit(
-    kernel: &DaemonKernelClient,
+/// exact error instead of evaluating against stale bindings), then either
+/// runs an explicitly supplied admitted event bundle through the B-consumer
+/// entry or reports every audit input missing with its exact owner.
+/// Nothing on the admitted-event path exists live in-candidate, and this
+/// evaluation fabricates none of it: an absent bundle idles as pending,
+/// never a defaulted delivery. Deterministic and side-effect free except
+/// for the live owner reads plus, on a supplied bundle, the B entry's own
+/// bridge reads; mutates nothing.
+pub async fn evaluate_experience_audit(
+    kernel: &Arc<DaemonKernelClient>,
     composition: &DaemonComposition,
+    event: Option<&ExperienceQualityEvent<'_>>,
 ) -> ExperienceAuditOutcome {
     let _span = tracing::info_span!("eliotd.experience_audit_poll").entered();
     let context = match audit_request_context(kernel, composition) {
@@ -176,8 +172,8 @@ pub fn evaluate_experience_audit(
         },
         MissingOwner {
             owner: "B-consumer entry",
-            artifact: "run_experience_quality_event invocation",
-            absent_read: "B-consumer entry not reconciled in-candidate (approved work/223-integration-candidate @22f57172, single terminal seam); import not authorized, trigger application stays O1",
+            artifact: "ExperienceQualityEvent bundle",
+            absent_read: "no admitted event bundle assembled; the run_experience_quality_event entry is live in-candidate and the trigger passes an explicit bundle (None today), never a defaulted one",
         },
         MissingOwner {
             owner: "store audit handler",
@@ -190,5 +186,37 @@ pub fn evaluate_experience_audit(
         fence_generation = context.state_fence.resource_generation.value(),
         "experience audit pended: audit inputs absent"
     );
-    ExperienceAuditOutcome::Pending { missing }
+    let Some(event) = event else {
+        return ExperienceAuditOutcome::Pending { missing };
+    };
+    // Admitted bundle path: the B-consumer entry runs the full connected
+    // runtime (TRUE position read, optional journal leg, range-payload
+    // consume with digest re-proof, retention-gated shaping, assess plus
+    // recheck) and returns the frozen candidate with validated views and
+    // gap postures. Anything drifted, malformed, withheld-but-uncited, or
+    // missing fails closed inside the entry; nothing partial emits as
+    // complete and nothing persists. The output projects observably with
+    // bounded identities; failures record with identities preserved and
+    // never fail the activation loop.
+    match run_experience_quality_event(composition, kernel, &context, event).await {
+        Ok(output) => {
+            tracing::info!(
+                assessment = %crate::diagnostics::sanitize_identity(
+                    output.candidate.assessment_id.as_str()
+                ),
+                candidate_digest = %output.candidate.digest,
+                journal_present = output.journal_view.is_some(),
+                bank_withheld = output.bank_withheld.len(),
+                feedback_withheld = output.feedback_withheld.len(),
+                "experience audit completed with reviewed candidate",
+            );
+            ExperienceAuditOutcome::Completed
+        }
+        Err(error) => {
+            ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                owner: "experience driver",
+                reason: error.to_string(),
+            })
+        }
+    }
 }
