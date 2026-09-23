@@ -37,7 +37,7 @@ use eliot_protocol::{
 use eliot_store_api::{
     CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
-    RecoveryRecordKey, RequestMeta,
+    RecoveryRecord, RecoveryRecordKey, RequestMeta,
     RevisionHeadExpectation, StoreError, StoreGenesisRequest, StoreRecoveryRequest,
     StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
 };
@@ -1337,10 +1337,17 @@ impl KernelComposition {
                 UserAutomationRuntimeError::IdentityConflict,
             ));
         }
-        let policy_snapshot = match self
-            .read_user_automation_policy_snapshot(&lookup.state_fence)
+        let preflight_owner_snapshot = match self
+            .read_user_automation_preflight_owner_snapshot(&lookup.state_fence)
             .await
         {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        let policy_snapshot = match Self::user_automation_policy_snapshot_from_recovery(
+            &preflight_owner_snapshot,
+            &lookup.state_fence,
+        ) {
             Ok(snapshot) => snapshot,
             Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
         };
@@ -1395,14 +1402,23 @@ impl KernelComposition {
             )
             .await
             .map_err(|_| TransportError::SessionFenced)?;
-        let policy_snapshot_after = match self
-            .read_user_automation_policy_snapshot(&lookup.state_fence)
+        let preflight_owner_snapshot_after = match self
+            .read_user_automation_preflight_owner_snapshot(&lookup.state_fence)
             .await
         {
             Ok(snapshot) => snapshot,
             Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
         };
-        if policy_snapshot_after != policy_snapshot {
+        let policy_snapshot_after = match Self::user_automation_policy_snapshot_from_recovery(
+            &preflight_owner_snapshot_after,
+            &lookup.state_fence,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+        };
+        if preflight_owner_snapshot_after != preflight_owner_snapshot
+            || policy_snapshot_after != policy_snapshot
+        {
             return Ok(Self::user_automation_runtime_error_response(
                 UserAutomationRuntimeError::IdentityConflict,
             ));
@@ -1421,6 +1437,16 @@ impl KernelComposition {
                 UserAutomationRuntimeError::IdentityConflict,
             ));
         }
+        let preflight_owner_readback_digest = match canonical_json_bytes(&preflight_owner_snapshot) {
+            Ok(bytes) => sha256_hex(&bytes),
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(format!(
+                        "canonical UserAutomation preflight readback encoding failed: {error}"
+                    )),
+                ));
+            }
+        };
         Ok(serde_json::json!({
             "status": "known",
             "value": {
@@ -1431,9 +1457,131 @@ impl KernelComposition {
                 "source_receipt": source_receipt,
                 "wake_readback": wake_readback,
                 "policy_snapshot": policy_snapshot,
+                "preflight_owner_readback_digest": preflight_owner_readback_digest,
             },
             "recovery": null,
         }))
+    }
+
+    #[cfg(windows)]
+    /// Reads the canonical owner and Durable Job inputs for one UserAutomation
+    /// preflight at a single Store State Fence. This remains a mechanical
+    /// Kernel join: payloads stay opaque, but Store record identity, schema,
+    /// canonical bytes, and any embedded fence must agree before the caller
+    /// can use the readback as preflight evidence.
+    async fn read_user_automation_preflight_owner_snapshot(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<StoreRecoverySnapshot, UserAutomationRuntimeError> {
+        state_fence
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let records = ["config", "policy", "task", "skill", "module_registry"]
+            .into_iter()
+            .map(|key| {
+                RecoveryRecordKey::new("owner", key).map_err(|error| {
+                    UserAutomationRuntimeError::Rejected(error.to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected_records = records.iter().cloned().collect::<BTreeSet<_>>();
+        let request = StoreRecoveryRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            state_fence: state_fence.clone(),
+            records,
+            include_receipts: false,
+            include_jobs: true,
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation preflight Store route is unavailable".to_owned(),
+            )
+        })?;
+        let recovery = gateway
+            .recovery(request)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        recovery
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let observed_records = recovery
+            .owner_records
+            .iter()
+            .map(RecoveryRecord::record_key)
+            .collect::<BTreeSet<_>>();
+        if recovery.state_fence != *state_fence
+            || recovery.canonical_scope.state_fence != *state_fence
+            || recovery.owner_records.len() != expected_records.len()
+            || observed_records != expected_records
+            || !recovery.receipts.is_empty()
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        for record in &recovery.owner_records {
+            Self::validate_user_automation_preflight_record(record, state_fence, true)?;
+        }
+        for record in &recovery.job_records {
+            Self::validate_user_automation_preflight_record(record, state_fence, false)?;
+        }
+        Ok(recovery)
+    }
+
+    #[cfg(windows)]
+    fn validate_user_automation_preflight_record(
+        record: &RecoveryRecord,
+        state_fence: &StateFence,
+        owner_record: bool,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        record
+            .validate()
+            .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+        if record.state_fence != *state_fence
+            || (owner_record && record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA)
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&record.payload).map_err(|_| {
+            UserAutomationRuntimeError::Rejected(
+                "canonical UserAutomation preflight owner payload is invalid JSON".to_owned(),
+            )
+        })?;
+        let canonical = canonical_json_bytes(&payload).map_err(|error| {
+            UserAutomationRuntimeError::Rejected(format!(
+                "canonical UserAutomation preflight owner encoding failed: {error}"
+            ))
+        })?;
+        if canonical != record.payload {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Self::validate_embedded_user_automation_fences(&payload, state_fence)
+    }
+
+    #[cfg(windows)]
+    fn validate_embedded_user_automation_fences(
+        value: &serde_json::Value,
+        expected: &StateFence,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    Self::validate_embedded_user_automation_fences(value, expected)?;
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                if let Some(fence_value) = fields.get("state_fence") {
+                    let observed: StateFence = serde_json::from_value(fence_value.clone())
+                        .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+                    if &observed != expected {
+                        return Err(UserAutomationRuntimeError::IdentityConflict);
+                    }
+                }
+                for value in fields.values() {
+                    Self::validate_embedded_user_automation_fences(value, expected)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -1449,37 +1597,26 @@ impl KernelComposition {
         eliot_kernel_core::user_automation::ConfigPolicySnapshot,
         UserAutomationRuntimeError,
     > {
-        let key = RecoveryRecordKey::new("owner", "policy")
-            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
-        let request = StoreRecoveryRequest {
-            contract_version: eliot_store_api::CONTRACT_VERSION,
-            state_fence: state_fence.clone(),
-            records: vec![key.clone()],
-            include_receipts: false,
-            include_jobs: false,
-        };
-        let gateway = self
-            .retained_store_gateway()
-            .map_err(|_| UserAutomationRuntimeError::Unavailable(
-                "canonical Policy owner Store route is unavailable".to_owned(),
-            ))?;
-        let recovery = gateway
-            .recovery(request)
-            .await
-            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        let recovery = self
+            .read_user_automation_preflight_owner_snapshot(state_fence)
+            .await?;
+        Self::user_automation_policy_snapshot_from_recovery(&recovery, state_fence)
+    }
+
+    #[cfg(windows)]
+    fn user_automation_policy_snapshot_from_recovery(
+        recovery: &StoreRecoverySnapshot,
+        state_fence: &StateFence,
+    ) -> Result<eliot_kernel_core::user_automation::ConfigPolicySnapshot, UserAutomationRuntimeError>
+    {
+        let record = recovery
+            .owner_records
+            .iter()
+            .find(|record| record.namespace == "owner" && record.key == "policy")
+            .ok_or(UserAutomationRuntimeError::IdentityConflict)?;
         if recovery.state_fence != *state_fence
-            || recovery.owner_records.len() != 1
-            || !recovery.job_records.is_empty()
-            || !recovery.receipts.is_empty()
-        {
-            return Err(UserAutomationRuntimeError::IdentityConflict);
-        }
-        let record = &recovery.owner_records[0];
-        if record.record_key() != key
             || record.state_fence != *state_fence
             || record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA
-            || record.revision == 0
-            || record.value_digest != sha256_hex(&record.payload)
         {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
