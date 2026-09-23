@@ -2574,6 +2574,10 @@ pub enum OrsError {
     #[error("native-worker claim {claim_id} conflicts with durable ORS state: IDENTITY_CONFLICT")]
     NativeWorkerClaimIdentityConflict { claim_id: String },
     #[error(
+        "native-worker registration {registration_id} conflicts with durable ORS state: IDENTITY_CONFLICT"
+    )]
+    NativeWorkerRegistrationIdentityConflict { registration_id: String },
+    #[error(
         "worker replay stream {stream_id} request {request_id} conflicts with durable ORS state: IDENTITY_CONFLICT"
     )]
     WorkerReplayIdentityConflict {
@@ -3320,6 +3324,183 @@ impl NativeWorkerClaimState {
                 )
         );
         legal.then_some(next).ok_or(OrsError::InvalidTransition)
+    }
+}
+
+/// Lifecycle state of a durable native-worker registration owner record.
+///
+/// A new registration for the same installation and worker generation
+/// supersedes the previous record in the same ORS transaction.  Expiry is
+/// evaluated by the Kernel owner at read time; it is not a silent state
+/// transition in this opaque store.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NativeWorkerRegistrationState {
+    Active,
+    Superseded,
+}
+
+/// Durable authenticated native-worker registration owner record.
+///
+/// The Kernel lifecycle route creates this record only after the authenticated
+/// registration shape, epoch/fence and future lease have been checked.  ORS
+/// stores the exact binding projection and a digest of the complete presented
+/// registration; it does not grant authority or interpret the worker.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerRegistrationRecord {
+    pub contract_version: u16,
+    pub registration_id: OperationIdentity,
+    pub installation_id: OpaqueLabel,
+    pub worker_generation: u64,
+    pub worker_artifact_digest: String,
+    pub worker_config_digest: String,
+    pub process_image_digest: String,
+    pub process_id: u64,
+    pub process_start_100ns: u64,
+    pub principal_ref: OpaqueLabel,
+    pub session_id: OpaqueLabel,
+    pub connection_id: OpaqueLabel,
+    pub authority_epoch: u64,
+    pub state_fence: StateFence,
+    pub lease_id: OpaqueLabel,
+    pub lease_expires_at_unix_ms: u64,
+    pub renewal_id: OpaqueLabel,
+    pub protocol_version: OpaqueLabel,
+    pub execution_unit_schema_version: u16,
+    /// Canonical digest over installation, artifact and configuration identity.
+    pub resource_envelope_digest: String,
+    /// Canonical digest over the complete authenticated registration payload.
+    pub registration_digest: String,
+    /// Canonical digest over the immutable registration/admission material.
+    /// Lease expiry and renewal identity are deliberately excluded so a
+    /// current owner can renew the same registration identity.
+    pub binding_digest: String,
+    /// ORS-owned registration revision. The first admission is revision one;
+    /// each accepted renewal advances this value atomically.
+    #[serde(default = "native_worker_registration_revision_default")]
+    pub revision: u64,
+    pub state: NativeWorkerRegistrationState,
+}
+
+fn native_worker_registration_revision_default() -> u64 {
+    1
+}
+
+impl NativeWorkerRegistrationRecord {
+    pub fn record_key(&self) -> String {
+        self.registration_id.as_str().to_owned()
+    }
+
+    /// Returns whether two records are the exact same replay, excluding the
+    /// ORS-owned revision and lifecycle state.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.same_owner_binding(other)
+            && self.lease_expires_at_unix_ms == other.lease_expires_at_unix_ms
+            && self.renewal_id == other.renewal_id
+            && self.registration_digest == other.registration_digest
+    }
+
+    /// Returns whether two records carry the same immutable owner/admission
+    /// material. Lease expiry, renewal identity, full request digest, revision
+    /// and lifecycle state are owner progression and are intentionally absent.
+    pub fn same_owner_binding(&self, other: &Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.registration_id == other.registration_id
+            && self.installation_id == other.installation_id
+            && self.worker_generation == other.worker_generation
+            && self.worker_artifact_digest == other.worker_artifact_digest
+            && self.worker_config_digest == other.worker_config_digest
+            && self.process_image_digest == other.process_image_digest
+            && self.process_id == other.process_id
+            && self.process_start_100ns == other.process_start_100ns
+            && self.principal_ref == other.principal_ref
+            && self.session_id == other.session_id
+            && self.connection_id == other.connection_id
+            && self.authority_epoch == other.authority_epoch
+            && self.state_fence == other.state_fence
+            && self.lease_id == other.lease_id
+            && self.protocol_version == other.protocol_version
+            && self.execution_unit_schema_version == other.execution_unit_schema_version
+            && self.resource_envelope_digest == other.resource_envelope_digest
+            && self.binding_digest == other.binding_digest
+    }
+
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        for (value, field) in [
+            (&self.registration_id, "native_worker_registration_id"),
+            (
+                &self.installation_id,
+                "native_worker_registration_installation_id",
+            ),
+            (
+                &self.principal_ref,
+                "native_worker_registration_principal_ref",
+            ),
+            (&self.session_id, "native_worker_registration_session_id"),
+            (
+                &self.connection_id,
+                "native_worker_registration_connection_id",
+            ),
+            (&self.lease_id, "native_worker_registration_lease_id"),
+            (&self.renewal_id, "native_worker_registration_renewal_id"),
+            (
+                &self.protocol_version,
+                "native_worker_registration_protocol_version",
+            ),
+        ] {
+            validate_text(value.as_str(), field)?;
+        }
+        for (value, field) in [
+            (
+                &self.worker_artifact_digest,
+                "native_worker_registration_artifact_digest",
+            ),
+            (
+                &self.worker_config_digest,
+                "native_worker_registration_config_digest",
+            ),
+            (
+                &self.process_image_digest,
+                "native_worker_registration_process_image_digest",
+            ),
+            (
+                &self.resource_envelope_digest,
+                "native_worker_registration_resource_digest",
+            ),
+            (
+                &self.registration_digest,
+                "native_worker_registration_digest",
+            ),
+            (
+                &self.binding_digest,
+                "native_worker_registration_binding_digest",
+            ),
+        ] {
+            validate_digest(value, field)?;
+        }
+        if self.worker_generation == 0
+            || self.process_id == 0
+            || self.process_start_100ns == 0
+            || self.lease_expires_at_unix_ms == 0
+            || self.revision == 0
+            || self.execution_unit_schema_version == 0
+        {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_registration_bounded_fields",
+                reason: "generation, process identity, lease expiry and schema must be non-zero",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| OrsError::FenceMismatch)?;
+        if self.authority_epoch != self.state_fence.authority_epoch.sequence.get() {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
     }
 }
 

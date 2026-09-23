@@ -32,11 +32,10 @@
 //!   [`NativeWorkerClaimRequest`] and re-validated by the service owner, so a
 //!   tampered presentation fails there even if it passed the boundary parse.
 //!
-//! Registration is a validated verdict, not a durable row: the ORS owner
-//! persists claims (the unit of admission), while the registration lease is
-//! enforced per message (expiry, renewal distinctness, generation/epoch/fence
-//! agreement with the claim). A registration replay table belongs to a later
-//! wave and is recorded as a residual, not faked here.
+//! Registration is a durable ORS owner row. The Kernel binds it to the
+//! authenticated Session before persistence; ORS owns exact replay, immutable
+//! binding conflict, and same-registration renewal revision. Claim and
+//! lifecycle messages must read that current owner before they can proceed.
 //!
 //! Transport error mapping is mechanical: shape, digest, fence, service-gate,
 //! and storage failures fail closed as `SessionFenced`; a changed binding
@@ -49,7 +48,7 @@ use super::{
     status_frame, unix_ms,
 };
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_ipc::{Session, TransportError};
+use eliot_ipc::{PeerIdentity, Session, TransportError};
 use eliot_kernel_service::{
     KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
     NATIVE_WORKER_CLAIM_WIRE_VERSION_V1, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
@@ -57,7 +56,10 @@ use eliot_kernel_service::{
     NativeWorkerClaimBudget, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
     NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
 };
-use eliot_ors::{NativeWorkerClaimRecord, NativeWorkerClaimState, OperationIdentity, OrsError};
+use eliot_ors::{
+    NativeWorkerClaimRecord, NativeWorkerClaimState, NativeWorkerRegistrationRecord,
+    NativeWorkerRegistrationState, OpaqueLabel, OperationIdentity, OrsError,
+};
 use eliot_process::OperationId;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use serde::Serialize;
@@ -794,22 +796,22 @@ impl KernelComposition {
         }
         let receipt = match operation {
             NATIVE_WORKER_REGISTRATION_OPERATION => {
-                self.handle_native_worker_registration(&identity_value, &payload)
+                self.handle_native_worker_registration(session, &identity_value, &payload)
             }
             NATIVE_WORKER_CLAIM_OPERATION => {
-                self.handle_native_worker_claim(&identity_value, &payload)
+                self.handle_native_worker_claim(session, &identity_value, &payload)
             }
             NATIVE_WORKER_READY_OPERATION => {
-                self.handle_native_worker_ready(&identity_value, &payload)
+                self.handle_native_worker_ready(session, &identity_value, &payload)
             }
             NATIVE_WORKER_HEARTBEAT_OPERATION => {
-                self.handle_native_worker_heartbeat(&identity_value, &payload)
+                self.handle_native_worker_heartbeat(session, &identity_value, &payload)
             }
             NATIVE_WORKER_CHECKPOINT_OPERATION => {
-                self.handle_native_worker_checkpoint(&identity_value, &payload)
+                self.handle_native_worker_checkpoint(session, &identity_value, &payload)
             }
             NATIVE_WORKER_RESULT_SUBMIT_OPERATION => {
-                self.handle_native_worker_result(&identity_value, &payload)
+                self.handle_native_worker_result(session, &identity_value, &payload)
             }
             _ => Err(NativeWorkerRouteError::Shape { field: "operation" }),
         }
@@ -955,20 +957,230 @@ impl KernelComposition {
         Ok((registration_id, worker_generation))
     }
 
-    /// Admits one registration: validate, Ready-gate, lease check, verdict.
+    /// Projects the exact authenticated registration presentation into the
+    /// durable Kernel/ORS owner record. The full registration JSON digest is
+    /// retained alongside the fields used by claim and RuntimeLease
+    /// revalidation; no caller-supplied registration is treated as current
+    /// until this record has been committed.
+    fn native_worker_registration_record(
+        payload: &serde_json::Value,
+    ) -> Result<NativeWorkerRegistrationRecord, NativeWorkerRouteError> {
+        let (registration_id, worker_generation) =
+            Self::validate_native_worker_registration(payload)?;
+        let state_fence: StateFence =
+            serde_json::from_value(payload.get("state_fence").cloned().ok_or(
+                NativeWorkerRouteError::Shape {
+                    field: "state_fence",
+                },
+            )?)
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "state_fence",
+            })?;
+        let installation_id = require_claim_text(payload, "installation_id")?;
+        let worker_artifact_digest = require_digest(payload, "worker_artifact_digest")?;
+        let worker_config_digest = require_digest(payload, "worker_config_digest")?;
+        let resource_material = serde_json::json!({
+            "installation_id": installation_id,
+            "worker_artifact_digest": worker_artifact_digest,
+            "worker_config_digest": worker_config_digest,
+        });
+        let resource_envelope_digest = canonical_json_bytes(&resource_material)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "resource_envelope_digest",
+            })?;
+        let registration_digest = canonical_json_bytes(payload)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "registration_digest",
+            })?;
+        let mut binding_material = payload.clone();
+        if let Some(object) = binding_material.as_object_mut() {
+            object.remove("lease_expires_at_unix_ms");
+            object.remove("renewal_id");
+        }
+        let binding_digest = canonical_json_bytes(&binding_material)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "binding_digest",
+            })?;
+        let label = |field: &'static str| {
+            OpaqueLabel::new(require_claim_text(payload, field)?)
+                .map_err(|_| NativeWorkerRouteError::Shape { field })
+        };
+        let operation_id = OperationIdentity::new(registration_id.clone()).map_err(|_| {
+            NativeWorkerRouteError::Shape {
+                field: "registration_id",
+            }
+        })?;
+        Ok(NativeWorkerRegistrationRecord {
+            contract_version: eliot_ors::CONTRACT_VERSION,
+            registration_id: operation_id,
+            installation_id: OpaqueLabel::new(installation_id).map_err(|_| {
+                NativeWorkerRouteError::Shape {
+                    field: "installation_id",
+                }
+            })?,
+            worker_generation,
+            worker_artifact_digest,
+            worker_config_digest,
+            process_image_digest: require_digest(payload, "process_image_digest")?,
+            process_id: require_nonzero_u64(payload, "process_id")?,
+            process_start_100ns: require_nonzero_u64(payload, "process_start_100ns")?,
+            principal_ref: label("principal_ref")?,
+            session_id: label("session_id")?,
+            connection_id: label("connection_id")?,
+            authority_epoch: state_fence.authority_epoch.sequence.get(),
+            state_fence,
+            lease_id: label("lease_id")?,
+            lease_expires_at_unix_ms: require_nonzero_u64(payload, "lease_expires_at_unix_ms")?,
+            renewal_id: label("renewal_id")?,
+            protocol_version: label("protocol_version")?,
+            execution_unit_schema_version: native_worker_json_u16(
+                payload,
+                "execution_unit_schema_version",
+            )?,
+            resource_envelope_digest,
+            registration_digest,
+            binding_digest,
+            revision: 1,
+            state: NativeWorkerRegistrationState::Active,
+        })
+    }
+
+    /// Binds a projected registration to the authenticated transport owner.
+    /// Registration fields are observations, not authority: the Session's
+    /// Kernel fence, connection, authenticated peer, and handle-bound
+    /// process identity are the source of truth for this check.
+    fn validate_authenticated_registration_owner(
+        session: &Session,
+        registration: &NativeWorkerRegistrationRecord,
+    ) -> Result<(), NativeWorkerRouteError> {
+        if registration.state_fence != session.module_generation.state_fence
+            || registration.authority_epoch
+                != session
+                    .module_generation
+                    .state_fence
+                    .authority_epoch
+                    .sequence
+                    .get()
+            || registration.connection_id.as_str() != session.connection_id
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "registration_session_binding",
+            });
+        }
+        let process = session
+            .peer
+            .process_binding()
+            .ok_or(NativeWorkerRouteError::Fence {
+                field: "registration_peer_binding",
+            })?;
+        if registration.process_id != u64::from(process.process_id())
+            || registration.process_start_100ns != process.start_time_100ns()
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "registration_process_binding",
+            });
+        }
+        let (principal_ref, session_id) = match &session.peer {
+            PeerIdentity::Authenticated {
+                user_identity,
+                session_identity,
+                ..
+            } => (user_identity.as_str(), session_identity.as_str()),
+            PeerIdentity::Unavailable { .. } => {
+                return Err(NativeWorkerRouteError::Fence {
+                    field: "registration_peer_binding",
+                });
+            }
+        };
+        if registration.principal_ref.as_str() != principal_ref
+            || registration.session_id.as_str() != session_id
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "registration_principal_binding",
+            });
+        }
+        Ok(())
+    }
+
+    /// Loads the one current durable registration owner and revalidates it
+    /// against the authenticated Session. A missing, expired, or superseded
+    /// row never becomes authority by presentation alone.
+    fn load_current_native_worker_registration(
+        &self,
+        session: &Session,
+        registration_id: &OpaqueLabel,
+    ) -> Result<NativeWorkerRegistrationRecord, NativeWorkerRouteError> {
+        let identity = OperationIdentity::new(registration_id.as_str()).map_err(|_| {
+            NativeWorkerRouteError::Shape {
+                field: "registration_id",
+            }
+        })?;
+        let current = self
+            .generation_gateway
+            .ors
+            .load_native_worker_registration(&identity)
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "registration_owner",
+            })?
+            .ok_or(NativeWorkerRouteError::Fence {
+                field: "registration_owner",
+            })?;
+        if current.state != NativeWorkerRegistrationState::Active
+            || current.lease_expires_at_unix_ms <= unix_ms()
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "registration_owner",
+            });
+        }
+        Self::validate_authenticated_registration_owner(session, &current)?;
+        Ok(current)
+    }
+
+    /// Requires a presented registration to equal the current durable owner,
+    /// including the exact lease/renewal replay material. This is used by
+    /// claim and readiness admission so an old or caller-minted presentation
+    /// cannot sponsor lifecycle authority.
+    fn require_current_native_worker_registration(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+    ) -> Result<NativeWorkerRegistrationRecord, NativeWorkerRouteError> {
+        let presented = Self::native_worker_registration_record(payload)?;
+        Self::validate_authenticated_registration_owner(session, &presented)?;
+        let current =
+            self.load_current_native_worker_registration(session, &presented.registration_id)?;
+        if !current.same_binding(&presented) {
+            return Err(NativeWorkerRouteError::Conflict(
+                NativeWorkerRouteConflict {
+                    identity: presented.registration_id.as_str().to_owned(),
+                    expected_digest: current.registration_digest,
+                    observed_digest: presented.registration_digest,
+                    changed_fields: vec!["registration_binding".to_owned()],
+                },
+            ));
+        }
+        Ok(current)
+    }
+
+    /// Admits one authenticated registration or owner-observed renewal.
     ///
-    /// The verdict is deliberately not a durable row: the ORS owner persists
-    /// claims (the unit of admission). The lease is enforced per message
-    /// (nonzero expiry strictly in the future, distinct renewal identity);
-    /// registration replay detection belongs to a later wave.
+    /// ORS owns exact replay, immutable-binding conflict, and the atomic
+    /// same-registration renewal transition. The route only supplies the
+    /// authenticated Session binding and a future lease.
     fn handle_native_worker_registration(
         &self,
+        session: &Session,
         identity: &serde_json::Value,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, NativeWorkerRouteError> {
         let (registration_id, worker_generation) =
             Self::validate_native_worker_registration(payload)?;
         Self::require_message_identity(identity, &registration_id)?;
+        let registration = Self::native_worker_registration_record(payload)?;
+        Self::validate_authenticated_registration_owner(session, &registration)?;
         if self
             .service_state()
             .map_err(|_| NativeWorkerRouteError::Fence {
@@ -986,12 +1198,28 @@ impl KernelComposition {
                 field: "lease_expires_at_unix_ms",
             });
         }
+        let persisted = self
+            .generation_gateway
+            .ors
+            .persist_native_worker_registration(&registration, unix_ms())
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "registration_owner",
+            })?;
+        if persisted.state != NativeWorkerRegistrationState::Active
+            || persisted.lease_expires_at_unix_ms <= unix_ms()
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "registration_owner",
+            });
+        }
         seal_route_receipt(serde_json::json!({
             "kind": "native_worker_registration",
             "registration_id": registration_id,
             "worker_generation": worker_generation,
             "lease_expires_at_unix_ms": lease_expires_at_unix_ms,
-            "durable": false,
+            "registration_digest": persisted.registration_digest,
+            "revision": persisted.revision,
+            "durable": true,
             "decided_at_unix_ms": unix_ms(),
         }))
         .map_err(|_| NativeWorkerRouteError::Shape { field: "receipt" })
@@ -1552,11 +1780,13 @@ impl KernelComposition {
     /// path owned by `stage_native_worker_cancellation`.
     fn handle_native_worker_claim(
         &self,
+        session: &Session,
         identity: &serde_json::Value,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, NativeWorkerRouteError> {
         let (claim, registration) = Self::split_claim_presentation(payload)?;
         Self::validate_native_worker_registration(registration)?;
+        self.require_current_native_worker_registration(session, registration)?;
         let now = unix_ms();
         let lease_expires_at_unix_ms =
             require_nonzero_u64(registration, "lease_expires_at_unix_ms")?;
@@ -1798,6 +2028,7 @@ impl KernelComposition {
     /// ready by mistake.
     fn handle_native_worker_ready(
         &self,
+        session: &Session,
         identity: &serde_json::Value,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, NativeWorkerRouteError> {
@@ -1857,6 +2088,7 @@ impl KernelComposition {
                 field: "registration",
             })?;
         Self::validate_native_worker_registration(registration)?;
+        self.require_current_native_worker_registration(session, registration)?;
         Self::require_claim_registration_resource_binding(claim, registration)?;
         let request = Self::build_single_shape_request(claim, registration)?;
         let report = readiness.get("payload").cloned().unwrap_or_default();
@@ -1919,9 +2151,11 @@ impl KernelComposition {
     /// is fenced even when the epoch value alone still matches.
     fn load_and_bind(
         &self,
+        session: &Session,
         binding: &NativeWorkerBindingView,
     ) -> Result<NativeWorkerClaimRecord, NativeWorkerRouteError> {
         let staged = self.load_claim_record(&binding.claim_id)?;
+        self.load_current_native_worker_registration(session, &staged.registration_id)?;
         if staged.worker_generation == 0 || staged.worker_generation != binding.worker_generation {
             return Err(NativeWorkerRouteError::Fence {
                 field: "worker_generation",
@@ -1993,6 +2227,7 @@ impl KernelComposition {
     /// staging. It cannot create progress, success, authority, or completion.
     fn handle_native_worker_heartbeat(
         &self,
+        session: &Session,
         identity: &serde_json::Value,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, NativeWorkerRouteError> {
@@ -2000,7 +2235,7 @@ impl KernelComposition {
         Self::require_message_identity(identity, &heartbeat_id)?;
         let observed_at = require_nonzero_u64(payload, "observed_at_unix_ms")?;
         let binding = NativeWorkerBindingView::parse(payload)?;
-        let staged = self.load_and_bind(&binding)?;
+        let staged = self.load_and_bind(session, &binding)?;
         Self::require_claim_state(
             staged.state,
             &[
@@ -2026,6 +2261,7 @@ impl KernelComposition {
     /// lifecycle proof and Wave D reconciles it.
     fn handle_native_worker_checkpoint(
         &self,
+        session: &Session,
         identity: &serde_json::Value,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, NativeWorkerRouteError> {
@@ -2034,7 +2270,7 @@ impl KernelComposition {
         let checkpoint_ref = require_claim_text(payload, "checkpoint_ref")?;
         let observed_at = require_nonzero_u64(payload, "observed_at_unix_ms")?;
         let binding = NativeWorkerBindingView::parse(payload)?;
-        let staged = self.load_and_bind(&binding)?;
+        let staged = self.load_and_bind(session, &binding)?;
         Self::require_claim_state(
             staged.state,
             &[
@@ -2065,6 +2301,7 @@ impl KernelComposition {
     /// attests activity); a `Cancelling` claim keeps its submitted work.
     fn handle_native_worker_result(
         &self,
+        session: &Session,
         identity: &serde_json::Value,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, NativeWorkerRouteError> {
@@ -2075,7 +2312,7 @@ impl KernelComposition {
         let result_digest = require_digest(payload, "result_digest")?;
         let submitted_at = require_nonzero_u64(payload, "submitted_at_unix_ms")?;
         let binding = NativeWorkerBindingView::parse(payload)?;
-        let staged = self.load_and_bind(&binding)?;
+        let staged = self.load_and_bind(session, &binding)?;
         Self::require_claim_state(
             staged.state,
             &[
@@ -2156,7 +2393,7 @@ impl KernelComposition {
         require_claim_text(payload, "reason")?;
         require_nonzero_u64(payload, "observed_at_unix_ms")?;
         let binding = NativeWorkerBindingView::parse(payload)?;
-        let staged = self.load_and_bind(&binding)?;
+        let staged = self.load_and_bind(session, &binding)?;
         if staged.state == NativeWorkerClaimState::Submitted {
             // A submitted result is preserved for Wave-D reconciliation; the
             // attempt's execution is still fenced through the `Cancel`

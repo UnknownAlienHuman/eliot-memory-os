@@ -42,15 +42,15 @@ use crate::{
     EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
     GenerationTransition, GenerationTransitionReceipt, HostRequestRecord, HostRequestState,
     JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
-    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
-    OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
-    OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
-    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
-    RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
-    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
-    RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
-    RetryState, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach,
-    StageReceipt, StagedOperation, StateFenceSnapshot, SupervisionLeaseCommitTicket,
+    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, NativeWorkerRegistrationRecord,
+    OpaqueLabel, OperationalMutationReceipt, OperationalPhase, OperationalRecordContext,
+    OperationalRecordInput, OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
+    ProcessEvidenceRecord, ProcessStartReplayAbort, ProcessStartReplayRecord,
+    ProcessStartReplayState, RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition,
+    RecoveryInboxItem, RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope,
+    RecoveryProblem, RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState,
+    ReservedScope, RetryState, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt,
+    SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot, SupervisionLeaseCommitTicket,
     SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
     SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
@@ -109,6 +109,8 @@ const ACTIVATION_RESULT_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_agent_activation_results_v1");
 const NATIVE_WORKER_CLAIMS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_native_worker_claims_v1");
+const NATIVE_WORKER_REGISTRATIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_native_worker_registrations_v1");
 const REPLAY_STREAMS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_streams_v1");
 const REPLAY_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_requests_v1");
 const REPLAY_EVENTS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_events_v1");
@@ -515,6 +517,19 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         claim_id: &crate::OperationIdentity,
     ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError>;
+    /// Persists one authenticated worker registration and atomically
+    /// supersedes the prior registration for the same installation and
+    /// worker generation. An exact replay returns the retained record.
+    fn persist_native_worker_registration(
+        &self,
+        record: &crate::NativeWorkerRegistrationRecord,
+        now_unix_ms: u64,
+    ) -> Result<crate::NativeWorkerRegistrationRecord, OrsError>;
+    /// Loads the exact durable registration owner record.
+    fn load_native_worker_registration(
+        &self,
+        registration_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerRegistrationRecord>, OrsError>;
     /// Looks up one durable replay request without acquiring anything.
     ///
     /// An unknown identity returns [`WorkerReplayRequestDecision::New`]; a
@@ -660,6 +675,14 @@ impl persistence_codec::PersistedValue for ActivationResultRetentionRecord {
 
 impl persistence_codec::PersistedValue for NativeWorkerClaimRecord {
     const RECORD_TYPE: &'static str = "native_worker_claim";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for NativeWorkerRegistrationRecord {
+    const RECORD_TYPE: &'static str = "native_worker_registration";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -2297,6 +2320,153 @@ impl RedbRecoveryStore {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "native_worker_claim",
                         reason: "claim record identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Persists one authenticated registration before its route receipt is
+    /// emitted. A new registration for the same installation and worker
+    /// generation fences the previous record in this transaction, so claim,
+    /// lifecycle and RuntimeLease consumers can read one current owner.
+    pub fn persist_native_worker_registration(
+        &self,
+        record: &crate::NativeWorkerRegistrationRecord,
+        now_unix_ms: u64,
+    ) -> Result<crate::NativeWorkerRegistrationRecord, OrsError> {
+        record.validate()?;
+        if record.state != crate::NativeWorkerRegistrationState::Active {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_registration_state",
+                reason: "only an active registration may be admitted",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.record_key();
+        let encoded_existing = {
+            let table = write
+                .open_table(NATIVE_WORKER_REGISTRATIONS)
+                .map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+        };
+        let existing = if let Some(encoded) = encoded_existing {
+            let existing: crate::NativeWorkerRegistrationRecord = decode(encoded.as_str())?;
+            existing.validate()?;
+            if existing.registration_id != record.registration_id {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "native_worker_registration",
+                    reason: "registration record identity does not match its key".to_owned(),
+                });
+            }
+            if existing.state != crate::NativeWorkerRegistrationState::Active
+                || existing.lease_expires_at_unix_ms <= now_unix_ms
+            {
+                return Err(OrsError::NativeWorkerRegistrationIdentityConflict {
+                    registration_id: record.registration_id.as_str().to_owned(),
+                });
+            }
+            if existing.same_binding(record) {
+                Some(existing)
+            } else {
+                if !existing.same_owner_binding(record)
+                    || record.renewal_id == existing.renewal_id
+                    || record.lease_expires_at_unix_ms <= existing.lease_expires_at_unix_ms
+                {
+                    return Err(OrsError::NativeWorkerRegistrationIdentityConflict {
+                        registration_id: record.registration_id.as_str().to_owned(),
+                    });
+                }
+                let mut renewed = record.clone();
+                renewed.revision =
+                    existing
+                        .revision
+                        .checked_add(1)
+                        .ok_or(OrsError::InvalidField {
+                            field: "native_worker_registration_revision",
+                            reason: "revision overflow",
+                        })?;
+                renewed.validate()?;
+                let payload = encode(&renewed)?;
+                let mut table = write
+                    .open_table(NATIVE_WORKER_REGISTRATIONS)
+                    .map_err(storage)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                Some(renewed)
+            }
+        } else {
+            None
+        };
+        if let Some(existing) = existing {
+            write.commit().map_err(storage)?;
+            return Ok(existing);
+        }
+
+        let prior = {
+            let table = write
+                .open_table(NATIVE_WORKER_REGISTRATIONS)
+                .map_err(storage)?;
+            let mut rows = Vec::new();
+            for row in table.iter().map_err(storage)? {
+                let (stored_key, value) = row.map_err(storage)?;
+                let prior: crate::NativeWorkerRegistrationRecord = decode(value.value())?;
+                prior.validate()?;
+                rows.push((stored_key.value().to_owned(), prior));
+            }
+            rows
+        };
+        let mut table = write
+            .open_table(NATIVE_WORKER_REGISTRATIONS)
+            .map_err(storage)?;
+        for (prior_key, prior) in prior {
+            if prior.state == crate::NativeWorkerRegistrationState::Active
+                && prior.installation_id == record.installation_id
+                && prior.worker_generation == record.worker_generation
+            {
+                let mut superseded = prior;
+                superseded.state = crate::NativeWorkerRegistrationState::Superseded;
+                superseded.validate()?;
+                let payload = encode(&superseded)?;
+                table
+                    .insert(prior_key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+        }
+        let payload = encode(record)?;
+        table
+            .insert(key.as_str(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)?;
+        Ok(record.clone())
+    }
+
+    /// Loads one registration by exact durable identity. Expiry and
+    /// supersession remain explicit owner state for the caller to evaluate.
+    pub fn load_native_worker_registration(
+        &self,
+        registration_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerRegistrationRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(NATIVE_WORKER_REGISTRATIONS)
+            .map_err(storage)?;
+        table
+            .get(registration_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::NativeWorkerRegistrationRecord = decode(value.value())?;
+                record.validate()?;
+                if record.registration_id != *registration_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "native_worker_registration",
+                        reason: "registration record identity does not match its key".to_owned(),
                     });
                 }
                 Ok(record)
@@ -5015,6 +5185,11 @@ impl RedbRecoveryStore {
             drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
             drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
             drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
+            drop(
+                write
+                    .open_table(NATIVE_WORKER_REGISTRATIONS)
+                    .map_err(storage)?,
+            );
             drop(
                 write
                     .open_table(ACTIVATION_RESULT_RETENTION)
@@ -7907,6 +8082,21 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::load_native_worker_claim(self, claim_id)
     }
 
+    fn persist_native_worker_registration(
+        &self,
+        record: &crate::NativeWorkerRegistrationRecord,
+        now_unix_ms: u64,
+    ) -> Result<crate::NativeWorkerRegistrationRecord, OrsError> {
+        RedbRecoveryStore::persist_native_worker_registration(self, record, now_unix_ms)
+    }
+
+    fn load_native_worker_registration(
+        &self,
+        registration_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerRegistrationRecord>, OrsError> {
+        RedbRecoveryStore::load_native_worker_registration(self, registration_id)
+    }
+
     fn lookup_replay_request(
         &self,
         stream_id: &str,
@@ -8275,6 +8465,24 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         claim_id: &crate::OperationIdentity,
     ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
         self.store.load_native_worker_claim(claim_id)
+    }
+
+    /// Persists one authenticated native-worker registration owner record.
+    pub fn persist_native_worker_registration(
+        &self,
+        record: &crate::NativeWorkerRegistrationRecord,
+        now_unix_ms: u64,
+    ) -> Result<crate::NativeWorkerRegistrationRecord, OrsError> {
+        self.store
+            .persist_native_worker_registration(record, now_unix_ms)
+    }
+
+    /// Loads one exact native-worker registration owner record.
+    pub fn load_native_worker_registration(
+        &self,
+        registration_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerRegistrationRecord>, OrsError> {
+        self.store.load_native_worker_registration(registration_id)
     }
 
     /// Looks up one durable replay request without acquiring anything.
