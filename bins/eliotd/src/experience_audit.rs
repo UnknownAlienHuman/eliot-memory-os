@@ -63,7 +63,7 @@ use eliot_observation_contracts::{
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
     EXPERIENCE_PARAM_MAX_RECORDS, MAX_EXPERIENCE_PAGE_RECORDS, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, ReadConsistency, RevisionHeadExpectation, ScopeId,
+    NamedReadResponse, ReadConsistency, RevisionHeadExpectation, ScopeId, WriteReceiptStatus,
 };
 
 use crate::attempt_execution_chain::{
@@ -71,8 +71,8 @@ use crate::attempt_execution_chain::{
     supply_owner_session,
 };
 use crate::experience_runtime::{
-    ExperienceBankEventInputs, ExperienceFeedbackEventInputs, ExperienceQualityEvent,
-    commit_experience_event_records, run_experience_quality_event,
+    ExperienceBankEventInputs, ExperienceDriverError, ExperienceFeedbackEventInputs,
+    ExperienceQualityEvent, commit_experience_event_records, run_experience_quality_event,
 };
 use crate::{DaemonComposition, DaemonKernelClient};
 
@@ -272,7 +272,13 @@ fn correlation_ms() -> u64 {
 /// readback verification, owner decode into the shared record slices,
 /// live revision-head expectations, event assembly, the read entry, and
 /// the commit entry with the shared decoded slices, projecting the
-/// reviewed candidate plus commit receipts observably. Anything missing
+/// reviewed candidate plus verified commit receipts observably. Commit
+/// errors distinguish pre-write ingress refusals (nothing committed)
+/// from unknown-persistence failures (convergent retry, nothing
+/// claimed); receipts prove success by Committed status plus shape
+/// validation (never by fence equality), project observably even on
+/// later-stage failure, and corroborate durability against live
+/// revision heads. Anything missing
 /// idles as pending with exact owners. Deterministic and side-effect
 /// free except for the live owner/bridge reads plus, on a complete
 /// event, the read entry's own bridge reads and the commit entry's
@@ -596,9 +602,12 @@ pub async fn evaluate_experience_audit(
     // Terminal commit entry: the SAME decoded record slices the read
     // entry consumed, re-committed with live revision expectations and
     // empty ordering expectations. Per-record receipts return in input
-    // order under deterministic idempotency keys; a mid-batch failure
-    // fails closed with identities preserved while already-durable
-    // receipts stay durable (retry is convergent, never double-persists).
+    // order under deterministic idempotency keys. Error meaning is
+    // exact, never collapsed: an `Ingress` refusal fired before any
+    // write (the entry documents nothing committed), while any later
+    // failure leaves persistence outcome UNKNOWN — already-durable
+    // receipts stay durable and retry is convergent, but this evaluation
+    // claims neither success nor failure of persistence.
     let commit = match commit_experience_event_records(
         composition,
         &context,
@@ -612,23 +621,125 @@ pub async fn evaluate_experience_audit(
     .await
     {
         Ok(commit) => commit,
+        Err(ExperienceDriverError::Ingress { field, reason }) => {
+            return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                owner: "experience commit ingress",
+                reason: format!("{field}: {reason}; nothing was committed"),
+            });
+        }
         Err(error) => {
             return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
                 owner: "experience commit",
-                reason: error.to_string(),
+                reason: format!(
+                    "{error}; persistence outcome unknown past validation — already-durable receipts stay durable under idempotency keys, retry is convergent"
+                ),
             });
         }
     };
+    // Receipt verification: every returned receipt must carry Committed
+    // status and validate its shape. A non-committed or malformed
+    // receipt from the commit caller is an owner disagreement, never a
+    // success — success is proven by receipts, never by fence equality.
+    for receipt in commit
+        .bank_receipts
+        .iter()
+        .chain(commit.feedback_receipts.iter())
+    {
+        if receipt.status != WriteReceiptStatus::Committed {
+            return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                owner: "experience commit readback",
+                reason: "commit caller returned a non-committed receipt".to_owned(),
+            });
+        }
+        if let Err(error) = receipt.validate() {
+            return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                owner: "experience commit readback",
+                reason: error.to_string(),
+            });
+        }
+    }
+    // Durable-receipt projection: counts plus per-receipt canonical
+    // digests, so committed records stay recorded even if a later stage
+    // fails. Digests are bounded owner hex, never identities.
+    let committed_digests: Vec<&str> = commit
+        .bank_receipts
+        .iter()
+        .chain(commit.feedback_receipts.iter())
+        .map(|receipt| receipt.canonical_request_hash.as_str())
+        .collect();
+    tracing::debug!(
+        bank_committed = commit.bank_receipts.len(),
+        feedback_committed = commit.feedback_receipts.len(),
+        committed_digests = ?committed_digests,
+        "experience audit projected durable commit receipts",
+    );
     // Post-commit fence currency: an Arc-held trigger cannot refresh the
     // dependent view itself (no `&mut`), so staleness is handled
     // explicitly instead of silently skipped — re-read the live fence
     // and fail closed on drift. Committed receipts stay durable under
-    // their idempotency keys; the next tick retries convergently and the
-    // mutably-held owning context runs `refresh_dependent_view` on its
-    // own discipline.
+    // their idempotency keys (projected above); the next tick retries
+    // convergently and the mutably-held owning context runs
+    // `refresh_dependent_view` on its own discipline.
     let post_fence = supply_live_kernel_fence(kernel);
     if !fences_match_exact(&post_fence, &context.state_fence) {
         return ExperienceAuditOutcome::Failed(ExecutionChainError::StaleAdmissionFence);
+    }
+    // Revision-delta durability corroboration: every receipt delta's
+    // `after` revision must be present-or-surpassed in the live heads.
+    // A live head BELOW a committed `after` means the store lost a
+    // write (integrity failure, fail closed). Heads at or above prove
+    // the writes landed; they do NOT prove view currency — projections
+    // refresh on the owning context's discipline, so currency beyond
+    // the fence is reported as delegated, never claimed. An unreadable
+    // heads leg degrades to explicit unverified (traced), never silent.
+    let heads_request = NamedReadRequest {
+        operation: NamedReadOperation::GetRevisionHeads,
+        scope_id: None,
+        consistency: ReadConsistency::ExactFence,
+        state_fence: context.state_fence.clone(),
+        parameters: BTreeMap::new(),
+    };
+    if let Err(error) = heads_request.validate() {
+        return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+            owner: "revision heads planner",
+            reason: error.to_string(),
+        });
+    }
+    match fetch_experience_range(&reads, heads_request, &context.state_fence).await {
+        Ok(heads_response) => {
+            for receipt in commit
+                .bank_receipts
+                .iter()
+                .chain(commit.feedback_receipts.iter())
+            {
+                for delta in &receipt.revision_before_after {
+                    let live = heads_response
+                        .revision_heads
+                        .iter()
+                        .find(|head| head.key == delta.key)
+                        .map(|head| head.revision)
+                        .unwrap_or(0);
+                    if live < delta.after {
+                        return ExperienceAuditOutcome::Failed(
+                            ExecutionChainError::SupplierReadRejected {
+                                owner: "revision currency readback",
+                                reason: "live revision head is below a committed after-revision".to_owned(),
+                            },
+                        );
+                    }
+                }
+            }
+            tracing::debug!(
+                live_heads = heads_response.revision_heads.len(),
+                "experience audit corroborated commit durability against live heads",
+            );
+        }
+        Err(error) => {
+            tracing::debug!(
+                reason = %error.to_string(),
+                "experience audit could not verify revision currency; durability rests on committed receipts, view refresh stays delegated",
+            );
+        }
     }
     tracing::info!(
         assessment = %crate::diagnostics::sanitize_identity(
