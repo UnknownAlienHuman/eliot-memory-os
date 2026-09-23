@@ -1879,11 +1879,14 @@ dependencies = [
  "eliot-evidence",
  "eliot-finish",
  "eliot-integration-coverage",
+ "eliot-kernel-core",
  "eliot-maintenance",
  "eliot-mcp",
  "eliot-module-registry",
  "eliot-observation",
  "eliot-observation-contracts",
+ "eliot-ors",
+ "eliot-platform",
  "eliot-problem",
  "eliot-protocol",
  "eliot-read",
@@ -3165,8 +3168,8 @@ dependencies = [
 name = "eliot-understanding-assessment"
 version = "0.1.0"
 dependencies = [
- "eliot-contracts",
  "eliot-context-contracts",
+ "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-epistemic-contracts",
  "eliot-observation-contracts",

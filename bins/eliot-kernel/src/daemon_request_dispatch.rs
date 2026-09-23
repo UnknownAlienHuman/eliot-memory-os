@@ -358,6 +358,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "local_read_result" => "local_read_result",
         "agent_host_request_submit" => "agent_host_request_submit",
         "agent_host_request_cancel" => "agent_host_request_cancel",
+        "publish_owner_bundle" => "publish_owner_bundle",
+        "query_owner_bundle" => "query_owner_bundle",
         "agent_host_request_reconcile" => "agent_host_request_reconcile",
         "agent_host_request_rehydrate" => "agent_host_request_rehydrate",
         _ => "untrusted_operation",
@@ -392,6 +394,43 @@ struct StoreRecoveryOperation {
     request: StoreRecoveryRequest,
 }
 
+/// Closed Governor owner-bundle publish operation (`#2100`).
+///
+/// Carries the canonical restore plus the exact expected graph revision.
+/// The Kernel binds (or refreshes) its retained P-07 owner through the
+/// composition owner step and acknowledges the bound revision; a
+/// disagreeing bundle fails closed as an identity conflict.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerPublishOperation {
+    bundle: super::GovernorClosureRestore,
+    expected_revision: u64,
+}
+
+/// Checks every admitted binding in the bundle against the authenticated
+/// session authority: the bundle must describe authority this session may
+/// fence. A single crossing binding refuses the whole publish.
+fn owner_bundle_agrees_with_session(
+    bundle: &super::GovernorClosureRestore,
+    session: &Session,
+) -> bool {
+    let mut bindings = bundle
+        .members
+        .iter()
+        .map(|member| &member.intent.binding)
+        .chain(bundle.roots.iter().map(|root| &root.intent.binding))
+        .chain(
+            bundle
+                .introductions
+                .iter()
+                .map(|hydration| &hydration.intent.binding),
+        );
+    bindings.all(|binding| {
+        binding
+            .authority_epoch
+            .is_same_authority(&session.authority_epoch)
+    })
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoreInitializeGenesisOperation {
@@ -852,6 +891,43 @@ impl KernelComposition {
                 Ok(host_request_route::host_request_rehydrated_response(
                     &record,
                 ))
+            }
+            "publish_owner_bundle" => {
+                let operation: OwnerPublishOperation =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                if operation.expected_revision == 0 {
+                    return Err(TransportError::SessionFenced);
+                }
+                // Session-authority agreement under the existing session
+                // authorities: every admitted binding must share the
+                // authenticated session authority, or the bundle does not
+                // describe authority this session may fence.
+                if !owner_bundle_agrees_with_session(&operation.bundle, session) {
+                    return Err(TransportError::SessionFenced);
+                }
+                match self.recover_p07_owner(operation.bundle, operation.expected_revision) {
+                    Ok(revision) => Ok(serde_json::json!({
+                        "kind": "owner_bundle_receipt",
+                        "value": { "revision": revision, "status": "bound" },
+                    })),
+                    // The presented bundle conflicts with Kernel owner
+                    // state (stale revision, disagreeing material): the
+                    // caller re-serves fresh state, never retries blindly.
+                    Err(KernelBuildError::Core(_)) => Err(TransportError::IdentityConflict),
+                    Err(_) => Err(TransportError::SessionFenced),
+                }
+            }
+            "query_owner_bundle" => {
+                let (bound, revision, digest) = self.p07_owner_readback();
+                Ok(serde_json::json!({
+                    "kind": "owner_bundle_readback",
+                    "value": {
+                        "bound": bound,
+                        "revision": revision,
+                        "digest": digest,
+                    },
+                }))
             }
             _ => return Err(TransportError::SessionFenced),
         };
@@ -1355,6 +1431,28 @@ impl KernelComposition {
             ));
         }
         validate_store_session_fence(session, &operation.request.state_fence)?;
+        // Authority-history reads are Kernel-owned fence state (`#2100`):
+        // serve durable closure-fence history from the retained ORS instead
+        // of forwarding to the store bridge. The store catalogue truthfully
+        // still lists the operation unsupported because the store never
+        // serves it; every other named read forwards unchanged below. The
+        // live session fence binds the served view: the projector refuses
+        // a request fence that disagrees with it.
+        if operation.request.operation
+            == eliot_store_api::NamedReadOperation::GetAuthorityRevocationHistory
+        {
+            return match eliot_kernel_service::serve_authority_revocation_history(
+                self.p07_ors.as_ref(),
+                &operation.request,
+                &session.module_generation.state_fence,
+            ) {
+                Ok(response) => Ok(store_named_response(&response)),
+                Err(error) => Ok(Self::store_error_response_text(
+                    "store_named",
+                    &error.to_string(),
+                )),
+            };
+        }
         let gateway = self.retained_store_gateway()?;
         match gateway.execute_named(operation.request).await {
             Ok(response) => Ok(store_named_response(&response)),
