@@ -31,6 +31,7 @@ eliot-platform-windows.workspace = true
 eliot-runtime.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-store-api.workspace = true
+eliot-testd-core.workspace = true
 eliot-process.workspace = true
 serde_json.workspace = true
 serde.workspace = true

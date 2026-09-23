@@ -8,6 +8,7 @@ use eliot_process::ProcessExecutor;
 use eliot_testd::{
     ADMITTED_WORKER_LEASE_MS, PROTOCOL_VERSION, SERVICE_NAME, TestReceipt, TestdComposition,
     ValidatedDispatchDriveOutcome, drive_validated_dispatch_material,
+    drive_validated_dispatch_material_with_terminal_publisher,
     kernel_client::{KernelTestdIpcClient, PresentedAdmission},
     run_admitted_one_shot,
     testd_material::{ValidatedTestdMaterial, read_testd_material},
@@ -102,7 +103,7 @@ fn bootstrap_and_run_once() -> i32 {
             // the canonical job and admitted profile binding, while the
             // supervised worker owns the durable claim, observation, capture,
             // and finish path.
-            drive_material_probe(&material)
+            drive_material_probe_with_terminal_publisher(&material, &mut client)
         }
         GateDecision::DenyNotAdvertised | GateDecision::DenyNoPresentedAttempt => deny(),
     }
@@ -133,16 +134,21 @@ fn acquire_presented_admission() -> Option<ValidatedTestdMaterial> {
 /// validated grant, and the supervised worker owns one durable claim and
 /// finish. Cancelled admissions project cancellation without executing. Every
 /// refused derivation or issuance fails the shot closed.
-fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
+fn drive_material_probe_with_terminal_publisher(
+    material: &ValidatedTestdMaterial,
+    client: &mut KernelTestdIpcClient,
+) -> i32 {
     let Some(source_root) = generation_root_cwd() else {
         return EXIT_ADMITTED_DRIVE_FAILED;
     };
-    match block_on_drive(drive_validated_dispatch_material(
+    match block_on_drive(drive_validated_dispatch_material_with_terminal_publisher(
         material,
         &source_root,
         now_ms(),
+        client,
     )) {
         Ok(ValidatedDispatchDriveOutcome::Completed { .. }) => EXIT_ADMITTED_COMPLETED,
+        Ok(ValidatedDispatchDriveOutcome::Failed { .. }) => EXIT_ADMITTED_DRIVE_FAILED,
         Ok(ValidatedDispatchDriveOutcome::Cancelled { .. }) => EXIT_ADMITTED_CANCELLED,
         Ok(ValidatedDispatchDriveOutcome::ReconcileRequired { .. }) => {
             EXIT_ADMITTED_RECONCILE_REQUIRED
@@ -160,6 +166,27 @@ fn generation_root_cwd() -> Option<String> {
         .and_then(|path| std::fs::canonicalize(path).ok())
         .filter(|path| path.is_dir())
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Worker-only projection retained for non-production unit fixtures. The
+/// executable path above always uses the authenticated terminal publisher.
+fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
+    let Some(source_root) = generation_root_cwd() else {
+        return EXIT_ADMITTED_DRIVE_FAILED;
+    };
+    match block_on_drive(drive_validated_dispatch_material(
+        material,
+        &source_root,
+        now_ms(),
+    )) {
+        Ok(ValidatedDispatchDriveOutcome::Completed { .. }) => EXIT_ADMITTED_COMPLETED,
+        Ok(ValidatedDispatchDriveOutcome::Failed { .. }) => EXIT_ADMITTED_DRIVE_FAILED,
+        Ok(ValidatedDispatchDriveOutcome::Cancelled { .. }) => EXIT_ADMITTED_CANCELLED,
+        Ok(ValidatedDispatchDriveOutcome::ReconcileRequired { .. }) => {
+            EXIT_ADMITTED_RECONCILE_REQUIRED
+        }
+        Err(_) => EXIT_ADMITTED_DRIVE_FAILED,
+    }
 }
 
 /// Minimal std-only driver for the single executor future, mirroring

@@ -312,6 +312,7 @@ async fn serve_connection(
             }
             KernelFrameAction::Testd {
                 request_id,
+                identity,
                 operation,
                 payload,
             } => {
@@ -323,9 +324,23 @@ async fn serve_connection(
                 // first; unknown operations never reach this arm (dispatch
                 // fences them) and any handler failure fences the session
                 // instead of silently dropping the submit.
-                let reply = kernel
-                    .execute_testd_request(&session, request_id, &operation, payload)
-                    .await?;
+                let reply = if operation
+                    == crate::testd_terminal_completion_route::OPERATION
+                {
+                    kernel
+                        .execute_testd_terminal_completion(
+                            &session,
+                            request_id,
+                            &identity,
+                            &operation,
+                            payload,
+                        )
+                        .await?
+                } else {
+                    kernel
+                        .execute_testd_request(&session, request_id, &operation, payload)
+                        .await?
+                };
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     session.fence();
                     return Err(error);

@@ -10,25 +10,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_canonical::{
-    AcceptanceCoverage, CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence,
-};
-use eliot_contracts::{canonical_json_bytes, sha256_hex, OperationId, StateFence, TaskId};
+use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence};
+use eliot_contracts::{OperationId, StateFence, TaskId, canonical_json_bytes, sha256_hex};
 use eliot_coordination::CoordinationOwner;
 use eliot_finish::{
     FinishAdmission, FinishAttempt, FinishClosureIntent, FinishContext, FinishDecisionReceipt,
     FinishError, FinishService, TaskLifecycleState,
 };
-use eliot_instrument_api::EvidenceFreshness;
+use eliot_observation::{ObservationAdmissionResult, ObservationJournal, ObservationPlanBinding};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
-    generated_operation_manifests, operation_manifest_set_digest, EffectClass,
-    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     OperationManifestDigest, ScopeId, SecurityContext, StoreFailure, TransitionClass, WriteReceipt,
-    WriteReceiptStatus,
-};
-use eliot_observation::{
-    ObservationAdmissionResult, ObservationJournal, ObservationPlanBinding,
+    WriteReceiptStatus, generated_operation_manifests, operation_manifest_set_digest,
 };
 use eliot_task::{TaskCommand, TaskLifecycleOwner, TaskRecord, TaskState};
 use eliot_testd_core::TestdStore;
@@ -37,7 +31,8 @@ use thiserror::Error;
 use crate::{
     CanonicalAdmissionOwner, CanonicalAdmissionSnapshot, CanonicalFinishEvidence,
     CanonicalPlanBinding, CanonicalVerifierExecutionFact, CompositionError, GovernorOwners,
-    KernelPortError, KernelTransitionPort, evaluate_testd_verification_current,
+    KernelPortError, KernelTransitionPort, acceptance_coverage_from_verifier_fact,
+    evaluate_testd_verification_current,
 };
 
 const GOVERNOR_SCOPE_ID: &str = "governor";
@@ -127,7 +122,11 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         let mut frame_refs = BTreeSet::new();
         let mut finish_authority_ref = None;
         for event in self.task.events().iter().filter(|event| {
-            event.task_id == *task_id && event.state_fence == *fence
+            event.task_id == *task_id
+                && event.state_fence == *fence
+                && event.authority_epoch == fence.authority_epoch
+                && event.sequence > 0
+                && event.sequence <= task.last_sequence
         }) {
             let Some(command) = &event.command else {
                 continue;
@@ -189,122 +188,65 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             )));
         }
 
-        let has_accepted_task_observation = self.observation.snapshot().iter().any(|entry| {
-            let ObservationAdmissionResult::Accepted { receipt } = &entry.result else {
-                return false;
+        let mut observation_refs = BTreeSet::new();
+        for entry in self.observation.snapshot() {
+            let receipt = match &entry.result {
+                ObservationAdmissionResult::Accepted { receipt }
+                | ObservationAdmissionResult::Replayed { receipt } => receipt,
+                ObservationAdmissionResult::Rejected { .. } => continue,
             };
-            receipt.state_fence == *fence
+            if receipt.state_fence == *fence
                 && receipt.task_selection.as_ref().is_some_and(|selection| {
                     selection.task_ref == task_id.as_str()
                         && selection.task_revision == task.revision
                 })
                 && matches_plan(receipt.plan.as_ref(), plan, fence)
-        });
-        if !has_accepted_task_observation {
+            {
+                receipt.validate().map_err(|error| {
+                    FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                        "accepted task observation receipt is invalid: {error}"
+                    )))
+                })?;
+                observation_refs.insert(receipt.record_id.clone());
+            }
+        }
+        if observation_refs.is_empty() {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
                 "canonical finish evidence has no accepted task-and-plan-bound observation"
                     .to_owned(),
             )));
         }
 
-        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
-            FinishAttemptError::Composition(CompositionError::Recovery(
-                "canonical finish plan has no verifier item bindings".to_owned(),
-            ))
-        })?;
-        let run_is_current = matches!(
-            verifier_fact.verification_run.freshness,
-            EvidenceFreshness::ExactCandidate
-                | EvidenceFreshness::ExactCommit
-                | EvidenceFreshness::ExactQuiescedWorktree
-        );
-        let stale_verifier_run_refs = if run_is_current {
+        let acceptance = acceptance_coverage_from_verifier_fact(&verifier_fact)?;
+        let stale_verifier_run_refs = if verifier_fact.certifies_completion() {
             Vec::new()
         } else {
             vec![verifier_run_ref.clone()]
         };
-        let mut acceptance = Vec::with_capacity(verifier_plan.required_test_ids.len());
-        for item_id in &verifier_plan.required_test_ids {
-            let item_events = verifier_fact
-                .verification_run
-                .evidence
-                .iter()
-                .filter(|event| {
-                    event
-                        .value
-                        .get("nextest_test_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(item_id.as_str())
-                })
-                .collect::<Vec<_>>();
-            let mut item_evidence_refs = BTreeSet::new();
-            for event in &item_events {
-                item_evidence_refs.insert(event.evidence_id.to_string());
-                item_evidence_refs.insert(event.raw_artifact_id.to_string());
-                if let Some(handles) = event
-                    .value
-                    .get("raw_artifact_handles")
-                    .and_then(serde_json::Value::as_array)
-                {
-                    item_evidence_refs.extend(
-                        handles.iter().filter_map(serde_json::Value::as_str).map(str::to_owned),
-                    );
-                }
-            }
-            if item_events.is_empty() {
-                // A missing required event is still an explicit unsatisfied
-                // item. Bind the complete raw run artifact set inspected for
-                // it so the canonical validator can retain that negative
-                // coverage without borrowing another item's event evidence.
-                item_evidence_refs.extend(
-                    verifier_fact
-                        .verification_run
-                        .raw_evidence
-                        .iter()
-                        .map(ToString::to_string),
-                );
-            }
-            let item_passed = run_is_current
-                && !item_events.is_empty()
-                && item_events.iter().all(|event| {
-                    event
-                        .value
-                        .get("nextest_status")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("PASS")
-                });
-            let item_verifier_refs = if item_events.is_empty() {
-                Vec::new()
-            } else {
-                vec![verifier_run_ref.clone()]
-            };
-            acceptance.push(AcceptanceCoverage {
-                item_id: item_id.clone(),
-                satisfied: item_passed,
-                evidence_refs: item_evidence_refs.into_iter().collect(),
-                verifier_run_refs: item_verifier_refs,
-                requires_verifier: true,
-            });
-        }
         let mut artifact_refs = coordination.artifact_refs.clone();
+        artifact_refs.extend(frame_refs);
+        artifact_refs.extend(observation_refs);
+        let descendant_receipt_ref = coordination.descendant_receipt_ref;
+        if let Some(receipt_ref) = &descendant_receipt_ref {
+            artifact_refs.push(receipt_ref.clone());
+        }
         artifact_refs.sort();
         artifact_refs.dedup();
         let mut unresolved_effect_refs = coordination.unresolved_refs.clone();
         unresolved_effect_refs.sort();
         unresolved_effect_refs.dedup();
-        let descendant_closure = if let Some(receipt_ref) = coordination.descendant_receipt_ref {
-            eliot_finish::DescendantClosure::Complete { receipt_ref }
-        } else {
-            eliot_finish::DescendantClosure::Incomplete {
+        let descendant_closure = match descendant_receipt_ref {
+            Some(receipt_ref) => eliot_finish::DescendantClosure::Complete { receipt_ref },
+            None => eliot_finish::DescendantClosure::Incomplete {
                 unresolved_refs: unresolved_effect_refs.clone(),
-            }
+            },
         };
         let evidence = FinishEvidence {
             task_id: task_id.as_str().to_owned(),
             current_task_revision: task.revision,
             artifact_refs,
             acceptance,
-            executed_verifier_run_refs: vec![verifier_run_ref],
+            executed_verifier_run_refs: vec![verifier_run_ref.clone()],
             stale_verifier_run_refs,
             unresolved_effect_refs,
         };
@@ -314,16 +256,22 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         let canonical = CanonicalFinishEvidence {
             state_fence: fence.clone(),
             evidence,
+            effect_reference_bindings: verifier_fact.effect_reference_bindings.clone(),
             descendant_closure,
             finish_authority_ref: finish_authority_ref.clone(),
-            // Action authorization permits the governed task action; it is
-            // not a separate owner disposition to close partial/cancelled
-            // work. Leave closure authority absent until its owner receipt is
-            // joined explicitly.
-            closure_authority_ref: None,
+            closure_authority_ref: task_closure_authority_ref(
+                task_id,
+                task,
+                self.task.events(),
+                fence,
+                &verifier_run_ref,
+            ),
         };
         let snapshot = self.canonical.prepare_finish_evidence(canonical.clone())?;
-        Ok(ProducedFinishEvidence { canonical, snapshot })
+        Ok(ProducedFinishEvidence {
+            canonical,
+            snapshot,
+        })
     }
 }
 
@@ -336,6 +284,39 @@ fn matches_plan(
         observed.plan_id == plan.plan_id
             && observed.plan_revision == plan.plan_revision
             && observed.state_fence == *fence
+    })
+}
+
+fn task_closure_authority_ref(
+    task_id: &TaskId,
+    task: &TaskRecord,
+    events: &[eliot_task::TaskLifecycleEvent],
+    fence: &StateFence,
+    verifier_run_ref: &str,
+) -> Option<String> {
+    let event = events.iter().find(|event| {
+        event.task_id == *task_id
+            && event.sequence == task.last_sequence
+            && event.event_id == task.last_event_id
+            && event.to == task.state
+            && event.state_fence == *fence
+            && event.authority_epoch == fence.authority_epoch
+    })?;
+    let owner_disposition_matches = match (task.state, event.command.as_ref()) {
+        (TaskState::DoneVerified, Some(TaskCommand::Verify { verification_ref })) => {
+            verification_ref == verifier_run_ref
+        }
+        (TaskState::Partial, Some(TaskCommand::MarkPartial { .. }))
+        | (TaskState::Failed, Some(TaskCommand::Fail { .. })) => true,
+        _ => false,
+    };
+    owner_disposition_matches.then(|| {
+        format!(
+            "task-lifecycle:event:{}:{}:{}",
+            task_id.as_str(),
+            event.sequence,
+            event.event_id
+        )
     })
 }
 
@@ -398,9 +379,11 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         }
         let job = testd
             .get(job_id)
-            .map_err(|error| FinishAttemptError::Composition(CompositionError::Recovery(format!(
-                "TestD owner read failed: {error}"
-            ))))?
+            .map_err(|error| {
+                FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                    "TestD owner read failed: {error}"
+                )))
+            })?
             .ok_or_else(|| {
                 FinishAttemptError::Composition(CompositionError::Recovery(format!(
                     "durable TestD job {job_id} is absent"
@@ -426,15 +409,6 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             receipt,
             run,
         )?;
-        if self
-            .canonical
-            .read_verifier_execution_fact(&fence)
-            .ok()
-            .is_some_and(|existing| existing == fact)
-        {
-            return Ok(None);
-        }
-        let snapshot = self.canonical.prepare_verifier_execution_fact(fact.clone())?;
         let fact_operation = OperationId::new(format!("{operation_id}/verifier-execution"))
             .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
         let fact_identity = RequestIdentity {
@@ -443,6 +417,33 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             deadline_unix_ms: identity.deadline_unix_ms,
             cancellation_id: identity.cancellation_id.clone(),
         };
+        if self
+            .canonical
+            .read_verifier_execution_fact(&fence)
+            .ok()
+            .is_some_and(|existing| existing == fact)
+        {
+            let committed = self
+                .kernel
+                .receipt(fact_operation.clone())
+                .await?
+                .ok_or_else(|| {
+                    FinishAttemptError::Kernel(KernelPortError::Unknown(
+                        "verifier fact is current but its committed WriteReceipt is absent"
+                            .to_owned(),
+                    ))
+                })?;
+            check_finish_receipt(
+                &committed,
+                &fact_operation,
+                &fence,
+                &fact_identity.idempotency_key,
+            )?;
+            return Ok(Some(committed));
+        }
+        let snapshot = self
+            .canonical
+            .prepare_verifier_execution_fact(fact.clone())?;
         let envelope = canonical_owner_snapshot_envelope(
             &fact_identity,
             fact_operation.clone(),
@@ -767,14 +768,11 @@ fn canonical_owner_snapshot_envelope(
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
     let snapshot_json = String::from_utf8(snapshot_bytes.clone())
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
-    let expected_canonical_revision = snapshot
-        .owner_revision
-        .checked_sub(1)
-        .ok_or_else(|| {
-            FinishAttemptError::Serialization(
-                "canonical owner snapshot has no CAS predecessor".to_owned(),
-            )
-        })?;
+    let expected_canonical_revision = snapshot.owner_revision.checked_sub(1).ok_or_else(|| {
+        FinishAttemptError::Serialization(
+            "canonical owner snapshot has no CAS predecessor".to_owned(),
+        )
+    })?;
     if task_id.trim().is_empty() || required_proof_ref.trim().is_empty() {
         return Err(FinishAttemptError::Serialization(
             "canonical owner snapshot has an empty task/proof binding".to_owned(),

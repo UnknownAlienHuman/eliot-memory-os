@@ -100,11 +100,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use eliot_contracts::EpochId;
+use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
-    KernelService, KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NativeWorkerClaimReceipt,
+    KernelService, KernelServiceError, KernelServiceState, NATIVE_WORKER_CLAIM_WIRE_ID, NativeWorkerClaimReceipt,
     NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
     TestdAdmissionAttemptRequest, TestdAdmissionEnvelope, TestdAdmissionResponse,
     advertise_doctor_repair, advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
@@ -116,6 +116,11 @@ use eliot_ors::{
 };
 use eliot_process::OperationId;
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
+use eliot_protocol::RequestIdentity;
+use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
+use eliot_testd_core::{
+    JobState as TestdJobState, RetryPolicy, TestdStore, verification_receipt_sha256,
+};
 use serde::{Deserialize, Serialize};
 
 /// Protected Dreamer dispatch-launch material and launch lineage (T12-09).
@@ -657,6 +662,9 @@ struct LaunchRecord {
     request_digest: String,
     effect_digest: Option<String>,
     material_path: Option<PathBuf>,
+    /// Canonical source root used to reopen the durable TestD owner during
+    /// the authenticated terminal-completion exchange.
+    testd_source_root: Option<PathBuf>,
     nonce: String,
     operation_id: String,
     phase: LaunchPhase,
@@ -1077,6 +1085,184 @@ pub(crate) fn admit_testd_attempt(
     let session = AuthenticatedTestdSession::bind(service, contour.principal_owner.as_str())
         .map_err(gate_error)?;
     handle_testd_admission_attempt(service, &session, request, now_unix_nanos).map_err(gate_error)
+}
+
+/// Rehydrates a TestD terminal completion against the retained Kernel launch,
+/// the current authenticated TestD session, and the durable TestD owner row.
+/// The transport request never supplies a task, operation, plan, or verdict.
+pub(crate) fn read_testd_terminal_completion(
+    service: &KernelService,
+    identity: &RequestIdentity,
+    request: &super::testd_terminal_completion_route::Request,
+) -> Result<super::testd_terminal_completion_route::Response, DispatchLaunchError> {
+    request
+        .validate()
+        .map_err(DispatchLaunchError::InvalidMaterial)?;
+    identity
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    if !matches!(
+        service.state(),
+        KernelServiceState::Ready | KernelServiceState::Degraded
+    ) {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel is outside the TestD terminal-completion admission state".to_owned(),
+        ));
+    }
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("testd front door"))?;
+    let _authenticated_session = AuthenticatedTestdSession::bind(
+        service,
+        contour.principal_owner.as_str(),
+    )
+    .map_err(gate_error)?;
+    let retained = {
+        let launches = launches_table(contour)?;
+        launches.by_identity.get(&request.job_id).cloned()
+    }
+    .ok_or_else(|| DispatchLaunchError::Gate("TestD launch owner is absent".to_owned()))?;
+    if retained.kind != DispatchedWorkerKind::Testd
+        || retained.identity != request.job_id
+        || !matches!(retained.phase, LaunchPhase::Launched | LaunchPhase::Reconciled)
+        || retained
+            .testd_admission
+            .as_ref()
+            .is_none_or(|admission| {
+                admission.job_id != request.job_id
+                    || admission.admission_digest != retained.admission_digest
+                    || admission.request_digest != retained.request_digest
+            })
+    {
+        return Err(DispatchLaunchError::Gate(
+            "terminal request does not bind the retained TestD launch".to_owned(),
+        ));
+    }
+    let admission = retained.testd_admission.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("retained TestD admission is absent".to_owned())
+    })?;
+    admission
+        .validate()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let current_generation = service
+        .activation_receipt()
+        .map(|receipt| receipt.generation.value())
+        .unwrap_or(0);
+    if current_generation == 0
+        || current_generation != admission.generation
+        || !service
+            .authority_epoch()
+            .is_same_authority(&admission.authority_epoch)
+    {
+        return Err(DispatchLaunchError::Gate(
+            "retained TestD launch is outside the live Kernel fence".to_owned(),
+        ));
+    }
+    let source_root = retained.testd_source_root.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("retained TestD source root is absent".to_owned())
+    })?;
+    if std::fs::canonicalize(source_root)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+        != *source_root
+    {
+        return Err(DispatchLaunchError::Gate(
+            "TestD source root changed after launch admission".to_owned(),
+        ));
+    }
+    let owner_path = source_root.join(".eliot").join("testd-state.redb");
+    if !owner_path.is_file() {
+        return Err(DispatchLaunchError::Gate(
+            "durable TestD owner file is absent".to_owned(),
+        ));
+    }
+    let store = TestdStore::open(&owner_path, RetryPolicy::default())
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let job = store
+        .get(&request.job_id)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+        .ok_or_else(|| DispatchLaunchError::Gate("durable TestD job is absent".to_owned()))?;
+    let binding = job.verifier_dispatch.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("pre-dispatch verifier owner binding is absent".to_owned())
+    })?;
+    binding
+        .validate_for_job(&job)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let invocation_bytes = canonical_json_bytes(&job.invocation)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let invocation_digest = sha256_hex(&invocation_bytes);
+    if job.invocation.profile != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+        || binding.request_identity != *identity
+        || binding.operation_id != job.process.operation_id.as_str()
+        || job.job_id != admission.job_id
+        || job.process.generation != admission.generation
+        || !job
+            .process
+            .authority_epoch
+            .is_same_authority(&admission.authority_epoch)
+        || job.process.invocation_digest != admission.invocation_digest
+        || invocation_digest != admission.invocation_digest
+        || job.target_roots.source_root.as_str() != source_root.to_string_lossy().as_ref()
+        || job.lease.is_some()
+        || !matches!(
+            job.state,
+            TestdJobState::Succeeded | TestdJobState::Failed | TestdJobState::Cancelled
+        )
+    {
+        return Err(DispatchLaunchError::Gate(
+            "durable TestD job is not the admitted terminal verifier".to_owned(),
+        ));
+    }
+    let verification = job.verification_receipt.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("durable TestD finish receipt is absent".to_owned())
+    })?;
+    let actual_receipt_digest = verification_receipt_sha256(verification)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if actual_receipt_digest != request.receipt_sha256 {
+        return Err(DispatchLaunchError::Gate(
+            "terminal request does not bind the exact TestD finish receipt".to_owned(),
+        ));
+    }
+    let publication = job.terminal_publication.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("durable TestD terminal handoff is absent".to_owned())
+    })?;
+    if publication.receipt_sha256 != request.receipt_sha256 {
+        return Err(DispatchLaunchError::Gate(
+            "durable terminal handoff binds a different finish receipt".to_owned(),
+        ));
+    }
+    if let Some(receipt_json) = &publication.committed_receipt_json {
+        let receipt: WriteReceipt = serde_json::from_str(receipt_json)
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        receipt
+            .validate()
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        let expected_operation = format!("{}/verifier-execution", binding.operation_id);
+        let expected_idempotency = format!(
+            "{}:verifier-execution",
+            binding.request_identity.idempotency_key
+        );
+        if receipt.status != WriteReceiptStatus::Committed
+            || receipt.operation_id.as_str() != expected_operation
+            || receipt.idempotency_key != expected_idempotency
+            || receipt.state_fence != identity.request.state_fence
+        {
+            return Err(DispatchLaunchError::Gate(
+                "stored terminal acknowledgement is not the exact committed Governor receipt"
+                    .to_owned(),
+            ));
+        }
+        return Ok(super::testd_terminal_completion_route::Response::Committed {
+            job_id: request.job_id.clone(),
+            receipt_sha256: request.receipt_sha256.clone(),
+            request_digest: request.request_digest.clone(),
+            receipt,
+        });
+    }
+    Ok(super::testd_terminal_completion_route::Response::Pending {
+        job_id: request.job_id.clone(),
+        receipt_sha256: request.receipt_sha256.clone(),
+        request_digest: request.request_digest.clone(),
+    })
 }
 
 /// Mints the I7.5/I15.2 launch nonce for one admitted identity.
@@ -1604,6 +1790,16 @@ pub fn prepare_doctor_launch(
             "dispatch child working directory must be non-blank".to_owned(),
         ));
     }
+    let testd_source_root = std::fs::canonicalize(material.working_directory).map_err(|error| {
+        DispatchLaunchError::InvalidMaterial(format!(
+            "testd source root cannot be canonicalized: {error}"
+        ))
+    })?;
+    if !testd_source_root.is_dir() {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "testd source root is not a directory".to_owned(),
+        ));
+    }
     let contour = DISPATCH_CONTOUR
         .get()
         .ok_or(DispatchLaunchError::Uncomposed("doctor front door"))?;
@@ -1714,6 +1910,7 @@ pub fn prepare_doctor_launch(
                 request_digest: material.attempt.request_digest.clone(),
                 effect_digest: admission.effect_digest.clone(),
                 material_path: None,
+                testd_source_root: None,
                 nonce: nonce.clone(),
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
@@ -2141,6 +2338,7 @@ pub async fn launch_admitted_doctor_attempt(
                     request_digest,
                     effect_digest: ready.admission.effect_digest.clone(),
                     material_path: Some(material_path),
+                    testd_source_root: None,
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&ready.operation_id),
                     phase: LaunchPhase::Launched,
@@ -2166,6 +2364,7 @@ pub async fn launch_admitted_doctor_attempt(
                     request_digest,
                     effect_digest: ready.admission.effect_digest.clone(),
                     material_path: Some(material_path),
+                    testd_source_root: None,
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&uncertain.operation_id),
                     phase: LaunchPhase::Unreconciled,
@@ -2399,6 +2598,11 @@ fn retain_launch(
                 existing.request_digest.clone_from(&record.request_digest);
                 existing.effect_digest.clone_from(&record.effect_digest);
                 existing.material_path.clone_from(&record.material_path);
+                if record.testd_source_root.is_some() {
+                    existing
+                        .testd_source_root
+                        .clone_from(&record.testd_source_root);
+                }
                 existing.testd_admission.clone_from(&record.testd_admission);
                 existing.native_receipt.clone_from(&record.native_receipt);
                 existing.native_request.clone_from(&record.native_request);
@@ -2783,6 +2987,7 @@ pub fn prepare_testd_launch(
                 request_digest: admission.request_digest.clone(),
                 effect_digest: None,
                 material_path: None,
+                testd_source_root: Some(testd_source_root.clone()),
                 nonce: nonce.clone(),
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
@@ -2850,7 +3055,7 @@ pub fn prepare_testd_launch(
         operation_id,
         executable: material.executable.to_path_buf(),
         executable_sha256: material.executable_sha256.to_owned(),
-        working_directory: material.working_directory.to_path_buf(),
+        working_directory: testd_source_root,
         material_path,
         authority_epoch,
         generation,
@@ -2938,6 +3143,7 @@ pub async fn launch_admitted_testd_attempt(
                     request_digest,
                     effect_digest: None,
                     material_path: Some(material_path),
+                    testd_source_root: Some(ready.working_directory.clone()),
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&ready.operation_id),
                     phase: LaunchPhase::Launched,
@@ -2963,6 +3169,7 @@ pub async fn launch_admitted_testd_attempt(
                     request_digest,
                     effect_digest: None,
                     material_path: Some(material_path),
+                    testd_source_root: Some(ready.working_directory.clone()),
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&uncertain.operation_id),
                     phase: LaunchPhase::Unreconciled,
@@ -3382,6 +3589,7 @@ pub fn prepare_native_worker_launch(
                 request_digest: material.request.request_digest.clone(),
                 effect_digest: None,
                 material_path: None,
+                testd_source_root: None,
                 nonce: nonce.clone(),
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
@@ -3541,6 +3749,7 @@ pub async fn launch_admitted_native_worker_attempt(
                     request_digest,
                     effect_digest: None,
                     material_path: Some(material_path),
+                    testd_source_root: None,
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&ready.operation_id),
                     phase: LaunchPhase::Launched,
@@ -3573,6 +3782,7 @@ pub async fn launch_admitted_native_worker_attempt(
                     request_digest,
                     effect_digest: None,
                     material_path: Some(material_path),
+                    testd_source_root: None,
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&uncertain.operation_id),
                     phase: LaunchPhase::Unreconciled,

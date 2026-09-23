@@ -2165,6 +2165,7 @@ dependencies = [
  "eliot-store-api",
  "eliot-store-memory",
  "eliot-store-surreal-adapter",
+ "eliot-testd-core",
  "redb",
  "secrecy",
  "serde",
@@ -3111,6 +3112,8 @@ dependencies = [
  "eliot-platform-windows",
  "eliot-process",
  "eliot-process-executor",
+ "eliot-protocol",
+ "eliot-store-api",
  "eliot-testd-core",
  "serde",
  "serde_json",
@@ -3126,6 +3129,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-process",
+ "eliot-protocol",
  "redb",
  "serde",
  "serde_json",
@@ -3151,8 +3155,8 @@ dependencies = [
 name = "eliot-understanding-assessment"
 version = "0.1.0"
 dependencies = [
- "eliot-contracts",
  "eliot-context-contracts",
+ "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-epistemic-contracts",
  "eliot-observation-contracts",
@@ -3317,6 +3321,7 @@ dependencies = [
  "eliot-dreamer-rival-model",
  "eliot-evaluation-contracts",
  "eliot-governor",
+ "eliot-instrument-api",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-maintenance",

@@ -72,7 +72,7 @@ use eliot_process::{
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
     Lease, NormalizedEvidence, RawArtifactStream, TestJob, TestdError, TestdStore,
-    TestdToolObservation,
+    TestdSourceObservation, TestdSourceObservationRange, TestdToolObservation,
     evaluate_testd_verification, issue_process_admission,
 };
 
@@ -560,7 +560,35 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
             return Ok(());
         }
     };
+    let source_observation = if current.invocation.profile
+        == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+    {
+        match current.source_observation_before.as_ref() {
+            Some(before) => match TestdSourceObservation::capture(&current.target_roots.source_root) {
+                Ok(after) => Some(TestdSourceObservationRange {
+                    before: before.clone(),
+                    after,
+                }),
+                Err(error) => {
+                    execution = ExecutionStatus::Unknown;
+                    reason = format!(
+                        "terminal source state was not observed after verifier execution: {error}"
+                    );
+                    None
+                }
+            },
+            None => {
+                execution = ExecutionStatus::Unknown;
+                reason = "productive verifier has no persisted pre-dispatch source observation"
+                    .to_owned();
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut receipt = collector.verification_receipt_at(job, execution, started_at, finished_at);
+    receipt.source_observation = source_observation;
     for handle in &synthetic {
         receipt.normalized.push(NormalizedEvidence {
             kind: "process.observation".to_owned(),

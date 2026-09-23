@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::{ArtifactId, ClockReading, ContractId, EpochId, RequestId};
+use eliot_contracts::{ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes};
 pub use eliot_instrument_api::KernelProcessAdmissionRequest;
 use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
@@ -15,12 +15,14 @@ use eliot_instrument_api::{
 use eliot_process::{
     EnvironmentInheritance, EnvironmentProjection, ProcessRequest, ResourceLimits,
 };
+use eliot_protocol::RequestIdentity;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -904,10 +906,382 @@ pub struct TestJob {
     /// artifact lineage after the worker has returned.
     #[serde(default)]
     pub verification_receipt: Option<VerificationReceipt>,
+    /// Exact request identity and canonical verifier plan captured before a
+    /// productive verifier is dispatched. The TestD owner stores the bytes;
+    /// the daemon rehydrates and compares the Governor-owned plan at publish.
+    #[serde(default)]
+    pub verifier_dispatch: Option<TestdVerifierDispatchBinding>,
+    /// Actual repository identity observed immediately before productive
+    /// worker claim. The terminal receipt must retain this exact baseline.
+    #[serde(default)]
+    pub source_observation_before: Option<TestdSourceObservation>,
+    /// Durable handoff to the daemon's canonical verifier-fact publisher.
+    /// A pending marker is never a completion receipt.
+    #[serde(default)]
+    pub terminal_publication: Option<TestdTerminalPublication>,
     /// Last durable mutation time.
     pub updated_at_ms: u64,
     /// Immutable digest of the submitted contracts and scheduling fields.
     pub payload_digest: String,
+}
+
+/// Immutable owner binding persisted before a productive verifier starts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdVerifierDispatchBinding {
+    pub request_identity: RequestIdentity,
+    pub operation_id: String,
+    pub canonical_plan_json: String,
+    pub canonical_plan_sha256: String,
+}
+
+/// Immutable observation of the source repository used by one verifier run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdSourceObservation {
+    pub repository_root: String,
+    pub branch: String,
+    pub commit: String,
+    pub dirty_state_sha256: String,
+}
+
+impl TestdSourceObservation {
+    /// Reads the live Git repository identity and a content-bound working-tree
+    /// digest. Any unavailable or oversized observation fails closed.
+    pub fn capture(repository_root: impl AsRef<Path>) -> Result<Self, TestdError> {
+        const MAX_GIT_OUTPUT: usize = 64 * 1024 * 1024;
+        let repository_root = std::fs::canonicalize(repository_root).map_err(|_| {
+            TestdError::Invalid {
+                field: "source_observation.repository_root",
+                reason: "source root cannot be canonicalized",
+            }
+        })?;
+        if !repository_root.is_dir() {
+            return Err(TestdError::Invalid {
+                field: "source_observation.repository_root",
+                reason: "source root is not a directory",
+            });
+        }
+        let run_git = |arguments: &[&str]| -> Result<Vec<u8>, TestdError> {
+            let mut command = Command::new("git");
+            command.current_dir(&repository_root);
+            for variable in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_PREFIX",
+                "GIT_CEILING_DIRECTORIES",
+                "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+                "GIT_EXTERNAL_DIFF",
+                "GIT_CONFIG",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_SYSTEM",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_NOSYSTEM",
+            ] {
+                command.env_remove(variable);
+            }
+            let output = command
+                .args(arguments)
+                .output()
+                .map_err(|_| TestdError::Invalid {
+                    field: "source_observation.git",
+                    reason: "Git could not be started for source observation",
+                })?;
+            if !output.status.success() || output.stdout.len() > MAX_GIT_OUTPUT {
+                return Err(TestdError::Invalid {
+                    field: "source_observation.git",
+                    reason: "Git source observation failed or exceeded its bound",
+                });
+            }
+            Ok(output.stdout)
+        };
+        let decode_text = |bytes: Vec<u8>, field| -> Result<String, TestdError> {
+            String::from_utf8(bytes)
+                .map(|value| value.trim().to_owned())
+                .map_err(|_| TestdError::Invalid {
+                    field,
+                    reason: "Git returned non-UTF-8 source identity",
+                })
+        };
+        let top_level = decode_text(
+            run_git(&["rev-parse", "--show-toplevel"] )?,
+            "source_observation.repository_root",
+        )?;
+        let observed_root = std::fs::canonicalize(top_level).map_err(|_| TestdError::Invalid {
+            field: "source_observation.repository_root",
+            reason: "Git repository root cannot be canonicalized",
+        })?;
+        if observed_root != repository_root {
+            return Err(TestdError::Invalid {
+                field: "source_observation.repository_root",
+                reason: "admitted source root is not the Git repository root",
+            });
+        }
+        let branch = decode_text(
+            run_git(&["rev-parse", "--abbrev-ref", "HEAD"] )?,
+            "source_observation.branch",
+        )?;
+        let branch = if branch == "HEAD" {
+            "detached".to_owned()
+        } else {
+            branch
+        };
+        let commit = decode_text(
+            run_git(&["rev-parse", "--verify", "HEAD^{commit}"] )?,
+            "source_observation.commit",
+        )?;
+        let status = run_git(&["status", "--porcelain=v2", "-z", "--untracked-files=all"])?;
+        let diff = run_git(&["diff", "--binary", "--no-ext-diff", "HEAD", "--"])?;
+        let untracked = run_git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let mut untracked_paths = untracked
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                String::from_utf8(path.to_vec()).map_err(|_| TestdError::Invalid {
+                    field: "source_observation.untracked_path",
+                    reason: "Git returned a non-UTF-8 untracked path",
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        untracked_paths.sort();
+        let mut hasher = Sha256::new();
+        hasher.update(b"eliot-testd-source-dirty-state-v1\0");
+        hash_source_part(&mut hasher, &status);
+        hash_source_part(&mut hasher, &diff);
+        for relative in untracked_paths {
+            let relative_path = Path::new(&relative);
+            if relative_path.is_absolute()
+                || relative_path.components().any(|component| {
+                    matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+                })
+            {
+                return Err(TestdError::Invalid {
+                    field: "source_observation.untracked_path",
+                    reason: "Git returned an untracked path outside the source root",
+                });
+            }
+            let path = repository_root.join(relative_path);
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| TestdError::Invalid {
+                field: "source_observation.untracked_path",
+                reason: "untracked source path cannot be observed",
+            })?;
+            hasher.update((relative.len() as u64).to_be_bytes());
+            hasher.update(relative.as_bytes());
+            if is_reparse_point(&metadata) {
+                let target = std::fs::read_link(&path).map_err(|_| TestdError::Invalid {
+                    field: "source_observation.untracked_path",
+                    reason: "untracked link target cannot be observed",
+                })?;
+                hasher.update(b"link\0");
+                hash_source_part(&mut hasher, target.to_string_lossy().as_bytes());
+            } else {
+                let bytes = std::fs::read(&path).map_err(|_| TestdError::Invalid {
+                    field: "source_observation.untracked_path",
+                    reason: "untracked file cannot be read for source observation",
+                })?;
+                if bytes.len() > MAX_GIT_OUTPUT {
+                    return Err(TestdError::Invalid {
+                        field: "source_observation.untracked_path",
+                        reason: "untracked file exceeds the source-observation bound",
+                    });
+                }
+                hasher.update(b"file\0");
+                hash_source_part(&mut hasher, &bytes);
+            }
+        }
+        let observation = Self {
+            repository_root: repository_root.to_string_lossy().into_owned(),
+            branch,
+            commit,
+            dirty_state_sha256: format!("{:x}", hasher.finalize()),
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    pub fn validate(&self) -> Result<(), TestdError> {
+        let commit_valid = matches!(self.commit.len(), 40 | 64)
+            && self
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !Path::new(&self.repository_root).is_absolute()
+            || self.branch.trim().is_empty()
+            || self.branch.chars().any(char::is_control)
+            || !commit_valid
+            || !is_binding_digest(&self.dirty_state_sha256)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Before/after source identity around one physical verifier execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdSourceObservationRange {
+    pub before: TestdSourceObservation,
+    pub after: TestdSourceObservation,
+}
+
+impl TestdSourceObservationRange {
+    pub fn validate(&self) -> Result<(), TestdError> {
+        self.before.validate()?;
+        self.after.validate()?;
+        if self.before.repository_root != self.after.repository_root {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn unchanged(&self) -> bool {
+        self.before == self.after
+    }
+}
+
+fn hash_source_part(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+impl TestdVerifierDispatchBinding {
+    /// Checks request, operation and plan identity against the durable job.
+    /// Governor must still re-read the live task and plan before publishing.
+    pub fn validate_for_job(&self, job: &TestJob) -> Result<(), TestdError> {
+        self.request_identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let metadata = &self.request_identity.request.metadata;
+        let Some(task_id) = metadata.task_id.as_ref() else {
+            return Err(TestdError::InvalidBinding);
+        };
+        let task_revision = self
+            .request_identity
+            .request
+            .state_fence
+            .task_revision
+            .as_ref()
+            .map(|revision| revision.value())
+            .ok_or(TestdError::InvalidBinding)?;
+        if self.operation_id.trim().is_empty()
+            || self.operation_id.chars().any(char::is_control)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        if metadata != &job.invocation.request
+            || self.request_identity.request.state_fence != job.invocation.request.state_fence
+            || self.operation_id != job.process.operation_id.as_str()
+            || task_revision == 0
+            || job.process.generation == 0
+            || !job
+                .process
+                .authority_epoch
+                .is_same_authority(&job.invocation.request.state_fence.authority_epoch)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let plan_value: serde_json::Value = serde_json::from_str(&self.canonical_plan_json)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let canonical = canonical_json_bytes(&plan_value)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let canonical_text =
+            String::from_utf8(canonical.clone()).map_err(|_| TestdError::InvalidBinding)?;
+        if canonical_text != self.canonical_plan_json
+            || sha256_hex(&canonical) != self.canonical_plan_sha256
+            || plan_value.get("task_id").and_then(serde_json::Value::as_str)
+                != Some(task_id.as_str())
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let verifier = plan_value
+            .get("verifier")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TestdError::InvalidBinding)?;
+        let invocation = serde_json::to_value(&job.invocation)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        for field in [
+            "instrument",
+            "kind",
+            "profile",
+            "target",
+            "arguments",
+            "declared_scope",
+            "input_artifacts",
+        ] {
+            if verifier.get(field) != invocation.get(field) {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        let evaluator = verifier
+            .get("evaluator")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TestdError::InvalidBinding)?;
+        let required_test_ids = verifier
+            .get("required_test_ids")
+            .and_then(serde_json::Value::as_array)
+            .filter(|ids| !ids.is_empty())
+            .ok_or(TestdError::InvalidBinding)?;
+        let mut unique_test_ids = BTreeSet::new();
+        for id in required_test_ids {
+            let id = id.as_str().ok_or(TestdError::InvalidBinding)?;
+            validate_text(id, "verifier_dispatch.required_test_id")?;
+            if !unique_test_ids.insert(id) {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        let planned = verifier
+            .get("planned")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TestdError::InvalidBinding)?;
+        let planned_id = planned
+            .get("verifier_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TestdError::InvalidBinding)?;
+        let planned_scope = planned
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TestdError::InvalidBinding)?;
+        let declared_scope = verifier
+            .get("declared_scope")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TestdError::InvalidBinding)?;
+        let config_hash = planned
+            .get("verifier_config_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TestdError::InvalidBinding)?;
+        if planned_id != evaluator
+            || planned_scope != declared_scope
+            || !is_binding_digest(config_hash)
+            || plan_value.get("work_scope_id").and_then(serde_json::Value::as_str).is_none()
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated terminal notification for the daemon completion poller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestdTerminalCompletionNotice {
+    pub job_id: String,
+    pub receipt_sha256: String,
+}
+
+/// Persisted completion handoff. The receipt body is stored only after the
+/// Governor returns a committed canonical WriteReceipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdTerminalPublication {
+    pub receipt_sha256: String,
+    #[serde(default)]
+    pub committed_receipt_json: Option<String>,
 }
 
 /// Contract spelling used by the test-execution-plane boundary.
@@ -1150,6 +1524,10 @@ pub struct VerificationReceipt {
     /// cannot be accepted without it.
     #[serde(default)]
     pub tool_observation: Option<TestdToolObservation>,
+    /// Actual repository identity immediately before and after the physical
+    /// verifier execution. A mismatch remains visible and cannot certify.
+    #[serde(default)]
+    pub source_observation: Option<TestdSourceObservationRange>,
     pub raw_artifacts: Vec<RawArtifact>,
     pub normalized: Vec<NormalizedEvidence>,
 }
@@ -1249,6 +1627,20 @@ impl VerificationReceipt {
             .map_err(|_| TestdError::InvalidBinding)?;
         if let Some(observation) = &self.tool_observation {
             observation.validate()?;
+        } else if job.invocation.profile == TESTD_PRODUCTIVE_PROFILE
+            && matches!(self.execution, ExecutionStatus::Succeeded)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(source) = &self.source_observation {
+            source.validate()?;
+            if source.before.repository_root != job.target_roots.source_root
+                || source.after.repository_root != job.target_roots.source_root
+                || (job.invocation.profile == TESTD_PRODUCTIVE_PROFILE
+                    && job.source_observation_before.as_ref() != Some(&source.before))
+            {
+                return Err(TestdError::InvalidBinding);
+            }
         } else if job.invocation.profile == TESTD_PRODUCTIVE_PROFILE
             && matches!(self.execution, ExecutionStatus::Succeeded)
         {
@@ -1460,6 +1852,7 @@ impl EvidenceCollector {
                 .tool_observation
                 .lock()
                 .map_or(None, |observation| observation.clone()),
+            source_observation: None,
             raw_artifacts,
             normalized,
         }
@@ -1674,7 +2067,325 @@ impl TestdStore {
                 serde_json::from_slice(value.value())
                     .map(Some)
                     .map_err(|error| TestdError::Corrupt(error.to_string()))
-            })
+        })
+    }
+
+    /// Attaches the exact Governor request and current plan before a
+    /// productive job can be claimed. Replays must supply byte-identical
+    /// binding; a changed binding under the same durable job id conflicts.
+    pub fn bind_verifier_dispatch(
+        &self,
+        job_id: &str,
+        binding: TestdVerifierDispatchBinding,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        if now == 0 {
+            return Err(TestdError::Invalid {
+                field: "verifier_dispatch",
+                reason: "binding time must be non-zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        binding.validate_for_job(&job)?;
+        if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE {
+            return Err(TestdError::Invalid {
+                field: "verifier_dispatch",
+                reason: "canonical verifier binding is only valid for productive nextest jobs",
+            });
+        }
+        if let Some(existing) = &job.verifier_dispatch {
+            if existing == &binding {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        if job.state != JobState::Queued || job.attempts != 0 || job.lease.is_some() {
+            return Err(TestdError::InvalidBinding);
+        }
+        job.verifier_dispatch = Some(binding);
+        job.updated_at_ms = now;
+        let encoded = serde_json::to_vec(&job)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job_id, encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(JobState::Queued),
+            JobState::Queued,
+            "verifier-dispatch-owner",
+            now,
+            Some("immutable canonical verifier plan bound before dispatch".to_owned()),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
+    /// Persists the real source identity before the first productive claim.
+    /// An exact retry is idempotent; any changed source snapshot or post-claim
+    /// rewrite is rejected.
+    pub fn bind_source_observation_before_dispatch(
+        &self,
+        job_id: &str,
+        observation: TestdSourceObservation,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        observation.validate()?;
+        if now == 0 {
+            return Err(TestdError::Invalid {
+                field: "source_observation",
+                reason: "observation time must be non-zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+            || job.verifier_dispatch.is_none()
+            || job.state != JobState::Queued
+            || job.attempts != 0
+            || job.lease.is_some()
+            || job.target_roots.source_root != observation.repository_root
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(existing) = &job.source_observation_before {
+            if existing == &observation {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        job.source_observation_before = Some(observation);
+        job.updated_at_ms = now;
+        let encoded = serde_json::to_vec(&job)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job_id, encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(JobState::Queued),
+            JobState::Queued,
+            "verifier-source-observation",
+            now,
+            Some("actual branch, commit, and dirty state captured before dispatch".to_owned()),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
+    /// Records one authenticated terminal notification. Only a terminal row
+    /// with a full durable verification receipt and the exact active launch
+    /// fence can enter the daemon publication queue.
+    pub fn request_terminal_publication(
+        &self,
+        job_id: &str,
+        receipt_sha256: &str,
+        authority_epoch: &EpochId,
+        generation: u64,
+        operation_id: &str,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        if !is_binding_digest(receipt_sha256) {
+            return Err(TestdError::Invalid {
+                field: "terminal_publication.receipt_sha256",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        validate_text(operation_id, "terminal_publication.operation_id")?;
+        if generation == 0 || now == 0 {
+            return Err(TestdError::InvalidBinding);
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        let terminal = matches!(job.state, JobState::Succeeded | JobState::Failed | JobState::Cancelled);
+        let Some(binding) = job.verifier_dispatch.as_ref() else {
+            return Err(TestdError::InvalidBinding);
+        };
+        binding.validate_for_job(&job)?;
+        let receipt = job
+            .verification_receipt
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?;
+        if !terminal
+            || job.lease.is_some()
+            || job.process.generation != generation
+            || !job.process.authority_epoch.is_same_authority(authority_epoch)
+            || job.process.operation_id.as_str() != operation_id
+            || verification_receipt_sha256(receipt)? != receipt_sha256
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(existing) = &job.terminal_publication {
+            if existing.receipt_sha256 == receipt_sha256 {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        job.terminal_publication = Some(TestdTerminalPublication {
+            receipt_sha256: receipt_sha256.to_owned(),
+            committed_receipt_json: None,
+        });
+        job.updated_at_ms = now;
+        let encoded = serde_json::to_vec(&job)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job_id, encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(job.state),
+            job.state,
+            "authenticated-testd-terminal",
+            now,
+            Some(format!("receipt-sha256={receipt_sha256}")),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
+    /// Returns pending terminal notifications in stable job-id order for the
+    /// daemon's reactive completion feed.
+    pub fn pending_terminal_publications(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<TestdTerminalCompletionNotice>, TestdError> {
+        if limit == 0 || limit > 256 {
+            return Err(TestdError::Invalid {
+                field: "terminal_publication.limit",
+                reason: "must be between one and 256",
+            });
+        }
+        let read = self.database.begin_read().map_err(database)?;
+        let table = read.open_table(JOBS).map_err(database)?;
+        let mut pending = Vec::new();
+        for item in table.iter().map_err(database)? {
+            let (key, value) = item.map_err(database)?;
+            let job: TestJob = serde_json::from_slice(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            if job.job_id != key.value() {
+                return Err(corrupt("durable job key conflicts with record"));
+            }
+            if let Some(publication) = job.terminal_publication
+                && publication.committed_receipt_json.is_none()
+            {
+                pending.push(TestdTerminalCompletionNotice {
+                    job_id: job.job_id,
+                    receipt_sha256: publication.receipt_sha256,
+                });
+            }
+        }
+        pending.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        pending.truncate(limit);
+        Ok(pending)
+    }
+
+    /// Stores the exact serialized canonical WriteReceipt after the daemon
+    /// publisher has returned from its committed owner boundary.
+    pub fn record_terminal_publication_receipt(
+        &self,
+        job_id: &str,
+        receipt_sha256: &str,
+        committed_receipt_json: String,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        if !is_binding_digest(receipt_sha256) {
+            return Err(TestdError::Invalid {
+                field: "terminal_publication.receipt_sha256",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        if now == 0 {
+            return Err(TestdError::InvalidBinding);
+        }
+        let receipt_value: serde_json::Value = serde_json::from_str(&committed_receipt_json)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let canonical = canonical_json_bytes(&receipt_value).map_err(|_| TestdError::InvalidBinding)?;
+        if String::from_utf8(canonical.clone()).map_err(|_| TestdError::InvalidBinding)?
+            != committed_receipt_json
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        let publication = job
+            .terminal_publication
+            .as_mut()
+            .ok_or(TestdError::InvalidBinding)?;
+        if publication.receipt_sha256 != receipt_sha256 {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(existing) = &publication.committed_receipt_json {
+            if existing == &committed_receipt_json {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        publication.committed_receipt_json = Some(committed_receipt_json);
+        job.updated_at_ms = now;
+        let encoded = serde_json::to_vec(&job)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job_id, encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(job.state),
+            job.state,
+            "governor-verifier-fact-receipt",
+            now,
+            Some(format!("write-receipt-sha256={}", sha256_hex(&canonical))),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
     }
 
     /// Submits a job exactly once and assigns its project-local sequence.
@@ -1785,6 +2496,9 @@ impl TestdStore {
             verification: None,
             receipt: None,
             verification_receipt: None,
+            verifier_dispatch: None,
+            source_observation_before: None,
+            terminal_publication: None,
             updated_at_ms: at_ms,
             payload_digest: digest,
         };
@@ -1821,7 +2535,14 @@ impl TestdStore {
         // it needs a fresh claim, lease, and permit binding.
         self.reconcile_expired_running_all(now)?;
         let candidates = self.ready_heads(now)?;
-        let Some(candidate) = candidates.into_iter().max_by(compare_ready) else {
+        let Some(candidate) = candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+                    || candidate.verifier_dispatch.is_some()
+            })
+            .max_by(compare_ready)
+        else {
             return Ok(None);
         };
         let mut job = candidate;
@@ -2584,6 +3305,16 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         output.push_str(&format!("{byte:02x}"));
     }
     output
+}
+
+/// Hashes the canonical durable finish receipt used by the authenticated
+/// TestD terminal notification.
+pub fn verification_receipt_sha256(
+    receipt: &VerificationReceipt,
+) -> Result<String, TestdError> {
+    let bytes = canonical_json_bytes(receipt)
+        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
 }
 
 /// Computes a length-domain-separated SHA-256 digest for one raw artifact.

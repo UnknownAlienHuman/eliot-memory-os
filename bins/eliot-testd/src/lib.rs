@@ -27,18 +27,20 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
-    EvidenceCollector, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
+    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
     KernelProcessAdmissionRequest, Lease, ProcessAdmissionPermit, RetryPolicy, TargetRoots,
-    TestJob, TestdError, TestdStore, is_admitted_testd_profile, issue_process_admission,
-    testd_profile_binding, testd_profile_environment, testd_profile_resource_limits,
+    TestJob, TestdError, TestdSourceObservation, TestdStore, is_admitted_testd_profile,
+    issue_process_admission,
+    testd_profile_binding, testd_profile_resource_limits,
     validate_running_lease,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use eliot_testd_core::{
-    NormalizedEvidence, RawArtifact, TestdToolObservation, VerificationReceipt, sha256_artifact,
-    sha256_hex,
+    NormalizedEvidence, RawArtifact, TestdToolObservation, VerificationReceipt,
+    TestdVerifierDispatchBinding, TestdTerminalCompletionNotice, sha256_artifact, sha256_hex,
+    verification_receipt_sha256,
 };
 
 pub mod kernel_client;
@@ -46,7 +48,9 @@ pub mod testd_material;
 pub mod worker;
 pub use kernel_client::{
     KernelTestdIpcClient, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_OPERATION,
-    TESTD_ADMISSION_OPERATION_VERSION, advertise_testd_admission, route_testd_admission,
+    TESTD_ADMISSION_OPERATION_VERSION, TESTD_TERMINAL_COMPLETION_OPERATION,
+    TESTD_TERMINAL_COMPLETION_OPERATION_VERSION, TestdTerminalCompletionRequest,
+    TestdTerminalCompletionResponse, advertise_testd_admission, route_testd_admission,
 };
 pub use worker::{ADMITTED_WORKER_LEASE_MS, drive_admitted_one_shot};
 
@@ -303,6 +307,10 @@ pub struct TestdJobRequest {
     pub invocation: InstrumentInvocation,
     pub target_contract: TargetContract,
     pub priority: i32,
+    /// Governor owner binding persisted before a productive verifier can be
+    /// claimed. Probe jobs may omit it; productive nextest jobs fail closed.
+    #[serde(default)]
+    pub verifier_dispatch: Option<TestdVerifierDispatchBinding>,
 }
 
 /// A candidate receipt returned by testd after durable admission/observation.
@@ -378,6 +386,14 @@ impl TestdComposition {
                 reason: "profile argument limit exceeded",
             });
         }
+        if request.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+            && request.verifier_dispatch.is_none()
+        {
+            return Err(TestdError::Invalid {
+                field: "verifier_dispatch",
+                reason: "productive verifier dispatch requires a persisted canonical owner binding",
+            });
+        }
         let admission_request = KernelProcessAdmissionRequest {
             job_id: request.job_id.clone(),
             project_id: request.project_id.clone(),
@@ -399,6 +415,12 @@ impl TestdComposition {
             request.priority,
             unix_ms(),
         )?;
+        let job = match request.verifier_dispatch {
+            Some(binding) => self
+                .store
+                .bind_verifier_dispatch(&job.job_id, binding, unix_ms())?,
+            None => job,
+        };
         Ok(receipt(&job))
     }
 
@@ -1410,6 +1432,12 @@ pub enum ValidatedDispatchDriveOutcome {
         /// Echo of the admitted job identity.
         job_id: String,
     },
+    /// The admitted process reached a terminal failure and its durable
+    /// verification receipt remains eligible for Governor evaluation.
+    Failed {
+        /// Echo of the admitted job identity.
+        job_id: String,
+    },
     /// A cancelled admission was projected without executing.
     Cancelled {
         /// Echo of the admitted job identity.
@@ -1469,12 +1497,18 @@ pub async fn drive_validated_dispatch_material(
     let source_root = Path::new(source_root);
     let store_path = testd_store_path(source_root)?;
     let store = TestdStore::open(store_path, RetryPolicy::default())?;
-    let job = store
+    let mut job = store
         .get(&material.job_id)?
         .ok_or_else(|| TestdError::Invalid {
             field: "job_id",
             reason: "admitted dispatch has no canonical TestD job row",
         })?;
+    if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        job.verifier_dispatch
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?
+            .validate_for_job(&job)?;
+    }
     job.target_roots.validate()?;
     let observed_source = std::fs::canonicalize(source_root).map_err(|_| TestdError::Invalid {
         field: "source_root",
@@ -1495,6 +1529,21 @@ pub async fn drive_validated_dispatch_material(
             .is_same_authority(&material.epoch)
     {
         return Err(TestdError::InvalidBinding);
+    }
+    if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        if let Some(observation) = &job.source_observation_before {
+            observation.validate()?;
+            if std::path::Path::new(&observation.repository_root) != canonical_job_source {
+                return Err(TestdError::InvalidBinding);
+            }
+        } else {
+            let observation = TestdSourceObservation::capture(&canonical_job_source)?;
+            job = store.bind_source_observation_before_dispatch(
+                &job.job_id,
+                observation,
+                now_unix_ms,
+            )?;
+        }
     }
     let program_path = if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
@@ -1564,6 +1613,9 @@ pub async fn drive_validated_dispatch_material(
         "Succeeded" => Ok(ValidatedDispatchDriveOutcome::Completed {
             job_id: receipt.job_id,
         }),
+        "Failed" => Ok(ValidatedDispatchDriveOutcome::Failed {
+            job_id: receipt.job_id,
+        }),
         "Cancelled" => Ok(ValidatedDispatchDriveOutcome::Cancelled {
             job_id: receipt.job_id,
         }),
@@ -1574,6 +1626,61 @@ pub async fn drive_validated_dispatch_material(
             "durable TestD worker returned non-terminal state {state}"
         ))),
     }
+}
+
+/// Production one-shot entry: executes the durable admitted job and then
+/// waits on the same authenticated Kernel session for the daemon's committed
+/// verifier-fact WriteReceipt. Worker terminal state alone never maps to a
+/// successful return from this entry.
+pub async fn drive_validated_dispatch_material_with_terminal_publisher(
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    source_root: &str,
+    now_unix_ms: u64,
+    client: &mut crate::kernel_client::KernelTestdIpcClient,
+) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    let outcome = drive_validated_dispatch_material(material, source_root, now_unix_ms).await?;
+    let job_id = match &outcome {
+        ValidatedDispatchDriveOutcome::Completed { job_id }
+        | ValidatedDispatchDriveOutcome::Failed { job_id }
+        | ValidatedDispatchDriveOutcome::Cancelled { job_id } => Some(job_id.as_str()),
+        ValidatedDispatchDriveOutcome::ReconcileRequired { .. } => None,
+    };
+    let Some(job_id) = job_id else {
+        return Ok(outcome);
+    };
+    let store_path = testd_store_path(Path::new(source_root))?;
+    let store = TestdStore::open(store_path, RetryPolicy::default())?;
+    let job = store
+        .get(job_id)?
+        .ok_or_else(|| TestdError::Corrupt("terminal TestD job disappeared".to_owned()))?;
+    if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        let binding = job
+            .verifier_dispatch
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?
+            .clone();
+        let receipt = job
+            .verification_receipt
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?;
+        let notice = eliot_testd_core::TestdTerminalCompletionNotice {
+            job_id: job.job_id.clone(),
+            receipt_sha256: verification_receipt_sha256(receipt)?,
+        };
+        store.request_terminal_publication(
+            &job.job_id,
+            &notice.receipt_sha256,
+            &job.process.authority_epoch,
+            job.process.generation,
+            job.process.operation_id.as_str(),
+            unix_ms(),
+        )?;
+        drop(store);
+        client
+            .publish_terminal_completion(&notice, &binding, &job)
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+    }
+    Ok(outcome)
 }
 
 /// Returns the daemon-owned durable TestD state path for an admitted source
@@ -2022,6 +2129,7 @@ mod tests {
                     cache_root: build.clone(),
                 },
                 priority: 0,
+                verifier_dispatch: None,
             })
             .unwrap();
         AdmittedDriveFixture {
