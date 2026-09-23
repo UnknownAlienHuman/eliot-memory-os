@@ -23,6 +23,11 @@ mod host_composition_phase_b;
 #[cfg(windows)]
 mod host_composition_store_recovery;
 mod host_composition_validation;
+/// Authenticated Kernel ORS introduction readback for cutover evidence
+/// (issue #961, F-AUR-1). Windows-only like its transport contour: the
+/// Kernel front-door channel exists only on Windows.
+#[cfg(windows)]
+mod introduction_readback;
 /// Host structured diagnostics facade (F-LOG-HOST-0, #889): compiled
 /// once here and imported by the binary; later leaves extend through their
 /// own serialized turns, never a second copy.

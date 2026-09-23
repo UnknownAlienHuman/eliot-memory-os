@@ -660,6 +660,36 @@ pub fn execute_cutover(
         Some(active) if *active == validated.request.expected_predecessor => {}
         Some(_) | None => return Err(CutoverError::ExpectedPredecessorConflict),
     }
+    // F-AUR-1 live owner readback (not shape trust): reload every presented
+    // introduction from the canonical ORS owner through the authenticated
+    // Kernel front door and compare subject, fence, order, and phase before
+    // the barrier below. An empty presented list verifies vacuously.
+    let presented = &validated.evidence.fenced_introductions;
+    if !presented.is_empty() {
+        let subjects: Vec<String> = presented
+            .iter()
+            .map(|introduction| introduction.record().subject_id.as_str().to_owned())
+            .collect();
+        let live = super::introduction_readback::read_live_introductions(
+            host,
+            &validated.request.activation_fence,
+            &subjects,
+        )
+        .map_err(|_| CutoverError::AuthorityOrReadinessMissing)?;
+        for introduction in presented {
+            let subject = introduction.record().subject_id.as_str();
+            let current = live.iter().find(|row| row.subject_id == subject).ok_or(
+                CutoverError::PriorAuthorityStillActive,
+            )?;
+            if current.phase != "FENCED"
+                || introduction.phase() != OperationalPhase::Fenced
+                || current.fence_digest != introduction.record().state_fence.sha256
+                || current.operation_order < introduction.operation_order()
+            {
+                return Err(CutoverError::PriorAuthorityStillActive);
+            }
+        }
+    }
     if retirement.activation_id != *activation_id {
         return Err(CutoverError::BindingMismatch);
     }
