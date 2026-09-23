@@ -100,8 +100,8 @@ pub use backup_restore_admission::{
     mint_restore_admission, require_restore_transition_class,
 };
 pub use backup_restore_driver::{
-    CoordinationCommit, ProductionRestoreOutcome, ProductionRestoreRequest, RestoreImport,
-    RestoreImportOutcome, drive_production_restore,
+    CoordinationCommit, DispatchTargetDescriptors, ProductionRestoreOutcome, ProductionRestoreRequest,
+    RestoreImport, RestoreImportOutcome, dispatch_production_restore, drive_production_restore,
 };
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
