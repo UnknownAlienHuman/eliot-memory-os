@@ -627,10 +627,12 @@ impl CanonicalStoreImportClient {
         Ok(())
     }
 
-    /// Enforces one Governor-minted restore admission against the exact
-    /// transition it is presented for, shared by the restore import and
-    /// coordination commit wires: same destination binding, same
-    /// transition identity, same fence, and a self-consistent decision.
+    /// Enforces one Governor-minted restore admission against the
+    /// destination and fence it is presented for, shared by the restore
+    /// import and coordination commit wires. Identity binding is enforced
+    /// by each wire separately: imports link by decision-digest reference
+    /// (per-import identities stay distinct), while the coordination
+    /// commit requires full triple equality (single-anchor rule).
     /// Divergence conflicts here, never at the store.
     fn check_restore_admission(
         &self,
@@ -641,9 +643,6 @@ impl CanonicalStoreImportClient {
             return Err(BackupError::FenceMismatch {
                 subject: "destination authorization".to_owned(),
             });
-        }
-        if admission.identity() != &transition.identity {
-            return Err(BackupError::PlanMismatch);
         }
         if admission.fence() != &transition.state_fence {
             return Err(BackupError::FenceMismatch {
@@ -671,18 +670,22 @@ impl CanonicalStoreImportClient {
     /// Executes one Governor-admitted restore transition through the gateway.
     ///
     /// The admitted-restore wire: restore imports run only under a
-    /// Governor-minted [`KernelRestoreAdmission`] bound to this exact
-    /// transition, destination, and fence. The admission is enforced here
-    /// before any store effect — a restore-class transition without one,
-    /// an admission bound to a different transition or destination, a
-    /// fence-diverged admission, or a diverged decision digest refuses
-    /// (conflict, never retry-as-same). The journal anchor is re-fetched
-    /// live below: the importer reads the owner-held stream binding from
-    /// the journal handle at import time and requires it to anchor the
-    /// presented admission, so a self-consistent admission the journal
-    /// does not anchor refuses with `RestoreJournalMismatch`. Ordinary
-    /// canonical imports keep using [`Self::import_transition`]; this wire
-    /// never admits them.
+    /// Governor-minted [`KernelRestoreAdmission`] covering this import.
+    /// Each import carries the admission's decision digest in its proof
+    /// handles (set by the Governor builder); an import that does not
+    /// reference the enforced admission refuses here. The admission
+    /// itself is enforced for destination, fence, and decision before
+    /// any store effect — a fence-diverged admission or a diverged
+    /// decision digest refuses (conflict, never retry-as-same). The
+    /// journal anchor is re-fetched live below: the importer reads the
+    /// owner-held stream binding from the journal handle at import time
+    /// and requires it to anchor the presented admission, so a
+    /// self-consistent admission the journal does not anchor refuses
+    /// with `RestoreJournalMismatch`. Per-import transition identities
+    /// stay distinct (idempotency per import); the single restore
+    /// identity lives in the admission and the coordination row, never
+    /// duplicated. Ordinary canonical imports keep using
+    /// [`Self::import_transition`]; this wire never admits them.
     pub async fn import_restore_transition(
         &self,
         verified: &VerifiedDestinationBinding,
@@ -701,6 +704,20 @@ impl CanonicalStoreImportClient {
             .map_err(OwnerChannelError::Backup)?;
         require_restore_transition_class(&transition).map_err(OwnerChannelError::Backup)?;
         if transition.identity.operation_id != *operation_id {
+            return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
+        }
+        // Admission reference: the import must carry this admission's
+        // decision digest in its proof handles (bound by the Governor
+        // builder). Per-import identities stay distinct for idempotent
+        // replay; the admission is linked by digest reference, never by
+        // identity equality — there is deliberately one restore identity,
+        // carried by the admission and the coordination row, not one per
+        // import.
+        if !transition
+            .required_proof_and_approval_refs
+            .iter()
+            .any(|proof| proof == admission.decision_digest())
+        {
             return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
         }
         self.check_restore_admission(&transition, admission)
@@ -755,6 +772,13 @@ impl CanonicalStoreImportClient {
         }
         self.check_restore_admission(&transition, admission)
             .map_err(OwnerChannelError::Backup)?;
+        // Single-anchor rule: the coordination transition commits UNDER
+        // the restore identity — full triple equality, no second
+        // identity. The bridge fetches the coordination receipt by this
+        // exact identity.
+        if admission.identity() != &transition.identity {
+            return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
+        }
         // Decision binding: the decision links this exact admission and
         // transition — operation, payload, destination, and fence must all
         // agree across decision, admission, and transition, or the commit

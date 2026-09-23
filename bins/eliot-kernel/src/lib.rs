@@ -45,6 +45,7 @@ mod backup_owner_clients;
 mod backup_coordination;
 mod backup_restore;
 mod backup_restore_admission;
+mod backup_restore_driver;
 mod backup_restore_ports;
 mod blob_store_controller;
 mod canonical_store_runtime;
@@ -78,6 +79,10 @@ pub use backup_restore_admission::{
     KernelRestoreAdmission, RESTORE_ADMISSION_CLASS_MARKER, RESTORE_ADMISSION_DECISION_DOMAIN,
     RESTORE_ADMISSION_WIRE_MARKER, RestoreAdmissionMintRequest, RestoreProvisioningProof,
     mint_restore_admission, require_restore_transition_class,
+};
+pub use backup_restore_driver::{
+    CoordinationCommit, ProductionRestoreOutcome, ProductionRestoreRequest, RestoreImport,
+    RestoreImportOutcome, drive_production_restore,
 };
 pub use backup_restore_ports::{
     DestinationManifestEvidence, KernelIsolatedDestination, KernelRestoreError, KernelRestoreJournal,

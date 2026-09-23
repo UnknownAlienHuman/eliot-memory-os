@@ -84,7 +84,7 @@
 //! no `Value`-based escapes.
 
 use eliot_backup::{BackupBundle, BackupError, RestorePlan};
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{OperationId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_store_api::{OperationIdentity, PreparedTransition, TransitionClass};
 
 use super::backup_owner_clients::VerifiedDestinationBinding;
@@ -175,9 +175,9 @@ impl RestoreProvisioningProof {
 /// is the caller's live fence checked for currency; the journal handle
 /// supplies the owner-held stream binding by live readback; the
 /// destination is the constructed isolated root bound to the plan target;
-/// the provisioning proof carries the destination-store attestations; the
-/// transition identity is the exact Governor-built import identity being
-/// admitted and is bound, never invented.
+/// the provisioning proof carries the destination-store attestations.
+/// The restore identity is minter-built below (deterministic per plan),
+/// never caller-supplied.
 pub struct RestoreAdmissionMintRequest<'a> {
     /// Compiled restore plan being admitted.
     pub plan: &'a RestorePlan,
@@ -193,9 +193,6 @@ pub struct RestoreAdmissionMintRequest<'a> {
     pub live_fence: &'a StateFence,
     /// Destination-store provisioning attestations.
     pub provisioning: RestoreProvisioningProof,
-    /// Exact import identity being admitted (from the Governor-built
-    /// transition, never minted here).
-    pub transition_identity: OperationIdentity,
 }
 
 /// Governor-minted restore admission for one kernel store import.
@@ -368,7 +365,10 @@ impl KernelRestoreAdmission {
 /// Mints one Governor-side restore admission from live owner state.
 ///
 /// Pure constructor: validates every binding and returns the admission —
-/// no journal write, no store effect, no staging. Each load-bearing field
+/// no journal write, no store effect, no staging. The restore identity
+/// is built here deterministically from the plan (receipt key == stream
+/// key), so resume replays converge instead of minting twice; callers
+/// supply no identity material at all. Each other load-bearing field
 /// is either recomputed from owner-held state (bundle digest, journal
 /// stream binding, writer fence digest, destination digest) or
 /// cross-bound against at least two independent owner sources (plan,
@@ -386,7 +386,6 @@ pub fn mint_restore_admission(
         destination,
         live_fence,
         provisioning,
-        transition_identity,
     } = request;
     non_blank(&plan.plan_id, "restore.plan_id")?;
     non_blank(&plan.target.target_id, "restore.target_id")?;
@@ -395,6 +394,33 @@ pub fn mint_restore_admission(
     if bundle_sha256 != plan.bundle_sha256 {
         return Err(BackupError::PlanMismatch);
     }
+    let transaction = plan.transaction()?;
+    // Minter-built restore identity (single-anchor rule): deterministic
+    // per plan, so resume replays converge on the same identity instead
+    // of minting a second one. The operation id is the stable
+    // transaction identity (receipt key == stream key by construction);
+    // the idempotency key repeats it; the canonical request hash binds
+    // plan, transaction, bundle, and target. Never caller-supplied.
+    let operation_id =
+        OperationId::new(transaction.transaction_id.clone()).map_err(|_| {
+            BackupError::InvalidField {
+                field: "restore.operation_id",
+                reason: "restore transaction identity is not a valid operation identity",
+            }
+        })?;
+    let payload_material = (
+        plan.plan_id.as_str(),
+        transaction.transaction_id.as_str(),
+        bundle_sha256.as_str(),
+        plan.target.target_id.as_str(),
+    );
+    let payload_bytes = canonical_json_bytes(&payload_material)
+        .map_err(|error| BackupError::Serialization(error.to_string()))?;
+    let transition_identity = OperationIdentity {
+        operation_id,
+        idempotency_key: transaction.transaction_id.clone(),
+        canonical_request_hash: sha256_hex(&payload_bytes),
+    };
     transition_identity.validate().map_err(BackupError::Store)?;
     provisioning.validate()?;
     // Isolated destination binding: the constructed root answers to the
@@ -439,7 +465,6 @@ pub fn mint_restore_admission(
         .read_durable_binding(stream)
         .map_err(|error| BackupError::Target(error.to_string()))?
         .ok_or(BackupError::RestoreJournalMismatch)?;
-    let transaction = plan.transaction()?;
     if durable.transaction_id != transaction.transaction_id {
         return Err(BackupError::PlanMismatch);
     }
