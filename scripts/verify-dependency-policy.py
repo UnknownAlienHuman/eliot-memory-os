@@ -402,6 +402,8 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
         if isinstance(pkg_name, str) and pkg_name:
             internal_crates.add(pkg_name)
 
+    parsed_by_path = {path.resolve(): data for path, data in parsed_manifests}
+
     def add_dependency_table(
         dependencies: object,
         manifest_path: str,
@@ -410,6 +412,7 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
         target: str,
         root_workspace_member: bool,
         resolver_workspace_root: str | None,
+        workspace_dependencies: dict,
     ) -> None:
         if not isinstance(dependencies, dict):
             if dependencies is not None:
@@ -433,7 +436,7 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
                         )
                     )
                     continue
-                inherited = ws_deps.get(declared_name)
+                inherited = workspace_dependencies.get(declared_name)
                 if isinstance(inherited, str):
                     effective_spec = {"version": inherited}
                 elif isinstance(inherited, dict):
@@ -448,9 +451,28 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
                         )
                     )
                     continue
-                effective_spec.update(
-                    {key: value for key, value in spec.items() if key != "workspace"}
-                )
+                member_overrides = {
+                    key: value for key, value in spec.items() if key != "workspace"
+                }
+                if "features" in member_overrides:
+                    inherited_features = effective_spec.get("features", [])
+                    member_features = member_overrides.pop("features")
+                    if (
+                        isinstance(inherited_features, list)
+                        and isinstance(member_features, list)
+                    ):
+                        # Cargo workspace dependency features are additive in members.
+                        effective_spec["features"] = [
+                            *inherited_features,
+                            *member_features,
+                        ]
+                    elif not isinstance(inherited_features, list):
+                        # Preserve malformed inherited data so validation fails closed.
+                        effective_spec["features"] = inherited_features
+                    else:
+                        # Preserve malformed member data so validation fails closed.
+                        effective_spec["features"] = member_features
+                effective_spec.update(member_overrides)
             elif not isinstance(spec, (str, dict)):
                 findings.append(
                     Finding(
@@ -470,7 +492,6 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
             if not isinstance(package_name, str) or not package_name:
                 findings.append(Finding("DEP-003", manifest_path, 1, f"dependency alias '{declared_name}' has no valid package identity"))
                 continue
-            internal = package_name in internal_crates
             raw_features = effective_spec.get("features", []) if isinstance(effective_spec, dict) else []
             if not isinstance(raw_features, list) or any(not isinstance(feature, str) for feature in raw_features):
                 findings.append(Finding("DEP-003", manifest_path, 1, f"dependency '{declared_name}' has malformed feature metadata"))
@@ -492,9 +513,16 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
                     else "registry" if "version" in effective_spec or "registry" in effective_spec
                     else "unspecified"
                 )
+            internal = package_name in internal_crates and source_kind == "path"
             if version_requirement is not None and not isinstance(version_requirement, str):
                 findings.append(Finding("DEP-003", manifest_path, 1, f"dependency '{declared_name}' has a malformed version requirement"))
                 version_requirement = None
+            source_spec = {}
+            if isinstance(effective_spec, dict):
+                for key in ("path", "git", "branch", "tag", "rev", "registry"):
+                    value = effective_spec.get(key)
+                    if isinstance(value, str) and value.strip():
+                        source_spec[key] = value
             dependency_edges.append(
                 {
                     "consumer": consumer,
@@ -505,6 +533,7 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
                     "target": target,
                     "version_requirement": version_requirement,
                     "source_kind": source_kind,
+                    "source_spec": source_spec,
                     "features": sorted(set(raw_features)),
                     "optional": optional,
                     "default_features": default_features,
@@ -542,6 +571,25 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
                 except (OSError, ValueError):
                     resolver_workspace_root = None
         contextual_manifests.append((cpath, data, is_root_member, resolver_workspace_root))
+        if is_root_member:
+            workspace_dependencies = ws_deps
+        elif isinstance(resolver_workspace_root, str) and resolver_workspace_root:
+            workspace_dir = root if resolver_workspace_root == "." else root / Path(resolver_workspace_root)
+            workspace_data = parsed_by_path.get((workspace_dir / "Cargo.toml").resolve(), {})
+            workspace_table = workspace_data.get("workspace", {}) if isinstance(workspace_data, dict) else {}
+            workspace_dependencies = workspace_table.get("dependencies", {}) if isinstance(workspace_table, dict) else {}
+            if not isinstance(workspace_dependencies, dict):
+                findings.append(
+                    Finding(
+                        "DEP-003",
+                        (workspace_dir / "Cargo.toml").relative_to(root).as_posix(),
+                        1,
+                        "standalone workspace dependencies must be a table",
+                    )
+                )
+                workspace_dependencies = {}
+        else:
+            workspace_dependencies = {}
         package = data.get("package", {})
         consumer = package.get("name") if isinstance(package, dict) else None
         if not isinstance(consumer, str) or not consumer:
@@ -549,7 +597,7 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
         for section in ("dependencies", "dev-dependencies", "build-dependencies"):
             add_dependency_table(
                 data.get(section, {}), manifest_path, consumer, section, "all",
-                is_root_member, resolver_workspace_root,
+                is_root_member, resolver_workspace_root, workspace_dependencies,
             )
 
         target_sections = data.get("target", {})
@@ -567,6 +615,7 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
                         target_expression,
                         is_root_member,
                         resolver_workspace_root,
+                        workspace_dependencies,
                     )
         elif target_sections is not None:
             findings.append(Finding("DEP-003", manifest_path, 1, "target dependency groups must be a table"))
@@ -583,76 +632,591 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
     return findings, direct_deps, dependency_edges
 
 
+def _resolver_workspace_dir(root: Path, workspace_root: object) -> Path | None:
+    if not isinstance(workspace_root, str) or not workspace_root:
+        return None
+    relative = Path(workspace_root)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    try:
+        resolved_root = root.resolve()
+        resolved_workspace = (root if workspace_root == "." else root / relative).resolve()
+        resolved_workspace.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return None
+    return resolved_workspace
+
+
+def _resolver_toolchain_inputs(root: Path, workspace_dir: Path) -> list[str]:
+    inputs: set[str] = set()
+    root_resolved = root.resolve()
+    current = workspace_dir.resolve()
+    while True:
+        for relative_name in (
+            "rust-toolchain.toml",
+            "rust-toolchain",
+            ".cargo/config.toml",
+            ".cargo/config",
+        ):
+            candidate = current / relative_name
+            if not candidate.is_file():
+                continue
+            try:
+                inputs.add(candidate.resolve().relative_to(root_resolved).as_posix())
+            except (OSError, ValueError):
+                continue
+        if current == root_resolved or root_resolved not in current.parents:
+            break
+        current = current.parent
+    return sorted(inputs)
+
+
+def _effective_cargo_resolver(root: Path, workspace_dir: Path) -> tuple[str | None, str | None]:
+    manifest = workspace_dir / "Cargo.toml"
+    try:
+        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        return None, f"workspace Cargo.toml cannot be read for resolver identity: {exc}"
+    workspace = data.get("workspace", {})
+    package = data.get("package", {})
+    if not isinstance(workspace, dict) or not isinstance(package, dict):
+        return None, "workspace or package resolver metadata is malformed"
+    workspace_package = workspace.get("package", {})
+    if not isinstance(workspace_package, dict):
+        return None, "workspace.package metadata is malformed"
+    explicit = workspace.get("resolver")
+    if explicit is not None:
+        if explicit in ("1", "2", "3"):
+            return explicit, "workspace.resolver"
+        return None, "workspace.resolver is not a supported string version"
+    if "package" not in data:
+        return "1", "Cargo default for a virtual workspace without a package root"
+    edition = package.get("edition")
+    if isinstance(edition, dict):
+        if edition.get("workspace") is not True:
+            return None, "package edition inheritance marker is malformed"
+        edition = workspace_package.get("edition")
+    if edition is None:
+        return "1", "Cargo default package edition 2015"
+    if not isinstance(edition, (str, int)):
+        return None, "workspace package edition is malformed"
+    edition_text = str(edition)
+    if edition_text == "2024":
+        return "3", "Cargo edition 2024 default"
+    if edition_text == "2021":
+        return "2", "Cargo edition 2021 default"
+    if edition_text in {"2015", "2018"}:
+        return "1", f"Cargo edition {edition_text} default"
+    return None, f"cannot infer Cargo resolver from edition {edition_text!r}"
+
+
+def _run_resolver_command(argv: list[str], cwd: Path, timeout_seconds: int) -> dict:
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    stdout_bytes = completed.stdout if isinstance(completed.stdout, bytes) else b""
+    stderr_bytes = completed.stderr if isinstance(completed.stderr, bytes) else b""
+    return {
+        "ok": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "stdout": stdout_bytes.decode("utf-8", errors="replace"),
+        "stderr": stderr_bytes.decode("utf-8", errors="replace"),
+        "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+    }
+
+
+def _load_nonmember_resolver_metadata(
+    root: Path, workspace_dir: Path, lockfile: str
+) -> tuple[dict, dict | None, str | None]:
+    resolver, resolver_source = _effective_cargo_resolver(root, workspace_dir)
+    toolchain_inputs = _resolver_toolchain_inputs(root, workspace_dir)
+    evidence = {
+        "status": "metadata_not_executed",
+        "workspace_root": workspace_dir.resolve().relative_to(root.resolve()).as_posix() or ".",
+        "lockfile": lockfile,
+        "resolver_version": resolver,
+        "resolver_source": resolver_source,
+        "feature_scope": "all-features",
+        "target_scope": "all-declared-platforms",
+        "locked": True,
+        "offline": True,
+        "toolchain_inputs": toolchain_inputs,
+    }
+    if resolver is None:
+        evidence["status"] = "resolver_identity_unavailable"
+        return evidence, None, resolver_source or "effective Cargo resolver version is unknown"
+
+    cargo = shutil.which("cargo")
+    rustc = shutil.which("rustc")
+    if not cargo or not rustc:
+        evidence["status"] = "tool_unavailable"
+        return evidence, None, "Cargo and rustc must both be available to bind resolver/toolchain identity"
+    cargo_path = str(Path(cargo).resolve())
+    rustc_path = str(Path(rustc).resolve())
+    cargo_version = _run_resolver_command([cargo_path, "--version", "--verbose"], workspace_dir, 20)
+    rustc_version = _run_resolver_command([rustc_path, "--version", "--verbose"], workspace_dir, 20)
+    evidence.update(
+        {
+            "cargo_executable": cargo_path,
+            "rustc_executable": rustc_path,
+            "cargo_version_sha256": cargo_version.get("stdout_sha256"),
+            "rustc_version_sha256": rustc_version.get("stdout_sha256"),
+            "cargo_version": cargo_version.get("stdout", "").strip(),
+            "rustc_version": rustc_version.get("stdout", "").strip(),
+            "cargo_version_stderr_sha256": cargo_version.get("stderr_sha256"),
+            "rustc_version_stderr_sha256": rustc_version.get("stderr_sha256"),
+            "resolution_environment": {
+                key: os.environ[key]
+                for key in (
+                    "CARGO_HOME",
+                    "RUSTUP_HOME",
+                    "RUSTUP_TOOLCHAIN",
+                    "RUSTFLAGS",
+                    "CARGO_ENCODED_RUSTFLAGS",
+                )
+                if key in os.environ
+            },
+        }
+    )
+    if not cargo_version.get("ok") or not cargo_version.get("stdout", "").strip():
+        evidence["status"] = "cargo_version_failed"
+        return evidence, None, "cargo --version --verbose did not return a successful tool identity"
+    if not rustc_version.get("ok") or not rustc_version.get("stdout", "").strip():
+        evidence["status"] = "rustc_version_failed"
+        return evidence, None, "rustc --version --verbose did not return a successful tool identity"
+
+    manifest = workspace_dir / "Cargo.toml"
+    argv = [
+        cargo_path,
+        "metadata",
+        "--format-version",
+        "1",
+        "--locked",
+        "--offline",
+        "--all-features",
+        "--manifest-path",
+        str(manifest),
+    ]
+    result = _run_resolver_command(argv, workspace_dir, 120)
+    evidence["command"] = argv
+    evidence["exit_code"] = result.get("returncode")
+    evidence["metadata_sha256"] = result.get("stdout_sha256")
+    evidence["metadata_stderr_sha256"] = result.get("stderr_sha256")
+    if not result.get("ok"):
+        evidence["status"] = "metadata_failed"
+        error = result.get("error") or result.get("stderr", "").strip() or f"cargo metadata exited {result.get('returncode')}"
+        evidence["error"] = str(error)[:2000]
+        return evidence, None, f"locked offline cargo metadata failed: {str(error)[:600]}"
+    try:
+        metadata = json.loads(
+            result.get("stdout", ""),
+            object_pairs_hook=_json_object_without_duplicate_keys,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        evidence["status"] = "metadata_malformed"
+        evidence["error"] = f"{type(exc).__name__}: {exc}"
+        return evidence, None, "cargo metadata output is malformed or contains duplicate JSON keys"
+    if not isinstance(metadata, dict) or metadata.get("version") != 1:
+        evidence["status"] = "metadata_shape_invalid"
+        return evidence, None, "cargo metadata output does not have the version-1 object shape"
+    expected_root = os.path.normcase(str(workspace_dir.resolve()))
+    reported_root = metadata.get("workspace_root")
+    try:
+        same_workspace = isinstance(reported_root, str) and os.path.normcase(str(Path(reported_root).resolve())) == expected_root
+    except (OSError, ValueError):
+        same_workspace = False
+    if not same_workspace:
+        evidence["status"] = "workspace_identity_mismatch"
+        return evidence, None, "cargo metadata workspace_root does not match the requested workspace"
+    packages = metadata.get("packages")
+    workspace_members = metadata.get("workspace_members")
+    resolve = metadata.get("resolve")
+    if (
+        not isinstance(packages, list)
+        or not isinstance(workspace_members, list)
+        or any(not isinstance(item, str) for item in workspace_members)
+        or not isinstance(resolve, dict)
+        or not isinstance(resolve.get("nodes"), list)
+    ):
+        evidence["status"] = "metadata_shape_invalid"
+        return evidence, None, "cargo metadata lacks packages, workspace members, or resolved dependency nodes"
+    package_ids = [item.get("id") for item in packages if isinstance(item, dict)]
+    if len(package_ids) != len(packages) or any(not isinstance(item, str) for item in package_ids) or len(set(package_ids)) != len(package_ids):
+        evidence["status"] = "metadata_package_identity_invalid"
+        return evidence, None, "cargo metadata package identities are malformed or duplicated"
+    evidence["status"] = "metadata_ready"
+    return evidence, metadata, None
+
+
+def _cargo_kind_and_target(edge: dict) -> tuple[object, object] | None:
+    kind = {
+        "dependencies": None,
+        "dev-dependencies": "dev",
+        "build-dependencies": "build",
+    }.get(edge.get("dependency_kind"), "__invalid__")
+    if kind == "__invalid__":
+        return None
+    target = edge.get("target")
+    if target == "all":
+        target = None
+    return kind, target
+
+
+def _cargo_requirement_matches(requested: object, resolved_request: object) -> bool:
+    if requested is None:
+        return resolved_request in (None, "*")
+    if not isinstance(requested, str) or not isinstance(resolved_request, str):
+        return False
+    requested = requested.strip()
+    if requested == resolved_request:
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", requested):
+        return "^" + requested == resolved_request
+    return False
+
+
+def _same_resolved_path(left: object, right: Path) -> bool:
+    if not isinstance(left, str) or not left.strip():
+        return False
+    try:
+        return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(str(right.resolve()))
+    except (OSError, ValueError):
+        return False
+
+
+def _bind_nonmember_edge_to_metadata(
+    root: Path,
+    edge: dict,
+    workspace_dir: Path,
+    metadata: dict,
+    locked_packages: list[dict],
+) -> tuple[dict | None, str | None]:
+    kind_target = _cargo_kind_and_target(edge)
+    if kind_target is None:
+        return None, "manifest dependency kind or target is malformed"
+    expected_kind, expected_target = kind_target
+    alias = edge.get("alias")
+    package_name = edge.get("package")
+    manifest = edge.get("manifest")
+    consumer = edge.get("consumer")
+    if not all(isinstance(value, str) and value for value in (alias, package_name, manifest, consumer)):
+        return None, "manifest edge lacks consumer, alias, package, or manifest identity"
+    manifest_path = root / Path(manifest)
+    try:
+        manifest_path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None, "manifest edge path escapes the repository boundary"
+    packages = metadata.get("packages", [])
+    members = metadata.get("workspace_members", [])
+    consumer_packages = []
+    for package in packages:
+        if not isinstance(package, dict) or package.get("name") != consumer:
+            continue
+        if _same_resolved_path(package.get("manifest_path"), manifest_path):
+            consumer_packages.append(package)
+    if len(consumer_packages) != 1:
+        return None, "cargo metadata does not identify exactly one consumer package at the source manifest"
+    consumer_package = consumer_packages[0]
+    consumer_id = consumer_package.get("id")
+    if not isinstance(consumer_id, str) or consumer_id not in members:
+        return None, "source consumer package is not a member of the resolved Cargo workspace"
+    resolve = metadata.get("resolve", {})
+    nodes = resolve.get("nodes", []) if isinstance(resolve, dict) else []
+    consumer_nodes = [node for node in nodes if isinstance(node, dict) and node.get("id") == consumer_id]
+    if len(consumer_nodes) != 1:
+        return None, "cargo resolve graph does not contain exactly one consumer node"
+    node_deps = consumer_nodes[0].get("deps", [])
+    if not isinstance(node_deps, list):
+        return None, "cargo resolve consumer node dependencies are malformed"
+    # Cargo metadata normalizes dependency names to Rust crate identifiers in
+    # resolve.nodes (hyphens become underscores); Package.dependencies.rename
+    # retains the manifest spelling and is compared exactly below.
+    resolve_node_name = alias.replace("-", "_")
+    matching_node_deps = []
+    for node_dep in node_deps:
+        if not isinstance(node_dep, dict) or node_dep.get("name") != resolve_node_name:
+            continue
+        dep_kinds = node_dep.get("dep_kinds", [])
+        if not isinstance(dep_kinds, list):
+            continue
+        if any(
+            isinstance(dep_kind, dict)
+            and dep_kind.get("kind") in ((None, "normal") if expected_kind is None else (expected_kind,))
+            and dep_kind.get("target") == expected_target
+            for dep_kind in dep_kinds
+        ):
+            matching_node_deps.append(node_dep)
+    if len(matching_node_deps) != 1:
+        return None, "cargo resolve graph does not bind exactly one package ID for the alias/kind/target edge"
+    resolved_id = matching_node_deps[0].get("pkg")
+    if not isinstance(resolved_id, str):
+        return None, "cargo resolve dependency node lacks a package ID"
+    resolved_packages = [package for package in packages if isinstance(package, dict) and package.get("id") == resolved_id]
+    if len(resolved_packages) != 1:
+        return None, "resolved package ID does not identify exactly one cargo metadata package"
+    resolved_package = resolved_packages[0]
+    if resolved_package.get("name") != package_name:
+        return None, "resolved package name does not match the manifest package name"
+    dependency_records = consumer_package.get("dependencies", [])
+    if not isinstance(dependency_records, list):
+        return None, "cargo metadata consumer dependency declarations are malformed"
+    edge_features = edge.get("features", [])
+    if not isinstance(edge_features, list) or any(not isinstance(item, str) for item in edge_features):
+        return None, "manifest edge feature selection is malformed"
+    matching_declarations = []
+    for dependency in dependency_records:
+        if not isinstance(dependency, dict) or dependency.get("name") != package_name:
+            continue
+        rename = dependency.get("rename")
+        actual_alias = rename if isinstance(rename, str) and rename else dependency.get("name")
+        if actual_alias != alias:
+            continue
+        actual_kind = dependency.get("kind")
+        if expected_kind is None:
+            if actual_kind not in (None, "normal"):
+                continue
+        elif actual_kind != expected_kind:
+            continue
+        if dependency.get("target") != expected_target:
+            continue
+        if not _cargo_requirement_matches(edge.get("version_requirement"), dependency.get("req")):
+            continue
+        if dependency.get("optional") is not edge.get("optional"):
+            continue
+        if dependency.get("uses_default_features") is not edge.get("default_features"):
+            continue
+        features = dependency.get("features")
+        if not isinstance(features, list) or any(not isinstance(item, str) for item in features):
+            continue
+        if sorted(set(features)) != sorted(set(edge_features)):
+            continue
+        matching_declarations.append(dependency)
+    if len(matching_declarations) != 1:
+        return None, "cargo metadata does not identify exactly one declaration matching alias/kind/target/version/features"
+
+    declaration = matching_declarations[0]
+    source_kind = edge.get("source_kind")
+    source_spec = edge.get("source_spec", {})
+    if not isinstance(source_spec, dict):
+        return None, "manifest source selector is malformed"
+    declared_source = declaration.get("source")
+    package_source = resolved_package.get("source")
+    if declared_source != package_source:
+        return None, "cargo metadata declaration source does not equal the resolved package source"
+    if source_kind == "registry":
+        if not isinstance(package_source, str) or not package_source.startswith("registry+"):
+            return None, "registry declaration did not resolve to an exact registry source"
+        explicit_registry = source_spec.get("registry")
+        metadata_registry = declaration.get("registry")
+        if explicit_registry is not None and metadata_registry != explicit_registry:
+            return None, "explicit registry selector does not match cargo metadata"
+    elif source_kind == "path":
+        raw_path = source_spec.get("path")
+        if not isinstance(raw_path, str):
+            return None, "path dependency has no exact manifest path selector"
+        expected_path = (manifest_path.parent / raw_path).resolve()
+        try:
+            expected_path.relative_to(root.resolve())
+        except (OSError, ValueError):
+            return None, "path dependency resolves outside the repository input boundary"
+        if package_source is not None or not _same_resolved_path(declaration.get("path"), expected_path):
+            return None, "path dependency source does not match the manifest path and resolved package"
+        if not _same_resolved_path(resolved_package.get("manifest_path"), expected_path / "Cargo.toml"):
+            return None, "resolved path package manifest does not match the declared path"
+    elif source_kind == "git":
+        git_url = source_spec.get("git")
+        if not isinstance(git_url, str) or not isinstance(package_source, str) or not package_source.startswith("git+"):
+            return None, "git dependency lacks an exact Cargo git source identity"
+        source_without_prefix = package_source[4:]
+        source_base = re.split(r"[?#]", source_without_prefix, maxsplit=1)[0]
+        if git_url not in (source_base, source_base.removesuffix(".git"), source_base + ".git"):
+            return None, "resolved git source does not match the manifest URL"
+        for selector in ("branch", "tag", "rev"):
+            requested_selector = source_spec.get(selector)
+            if requested_selector is not None and requested_selector not in package_source:
+                return None, f"resolved git source does not retain the manifest {selector} selector"
+    else:
+        return None, "manifest dependency source kind is not explicit enough for resolver binding"
+
+    version = resolved_package.get("version")
+    resolved_name = resolved_package.get("name")
+    if not isinstance(version, str) or not version or not isinstance(resolved_name, str):
+        return None, "resolved Cargo package lacks an exact name or version"
+    lock_matches = [
+        package for package in locked_packages
+        if package.get("name") == resolved_name
+        and package.get("version") == version
+        and package.get("source") == package_source
+    ]
+    if len(lock_matches) != 1:
+        return None, "resolved package ID does not join uniquely to an exact package in the adjacent Cargo.lock"
+    lock_identity = lock_matches[0]
+    if isinstance(package_source, str) and package_source.startswith("registry+"):
+        checksum = lock_identity.get("checksum")
+        if not isinstance(checksum, str) or not _HEX64.fullmatch(checksum):
+            return None, "resolved registry package lacks its exact Cargo.lock checksum"
+    resolved_nodes = [node for node in nodes if isinstance(node, dict) and node.get("id") == resolved_id]
+    if len(resolved_nodes) != 1:
+        return None, "resolved package ID does not identify exactly one Cargo resolve node"
+    resolved_features = resolved_nodes[0].get("features")
+    if not isinstance(resolved_features, list) or any(not isinstance(item, str) for item in resolved_features):
+        return None, "resolved package node features are malformed"
+    if any(feature not in resolved_features for feature in edge_features):
+        return None, "Cargo resolve node does not include every feature requested by the manifest edge"
+    consumer_resolved_features = consumer_nodes[0].get("features")
+    consumer_declared_features = consumer_package.get("features")
+    if (
+        not isinstance(consumer_resolved_features, list)
+        or any(not isinstance(item, str) for item in consumer_resolved_features)
+        or not isinstance(consumer_declared_features, dict)
+        or any(feature not in consumer_resolved_features for feature in consumer_declared_features)
+    ):
+        return None, "Cargo resolve node does not prove that every consumer feature was enabled"
+    return {
+        "id": resolved_id,
+        "name": resolved_name,
+        "version": version,
+        "source": package_source,
+        "checksum": lock_identity.get("checksum"),
+        "lockfile_dependencies": lock_identity.get("dependencies", []),
+        "consumer_features": sorted(set(consumer_resolved_features)),
+        "features": sorted(set(resolved_features)),
+    }, None
+
+
 def bind_nonmember_resolver_identity(
     root: Path, dependency_edges: list[dict]
 ) -> list[Finding]:
-    """Keep non-member manifest edges explicitly incomplete without resolver evidence.
-
-    A package-name match in the root Cargo.lock is not proof that an independent
-    Cargo workspace resolved that declaration. The edge remains source-bound
-    until resolver metadata ties its alias, kind, target and requirement to a
-    locked package identity.
-    """
+    """Join non-member declarations through their own locked Cargo resolver graph."""
 
     findings: list[Finding] = []
-    manifests: dict[str, dict] = {}
+    workspace_edges: dict[str, list[dict]] = {}
+    unresolved_reason: dict[int, str] = {}
+    workspace_dirs: dict[str, Path | None] = {}
+    workspace_locks: dict[str, str | None] = {}
     for edge in dependency_edges:
         if not isinstance(edge, dict) or edge.get("root_workspace_member") is not False:
             continue
-
-        manifest = edge.get("manifest")
         workspace_root = edge.get("resolver_workspace_root")
-        if not isinstance(manifest, str) or not manifest:
-            continue
-
-        lockfile: str | None = None
-        if isinstance(workspace_root, str) and workspace_root:
-            workspace_dir = root if workspace_root == "." else root / Path(workspace_root)
+        workspace_key = workspace_root if isinstance(workspace_root, str) else "<unknown>"
+        workspace_dir = _resolver_workspace_dir(root, workspace_root)
+        workspace_dirs[workspace_key] = workspace_dir
+        lockfile = None
+        if workspace_dir is not None:
             candidate = workspace_dir / "Cargo.lock"
             try:
-                lockfile = candidate.relative_to(root).as_posix() if candidate.is_file() else None
-            except ValueError:
+                lockfile = candidate.resolve().relative_to(root.resolve()).as_posix() if candidate.is_file() else None
+            except (OSError, ValueError):
                 lockfile = None
+        workspace_locks[workspace_key] = lockfile
+        workspace_edges.setdefault(workspace_key, []).append(edge)
 
-        if lockfile is None:
-            reason = "non-member workspace has no checked-in Cargo.lock; this declaration is source-only"
-        else:
-            reason = (
-                "a same-name root lock identity is not a resolver edge; this standalone lock has not been joined "
-                "to the declaration's alias, kind, target and requested version"
-            )
-
-        edge["resolver_identity"] = {
-            "status": "source_only_incomplete",
-            "workspace_root": workspace_root,
-            "lockfile": lockfile,
-            "resolved_package": None,
-            "requested_version": edge.get("version_requirement"),
-            "target": edge.get("target"),
-            "dependency_kind": edge.get("dependency_kind"),
-            "reason": reason,
+    for workspace_key, edges in sorted(workspace_edges.items()):
+        workspace_dir = workspace_dirs.get(workspace_key)
+        lockfile = workspace_locks.get(workspace_key)
+        workspace_resolver, resolver_source = (
+            _effective_cargo_resolver(root, workspace_dir)
+            if workspace_dir is not None else (None, "workspace root is unavailable")
+        )
+        workspace_evidence = {
+            "status": "lock_missing",
+            "workspace_root": workspace_key if workspace_key != "<unknown>" else None,
+            "lockfile": None,
+            "resolver_version": workspace_resolver,
+            "resolver_source": resolver_source,
+            "feature_scope": "all-features",
+            "target_scope": "all-declared-platforms",
+            "locked": True,
+            "offline": True,
+            "toolchain_inputs": _resolver_toolchain_inputs(root, workspace_dirs[workspace_key])
+            if workspace_dirs.get(workspace_key) is not None else [],
         }
-        summary = manifests.setdefault(
-            manifest,
-            {
-                "consumer": edge.get("consumer", manifest),
-                "workspace_root": workspace_root,
-                "lockfile": lockfile,
-                "edge_count": 0,
-            },
-        )
-        summary["edge_count"] += 1
+        metadata = None
+        locked_packages: list[dict] = []
+        workspace_failure = None
+        if workspace_dir is None:
+            workspace_failure = "non-member workspace root is missing, malformed, or outside the repository"
+            workspace_evidence["status"] = "workspace_identity_invalid"
+        elif lockfile is None:
+            workspace_failure = "non-member workspace has no checked-in adjacent Cargo.lock; no resolver is run and the declaration stays source-only"
+        else:
+            workspace_evidence["lockfile"] = lockfile
+            lock_findings, locked_packages = collect_all_rust_locked_packages(root, lockfile)
+            if lock_findings:
+                workspace_failure = "; ".join(finding.detail for finding in lock_findings[:3])
+                workspace_evidence["status"] = "lock_invalid"
+            else:
+                workspace_evidence, metadata, workspace_failure = _load_nonmember_resolver_metadata(
+                    root, workspace_dir, lockfile
+                )
 
-    for manifest, summary in sorted(manifests.items()):
-        findings.append(
-            Finding(
-                IDENTITY_BINDING_FINDING,
-                manifest,
-                1,
-                f"non-member Cargo package '{summary['consumer']}' has {summary['edge_count']} observed edge(s) "
-                "without a resolver-backed lock identity; edges remain source-only/incomplete",
+        per_manifest: dict[str, dict] = {}
+        for edge in edges:
+            manifest = edge.get("manifest")
+            manifest_key = manifest if isinstance(manifest, str) and manifest else "<unknown manifest>"
+            consumer = edge.get("consumer")
+            summary = per_manifest.setdefault(
+                manifest_key,
+                {"consumer": consumer if isinstance(consumer, str) else manifest_key, "edge_count": 0, "unresolved": 0, "reasons": set()},
             )
+            summary["edge_count"] += 1
+            resolved_package = None
+            reason = workspace_failure
+            if reason is None and metadata is not None and workspace_dir is not None:
+                resolved_package, reason = _bind_nonmember_edge_to_metadata(
+                    root, edge, workspace_dir, metadata, locked_packages
+                )
+            if resolved_package is None:
+                summary["unresolved"] += 1
+                summary["reasons"].add(reason or "resolver evidence did not bind this declaration")
+            edge["resolver_identity"] = {
+                "status": "lock_bound" if resolved_package is not None else "source_only_incomplete",
+                "workspace_root": workspace_key if workspace_key != "<unknown>" else None,
+                "lockfile": lockfile,
+                "resolved_package": resolved_package,
+                "requested_version": edge.get("version_requirement"),
+                "requested_features": edge.get("features", []),
+                "target": edge.get("target"),
+                "dependency_kind": edge.get("dependency_kind"),
+                "alias": edge.get("alias"),
+                "source_spec": edge.get("source_spec", {}),
+                "workspace_evidence": workspace_evidence,
+                "reason": reason,
+            }
+
+        joined_count = sum(
+            1 for edge in edges
+            if isinstance(edge.get("resolver_identity"), dict)
+            and edge["resolver_identity"].get("status") == "lock_bound"
         )
+        workspace_evidence["joined_edge_count"] = joined_count
+        workspace_evidence["incomplete_edge_count"] = len(edges) - joined_count
+        workspace_evidence["join_status"] = "complete" if joined_count == len(edges) else "incomplete"
+
+        for manifest, summary in sorted(per_manifest.items()):
+            if summary["unresolved"] == 0:
+                continue
+            reasons = sorted(summary["reasons"])
+            reason_text = "; ".join(reasons[:2])
+            findings.append(
+                Finding(
+                    IDENTITY_BINDING_FINDING,
+                    manifest,
+                    1,
+                    f"non-member Cargo package '{summary['consumer']}' has {summary['unresolved']} of "
+                    f"{summary['edge_count']} observed edge(s) without an exact resolver/lock join: {reason_text}",
+                )
+            )
     return findings
 
 
@@ -4369,6 +4933,16 @@ def build_receipt(
                 and not Path(lockfile).is_absolute()
             ):
                 input_paths.add(lockfile.replace("\\", "/"))
+            workspace_evidence = resolver_identity.get("workspace_evidence", {}) if isinstance(resolver_identity, dict) else {}
+            toolchain_inputs = workspace_evidence.get("toolchain_inputs", []) if isinstance(workspace_evidence, dict) else []
+            for toolchain_input in toolchain_inputs if isinstance(toolchain_inputs, list) else []:
+                if (
+                    isinstance(toolchain_input, str)
+                    and toolchain_input
+                    and not Path(toolchain_input).is_absolute()
+                    and ".." not in Path(toolchain_input).parts
+                ):
+                    input_paths.add(toolchain_input.replace("\\", "/"))
     digests = {}
     missing_inputs = []
     for relative_path in sorted(input_paths):
@@ -4563,10 +5137,23 @@ def _collect_ecosystem_denominator(
         edge for edge in rust_dependency_edges
         if isinstance(edge, dict) and edge.get("root_workspace_member") is False
     ]
-    # No resolver-backed join is implemented for non-member workspaces yet.
-    # Count every such edge as incomplete, including a missing or malformed
-    # identity record; absence of evidence must never make the denominator green.
-    incomplete_nonmember_edges = list(nonmember_edges)
+    # Count every edge lacking the explicit resolver-to-lock join as incomplete;
+    # missing or malformed identity records must never make the denominator green.
+    incomplete_nonmember_edges = [
+        edge for edge in nonmember_edges
+        if not isinstance(edge.get("resolver_identity"), dict)
+        or edge["resolver_identity"].get("status") != "lock_bound"
+    ]
+    joined_nonmember_edges = len(nonmember_edges) - len(incomplete_nonmember_edges)
+    nonmember_workspace_evidence: dict[str, dict] = {}
+    for edge in nonmember_edges:
+        identity = edge.get("resolver_identity", {})
+        evidence = identity.get("workspace_evidence") if isinstance(identity, dict) else None
+        if not isinstance(evidence, dict):
+            continue
+        workspace_root = evidence.get("workspace_root")
+        key = workspace_root if isinstance(workspace_root, str) else "<unknown>"
+        nonmember_workspace_evidence.setdefault(key, evidence)
     workspace_disposition_findings = check_workspace_dependency_dispositions(
         manifest_data, rust_dependency_edges
     )
@@ -4585,13 +5172,18 @@ def _collect_ecosystem_denominator(
         "direct_dependencies_count": len(direct_rust_dependencies),
         "direct_dependencies": sorted(direct_rust_dependencies),
         "direct_dependency_identities": direct_rust_identity,
+        "direct_dependency_identity_scope": "root-workspace direct edges; non-member identities are attached to resolver-joined edges",
         "workspace_dependency_edge_count": len(rust_dependency_edges),
         "workspace_dependency_edges": rust_dependency_edges,
         "non_member_manifest_count": len({edge.get("manifest") for edge in nonmember_edges}),
+        "non_member_resolver_joined_edge_count": joined_nonmember_edges,
         "non_member_resolver_incomplete_edge_count": len(incomplete_nonmember_edges),
         "non_member_resolver_incomplete_manifests": sorted(
             {edge.get("manifest") for edge in incomplete_nonmember_edges if isinstance(edge.get("manifest"), str)}
         ),
+        "non_member_resolver_workspaces": [
+            nonmember_workspace_evidence[key] for key in sorted(nonmember_workspace_evidence)
+        ],
         "workspace_dependency_dispositions": manifest_data.get(
             "workspace_dependency_dispositions", []
         ),
@@ -4743,8 +5335,16 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
     ecosystems = manifest_data.get("ecosystems", {})
     rust_policy = ecosystems.get("rust", {}) if isinstance(ecosystems, dict) else {}
     rust_policy = rust_policy if isinstance(rust_policy, dict) else {}
+    root_workspace_direct_deps = {
+        edge["package"]
+        for edge in rust_dependency_edges
+        if isinstance(edge, dict)
+        and edge.get("root_workspace_member") is True
+        and edge.get("internal_workspace_package") is False
+        and isinstance(edge.get("package"), str)
+    }
     identity_findings, direct_dependency_identity = collect_locked_dependency_identity(
-        root, direct_deps, rust_policy.get("lockfile")
+        root, root_workspace_direct_deps, rust_policy.get("lockfile")
     )
     all_findings.extend(identity_findings)
 
