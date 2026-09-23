@@ -451,9 +451,28 @@ def _collect_rust_dependency_graph(root: Path) -> tuple[list[Finding], set[str],
                         )
                     )
                     continue
-                effective_spec.update(
-                    {key: value for key, value in spec.items() if key != "workspace"}
-                )
+                member_overrides = {
+                    key: value for key, value in spec.items() if key != "workspace"
+                }
+                if "features" in member_overrides:
+                    inherited_features = effective_spec.get("features", [])
+                    member_features = member_overrides.pop("features")
+                    if (
+                        isinstance(inherited_features, list)
+                        and isinstance(member_features, list)
+                    ):
+                        # Cargo workspace dependency features are additive in members.
+                        effective_spec["features"] = [
+                            *inherited_features,
+                            *member_features,
+                        ]
+                    elif not isinstance(inherited_features, list):
+                        # Preserve malformed inherited data so validation fails closed.
+                        effective_spec["features"] = inherited_features
+                    else:
+                        # Preserve malformed member data so validation fails closed.
+                        effective_spec["features"] = member_features
+                effective_spec.update(member_overrides)
             elif not isinstance(spec, (str, dict)):
                 findings.append(
                     Finding(

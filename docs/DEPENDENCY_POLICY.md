@@ -148,9 +148,13 @@ digests. It joins the source consumer manifest and package ID, dependency alias
 (including renames), kind, target condition, requested version, optional and
 default-feature flags, and declared features to one Cargo resolve-node edge and
 one metadata dependency declaration; the resolve nodes must include all
-consumer features and the dependency's requested features. The resolved package
-ID must then match exactly one entry in the adjacent `Cargo.lock` by package name, version, source,
-and registry checksum where applicable. A missing lock does not trigger lock
+consumer features and the dependency's requested features. For `workspace = true`
+declarations, requested features are the union of workspace-inherited and
+member-local feature lists before metadata comparison, matching Cargo's additive
+feature semantics. Malformed feature lists remain invalid rather than silently
+replacing either input. The resolved package ID must then match exactly one
+entry in the adjacent `Cargo.lock` by package name, version, source, and
+registry checksum where applicable. A missing lock does not trigger lock
 generation or metadata resolution. Missing tools, metadata errors, malformed
 or ambiguous joins, and identity mismatches remain
 `source_only_incomplete`; missing or malformed identity records are counted as
