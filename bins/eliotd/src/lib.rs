@@ -154,7 +154,8 @@ pub use governor_local_read::{
 pub use experience_runtime::{
     CommonGroundEventInputs, ExperienceDriverError, ExperienceJournalDriverInputs,
     ExperienceQualityEvent, ExperienceQualityEventOutput, UnderstandingEventInputs,
-    produce_journal_projection, read_current_position, run_experience_quality_event,
+    derive_commit_ingress, produce_journal_projection, read_current_position,
+    run_experience_quality_event,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
@@ -430,6 +431,28 @@ impl DaemonComposition {
             self.view_stale = true;
         }
         Ok(receipt)
+    }
+
+    /// Refreshes Governor owners from the Kernel snapshot, marking the
+    /// dependent view stale/pending when the refresh fails.
+    ///
+    /// Separated refresh discipline for commit paths that cannot hold
+    /// `&mut self` at the call site (notably Arc-held trigger contexts):
+    /// those paths return durable receipts without refreshing, and the
+    /// owning context runs this call on its own mutably-held discipline
+    /// afterwards. Failure semantics match
+    /// [`Self::commit_canonical_and_refresh`]: the error is recorded in
+    /// `view_stale` (surfaced via health/status as `"stale"`), never
+    /// swallowed silently and never promoted to a write failure. Until
+    /// this runs, projections read through this composition may lag the
+    /// durable store; callers must not treat an unrefreshed view as
+    /// current.
+    pub fn refresh_dependent_view(&mut self) -> Result<(), DaemonError> {
+        if let Err(error) = self.governor.refresh_from_kernel() {
+            self.view_stale = true;
+            return Err(DaemonError::Composition(error));
+        }
+        Ok(())
     }
 
     /// Returns the admitted Kernel snapshot.

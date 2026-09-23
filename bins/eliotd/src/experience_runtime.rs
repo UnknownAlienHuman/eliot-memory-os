@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use eliot_contracts::{ArtifactId, RequestMetadata};
+use eliot_contracts::{ArtifactId, RequestMetadata, StateFence};
 use eliot_cognitive_quality::QualityAssessmentCandidate;
 use eliot_context_contracts::ActiveUnderstandingView;
 use eliot_dreamer_contracts::self_query::AcceptedSourceProjection;
@@ -60,7 +60,8 @@ use eliot_understanding_assessment::{
     AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
     ExperienceEvidence, OwnerContext, ScopedUnderstandingAssessment,
 };
-use eliot_receipts::WorkScopeId;
+use eliot_protocol::RequestIdentity;
+use eliot_receipts::{RequestBinding, WorkScopeId};
 use eliot_store_api::{
     CanonicalReadClient, NamedReadOperation, NamedReadRequest, ReadConsistency, RevisionKey,
     ScopeId, StoreError, epistemic_revision::EpistemicPositionReadback,
@@ -87,6 +88,14 @@ pub enum ExperienceDriverError {
     /// The position readback holds no usable current position.
     #[error("position field {field}: {reason}")]
     Position {
+        field: &'static str,
+        reason: &'static str,
+    },
+    /// Admitted commit ingress could not be derived: the invocation
+    /// metadata, fence agreement, commit key, or lifecycle scope is
+    /// missing or malformed. Nothing was committed.
+    #[error("ingress field {field}: {reason}")]
+    Ingress {
         field: &'static str,
         reason: &'static str,
     },
@@ -608,4 +617,71 @@ pub async fn run_experience_quality_event(
         understanding,
         common_ground,
     })
+}
+
+/// Derive admitted commit ingress for one record commit.
+///
+/// Binds the owner-derived commit key into a [`RequestIdentity`] whose
+/// request binding clones the admitted invocation metadata verbatim
+/// (identity, session, task, product, source, fence, clock) with the
+/// fence echoed as the binding fence. The lifecycle scope
+/// (`deadline_unix_ms`, `cancellation_id`) arrives edge-supplied: no
+/// admitted source carries a commit deadline or cancellation scope, so
+/// minting either here would invent lifecycle authority — the trigger
+/// edge owns its lifecycle and passes it explicitly, exactly as it
+/// passes receipts and handles. The commit key itself is owner-derived
+/// (the `idempotency_key` the owner commit payload carries for the
+/// record), never minted: caller-supplied keys are rejected.
+///
+/// Fence agreement (admitted metadata versus the retained Kernel
+/// fence), key text, cancellation text, and the assembled identity
+/// shape all fail closed before any identity exists; the canonical
+/// owner re-validates the identity again downstream. This is the O1
+/// seam for the trigger's commit legs: O1 calls it per record with the
+/// same admitted `ctx`, the live Kernel fence, the owner-derived key,
+/// and its own lifecycle scope, then passes the identity to the
+/// canonical commit caller.
+pub fn derive_commit_ingress(
+    ctx: &RequestMetadata,
+    kernel_fence: &StateFence,
+    commit_key: &str,
+    deadline_unix_ms: u64,
+    cancellation_id: String,
+) -> Result<RequestIdentity, ExperienceDriverError> {
+    ctx.validate().map_err(|_| ExperienceDriverError::Ingress {
+        field: "request_metadata",
+        reason: "retained invocation metadata is invalid",
+    })?;
+    if ctx.state_fence != *kernel_fence {
+        return Err(ExperienceDriverError::Ingress {
+            field: "request_metadata.state_fence",
+            reason: "invocation fence differs from the admitted Kernel fence",
+        });
+    }
+    if commit_key.trim().is_empty() || commit_key.chars().any(char::is_control) {
+        return Err(ExperienceDriverError::Ingress {
+            field: "idempotency_key",
+            reason: "owner-derived commit key is blank or carries control characters",
+        });
+    }
+    if cancellation_id.trim().is_empty() || cancellation_id.chars().any(char::is_control) {
+        return Err(ExperienceDriverError::Ingress {
+            field: "cancellation_id",
+            reason: "edge cancellation scope is blank or carries control characters",
+        });
+    }
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata: ctx.clone(),
+            state_fence: ctx.state_fence.clone(),
+        },
+        idempotency_key: commit_key.to_owned(),
+        deadline_unix_ms,
+        cancellation_id,
+    };
+    identity.validate().map_err(|_| ExperienceDriverError::Ingress {
+        field: "request_identity",
+        reason: "derived ingress identity is invalid",
+    })?;
+    Ok(identity)
 }
