@@ -6,17 +6,18 @@ use eliot_types::{
     EvalComparisonVerdict, EvalComponentCoverage, EvalCoverageMatrix, EvalCoverageStatus,
     EvalCriterion, EvalDatasetManifest, EvalDatasetManifestId, EvalFamily, EvalFamilyCoverage,
     EvalFamilyDelta, EvalFamilyThreshold, EvalFamilyTrend, EvalFixtureChecksum,
-    EvalFixtureStabilityReport, EvalGateDecision, EvalGateDecisionKind, EvalMeasurementKind,
-    EvalMeasurementResult, EvalMeasurementSpec, EvalRegressionGateProfile, EvalRegressionSeverity,
-    EvalRiskCoverage, EvalRun, EvalRunId, EvalRunProfile, EvalRunStatus, EvalSuite, EvalSuiteId,
-    EvalTrendDirection, EvalTrendReport, EvalVerdict, EvalVerdictId, EvalVerdictStatus,
-    ExperimentalMetaPolicyCandidate, ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState,
-    HarnessExperimentRecord, HarnessExperimentRecordId, LifecycleStatus, MetaCandidateChangeClass,
-    MetaExperimentDecision, MetaIsolationFence, MetaIsolationRejectionRecord,
-    MetaPolicyAuthorization, MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, ProjectId,
-    ReplayCaseStatus, ReplayRun, ReplayRunStatus, ReplaySetRole, ReplayThresholdPolicyV1,
-    SealedReplaySetRecord, SemanticCommand, TaintClass, TaskId, ToolObservationRecordCommand,
-    Visibility, WriteId, WriteReceiptRef,
+    EvalFixtureStabilityReport, EvalGateDecision, EvalGateDecisionKind,
+    EvalIntegrityFingerprintSet, EvalMeasurementKind, EvalMeasurementResult, EvalMeasurementSpec,
+    EvalRegressionGateProfile, EvalRegressionSeverity, EvalRiskCoverage, EvalRun, EvalRunId,
+    EvalRunProfile, EvalRunStatus, EvalSuite, EvalSuiteId, EvalTrendDirection, EvalTrendReport,
+    EvalVerdict, EvalVerdictId, EvalVerdictStatus, ExperimentalMetaPolicyCandidate,
+    ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState, HarnessExperimentRecord,
+    HarnessExperimentRecordId, LifecycleStatus, MetaCandidateChangeClass, MetaExperimentDecision,
+    MetaIsolationFence, MetaIsolationRejectionRecord, MetaPolicyAuthorization,
+    MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, ProjectId, ReplayCaseStatus, ReplayRun,
+    ReplayRunStatus, ReplaySetRole, ReplayThresholdPolicyV1, SealedReplaySetRecord,
+    SemanticCommand, TaintClass, TaskId, ToolObservationRecordCommand, Visibility, WriteId,
+    WriteReceiptRef,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -901,6 +902,39 @@ pub struct EvalMeasurementService;
 const NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX: &str = "not yet implemented:";
 const STRUCTURAL_ONLY_PROOF_CEILING: &str = "STRUCTURAL_ONLY";
 
+/// Current evaluator identity fingerprints (issue #1922 stale-marking basis).
+///
+/// Single source for the identity strings the receipt builder records:
+/// the builder and [`current_eval_fingerprints`] both read these
+/// constants, so any future identity change automatically stale-marks
+/// previously recorded fingerprint sets through
+/// [`EvalIntegrityFingerprintSet::is_stale_against`] instead of silently
+/// comparing across identities.
+const HARNESS_FINGERPRINT: &str = "eliot-engine-eval-case-schema";
+const EVALUATOR_FINGERPRINT: &str = "eliot-engine::EvalMeasurementService";
+const ENVIRONMENT_FINGERPRINT: &str = "not-captured:structural-evaluator-process";
+const ACTUAL_ROUTE: &str = "eliot-engine::EvalMeasurementService::evaluate_case";
+const REQUESTED_ROUTE: &str = "runtime artifact/effect observation";
+const ACCEPTANCE_RELATION: &str = "required criterion matches a measurement result";
+const PRODUCT_IDENTITY: &str = "eliot-memory-os/eliot-engine-eval";
+const ORACLE_OWNER: &str = "eliot-engine::EvalMeasurementService";
+
+/// Capture the current evaluator identity as a comparable set.
+/// Pure snapshot of the constants above; performs no observation and
+/// grants no validity.
+pub fn current_eval_fingerprints() -> EvalIntegrityFingerprintSet {
+    EvalIntegrityFingerprintSet {
+        harness_fingerprint: HARNESS_FINGERPRINT.to_owned(),
+        evaluator_fingerprint: EVALUATOR_FINGERPRINT.to_owned(),
+        environment_fingerprint: ENVIRONMENT_FINGERPRINT.to_owned(),
+        actual_route: ACTUAL_ROUTE.to_owned(),
+        requested_route: REQUESTED_ROUTE.to_owned(),
+        acceptance_relation: ACCEPTANCE_RELATION.to_owned(),
+        product_identity: PRODUCT_IDENTITY.to_owned(),
+        oracle_owner: ORACLE_OWNER.to_owned(),
+    }
+}
+
 impl EvalMeasurementService {
     pub fn evaluate_case(case: &EvalCase) -> EvalCaseResult {
         let measurements = case
@@ -956,6 +990,7 @@ impl EvalMeasurementService {
             produced_refs: vec![format!("eval:{}:report", family_slug(case.family))],
             errors,
             duration_ms: 0,
+            integrity_fingerprints: Some(current_eval_fingerprints()),
         }
     }
 
@@ -1003,17 +1038,17 @@ impl EvalMeasurementService {
                 checksum_text(&receipt_binding)
             ),
             property: case.description.clone(),
-            product_identity: "eliot-memory-os/eliot-engine-eval".to_owned(),
-            oracle_owner: "eliot-engine::EvalMeasurementService".to_owned(),
-            acceptance_relation: "required criterion matches a measurement result".to_owned(),
+            product_identity: PRODUCT_IDENTITY.to_owned(),
+            oracle_owner: ORACLE_OWNER.to_owned(),
+            acceptance_relation: ACCEPTANCE_RELATION.to_owned(),
             task_subset: vec![case.eval_case_id.to_string()],
             sampling_procedure: "single declared case; no runtime sampling or replicate unit"
                 .to_owned(),
             model_fingerprint: "not-applicable:no-model-invocation".to_owned(),
-            harness_fingerprint: "eliot-engine-eval-case-schema".to_owned(),
+            harness_fingerprint: HARNESS_FINGERPRINT.to_owned(),
             tools_fingerprint: "not-applicable:no-runtime-tools".to_owned(),
-            evaluator_fingerprint: "eliot-engine::EvalMeasurementService".to_owned(),
-            environment_fingerprint: "not-captured:structural-evaluator-process".to_owned(),
+            evaluator_fingerprint: EVALUATOR_FINGERPRINT.to_owned(),
+            environment_fingerprint: ENVIRONMENT_FINGERPRINT.to_owned(),
             budget_fingerprint: format!(
                 "declared:max_runtime_ms={};max_input_tokens={};max_output_tokens={};max_tool_calls={}",
                 case.budget.max_runtime_ms,
@@ -1077,8 +1112,8 @@ impl EvalMeasurementService {
             false_fail_evidence: vec![
                 "not measured: no known-valid/known-invalid runtime set".to_owned(),
             ],
-            actual_route: "eliot-engine::EvalMeasurementService::evaluate_case".to_owned(),
-            requested_route: "runtime artifact/effect observation".to_owned(),
+            actual_route: ACTUAL_ROUTE.to_owned(),
+            requested_route: REQUESTED_ROUTE.to_owned(),
             resource_fingerprint: "not-captured:no runtime execution".to_owned(),
             oracle_dependencies: vec![
                 "case-declared expectations".to_owned(),

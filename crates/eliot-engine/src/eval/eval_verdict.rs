@@ -17,7 +17,7 @@ use eliot_types::{
 };
 use time::OffsetDateTime;
 
-use super::{u32_count, u8_count};
+use super::{u8_count, u32_count};
 
 pub struct EvalVerdictService;
 
@@ -31,12 +31,23 @@ impl EvalVerdictService {
             .case_results
             .iter()
             .any(|result| result.status == EvalCaseStatus::NotYetImplemented);
+        // Automatic stale marking (issue #1922): a retained fingerprint set
+        // recorded under older evaluator identity can never support a fresh
+        // verdict. Fresh results carry current fingerprints (never stale);
+        // pre-retention results carry None (unknown, never a staleness
+        // claim). Only genuinely drifted retained sets downgrade, and only
+        // to Inconclusive — staleness is not failure evidence.
+        let current = super::current_eval_fingerprints();
+        let has_stale_case = run.case_results.iter().any(|result| {
+            matches!(&result.integrity_fingerprints, Some(recorded) if recorded.is_stale_against(&current))
+        });
         let failure_clusters = Self::failure_clusters(run);
         let status = match run.status {
-            EvalRunStatus::Completed if all_passed => EvalVerdictStatus::Pass,
+            EvalRunStatus::Completed if all_passed && !has_stale_case => EvalVerdictStatus::Pass,
             EvalRunStatus::BlockedInvalidDataset
             | EvalRunStatus::BlockedMutationAttempt
             | EvalRunStatus::BlockedUnsafeProfile => EvalVerdictStatus::Blocked,
+            _ if has_stale_case => EvalVerdictStatus::Inconclusive,
             EvalRunStatus::Completed | EvalRunStatus::Failed if has_inconclusive_case => {
                 EvalVerdictStatus::Inconclusive
             }
@@ -44,6 +55,12 @@ impl EvalVerdictService {
             _ => EvalVerdictStatus::Inconclusive,
         };
         let mut reasons = vec!["eval verdict is report-only and grants no authority".to_owned()];
+        if has_stale_case {
+            reasons.push(
+                "at least one retained integrity fingerprint set predates current evaluator identity; the run cannot support a fresh verdict"
+                    .to_owned(),
+            );
+        }
         if has_inconclusive_case {
             reasons.push(
                 "at least one case is NotYetImplemented; an inconclusive integrity result cannot produce a PASS verdict"
