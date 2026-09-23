@@ -22,6 +22,7 @@ eliot-doctor = { path = "../eliot-doctor", version = "0.1.0" }
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-live-canary = { path = "../../workspace/tools/eliot-live-canary", version = "0.1.0" }
 eliot-governor.workspace = true
+eliot-host = { path = "../eliot-host", version = "0.1.0" }
 eliot-kernel-service.workspace = true
 eliot-host-state.workspace = true
 eliot-installation.workspace = true
