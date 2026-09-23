@@ -9,27 +9,39 @@
 //!
 //! The feed is trigger-driven, not scheduled here: the owning daemon
 //! runtime (O1 `daemon_runtime` / `reactive_feed` in `bins/eliotd`)
-//! calls [`publish_owner_feed`] whenever the provider revision advances
-//! (rotation) and during recovery (restart re-presentation). This module
-//! owns the feed exchange — serve, publish, readback verification — while
-//! O1 owns when it runs. Registration hunk for O1/root:
+//! calls [`synchronize_owner_feed`] whenever the provider revision
+//! advances (rotation) and during recovery (restart re-presentation).
+//! This module owns the feed exchange — read, restore, serve, publish,
+//! readback verification — while O1 owns when it runs. Registration
+//! hunk for O1/root:
 //!
 //! ```text
-//! use eliot_governor::owner_closure_feed::{OwnerPublishPort, publish_owner_feed};
+//! use eliot_governor::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
 //!
-//! // On provider-revision advance and on recovery, with the live
-//! // OwnerClosureProvider and the exact expected graph revision:
-//! let bound = publish_owner_feed(&kernel_publish_port, &provider, expected_revision).await?;
+//! // On provider-revision advance and on recovery, with the canonical
+//! // read client, the Kernel publish port, the owner snapshot, the live
+//! // fence, the origin selector, the record bound, and the exact expected
+//! // graph revision:
+//! let bound = synchronize_owner_feed(
+//!     &reads, &kernel_publish_port,
+//!     snapshot, state_fence, origin_ref, max_records, expected_revision,
+//! ).await?;
 //! ```
 //!
 //! `OwnerPublishPort` is implemented once by the daemon runtime against
 //! the Kernel front-door `publish_owner_bundle` / `query_owner_bundle`
 //! operations; the exchange below stays typed and never touches
-//! transport bytes.
+//! transport bytes. [`publish_owner_feed`] remains available for a
+//! caller that already holds a restored provider.
 
+use eliot_contracts::StateFence;
 use eliot_kernel_core::{GovernorClosureRestore, owner_bundle_digest};
+use eliot_store_api::CanonicalReadClient;
 
-use crate::{CompositionError, OwnerClosureProvider};
+use crate::{
+    AuthorityOwnerSnapshot, CompositionError, OwnerClosureProvider, decode_revocation_history_evidence,
+    revocation_history_read_request,
+};
 
 /// Kernel publish endpoint for owner bundles, implemented by the daemon
 /// runtime (O1) against the front-door operations.
@@ -94,4 +106,45 @@ pub async fn publish_owner_feed<P: OwnerPublishPort + ?Sized>(
         ));
     }
     Ok(acknowledged)
+}
+
+/// Runs one complete trigger-driven owner synchronization (`#2100`
+/// admitted caller → publish → recover path).
+///
+/// One call performs the whole chain with no gaps for the trigger
+/// owner to fill: it builds the closed history read for the exact
+/// origin, executes it through the canonical read client, decodes the
+/// reply against the expected fence, restores the provider with that
+/// live evidence, and publishes through [`publish_owner_feed`]. The
+/// observed evidence revision must equal the expected revision, or the
+/// trigger is stale and the call refuses before any publish. Unavailable
+/// history, fence disagreement, stale evidence, and readback mismatch
+/// all refuse before any owner state is installed or claimed.
+pub async fn synchronize_owner_feed<
+    R: CanonicalReadClient + ?Sized,
+    P: OwnerPublishPort + ?Sized,
+>(
+    reads: &R,
+    kernel: &P,
+    snapshot: AuthorityOwnerSnapshot,
+    state_fence: &StateFence,
+    origin_ref: &str,
+    max_records: u32,
+    expected_revision: u64,
+) -> Result<u64, CompositionError> {
+    let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
+    let response = reads
+        .execute_named(request)
+        .await
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    let evidence = decode_revocation_history_evidence(&response, state_fence)?;
+    if evidence.source_revision != expected_revision {
+        return Err(CompositionError::Recovery(format!(
+            "owner feed observed revision {} disagrees with expected {expected_revision}; trigger is stale",
+            evidence.source_revision
+        )));
+    }
+    let provider =
+        OwnerClosureProvider::restore(snapshot, Some(evidence), state_fence)?;
+    publish_owner_feed(kernel, &provider, expected_revision).await
 }
