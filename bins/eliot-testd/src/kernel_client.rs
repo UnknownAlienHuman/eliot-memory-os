@@ -48,14 +48,18 @@
 //! already derives its executable binding from the admitted profile registry.
 
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
 use eliot_process::{ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest};
+use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    TestdError,
+    TestJob, TestdError, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
+    verification_receipt_sha256,
 };
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +71,12 @@ use serde::{Deserialize, Serialize};
 pub const TESTD_ADMISSION_OPERATION: &str = "eliot.kernel.testd-admission";
 /// Wire revision admitted by this client.
 pub const TESTD_ADMISSION_OPERATION_VERSION: u16 = 1;
+/// Authenticated receipt-publication operation on the same TestD Kernel
+/// session used for admission.
+pub const TESTD_TERMINAL_COMPLETION_OPERATION: &str =
+    "eliot.kernel.testd-terminal-completion";
+/// Version of the TestD terminal-completion wire.
+pub const TESTD_TERMINAL_COMPLETION_OPERATION_VERSION: u16 = 1;
 /// Advertisement for the testd admission operation: inert until the dispatch
 /// slice lands. Testd fails closed with `KERNEL_ADMISSION_REQUIRED` while
 /// this is `false`.
@@ -87,6 +97,89 @@ pub fn advertise_testd_admission() -> bool {
 /// (`TESTD_ADMISSION_OPERATION`, `TESTD_ADMISSION_OPERATION_VERSION`) pair.
 pub fn route_testd_admission(wire_id: &str, wire_version: u16) -> bool {
     wire_id == TESTD_ADMISSION_OPERATION && wire_version == TESTD_ADMISSION_OPERATION_VERSION
+}
+
+/// Closed TestD terminal notification. Its payload contains only the durable
+/// job identity and the digest of the immutable finish receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdTerminalCompletionRequest {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub job_id: String,
+    pub receipt_sha256: String,
+    pub request_digest: String,
+}
+
+impl TestdTerminalCompletionRequest {
+    pub fn new(notice: &TestdTerminalCompletionNotice) -> Result<Self, TestdIpcError> {
+        let mut request = Self {
+            wire_id: TESTD_TERMINAL_COMPLETION_OPERATION.to_owned(),
+            wire_version: TESTD_TERMINAL_COMPLETION_OPERATION_VERSION,
+            job_id: notice.job_id.clone(),
+            receipt_sha256: notice.receipt_sha256.clone(),
+            request_digest: String::new(),
+        };
+        request.request_digest = request.canonical_request_digest()?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn canonical_request_digest(&self) -> Result<String, TestdIpcError> {
+        #[derive(Serialize)]
+        struct Canonical<'a> {
+            wire_id: &'a str,
+            wire_version: u16,
+            job_id: &'a str,
+            receipt_sha256: &'a str,
+        }
+        let canonical = Canonical {
+            wire_id: &self.wire_id,
+            wire_version: self.wire_version,
+            job_id: &self.job_id,
+            receipt_sha256: &self.receipt_sha256,
+        };
+        canonical_json_bytes(&canonical)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))
+    }
+
+    pub fn validate(&self) -> Result<(), TestdIpcError> {
+        if self.wire_id != TESTD_TERMINAL_COMPLETION_OPERATION
+            || self.wire_version != TESTD_TERMINAL_COMPLETION_OPERATION_VERSION
+        {
+            return Err(TestdIpcError::Contract(
+                "unsupported TestD terminal-completion wire".to_owned(),
+            ));
+        }
+        validate_wire_text(&self.job_id, "testd_terminal.job_id")?;
+        validate_wire_digest(&self.receipt_sha256, "testd_terminal.receipt_sha256")?;
+        validate_wire_digest(&self.request_digest, "testd_terminal.request_digest")?;
+        if self.canonical_request_digest()? != self.request_digest {
+            return Err(TestdIpcError::Contract(
+                "TestD terminal-completion request digest mismatch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Kernel reply. `Pending` is a nonterminal handoff state; only `Committed`
+/// carries completion authority, and it must include the canonical receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TestdTerminalCompletionResponse {
+    Pending {
+        job_id: String,
+        receipt_sha256: String,
+        request_digest: String,
+    },
+    Committed {
+        job_id: String,
+        receipt_sha256: String,
+        request_digest: String,
+        receipt: WriteReceipt,
+    },
 }
 
 /// Typed failure for the authenticated testd exchange. Every variant is
@@ -160,6 +253,14 @@ fn validate_wire_digest(value: &str, field: &'static str) -> Result<(), TestdIpc
         )));
     }
     Ok(())
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |duration| {
+            u64::try_from(duration.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
+        })
 }
 
 /// Wire request presenting one testd admission for Kernel admission.
@@ -510,6 +611,7 @@ struct RetainedTestdAdmission {
 /// idempotent intent check against the retained admission. It mints no
 /// permit, builds no [`ProcessRequest`], and executes nothing.
 pub struct KernelTestdIpcClient {
+    client: KernelClient,
     #[allow(
         dead_code,
         reason = "dispatch contour retains the live epoch for the lineage-aware binding once the delivery seam lands"
@@ -537,6 +639,7 @@ impl KernelTestdIpcClient {
         require_health_open(&health)?;
         let live_epoch = parse_live_epoch(&health)?;
         Ok(Self {
+            client,
             live_epoch: Some(live_epoch),
             retained: None,
         })
@@ -547,6 +650,114 @@ impl KernelTestdIpcClient {
     #[must_use]
     pub fn live_epoch(&self) -> Option<&EpochId> {
         self.live_epoch.as_ref()
+    }
+
+    /// Sends the immutable terminal receipt reference through the existing
+    /// authenticated Kernel session and waits for the daemon's committed
+    /// canonical WriteReceipt. Pending replies never map to success.
+    pub fn publish_terminal_completion(
+        &mut self,
+        notice: &TestdTerminalCompletionNotice,
+        binding: &TestdVerifierDispatchBinding,
+        job: &TestJob,
+    ) -> Result<WriteReceipt, TestdIpcError> {
+        let request = TestdTerminalCompletionRequest::new(notice)?;
+        binding
+            .validate_for_job(job)
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        if job.job_id != notice.job_id
+            || job
+                .verification_receipt
+                .as_ref()
+                .map(verification_receipt_sha256)
+                .transpose()
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?
+                .as_deref()
+                != Some(notice.receipt_sha256.as_str())
+        {
+            return Err(TestdIpcError::Contract(
+                "terminal reference differs from the durable TestD row".to_owned(),
+            ));
+        }
+        let identity = &binding.request_identity;
+        identity
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        loop {
+            if unix_ms() >= identity.deadline_unix_ms {
+                return Err(TestdIpcError::UnknownOutcome {
+                    job_id: notice.job_id.clone(),
+                    request_digest: request.request_digest.clone(),
+                });
+            }
+            self.client.set_request_identity(identity.clone());
+            let payload = serde_json::json!({"request": &request});
+            let value = self
+                .client
+                .transact_json(TESTD_TERMINAL_COMPLETION_OPERATION, payload)
+                .map_err(|error| match error {
+                    KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
+                        job_id: notice.job_id.clone(),
+                        request_digest: request.request_digest.clone(),
+                    },
+                    other => TestdIpcError::Transport(other.to_string()),
+                })?;
+            let response: TestdTerminalCompletionResponse = serde_json::from_value(value)
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+            match response {
+                TestdTerminalCompletionResponse::Pending {
+                    job_id,
+                    receipt_sha256,
+                    request_digest,
+                } if job_id == notice.job_id
+                    && receipt_sha256 == notice.receipt_sha256
+                    && request_digest == request.request_digest =>
+                {
+                    thread::sleep(Duration::from_millis(200));
+                }
+                TestdTerminalCompletionResponse::Committed {
+                    job_id,
+                    receipt_sha256,
+                    request_digest,
+                    receipt,
+                } => {
+                    if job_id != notice.job_id
+                        || receipt_sha256 != notice.receipt_sha256
+                        || request_digest != request.request_digest
+                    {
+                        return Err(TestdIpcError::Contract(
+                            "Kernel terminal receipt response does not echo the submitted owner reference"
+                                .to_owned(),
+                        ));
+                    }
+                    receipt
+                        .validate()
+                        .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+                    let expected_operation = format!("{}/verifier-execution", binding.operation_id);
+                    let expected_idempotency = format!(
+                        "{}:verifier-execution",
+                        identity.idempotency_key
+                    );
+                    if receipt.status != WriteReceiptStatus::Committed
+                        || receipt.operation_id.as_str() != expected_operation
+                        || receipt.idempotency_key != expected_idempotency
+                        || receipt.state_fence != identity.request.state_fence
+                    {
+                        return Err(TestdIpcError::Contract(
+                            "Kernel terminal response lacks the exact committed verifier WriteReceipt"
+                                .to_owned(),
+                        ));
+                    }
+                    return Ok(receipt);
+                }
+                _ => {
+                    return Err(TestdIpcError::Contract(
+                        "Kernel terminal-completion response is not bound to the request"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
     }
 
     /// Reports whether the live Kernel advertises the exact testd
