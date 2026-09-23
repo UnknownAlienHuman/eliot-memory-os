@@ -51,11 +51,14 @@
 //!   `audit_range_v1` payload shape carries records only — a short page
 //!   ends enumeration, a full page may continue;
 //! coordinated evolution (recorded, not applied): carrying the next
-//!   cursor inside the response payload requires the consumer parser to
-//!   accept an optional `next_cursor` member (backward compatible for
-//!   payloads without it); until the consumer lane adopts that member,
-//!   continuation stays caller-derived and every bound is enforced
-//!   store-side exactly as specified here.
+//!   cursor inside the *audit* response payload requires the consumer
+//!   parser to accept an optional `next_cursor` member (backward
+//!   compatible for payloads without it); until the consumer lane adopts
+//!   that member, audit continuation stays caller-derived and every bound
+//!   is enforced store-side exactly as specified here. The bank/feedback
+//!   range pages already carry an owner-minted `next_cursor` (fence plus
+//!   heads bound, same issuer as audit cursors) because their Governor
+//!   readers select only the `records` array and stay compatible.
 //! ```
 
 use std::collections::BTreeMap;
@@ -123,6 +126,8 @@ pub const EXPERIENCE_PAGE_RECORDS: &str = "records";
 pub const EXPERIENCE_PAGE_MATCHED_TOTAL: &str = "matched_total";
 /// Read payload field: whether further rows exist past the bound.
 pub const EXPERIENCE_PAGE_TRUNCATED: &str = "truncated";
+/// Read payload field: owner-minted continuation cursor, or null at end.
+pub const EXPERIENCE_PAGE_NEXT_CURSOR: &str = "next_cursor";
 /// Read payload field: projection fence.
 pub const EXPERIENCE_PAGE_STATE_FENCE: &str = "state_fence";
 
@@ -555,6 +560,12 @@ pub struct ExperienceRangePage {
     pub matched_total: usize,
     /// Whether further rows exist past the bound.
     pub truncated: bool,
+    /// Owner-minted continuation cursor for the next page, or `None`
+    /// when this page ends the enumeration. Callers echo it back as the
+    /// `cursor` selector; cursors bind fence plus revision heads exactly
+    /// like the audit range.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 impl ExperienceRangePage {
@@ -564,6 +575,7 @@ impl ExperienceRangePage {
             EXPERIENCE_PAGE_RECORDS: self.records,
             EXPERIENCE_PAGE_MATCHED_TOTAL: self.matched_total,
             EXPERIENCE_PAGE_TRUNCATED: self.truncated,
+            EXPERIENCE_PAGE_NEXT_CURSOR: self.next_cursor,
             EXPERIENCE_PAGE_STATE_FENCE: state_fence,
         })
     }

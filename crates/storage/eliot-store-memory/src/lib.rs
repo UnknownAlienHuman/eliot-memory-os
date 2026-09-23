@@ -1718,51 +1718,77 @@ fn experience_range_payload(
         .clone()
         .ok_or_else(|| serde_json::Error::custom("experience range read requires scope_id"))?;
     let limit = usize::from(decoded.max_records.max(1));
+    let heads: Vec<(String, u64)> = state
+        .revision_heads
+        .values()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, fence, &heads)
+                .map_err(|error| serde_json::Error::custom(error.to_string()))?,
+        ),
+    };
     let mut records = Vec::new();
     let mut truncated = false;
+    let mut ordinal: u64 = 0;
+    // Local row walk shared by both families: fence plus scope gating,
+    // deterministic key order, ordinal skip for continuation, and a
+    // limit-plus-probe bound with caller-visible truncation.
+    macro_rules! walk_rows {
+        ($rows:expr) => {
+            for row in $rows {
+                if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
+                    continue;
+                }
+                ordinal = ordinal.saturating_add(1);
+                if start.is_some_and(|start| ordinal <= start) {
+                    continue;
+                }
+                if records.len() > limit {
+                    truncated = true;
+                    break;
+                }
+                records.push(json!({
+                    "handle": row.handle,
+                    "revision": row.revision,
+                    "record_json": row.record_json,
+                    "record_digest": row.record_digest,
+                }));
+            }
+        };
+    }
     if bank {
-        for row in state.experience_bank_rows.values() {
-            if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
-                continue;
-            }
-            if records.len() > limit {
-                truncated = true;
-                break;
-            }
-            records.push(json!({
-                "handle": row.handle,
-                "revision": row.revision,
-                "record_json": row.record_json,
-                "record_digest": row.record_digest,
-            }));
-        }
+        walk_rows!(state.experience_bank_rows.values());
     } else {
-        for row in state.experience_feedback_rows.values() {
-            if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
-                continue;
-            }
-            if records.len() > limit {
-                truncated = true;
-                break;
-            }
-            records.push(json!({
-                "handle": row.handle,
-                "revision": row.revision,
-                "record_json": row.record_json,
-                "record_digest": row.record_digest,
-            }));
-        }
+        walk_rows!(state.experience_feedback_rows.values());
     }
     if records.len() > limit {
         records.pop();
         truncated = true;
     }
     let matched_total = records.len();
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(matched_total).unwrap_or(u64::MAX)),
+            )
+            .map_err(|error| serde_json::Error::custom(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     serde_json::to_value(
         eliot_store_api::ExperienceRangePage {
             records,
             matched_total,
             truncated,
+            next_cursor,
         }
         .payload(fence),
     )

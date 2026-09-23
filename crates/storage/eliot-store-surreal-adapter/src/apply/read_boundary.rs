@@ -2077,19 +2077,46 @@ async fn experience_bank_range_payload(
         reason: "experience range read requires scope_id",
     })?;
     let limit = usize::from(decoded.max_records.max(1));
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    // Fetch covers the skip window plus one probe row: the row scan is
+    // O(table) like every other range read on this contour, and the
+    // probe decides truncation without a second query.
+    let fetch = start
+        .unwrap_or(0)
+        .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+        .saturating_add(1);
+    let fetch = usize::try_from(fetch).unwrap_or(usize::MAX);
     let rows = super::surreal_experience::read_bank_for_read(
         db,
         config,
         scope_id.as_str(),
-        limit.saturating_add(1),
+        fetch,
     )
     .await?;
     let mut records = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
     for row in rows {
         if row.state_fence != *state_fence {
             continue;
         }
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
         if records.len() > limit {
+            truncated = true;
             break;
         }
         records.push(json!({
@@ -2099,16 +2126,30 @@ async fn experience_bank_range_payload(
             "record_digest": row.record_digest,
         }));
     }
-    let mut truncated = false;
     if records.len() > limit {
         records.pop();
         truncated = true;
     }
     let matched_total = projection_len(records.len())?;
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                state_fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX)),
+            )
+            .map_err(AdapterError::Store)?,
+        )
+    } else {
+        None
+    };
     Ok(json!({
         "records": records,
         "matched_total": matched_total,
         "truncated": truncated,
+        "next_cursor": next_cursor,
         "state_fence": state_fence,
     }))
 }
@@ -2136,19 +2177,46 @@ async fn experience_feedback_range_payload(
         reason: "experience range read requires scope_id",
     })?;
     let limit = usize::from(decoded.max_records.max(1));
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    // Fetch covers the skip window plus one probe row: the row scan is
+    // O(table) like every other range read on this contour, and the
+    // probe decides truncation without a second query.
+    let fetch = start
+        .unwrap_or(0)
+        .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+        .saturating_add(1);
+    let fetch = usize::try_from(fetch).unwrap_or(usize::MAX);
     let rows = super::surreal_experience::read_feedback_for_read(
         db,
         config,
         scope_id.as_str(),
-        limit.saturating_add(1),
+        fetch,
     )
     .await?;
     let mut records = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
     for row in rows {
         if row.state_fence != *state_fence {
             continue;
         }
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
         if records.len() > limit {
+            truncated = true;
             break;
         }
         records.push(json!({
@@ -2158,16 +2226,30 @@ async fn experience_feedback_range_payload(
             "record_digest": row.record_digest,
         }));
     }
-    let mut truncated = false;
     if records.len() > limit {
         records.pop();
         truncated = true;
     }
     let matched_total = projection_len(records.len())?;
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                state_fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX)),
+            )
+            .map_err(AdapterError::Store)?,
+        )
+    } else {
+        None
+    };
     Ok(json!({
         "records": records,
         "matched_total": matched_total,
         "truncated": truncated,
+        "next_cursor": next_cursor,
         "state_fence": state_fence,
     }))
 }

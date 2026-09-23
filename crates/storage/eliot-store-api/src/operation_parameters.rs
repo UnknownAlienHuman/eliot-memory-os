@@ -34,8 +34,10 @@
 //! (`selector` + `max_records`), and `GetCapabilityEvidenceState`
 //! (`skill_id` + `max_records`), each scope-addressed and bounded like
 //! `GetEvidencePack`, plus issue #223 the two experience range reads
-//! `GetExperienceBankRange` / `GetAgentFeedbackRange` (`max_records` only;
-//! scope through the typed `scope_id` request field) and the two
+//! `GetExperienceBankRange` / `GetAgentFeedbackRange` (required
+//! `max_records` plus the optional opaque `cursor` continuation
+//! selector; scope through the typed `scope_id` request field) and the
+//! two
 //! `CommitExperienceBank` / `CommitAgentFeedback` mutations
 //! (`CaptureCandidate` with the `Candidate` ceiling; verbatim record
 //! document plus presented digests, decimal owner revision, and
@@ -746,11 +748,18 @@ static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 4] = [
 /// Shared closed selector for both experience range reads (issue #223):
 /// the explicit `max_records` bound as its decimal string. Scope arrives
 /// through the typed `scope_id` request field, mirroring `GetEvidencePack`.
-static GET_EXPERIENCE_RANGE_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
-    name: "max_records",
-    shape: ParameterShape::Subject,
-    required: true,
-}];
+static GET_EXPERIENCE_RANGE_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "max_records",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "cursor",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+];
 
 /// Closed selector for the audit-range read (issue #223): the optional
 /// opaque continuation cursor minted by the store-api audit cursor
@@ -977,7 +986,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// discriminator, the optional exact `automation_id` selector, the required
 /// `include_retired` flag, and the required decimal `max_records` bound;
 /// `GetExperienceBankRange` and `GetAgentFeedbackRange` declare the required
-/// decimal `max_records` bound (issue #223; scope arrives through the typed
+/// decimal `max_records` bound plus the optional opaque `cursor`
+/// continuation selector (issue #223; scope arrives through the typed
 /// `scope_id` request field, mirroring `GetEvidencePack`);
 /// `GetAuditRange` declares the optional opaque `cursor` continuation
 /// selector (issue #223; absent cursors read from the start);
