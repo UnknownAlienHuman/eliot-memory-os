@@ -9,9 +9,11 @@
 #![allow(clippy::result_large_err, clippy::large_enum_variant)]
 
 mod bridge_admission;
+mod compiler;
 mod input;
 mod plan;
 mod result;
+mod retrieval_plan;
 mod settled_plan_feed;
 
 pub use bridge_admission::{
@@ -19,6 +21,8 @@ pub use bridge_admission::{
     BridgeAdmissionInstruction, BridgeAdmissionSeverity, MAX_BRIDGE_RELATIONS,
     plan_bridge_admissions,
 };
+
+pub use compiler::{CampaignQueryParts, PlanParts, compile_retrieval_plan};
 
 pub use input::{
     AttentionDisclosureRule, ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTargetBinding,
@@ -29,6 +33,11 @@ pub use result::{
     PendingContextInjectionPlan, PlannedAttentionBinding, PlannedContextItem, PlannedItemKind,
     PlanningAccounting, PlanningErrorDisposition, PlanningErrorKind, ReactiveContextPlanResult,
     ReactiveContextPlanningError,
+};
+pub use retrieval_plan::{
+    CampaignBudgets, CampaignExperienceQuery, CampaignIntent, CampaignOutputMode,
+    RetrievalPlan, RetrievalRouteKind, RouteExecution, RouteExecutionOrder, SourceProjectionFence,
+    MAX_PLAN_HANDLES, MAX_PLAN_ROUTES, MAX_PLAN_TEXT_CHARS,
 };
 pub use settled_plan_feed::{
     LiveActivationBindings, SettledPlanFeed, SettledPlanFeedError, SettledPlanFeedInputs,

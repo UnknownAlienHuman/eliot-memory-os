@@ -1076,7 +1076,9 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-reactive-context-plan",
  "eliot-receipts",
+ "serde",
 ]
 
 [[package]]
@@ -3145,8 +3147,8 @@ dependencies = [
 name = "eliot-understanding-assessment"
 version = "0.1.0"
 dependencies = [
- "eliot-contracts",
  "eliot-context-contracts",
+ "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-epistemic-contracts",
  "eliot-observation-contracts",
