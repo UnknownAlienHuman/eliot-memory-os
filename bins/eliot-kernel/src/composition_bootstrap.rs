@@ -1279,6 +1279,7 @@ impl KernelComposition {
             ipc,
             generation_gateway,
             service: Arc::new(Mutex::new(service)),
+            runtime_lease_gate: tokio::sync::Mutex::new(()),
             generations: Mutex::new(generations),
             generation_poison: Mutex::new(None),
             front_door_policy: Mutex::new(policy),

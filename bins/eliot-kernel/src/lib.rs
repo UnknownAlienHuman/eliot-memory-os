@@ -491,6 +491,10 @@ pub struct KernelComposition {
     ipc: IpcImplementation,
     generation_gateway: OrsGenerationCoordinator,
     service: Arc<Mutex<KernelService>>,
+    /// Serializes readiness/supervision renewal and RuntimeLease operations
+    /// with admission-closing lifecycle commands and exact-fence census.
+    /// Ported from #1751 donor 552ee79a (M2 integration copy).
+    runtime_lease_gate: tokio::sync::Mutex<()>,
     generations: Mutex<GenerationRouter>,
     generation_poison: Mutex<Option<String>>,
     front_door_policy: Mutex<ServerHandshakePolicy>,

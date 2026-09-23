@@ -305,6 +305,22 @@ impl KernelComposition {
                     StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
             }
         }
+        // Serializes probe/lease lifecycle admission with the exact-fence
+        // census (#1751 donor 552ee79a, M2 port; variant list matches this
+        // copy's command enum exactly).
+        let _runtime_lease_gate = if matches!(
+            &request.command,
+            KernelControlCommand::ProbeReady
+                | KernelControlCommand::ReadRuntimeLeaseCensus(_)
+                | KernelControlCommand::Degrade(_)
+                | KernelControlCommand::Drain
+                | KernelControlCommand::Stop
+                | KernelControlCommand::Fail(_)
+        ) {
+            Some(self.runtime_lease_gate.lock().await)
+        } else {
+            None
+        };
         if let KernelControlCommand::ReportHostStartupEvidence(evidence) = &request.command {
             self.consume_host_startup_evidence(evidence)?;
         }
@@ -615,11 +631,17 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?
                     .reconcile(request.candidate.clone())
                     .map_err(|_| TransportError::SessionFenced)?,
+                KernelControlCommand::Drain
+                    if self
+                        .service_state()
+                        .map_err(|_| TransportError::SessionFenced)?
+                        == KernelServiceState::Draining => {}
                 KernelControlCommand::BootstrapStore(_)
                 | KernelControlCommand::Activate(_)
                 | KernelControlCommand::ReconcileActivation(_)
                 | KernelControlCommand::RebindStore(_)
                 | KernelControlCommand::ReconcileRebindStore(_)
+                | KernelControlCommand::ReadRuntimeLeaseCensus(_)
                 | KernelControlCommand::ReportHostStartupEvidence(_) => {}
                 command => {
                     self.apply_control(command.clone())
@@ -633,6 +655,42 @@ impl KernelComposition {
         {
             self.promote_agent_bridge_profile(next)?;
         }
+        let runtime_lease_census = match &request.command {
+            KernelControlCommand::ReadRuntimeLeaseCensus(query) => {
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Draining
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let supervision_lease_id = eliot_ors::OperationIdentity::new(
+                    query.supervision_lease_id.clone(),
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                let (runtime_leases, supervision_lease) = self
+                    .generation_gateway
+                    .ors
+                    .load_runtime_lease_census_by_state_fence(
+                        &query.state_fence,
+                        Some(&supervision_lease_id),
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let supervision_lease =
+                    supervision_lease.ok_or(TransportError::SessionFenced)?;
+                let census = eliot_kernel_service::RuntimeLeaseCensus {
+                    state_fence: query.state_fence.clone(),
+                    supervision_lease_id: query.supervision_lease_id.clone(),
+                    runtime_leases,
+                    supervision_lease,
+                };
+                census
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Some(census)
+            }
+            _ => None,
+        };
         let state = self
             .service_state()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -655,6 +713,7 @@ impl KernelComposition {
             activation_receipt,
             store_rebind_receipt,
             supervision_lease,
+            runtime_lease_census,
             error: None,
             payload_digest: String::new(),
         }
