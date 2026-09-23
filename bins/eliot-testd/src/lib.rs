@@ -27,19 +27,17 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
-    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    KernelProcessAdmissionRequest, Lease, ProcessAdmissionPermit, RetryPolicy, TargetRoots,
-    TestJob, TestdError, TestdSourceObservation, TestdStore, is_admitted_testd_profile,
-    issue_process_admission,
-    testd_profile_binding, testd_profile_resource_limits,
-    validate_running_lease,
+    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
+    Lease, ProcessAdmissionPermit, RetryPolicy, TargetRoots, TestJob, TestdError,
+    TestdSourceObservation, TestdStore, is_admitted_testd_profile, issue_process_admission,
+    testd_profile_binding, testd_profile_resource_limits, validate_running_lease,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use eliot_testd_core::{
-    NormalizedEvidence, RawArtifact, TestdToolObservation, VerificationReceipt,
-    TestdVerifierDispatchBinding, TestdTerminalCompletionNotice, sha256_artifact, sha256_hex,
+    NormalizedEvidence, RawArtifact, TestdTerminalCompletionNotice, TestdToolObservation,
+    TestdVerifierDispatchBinding, VerificationReceipt, sha256_artifact, sha256_hex,
     verification_receipt_sha256,
 };
 
@@ -465,16 +463,7 @@ impl TestdComposition {
         executor: &E,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, TestdError> {
-        start_claimed_from_store(
-            &self.store,
-            job,
-            lease,
-            now,
-            permit,
-            executor,
-            sink,
-        )
-        .await
+        start_claimed_from_store(&self.store, job, lease, now, permit, executor, sink).await
     }
 }
 
@@ -828,7 +817,9 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
     ] {
         let path = Path::new(value);
         if !path.is_absolute()
-            || path.components().any(|component| matches!(component, Component::ParentDir))
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
             || !path.is_dir()
         {
             return Err(TestdError::Invalid {
@@ -1062,10 +1053,7 @@ fn productive_tool_environment(
         .into_owned();
     Ok(vec![
         (TESTD_ENV_NEXTEST_GATE.to_owned(), "1".to_owned()),
-        (
-            TESTD_ENV_NEXTEST_SHA256.to_owned(),
-            nextest.sha256.clone(),
-        ),
+        (TESTD_ENV_NEXTEST_SHA256.to_owned(), nextest.sha256.clone()),
         (TESTD_ENV_CARGO.to_owned(), cargo.path.clone()),
         (TESTD_ENV_RUSTC.to_owned(), rustc.path.clone()),
         (TESTD_ENV_CARGO_SHA256.to_owned(), cargo.sha256.clone()),
@@ -1114,12 +1102,12 @@ fn resolve_selected_toolchain(
     })
 }
 
-fn selected_toolchain_name(
-    rustup_home: &str,
-    source_root: &Path,
-) -> Result<String, TestdError> {
+fn selected_toolchain_name(rustup_home: &str, source_root: &Path) -> Result<String, TestdError> {
     let override_name = read_toolchain_override(source_root)?;
-    let settings = read_bounded_text(&Path::new(rustup_home).join("settings.toml"), "rustup settings")?;
+    let settings = read_bounded_text(
+        &Path::new(rustup_home).join("settings.toml"),
+        "rustup settings",
+    )?;
     let host = toml_string_value(&settings, "default_host_triple");
     let requested = override_name.or_else(|| toml_string_value(&settings, "default_toolchain"));
     let requested = requested.ok_or(TestdError::Invalid {
@@ -1220,10 +1208,15 @@ fn toml_string_value(text: &str, key: &str) -> Option<String> {
     })
 }
 
-fn resolved_tool_path(candidate: &Path, field: &'static str) -> Result<ResolvedToolFile, TestdError> {
-    if !candidate.is_absolute() || candidate.components().any(|component| {
-        matches!(component, Component::ParentDir)
-    }) {
+fn resolved_tool_path(
+    candidate: &Path,
+    field: &'static str,
+) -> Result<ResolvedToolFile, TestdError> {
+    if !candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
         return Err(TestdError::Invalid {
             field,
             reason: "rustup selected tool path is not absolute and traversal-free",
@@ -1484,20 +1477,11 @@ pub enum ValidatedDispatchDriveOutcome {
 /// binary passes its dispatch-locator directory (the honest closed stand-in
 /// for the bounded probe, which reads no working directory); the production
 /// contour delivers the admitted generation root.
-pub async fn drive_validated_dispatch_material(
+fn load_dispatch_job(
     material: &crate::testd_material::ValidatedTestdMaterial,
-    source_root: &str,
-    now_unix_ms: u64,
-) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
-    if material.cancelled {
-        return Ok(ValidatedDispatchDriveOutcome::Cancelled {
-            job_id: material.job_id.clone(),
-        });
-    }
-    let source_root = Path::new(source_root);
-    let store_path = testd_store_path(source_root)?;
-    let store = TestdStore::open(store_path, RetryPolicy::default())?;
-    let mut job = store
+) -> Result<(TestdStore, TestJob), TestdError> {
+    let store = TestdStore::open(&material.owner_store_path, RetryPolicy::default())?;
+    let job = store
         .get(&material.job_id)?
         .ok_or_else(|| TestdError::Invalid {
             field: "job_id",
@@ -1510,16 +1494,23 @@ pub async fn drive_validated_dispatch_material(
             .validate_for_job(&job)?;
     }
     job.target_roots.validate()?;
+    Ok((store, job))
+}
+
+fn canonicalize_dispatch_roots(
+    source_root: &Path,
+    job: &TestJob,
+    material: &crate::testd_material::ValidatedTestdMaterial,
+) -> Result<PathBuf, TestdError> {
     let observed_source = std::fs::canonicalize(source_root).map_err(|_| TestdError::Invalid {
         field: "source_root",
         reason: "admitted source root cannot be canonicalized",
     })?;
-    let canonical_job_source = std::fs::canonicalize(&job.target_roots.source_root).map_err(|_| {
-        TestdError::Invalid {
+    let canonical_job_source =
+        std::fs::canonicalize(&job.target_roots.source_root).map_err(|_| TestdError::Invalid {
             field: "source_root",
             reason: "canonical TestD source root cannot be canonicalized",
-        }
-    })?;
+        })?;
     if observed_source != canonical_job_source
         || job.invocation.profile != material.profile
         || job.process.generation != material.generation
@@ -1530,6 +1521,15 @@ pub async fn drive_validated_dispatch_material(
     {
         return Err(TestdError::InvalidBinding);
     }
+    Ok(canonical_job_source)
+}
+
+fn ensure_dispatch_source_observation(
+    store: &TestdStore,
+    mut job: TestJob,
+    canonical_job_source: &Path,
+    now_unix_ms: u64,
+) -> Result<TestJob, TestdError> {
     if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
         if let Some(observation) = &job.source_observation_before {
             observation.validate()?;
@@ -1537,7 +1537,7 @@ pub async fn drive_validated_dispatch_material(
                 return Err(TestdError::InvalidBinding);
             }
         } else {
-            let observation = TestdSourceObservation::capture(&canonical_job_source)?;
+            let observation = TestdSourceObservation::capture(canonical_job_source)?;
             job = store.bind_source_observation_before_dispatch(
                 &job.job_id,
                 observation,
@@ -1545,12 +1545,20 @@ pub async fn drive_validated_dispatch_material(
             )?;
         }
     }
+    Ok(job)
+}
+
+fn derive_dispatch_process_intent(
+    job: &TestJob,
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    canonical_job_source: &Path,
+) -> Result<ProcessIntent, TestdError> {
     let program_path = if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
     } else {
         eliot_testd_core::TESTD_PROFILE_PROGRAM
     };
-    let tool = resolve_testd_tool_at(program_path, &canonical_job_source)?;
+    let tool = resolve_testd_tool_at(program_path, canonical_job_source)?;
     let tool_environment = bind_tool_environment_to_roots(
         &job.invocation.profile,
         tool.environment,
@@ -1571,10 +1579,24 @@ pub async fn drive_validated_dispatch_material(
         target_root: job.target_roots.target_root.clone(),
         cache_root: job.target_roots.cache_root.clone(),
     };
-    let intent = derive_testd_intent(&params)?;
+    derive_testd_intent(&params)
+}
+
+fn present_dispatch_admission(
+    job: &TestJob,
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    intent: &ProcessIntent,
+    now_unix_ms: u64,
+) -> Result<
+    (
+        crate::kernel_client::PresentedAdmission,
+        TestdDispatchAuthority,
+    ),
+    TestdError,
+> {
     let authority_epoch = material.epoch.clone();
     let authority = TestdDispatchAuthority::new()?;
-    let request = authority.issue(&intent, &material.grant, now_unix_ms)?;
+    let request = authority.issue(intent, &material.grant, now_unix_ms)?;
     if request.invocation_digest() != job.process.invocation_digest {
         return Err(TestdError::InvalidBinding);
     }
@@ -1600,6 +1622,47 @@ pub async fn drive_validated_dispatch_material(
         evidence_ref: material.operation_id.clone(),
         cancelled: material.cancelled,
     };
+    Ok((presented, authority))
+}
+
+fn project_dispatch_receipt_state(
+    receipt: &TestReceipt,
+) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    match receipt.state.as_str() {
+        "Succeeded" => Ok(ValidatedDispatchDriveOutcome::Completed {
+            job_id: receipt.job_id.clone(),
+        }),
+        "Failed" => Ok(ValidatedDispatchDriveOutcome::Failed {
+            job_id: receipt.job_id.clone(),
+        }),
+        "Cancelled" => Ok(ValidatedDispatchDriveOutcome::Cancelled {
+            job_id: receipt.job_id.clone(),
+        }),
+        "RetryWait" => Ok(ValidatedDispatchDriveOutcome::ReconcileRequired {
+            job_id: receipt.job_id.clone(),
+        }),
+        state => Err(TestdError::Contract(format!(
+            "durable TestD worker returned non-terminal state {state}"
+        ))),
+    }
+}
+
+pub async fn drive_validated_dispatch_material(
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    source_root: &str,
+    now_unix_ms: u64,
+) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    if material.cancelled {
+        return Ok(ValidatedDispatchDriveOutcome::Cancelled {
+            job_id: material.job_id.clone(),
+        });
+    }
+    let source_root = Path::new(source_root);
+    let (store, job) = load_dispatch_job(material)?;
+    let canonical_job_source = canonicalize_dispatch_roots(source_root, &job, material)?;
+    let job = ensure_dispatch_source_observation(&store, job, &canonical_job_source, now_unix_ms)?;
+    let intent = derive_dispatch_process_intent(&job, material, &canonical_job_source)?;
+    let (presented, authority) = present_dispatch_admission(&job, material, &intent, now_unix_ms)?;
     let executor = compose_process_executor(Arc::new(authority));
     let receipt = worker::drive_admitted_one_shot_from_store(
         &store,
@@ -1609,23 +1672,7 @@ pub async fn drive_validated_dispatch_material(
         ADMITTED_WORKER_LEASE_MS,
         now_unix_ms,
     )?;
-    match receipt.state.as_str() {
-        "Succeeded" => Ok(ValidatedDispatchDriveOutcome::Completed {
-            job_id: receipt.job_id,
-        }),
-        "Failed" => Ok(ValidatedDispatchDriveOutcome::Failed {
-            job_id: receipt.job_id,
-        }),
-        "Cancelled" => Ok(ValidatedDispatchDriveOutcome::Cancelled {
-            job_id: receipt.job_id,
-        }),
-        "RetryWait" => Ok(ValidatedDispatchDriveOutcome::ReconcileRequired {
-            job_id: receipt.job_id,
-        }),
-        state => Err(TestdError::Contract(format!(
-            "durable TestD worker returned non-terminal state {state}"
-        ))),
-    }
+    project_dispatch_receipt_state(&receipt)
 }
 
 /// Production one-shot entry: executes the durable admitted job and then
@@ -1648,8 +1695,7 @@ pub async fn drive_validated_dispatch_material_with_terminal_publisher(
     let Some(job_id) = job_id else {
         return Ok(outcome);
     };
-    let store_path = testd_store_path(Path::new(source_root))?;
-    let store = TestdStore::open(store_path, RetryPolicy::default())?;
+    let store = TestdStore::open(&material.owner_store_path, RetryPolicy::default())?;
     let job = store
         .get(job_id)?
         .ok_or_else(|| TestdError::Corrupt("terminal TestD job disappeared".to_owned()))?;
@@ -1681,25 +1727,6 @@ pub async fn drive_validated_dispatch_material_with_terminal_publisher(
             .map_err(|error| TestdError::Contract(error.to_string()))?;
     }
     Ok(outcome)
-}
-
-/// Returns the daemon-owned durable TestD state path for an admitted source
-/// root. The child never creates a new owner store for a missing source tree.
-pub fn testd_store_path(source_root: &Path) -> Result<PathBuf, TestdError> {
-    if !source_root.is_absolute() || !source_root.is_dir() {
-        return Err(TestdError::Invalid {
-            field: "source_root",
-            reason: "admitted source root must be an existing absolute directory",
-        });
-    }
-    let state_root = source_root.join(".eliot");
-    if !state_root.is_dir() {
-        return Err(TestdError::Invalid {
-            field: "testd_state",
-            reason: "daemon-owned .eliot state directory is unavailable",
-        });
-    }
-    Ok(state_root.join("testd-state.redb"))
 }
 
 fn bind_tool_environment_to_roots(
@@ -1745,14 +1772,7 @@ pub fn run_admitted_one_shot<E: ProcessExecutor + 'static>(
     now: u64,
 ) -> Result<TestReceipt, TestdError> {
     let store = composition.store();
-    worker::drive_admitted_one_shot_from_store(
-        store,
-        presented,
-        executor,
-        owner,
-        lease_ms,
-        now,
-    )
+    worker::drive_admitted_one_shot_from_store(store, presented, executor, owner, lease_ms, now)
 }
 
 pub(crate) fn receipt(job: &TestJob) -> TestReceipt {
@@ -2314,6 +2334,7 @@ mod tests {
             fence_nonce: "testd-test-fence-01".to_owned(),
             idempotency_key: "testd-test-lease-01".to_owned(),
             expires_at: now.saturating_add(60_000),
+            testd_owner_store_path: None,
         };
         assert!(grant.expires_at > now);
 
@@ -2423,7 +2444,9 @@ mod tests {
                 fence_nonce: "fence-1".to_owned(),
                 idempotency_key: "lease-1".to_owned(),
                 expires_at: 2,
+                testd_owner_store_path: None,
             },
+            owner_store_path: std::path::PathBuf::from("C:\\unused-owner-store"),
             fence,
             cancelled: true,
         };

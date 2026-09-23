@@ -1896,6 +1896,7 @@ mod tests {
             fence_nonce: "native-worker-fence-kernel-drive-1".to_owned(),
             idempotency_key: "native-worker-lease-kernel-drive-1".to_owned(),
             expires_at: grant_expires_at,
+            testd_owner_store_path: None,
         };
         let bytes = load(eliot_kernel::native_worker_material_bytes(
             &request,

@@ -50,9 +50,9 @@ use eliot_diagnostic::{
 use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
 use eliot_finish::{DescendantClosure, FinishDecisionReceipt, FinishService};
 use eliot_instrument_api::{
-    EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus,
-    InstrumentInvocation, InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource,
-    VerificationOutcome, VerificationRun,
+    EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus, InstrumentInvocation,
+    InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource, VerificationOutcome,
+    VerificationRun,
 };
 use eliot_instrument_nextest::{
     NextestTestEvent, NextestTestStatus, catalog_test_id, parse_test_events,
@@ -74,7 +74,7 @@ use eliot_store_api::{
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
 use eliot_testd_core::{
     JobState, RawArtifactStream, ReceiptBinding, TestJob, TestdSourceObservation,
-    TestdSourceObservationRange, TestdStore, VerificationReceipt,
+    TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
 };
 use eliot_workscope::{WorkScopeBindingOwner, WorkScopeBindingSnapshot};
 use schemars::JsonSchema;
@@ -1798,13 +1798,13 @@ impl CanonicalVerifierExecutionFact {
             && !self.verification_run.raw_evidence.is_empty()
             && !self.verification_run.evidence.is_empty()
             && self.verification_run.evidence.iter().all(|evidence| {
-                    matches!(
-                        evidence.freshness,
-                        EvidenceFreshness::ExactCandidate
-                            | EvidenceFreshness::ExactCommit
-                            | EvidenceFreshness::ExactQuiescedWorktree
-                    ) && evidence.coverage == EvidenceCoverage::CompleteForScope
-                })
+                matches!(
+                    evidence.freshness,
+                    EvidenceFreshness::ExactCandidate
+                        | EvidenceFreshness::ExactCommit
+                        | EvidenceFreshness::ExactQuiescedWorktree
+                ) && evidence.coverage == EvidenceCoverage::CompleteForScope
+            })
             && self
                 .raw_artifact_bindings
                 .iter()
@@ -2414,11 +2414,11 @@ impl CanonicalAdmissionOwner {
             .verifier_execution_fact
             .clone()
             .ok_or_else(|| {
-            CompositionError::Recovery(
-                "canonical verifier execution fact is absent; completion proof is unavailable"
-                    .to_owned(),
-            )
-        })?;
+                CompositionError::Recovery(
+                    "canonical verifier execution fact is absent; completion proof is unavailable"
+                        .to_owned(),
+                )
+            })?;
         fact.validate(state_fence)?;
         Ok(fact)
     }
@@ -3300,48 +3300,48 @@ fn normalize_nextest_run(
                     CompositionError::Recovery("nextest event has no raw artifact".to_owned())
                 })?;
                 let diagnostic = DiagnosticEvent::from_input(DiagnosticInput {
-                        project_id: job.invocation.request.product_id.to_string(),
-                        task_id: job
-                            .invocation
-                            .request
-                            .task_id
-                            .as_ref()
-                            .map(ToString::to_string),
-                        tool_id: job.invocation.instrument.to_string(),
-                        tool_version: tool.nextest_identity(),
-                        config_hash: plan.planned.verifier_config_hash.clone(),
+                    project_id: job.invocation.request.product_id.to_string(),
+                    task_id: job
+                        .invocation
+                        .request
+                        .task_id
+                        .as_ref()
+                        .map(ToString::to_string),
+                    tool_id: job.invocation.instrument.to_string(),
+                    tool_version: tool.nextest_identity(),
+                    config_hash: plan.planned.verifier_config_hash.clone(),
                     branch: source_before.branch.clone(),
                     commit: source_before.commit.clone(),
                     dirty_state_hash: source_before.dirty_state_sha256.clone(),
-                        file_path: job.invocation.target.clone(),
-                        range: None,
-                        severity,
-                        rule_id: format!("nextest.test.{}", status_label.to_ascii_lowercase()),
+                    file_path: job.invocation.target.clone(),
+                    range: None,
+                    severity,
+                    rule_id: format!("nextest.test.{}", status_label.to_ascii_lowercase()),
                     message: format!("nextest test {name} completed with status {status_label}"),
-                        raw_observation_ref: raw_observation_ref.clone(),
-                        observed_at,
-                        status: if matches!(*status, NextestTestStatus::Pass) {
-                            DiagnosticStatus::Resolved
-                        } else {
-                            DiagnosticStatus::Active
-                        },
-                    })
-                    .map_err(|error| {
-                        CompositionError::Recovery(format!(
-                            "registered diagnostic normalizer rejected nextest event: {error}"
-                        ))
-                    })?;
-                let diagnostic = classifier.admit(diagnostic).map_err(|error| {
-                        CompositionError::Recovery(format!(
-                            "registered diagnostic normalizer rejected nextest event: {error}"
-                        ))
-                    })?;
-                let evidence_id = ArtifactId::new(format!("nextest-evidence-{}", sha256_hex(line)))
+                    raw_observation_ref: raw_observation_ref.clone(),
+                    observed_at,
+                    status: if matches!(*status, NextestTestStatus::Pass) {
+                        DiagnosticStatus::Resolved
+                    } else {
+                        DiagnosticStatus::Active
+                    },
+                })
                 .map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "registered diagnostic normalizer rejected nextest event: {error}"
+                    ))
+                })?;
+                let diagnostic = classifier.admit(diagnostic).map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "registered diagnostic normalizer rejected nextest event: {error}"
+                    ))
+                })?;
+                let evidence_id = ArtifactId::new(format!("nextest-evidence-{}", sha256_hex(line)))
+                    .map_err(|error| {
                         CompositionError::Recovery(format!(
                             "normalized evidence id is invalid: {error}"
                         ))
-                })?;
+                    })?;
                 let mut value = serde_json::to_value(&diagnostic).map_err(|error| {
                     CompositionError::Recovery(format!(
                         "normalized diagnostic serialization failed: {error}"
@@ -3735,9 +3735,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
-    /// Publishes the current durable TestD verifier execution fact through
-    /// the same canonical owner CAS used by FinishEvidence. The caller gives
-    /// only the job identity; TestD currentness and the full receipt/run are
+    /// Publishes the current durable `TestD` verifier execution fact through
+    /// the same canonical owner CAS used by `FinishEvidence`. The caller gives
+    /// only the job identity; `TestD` currentness and the full receipt/run are
     /// re-read inside the Governor service before the write.
     pub async fn publish_testd_verifier_execution_fact(
         &self,
@@ -3763,7 +3763,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
-    /// Runs the production FinishAttempt path and returns only after the
+    /// Publishes the verifier-execution owner from complete identity-joined
+    /// terminal evidence supplied by the Kernel owner route. The daemon-side
+    /// entry: no `TestdStore` handle crosses the daemon boundary.
+    pub async fn publish_testd_verifier_execution_fact_from_evidence(
+        &self,
+        evidence: &TestdTerminalCompletionEvidence,
+    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.finish_attempt_service()
+            .publish_testd_verifier_execution_fact_from_evidence(evidence)
+            .await
+    }
+
+    /// Runs the production `FinishAttempt` path and returns only after the
     /// canonical receipt has committed. Publication is performed by the
     /// daemon composition through `refresh_from_kernel`, using the same
     /// committed-receipt boundary as the other daemon callers.
@@ -4511,32 +4526,36 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         retained.note_unknown_outcome(snapshot_id)
     }
 
-/// Restores the authority owner with live revocation-history evidence
-/// (`#2100` owner-closure join).
-///
-/// Builds the closed `GetAuthorityRevocationHistory` read for one exact
-/// origin, executes it through the canonical read client (the Kernel
-/// serves its durable fence state on the `store_named` route), decodes
-/// the reply against the expected fence, and restores the authority
-/// owner with that evidence. A transport failure, a fence disagreement,
-/// an absent history, or a stale/invalid view refuses before any owner
-/// state is installed: unavailable history is never absence of
-/// revocation.
-pub async fn restore_authority_with_live_history<R: CanonicalReadClient + ?Sized>(
-    reads: &R,
-    snapshot: &AuthorityOwnerSnapshot,
-    state_fence: &StateFence,
-    origin_ref: &str,
-    max_records: u32,
-) -> Result<AuthorityRestoreOutcome, CompositionError> {
-    let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
-    let response = reads
-        .execute_named(request)
-        .await
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-    let evidence = decode_revocation_history_evidence(&response, state_fence)?;
-    AuthorityOwner::from_snapshot_with_revocation_history(snapshot, state_fence, Some(&evidence))
-}
+    /// Restores the authority owner with live revocation-history evidence
+    /// (`#2100` owner-closure join).
+    ///
+    /// Builds the closed `GetAuthorityRevocationHistory` read for one exact
+    /// origin, executes it through the canonical read client (the Kernel
+    /// serves its durable fence state on the `store_named` route), decodes
+    /// the reply against the expected fence, and restores the authority
+    /// owner with that evidence. A transport failure, a fence disagreement,
+    /// an absent history, or a stale/invalid view refuses before any owner
+    /// state is installed: unavailable history is never absence of
+    /// revocation.
+    pub async fn restore_authority_with_live_history<R: CanonicalReadClient + ?Sized>(
+        reads: &R,
+        snapshot: &AuthorityOwnerSnapshot,
+        state_fence: &StateFence,
+        origin_ref: &str,
+        max_records: u32,
+    ) -> Result<AuthorityRestoreOutcome, CompositionError> {
+        let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
+        let response = reads
+            .execute_named(request)
+            .await
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let evidence = decode_revocation_history_evidence(&response, state_fence)?;
+        AuthorityOwner::from_snapshot_with_revocation_history(
+            snapshot,
+            state_fence,
+            Some(&evidence),
+        )
+    }
 
     /// Synchronizes the Kernel P-07 owner from live Governor state after
     /// a revision advance (`#2100` owner-closure feed call).
@@ -5792,7 +5811,7 @@ mod tests {
             &expected,
             QueueLimits::default(),
         )
-                .expect("composition");
+        .expect("composition");
         let policy = composition.owners().policy.as_ref().expect("policy owner");
         assert_eq!(policy.state_fence(), &observed.state_fence());
         assert_eq!(policy.revision(), 1);
