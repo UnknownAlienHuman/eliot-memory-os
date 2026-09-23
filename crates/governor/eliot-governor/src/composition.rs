@@ -3735,9 +3735,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
-    /// Publishes the current durable TestD verifier execution fact through
-    /// the same canonical owner CAS used by FinishEvidence. The caller gives
-    /// only the job identity; TestD currentness and the full receipt/run are
+    /// Publishes the current durable `TestD` verifier execution fact through
+    /// the same canonical owner CAS used by `FinishEvidence`. The caller gives
+    /// only the job identity; `TestD` currentness and the full receipt/run are
     /// re-read inside the Governor service before the write.
     pub async fn publish_testd_verifier_execution_fact(
         &self,
@@ -3778,7 +3778,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
-    /// Runs the production FinishAttempt path and returns only after the
+    /// Runs the production `FinishAttempt` path and returns only after the
     /// canonical receipt has committed. Publication is performed by the
     /// daemon composition through `refresh_from_kernel`, using the same
     /// committed-receipt boundary as the other daemon callers.

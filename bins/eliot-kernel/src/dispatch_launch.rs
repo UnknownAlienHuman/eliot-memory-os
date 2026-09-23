@@ -326,7 +326,7 @@ pub struct DispatchGrant {
     pub idempotency_key: String,
     /// Grant expiry in Unix milliseconds for `PermitIssuance::new`.
     pub expires_at: u64,
-    /// Kernel-selected TestD owner database carried in the protected dispatch
+    /// Kernel-selected `TestD` owner database carried in the protected dispatch
     /// file. Other worker grants omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub testd_owner_store_path: Option<String>,
@@ -686,7 +686,7 @@ struct LaunchRecord {
     request_digest: String,
     effect_digest: Option<String>,
     material_path: Option<PathBuf>,
-    /// Owner state captured from the durable TestD row before productive
+    /// Owner state captured from the durable `TestD` row before productive
     /// dispatch and rechecked at authenticated terminal completion.
     testd_owner_binding: Option<TestdLaunchOwnerBinding>,
     nonce: String,
@@ -704,9 +704,9 @@ struct LaunchRecord {
     native_request: Option<NativeWorkerClaimRequest>,
 }
 
-/// Immutable TestD owner projection retained at Kernel dispatch time. The
-/// process identity is the TestD owner's projection of the consumed
-/// ProcessRequest; the invocation digest and verifier binding bind the exact
+/// Immutable `TestD` owner projection retained at Kernel dispatch time. The
+/// process identity is the `TestD` owner's projection of the consumed
+/// `ProcessRequest`; the invocation digest and verifier binding bind the exact
 /// admitted plan through terminal publication.
 #[derive(Clone, Debug)]
 struct TestdLaunchOwnerBinding {
@@ -1124,13 +1124,13 @@ pub(crate) fn admit_testd_attempt(
     handle_testd_admission_attempt(service, &session, request, now_unix_nanos).map_err(gate_error)
 }
 
-/// Returns the single Kernel-selected durable TestD owner database path.
+/// Returns the single Kernel-selected durable `TestD` owner database path.
 /// Job/project references are never used as filesystem paths.
 pub(crate) fn testd_owner_store_path(work_root: &Path) -> PathBuf {
     work_root.join(".eliot").join("testd-state.redb")
 }
 
-/// Reuses the current composed TestD principal and live Kernel fence for
+/// Reuses the current composed `TestD` principal and live Kernel fence for
 /// owner-side submit, readback, and receipt acknowledgement operations.
 pub(crate) fn bind_testd_owner_session(
     service: &KernelService,
@@ -1141,9 +1141,9 @@ pub(crate) fn bind_testd_owner_session(
     AuthenticatedTestdSession::bind(service, contour.principal_owner.as_str()).map_err(gate_error)
 }
 
-/// Creates one durable productive TestD job through the authenticated Kernel
-/// owner. The caller supplies Governor-resolved WorkScope and a tool
-/// observation; Kernel rehydrates RequestIdentity from the frame, chooses
+/// Creates one durable productive `TestD` job through the authenticated Kernel
+/// owner. The caller supplies Governor-resolved `WorkScope` and a tool
+/// observation; Kernel rehydrates `RequestIdentity` from the frame, chooses
 /// job/build/store paths, rereads tool bytes, issues the process request, and
 /// commits the identity and job together before any dispatcher can see it.
 #[allow(
@@ -1186,8 +1186,7 @@ pub(crate) async fn submit_testd_owner_job(
         let authenticated = bind_testd_owner_session(&service)?;
         let process_gateway = kernel
             .process_gateway
-            .as_ref()
-            .cloned()
+            .clone()
             .ok_or(DispatchLaunchError::ExecutorUnavailable)?;
         (authenticated, process_gateway)
     };
@@ -1411,7 +1410,7 @@ impl KernelProcessAdmissionProvider for KernelIssuedProcessProvider {
     }
 }
 
-/// Captures the durable TestD process identity and, for a productive profile,
+/// Captures the durable `TestD` process identity and, for a productive profile,
 /// verifier-plan binding before the Kernel writes dispatch material. This
 /// binds terminal publication to the same owner row the worker was admitted
 /// from.
@@ -1485,8 +1484,8 @@ fn capture_testd_launch_owner_binding(
     })
 }
 
-/// Rehydrates a TestD terminal completion against the retained Kernel launch,
-/// the current authenticated TestD session, and the durable TestD owner row.
+/// Rehydrates a `TestD` terminal completion against the retained Kernel launch,
+/// the current authenticated `TestD` session, and the durable `TestD` owner row.
 /// The transport request never supplies a task, operation, plan, or verdict.
 pub(crate) fn read_testd_terminal_completion(
     service: &KernelService,
@@ -3208,7 +3207,7 @@ pub struct ReadyTestdLaunch {
     pub authority_epoch: EpochId,
     /// Live activation generation bound at admission.
     pub generation: Generation,
-    /// Durable TestD process and verifier-plan identity captured before
+    /// Durable `TestD` process and verifier-plan identity captured before
     /// dispatch and retained through terminal publication.
     owner_binding: TestdLaunchOwnerBinding,
 }
