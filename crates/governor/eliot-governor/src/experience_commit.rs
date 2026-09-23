@@ -77,7 +77,7 @@ use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationRequest, OrderingHeadExpectation,
     RevisionHeadExpectation, ScopeId, SecurityContext, TransitionClass, WriteReceipt,
-    experience_bank_commit_params, experience_bank_mutation_request,
+    WriteReceiptStatus, experience_bank_commit_params, experience_bank_mutation_request,
     experience_feedback_commit_params, experience_feedback_mutation_request,
     generated_operation_manifests, operation_manifest_set_digest,
 };
@@ -181,6 +181,92 @@ fn bind_commit_identity(
         .map_err(|error| CompositionError::Owner(format!("operation identity invalid: {error}")))
 }
 
+/// Fail-closed freshness check over the owner-returned receipt (issue #223
+/// P2: a stale projection must never surface as a healthy commit).
+///
+/// Every marker asserted here is already defined by the owner types on
+/// [`WriteReceipt`]; nothing is synthesized and no authority is invented:
+/// receipt validity and terminal-status pairing come from
+/// [`WriteReceipt::validate`], identity/fence agreement mirrors the store's
+/// own receipt-identity rule, and head agreement follows the owner CAS
+/// contract (expectations are validated against current store state at
+/// execution; both providers then advance heads as `before = current`,
+/// `after = before + 1`). On every key/scope where the caller-supplied live
+/// expectations overlap the committed receipt, an overlapping revision delta
+/// must open exactly at the expected revision and an overlapping ordering
+/// head must advance strictly past the expected sequence. A receipt that is
+/// not `Committed`, belongs to a different operation/idempotency key, sits
+/// at a different fence, or echoes rather than advances an expected head is
+/// stale and fails closed here.
+///
+/// Idempotency is untouched: same key plus same committed bytes still
+/// resolves to the same receipt through the caller-owned retained-key path;
+/// this check only refuses a receipt that does not belong to this envelope.
+/// It never synthesizes an identity conflict: without the retained canonical
+/// bytes (owned by the caller layer) there is no basis to claim one.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "freshness joins every owner-defined receipt marker in one typed call"
+)]
+fn check_commit_freshness(
+    receipt: &WriteReceipt,
+    operation_id: &OperationId,
+    idempotency_key: &str,
+    record_fence: &eliot_contracts::StateFence,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), CompositionError> {
+    receipt
+        .validate()
+        .map_err(|error| CompositionError::Owner(format!("commit receipt invalid: {error}")))?;
+    if receipt.status != WriteReceiptStatus::Committed {
+        return Err(CompositionError::Owner(
+            "commit receipt is not committed; stale projection refused".to_owned(),
+        ));
+    }
+    if receipt.operation_id != *operation_id || receipt.idempotency_key != idempotency_key {
+        return Err(CompositionError::Owner(
+            "commit receipt identity does not match the committed envelope".to_owned(),
+        ));
+    }
+    if receipt.state_fence != *record_fence {
+        return Err(CompositionError::Owner(
+            "commit receipt fence does not match the committed record fence".to_owned(),
+        ));
+    }
+    for expected in expected_revision_heads {
+        if let Some(delta) = receipt
+            .revision_before_after
+            .iter()
+            .find(|delta| delta.key == expected.key)
+            && delta.before != expected.expected_revision
+        {
+            return Err(CompositionError::Owner(format!(
+                "commit receipt revision is stale for {}: expected base {}, observed {}",
+                expected.key.as_str(),
+                expected.expected_revision,
+                delta.before,
+            )));
+        }
+    }
+    for expected in expected_ordering_heads {
+        if let Some(head) = receipt
+            .ordering_sequences
+            .iter()
+            .find(|head| head.scope == expected.scope)
+            && head.sequence <= expected.expected_sequence
+        {
+            return Err(CompositionError::Owner(format!(
+                "commit receipt ordering is stale for {}: expected advance past {}, observed {}",
+                expected.scope.as_str(),
+                expected.expected_sequence,
+                head.sequence,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Commits one ledger-sequenced bank record through the canonical owner.
 ///
 /// Derives the real [`CanonicalWriteEnvelope`] from the admitted record
@@ -188,10 +274,11 @@ fn bind_commit_identity(
 /// (exact tracked revision), the admitted ingress (`identity`, scope
 /// addressing, proof refs, live head expectations), and the live store
 /// manifest digest — then invokes
-/// [`GovernorComposition::commit_canonical`](crate::composition::GovernorComposition::commit_canonical)
-/// and returns its receipt unmodified. Never accepts a caller-created
-/// `PreparedTransition` (there is no such parameter) and never
-/// reinterprets the receipt.
+/// [`GovernorComposition::commit_canonical`](crate::composition::GovernorComposition::commit_canonical),
+/// checks the returned receipt for freshness (never a stale projection
+/// reported healthy), and returns it unmodified. Never accepts a
+/// caller-created `PreparedTransition` (there is no such parameter) and
+/// never reinterprets the receipt.
 #[allow(
     clippy::too_many_arguments,
     reason = "the commit caller joins every handoff-required envelope input in one typed call"
@@ -222,10 +309,12 @@ pub async fn commit_experience_bank<P: KernelGenerationPort + ?Sized>(
             CompositionError::Owner(format!("operation manifest set unavailable: {error}"))
         })?)
         .map_err(|error| CompositionError::Owner(format!("operation manifest digest: {error}")))?;
+    let revision_expectations = expected_revision_heads.clone();
+    let ordering_expectations = expected_ordering_heads.clone();
     let envelope = CanonicalWriteEnvelope {
-        operation_id,
+        operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
-        idempotency_key: leg.idempotency_key,
+        idempotency_key: leg.idempotency_key.clone(),
         scope_id,
         task_id: record.scope.task_ref.clone(),
         transition_class: TransitionClass::CaptureCandidate,
@@ -243,11 +332,20 @@ pub async fn commit_experience_bank<P: KernelGenerationPort + ?Sized>(
         expected_revision_heads,
         expected_ordering_heads,
     };
-    composition.commit_canonical(identity, envelope).await
+    let receipt = composition.commit_canonical(identity, envelope).await?;
+    check_commit_freshness(
+        &receipt,
+        &operation_id,
+        &leg.idempotency_key,
+        &record.fence,
+        &revision_expectations,
+        &ordering_expectations,
+    )?;
+    Ok(receipt)
 }
 
 /// Commits one ledger-sequenced feedback record through the canonical
-/// owner. Same derivation and invocation rule as
+/// owner. Same derivation, freshness check, and invocation rule as
 /// [`commit_experience_bank`].
 #[allow(
     clippy::too_many_arguments,
@@ -279,10 +377,12 @@ pub async fn commit_experience_feedback<P: KernelGenerationPort + ?Sized>(
             CompositionError::Owner(format!("operation manifest set unavailable: {error}"))
         })?)
         .map_err(|error| CompositionError::Owner(format!("operation manifest digest: {error}")))?;
+    let revision_expectations = expected_revision_heads.clone();
+    let ordering_expectations = expected_ordering_heads.clone();
     let envelope = CanonicalWriteEnvelope {
-        operation_id,
+        operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
-        idempotency_key: leg.idempotency_key,
+        idempotency_key: leg.idempotency_key.clone(),
         scope_id,
         task_id: record.scope.task_ref.clone(),
         transition_class: TransitionClass::CaptureCandidate,
@@ -300,5 +400,14 @@ pub async fn commit_experience_feedback<P: KernelGenerationPort + ?Sized>(
         expected_revision_heads,
         expected_ordering_heads,
     };
-    composition.commit_canonical(identity, envelope).await
+    let receipt = composition.commit_canonical(identity, envelope).await?;
+    check_commit_freshness(
+        &receipt,
+        &operation_id,
+        &leg.idempotency_key,
+        &record.fence,
+        &revision_expectations,
+        &ordering_expectations,
+    )?;
+    Ok(receipt)
 }
