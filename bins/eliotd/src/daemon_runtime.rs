@@ -776,9 +776,23 @@ async fn run_loop(
                                     )
                                     .emit();
                                 }
-                                eliotd::reactive_feed::RetrievalDriveOutcome::Admitted { .. }
-                                | eliotd::reactive_feed::RetrievalDriveOutcome::Pending { .. }
-                                | eliotd::reactive_feed::RetrievalDriveOutcome::RefreshRequired => {
+                                eliotd::reactive_feed::RetrievalDriveOutcome::Admitted {
+                                    result_digest,
+                                    selection_digest,
+                                    traces,
+                                } => {
+                                    tracing::info!(
+                                        result_digest = %result_digest,
+                                        selection_digest = %selection_digest,
+                                        traces = traces.len(),
+                                        "retrieval drive admitted bundle with bound traces",
+                                    );
+                                }
+                                eliotd::reactive_feed::RetrievalDriveOutcome::Pending { .. } => {}
+                                eliotd::reactive_feed::RetrievalDriveOutcome::RefreshRequired => {
+                                    tracing::debug!(
+                                        "retrieval drive requests packet refresh on fence movement",
+                                    );
                                 }
                             }
                             // O1 scope-attach trigger (issue #1787): one
@@ -804,7 +818,22 @@ async fn run_loop(
                                     .emit();
                                 }
                                 eliotd::attempt_execution_chain::ScopeAttachDriveOutcome::Attached {
+                                    receipt,
                                     ..
+                                } => {
+                                    tracing::info!(
+                                        receipt_ref = %eliotd::diagnostics::sanitize_identity(
+                                            receipt.receipt_ref.as_str()
+                                        ),
+                                        scope_ref = %eliotd::diagnostics::sanitize_identity(
+                                            receipt.scope_ref.as_str()
+                                        ),
+                                        fence_generation = receipt
+                                            .state_fence
+                                            .resource_generation
+                                            .value(),
+                                        "scope-attach trigger admitted with owner-issued receipt",
+                                    );
                                 }
                                 | eliotd::attempt_execution_chain::ScopeAttachDriveOutcome::Pending {
                                     ..
@@ -865,11 +894,21 @@ async fn run_loop(
                                     .emit();
                                 }
                                 eliotd::owner_feed::OwnerFeedDriveOutcome::Published {
-                                    ..
+                                    revision,
+                                } => {
+                                    tracing::info!(
+                                        revision = revision,
+                                        "owner feed published and verified at bound revision",
+                                    );
                                 }
                                 | eliotd::owner_feed::OwnerFeedDriveOutcome::BoundVerified {
-                                    ..
-                                } => {}
+                                    revision,
+                                } => {
+                                    tracing::info!(
+                                        revision = revision,
+                                        "owner feed verified already-bound revision without republishing",
+                                    );
+                                }
                             }
                             flight = ActivationFlight::Idle;
                         }
