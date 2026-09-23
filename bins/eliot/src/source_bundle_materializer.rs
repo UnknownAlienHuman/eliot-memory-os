@@ -1871,7 +1871,7 @@ fn materialize_with_executables(
     }
 }
 
-/// Materialize one exact thirteen-role Phase-A source bundle.
+/// Materialize one exact fourteen-role Phase-A source bundle.
 pub fn materialize_canary_source_bundle(
     input: &CanarySourceBundleMaterializeInput,
 ) -> Result<CanarySourceBundleMaterializeOutcome, InstallationError> {
