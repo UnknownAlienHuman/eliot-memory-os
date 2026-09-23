@@ -143,6 +143,7 @@ use eliot_platform::PlatformHandle;
 use eliot_protocol::{
     host_request_operation_id, HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestKind,
 };
+use serde::Deserialize;
 
 // Stubless consumption of the Parfit-owned (#1751) retirement barrier,
 // landed in Parfit's branch (see module docs); root serializes the
@@ -160,7 +161,7 @@ pub const CUTOVER_EVIDENCE_BOUND: usize = 16;
 /// record) and external-effect idempotency (SCM/launch effects owned by the
 /// drain/stop contours) remain separate: a committed intent never proves an
 /// effect occurred exactly once.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct CutoverOperationIdentity {
     pub installation: PlatformHandle,
     pub operation_id: PlatformHandle,
@@ -175,7 +176,12 @@ pub struct CutoverOperationIdentity {
 /// creates no Session, task, or result). A successful restore rehearsal,
 /// checksum, zero unresolved count, or client declaration is not cutover
 /// authority and appears nowhere here as admission.
-#[derive(Clone, Debug)]
+///
+/// `Deserialize` (M2 integration) lets the admitted-cutover console
+/// envelope carry the exact typed request; every field is re-validated by
+/// owner calls in `validate_cutover_request`, so transport shape grants
+/// nothing by itself.
+#[derive(Clone, Debug, Deserialize)]
 pub struct CutoverRequest {
     pub operation: CutoverOperationIdentity,
     /// Exact admitted command envelope (real owner type).
@@ -220,7 +226,10 @@ pub struct CutoverRequest {
 /// library-emitted level alone qualifies, so both values are required.
 /// Lease quiescence is proven separately by the barrier, never by a local
 /// flag: there is no live-lease boolean here by design.
-#[derive(Clone, Debug)]
+///
+/// `Deserialize` (M2 integration) mirrors the request: transport only, all
+/// gates re-checked by owner calls.
+#[derive(Clone, Debug, Deserialize)]
 pub struct IsolatedRecoveryEvidence {
     /// All mandatory recovery phases completed with current receipts.
     pub mandatory_phases_complete: bool,
