@@ -1,0 +1,9 @@
+{
+  "issue": 686,
+  "description": "Retention expectations for transitive influence-revocation recovery (issue #686). Suppression never deletes history: the full five-grant denominator round-trips through recovery, with the revoked set carrying every suppression. Identities come from denominator.json.",
+  "total_grants": 5,
+  "origin_closure_id": "revocation-686-origin-01",
+  "origin_suppressed": ["grant:leaf-gamma", "grant:mid-beta", "grant:origin-alpha", "grant:tip-delta"],
+  "mid_closure_id": "revocation-686-mid-01",
+  "mid_suppressed": ["grant:leaf-gamma", "grant:mid-beta", "grant:tip-delta"]
+}

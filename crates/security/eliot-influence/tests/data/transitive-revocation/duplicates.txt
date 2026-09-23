@@ -1,0 +1,5 @@
+# Transitive revocation fixture: duplicate edge plus a changed edge.
+origin:x dep:y
+origin:x dep:y
+origin:x dep:changed
+dep:y leaf:z

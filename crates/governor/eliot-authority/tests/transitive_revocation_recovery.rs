@@ -18,8 +18,11 @@
 use std::collections::BTreeSet;
 
 use eliot_authority::{
-    AuthoritySet, CapabilityGrant, EffectAuthorizer, GrantGraph, GrantId, GrantStatus, LogicalTime,
-    PrincipalRef, RevocationHistoryError, RevocationHistoryEvidence, SuppressionCause,
+    AuthoritySet, CapabilityGrant, EffectAuthorizer, GrantActivationRequest, GrantGraph,
+    GrantGraphRecoverySnapshot, GrantId, GrantRestoreOutcome, GrantRevocationRequest, GrantStatus,
+    IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest, LogicalTime,
+    P07AuthorityPort, P07PortError, PrincipalRef, RevocationHistoryError,
+    RevocationHistoryEvidence, SuppressionCause, UnavailableP07AuthorityPort,
 };
 use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_receipts::{
@@ -50,6 +53,99 @@ struct Denominator {
 fn denominator() -> Denominator {
     let bytes = include_bytes!("data/transitive-revocation/denominator.json");
     serde_json::from_slice(bytes).expect("frozen denominator fixture parses")
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RetentionExpectations {
+    issue: u64,
+    origin_closure_id: String,
+    origin_suppressed: Vec<String>,
+    mid_closure_id: String,
+    mid_suppressed: Vec<String>,
+    total_grants: usize,
+}
+
+fn retention_expectations() -> RetentionExpectations {
+    let bytes = include_bytes!("data/transitive-revocation/retention-expectations.json");
+    serde_json::from_slice(bytes).expect("retention fixture parses")
+}
+
+fn restore_with_origin_evidence(
+    fence: &StateFence,
+    denominator: &Denominator,
+) -> GrantRestoreOutcome {
+    let snapshot = chain(fence, denominator)
+        .recovery_snapshot()
+        .expect("snapshot");
+    let evidence = origin_evidence(fence, denominator);
+    GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot, Some(&evidence))
+        .expect("current evidence restores")
+}
+
+fn restore_with_mid_evidence(fence: &StateFence, denominator: &Denominator) -> GrantRestoreOutcome {
+    let snapshot = chain(fence, denominator)
+        .recovery_snapshot()
+        .expect("snapshot");
+    let evidence = RevocationHistoryEvidence {
+        state_fence: fence.clone(),
+        source_revision: denominator.source_revision,
+        closures: vec![closure(
+            &denominator.mid_closure_id,
+            &denominator.mid_grant,
+            &denominator
+                .mid_affected
+                .iter()
+                .filter(|reference| *reference != &denominator.mid_grant)
+                .cloned()
+                .collect::<Vec<_>>(),
+            denominator.source_revision,
+            fence,
+        )],
+    };
+    GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot, Some(&evidence))
+        .expect("current evidence restores")
+}
+
+fn assert_full_lineage_retained(restored: &GrantGraphRecoverySnapshot, denominator: &Denominator) {
+    let ids: BTreeSet<&str> = restored
+        .grants
+        .iter()
+        .map(|record| record.grant_id.as_str())
+        .collect();
+    for record in &restored.grants {
+        match &record.parent_grant_id {
+            None => assert!(
+                record.grant_id == denominator.origin_grant
+                    || record.grant_id == denominator.unrelated_grant,
+                "only origin and unrelated are roots: {}",
+                record.grant_id
+            ),
+            Some(parent) => assert!(
+                ids.contains(parent.as_str()),
+                "parent linkage retained: {} -> {parent}",
+                record.grant_id
+            ),
+        }
+    }
+    // Walk the chain through parent ids: tip -> leaf -> mid -> origin.
+    let by_id: std::collections::BTreeMap<&str, Option<&str>> = restored
+        .grants
+        .iter()
+        .map(|record| (record.grant_id.as_str(), record.parent_grant_id.as_deref()))
+        .collect();
+    assert_eq!(by_id[denominator.origin_grant.as_str()], None);
+    assert_eq!(
+        by_id[denominator.mid_grant.as_str()],
+        Some(denominator.origin_grant.as_str())
+    );
+    assert_eq!(
+        by_id[denominator.leaf_grant.as_str()],
+        Some(denominator.mid_grant.as_str())
+    );
+    assert_eq!(
+        by_id[denominator.tip_grant.as_str()],
+        Some(denominator.leaf_grant.as_str())
+    );
 }
 
 fn fence() -> StateFence {
@@ -235,6 +331,7 @@ fn context(
     (snapshot_id, work_scope, session)
 }
 
+// WORK_UNIT_CASE: 686/15
 #[test]
 fn revoke_origin_recovery_suppresses_origin_and_dependents() {
     let denominator = denominator();
@@ -365,6 +462,7 @@ fn revoke_mid_tree_recovery_reports_transitive_suppression() {
     assert!(!by_id.contains_key(denominator.unrelated_grant.as_str()));
 }
 
+// WORK_UNIT_CASE: 686/16
 #[test]
 fn missing_evidence_refuses_restoration() {
     let denominator = denominator();
@@ -377,6 +475,7 @@ fn missing_evidence_refuses_restoration() {
     assert_eq!(error, RevocationHistoryError::MissingHistory);
 }
 
+// WORK_UNIT_CASE: 686/12
 #[test]
 fn stale_evidence_refuses_restoration() {
     let denominator = denominator();
@@ -434,6 +533,7 @@ fn stale_evidence_refuses_restoration() {
     );
 }
 
+// WORK_UNIT_CASE: 686/11
 #[test]
 fn unknown_evidence_refuses_restoration() {
     let denominator = denominator();
@@ -491,6 +591,7 @@ fn unknown_evidence_refuses_restoration() {
     );
 }
 
+// WORK_UNIT_CASE: 686/17
 #[test]
 fn current_empty_history_restores_unrelated_grants() {
     let denominator = denominator();
@@ -512,7 +613,142 @@ fn current_empty_history_restores_unrelated_grants() {
         outcome.graph.recovery_snapshot().expect("re-emit"),
         snapshot
     );
+    // Effective-path proof: the unrelated grant authorizes its holder after
+    // the empty-history restore.
+    let (snapshot_id, work_scope, session) = context(&fence);
+    let view = outcome
+        .graph
+        .snapshot(
+            snapshot_id,
+            &PrincipalRef::new("principal:unrelated").expect("holder"),
+            &work_scope,
+            &session,
+            LogicalTime::new(2),
+        )
+        .expect("unrelated grant stays effective");
+    assert!(view.allows("read", "resource:z", EffectClass::Read));
     // Effect authorization is untouched by revocation history.
     let authorizer = EffectAuthorizer::default();
     authorizer.snapshot().expect("effect snapshot");
+}
+
+// WORK_UNIT_CASE: 686/14
+#[test]
+fn p07_unknown_outcome_retains_request_without_commit_claim() {
+    let fence = fence();
+    let presented = binding(&fence);
+    let snapshot_id =
+        eliot_authority::SnapshotId::new("snapshot:686-unknown").expect("snapshot id");
+    let revoke_request = GrantRevocationRequest {
+        grant_id: GrantId::new("grant:origin-alpha").expect("grant id"),
+        snapshot_id: snapshot_id.clone(),
+        binding: presented.clone(),
+    };
+    let activate_request = GrantActivationRequest {
+        grant_id: GrantId::new("grant:origin-alpha").expect("grant id"),
+        snapshot_id: snapshot_id.clone(),
+        binding: presented.clone(),
+    };
+    let intro_activate = IntroductionActivationRequest {
+        introduction_id: IntroductionId::new("introduction:686-test").expect("introduction id"),
+        snapshot_id: snapshot_id.clone(),
+        binding: presented.clone(),
+    };
+    let intro_revoke = IntroductionRevocationRequest {
+        introduction_id: IntroductionId::new("introduction:686-test").expect("introduction id"),
+        snapshot_id: snapshot_id.clone(),
+        binding: presented.clone(),
+    };
+    let port = UnavailableP07AuthorityPort;
+    // A single call each: the unavailable port commits nothing and claims
+    // nothing beyond unavailability — no retry, no receipt.
+    assert_eq!(
+        port.revoke_grant(&revoke_request),
+        Err(P07PortError::Unavailable)
+    );
+    assert_eq!(
+        port.activate_grant(&activate_request),
+        Err(P07PortError::Unavailable)
+    );
+    assert_eq!(
+        port.activate_introduction(&intro_activate),
+        Err(P07PortError::Unavailable)
+    );
+    assert_eq!(
+        port.revoke_introduction(&intro_revoke),
+        Err(P07PortError::Unavailable)
+    );
+    // An unknown outcome retains the exact request identity for
+    // reconciliation and never collapses to unavailability.
+    let unknown = P07PortError::UnknownOutcome {
+        snapshot_id: snapshot_id.clone(),
+    };
+    assert_ne!(unknown, P07PortError::Unavailable);
+    assert!(
+        format!("{unknown}").contains("snapshot:686-unknown"),
+        "reconciliation retains the exact request identity: {unknown}"
+    );
+    assert!(matches!(unknown, P07PortError::UnknownOutcome { .. }));
+}
+
+// WORK_UNIT_CASE: 686/19
+#[test]
+fn history_suppression_retains_all_grants_and_lineage() {
+    let fixture = retention_expectations();
+    assert_eq!(fixture.issue, 686);
+    let denominator = denominator();
+    assert_eq!(fixture.origin_closure_id, denominator.origin_closure_id);
+    assert_eq!(fixture.mid_closure_id, denominator.mid_closure_id);
+    let fence = fence();
+
+    // Origin revocation: suppressed set matches the fixture, history retained.
+    let outcome = restore_with_origin_evidence(&fence, &denominator);
+    let suppressed: BTreeSet<String> = outcome
+        .suppressed
+        .iter()
+        .map(|entry| entry.grant_id.as_str().to_owned())
+        .collect();
+    let expected_origin: BTreeSet<String> = fixture.origin_suppressed.iter().cloned().collect();
+    assert_eq!(
+        suppressed, expected_origin,
+        "origin suppression matches the retention fixture"
+    );
+    assert!(
+        !suppressed.contains(&denominator.unrelated_grant),
+        "the unrelated grant is never suppressed"
+    );
+    let restored = outcome.graph.recovery_snapshot().expect("re-emit");
+    assert_eq!(
+        restored.grants.len(),
+        fixture.total_grants,
+        "no historical grant is deleted"
+    );
+    for suppressed_id in &expected_origin {
+        assert!(
+            restored.revoked.contains(suppressed_id),
+            "suppressed grant stays revoked: {suppressed_id}"
+        );
+    }
+    assert_full_lineage_retained(&restored, &denominator);
+
+    // Mid revocation: suppressed set matches the fixture; origin survives.
+    let mid_outcome = restore_with_mid_evidence(&fence, &denominator);
+    let mid_suppressed: BTreeSet<String> = mid_outcome
+        .suppressed
+        .iter()
+        .map(|entry| entry.grant_id.as_str().to_owned())
+        .collect();
+    let expected_mid: BTreeSet<String> = fixture.mid_suppressed.iter().cloned().collect();
+    assert_eq!(
+        mid_suppressed, expected_mid,
+        "mid suppression matches the retention fixture"
+    );
+    assert!(
+        !mid_suppressed.contains(&denominator.origin_grant),
+        "mid revocation leaves the origin restorable"
+    );
+    assert!(
+        !mid_suppressed.contains(&denominator.unrelated_grant),
+        "mid revocation leaves the unrelated grant restorable"
+    );
 }
