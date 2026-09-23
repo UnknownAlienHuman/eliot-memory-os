@@ -421,6 +421,68 @@ static RECORD_AUTHORITY_REVOCATION_PARAMETERS: [ParameterDeclaration; 7] = [
     },
 ];
 
+/// Closed coordination parameter carrying the restore coordination identity
+/// (issues #959/#960/#962/#975): the restore `operation_id` the coordination
+/// decision row is keyed by. The bridge persists the same keys as columns of
+/// the restore coordination decision row.
+pub const COORDINATION_PARAM_OPERATION_ID: &str = "coordination_operation_id";
+/// Closed coordination parameter carrying the admitted destination.
+pub const COORDINATION_PARAM_DESTINATION: &str = "coordination_destination";
+/// Closed coordination parameter carrying the admitted payload digest
+/// (the coordination transition's canonical request hash).
+pub const COORDINATION_PARAM_PAYLOAD_DIGEST: &str = "coordination_payload_digest";
+/// Closed coordination parameter carrying the admitted fence digest
+/// (sha256 over the canonical fence bytes).
+pub const COORDINATION_PARAM_FENCE_DIGEST: &str = "coordination_fence_digest";
+/// Closed coordination parameter carrying the coordination decision digest.
+pub const COORDINATION_PARAM_DECISION_DIGEST: &str = "coordination_decision_digest";
+/// Closed coordination parameter carrying the Governor admission digest
+/// the decision was built from.
+pub const COORDINATION_PARAM_ADMISSION_DIGEST: &str = "coordination_admission_digest";
+
+/// Owner-approved restore-coordination fields for the Governor-admitted
+/// `RecordRestoreCoordination` named transaction (issues #959/#960/#962/
+/// #975, built by the Governor coordination decision producer): the restore
+/// `coordination_operation_id` plus the five admitted coordination bindings
+/// (`coordination_destination`, `coordination_payload_digest`,
+/// `coordination_fence_digest`, `coordination_decision_digest`,
+/// `coordination_admission_digest`). Hex64 digest discipline and operation-id
+/// shape are enforced by [`validate_coordination_mutation_params`]; lineage
+/// validity stays Governor-owned; durable persistence stays with the bridge
+/// handler.
+static RECORD_RESTORE_COORDINATION_PARAMETERS: [ParameterDeclaration; 6] = [
+    ParameterDeclaration {
+        name: COORDINATION_PARAM_OPERATION_ID,
+        shape: ParameterShape::OperationId,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: COORDINATION_PARAM_DESTINATION,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: COORDINATION_PARAM_PAYLOAD_DIGEST,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: COORDINATION_PARAM_FENCE_DIGEST,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: COORDINATION_PARAM_DECISION_DIGEST,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: COORDINATION_PARAM_ADMISSION_DIGEST,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+
 /// Owner-approved revocation-history selectors for the
 /// `GetAuthorityRevocationHistory` named read (issue #686): the exact
 /// revoked `origin_ref` and the explicit `max_records` bound carried as its
@@ -878,6 +940,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplyUserAutomationState => "ApplyUserAutomationState",
         NamedMutationOperation::CommitExperienceBank => "CommitExperienceBank",
         NamedMutationOperation::CommitAgentFeedback => "CommitAgentFeedback",
+        NamedMutationOperation::RecordRestoreCoordination => "RecordRestoreCoordination",
     }
 }
 
@@ -899,6 +962,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ApplyUserAutomationState" => Some(NamedMutationOperation::ApplyUserAutomationState),
         b"CommitExperienceBank" => Some(NamedMutationOperation::CommitExperienceBank),
         b"CommitAgentFeedback" => Some(NamedMutationOperation::CommitAgentFeedback),
+        b"RecordRestoreCoordination" => Some(NamedMutationOperation::RecordRestoreCoordination),
         _ => None,
     }
 }
@@ -1005,6 +1069,11 @@ pub const fn declared_read_parameters(
 /// `record_revision` as its decimal string, `scope_digest`,
 /// `fence_digest`, `idempotency_key`; family bound by the operation
 /// variant, digest re-proof at the Governor read edge);
+/// `RecordRestoreCoordination` declares the six required coordination fields
+/// (`coordination_operation_id`, `coordination_destination`,
+/// `coordination_payload_digest`, `coordination_fence_digest`,
+/// `coordination_decision_digest`, `coordination_admission_digest`;
+/// hex64 digest discipline is enforced by the coordination contract);
 /// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
@@ -1029,6 +1098,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ApplyUserAutomationState => &APPLY_USER_AUTOMATION_PARAMETERS,
         NamedMutationOperation::CommitExperienceBank => &COMMIT_EXPERIENCE_PARAMETERS,
         NamedMutationOperation::CommitAgentFeedback => &COMMIT_EXPERIENCE_PARAMETERS,
+        NamedMutationOperation::RecordRestoreCoordination => {
+            &RECORD_RESTORE_COORDINATION_PARAMETERS
+        }
     }
 }
 
@@ -1158,6 +1230,75 @@ pub fn validate_typed_mutation_parameters(
                 reason: "missing required parameter",
             });
         }
+    }
+    Ok(())
+}
+
+/// Validates closed restore-coordination mutation parameters (issues
+/// #959/#960/#962/#975).
+///
+/// Shared acceptance boundary for the `RecordRestoreCoordination` catalogue
+/// arm and every backend: exact key presence with string values, operation-id
+/// shape, lowercase hex64 digests, and non-blank destination — no semantic
+/// admission, task meaning, or authority granted here. Lineage validity stays
+/// Governor-owned; durable persistence stays with the bridge handler.
+pub fn validate_coordination_mutation_params(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<(), StoreError> {
+    fn text_param(
+        parameters: &BTreeMap<String, Value>,
+        key: &'static str,
+    ) -> Result<String, StoreError> {
+        parameters
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(StoreError::InvalidField {
+                field: key,
+                reason: "coordination parameter must be a present string",
+            })
+    }
+    fn text_rule(value: &str, field: &'static str) -> Result<(), StoreError> {
+        // Same store text rule as `check_declared_shape` Subject arms
+        // (non-blank, no control characters); stated inline because the
+        // generic text helper lives in the crate root.
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field,
+                reason: "coordination parameter must be non-blank text",
+            });
+        }
+        Ok(())
+    }
+    fn digest_rule(value: &str, field: &'static str) -> Result<(), StoreError> {
+        if value.len() != 64
+            || value
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(StoreError::InvalidField {
+                field,
+                reason: "coordination digest must be lowercase SHA-256",
+            });
+        }
+        Ok(())
+    }
+    let operation_id = text_param(parameters, COORDINATION_PARAM_OPERATION_ID)?;
+    OperationId::new(operation_id).map_err(|_| StoreError::InvalidField {
+        field: COORDINATION_PARAM_OPERATION_ID,
+        reason: "coordination_operation_id must be a valid operation identity",
+    })?;
+    text_rule(
+        &text_param(parameters, COORDINATION_PARAM_DESTINATION)?,
+        COORDINATION_PARAM_DESTINATION,
+    )?;
+    for key in [
+        COORDINATION_PARAM_PAYLOAD_DIGEST,
+        COORDINATION_PARAM_FENCE_DIGEST,
+        COORDINATION_PARAM_DECISION_DIGEST,
+        COORDINATION_PARAM_ADMISSION_DIGEST,
+    ] {
+        digest_rule(&text_param(parameters, key)?, key)?;
     }
     Ok(())
 }

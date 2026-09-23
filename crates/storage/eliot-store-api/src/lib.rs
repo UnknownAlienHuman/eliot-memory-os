@@ -190,10 +190,13 @@ pub use operation_catalogue::{
 };
 
 pub use operation_parameters::{
-    ParameterDeclaration, ParameterSchemaField, ParameterShape, declared_read_parameters,
+    COORDINATION_PARAM_ADMISSION_DIGEST, COORDINATION_PARAM_DECISION_DIGEST,
+    COORDINATION_PARAM_DESTINATION, COORDINATION_PARAM_FENCE_DIGEST,
+    COORDINATION_PARAM_OPERATION_ID, COORDINATION_PARAM_PAYLOAD_DIGEST, ParameterDeclaration,
+    ParameterSchemaField, ParameterShape, declared_read_parameters,
     named_mutation_operation_by_name, named_mutation_operation_name, named_read_operation_by_name,
     named_read_operation_name, parameter_schema_digest, project_parameter_schema,
-    validate_typed_read_parameters,
+    validate_coordination_mutation_params, validate_typed_read_parameters,
 };
 
 pub use revocation_history::{
@@ -869,6 +872,15 @@ pub enum NamedMutationOperation {
     /// Canonical agent-feedback commit (issue #223). Same durable rule
     /// as the bank commit leg.
     CommitAgentFeedback,
+    /// Durable restore-coordination record (issues #959/#960/#962/#975).
+    ///
+    /// Governor-admitted restore coordination only: the prepared transition
+    /// must carry [`TransitionClass::RecoverySchema`], the declared recovery
+    /// effect ceiling, and the closed coordination typed parameters (restore
+    /// operation identity plus admitted destination/payload/fence/decision/
+    /// admission bindings). The store bridge persists the decision row
+    /// verbatim; it never derives lineage, admission, or cutover semantics.
+    RecordRestoreCoordination,
 }
 
 impl NamedMutationOperation {
@@ -882,6 +894,7 @@ impl NamedMutationOperation {
             Self::ReconcileRecovery | Self::RecordAuthorityRevocation => {
                 TransitionClass::RecoverySchema
             }
+            Self::RecordRestoreCoordination => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
             Self::ApplyNotificationState => TransitionClass::NotificationState,
             Self::ApplyReactiveInjectionState | Self::ApplyResourceSnapshot => {
