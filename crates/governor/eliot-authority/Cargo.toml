@@ -8,6 +8,7 @@ description = "Pure G-01 authority contracts and deterministic validation"
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-influence.workspace = true
 eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-security-contracts.workspace = true
