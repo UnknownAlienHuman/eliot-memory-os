@@ -3126,6 +3126,33 @@ impl RuntimeLeaseCensus {
         }
         Ok(())
     }
+
+    /// Returns whether every RuntimeLease and the current SupervisionLease
+    /// are terminal in this exact-fence ORS snapshot.
+    ///
+    /// Ported from #1751 donor b2566e47 (M2 integration copy; the barrier
+    /// retirement gate consumes it; no authorship change).
+    #[must_use]
+    pub fn is_fully_retired(&self) -> bool {
+        fn terminal(state: eliot_runtime_contracts::LeaseState) -> bool {
+            matches!(
+                state,
+                eliot_runtime_contracts::LeaseState::Released
+                    | eliot_runtime_contracts::LeaseState::Expired
+                    | eliot_runtime_contracts::LeaseState::Revoked
+                    | eliot_runtime_contracts::LeaseState::Superseded
+                    | eliot_runtime_contracts::LeaseState::Closed
+            )
+        }
+
+        self.validate().is_ok()
+            && self
+                .runtime_leases
+                .iter()
+                .all(|lease| terminal(lease.state))
+            && terminal(self.supervision_lease.record.state)
+            && self.supervision_lease.record.projection == SupervisionLeaseProjection::Terminal
+    }
 }
 
 /// Control messages accepted by the Kernel service boundary.
