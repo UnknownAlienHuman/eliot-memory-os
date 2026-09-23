@@ -1265,6 +1265,32 @@ impl DaemonComposition {
         Ok(self.governor.owners().authority.snapshot()?)
     }
 
+    /// Reads the retained Governor WorkScope binding at one exact live fence
+    /// (issue #223 experience trigger scope leg).
+    ///
+    /// Thin readiness-gated borrow of the canonical scope binding the
+    /// Governor composition retains (`owners().work_scope`), read only for
+    /// the caller-supplied agreed fence: unbound scope (`None` owner) or a
+    /// fence-mismatched (stale) binding reads as `Ok(None)` — no usable
+    /// scope at this fence — never as a defaulted scope. The caller derives
+    /// read-scope identities from the returned snapshot's admitted
+    /// `scope_ref`, never inventing one. No observation, receipt, or
+    /// binding logic lives here.
+    pub fn work_scope_binding(
+        &self,
+        fence: &eliot_contracts::StateFence,
+    ) -> Result<Option<eliot_governor::WorkScopeBindingSnapshot>, DaemonError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        let Some(owner) = self.governor.owners().work_scope.as_ref() else {
+            return Ok(None);
+        };
+        Ok(owner.read_current(fence).ok())
+    }
+
     /// Synchronizes the Kernel P-07 owner from live Governor state (issue
     /// #2100 owner-closure feed call).
     ///
