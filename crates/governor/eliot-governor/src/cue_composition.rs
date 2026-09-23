@@ -29,8 +29,8 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_context_candidates::ProjectionState;
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_cue_contracts::{
     AdmittedCueBindingProjection, CueSnapshotBuildCandidate, NormalizationProfile, SnapshotId,
     WorkScopeId,
@@ -82,9 +82,7 @@ pub enum CueCompositionError {
 /// The digest binds scope, dependency-head revisions, admitted binding
 /// digests, normalization profile, snapshot identity, and fence. Equal keys
 /// mean equal closure inputs; any churned input misses.
-#[derive(
-    Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CueCacheKey(String);
 
@@ -218,7 +216,13 @@ pub fn reconstruct_cue_snapshot(
         None,
     )
     .map_err(|error| CueCompositionError::CueBuild(error.to_string()))?;
-    post_verify_candidate(&candidate, &scope, snapshot_id, profile, &inputs.state_fence)?;
+    post_verify_candidate(
+        &candidate,
+        &scope,
+        snapshot_id,
+        profile,
+        &inputs.state_fence,
+    )?;
     cache.insert(key.clone(), candidate.clone());
     Ok(CueReconstruction {
         candidate,
@@ -249,17 +253,17 @@ fn cache_key(
     profile: &NormalizationProfile,
 ) -> Result<CueCacheKey, CueCompositionError> {
     let refused = |detail: &str| CueCompositionError::ClosureMismatch(detail.to_owned());
-    let heads_bytes =
-        canonical_json_bytes(&inputs.heads_after).map_err(|_| refused("heads are not canonical"))?;
+    let heads_bytes = canonical_json_bytes(&inputs.heads_after)
+        .map_err(|_| refused("heads are not canonical"))?;
     let mut binding_digests: Vec<&str> = bindings
         .iter()
         .map(|projection| projection.candidate.digest.as_str())
         .collect();
     binding_digests.sort_unstable();
-    let bindings_bytes =
-        canonical_json_bytes(&binding_digests).map_err(|_| refused("bindings are not canonical"))?;
-    let fence_bytes = canonical_json_bytes(&inputs.state_fence)
-        .map_err(|_| refused("fence is not canonical"))?;
+    let bindings_bytes = canonical_json_bytes(&binding_digests)
+        .map_err(|_| refused("bindings are not canonical"))?;
+    let fence_bytes =
+        canonical_json_bytes(&inputs.state_fence).map_err(|_| refused("fence is not canonical"))?;
     let shape = KeyShape {
         scope: scope.as_str(),
         heads_sha256: sha256_hex(&heads_bytes),
@@ -294,7 +298,9 @@ fn decoded_bindings(
     let payload = match &inputs.cue.state {
         ProjectionState::KnownEmpty => return Ok(Vec::new()),
         ProjectionState::Complete => inputs.cue.payload.as_ref().ok_or_else(|| {
-            CueCompositionError::UnexpectedPayload("complete cue role carries no payload".to_owned())
+            CueCompositionError::UnexpectedPayload(
+                "complete cue role carries no payload".to_owned(),
+            )
         })?,
         other => {
             return Err(CueCompositionError::CueRoleNotComplete(format!(
@@ -346,13 +352,19 @@ fn check_binding_closure(
         return Err(rejected("admission fence differs from the closure fence"));
     }
     if projection.normalized.observed.context.scope_id != *scope {
-        return Err(rejected("observed context scope differs from the closure scope"));
+        return Err(rejected(
+            "observed context scope differs from the closure scope",
+        ));
     }
     if projection.normalized.observed.context.state_fence != *fence {
-        return Err(rejected("observed context fence differs from the closure fence"));
+        return Err(rejected(
+            "observed context fence differs from the closure fence",
+        ));
     }
     if projection.normalized.observed.source.provenance.scope != scope.as_str() {
-        return Err(rejected("observed source does not resolve inside the closure scope"));
+        return Err(rejected(
+            "observed source does not resolve inside the closure scope",
+        ));
     }
     Ok(())
 }
@@ -383,18 +395,26 @@ fn post_verify_candidate(
         return Err(mismatch("candidate fence differs from the closure fence"));
     }
     if candidate.snapshot.rebuild.normalization_profile != *profile {
-        return Err(mismatch("candidate profile differs from the closure profile"));
+        return Err(mismatch(
+            "candidate profile differs from the closure profile",
+        ));
     }
     if candidate.snapshot.snapshot_id != *snapshot_id {
-        return Err(mismatch("candidate snapshot identity differs from the request"));
+        return Err(mismatch(
+            "candidate snapshot identity differs from the request",
+        ));
     }
     if !candidate.relation_edges.is_empty() {
-        return Err(mismatch("candidate carries relation edges outside the zero-edge set"));
+        return Err(mismatch(
+            "candidate carries relation edges outside the zero-edge set",
+        ));
     }
     let rebuilt = eliot_cue_index::rebuild_cue_snapshot(candidate, None)
         .map_err(|error| CueCompositionError::CueBuild(error.to_string()))?;
     if rebuilt.build_digest != candidate.build_digest {
-        return Err(mismatch("candidate does not round-trip through the owner rebuild"));
+        return Err(mismatch(
+            "candidate does not round-trip through the owner rebuild",
+        ));
     }
     Ok(())
 }

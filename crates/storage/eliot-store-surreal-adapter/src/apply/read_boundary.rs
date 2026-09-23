@@ -2525,7 +2525,7 @@ mod admitted_read_tests {
             SecurityContext, TransitionClass,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -2540,6 +2540,11 @@ mod admitted_read_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -2551,7 +2556,9 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     /// Plans one capture through the real planner and renders its durable
@@ -3044,7 +3051,7 @@ mod admitted_read_tests {
             SecurityContext, TransitionClass,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -3059,6 +3066,11 @@ mod admitted_read_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::UpdateTaskState,
                 parameters: BTreeMap::from([
@@ -3079,7 +3091,9 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     /// Recovery transition shape awaiting operation-aware persistence (see
@@ -3095,7 +3109,7 @@ mod admitted_read_tests {
             SecurityContext, TransitionClass,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -3110,6 +3124,11 @@ mod admitted_read_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::ReconcileRecovery,
                 parameters: BTreeMap::from([
@@ -3138,7 +3157,9 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     fn lifecycle_transition(
@@ -3151,7 +3172,7 @@ mod admitted_read_tests {
             SecurityContext, TransitionClass,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -3166,6 +3187,11 @@ mod admitted_read_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::ApplyLifecyclePolicy,
                 parameters: BTreeMap::from([
@@ -3184,7 +3210,9 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     /// Plans one transition through the real planner with its real payload

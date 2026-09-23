@@ -1605,7 +1605,7 @@ mod admitted_operation_gate_tests {
         ceiling: eliot_store_api::EffectClass,
         named_operations: Vec<eliot_store_api::NamedMutationRequest>,
     ) -> eliot_store_api::PreparedTransition {
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new("op-gate").expect("operation"),
                 idempotency_key: "idem-gate".to_owned(),
@@ -1619,6 +1619,11 @@ mod admitted_operation_gate_tests {
             requested_effect_ceiling: ceiling,
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: manifest_digest,
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations,
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: Vec::new(),
@@ -1627,7 +1632,9 @@ mod admitted_operation_gate_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     fn mutation_operation() -> eliot_store_api::NamedMutationRequest {
@@ -2302,6 +2309,12 @@ mod concurrent_allocation_tests {
                 admission_contract_set_digest: "b".repeat(64),
                 operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                     .expect("manifest"),
+                // Issue-#18 digests are derived below via
+                // `bind_issue18_digests`, never defaulted; no semantic
+                // source is bound here (`[]`).
+                admission_digest: String::new(),
+                mutation_plan_digest: String::new(),
+                semantic_source_revisions: Vec::new(),
                 named_operations: vec![NamedMutationRequest {
                     operation: NamedMutationOperation::CaptureObservation,
                     parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -2314,6 +2327,7 @@ mod concurrent_allocation_tests {
                 security: SecurityContext::default(),
                 required_proof_and_approval_refs: Vec::new(),
             };
+            eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
             transition.operation_manifest_digest =
                 operation_manifest_set_digest(&generated_operation_manifests().expect("catalogue"))
                     .expect("manifest digest");

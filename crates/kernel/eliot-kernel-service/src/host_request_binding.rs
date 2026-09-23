@@ -486,19 +486,13 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
         response: &McpResponse,
     ) -> Result<(), PortFailure> {
         let digest = canonical_result_digest(response)?;
-        let body = serde_json::to_value(response).map_err(|_| {
-            PortFailure::TransportBindingRejected {
+        let body =
+            serde_json::to_value(response).map_err(|_| PortFailure::TransportBindingRejected {
                 reason: "kernel result cannot be canonicalized".to_owned(),
-            }
-        })?;
+            })?;
         let operation_id = ors_operation_id(envelope)?;
         self.store
-            .persist_host_request_result(
-                &operation_id,
-                &envelope.envelope_sha256,
-                &digest,
-                &body,
-            )
+            .persist_host_request_result(&operation_id, &envelope.envelope_sha256, &digest, &body)
             .map_err(|error| ors_failure(&error))?
             .ok_or(PortFailure::TransportBindingRejected {
                 reason: "admitted operation disappeared before result persistence".to_owned(),
@@ -1026,7 +1020,11 @@ fn terminal_replay_failure(state: HostRequestState) -> PortFailure {
 /// digest/body pair, yields `None` so the caller falls back to the existing
 /// terminal/live disposition instead of inventing a response.
 fn stored_result_body(record: &HostRequestRecord) -> Option<(serde_json::Value, String)> {
-    match (&record.state, &record.result_digest, &record.result_response) {
+    match (
+        &record.state,
+        &record.result_digest,
+        &record.result_response,
+    ) {
         (
             HostRequestState::ResultReceived | HostRequestState::Terminal,
             Some(digest),
@@ -1042,11 +1040,10 @@ fn stored_result_body(record: &HostRequestRecord) -> Option<(serde_json::Value, 
 /// read owner returned, so the stored body is byte-exact and any forged or
 /// substituted body fails the readback check before it is served.
 fn canonical_result_digest(response: &McpResponse) -> Result<String, PortFailure> {
-    let bytes = canonical_json_bytes(response).map_err(|_| {
-        PortFailure::TransportBindingRejected {
+    let bytes =
+        canonical_json_bytes(response).map_err(|_| PortFailure::TransportBindingRejected {
             reason: "kernel result cannot be canonicalized".to_owned(),
-        }
-    })?;
+        })?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -1313,7 +1310,10 @@ mod local_read_result_tests {
             NonZeroU64::new(3).expect("nonzero test sequence"),
         )
         .expect("valid test epoch");
-        StateFence::new(epoch, ResourceGeneration::new(7).expect("nonzero test generation"))
+        StateFence::new(
+            epoch,
+            ResourceGeneration::new(7).expect("nonzero test generation"),
+        )
     }
 
     fn test_envelope(request: &HostInvocationRequest) -> HostRequestEnvelope {
@@ -1428,8 +1428,7 @@ mod local_read_result_tests {
         // operation's answer.
         let mut wrong_tool = response.clone();
         wrong_tool.canonical_tool_name = "eliot.state".to_owned();
-        let wrong_tool_body =
-            serde_json::to_value(&wrong_tool).expect("wrong-tool must serialize");
+        let wrong_tool_body = serde_json::to_value(&wrong_tool).expect("wrong-tool must serialize");
         let wrong_tool_digest =
             canonical_result_digest(&wrong_tool).expect("wrong-tool must digest");
         assert!(
@@ -1443,9 +1442,7 @@ mod local_read_result_tests {
         let response = test_response();
         let body = serde_json::to_value(&response).expect("response must serialize");
         let digest = canonical_result_digest(&response).expect("digest must compute");
-        let label = |value: &str| {
-            OpaqueLabel::new(value.to_owned()).expect("valid test label")
-        };
+        let label = |value: &str| OpaqueLabel::new(value.to_owned()).expect("valid test label");
         let mut record = HostRequestRecord {
             contract_version: ORS_CONTRACT_VERSION,
             operation_id: ors_operation_id_for_test(),
@@ -1542,7 +1539,10 @@ mod local_read_build_tests {
             NonZeroU64::new(3).expect("nonzero test sequence"),
         )
         .expect("valid test epoch");
-        StateFence::new(epoch, ResourceGeneration::new(7).expect("nonzero test generation"))
+        StateFence::new(
+            epoch,
+            ResourceGeneration::new(7).expect("nonzero test generation"),
+        )
     }
 
     fn test_query_pair() -> (HostInvocationRequest, HostRequestEnvelope) {
@@ -1550,8 +1550,7 @@ mod local_read_build_tests {
         let request: HostInvocationRequest =
             serde_json::from_str(QUERY_JSON).expect("fixture must deserialize");
         request.validate().expect("fixture must validate");
-        let payload_digest =
-            canonical_payload_digest(&request.tool).expect("tool must digest");
+        let payload_digest = canonical_payload_digest(&request.tool).expect("tool must digest");
         let envelope = eliot_protocol::HostRequestEnvelope {
             wire_id: eliot_protocol::HOST_REQUEST_WIRE_ID.to_owned(),
             wire_version: eliot_protocol::HostRequestEnvelope::CONTRACT_VERSION,
@@ -1617,11 +1616,9 @@ mod local_read_build_tests {
         .expect("admitted query must build its bounded body");
 
         // The digest binds the exact bounded bytes: determinism is the proof.
-        let decoded: McpResponse =
-            serde_json::from_value(body.clone()).expect("body must decode");
-        let recomputed = sha256_hex(
-            &canonical_json_bytes(&decoded).expect("built body must canonicalize"),
-        );
+        let decoded: McpResponse = serde_json::from_value(body.clone()).expect("body must decode");
+        let recomputed =
+            sha256_hex(&canonical_json_bytes(&decoded).expect("built body must canonicalize"));
         assert_eq!(recomputed, digest);
 
         // The projection half is exact: kind, ceiling, identity, and the
@@ -1682,9 +1679,8 @@ mod local_read_build_tests {
         let mut tampered: McpResponse =
             serde_json::from_value(first.1.clone()).expect("built body must decode");
         tampered.content = json!({"tampered": true});
-        let tampered_digest = sha256_hex(
-            &canonical_json_bytes(&tampered).expect("tampered must canonicalize"),
-        );
+        let tampered_digest =
+            sha256_hex(&canonical_json_bytes(&tampered).expect("tampered must canonicalize"));
         assert_ne!(
             tampered_digest, first.0,
             "a changed payload must never share the stored digest"
@@ -1695,20 +1691,17 @@ mod local_read_build_tests {
     fn build_rejects_non_query_and_over_bound_before_serving() {
         let (_, envelope) = test_query_pair();
         let payload = evidence_payload();
-        let build = |envelope: &HostRequestEnvelope,
-                     scope: &str,
-                     subject: &str,
-                     max: u32,
-                     mode: &str| {
-            AuthenticatedHostSession::build_local_read_result_body(
-                envelope,
-                scope,
-                subject,
-                max,
-                mode,
-                payload.clone(),
-            )
-        };
+        let build =
+            |envelope: &HostRequestEnvelope, scope: &str, subject: &str, max: u32, mode: &str| {
+                AuthenticatedHostSession::build_local_read_result_body(
+                    envelope,
+                    scope,
+                    subject,
+                    max,
+                    mode,
+                    payload.clone(),
+                )
+            };
 
         // A non-query capability is never a local read.
         let mut other = envelope.clone();
@@ -1737,7 +1730,14 @@ mod local_read_build_tests {
 
         // Position intent never admits GetEvidencePack; unknown modes fail too.
         assert!(
-            build(&envelope, "scope-1", "evidence-alpha", 10, "current_position").is_err(),
+            build(
+                &envelope,
+                "scope-1",
+                "evidence-alpha",
+                10,
+                "current_position"
+            )
+            .is_err(),
             "position intent must be rejected before serving"
         );
         assert!(

@@ -44,8 +44,8 @@ use eliot_kernel_core::{
     IntroductionActivationIntent, IntroductionHydration, RootGrantHydration,
 };
 use eliot_ors::{
-    CapabilityIntroductionActivation, EpochIdentity, EpochLineage, OperationalRecordContext,
-    OperationalRecordInput, OpaqueLabel, StateFenceSnapshot,
+    CapabilityIntroductionActivation, EpochIdentity, EpochLineage, OpaqueLabel,
+    OperationalRecordContext, OperationalRecordInput, StateFenceSnapshot,
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
@@ -278,10 +278,7 @@ impl OwnerClosureProvider {
     /// revision and fence this provider serves.
     #[must_use]
     pub fn snapshot_bundle(&self) -> (GrantGraphRecoverySnapshot, RevocationHistoryEvidence) {
-        (
-            self.snapshot.grant_graph.clone(),
-            self.history.clone(),
-        )
+        (self.snapshot.grant_graph.clone(), self.history.clone())
     }
 
     /// Rebinds the owner from newer durable Governor state.
@@ -405,10 +402,7 @@ impl OwnerClosureProvider {
         if self
             .registry
             .introductions
-            .insert(
-                hydration.intent.introduction_id.clone(),
-                hydration.clone(),
-            )
+            .insert(hydration.intent.introduction_id.clone(), hydration.clone())
             .is_some()
         {
             return Err(CompositionError::Owner(
@@ -554,7 +548,11 @@ impl OwnerClosureProvider {
                 &member.intent.authority_root_ref,
                 &member.intent.binding,
             )?;
-            verify_imported_grant_seal(&member.intent.grant_id, &member.intent.operation_id, member.durable_record.record())?;
+            verify_imported_grant_seal(
+                &member.intent.grant_id,
+                &member.intent.operation_id,
+                member.durable_record.record(),
+            )?;
             if shadow
                 .members
                 .insert(member.intent.grant_id.clone(), member.clone())
@@ -572,7 +570,11 @@ impl OwnerClosureProvider {
                 &root.intent.authority_root_ref,
                 &root.intent.binding,
             )?;
-            verify_imported_grant_seal(&root.intent.grant_id, &root.intent.operation_id, root.durable_record.record())?;
+            verify_imported_grant_seal(
+                &root.intent.grant_id,
+                &root.intent.operation_id,
+                root.durable_record.record(),
+            )?;
             if root.intent.parent_grant_id.is_some() {
                 return Err(CompositionError::Recovery(
                     "hydration snapshot carries a non-root identity as a root".to_owned(),
@@ -593,13 +595,14 @@ impl OwnerClosureProvider {
                 &hydration.intent.supporting_grant_ids,
                 &hydration.intent.authority_root_ref,
             )?;
-            verify_imported_introduction_seal(&hydration.intent.introduction_id, &hydration.intent.operation_id, hydration.durable_record.record())?;
+            verify_imported_introduction_seal(
+                &hydration.intent.introduction_id,
+                &hydration.intent.operation_id,
+                hydration.durable_record.record(),
+            )?;
             if shadow
                 .introductions
-                .insert(
-                    hydration.intent.introduction_id.clone(),
-                    hydration.clone(),
-                )
+                .insert(hydration.intent.introduction_id.clone(), hydration.clone())
                 .is_some()
             {
                 return Err(CompositionError::Recovery(
@@ -769,10 +772,7 @@ impl OwnerClosureProvider {
         reject_blank(&params.authority_root_ref, "admission.authority_root_ref")?;
         reject_blank(&params.snapshot_id, "admission.snapshot_id")?;
         reject_blank(&params.resource_handle, "admission.resource_handle")?;
-        reject_blank(
-            &params.facet_manifest_ref,
-            "admission.facet_manifest_ref",
-        )?;
+        reject_blank(&params.facet_manifest_ref, "admission.facet_manifest_ref")?;
         reject_blank(&params.holder_principal, "admission.holder_principal")?;
         reject_blank(&params.session_id, "admission.session_id")?;
         reject_blank(&params.scope_id, "admission.scope_id")?;
@@ -823,8 +823,7 @@ impl OwnerClosureProvider {
             secret,
             &intent,
         )?;
-        let durable_record =
-            CapabilityIntroductionActivation::new(input).map_err(recovery)?;
+        let durable_record = CapabilityIntroductionActivation::new(input).map_err(recovery)?;
         Ok(IntroductionHydration {
             intent,
             durable_record,
@@ -974,8 +973,7 @@ fn verify_imported_introduction_seal(
     operation_id: &str,
     record: &eliot_ors::OperationalRecordInput,
 ) -> Result<(), CompositionError> {
-    if record.record_id.as_str() != operation_id || record.subject_id.as_str() != introduction_id
-    {
+    if record.record_id.as_str() != operation_id || record.subject_id.as_str() != introduction_id {
         return Err(CompositionError::Recovery(
             "imported opaque record identity disagrees with the imported intent".to_owned(),
         ));
@@ -985,7 +983,8 @@ fn verify_imported_introduction_seal(
 }
 
 /// Rejects blank or control-character identities before admission.
-fn reject_blank(value: &str, field: &'static str) -> Result<(), CompositionError> {    if value.trim().is_empty() || value.chars().any(char::is_control) {
+fn reject_blank(value: &str, field: &'static str) -> Result<(), CompositionError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(CompositionError::Owner(format!(
             "{field} is blank or malformed"
         )));
@@ -1046,11 +1045,7 @@ mod owner_closure_provider_tests {
         }
     }
 
-    fn grant_entry(
-        fence: &StateFence,
-        grant_id: &str,
-        parent: Option<&str>,
-    ) -> CapabilityGrant {
+    fn grant_entry(fence: &StateFence, grant_id: &str, parent: Option<&str>) -> CapabilityGrant {
         CapabilityGrant {
             grant_id: GrantId::new(grant_id).expect("id"),
             parent_grant_id: parent.map(|id| GrantId::new(id).expect("parent")),
@@ -1149,9 +1144,7 @@ mod owner_closure_provider_tests {
     #[test]
     fn restore_refuses_absent_history() {
         let fence = test_fence();
-        assert!(
-            OwnerClosureProvider::restore(owner_snapshot(&fence), None, &fence).is_err()
-        );
+        assert!(OwnerClosureProvider::restore(owner_snapshot(&fence), None, &fence).is_err());
     }
 
     #[test]
@@ -1165,7 +1158,12 @@ mod owner_closure_provider_tests {
             1_000,
         )?;
         provider.admit_grant_member(
-            &grant_params(&fence, "op-admit-child", "grant:child", Some("grant:origin")),
+            &grant_params(
+                &fence,
+                "op-admit-child",
+                "grant:child",
+                Some("grant:origin"),
+            ),
             &secret(),
             1_000,
         )?;
@@ -1205,7 +1203,11 @@ mod owner_closure_provider_tests {
         assert!(restore.revocation_history.is_some());
         // The sealed opaque record carries the admitted identity contour.
         assert_eq!(
-            restore.members[0].durable_record.record().subject_id.as_str(),
+            restore.members[0]
+                .durable_record
+                .record()
+                .subject_id
+                .as_str(),
             "grant:child"
         );
         assert_eq!(
@@ -1264,8 +1266,11 @@ mod owner_closure_provider_tests {
         )?;
         let bytes = provider.export_registry()?;
         let fence2 = test_fence();
-        let mut fresh =
-            OwnerClosureProvider::restore(owner_snapshot(&fence2), Some(history(&fence2)), &fence2)?;
+        let mut fresh = OwnerClosureProvider::restore(
+            owner_snapshot(&fence2),
+            Some(history(&fence2)),
+            &fence2,
+        )?;
         assert!(fresh.serve_restore().is_err());
         fresh.import_registry(&bytes)?;
         assert_eq!(fresh.serve_restore()?.roots.len(), 1);

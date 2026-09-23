@@ -389,7 +389,7 @@ fn entry_binding_change_moves_set_digest() {
 fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::PreparedTransition {
     let mut parameters = BTreeMap::new();
     parameters.insert("subject".to_owned(), json!("observation-1"));
-    eliot_store_api::PreparedTransition {
+    let mut plan = eliot_store_api::PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("operation-1").unwrap(),
             idempotency_key: "retry-1".to_owned(),
@@ -403,6 +403,11 @@ fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: set_digest.clone(),
+        // Derived bindings, never placeholders; these catalogue fixtures
+        // carry no expected heads, so no source revisions render.
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters,
@@ -414,7 +419,9 @@ fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
+    plan
 }
 
 fn audit_params() -> BTreeMap<String, Value> {
@@ -434,6 +441,7 @@ fn audit_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepared
         operation: NamedMutationOperation::AppendAuditEvent,
         parameters: audit_params(),
     }];
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
     plan
 }
 
@@ -456,6 +464,7 @@ fn lifecycle_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prep
         operation: NamedMutationOperation::ApplyLifecyclePolicy,
         parameters: lifecycle_params(),
     }];
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
     plan
 }
 
@@ -488,6 +497,7 @@ fn recovery_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
         operation: NamedMutationOperation::ReconcileRecovery,
         parameters: recovery_params(),
     }];
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
     plan
 }
 
@@ -510,6 +520,7 @@ fn task_state_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Pre
         operation: NamedMutationOperation::UpdateTaskState,
         parameters: task_state_params(),
     }];
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
     plan
 }
 
@@ -661,9 +672,10 @@ fn update_task_state_passes_whole_path() {
     // The proposing shape omits the predecessor `from` and still passes:
     // the optional field is absent, never defaulted.
     let mut proposing = task_state_plan(&set_digest);
-    proposing.named_operations[0]
-        .parameters
-        .remove("from");
+    proposing.named_operations[0].parameters.remove("from");
+    // Re-derive the bound digests after the plan mutation so the catalogue
+    // gate (not a stale binding) decides the outcome.
+    eliot_store_api::bind_issue18_digests(&mut proposing).unwrap();
     assert!(proposing.validate_against_catalogue(&entries).is_ok());
 
     // A missing required task-control field fails closed.
@@ -671,6 +683,7 @@ fn update_task_state_passes_whole_path() {
     missing.remove("expected_revision");
     let mut plan = task_state_plan(&set_digest);
     plan.named_operations[0].parameters = missing;
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
     assert!(matches!(
         plan.validate_against_catalogue(&entries),
         Err(StoreError::InvalidField {
@@ -694,6 +707,9 @@ fn still_unactivated_mutation_is_refused() {
         operation: NamedMutationOperation::RecordAuthorityRevocation,
         parameters: BTreeMap::new(),
     }];
+    // Re-derive the bound digests after the plan mutation so the catalogue
+    // gate (not a stale binding) decides the outcome.
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
     assert_eq!(
         plan.validate_against_catalogue(&entries),
         Err(StoreError::UnknownOperation)
@@ -710,6 +726,9 @@ fn epistemic_revision_requires_its_closed_typed_payload() {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         parameters: BTreeMap::new(),
     }];
+    // Re-derive the bound digests after the plan mutation so the typed
+    // parameter gate (not a stale binding) decides the outcome.
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
     assert!(matches!(
         plan.validate_against_catalogue(&entries),
         Err(StoreError::InvalidField {

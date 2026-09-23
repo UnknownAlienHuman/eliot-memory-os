@@ -562,7 +562,10 @@ impl TestdAdmission {
         ] {
             validate_wire_text(text, field)?;
         }
-        if !matches!(self.profile.as_str(), TESTD_ADMITTED_PROFILE | TESTD_PRODUCTIVE_PROFILE) {
+        if !matches!(
+            self.profile.as_str(),
+            TESTD_ADMITTED_PROFILE | TESTD_PRODUCTIVE_PROFILE
+        ) {
             return Err(KernelServiceError::InvalidField {
                 field: "testd_admission.profile",
                 reason: "testd admits only the closed probe or productive nextest profile",

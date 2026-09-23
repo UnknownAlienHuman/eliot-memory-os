@@ -29,14 +29,12 @@
 //!   revocations at that revision; a missing watermark refuses because
 //!   absence of history is not evidence.
 
-use eliot_ors::{
-    GrantClosureState, OpaqueLabel, OperationalRecoveryStore,
-};
+use eliot_ors::{GrantClosureState, OpaqueLabel, OperationalRecoveryStore};
+use eliot_security_contracts::RevocationReason;
 use eliot_store_api::{
     NamedReadOperation, NamedReadRequest, NamedReadResponse, REVOCATION_HISTORY_MAX_RECORDS,
     REVOCATION_HISTORY_PAYLOAD_VERSION, RecordedRevocation, RevocationHistoryPayload, StoreError,
 };
-use eliot_security_contracts::RevocationReason;
 
 /// Serves one closed revocation-history view from durable Kernel fence
 /// state.
@@ -221,11 +219,10 @@ fn history_response(
         closures,
     };
     payload.validate()?;
-    let value =
-        serde_json::to_value(&payload).map_err(|_| StoreError::InvalidField {
-            field: "payload",
-            reason: "revocation-history payload is not encodable",
-        })?;
+    let value = serde_json::to_value(&payload).map_err(|_| StoreError::InvalidField {
+        field: "payload",
+        reason: "revocation-history payload is not encodable",
+    })?;
     Ok(NamedReadResponse {
         operation: NamedReadOperation::GetAuthorityRevocationHistory,
         state_fence: fence.clone(),

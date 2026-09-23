@@ -253,6 +253,37 @@ pub enum DaemonError {
     Lifecycle(String),
 }
 
+/// Typed revision-fence match failure for the daemon cache gate (issue #18
+/// W6/A5).
+///
+/// Daemon caches and hot mirrors are revision-keyed and rebuildable. This
+/// gate guards cache refresh/admission only: it never swallows or
+/// reinterprets a durable store receipt. No `HeadMismatch` arm exists here
+/// by intent — [`eliot_governor::KernelGenerationSnapshot`] carries no
+/// revision heads, so head comparison stays with the #15 port.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum RevisionFenceMismatch {
+    /// No fence was ever cached (the composition never admitted one).
+    #[error("daemon revision fence was never built")]
+    NeverBuilt,
+    /// The dependent view is already stale/pending: the caller drops this
+    /// composition and re-runs authenticated connect+start.
+    #[error("daemon view is stale; drop and re-run authenticated connect+start")]
+    StaleView,
+    /// The cached fence no longer equals the live Kernel fence.
+    ///
+    /// Both fences are boxed: [`StateFence`] carries epoch/revision
+    /// identity and would otherwise push this `Err` variant past the
+    /// `result_large_err` bound (and inflate every future holding it).
+    #[error("daemon cached revision fence does not match the live Kernel fence")]
+    FenceMismatch {
+        /// Fence the cache was built against.
+        expected: Box<StateFence>,
+        /// Fence observed on the live snapshot.
+        observed: Box<StateFence>,
+    },
+}
+
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -308,6 +339,20 @@ pub struct DaemonComposition {
     /// already durable. The dependent view is stale/pending until the caller
     /// drops this composition and re-runs authenticated connect+start.
     view_stale: bool,
+    /// Revision fence the daemon cache was built against (issue #18 W6/A5).
+    ///
+    /// Caches and hot mirrors are revision-keyed and rebuildable: this
+    /// cached fence never creates freshness or authority, it only keys the
+    /// dependent view so a fence move surfaces as an exact mismatch instead
+    /// of silent divergence. Admitted at [`Self::start`] from the Kernel
+    /// snapshot, re-keyed only when
+    /// [`Self::require_revision_fence_match`] observes an exact match after
+    /// a store commit, and never cleared by a refresh. Daemon loss leaves
+    /// the Kernel able to fence, cancel, and reconcile: durable truth stays
+    /// downstream, never here.
+    ///
+    /// Boxed so the composition stays small for futures holding it.
+    cached_revision_fence: Option<Box<StateFence>>,
     /// Owner receipts for experience-bank/feedback records this composition
     /// already committed, keyed by deterministic idempotency key (P1-1,
     /// issue #1942).
@@ -396,6 +441,7 @@ impl DaemonComposition {
             &config.launch().kernel,
             QueueLimits::default(),
         )?;
+        let cached_revision_fence = Some(Box::new(governor.kernel_snapshot().state_fence()));
         Ok(Self {
             governor,
             config_lease,
@@ -404,6 +450,7 @@ impl DaemonComposition {
             state_root: config.state_root,
             started: true,
             view_stale: false,
+            cached_revision_fence,
             committed_experience: BTreeMap::new(),
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
@@ -453,7 +500,53 @@ impl DaemonComposition {
         if self.governor.refresh_from_kernel().is_err() {
             self.view_stale = true;
         }
+        // Revision-fence match gate (issue #18 W6/A5): the cache is
+        // revision-keyed, so a fence move must surface as stale instead of
+        // silent divergence. A gate rejection marks the dependent view
+        // stale/pending but never swallows the already durable receipt.
+        if let Err(mismatch) = self.require_revision_fence_match() {
+            self.view_stale = true;
+            let _ = crate::diagnostics::ErrorRecord::of(
+                crate::diagnostics::OwningComponent::DaemonRuntime,
+                "revision-fence",
+                &mismatch.to_string(),
+            )
+            .emit();
+        } else {
+            self.cached_revision_fence =
+                Some(Box::new(self.governor.kernel_snapshot().state_fence()));
+        }
         Ok(receipt)
+    }
+
+    /// Requires the cached revision fence to match the live Kernel fence
+    /// exactly (issue #18 W6/A5).
+    ///
+    /// Rejects [`RevisionFenceMismatch::NeverBuilt`] when no fence was ever
+    /// cached, [`RevisionFenceMismatch::StaleView`] when the dependent view
+    /// is already stale/pending, and
+    /// [`RevisionFenceMismatch::FenceMismatch`] when the cached fence no
+    /// longer exactly equals the live snapshot fence. Called from
+    /// [`Self::commit_canonical_and_refresh`] after the store commit: the
+    /// caller marks the view stale on rejection and still returns the
+    /// durable receipt, so this gate guards cache refresh/admission without
+    /// creating freshness or authority.
+    fn require_revision_fence_match(&self) -> Result<(), RevisionFenceMismatch> {
+        if self.view_stale {
+            return Err(RevisionFenceMismatch::StaleView);
+        }
+        let cached = self
+            .cached_revision_fence
+            .as_ref()
+            .ok_or(RevisionFenceMismatch::NeverBuilt)?;
+        let live = self.governor.kernel_snapshot().state_fence();
+        if !eliot_contracts::fences_match_exact(cached, &live) {
+            return Err(RevisionFenceMismatch::FenceMismatch {
+                expected: cached.clone(),
+                observed: Box::new(live),
+            });
+        }
+        Ok(())
     }
 
     /// Commits one ledger-sequenced experience-bank record through the

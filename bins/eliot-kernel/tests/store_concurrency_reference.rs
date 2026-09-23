@@ -127,7 +127,7 @@ fn ctx_for(operation: &str, fence: &StateFence) -> RequestMeta {
 fn admitting_manifest() -> NamedOperationManifest {
     let entries = generated_operation_manifests().expect("generated catalogue");
     assert!(!entries.is_empty(), "catalogue must be non-empty");
-    let probe = PreparedTransition {
+    let mut probe = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-994-probe").expect("operation"),
             idempotency_key: "idem-994-probe".to_owned(),
@@ -141,6 +141,11 @@ fn admitting_manifest() -> NamedOperationManifest {
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: entries[0].digest.clone(),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; no semantic source is bound here (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), serde_json::json!("probe"))]),
@@ -153,6 +158,7 @@ fn admitting_manifest() -> NamedOperationManifest {
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut probe).unwrap();
     entries
         .into_iter()
         .find(|entry| {
@@ -201,6 +207,13 @@ fn build_transition(
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: manifest.digest.clone(),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; the admitted expected heads render here via
+        // `render_semantic_source_revisions`, mirroring the Governor
+        // envelope path.
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: eliot_store_api::render_semantic_source_revisions(revisions),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), serde_json::json!(subject))]),
@@ -213,6 +226,7 @@ fn build_transition(
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut transition).unwrap();
     transition.identity.canonical_request_hash = canonical_request_hash(
         &CanonicalRequestView::from_apply(ctx, &transition, revisions, orderings),
     )

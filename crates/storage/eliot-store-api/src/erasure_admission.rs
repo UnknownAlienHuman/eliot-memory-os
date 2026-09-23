@@ -196,10 +196,7 @@ pub fn admit_erasure_transition(
         ERASURE_PARAM_SUBJECT.to_owned(),
         Value::String(request.subject.clone()),
     );
-    parameters.insert(
-        ERASURE_PARAM_SURFACES.to_owned(),
-        Value::String(surfaces),
-    );
+    parameters.insert(ERASURE_PARAM_SURFACES.to_owned(), Value::String(surfaces));
     parameters.insert(
         ERASURE_PARAM_REASON.to_owned(),
         Value::String(request.reason.clone()),
@@ -212,7 +209,7 @@ pub fn admit_erasure_transition(
         ERASURE_PARAM_OPERATION_ID.to_owned(),
         Value::String(request.identity.operation_id.to_string()),
     );
-    let transition = PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: request.identity.clone(),
         state_fence: request.state_fence.clone(),
         scope_id: request.scope_id.clone(),
@@ -222,6 +219,12 @@ pub fn admit_erasure_transition(
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: request.admission_contract_set_digest.clone(),
         operation_manifest_digest: request.operation_manifest_digest.clone(),
+        // The decision/plan digests are derived below, never defaulted.
+        // Fence-scoped erasure binds no semantic source and records `[]`
+        // explicitly: the deletion admits no revision lineage.
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::ApplyErasure,
             parameters,
@@ -230,6 +233,7 @@ pub fn admit_erasure_transition(
         security: request.security.clone(),
         required_proof_and_approval_refs: request.approval_refs.clone(),
     };
+    super::bind_issue18_digests(&mut transition)?;
     transition.validate()?;
     Ok(transition)
 }

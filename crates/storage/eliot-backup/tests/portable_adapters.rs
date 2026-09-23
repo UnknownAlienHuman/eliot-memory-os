@@ -240,11 +240,7 @@ fn admitted_vault_binds_portable_restore_to_backup_and_ids() {
 fn admitted_vault_rejects_invalid_identity_after_zeroizing_ingress() {
     let mut keks = std::collections::BTreeMap::new();
     keks.insert(String::new(), PortableSecretKey::new(KEK_A));
-    let result = AdmittedKeyMap::for_backup(
-        String::new(),
-        keks,
-        std::collections::BTreeMap::new(),
-    );
+    let result = AdmittedKeyMap::for_backup(String::new(), keks, std::collections::BTreeMap::new());
     assert!(matches!(result, Err(BackupError::InvalidField { .. })));
 }
 

@@ -884,7 +884,7 @@ fn mutation_transition_for(
             let command = payload
                 .command()
                 .map_err(LifecyclePersistError::from_store)?;
-            let transition = PreparedTransition {
+            let mut transition = PreparedTransition {
                 identity: input.identity.clone(),
                 state_fence: bindings.fence.clone(),
                 scope_id: ScopeId::new(payload.candidate.scope.as_str()).map_err(|_| {
@@ -899,6 +899,12 @@ fn mutation_transition_for(
                 requested_effect_ceiling: TransitionClass::Epistemic.maximum_effect(),
                 admission_contract_set_digest: bindings.admission_digest.clone(),
                 operation_manifest_digest: bindings.manifest_digest.clone(),
+                // Issue-#18 digests are derived below via
+                // `bind_issue18_digests`, never defaulted; this Kernel leg
+                // binds no semantic source (`[]`).
+                admission_digest: String::new(),
+                mutation_plan_digest: String::new(),
+                semantic_source_revisions: Vec::new(),
                 named_operations: vec![command],
                 event_projection_relation_intents: EventProjectionRelationIntents {
                     event_ids: Vec::new(),
@@ -908,6 +914,8 @@ fn mutation_transition_for(
                 security: SecurityContext::default(),
                 required_proof_and_approval_refs: input.proof_refs.clone(),
             };
+            eliot_store_api::bind_issue18_digests(&mut transition)
+                .map_err(LifecyclePersistError::from_store)?;
             transition
                 .validate()
                 .map_err(LifecyclePersistError::from_store)?;
@@ -955,7 +963,7 @@ fn transition_for(
     bindings: &TransitionBindings,
     spec: TransitionSpec,
 ) -> Result<PreparedTransition, LifecyclePersistError> {
-    let transition = PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: identity.clone(),
         state_fence: bindings.fence.clone(),
         scope_id: bindings.scope.clone(),
@@ -965,6 +973,11 @@ fn transition_for(
         requested_effect_ceiling: spec.ceiling,
         admission_contract_set_digest: bindings.admission_digest.clone(),
         operation_manifest_digest: bindings.manifest_digest.clone(),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; this Kernel leg binds no semantic source (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: spec.commands,
         event_projection_relation_intents: EventProjectionRelationIntents {
             event_ids: spec.events,
@@ -974,6 +987,8 @@ fn transition_for(
         security: SecurityContext::default(),
         required_proof_and_approval_refs: spec.proof_refs,
     };
+    eliot_store_api::bind_issue18_digests(&mut transition)
+        .map_err(LifecyclePersistError::from_store)?;
     transition
         .validate()
         .map_err(LifecyclePersistError::from_store)?;

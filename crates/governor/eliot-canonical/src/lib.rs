@@ -21,7 +21,8 @@ use eliot_store_api::{
     OrderingHead, OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHead,
     RevisionHeadExpectation, ScopeId, ScopeRevisionView, SecurityContext, StoreConflictObservation,
     StoreError, StoreFailure, StoreFailureDisposition, StoreHealth, StoreMutationDisposition,
-    StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
+    StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt, bind_issue18_digests,
+    render_semantic_source_revisions,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -542,7 +543,7 @@ impl CanonicalWriteEnvelope {
     /// contract consumed by Kernel and the canonical store.
     pub fn prepare(&self) -> Result<PreparedTransition, CanonicalError> {
         self.validate()?;
-        let transition = PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: self.operation_id.clone(),
                 idempotency_key: self.idempotency_key.clone(),
@@ -560,11 +561,17 @@ impl CanonicalWriteEnvelope {
             requested_effect_ceiling: self.requested_effect_ceiling,
             admission_contract_set_digest: self.admission_contract_set_digest.clone(),
             operation_manifest_digest: self.operation_manifest_digest.clone(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: render_semantic_source_revisions(
+                &self.expected_revision_heads,
+            ),
             named_operations: self.semantic_commands.clone(),
             event_projection_relation_intents: self.event_projection_relation_intents.clone(),
             security: self.security.clone(),
             required_proof_and_approval_refs: self.required_proof_and_approval_refs.clone(),
         };
+        bind_issue18_digests(&mut transition)?;
         transition.validate()?;
         Ok(transition)
     }
@@ -918,10 +925,7 @@ impl FinishEvidence {
                 reason: "must be non-zero",
             });
         }
-        unique(
-            self.artifact_refs.iter(),
-            "finish.evidence.artifact_refs",
-        )?;
+        unique(self.artifact_refs.iter(), "finish.evidence.artifact_refs")?;
         for reference in &self.artifact_refs {
             text(reference, "finish.evidence.artifact_ref")?;
         }

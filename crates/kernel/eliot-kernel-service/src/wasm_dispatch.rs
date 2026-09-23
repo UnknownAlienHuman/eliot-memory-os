@@ -847,8 +847,7 @@ pub fn wasm_join_gate(
         .map_err(|_| WasmDispatchError::Gate)?;
     // Grant identical to the bundle publisher: the join test fixes the
     // same fence/lease derivation the child rebuilds.
-    let generation =
-        Generation::new(claim.generation).map_err(|_| invalid("join-generation"))?;
+    let generation = Generation::new(claim.generation).map_err(|_| invalid("join-generation"))?;
     let grant = wasm_dispatch_grant_for(
         &claim.identity_digest,
         &claim.authority_epoch,
@@ -876,9 +875,7 @@ pub fn wasm_join_gate(
         .to_str()
         .ok_or_else(|| invalid("join-paths"))?;
     let input_text = input_path.to_str().ok_or_else(|| invalid("join-paths"))?;
-    let working_text = install_dir
-        .to_str()
-        .ok_or_else(|| invalid("join-paths"))?;
+    let working_text = install_dir.to_str().ok_or_else(|| invalid("join-paths"))?;
     let environment = EnvironmentProjection::new(
         std::collections::BTreeMap::new(),
         Vec::new(),
@@ -1510,7 +1507,10 @@ mod tests {
         )
         .expect("bundle publishes");
         assert_eq!(bundle.material_path, dir.join(WASM_HOST_MATERIAL_FILE_NAME));
-        assert_eq!(bundle.artifact_path, dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME));
+        assert_eq!(
+            bundle.artifact_path,
+            dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME)
+        );
         assert_eq!(bundle.input_path, dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME));
         assert!(bundle.material_path.is_file());
         assert_eq!(joins.len(), 1);
@@ -1661,7 +1661,10 @@ mod tests {
         .expect("join gate computes");
         assert_eq!(join.claim_id, "claim-wasm-join-001");
         assert_eq!(join.operation_id, "operation-wasm-join-001");
-        assert!(join.authority_id.starts_with(WASM_DISPATCH_AUTHORITY_PREFIX));
+        assert!(
+            join.authority_id
+                .starts_with(WASM_DISPATCH_AUTHORITY_PREFIX)
+        );
         assert_eq!(join.invocation_digest.len(), 64);
         assert_eq!(join.expires_at, 4_000_000_060_000);
         // Replay-stable: identical inputs rebuild the identical gate.

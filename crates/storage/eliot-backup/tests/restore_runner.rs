@@ -129,6 +129,13 @@ fn receipt_for(operation: &str) -> eliot_store_api::WriteReceipt {
             "manifest-runner-1873x",
         )
         .expect("manifest"),
+        // Standalone-fixture issue-#18 values (not bound to a transition):
+        // this seed only exercises restore-runner retention, never digest
+        // bindings. Shapes stay valid so `validate()` reaches the behavior
+        // under test.
+        admission_digest: "e".repeat(64),
+        mutation_plan_digest: "f".repeat(64),
+        semantic_source_revisions: Vec::new(),
         error_code: None,
         resubmission: eliot_store_api::Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),

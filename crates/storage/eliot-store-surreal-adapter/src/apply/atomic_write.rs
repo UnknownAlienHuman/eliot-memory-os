@@ -558,11 +558,9 @@ fn append_finish_evidence_owner_statement(
     bindings: &mut Map<String, Value>,
     transition: &eliot_store_api::PreparedTransition,
 ) -> Result<(), AdapterError> {
-    let Some(command) = transition
-        .named_operations
-        .iter()
-        .find(|command| command.operation == eliot_store_api::NamedMutationOperation::RecordFinishEvidence)
-    else {
+    let Some(command) = transition.named_operations.iter().find(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::RecordFinishEvidence
+    }) else {
         return Ok(());
     };
     if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
@@ -653,11 +651,9 @@ fn append_finish_owner_statement(
     bindings: &mut Map<String, Value>,
     transition: &eliot_store_api::PreparedTransition,
 ) -> Result<(), AdapterError> {
-    let Some(command) = transition
-        .named_operations
-        .iter()
-        .find(|command| command.operation == eliot_store_api::NamedMutationOperation::RecordFinishDecision)
-    else {
+    let Some(command) = transition.named_operations.iter().find(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::RecordFinishDecision
+    }) else {
         return Ok(());
     };
     if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
@@ -692,17 +688,14 @@ fn append_finish_owner_statement(
         return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
 
-    let finish_key = eliot_store_api::RecoveryRecordKey::new("owner", "finish")
-        .map_err(AdapterError::Store)?;
+    let finish_key =
+        eliot_store_api::RecoveryRecordKey::new("owner", "finish").map_err(AdapterError::Store)?;
     let owner_id = recovery_owner_id(&finish_key)?;
     let payload = receipt_json.as_bytes();
     let mut record = Map::new();
     record.insert("namespace".to_owned(), json!(finish_key.namespace));
     record.insert("key".to_owned(), json!(finish_key.key));
-    record.insert(
-        "state_fence".to_owned(),
-        json!(&transition.state_fence),
-    );
+    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
     record.insert(
         "revision".to_owned(),
         json!(expected_revision.checked_add(1).ok_or_else(|| {
@@ -728,7 +721,10 @@ fn append_finish_owner_statement(
         json!(schema::table::RECOVERY_OWNER),
     );
     bindings.insert("finish_owner_id".to_owned(), json!(owner_id));
-    bindings.insert("finish_expected_state_fence".to_owned(), json!(&transition.state_fence));
+    bindings.insert(
+        "finish_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
     bindings.insert(
         "finish_expected_revision".to_owned(),
         json!(expected_revision),
@@ -742,9 +738,7 @@ fn append_finish_owner_statement(
     Ok(())
 }
 
-fn recovery_owner_id(
-    key: &eliot_store_api::RecoveryRecordKey,
-) -> Result<String, AdapterError> {
+fn recovery_owner_id(key: &eliot_store_api::RecoveryRecordKey) -> Result<String, AdapterError> {
     let bytes = eliot_store_api::canonical_json_bytes(key)
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
     Ok(eliot_store_api::sha256_hex(&bytes))
@@ -1454,7 +1448,7 @@ mod authority_binding_tests {
                 EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage");
             let epoch =
                 EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
-            eliot_store_api::PreparedTransition {
+            let mut transition = eliot_store_api::PreparedTransition {
                 identity: OperationIdentity {
                     operation_id: eliot_store_api::OperationId::new("op-evidence-bind")
                         .expect("operation"),
@@ -1470,6 +1464,11 @@ mod authority_binding_tests {
                 admission_contract_set_digest: "b".repeat(64),
                 operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                     .expect("manifest"),
+                // Issue-#18 digests are derived, never defaulted; no semantic
+                // source is bound here (`[]`).
+                admission_digest: String::new(),
+                mutation_plan_digest: String::new(),
+                semantic_source_revisions: Vec::new(),
                 named_operations: vec![NamedMutationRequest {
                     operation: NamedMutationOperation::CaptureObservation,
                     parameters: BTreeMap::from([("subject".to_owned(), json!("evidence-alpha"))]),
@@ -1481,7 +1480,9 @@ mod authority_binding_tests {
                 },
                 security: SecurityContext::default(),
                 required_proof_and_approval_refs: Vec::new(),
-            }
+            };
+            eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+            transition
         }
 
         // Real planner output — never a canned row — binds subject, full
@@ -1565,7 +1566,7 @@ mod allocation_classification_tests {
     fn transition(operation: &str) -> eliot_store_api::PreparedTransition {
         use serde_json::json;
         use std::collections::BTreeMap;
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation).expect("operation"),
                 idempotency_key: format!("idem-{operation}"),
@@ -1580,6 +1581,11 @@ mod allocation_classification_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!(operation))]),
@@ -1591,7 +1597,9 @@ mod allocation_classification_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     fn context() -> eliot_store_api::RequestMeta {

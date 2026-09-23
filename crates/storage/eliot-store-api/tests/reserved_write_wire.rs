@@ -35,8 +35,9 @@ use eliot_store_api::{
     OrderingScopeId, PreparedTransition, RequestMeta, ReservedScopeBinding, ReservedWriteRequest,
     Resubmission, RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreError,
     StoreRequest, StoreResponse, TransitionClass, WriteAdmissionParams, WriteAdmissionProjection,
-    WriteReceipt, WriteReceiptStatus, WriterEpochBinding, decode_request_frame,
-    decode_response_frame, issue_store_receipt_envelope, request_frame, response_frame,
+    WriteReceipt, WriteReceiptStatus, WriterEpochBinding, bind_issue18_digests,
+    bind_issue18_receipt, decode_request_frame, decode_response_frame,
+    issue_store_receipt_envelope, request_frame, response_frame,
 };
 use serde_json::{Value, json};
 
@@ -61,7 +62,7 @@ fn context() -> RequestMeta {
 }
 
 fn transition() -> PreparedTransition {
-    PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-991-1").unwrap(),
             idempotency_key: "idem-991-1".to_owned(),
@@ -75,6 +76,12 @@ fn transition() -> PreparedTransition {
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: OperationManifestDigest::new("manifest-991-1").unwrap(),
+        // Derived bindings, never placeholders. The envelope path renders
+        // the admitted expected heads (`rev-991-1@3`); the literal below is
+        // exactly that rendering for the frozen `valid_request` heads.
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: vec!["rev-991-1@3".to_owned()],
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!("observation-991-1"))]),
@@ -86,7 +93,9 @@ fn transition() -> PreparedTransition {
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    bind_issue18_digests(&mut transition).unwrap();
+    transition
 }
 
 fn scope_binding() -> ReservedScopeBinding {
@@ -188,11 +197,17 @@ fn receipt_for(request: &ReservedWriteRequest) -> WriteReceipt {
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        // The envelope path renders the admitted expected heads; equality
+        // with the transition binding is enforced when issuing the envelope.
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),
         envelope: None,
     };
+    bind_issue18_receipt(transition, &mut receipt, &request.expected_revision_heads);
     receipt.envelope =
         Some(issue_store_receipt_envelope(&request.context, transition, &receipt, 1).unwrap());
     receipt.validate().unwrap();
@@ -244,6 +259,23 @@ fn complete_request_to_frame_to_response_map_preserves_exact_identity() {
     assert_eq!(decoded, wire);
     assert!(decoded.validate().is_ok());
     let receipt = receipt_for(&request);
+    // Issue #18: the issued receipt carries the exact admitted bindings.
+    assert_eq!(
+        receipt.admission_digest,
+        request.transition.admission_digest
+    );
+    assert_eq!(
+        receipt.mutation_plan_digest,
+        request.transition.mutation_plan_digest
+    );
+    assert_eq!(
+        receipt.semantic_source_revisions,
+        vec!["rev-991-1@3".to_owned()]
+    );
+    assert_eq!(
+        receipt.semantic_source_revisions,
+        request.transition.semantic_source_revisions
+    );
     let response_frame = response_frame(
         "connection-991",
         ProtocolVersion::CURRENT,

@@ -398,20 +398,27 @@ impl DaemonComposition {
     ) -> Result<(), DaemonError> {
         let identity = &evidence.request_identity;
         let job = &evidence.job;
-        let committed = self
-            .governor
-            .publish_testd_verifier_execution_fact_from_evidence(evidence)
-            .await
-            .map_err(DaemonError::Finish)?
-            .ok_or_else(|| {
-                completion_error("Governor reported a verifier fact without its committed receipt")
-            })?;
+        // Boxed: the committed receipt is held across the finish/ack awaits
+        // and `WriteReceipt` carries the full issue-#18 digest bindings, so
+        // keeping it inline would push this drain future past the
+        // large-future bound. Same value, same move into the ack leg.
+        let committed = Box::new(
+            self.governor
+                .publish_testd_verifier_execution_fact_from_evidence(evidence)
+                .await
+                .map_err(DaemonError::Finish)?
+                .ok_or_else(|| {
+                    completion_error(
+                        "Governor reported a verifier fact without its committed receipt",
+                    )
+                })?,
+        );
         let draft = finish_draft_from_testd_terminal_evidence(job, identity)?;
         let operation_id = OperationId::new(format!("testd-owner-finish-{}", job.job_id))
             .map_err(completion_error)?;
         let _decision = self.finish_attempt(identity, operation_id, draft).await?;
         kernel
-            .acknowledge_testd_terminal_completion_async(&job.job_id, committed)
+            .acknowledge_testd_terminal_completion_async(&job.job_id, *committed)
             .await
             .map_err(|error| DaemonError::Kernel(error.to_string()))?;
         Ok(())

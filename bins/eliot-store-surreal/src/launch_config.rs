@@ -142,12 +142,9 @@ impl StoreLaunchConfig {
         SchemaGeneration::new(self.schema_generation.as_str())
             .map_err(|error| format!("invalid schema_generation: {error}"))?;
         if !Path::new(&self.blob_root).is_absolute()
-            || Path::new(&self.blob_root).components().any(|component| {
-                matches!(
-                    component,
-                    Component::CurDir | Component::ParentDir
-                )
-            })
+            || Path::new(&self.blob_root)
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
         {
             return Err(
                 "blob_root must be an absolute path without relative components".to_owned(),

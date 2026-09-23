@@ -33,15 +33,15 @@ use eliot_kernel_core::ResolutionAuthorization;
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::WindowsPlatform;
 use eliot_receipts::{
-    ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding,
-    ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding,
+    ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling,
+    ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding,
     WorkScopeBinding, WorkScopeId, contract_identity,
 };
 use eliot_store_api::{
-    CanonicalRequestView, NamedMutationOperation, NamedMutationRequest,
-    OperationIdentity, OrderingScopeId, PreparedTransition, RequestMeta, ScopeId,
-    SecurityContext, StoreError, TransitionClass, canonical_request_hash,
-    generated_operation_manifests, operation_manifest_set_digest,
+    CanonicalRequestView, NamedMutationOperation, NamedMutationRequest, OperationIdentity,
+    OrderingScopeId, PreparedTransition, RequestMeta, ScopeId, SecurityContext, StoreError,
+    TransitionClass, canonical_request_hash, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 use eliot_store_api::{EventProjectionRelationIntents, NOTIFY_PARAM_AUTHORIZATION_JSON};
 use eliot_store_api::{
@@ -216,6 +216,11 @@ fn transition_with(
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: "c".repeat(64),
         operation_manifest_digest: manifest_digest,
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; no semantic source is bound here (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation,
             parameters,
@@ -228,6 +233,7 @@ fn transition_with(
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
     let view = CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]);
     transition.identity.canonical_request_hash =
         canonical_request_hash(&view).expect("hash computes");
@@ -512,7 +518,8 @@ async fn read_payload(harness: &Harness, scope: Option<String>, include_resolved
 
 #[tokio::test]
 async fn upsert_persists_and_reads_back_with_atomic_outbox() {
-    let harness = Harness::fresh("upsert").await;    let receipt = apply(
+    let harness = Harness::fresh("upsert").await;
+    let receipt = apply(
         &harness,
         "live-upsert-1",
         NamedMutationOperation::ApplyNotificationState,

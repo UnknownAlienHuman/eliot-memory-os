@@ -248,6 +248,11 @@ fn transition(ctx: &RequestMeta, authority: &ExactJsonBytes) -> PreparedTransiti
             &generated_operation_manifests().expect("catalogue"),
         )
         .expect("manifest digest"),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; no semantic source is bound here (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: authority.decode_object_parameters().expect("parameters"),
@@ -260,6 +265,7 @@ fn transition(ctx: &RequestMeta, authority: &ExactJsonBytes) -> PreparedTransiti
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
     transition.identity.canonical_request_hash = canonical_request_hash(
         &CanonicalRequestView::from_apply(ctx, &transition, &[], &[]),
     )

@@ -39,8 +39,8 @@ use eliot_kernel_core::{GovernorClosureRestore, owner_bundle_digest};
 use eliot_store_api::CanonicalReadClient;
 
 use crate::{
-    AuthorityOwnerSnapshot, CompositionError, OwnerClosureProvider, decode_revocation_history_evidence,
-    revocation_history_read_request,
+    AuthorityOwnerSnapshot, CompositionError, OwnerClosureProvider,
+    decode_revocation_history_evidence, revocation_history_read_request,
 };
 
 /// Kernel publish endpoint for owner bundles, implemented by the daemon
@@ -59,7 +59,9 @@ pub trait OwnerPublishPort: Send + Sync {
         expected_revision: u64,
     ) -> Result<u64, CompositionError>;
     /// Reads back the retained owner triple for verification.
-    async fn query_owner_readback(&self) -> Result<(bool, Option<u64>, Option<String>), CompositionError>;
+    async fn query_owner_readback(
+        &self,
+    ) -> Result<(bool, Option<u64>, Option<String>), CompositionError>;
 }
 
 /// Publishes the provider's current owner bundle to the Kernel and
@@ -88,9 +90,8 @@ pub async fn publish_owner_feed<P: OwnerPublishPort + ?Sized>(
         ));
     }
     let bundle = provider.serve_restore()?;
-    let expected_digest = owner_bundle_digest(&bundle).map_err(|error| {
-        CompositionError::Owner(format!("owner bundle digest failed: {error}"))
-    })?;
+    let expected_digest = owner_bundle_digest(&bundle)
+        .map_err(|error| CompositionError::Owner(format!("owner bundle digest failed: {error}")))?;
     let acknowledged = kernel
         .publish_owner_bundle(bundle, expected_revision)
         .await?;
@@ -100,7 +101,10 @@ pub async fn publish_owner_feed<P: OwnerPublishPort + ?Sized>(
         )));
     }
     let (bound, revision, digest) = kernel.query_owner_readback().await?;
-    if !bound || revision != Some(acknowledged) || digest.as_deref() != Some(expected_digest.as_str()) {
+    if !bound
+        || revision != Some(acknowledged)
+        || digest.as_deref() != Some(expected_digest.as_str())
+    {
         return Err(CompositionError::Recovery(
             "owner readback disagrees with the published bundle; publish did not commit".to_owned(),
         ));
@@ -144,7 +148,6 @@ pub async fn synchronize_owner_feed<
             evidence.source_revision
         )));
     }
-    let provider =
-        OwnerClosureProvider::restore(snapshot, Some(evidence), state_fence)?;
+    let provider = OwnerClosureProvider::restore(snapshot, Some(evidence), state_fence)?;
     publish_owner_feed(kernel, &provider, expected_revision).await
 }

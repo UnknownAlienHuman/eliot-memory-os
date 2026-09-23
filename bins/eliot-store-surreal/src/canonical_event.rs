@@ -89,8 +89,8 @@ pub fn ordering_link_hash(
         ordering_sequence: sequence,
         previous_event_hash,
     };
-    let bytes =
-        canonical_json_bytes(&preimage).map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let bytes = canonical_json_bytes(&preimage)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -126,11 +126,7 @@ impl OrderingLink {
     }
 
     /// Recomputes the link hash and rejects any substitution.
-    pub fn verify(
-        &self,
-        event_id: &EventId,
-        payload_digest: &str,
-    ) -> Result<(), StoreError> {
+    pub fn verify(&self, event_id: &EventId, payload_digest: &str) -> Result<(), StoreError> {
         self.validate()?;
         let expected = ordering_link_hash(
             event_id,
@@ -349,9 +345,7 @@ impl CommittedCanonicalTransition {
                 return Err(StoreError::FenceMismatch);
             }
             if !seen_outbox.insert(intent.outbox_id.as_str().to_owned()) {
-                return Err(StoreError::Duplicate {
-                    field: "outbox",
-                });
+                return Err(StoreError::Duplicate { field: "outbox" });
             }
             if !self.receipt.outbox_refs.contains(&intent.outbox_id) {
                 return Err(StoreError::InvalidOutbox);
@@ -424,10 +418,7 @@ impl FencedProjectionPublication {
         }
         let mut actual = BTreeMap::new();
         for head in &self.record.source_revision_heads {
-            if actual
-                .insert(head.key.clone(), head.revision)
-                .is_some()
-            {
+            if actual.insert(head.key.clone(), head.revision).is_some() {
                 return Err(StoreError::Duplicate {
                     field: "source_revision_heads",
                 });
