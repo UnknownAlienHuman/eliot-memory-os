@@ -758,6 +758,58 @@ async fn run_loop(
                                     ..
                                 } => {}
                             }
+                            // O1 retrieval drive (issues #1942/#1947): one
+                            // evaluation per activation completion over the
+                            // retained supplier bundle. Suppliers arrive
+                            // through M1-owned producers (plan compiler
+                            // factors, closure parts, owner warnings); until
+                            // they land the drive idles as Pending naming
+                            // the exact missing owners — never fabricated,
+                            // never defaulted into delivery. Drive outcomes
+                            // never fail this activation loop.
+                            match eliotd::reactive_feed::drive_retrieval_once(None, None, &[]) {
+                                eliotd::reactive_feed::RetrievalDriveOutcome::Failed(error) => {
+                                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                        "retrieval-drive",
+                                        &format!("{error:?}"),
+                                    )
+                                    .emit();
+                                }
+                                eliotd::reactive_feed::RetrievalDriveOutcome::Admitted { .. }
+                                | eliotd::reactive_feed::RetrievalDriveOutcome::Pending { .. }
+                                | eliotd::reactive_feed::RetrievalDriveOutcome::RefreshRequired => {
+                                }
+                            }
+                            // O1 scope-attach trigger (issue #1787): one
+                            // evaluation per activation completion over the
+                            // explicit attach ingress. The ingress arrives
+                            // over the authenticated-ingress transport
+                            // (Kernel/protocol owners); until it lands the
+                            // trigger idles as Pending naming it. Trigger
+                            // outcomes never fail this activation loop.
+                            match eliotd::attempt_execution_chain::drive_scope_attach_trigger(
+                                kernel.as_ref(),
+                                composition.as_ref(),
+                                None,
+                            ) {
+                                eliotd::attempt_execution_chain::ScopeAttachDriveOutcome::Failed(
+                                    error,
+                                ) => {
+                                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                        "scope-attach-trigger",
+                                        &error.to_string(),
+                                    )
+                                    .emit();
+                                }
+                                eliotd::attempt_execution_chain::ScopeAttachDriveOutcome::Attached {
+                                    ..
+                                }
+                                | eliotd::attempt_execution_chain::ScopeAttachDriveOutcome::Pending {
+                                    ..
+                                } => {}
+                            }
                             flight = ActivationFlight::Idle;
                         }
                         Err(ActivationDispatchError::Hard(error)) => return Err(error),

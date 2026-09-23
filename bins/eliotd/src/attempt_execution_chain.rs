@@ -43,8 +43,6 @@
 //! triple — no other runtime join may invoke the supplier path, and no
 //! speculative loop is wired here.
 
-use std::path::PathBuf;
-
 use eliot_agent_api::{
     AgentLaunchRequest, AuthorityEnvelope, ExecutionUnit, NativeSession, ProviderExecutionBinding,
     RequestId, RouteFingerprint,
@@ -150,14 +148,6 @@ pub enum ExecutionChainError {
     /// disposition.
     #[error("retained Governor resolution fails its integrity validation")]
     RetainedResolutionInvalid,
-    /// The explicit session-attach payload is refused before observation:
-    /// blank/control-bearing refs or a non-absolute root. The activation
-    /// ticket is correlation-only and never authenticates an attach.
-    #[error("explicit session-attach payload refused: {reason}")]
-    AttachPayloadRefused {
-        /// Static refusal reason naming the exact failed shape check.
-        reason: &'static str,
-    },
     /// The adapter supplier rejected the bind inputs.
     #[error("execution-unit supplier rejected: {0}")]
     Supplier(#[from] CodexAdapterError),
@@ -962,10 +952,9 @@ fn check_activation_admission(
 /// read only from owner signals (the task record's `is_active`, record and
 /// resolution fence agreement), never inferred.
 ///
-/// Retrieval-join caller obligations (issue #1947; O1 binds these for the
-/// retrieval drive once root serializes the supplier modules — donor
-/// `work/1947-owner-warning-revision @ 0f9b456b` is read-only assessment,
-/// never imported). Against the exact callee
+/// Retrieval-join caller obligations (issue #1947; the live drive is
+/// [`crate::reactive_feed::drive_retrieval_once`], reconciled with the Read
+/// supplier modules in-candidate). Against the exact callee
 /// `eliot-context-admission/src/lib.rs::admit_context_traced[_with_warnings]`
 /// the drive must: resolve the plan through the retrieval-plan compiler
 /// (`eliot-reactive-context-plan/src/compiler.rs::compile_retrieval_plan`)
@@ -982,9 +971,11 @@ fn check_activation_admission(
 /// staleness, capacity pressure, suppression, and warning text only from
 /// the trace fields (`MaterialRankTrace::{staleness, capacity_constrained,
 /// suppression_reason, warning}`), never reclassifying the outcome; and
-/// thread warnings only as owner-minted `SuppliedWarning{atom_id, text}`
-/// records (Governor risk, conflict-analysis, or projection owners —
-/// warning minting is M1-owned), never synthesized at the call site.
+/// thread warnings only as derived (`derive_input_warnings`:
+/// candidate-owned epistemic qualifications) plus owner-minted
+/// `SuppliedWarning` records (projection owners and successors) — warning
+/// text is never synthesized at the call site, and Governor risk tiers
+/// never authorise warnings (risk evidence stays factual and separate).
 ///
 /// Execution-path revision precondition (M1-owned join keys): the retained
 /// triple's task/plan revision TEXT stays observed-only here because fence
@@ -1096,147 +1087,154 @@ pub fn poll_governed_dispatch(
 }
 
 // ---------------------------------------------------------------------------
-// Explicit session-attach trigger: authenticated root/session payload,
-// mechanical root observation, and the proposed WorkScope admission call
-// (issue #1787; O1 owns this daemon trigger ingress only).
+// Explicit session-attach trigger drive: session-proofed ingress bundle →
+// live observation → owning attach admission, once per trigger (issue #1787;
+// O1 owns this daemon trigger drive only).
 // ---------------------------------------------------------------------------
 
-/// Bound for attach-payload free-text refs. Matches the activation-result
-/// wire text bound (512); the attach IPC owners may tighten it when the
-/// ingress transport lands.
-const ATTACH_REF_MAX_BYTES: usize = 512;
-
-/// Explicit authenticated root/session attach payload for the scope-attach
-/// trigger (issue #1787).
+/// Session-proofed scope-attach trigger bundle for one attach attempt.
 ///
-/// O1-owned ingress shape. Every field is caller-explicit: the workspace
-/// root under attach, the handshake-bound session, the explicit root
-/// authorization reference, and the caller correlation for the attach
-/// receipt. Nothing is inferred from the activation ticket (correlation-only
-/// by contract), from cwd/proximity/recency, or from a live
-/// composition-method's mere existence. The admission fence and the retained
-/// descriptor/owner are read live at trigger time, never carried here.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionAttachPayload {
-    /// Explicit workspace root under attach. Must be absolute; mechanical
-    /// observability (exists, is a directory) is checked at authentication.
-    pub explicit_root: PathBuf,
-    /// Handshake-bound session this attach serves. Must equal the live
-    /// Kernel owner session; the principal half stays with the Kernel owner.
+/// O1-owned intake composing the WorkScope-owned ingress arguments with the
+/// daemon-live session proof the ingress shape does not carry: `ingress` is
+/// the exact nine-field
+/// [`ScopeAttachIngress`](crate::task_binding_admission::ScopeAttachIngress)
+/// the onboarding caller built from its retained leases (explicit root,
+/// per-attempt receipt identity, retained descriptor, trigger-authenticated
+/// authorization reference, admitted privacy class, source generation,
+/// governing sources, privacy boundary, caller-sequenced owner revision);
+/// `session` is the handshake-bound session this attach serves, proved
+/// against the live Kernel owner session below — never inferred from the
+/// activation ticket (correlation-only by contract), from cwd/proximity/
+/// recency, or from a live composition-method's mere existence. The
+/// admission fence is read live at trigger time, never carried.
+#[derive(Clone, Debug)]
+pub struct SessionAttachTrigger {
+    /// Handshake-bound session this attach serves.
     pub session: SessionId,
-    /// Explicit root authorization reference. Bounded text; names the
-    /// root-authorized ingress authorization, never the ticket.
-    pub authorizing_ref: String,
-    /// Caller correlation for the attach receipt. Bounded text; correlation
-    /// only, never authority — the receipt itself is owner-issued.
-    pub receipt_ref: String,
+    /// Onboarding-caller-built attach ingress arguments.
+    pub ingress: crate::task_binding_admission::ScopeAttachIngress,
 }
 
-/// An attach payload authenticated against live owners and ready to observe.
-///
-/// Carries only values checked live at trigger time: the explicit root
-/// (absolute, mechanically observable directory), the live-matched session,
-/// the bounded refs, and the exact admission fence the observation must
-/// derive under. The retained descriptor/owner and policy inputs are NOT
-/// carried: the owning admit entry reads them itself.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthenticatedSessionAttach {
-    /// Authenticated explicit workspace root.
-    pub explicit_root: PathBuf,
-    /// Live-matched handshake-bound session.
-    pub session: SessionId,
-    /// Bounded explicit authorization reference, carried through to admit.
-    pub authorizing_ref: String,
-    /// Bounded caller correlation, carried through to receipt production.
-    pub receipt_ref: String,
-    /// Exact admission fence the observation derives under.
-    pub fence: StateFence,
+/// Outcome of one scope-attach trigger evaluation: attached with the
+/// verbatim receipt plus admitted owner, pended with the exact missing
+/// ingress, or failed with identities preserved. Debug-only: the `Failed`
+/// payload carries owner errors without clone/equality semantics.
+#[derive(Debug)]
+pub enum ScopeAttachDriveOutcome {
+    /// The attach admitted with the owner-issued receipt and admitted
+    /// owner bound verbatim, cleared for retention alongside the
+    /// authorization evidence.
+    Attached {
+        /// Owner-issued attach receipt binding the observed instance.
+        receipt: eliot_governor::ScopeRelocationOrAttachReceipt,
+        /// Admitted scope owner under the fresh MATCHED closure.
+        owner: eliot_governor::WorkScopeBindingOwner,
+    },
+    /// No attach: the authenticated ingress is absent (normal idle, never
+    /// an error) with the exact missing producer named.
+    Pending {
+        /// Missing-ingress inventory.
+        missing: Vec<MissingOwner>,
+    },
+    /// An ingress, observation, or admission refusal with identities
+    /// preserved, never collapsed into pending. Never fails the activation
+    /// loop that hosts this drive.
+    Failed(ExecutionChainError),
 }
 
-fn attach_ref_valid(value: &str) -> bool {
-    !value.is_empty()
-        && value.trim() == value
-        && !value.chars().any(char::is_control)
-        && value.len() <= ATTACH_REF_MAX_BYTES
-}
-
-/// Authenticate one explicit session-attach payload against live owners.
+/// Drive one scope-attach trigger evaluation over an explicit bundle.
 ///
-/// Order: bounded-text shape on both refs; explicit-root absoluteness plus
-/// a thin mechanical observability check (exists, is a directory — symlinked
-/// roots are refused rather than traversed; full workspace observation
-/// belongs to the WorkScope owner at admit time); live Kernel owner session
-/// agreement (an absent handshake fails closed, and the activation ticket is
-/// never consulted); live Kernel/Governor fence agreement under
-/// [`fences_match_exact`]. The returned value is ready to observe at `fence`
-/// generation. Pure except for the one filesystem metadata read; mutates
-/// nothing.
-///
-/// Proposed complete path (WorkScope child owns the callee; O1 proposes, never
-/// seizes): `AuthenticatedSessionAttach` → WorkScope-owner mechanical
-/// observation of `explicit_root` at `fence.resource_generation` →
-/// `GovernorComposition::admit_observed_scope_attach(receipt_ref,
-/// observed, descriptor, authorizing_ref, privacy_class,
-/// governing_source_generation, sources, privacy, owner_revision)` at
-/// `crates/governor/eliot-governor/src/composition.rs` (WorkScope child
-/// `5ea54bf8`, not live) → `admit_scope_relocation` rebind with a fresh
-/// `MATCHED` source closure → receipt plus admitted owner retained alongside
-/// the authorization evidence. The daemon run-loop arm for this trigger
-/// (session-attach / first-tool-event / root-change ingress, pending on the
-/// authenticated-ingress transport owned by the Kernel/protocol owners) is
-/// likewise proposed, not built: no producer exists yet, and an arm polling
-/// a hardcoded-None source would be interface-only. CLI stays
-/// authority-free: the CLI scope-observe ingress derives the same
-/// observation shape as evidence only.
-pub fn authenticate_session_attach(
+/// Evaluated in the daemon binary flow (see the run-loop dispatch arm): an
+/// absent trigger idles as [`Pending`](ScopeAttachDriveOutcome::Pending)
+/// naming the ingress transport; otherwise the ingress shape validates
+/// through its owner, the session agrees with the live Kernel owner
+/// session, the live fences agree, the explicit root observes mechanically
+/// and derives at the admission fence generation, and the owning attach
+/// entry admits with a fresh MATCHED source closure, binding receipt plus
+/// admitted owner verbatim. A symlinked explicit root is refused upstream
+/// by the mechanical observation (never traversed); TOCTOU between
+/// observation and admission is inherent and closed by the admit entry's
+/// fresh closure check before anything rebinds. Mutates nothing itself —
+/// the only mutation is the owner's rebinding inside the admit entry.
+pub fn drive_scope_attach_trigger(
     kernel: &DaemonKernelClient,
     composition: &DaemonComposition,
-    payload: SessionAttachPayload,
-) -> Result<AuthenticatedSessionAttach, ExecutionChainError> {
-    if !attach_ref_valid(&payload.authorizing_ref) {
-        return Err(ExecutionChainError::AttachPayloadRefused {
-            reason: "authorizing_ref must be bounded non-blank text without control characters",
+    trigger: Option<SessionAttachTrigger>,
+) -> ScopeAttachDriveOutcome {
+    let _span = tracing::info_span!("eliotd.scope_attach_trigger_poll").entered();
+    let Some(trigger) = trigger else {
+        return ScopeAttachDriveOutcome::Pending {
+            missing: vec![MissingOwner {
+                owner: "attach ingress transport",
+                artifact: "SessionAttachTrigger",
+                absent_read: "no authenticated attach ingress delivered; the onboarding caller packages ScopeAttachIngress over the Kernel/protocol authenticated ingress (proposed, bins/eliotd/src/task_binding_admission.rs)",
+            }],
+        };
+    };
+    if let Err(error) = trigger.ingress.validate() {
+        return ScopeAttachDriveOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+            owner: "scope-attach ingress",
+            reason: error.to_string(),
         });
     }
-    if !attach_ref_valid(&payload.receipt_ref) {
-        return Err(ExecutionChainError::AttachPayloadRefused {
-            reason: "receipt_ref must be bounded non-blank text without control characters",
-        });
-    }
-    if !payload.explicit_root.is_absolute() {
-        return Err(ExecutionChainError::AttachPayloadRefused {
-            reason: "explicit root must be absolute",
-        });
-    }
-    // Thin mechanical check only: existence plus directory-ness through the
-    // link itself, never traversed. TOCTOU between this read and admission
-    // is inherent; the owning admit entry re-verifies with a fresh MATCHED
-    // source closure before anything rebinds.
-    let root_observable = std::fs::symlink_metadata(&payload.explicit_root)
-        .map(|metadata| metadata.is_dir())
-        .unwrap_or(false);
-    if !root_observable {
-        return Err(ExecutionChainError::AttachPayloadRefused {
-            reason: "explicit root is not a mechanically observable directory",
-        });
-    }
-    let live_session = supply_owner_session(kernel)?;
-    if payload.session != live_session {
-        return Err(ExecutionChainError::LiveAttachMismatch {
+    let live_session = match supply_owner_session(kernel) {
+        Ok(session) => session,
+        Err(error) => return ScopeAttachDriveOutcome::Failed(error),
+    };
+    if trigger.session != live_session {
+        return ScopeAttachDriveOutcome::Failed(ExecutionChainError::LiveAttachMismatch {
             field: "attach.session",
         });
     }
     let live_fence = supply_live_kernel_fence(kernel);
     let governor_fence = supply_governor_fence(composition);
     if !fences_match_exact(&live_fence, &governor_fence) {
-        return Err(ExecutionChainError::StaleAdmissionFence);
+        return ScopeAttachDriveOutcome::Failed(ExecutionChainError::StaleAdmissionFence);
     }
-    Ok(AuthenticatedSessionAttach {
-        explicit_root: payload.explicit_root,
-        session: live_session,
-        authorizing_ref: payload.authorizing_ref,
-        receipt_ref: payload.receipt_ref,
-        fence: live_fence,
-    })
+    let facts = match eliot_bootstrap::capture::observe_workspace_instance(
+        &trigger.ingress.explicit_root,
+    ) {
+        Ok(facts) => facts,
+        Err(error) => {
+            return ScopeAttachDriveOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                owner: "workspace observation",
+                reason: error.to_string(),
+            });
+        }
+    };
+    let observed = match eliot_governor::derive_observed_resources(
+        &facts,
+        live_fence.resource_generation,
+        None,
+    ) {
+        Ok(observed) => observed,
+        Err(error) => {
+            return ScopeAttachDriveOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                owner: "scope observation derivation",
+                reason: error.to_string(),
+            });
+        }
+    };
+    let ingress = trigger.ingress;
+    match composition.admit_observed_scope_attach(
+        &ingress.receipt_ref,
+        &observed,
+        &ingress.descriptor,
+        &ingress.authorizing_ref,
+        ingress.privacy_class,
+        ingress.governing_source_generation,
+        &ingress.sources,
+        &ingress.privacy,
+        ingress.owner_revision,
+    ) {
+        Ok((receipt, owner)) => {
+            tracing::info!("scope attach admitted with owner-issued receipt");
+            ScopeAttachDriveOutcome::Attached { receipt, owner }
+        }
+        Err(error) => ScopeAttachDriveOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+            owner: "Governor scope attach admission",
+            reason: error.to_string(),
+        }),
+    }
 }
 

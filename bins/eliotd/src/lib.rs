@@ -59,6 +59,7 @@ mod kernel_transition_client;
 pub mod notification_board_attach;
 mod observation_adapters;
 mod process_origin;
+pub mod reactive_feed;
 mod route_receipts;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -1045,6 +1046,59 @@ impl DaemonComposition {
         Ok(task_lifecycle_adapters::ForwardingTaskLifecycle::new(
             self.governor.task_lifecycle(),
         ))
+    }
+
+    /// Admits one observed workspace attach through the Governor scope owner
+    /// (issue #1787, O1 trigger caller).
+    ///
+    /// Thin forwarder over
+    /// [`GovernorComposition::admit_observed_scope_attach`](eliot_governor::GovernorComposition::admit_observed_scope_attach):
+    /// readiness is checked first so callers observe the entry only on the
+    /// admitted path, then every argument crosses verbatim — the owner reads
+    /// its retained descriptor/owner itself, produces the attach receipt,
+    /// and rebinds under a fresh `MATCHED` source closure. No observation,
+    /// receipt, or binding logic lives here; failures leave retained state
+    /// untouched in the owner. Callers take the observation from live
+    /// mechanical reads per call so a Governor refresh surfaces as an exact
+    /// mismatch instead of silent divergence.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "forwarder mirrors the owning attach entry argument-for-argument"
+    )]
+    pub fn admit_observed_scope_attach(
+        &self,
+        receipt_ref: &str,
+        observed: &eliot_workscope::ObservedScopeResources,
+        descriptor: &eliot_governor::WorkScopeDescriptor,
+        authorizing_ref: &str,
+        privacy_class: eliot_security_contracts::PrivacyClass,
+        governing_source_generation: u64,
+        sources: &eliot_governor::GoverningSourceSet,
+        privacy: &eliot_governor::PrivacyProfile,
+        owner_revision: u64,
+    ) -> Result<
+        (
+            eliot_governor::ScopeRelocationOrAttachReceipt,
+            eliot_governor::WorkScopeBindingOwner,
+        ),
+        DaemonError,
+    > {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(self.governor.admit_observed_scope_attach(
+            receipt_ref,
+            observed,
+            descriptor,
+            authorizing_ref,
+            privacy_class,
+            governing_source_generation,
+            sources,
+            privacy,
+            owner_revision,
+        )?)
     }
 
     /// Borrows the single Governor Skill lifecycle owner as the provider-neutral
