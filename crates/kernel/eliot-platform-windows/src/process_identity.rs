@@ -96,6 +96,53 @@ pub(crate) fn file_identity(_path: &Path) -> std::io::Result<FileIdentity> {
     Err(std::io::Error::other("Windows identity unavailable"))
 }
 
+/// Returns the stable identity of one existing directory without following
+/// a reparse point (issue #958, ported from lane E `050cad75` with
+/// attribution; mirrors the `file_identity_for_path` precedent).
+///
+/// The directory opens with backup semantics for identity reads only; the
+/// returned identity belongs to the opened handle, never to a pathname
+/// metadata query. Handles are never retained: callers that need a pinned
+/// protected-path contour use the protected-path owner, not this observer.
+///
+/// # Errors
+///
+/// Returns an error when the path is relative, missing, not a plain
+/// directory, a reparse point, or its stable identity cannot be read — and
+/// on non-Windows targets, where directory identity is unavailable.
+#[cfg(windows)]
+pub fn directory_identity_for_path(path: &Path) -> std::io::Result<FileIdentity> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    if !path.is_absolute() {
+        return Err(std::io::Error::other(
+            "directory identity requires an absolute path",
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other(
+            "identity target is not a plain directory",
+        ));
+    }
+    file_identity_from_handle(&file)
+}
+
+#[cfg(not(windows))]
+pub fn directory_identity_for_path(_path: &Path) -> std::io::Result<FileIdentity> {
+    Err(std::io::Error::other(
+        "Windows directory identity unavailable",
+    ))
+}
+
 #[cfg(windows)]
 pub(crate) fn file_identity_from_handle(file: &std::fs::File) -> std::io::Result<FileIdentity> {
     use std::os::windows::io::AsRawHandle;

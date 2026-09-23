@@ -23,6 +23,9 @@ use persistence_models::{
     DurableOperationalRecord, DurableSupervisionLeaseResult, OperationalKind, ScopeReservationHead,
 };
 
+#[path = "store/restore_journal.rs"]
+mod restore_journal;
+
 mod recovery_projection;
 
 use crate::cutover_ownership::{
