@@ -144,6 +144,7 @@ pub mod reactive_restore_serve;
 mod runtime_identity;
 mod shutdown_drain;
 mod startup_coordinator;
+mod wasm_runtime_port_grant;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
@@ -362,6 +363,16 @@ use eliot_store_api::{
 pub use generation_control::ActiveGenerationRegistryProjection;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+/// WASM runtime port-grant seam for the front-door dispatch arm (#1780).
+///
+/// The dispatch arm (`frame_dispatch`) admits through this closed grant
+/// constructor; bundle publication and launch composition live in
+/// `daemon_request_dispatch`. The grant attests transport + freshness only
+/// and issues no permits, Governor observations, or keys.
+pub use wasm_runtime_port_grant::{
+    HostBinaryFacts, KernelObservedGrantFacts, WASM_PORT_GRANT_OPERATION, WasmGrantRequest,
+    WasmPortGrant, handle_wasm_port_grant, issue_wasm_port_grant, validate_wasm_port_grant,
+};
 
 #[cfg(all(test, windows))]
 use canonical_store_runtime::attach_then_retain_canonical_store;
@@ -460,6 +471,12 @@ pub struct KernelComposition {
     daemon_active_launch: Mutex<Option<EliotdLaunchDescriptor>>,
     kernel_artifact_sha256: Option<String>,
     eliotd_descriptor_artifact_sha256: Option<String>,
+    /// Host-approved WASM-host executable path retained for the grant-arm
+    /// host-facts call-in (#1780). `None` fails that arm closed; the live
+    /// image digest is re-proved at launch, never cached as authority here.
+    wasm_host_executable_path: Option<PathBuf>,
+    /// Digest bound to `wasm_host_executable_path`, validated at assembly.
+    wasm_host_artifact_sha256: Option<String>,
     daemon_runtime: Mutex<DaemonRuntimeState>,
     daemon_status_changed: tokio::sync::Notify,
     #[cfg(windows)]

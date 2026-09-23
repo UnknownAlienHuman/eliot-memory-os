@@ -375,6 +375,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_host_request_cancel" => "agent_host_request_cancel",
         "publish_owner_bundle" => "publish_owner_bundle",
         "query_owner_bundle" => "query_owner_bundle",
+        "publish_wasm_dispatch_bundle" => "publish_wasm_dispatch_bundle",
+        "bind_notify_launch_grant" => "bind_notify_launch_grant",
         "agent_host_request_reconcile" => "agent_host_request_reconcile",
         "agent_host_request_rehydrate" => "agent_host_request_rehydrate",
         _ => "untrusted_operation",
@@ -420,6 +422,59 @@ struct StoreRecoveryOperation {
 struct OwnerPublishOperation {
     bundle: super::GovernorClosureRestore,
     expected_revision: u64,
+}
+
+/// Canonical installed WASM-host image filename pinned by the
+/// installer-owned binding chain. Mirrors the `eliot-wasm-host.exe` pin the
+/// installation descriptor validates before releasing its
+/// `wasm_host_artifact_binding()`: any divergence fails closed here, the
+/// same way `bind_notify_launch_grant` pins its own canonical image name.
+const WASM_HOST_IMAGE_FILE_NAME: &str = "eliot-wasm-host.exe";
+
+/// Closed owner-side WASM dispatch publication (`#1780` D4a, `#1955`).
+///
+/// Carries the installation-observed host binding (path + digest, re-hashed
+/// against real file bytes before publication — never trusted from config)
+/// plus every admitted owner record and the exact guest bytes to stage. The
+/// install directory derives as the host path's parent, never from a caller
+/// string. Unknown fields fail closed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WasmDispatchBundleOperation {
+    host_executable_path: String,
+    host_artifact_digest: String,
+    claim_id: String,
+    operation_id: String,
+    generation: u64,
+    authority_epoch: eliot_contracts::EpochId,
+    launch_nonce: String,
+    admitted_at_unix_ms: u64,
+    identity_digest: String,
+    guest: eliot_kernel_service::WasmGuestCeilings,
+    profile: String,
+    manifest: eliot_kernel_service::WasmManifestRecord,
+    work: eliot_kernel_service::WasmWorkRecord,
+    assurance: eliot_kernel_service::WasmAssuranceRecord,
+    promotion: eliot_kernel_service::WasmPromotionRecord,
+    snapshot: eliot_kernel_service::WasmSnapshotRecord,
+    prior_conformance_artifact: Option<String>,
+    artifact_bytes: Vec<u8>,
+    input_bytes: Vec<u8>,
+}
+
+/// Closed normal Notify launch-grant request (`#1780` D4b).
+///
+/// Carries the canonical notification reference plus the installer-observed
+/// launch artifact (path + digest, re-hashed against real file bytes before
+/// binding). Session evidence is threaded from the live authenticated
+/// session, never from the payload. Unknown fields fail closed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotifyLaunchGrantOperation {
+    notification_id: String,
+    notification_digest: String,
+    executable_path: String,
+    artifact_digest: String,
 }
 
 /// Checks every admitted binding in the bundle against the authenticated
@@ -1035,6 +1090,12 @@ impl KernelComposition {
                         "digest": digest,
                     },
                 }))
+            }
+            "publish_wasm_dispatch_bundle" => {
+                self.wasm_dispatch_bundle_operation(session, payload.clone())
+            }
+            "bind_notify_launch_grant" => {
+                self.notify_launch_grant_operation(session, payload.clone())
             }
             _ => return Err(TransportError::SessionFenced),
         };
@@ -2585,6 +2646,231 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         let _ = payload;
         Err(TransportError::SessionFenced)
+    }
+
+    /// Publishes one owner-side WASM dispatch bundle on the admitted path
+    /// (`#1780` D4a, `#1955`): the production caller of
+    /// `eliot_kernel_service::publish_wasm_dispatch_bundle`.
+    ///
+    /// The `WasmOwnerClaim` is built from admitted owner material carried in
+    /// the closed payload; guest/input digests re-hash against those exact
+    /// bytes inside the publisher. Host facts arrive as presented evidence
+    /// and are proven here, not trusted: the path must be absolute and name
+    /// the installer-pinned image, and the real file bytes must re-hash to
+    /// the presented digest. (`eliot-installation` is not a dependency of
+    /// this composition root, so the validated
+    /// `wasm_host_artifact_binding()` accessor cannot be called here; the
+    /// path pin plus byte re-hash is the fail-closed equivalent — the same
+    /// proof the P03 executor repeats at launch.) The install directory is
+    /// the host path's parent, never a caller string. Publication requires
+    /// a fence-bound session on a Ready, unfenced Kernel; the claim and its
+    /// snapshot must speak for this session's authority at this generation.
+    /// The computed one-shot join gate is projected into the receipt so the
+    /// live join table can close over it; no second registry is retained
+    /// here.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the admitted-path bundle publication keeps decode, fence/ready/claim/snapshot gates, host re-hash, publish, and receipt projection in one audited order"
+    )]
+    fn wasm_dispatch_bundle_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: WasmDispatchBundleOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        // Guest byte vectors must each fit one transport frame
+        // (`eliot_protocol::MAX_FRAME_BYTES`): anything larger could not
+        // have arrived intact, and unbounded staging buffers are refused.
+        if operation.artifact_bytes.is_empty()
+            || operation.input_bytes.is_empty()
+            || operation.artifact_bytes.len() > eliot_protocol::MAX_FRAME_BYTES
+            || operation.input_bytes.len() > eliot_protocol::MAX_FRAME_BYTES
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        // Live session fence first: the presenting session must itself be
+        // exactly fence-bound before any owner material is honored.
+        validate_store_session_fence(session, &session.module_generation.state_fence)?;
+        // Ready/unfenced Kernel admission: publication is normal work, never
+        // fenced-drive output.
+        {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if service.state() != KernelServiceState::Ready || service.generation_fenced() {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        // Claim-to-session binding: admitted owner material must describe
+        // authority this session fences, at this generation.
+        if !operation
+            .authority_epoch
+            .is_same_authority(&session.authority_epoch)
+            || operation.generation != session.module_generation.generation.value()
+            || operation.generation == 0
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        // Snapshot-to-claim binding: the owner-attested snapshot must speak
+        // for the same authority and generation the grant funds. (Record
+        // shape is the publisher's; the child re-derives every fence from
+        // the grant.)
+        if !operation
+            .snapshot
+            .authority_epoch
+            .is_same_authority(&operation.authority_epoch)
+            || operation.snapshot.generation != operation.generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let host_executable_path = operation.host_executable_path.clone();
+        let host_artifact_digest = operation.host_artifact_digest.clone();
+        // Installation-observed host binding: absolute path, canonical image
+        // name (the installer's pin), then re-hash of the real file bytes
+        // against the presented digest. A missing, renamed, or re-written
+        // image fails closed here, never inside the publisher.
+        let host_path = std::path::Path::new(host_executable_path.as_str());
+        if !host_path.is_absolute()
+            || host_path.file_name().and_then(|name| name.to_str())
+                != Some(WASM_HOST_IMAGE_FILE_NAME)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let install_dir = host_path.parent().ok_or(TransportError::SessionFenced)?;
+        let observed_host_bytes =
+            std::fs::read(host_path).map_err(|_| TransportError::SessionFenced)?;
+        if sha256_hex(&observed_host_bytes) != host_artifact_digest {
+            return Err(TransportError::SessionFenced);
+        }
+        let claim = eliot_kernel_service::WasmOwnerClaim {
+            claim_id: operation.claim_id,
+            operation_id: operation.operation_id,
+            generation: operation.generation,
+            authority_epoch: operation.authority_epoch,
+            launch_nonce: operation.launch_nonce,
+            admitted_at_unix_ms: operation.admitted_at_unix_ms,
+            identity_digest: operation.identity_digest,
+            guest: operation.guest,
+            profile: operation.profile,
+            manifest: operation.manifest,
+            work: operation.work,
+            assurance: operation.assurance,
+            promotion: operation.promotion,
+            snapshot: operation.snapshot,
+            prior_conformance_artifact: operation.prior_conformance_artifact,
+            artifact_bytes: operation.artifact_bytes,
+            input_bytes: operation.input_bytes,
+        };
+        let mut joins = eliot_kernel_service::WasmJoinTable::default();
+        let bundle = eliot_kernel_service::publish_wasm_dispatch_bundle(
+            host_executable_path.as_str(),
+            host_artifact_digest.as_str(),
+            install_dir,
+            &claim,
+            &mut joins,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let material_digest = sha256_hex(
+            &eliot_kernel_service::material_bytes(&bundle.material)
+                .map_err(|_| TransportError::SessionFenced)?,
+        );
+        Ok(serde_json::json!({
+            "kind": "wasm_dispatch_bundle_receipt",
+            "value": {
+                "claim_id": bundle.material.claim_id,
+                "operation_id": bundle.material.operation_id,
+                "grant_digest": bundle.material.grant.grant_digest,
+                "invocation_digest": bundle.join.invocation_digest,
+                "expires_at": bundle.join.expires_at,
+                "material_digest": material_digest,
+                "material_path": bundle.material_path.to_string_lossy(),
+                "artifact_path": bundle.artifact_path.to_string_lossy(),
+                "input_path": bundle.input_path.to_string_lossy(),
+            },
+        }))
+    }
+
+    /// Binds one normal Notify launch grant on the admitted path (`#1780`
+    /// D4b): the production caller of
+    /// `eliot_kernel_service::bind_notify_launch_grant`, the
+    /// minter-to-durable-state + ApprovedLaunch invocation.
+    ///
+    /// The canonical notification reference and the installer-observed
+    /// launch artifact arrive as closed payload evidence; the artifact
+    /// digest is proven here by re-hashing the real installed bytes (the
+    /// binder checks shape, this dispatch proves bytes). Session evidence
+    /// is threaded from the live authenticated session — connection, exact
+    /// epoch, exact fence — never from the payload. Ready state, unfenced
+    /// generation, and exact epoch/fence currency are enforced inside the
+    /// binder; any denial fails closed here.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the admitted-path notify grant keeps decode, fence gate, artifact re-hash, session threading, bind, and receipt projection in one audited order"
+    )]
+    fn notify_launch_grant_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: NotifyLaunchGrantOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        validate_store_session_fence(session, &session.module_generation.state_fence)?;
+        // Installer-observed launch artifact first: absolute path plus the
+        // canonical image name (re-checked by the binder), then re-hash of
+        // the real installed bytes against the presented digest.
+        let executable_path = std::path::Path::new(operation.executable_path.as_str());
+        if !executable_path.is_absolute()
+            || executable_path.file_name().and_then(|name| name.to_str())
+                != Some(eliot_kernel_service::NOTIFY_IMAGE_FILE_NAME)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let observed_bytes =
+            std::fs::read(executable_path).map_err(|_| TransportError::SessionFenced)?;
+        if sha256_hex(&observed_bytes) != operation.artifact_digest {
+            return Err(TransportError::SessionFenced);
+        }
+        // Session evidence threaded from the live authenticated session.
+        // `SessionBinding` lives in `eliot-receipts` (no direct dependency
+        // edge from this composition root under single-file ownership); its
+        // `Deserialize` impl plus struct-field inference carries the exact
+        // evidence type — connection, epoch, fence — without a new
+        // dependency or a caller-asserted session.
+        let session_evidence = serde_json::json!({
+            "session_id": &session.connection_id,
+            "authority_epoch": &session.authority_epoch,
+            "state_fence": &session.module_generation.state_fence,
+        });
+        let session_binding =
+            serde_json::from_value(session_evidence).map_err(|_| TransportError::SessionFenced)?;
+        let inputs = eliot_kernel_service::NotifyGrantInputs {
+            notification_id: operation.notification_id,
+            notification_digest: operation.notification_digest,
+            executable_path: operation.executable_path,
+            artifact_digest: operation.artifact_digest,
+            session: session_binding,
+        };
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let authorization = eliot_kernel_service::bind_notify_launch_grant(&service, &inputs)
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "kind": "notify_launch_grant",
+            "value": {
+                "operation_id": authorization.operation_id(),
+                "notification_id": authorization.notification_id(),
+                "notification_digest": authorization.notification_digest(),
+                "executable_path": authorization.executable_path(),
+                "artifact_digest": authorization.artifact_digest(),
+                "generation": authorization.generation().value(),
+                "authority_epoch": authorization.authority_epoch(),
+                "state_fence": authorization.state_fence(),
+            },
+        }))
     }
 
     #[cfg(windows)]
