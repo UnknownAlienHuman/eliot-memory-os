@@ -144,6 +144,22 @@ impl KernelContextReadClient {
                 Self::check_reconstruction_capability(request)
             }
             NamedReadOperation::GetNotificationState => Self::check_notification_selectors(request),
+            NamedReadOperation::GetAuditRange => {
+                if request.scope_id.is_some() {
+                    return Err(StoreError::InvalidField {
+                        field: "scope_id",
+                        reason: "GetAuditRange is scope-free; scope filtering stays consumer-owned",
+                    });
+                }
+                if !request.parameters.is_empty() {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.parameters",
+                        reason: "GetAuditRange takes no parameters",
+                    });
+                }
+                request.validate()?;
+                Ok(())
+            }
             NamedReadOperation::GetCurrentEpistemicPosition => {
                 if request.scope_id.is_none() {
                     return Err(StoreError::InvalidField {
