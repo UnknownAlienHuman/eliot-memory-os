@@ -2228,8 +2228,8 @@ mod concurrent_allocation_tests {
 
         use super::super::{
             apply_prepared_with_authority, apply_prepared_without_write_guard, atomic_write,
-            build_receipt, client, read_fence, surreal_automation, surreal_reactive,
-            validate_receipt_identity,
+            build_receipt, client, read_fence, surreal_automation, surreal_experience,
+            surreal_reactive, validate_receipt_identity,
         };
         use crate::client::session_pool::SessionRole;
         use crate::config::{ClientSetLimits, SurrealAdapterConfig};
