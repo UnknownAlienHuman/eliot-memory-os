@@ -40,8 +40,8 @@ use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness, ProviderC
 use eliot_experience_provider::{
     BankShapeInputs, ExperienceView, FeedbackShapeInputs, JournalShapeOutput, ProduceJournalInputs,
     ProviderError, RetentionContext, SelfQualityInputs, SelfQualityRecheckInputs, WithheldMember,
-    assess_and_recheck, produce_journal_read, produce_memory_quality,
-    produce_understanding_assessment,
+    assess_and_recheck, produce_common_ground_assessment, produce_journal_read,
+    produce_memory_quality, produce_understanding_assessment,
 };
 use eliot_learning_contracts::HarnessActivationReceiptCandidate;
 use eliot_memory_quality::{MemoryEcologyAssessment, QualityRequest};
@@ -57,8 +57,8 @@ use eliot_observation_contracts::{
     ObservationScope, ProjectionCoverage, ProjectionOmission, RetentionHold, RetentionSchedule,
 };
 use eliot_understanding_assessment::{
-    AssessmentClosure, AssessmentScope, EvidenceCite, ExperienceEvidence, OwnerContext,
-    ScopedUnderstandingAssessment,
+    AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
+    ExperienceEvidence, OwnerContext, ScopedUnderstandingAssessment,
 };
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
@@ -301,6 +301,40 @@ pub struct UnderstandingEventInputs<'a> {
     pub product_claims: bool,
 }
 
+/// Common-ground leg inputs: everything except outcome-side experience.
+///
+/// Same binding rule as [`UnderstandingEventInputs`]: the entry binds
+/// outcome-side experience evidence from its own live envelopes; all
+/// other inputs arrive edge-supplied from their owners.
+pub struct CommonGroundEventInputs<'a> {
+    /// Already-compiled understanding view, by handle (edge-supplied).
+    pub view: &'a ActiveUnderstandingView,
+    /// Accepted-source projection for citation checks (edge-supplied).
+    pub sources: &'a AcceptedSourceProjection,
+    /// Optional admitted epistemic contribution, echoed by digest/claim.
+    pub contribution: Option<&'a ProviderContribution>,
+    /// Denominator anchor.
+    pub scope: AssessmentScope,
+    /// Terminology compatibility cites.
+    pub terminology: Vec<EvidenceCite>,
+    /// Reference compatibility cites.
+    pub reference: Vec<EvidenceCite>,
+    /// Commitment compatibility cites.
+    pub commitment: Vec<EvidenceCite>,
+    /// Action-consequence compatibility cites.
+    pub action_consequence: Vec<EvidenceCite>,
+    /// Survival-across-change cites.
+    pub survival: Vec<EvidenceCite>,
+    /// Public inheritance transfer refs.
+    pub transfer_refs: Vec<EvidenceCite>,
+    /// Requalification scope for tacit competence.
+    pub requalification_scope: String,
+    /// Rival/prediction/discriminator/verifier/revision closure.
+    pub closure: AssessmentClosure,
+    /// True when the verdict backs a product claim (held-out required).
+    pub product_claims: bool,
+}
+
 /// The event producer (operator/planner edge, O1 trigger) assembles this
 /// from explicit owner-issued inputs only: bridge scope and position
 /// subject, journal presence inputs, durable bank/feedback documents with
@@ -344,6 +378,9 @@ pub struct ExperienceQualityEvent<'a> {
     /// (edge-supplied owner context minus outcome experience, which the
     /// entry binds from its own live envelopes).
     pub understanding: Option<UnderstandingEventInputs<'a>>,
+    /// Common-ground leg inputs, when the common-ground family runs
+    /// (same outcome-experience binding rule as the scoped leg).
+    pub common_ground: Option<CommonGroundEventInputs<'a>>,
 }
 
 /// Terminal output bundle: frozen candidates plus validated views and gaps.
@@ -364,6 +401,8 @@ pub struct ExperienceQualityEventOutput {
     pub memory_assessment: Option<MemoryEcologyAssessment>,
     /// Scoped understanding assessment, when the understanding family ran.
     pub understanding: Option<ScopedUnderstandingAssessment>,
+    /// Common-ground assessment, when the common-ground family ran.
+    pub common_ground: Option<CommonGroundAssessment>,
 }
 
 /// Terminal event entry: trigger event to reviewed candidate.
@@ -492,14 +531,14 @@ pub async fn run_experience_quality_event(
         Some(request) => Some(produce_memory_quality(request)?),
         None => None,
     };
+    let mut experience = Vec::new();
+    if let Some(journal) = journal_envelope.as_ref() {
+        experience.push(ExperienceEvidence::Journal(journal));
+    }
+    experience.push(ExperienceEvidence::Bank(&bank_live));
+    experience.push(ExperienceEvidence::Feedback(&feedback_live));
     let understanding = match &event.understanding {
         Some(inputs) => {
-            let mut experience = Vec::new();
-            if let Some(journal) = journal_envelope.as_ref() {
-                experience.push(ExperienceEvidence::Journal(journal));
-            }
-            experience.push(ExperienceEvidence::Bank(&bank_live));
-            experience.push(ExperienceEvidence::Feedback(&feedback_live));
             let scoped = eliot_understanding_assessment::ScopedInput {
                 owner: OwnerContext {
                     view: inputs.view,
@@ -521,6 +560,30 @@ pub async fn run_experience_quality_event(
         }
         None => None,
     };
+    let common_ground = match &event.common_ground {
+        Some(inputs) => {
+            let common = CommonGroundInput {
+                owner: OwnerContext {
+                    view: inputs.view,
+                    sources: inputs.sources,
+                    contribution: inputs.contribution,
+                    experience: &experience,
+                },
+                scope: inputs.scope.clone(),
+                terminology: inputs.terminology.clone(),
+                reference: inputs.reference.clone(),
+                commitment: inputs.commitment.clone(),
+                action_consequence: inputs.action_consequence.clone(),
+                survival: inputs.survival.clone(),
+                transfer_refs: inputs.transfer_refs.clone(),
+                requalification_scope: inputs.requalification_scope.clone(),
+                closure: inputs.closure.clone(),
+                product_claims: inputs.product_claims,
+            };
+            Some(produce_common_ground_assessment(common)?)
+        }
+        None => None,
+    };
     Ok(ExperienceQualityEventOutput {
         candidate,
         journal_view,
@@ -530,5 +593,6 @@ pub async fn run_experience_quality_event(
         feedback_withheld: feedback_shaped.withheld,
         memory_assessment,
         understanding,
+        common_ground,
     })
 }

@@ -102,7 +102,8 @@ use eliot_learning_contracts::HarnessActivationReceiptCandidate;
 use eliot_memory_quality::{MemoryEcologyAssessment, QualityRequest, assess_quality};
 use eliot_memory_quality::QualityError as MemoryQualityError;
 use eliot_understanding_assessment::{
-    ScopedInput, ScopedUnderstandingAssessment, assess_scoped,
+    CommonGroundAssessment, CommonGroundInput, ScopedInput, ScopedUnderstandingAssessment,
+    assess_common_ground, assess_scoped,
 };
 use eliot_understanding_assessment::AssessmentError as UnderstandingError;
 use eliot_observation_contracts::{
@@ -909,4 +910,20 @@ pub fn produce_understanding_assessment(
     input: ScopedInput<'_>,
 ) -> Result<ScopedUnderstandingAssessment, ProviderError> {
     assess_scoped(input).map_err(ProviderError::Understanding)
+}
+
+/// Understanding consumer invocation: assess common ground.
+///
+/// Calls the released [`assess_common_ground`](eliot_understanding_assessment::assess_common_ground)
+/// consumer with the edge-supplied common-ground input (owner context
+/// with experience envelopes, scope, per-slot compatibility cites,
+/// requalification scope, closure). Same binding rule as
+/// [`produce_understanding_assessment`]: outcome-side experience
+/// evidence arrives bound by the caller. Terminology, reference,
+/// commitment, action-consequence, survival, and transfer cites stay
+/// caller-supplied; nothing is inferred here.
+pub fn produce_common_ground_assessment(
+    input: CommonGroundInput<'_>,
+) -> Result<CommonGroundAssessment, ProviderError> {
+    assess_common_ground(input).map_err(ProviderError::Understanding)
 }
