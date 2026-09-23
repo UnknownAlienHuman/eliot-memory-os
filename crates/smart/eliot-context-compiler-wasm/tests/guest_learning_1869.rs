@@ -15,7 +15,7 @@ use std::num::NonZeroU64;
 
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_context_compiler_wasm::{
-    GUEST_ABI_VERSION, HANDLER_SUBTYPE, WORLD_NAME, GuestRequest, handle_request_typed,
+    GUEST_ABI_VERSION, GuestRequest, HANDLER_SUBTYPE, WORLD_NAME, handle_request_typed,
 };
 use eliot_context_contracts::*;
 use eliot_contracts::{
@@ -180,6 +180,7 @@ fn measurement(
 
 /// Compact valid input: required floor atom plus marked learning atom plus
 /// the presented tickets. The `task` parameter re-binds coherently.
+#[allow(clippy::too_many_lines)]
 fn input_with_mark(
     task: &str,
     permit_digest: &str,
@@ -357,7 +358,11 @@ fn owner_ticket(fence: &StateFence, overlay: Option<&str>) -> LearningAdmissionT
     .expect("live owner issues")
 }
 
-fn request_for(task: &str, permit_digest: &str, tickets: Vec<LearningAdmissionTicket>) -> GuestRequest {
+fn request_for(
+    task: &str,
+    permit_digest: &str,
+    tickets: Vec<LearningAdmissionTicket>,
+) -> GuestRequest {
     GuestRequest {
         abi_version: GUEST_ABI_VERSION,
         world: WORLD_NAME.to_string(),
@@ -409,18 +414,18 @@ fn tampered_and_transplanted_tickets_refused() {
     // Tampered subject: digest no longer recomputes.
     let mut forged = ticket.clone();
     forged.overlay_id = Some("overlay-forged".to_string());
-    let response =
-        handle_request_typed(&request_for(TASK_1869, &ticket.digest.clone(), vec![forged]));
+    let response = handle_request_typed(&request_for(
+        TASK_1869,
+        &ticket.digest.clone(),
+        vec![forged],
+    ));
     assert_eq!(response.native_calls, 0);
     assert!(response.result.is_none());
 
     // Transplanted issuance: genuine ticket for another overlay.
     let other = owner_ticket(&fence, Some("overlay-other"));
-    let response = handle_request_typed(&request_for(
-        TASK_1869,
-        &other.digest.clone(),
-        vec![other],
-    ));
+    let response =
+        handle_request_typed(&request_for(TASK_1869, &other.digest.clone(), vec![other]));
     assert_eq!(response.native_calls, 0);
     assert!(response.result.is_none());
 }

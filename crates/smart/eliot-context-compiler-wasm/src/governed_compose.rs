@@ -31,18 +31,19 @@
 use crate::conversion::{GuestRequest, GuestResponse};
 use eliot_context_admission::admit_context_with_learning;
 use eliot_context_assembly::{
-    ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view_with_learning,
+    ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy,
+    assemble_active_view_with_learning,
 };
 use eliot_context_contracts::{
     AdmissionInput, AdmissionResult, ContextError, ContextOutcome, ContextRecipe, QualityScorecard,
     SerializedContextMeasurement,
 };
+use eliot_improvement::candidate_bounds::{
+    BoundsError, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
+};
 use eliot_improvement::{
     CarriageMark, LearningProduction, PresentedLearning, bounds_to_context_error,
     check_governed_carriage, datetime_from_unix, produce_learning_candidate,
-};
-use eliot_improvement::candidate_bounds::{
-    BoundsError, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -119,7 +120,9 @@ where
             .learning
             .as_ref()
             .and_then(|mark| mark.candidate_id.clone())
-            .ok_or(ComposeError::Retrieval(BoundsError::ReusableBackingMismatch))?,
+            .ok_or(ComposeError::Retrieval(
+                BoundsError::ReusableBackingMismatch,
+            ))?,
         closure_ref: produced
             .learning
             .as_ref()
@@ -251,9 +254,7 @@ pub fn check_honored_output(
     if let ContextOutcome::Complete(set) = &admission.outcome {
         for record in &set.records {
             if let Some(provenance) = &record.candidate.learning {
-                provenance
-                    .validate()
-                    .map_err(HonorError::Carriage)?;
+                provenance.validate().map_err(HonorError::Carriage)?;
                 marks.push(CarriageMark {
                     campaign_id: provenance.campaign_id.as_str(),
                     overlay_id: provenance.overlay_id.as_deref(),

@@ -60,10 +60,8 @@ pub fn check_guest_tickets(input: &AdmissionInput) -> Result<(), ContextError> {
             });
         }
         mark.validate()?;
-        let ticket =
-            find_covering_ticket(&input.learning_tickets, mark).ok_or(
-                ContextError::IdentityConflict,
-            )?;
+        let ticket = find_covering_ticket(&input.learning_tickets, mark)
+            .ok_or(ContextError::IdentityConflict)?;
         check_ticket_for_atom(input, mark, ticket)?;
     }
     Ok(())
@@ -99,9 +97,8 @@ fn check_ticket_for_atom(
     ticket: &LearningAdmissionTicket,
 ) -> Result<(), ContextError> {
     // Tamper evidence: the digest must recompute from the ticket fields.
-    let recomputed =
-        eliot_context_contracts::learning_ticket_digest(ticket)
-            .map_err(|_| ContextError::IdentityConflict)?;
+    let recomputed = eliot_context_contracts::learning_ticket_digest(ticket)
+        .map_err(|_| ContextError::IdentityConflict)?;
     if recomputed != ticket.digest {
         return Err(ContextError::IdentityConflict);
     }

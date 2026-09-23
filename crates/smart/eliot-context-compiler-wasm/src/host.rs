@@ -42,14 +42,15 @@ fn admission_error_to_guest(error: &LearningAdmissionError) -> GuestError {
         LearningAdmissionError::NoInfluenceSubject => {
             GuestError::InvalidField("learning.subject".to_owned())
         }
-        LearningAdmissionError::InvalidFence => GuestError::InvalidFence,
+        LearningAdmissionError::InvalidFence | LearningAdmissionError::StaleStateFence => {
+            GuestError::InvalidFence
+        }
         LearningAdmissionError::GovernorNotAdmitting => {
             GuestError::RejectedEnvelope("governor-not-admitting".to_owned())
         }
         LearningAdmissionError::StaleAuthorityEpoch
         | LearningAdmissionError::GenerationMismatch
         | LearningAdmissionError::DigestMismatch => GuestError::IdentityConflict,
-        LearningAdmissionError::StaleStateFence => GuestError::InvalidFence,
     }
 }
 

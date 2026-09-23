@@ -27,9 +27,11 @@
 pub mod conversion;
 pub mod descriptor;
 pub mod export;
-pub mod guest_gate;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod governed_compose;
+pub mod guest_gate;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod host;
 
 pub use conversion::{
     CallLedger, ConversionError, GuestError, GuestRequest, GuestResponse, INCOMPLETE_CODE,
@@ -49,5 +51,8 @@ pub use descriptor::{
 pub use export::{qualified_export_name, run, run_with_ledger};
 #[cfg(not(target_arch = "wasm32"))]
 pub use governed_compose::{
-    ComposeError, GovernedCompilation, HonorError, check_honored_output, compose_governed_compilation,
+    ComposeError, GovernedCompilation, HonorError, check_honored_output,
+    compose_governed_compilation,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use host::compile_learning_context;
