@@ -46,7 +46,30 @@ const UNKNOWN_AVAILABILITY_CONSTRAINT: &str =
 /// disposition, and optional omissions retain the supplied reversible handle
 /// or non-recoverable reason. No source is fetched and no representation is
 /// generated here.
+///
+/// I12.24/#1869 plain-path rule: learning-marked or ticketed inputs are
+/// refused fail-closed here; governed influence must use
+/// `admit_context_with_learning`.
 pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
+    refuse_ungoverned_learning(input)?;
+    admit_context_inner(input)
+}
+
+fn refuse_ungoverned_learning(input: &AdmissionInput) -> Result<(), ContextError> {
+    let marked = input
+        .candidates
+        .candidates
+        .iter()
+        .any(|c| c.learning.is_some());
+    if marked || !input.learning_tickets.is_empty() {
+        return Err(ContextError::InvalidField(
+            "learning.governed_path_required",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn admit_context_inner(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
     // I12.26 stale-projection fence arm, enforced before exact cue firing: a
     // candidate closure compiled under another fence must refresh the packet
     // and can never silently admit. Today's boundary refusal for exactly this
