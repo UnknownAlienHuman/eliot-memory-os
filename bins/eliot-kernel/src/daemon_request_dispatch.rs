@@ -1308,6 +1308,7 @@ impl KernelComposition {
             }
             "bind_notify_launch_grant" => {
                 self.notify_launch_grant_operation(session, payload.clone())
+                    .await
             }
             _ => return Err(TransportError::SessionFenced),
         };
@@ -3012,7 +3013,14 @@ impl KernelComposition {
     /// The canonical notification reference and the installer-observed
     /// launch artifact arrive as closed payload evidence; the artifact
     /// digest is proven here by re-hashing the real installed bytes (the
-    /// binder checks shape, this dispatch proves bytes). Session evidence
+    /// binder checks shape, this dispatch proves bytes). The grant never
+    /// binds to a merely presented reference: the durable canonical record
+    /// is read back from the retained store by `notification_id` first under
+    /// the live session fence — the minter-to-durable-state join. A missing
+    /// record, a fence disagreement, or an unavailable store fails closed
+    /// before binding. The presented `notification_digest` stays opaque here
+    /// (shape-checked by the binder; no digest derivation is specified in
+    /// `notify_grant.rs`, so this dispatch never invents one). Session evidence
     /// is threaded from the live authenticated session — connection, exact
     /// epoch, exact fence — never from the payload. Ready state, unfenced
     /// generation, and exact epoch/fence currency are enforced inside the
@@ -3021,7 +3029,7 @@ impl KernelComposition {
         clippy::too_many_lines,
         reason = "the admitted-path notify grant keeps decode, fence gate, artifact re-hash, session threading, bind, and receipt projection in one audited order"
     )]
-    fn notify_launch_grant_operation(
+    async fn notify_launch_grant_operation(
         &self,
         session: &Session,
         payload: serde_json::Value,
@@ -3044,6 +3052,16 @@ impl KernelComposition {
         if sha256_hex(&observed_bytes) != operation.artifact_digest {
             return Err(TransportError::SessionFenced);
         }
+        // Minter-to-durable-state join: the grant binds only to a persisted
+        // canonical record read back under the session fence. This is a
+        // read-only existence/digest proof — canonical writes stay on the
+        // `eliotd` admission path, never in this composition root.
+        self.require_durable_notification_record(
+            session,
+            operation.notification_id.as_str(),
+            operation.notification_digest.as_str(),
+        )
+        .await?;
         // Session evidence threaded from the live authenticated session.
         // `SessionBinding` lives in `eliot-receipts` (no direct dependency
         // edge from this composition root under single-file ownership); its
@@ -3083,6 +3101,86 @@ impl KernelComposition {
                 "state_fence": authorization.state_fence(),
             },
         }))
+    }
+
+    /// Proves the presented notification reference against durable canonical
+    /// state before a Notify launch grant binds (`#1780` W2).
+    ///
+    /// Reads back the canonical `GetNotificationState` projection for
+    /// `notification_id` through the retained store gateway under the live
+    /// session fence, then requires one same-fence record with that exact
+    /// identity. An unavailable store, a failed read, a missing record, or a
+    /// fence disagreement fails closed. The presented digest is intentionally
+    /// opaque here (no derivation is specified; shape is enforced by the
+    /// binder). This performs no canonical write: record creation stays on
+    /// the owning admission path; the grant only proceeds when the record
+    /// already persists.
+    #[cfg(windows)]
+    async fn require_durable_notification_record(
+        &self,
+        session: &Session,
+        notification_id: &str,
+        _notification_digest: &str,
+    ) -> Result<(), TransportError> {
+        let fence = session.module_generation.state_fence.clone();
+        let query = eliot_store_api::notification_read_request(
+            None,
+            None,
+            Some(notification_id.to_owned()),
+            true,
+            1,
+            None,
+            fence.clone(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let gateway = self.retained_store_gateway()?;
+        let response = gateway
+            .execute_named(query)
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        if response.operation != eliot_store_api::NamedReadOperation::GetNotificationState
+            || response.state_fence != fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let records = response
+            .payload
+            .get("records")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(TransportError::SessionFenced)?;
+        let record = records
+            .iter()
+            .find(|value| {
+                value
+                    .get("notification_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(notification_id)
+            })
+            .ok_or(TransportError::SessionFenced)?;
+        let record_fence: StateFence = serde_json::from_value(
+            record
+                .get("state_fence")
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        if record_fence != fence {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    /// No durable notification state exists off Windows: the retained store
+    /// gateway is a Windows-only contour, so the minter-to-durable-state
+    /// join is unprovable here and the grant fails closed.
+    #[cfg(not(windows))]
+    async fn require_durable_notification_record(
+        &self,
+        _session: &Session,
+        _notification_id: &str,
+        _notification_digest: &str,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::SessionFenced)
     }
 
     #[cfg(windows)]
