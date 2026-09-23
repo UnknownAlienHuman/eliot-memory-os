@@ -7,7 +7,8 @@ use eliot_platform::PlatformHandle;
 use eliot_receipts::{ReceiptDispositionKind, ReceiptEnvelope};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
-    SignedSupervisionLease, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
+    RuntimeLease, SignedSupervisionLease, VerifiedSupervisionLease,
+    VerifiedSupervisionLeaseTerminalTransition,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use serde_json::json;
@@ -27,6 +28,13 @@ use persistence_models::{
 mod restore_journal;
 
 mod recovery_projection;
+
+// Exact-fence RuntimeLease/SupervisionLease census readback for the
+// generation-retirement barrier (#1751 donor 552ee79a, M2 port; attribution
+// in store/lease_census.rs). No writers live here: lease staging stays with
+// its existing owner lanes.
+#[path = "store/lease_census.rs"]
+mod lease_census;
 
 use crate::cutover_ownership::{
     GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
@@ -97,6 +105,10 @@ const SUPERVISION_LEASE_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_results_v1");
 const SUPERVISION_LEASE_STAGE_RESOLUTIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
+// Canonical current RuntimeLease rows for exact-fence census reads
+// (#1751 donor 552ee79a, M2 port; name matches the donor table).
+const RUNTIME_LEASE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_runtime_lease_current_v1");
 const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_rebind_replay_v1");
 const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
@@ -721,6 +733,17 @@ impl persistence_codec::PersistedValue for HostRequestRecord {
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
+    }
+}
+
+// Persisted-value binding for exact-fence census reads (#1751 donor
+// 552ee79a, M2 port; RECORD_TYPE matches the donor row kind).
+impl persistence_codec::PersistedValue for RuntimeLease {
+    const RECORD_TYPE: &'static str = "runtime_lease";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))
     }
 }
 
@@ -4762,6 +4785,7 @@ impl RedbRecoveryStore {
                     .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
                     .map_err(storage)?,
             );
+            drop(write.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?);
             drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
             drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
             drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
