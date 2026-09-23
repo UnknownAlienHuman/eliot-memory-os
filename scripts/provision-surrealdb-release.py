@@ -2,9 +2,10 @@
 """Materialize the pinned SurrealDB evidence into project-local ignored state.
 
 This command never writes the shared C:\\Tools installation. It downloads the
-official release/source/tag and OSV snapshot selected by the tracked policy,
-refuses an existing byte mismatch, and leaves the verifier to validate PE,
-source-tree, tag, and advisory bindings.
+official release/source/tag and OSV snapshots selected by the tracked policy.
+The selected-candidate OSV response is fetched on every invocation so a release
+receipt can bind a fresh query to its exact response bytes. The verifier checks
+the PE, source-tree, tag, and advisory bindings.
 """
 
 from __future__ import annotations
@@ -344,6 +345,20 @@ def main() -> int:
     candidate_asset = f"{OFFICIAL_REPOSITORY}/releases/download/{candidate_tag}/surreal-{candidate_tag}.windows-amd64.exe"
     require_canonical(candidate["release_asset"], candidate_asset, "candidate release_asset")
     require_canonical(surreal["advisory_source"], OSV_ENDPOINT, "advisory_source")
+    if (
+        candidate.get("advisory_package") != "surrealdb"
+        or candidate.get("advisory_ecosystem") != "crates.io"
+        or candidate.get("advisory_scope") != "rust-crate"
+        or not isinstance(candidate.get("advisory_max_age_hours"), int)
+        or isinstance(candidate.get("advisory_max_age_hours"), bool)
+        or candidate["advisory_max_age_hours"] <= 0
+    ):
+        raise RuntimeError("candidate OSV scope and freshness policy are not canonical")
+    if (
+        candidate.get("advisory_query_path") == surreal.get("advisory_query_path")
+        or candidate.get("advisory_response_path") == surreal.get("advisory_response_path")
+    ):
+        raise RuntimeError("candidate OSV evidence must be separate from the installed-version snapshot")
     old_tag = evidence["source_tag"]
     old_version = surreal["version"]
     require_canonical(surreal["release_source"], f"{OFFICIAL_REPOSITORY}/releases/tag/{old_tag}", "installed release_source")
@@ -419,6 +434,60 @@ def main() -> int:
         "expected_sha256": str(surreal["advisory_response_digest"]).lower(),
         "expected_bytes": None,
         **response_record,
+    })
+
+    candidate_query = {
+        "package": {
+            "ecosystem": candidate["advisory_ecosystem"],
+            "name": candidate["advisory_package"],
+        },
+        "version": candidate_version,
+    }
+    candidate_query_bytes = (
+        json.dumps(candidate_query, separators=(",", ":"), ensure_ascii=False) + "\r\n"
+    ).encode("utf-8")
+    candidate_query_record = materialize(
+        root,
+        candidate["advisory_query_path"],
+        candidate_query_bytes,
+        replace_existing=True,
+    )
+    records.append({
+        "subject": f"osv.query.surrealdb.release-candidate.{candidate_tag}",
+        "url": OSV_ENDPOINT,
+        "request": True,
+        "expected_sha256": candidate_query_record["sha256"],
+        "expected_bytes": candidate_query_record["bytes"],
+        **candidate_query_record,
+    })
+
+    candidate_response_bytes = fetch(
+        OSV_ENDPOINT,
+        data=candidate_query_bytes,
+        accept="application/json",
+    )
+    try:
+        candidate_response_data = json.loads(candidate_response_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"candidate OSV response is not valid JSON: {exc}") from exc
+    if not isinstance(candidate_response_data, dict) or not isinstance(candidate_response_data.get("vulns"), list):
+        raise RuntimeError("candidate OSV response must contain a vulns array")
+    candidate_retrieved_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    candidate_response_record = materialize(
+        root,
+        candidate["advisory_response_path"],
+        candidate_response_bytes,
+        replace_existing=True,
+    )
+    records.append({
+        "subject": f"osv.response.surrealdb.release-candidate.{candidate_tag}",
+        "url": OSV_ENDPOINT,
+        "request": False,
+        "fetched": True,
+        "retrieved_at_utc": candidate_retrieved_at,
+        "expected_sha256": None,
+        "expected_bytes": None,
+        **candidate_response_record,
     })
 
     receipt = {
