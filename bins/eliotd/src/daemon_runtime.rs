@@ -810,20 +810,19 @@ async fn run_loop(
                                     ..
                                 } => {}
                             }
-                            // O1 experience audit scheduling (issue #223,
-                            // B-terminal): one evaluation per activation
-                            // completion over the audit request context
-                            // plus an explicit admitted event bundle. The
-                            // bundle arrives over owner-issued suppliers;
-                            // until one exists the evaluation idles as
-                            // Pending with exact owners. Admitted bundles
-                            // run the B-consumer entry with output
-                            // projected observably. Evaluation outcomes
-                            // never fail this activation loop.
+                            // O1 experience audit trigger (issue #223,
+                            // B-terminal): one staged evaluation per
+                            // activation completion over live owners —
+                            // agreed ctx, bridge client, admitted scope
+                            // binding, then the completeness gate over
+                            // supplier-gated fields. Complete events fire
+                            // the read entry with output projected
+                            // observably; anything missing idles as
+                            // Pending with exact owners. Evaluation
+                            // outcomes never fail this activation loop.
                             match eliotd::experience_audit::evaluate_experience_audit(
                                 &kernel,
                                 composition.as_ref(),
-                                None,
                             )
                             .await
                             {

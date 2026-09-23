@@ -6,31 +6,45 @@
 //! the real owner modules (range planning, range consume, retention-gated
 //! shaping, assess plus recheck, admitted commit chain); O1 owns this
 //! scheduling entrypoint plus its trigger application. This module resolves
-//! every event input from live reads in a fixed stage order — audit ctx,
-//! bridge client, admitted scope binding, scope-bound range reads, owner
-//! decode, then the completeness gate — and either fires both terminal
-//! entries or reports the exact missing inputs. It synthesizes no scope,
-//! subject, records, schedule, receipts, handles, or identities beyond
+//! every event input from live reads in a fixed stage order — agreed ctx,
+//! bridge client, admitted scope binding, scope-identity derivation,
+//! supplier-gated fields, then scope-bound range fetch, owner decode, and
+//! live revision-head expectations — and either fires the read entry or
+//! reports the exact missing inputs. It synthesizes no scope, subject,
+//! records, schedule, receipts, handles, or identities beyond
 //! caller-correlation ids the entry contract assigns to the caller
 //! (`assessment_id`, envelope `projection_id`), duplicates no owner type,
-//! holds no supplier state, and invents no Session or authority. A stage
-//! without a live supplier idles as
-//! [`Pending`](ExperienceAuditOutcome::Pending) with its exact owner —
-//! never fabricated, never defaulted into delivery. Failures record with
-//! identities preserved and never fail the activation loop that hosts this
-//! evaluation.
+//! holds no supplier state, and invents no Session or authority. A field
+//! without a live supplier resolves to `None` naming its exact absent
+//! owner and idles the evaluation as
+//! [`Pending`](ExperienceAuditOutcome::Pending) — never fabricated, never
+//! defaulted into delivery. Failures record with identities preserved and
+//! never fail the activation loop that hosts this evaluation.
+//!
+//! Correlation versus authority (read carefully): the audit ctx below is
+//! agreed live state (Kernel fence equals Governor fence, live handshake
+//! session when held, daemon product/source stamp, validated shape) —
+//! genuine admission currency for READS, retained across the whole
+//! evaluation so every leg binds the same fence. It is NOT a retained
+//! admitted `RequestIdentity` and must never be presented as one: commit
+//! authorization comes from the owner path itself (owner-derived commit
+//! keys in `derive_commit_ingress`, exact admission checks in
+//! `commit_canonical` downstream). The request id here is caller
+//! correlation only; task stays unbound per I5.5 and is never inferred.
 //!
 //! Stage notes: bank/feedback range reads are scope-addressed
 //! (`requires_scope_id`), so no range I/O runs before an admitted scope
-//! binds; revision-head expectations map 1:1 from live response heads
-//! (zero revisions filtered — the owner validator rejects them) and
-//! ordering expectations stay empty until an ordering-head supplier
-//! exists (the commit checklist permits empty vectors, never fabricated
-//! ones); decoded record slices are the SAME values the read entry
+//! binds; decoded record slices are the SAME values the read entry
 //! consumes and the commit entry re-commits (single decode, shared
-//! slices); the commit entry additionally needs M1's `&mut`-to-`&self`
-//! narrowing before an `Arc`-held composition can invoke it (CONTROL
-//! handoff — the read entry already takes `&self` and fires first).
+//! slices); revision-head expectations map 1:1 from live response heads
+//! (zero revisions filtered — the owner validator rejects them) while
+//! ordering expectations pass empty until an ordering-head supplier exists
+//! (the commit checklist permits empty vectors, never fabricated ones).
+//! The commit entry fires from the same gate once M1 narrows its `&mut`
+//! borrow (CONTROL handoff): an `Arc`-held composition cannot lend `&mut`,
+//! and the underlying canonical commit is already `&self` (only the
+//! refresh/stale mark needs exclusivity). Until then the read entry —
+//! already `&self` — is the firing call.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -39,17 +53,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, fences_match_exact,
 };
+use eliot_learning_contracts::HarnessActivationReceiptCandidate;
 use eliot_observation::bank_admission::{
     bank_records_from_range_payload, feedback_records_from_range_payload,
 };
 use eliot_observation_contracts::{
-    AgentFeedbackRecord, ExperienceBankRecord, ObservationScope,
+    AgentFeedbackRecord, ExperienceBankRecord, ObservationScope, ProjectionCoverage,
+    ProjectionOmission, RetentionHold, RetentionSchedule,
 };
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
-    CanonicalReadClient, EXPERIENCE_PARAM_MAX_RECORDS, MAX_EXPERIENCE_PAGE_RECORDS,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency, RevisionHeadExpectation,
-    ScopeId,
+    EXPERIENCE_PARAM_MAX_RECORDS, MAX_EXPERIENCE_PAGE_RECORDS, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, ReadConsistency, RevisionHeadExpectation, ScopeId,
 };
 
 use crate::attempt_execution_chain::{
@@ -90,11 +105,9 @@ pub enum ExperienceAuditOutcome {
 /// session when one holds — an absent handshake leaves the session unbound
 /// because reads stay reads, while a corrupt binding fails closed;
 /// stamps the daemon product/source identity; and validates the whole
-/// context. The request id is caller correlation for this evaluation, not
-/// authority: fence agreement plus the live session carry admission, and
-/// commit idempotency comes from owner-derived record keys downstream.
-/// Task stays unbound: task binding requires TaskSelectionEvidence
-/// (I5.5) and is never inferred here.
+/// context. See the module docs for the correlation-versus-authority
+/// boundary: this context admits reads, never commits. Task stays unbound
+/// per I5.5 and is never inferred here.
 pub fn audit_request_context(
     kernel: &DaemonKernelClient,
     composition: &DaemonComposition,
@@ -169,34 +182,35 @@ fn plan_experience_range(
 ///
 /// Executes through the canonical bridge client and checks the three
 /// readback bindings before returning anything: the operation echo must
-/// match the request, the response fence must equal the live agreed
-/// fence exactly, and the response must validate (heads unique and
-/// well-formed). Any disagreement fails closed with its exact owner
-/// detail — a moved fence or a foreign payload never becomes records.
-async fn fetch_experience_range<R: CanonicalReadClient + ?Sized>(
+/// match the request, the response fence must equal the agreed live fence
+/// exactly, and the response must validate (heads unique and well-formed).
+/// Any disagreement fails closed with its exact owner detail — a moved
+/// fence or a foreign payload never becomes records.
+async fn fetch_experience_range<R: eliot_store_api::CanonicalReadClient + ?Sized>(
     reads: &R,
-    request: &NamedReadRequest,
+    request: NamedReadRequest,
     fence: &eliot_contracts::StateFence,
 ) -> Result<NamedReadResponse, ExecutionChainError> {
     let refused = |owner: &'static str, reason: String| ExecutionChainError::SupplierReadRejected {
         owner,
         reason,
     };
+    let operation = request.operation;
     let response = reads
-        .execute_named(request.clone())
+        .execute_named(request)
         .await
         .map_err(|error| refused("experience range bridge", error.to_string()))?;
-    if response.operation != request.operation {
-        return refused(
+    if response.operation != operation {
+        return Err(refused(
             "experience range readback",
             "bridge response operation does not echo the requested read".to_owned(),
-        );
+        ));
     }
     if response.state_fence != *fence {
-        return refused(
+        return Err(refused(
             "experience range readback",
             "bridge response fence differs from the agreed live fence".to_owned(),
-        );
+        ));
     }
     response
         .validate()
@@ -250,21 +264,20 @@ fn correlation_ms() -> u64 {
 /// Evaluate one experience audit trigger step over live owners.
 ///
 /// Stages, in order: agreed ctx; bridge client; admitted scope binding
-/// (the scope-addressed range legs cannot run before one binds);
-/// scope-identity derivation; scope-bound bank/feedback range fetch with
-/// readback verification; owner decode into the shared record slices;
-/// live revision-head expectations; then the completeness gate over the
-/// fields with no live supplier yet (position subject, retention
-/// schedule, per-attempt receipts, bank/feedback source identities and
-/// read context). A complete event fires the read entry and projects the
-/// reviewed candidate observably; anything missing idles as pending with
-/// exact owners. Deterministic and side-effect free except for the live
-/// owner/bridge reads plus, on a complete event, the read entry's own
-/// bridge reads; mutates nothing. The commit entry fires from the same
-/// gate once M1 narrows its `&mut` borrow (CONTROL handoff): an
-/// `Arc`-held composition cannot lend `&mut`, and the underlying
-/// canonical commit is already `&self` (only the refresh/stale mark
-/// needs exclusivity).
+/// (the scope-addressed range legs cannot run before one binds, and no
+/// scope is ever defaulted); scope-identity derivation; supplier-gated
+/// fields (position subject, retention schedule, per-attempt receipts,
+/// bank/feedback source identities and read context — each names its
+/// exact absent owner and resolves to `None` until its supplier lane
+/// lands); then, on a complete resolution, scope-bound range fetch with
+/// readback verification, owner decode into the shared record slices,
+/// live revision-head expectations, event assembly, and the read entry,
+/// projecting the reviewed candidate observably. Anything missing idles
+/// as pending with exact owners. Deterministic and side-effect free
+/// except for the live owner/bridge reads plus, on a complete event, the
+/// read entry's own bridge reads; mutates nothing. The commit entry fires
+/// from the same gate once M1 narrows its `&mut` borrow (CONTROL
+/// handoff).
 pub async fn evaluate_experience_audit(
     kernel: &Arc<DaemonKernelClient>,
     composition: &DaemonComposition,
@@ -296,56 +309,68 @@ pub async fn evaluate_experience_audit(
             });
         }
     };
-    // Fields with no live supplier in-tree. Each names its exact absent
-    // owner; none is defaulted, minted as authority, or inferred.
-    let mut missing_scope = binding.is_none();
-    let mut missing_subject = true;
-    let mut missing_schedule = true;
-    let mut missing_receipts = true;
-    let mut missing_sources = true;
-    let mut missing_read_context = true;
-    if binding.is_none() {
+    let scope_ref: Option<String> = match binding {
+        Some(snapshot) => Some(snapshot.binding.scope.scope_ref.clone()),
+        None => {
+            missing.push(MissingOwner {
+                owner: "scope binder",
+                artifact: "admitted WorkScope binding at the live fence",
+                absent_read: "no WorkScope binding retained for the agreed fence; scope-addressed range legs (bank, feedback, position, journal) cannot name a scope",
+            });
+            None
+        }
+    };
+    // Supplier-gated fields: no live supplier exists in-tree for any of
+    // these today (position-subject binder, retention-schedule owner,
+    // harness receipt producer, Governor bank/feedback source identities,
+    // durable-read context beyond response heads). Each resolves to `None`
+    // naming its exact absent owner; none is defaulted, minted as
+    // authority, or inferred. Their resolution sites below are where
+    // supplier landings plug in — activation needs no structural change.
+    let position_subject: Option<String> = None;
+    if position_subject.is_none() {
         missing.push(MissingOwner {
-            owner: "scope binder",
-            artifact: "admitted WorkScope binding at the live fence",
-            absent_read: "no WorkScope binding retained for the agreed fence; scope-addressed range legs (bank, feedback, position, journal) cannot name a scope",
+            owner: "position subject owner",
+            artifact: "position subject text",
+            absent_read: "no admitted position subject; free text never becomes a read selector",
         });
     }
-    missing.push(MissingOwner {
-        owner: "position subject owner",
-        artifact: "position subject text",
-        absent_read: "no admitted position subject; free text never becomes a read selector",
-    });
-    missing.push(MissingOwner {
-        owner: "retention schedule owner",
-        artifact: "RetentionSchedule plus holds",
-        absent_read: "no owner-issued retention schedule retained for this run",
-    });
-    missing.push(MissingOwner {
-        owner: "per-attempt receipts",
-        artifact: "HarnessActivationReceiptCandidate set",
-        absent_read: "no per-attempt receipt candidates; the read entry requires at least one edge-supplied receipt and the harness receipt owner is absent in-tree",
-    });
-    missing.push(MissingOwner {
-        owner: "bank/feedback source identities",
-        artifact: "Governor bank/feedback source identities",
-        absent_read: "no owner-issued source identity for either family; the edge passes the Governor source identity and none is retained",
-    });
-    missing.push(MissingOwner {
-        owner: "bank/feedback read context",
-        artifact: "durable-read revision marker, coverage, omissions",
-        absent_read: "no owner-issued read context beyond response heads; markers are derived only with live range reads under an admitted scope",
-    });
+    let schedule: Option<RetentionSchedule> = None;
+    let holds: BTreeMap<String, RetentionHold> = BTreeMap::new();
+    if schedule.is_none() {
+        missing.push(MissingOwner {
+            owner: "retention schedule owner",
+            artifact: "RetentionSchedule plus holds",
+            absent_read: "no owner-issued retention schedule retained for this run; no holds are claimed",
+        });
+    }
+    let receipts: Vec<HarnessActivationReceiptCandidate> = Vec::new();
+    if receipts.is_empty() {
+        missing.push(MissingOwner {
+            owner: "per-attempt receipts",
+            artifact: "HarnessActivationReceiptCandidate set",
+            absent_read: "no per-attempt receipt candidates; the read entry requires at least one edge-supplied receipt and the harness receipt owner is absent in-tree",
+        });
+    }
+    let bank_source: Option<(String, String, ProjectionCoverage, Vec<ProjectionOmission>)> = None;
+    let feedback_source: Option<(String, String, ProjectionCoverage, Vec<ProjectionOmission>)> =
+        None;
+    if bank_source.is_none() || feedback_source.is_none() {
+        missing.push(MissingOwner {
+            owner: "bank/feedback source identities",
+            artifact: "Governor bank/feedback source identities plus read context",
+            absent_read: "no owner-issued source identity, revision marker, coverage, or omissions for either family; the edge passes the Governor source identity and none is retained",
+        });
+    }
     // Completeness gate: every field above must resolve live before any
-    // range I/O runs or any entry fires. The gate is a runtime condition
-    // over live state, not a static branch: when suppliers land, the
-    // stages below activate with no code change.
-    let complete = !missing_scope
-        && !missing_subject
-        && !missing_schedule
-        && !missing_receipts
-        && !missing_sources
-        && !missing_read_context;
+    // range I/O runs or any entry fires. No range fetch is attempted for
+    // unconsumable data and no entry fires on a partial event.
+    let complete = scope_ref.is_some()
+        && position_subject.is_some()
+        && schedule.is_some()
+        && !receipts.is_empty()
+        && bank_source.is_some()
+        && feedback_source.is_some();
     if !complete {
         tracing::debug!(
             missing_owners = missing.len(),
@@ -355,15 +380,14 @@ pub async fn evaluate_experience_audit(
         return ExperienceAuditOutcome::Pending { missing };
     }
     // Live stages below this point run only on a complete resolution.
-    // Scope-identity derivation from the admitted binding.
-    let snapshot = match binding {
-        Some(snapshot) => snapshot,
-        None => {
-            return ExperienceAuditOutcome::Pending { missing };
-        }
+    // Each `let ... else` below is statically reachable but runtime-dead
+    // until its supplier lane lands; the gate above already proved
+    // completeness, so these arms document the invariant instead of
+    // panicking on it.
+    let Some(scope_text) = scope_ref else {
+        return ExperienceAuditOutcome::Pending { missing };
     };
-    let scope_ref = snapshot.binding.scope.scope_ref.clone();
-    let scope_id = match ScopeId::new(scope_ref.clone()) {
+    let scope_id = match ScopeId::new(scope_text.clone()) {
         Ok(scope_id) => scope_id,
         Err(error) => {
             return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
@@ -372,7 +396,7 @@ pub async fn evaluate_experience_audit(
             });
         }
     };
-    let work_scope_id = match WorkScopeId::new(scope_ref.clone()) {
+    let work_scope_id = match WorkScopeId::new(scope_text.clone()) {
         Ok(work_scope_id) => work_scope_id,
         Err(error) => {
             return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
@@ -393,6 +417,23 @@ pub async fn evaluate_experience_audit(
             reason: error.to_string(),
         });
     }
+    let Some(subject) = position_subject else {
+        return ExperienceAuditOutcome::Pending { missing };
+    };
+    let Some(retention) = schedule else {
+        return ExperienceAuditOutcome::Pending { missing };
+    };
+    if receipts.is_empty() {
+        return ExperienceAuditOutcome::Pending { missing };
+    }
+    let Some((bank_revision, bank_source_id, bank_coverage, bank_omissions)) = bank_source else {
+        return ExperienceAuditOutcome::Pending { missing };
+    };
+    let Some((feedback_revision, feedback_source_id, feedback_coverage, feedback_omissions)) =
+        feedback_source
+    else {
+        return ExperienceAuditOutcome::Pending { missing };
+    };
     // Scope-bound range fetch with readback verification, then owner
     // decode into the shared slices the read entry consumes and the
     // commit entry re-commits.
@@ -412,14 +453,14 @@ pub async fn evaluate_experience_audit(
         Ok(request) => request,
         Err(error) => return ExperienceAuditOutcome::Failed(error),
     };
-    let bank_response = match fetch_experience_range(&reads, &bank_request, &context.state_fence).await
+    let bank_response = match fetch_experience_range(&reads, bank_request, &context.state_fence).await
     {
         Ok(response) => response,
         Err(error) => return ExperienceAuditOutcome::Failed(error),
     };
     let feedback_response = match fetch_experience_range(
         &reads,
-        &feedback_request,
+        feedback_request,
         &context.state_fence,
     )
     .await
@@ -453,5 +494,110 @@ pub async fn evaluate_experience_audit(
     };
     match live_revision_expectations(&feedback_response) {
         Ok(expectations) => revision_expectations.extend(expectations),
-        Err(error) => return ExperienceAuditO
-...[truncated 6154 chars]
+        Err(error) => return ExperienceAuditOutcome::Failed(error),
+    };
+    tracing::debug!(
+        bank_records = bank_records.len(),
+        feedback_records = feedback_records.len(),
+        revision_expectations = revision_expectations.len(),
+        fence_generation = context.state_fence.resource_generation.value(),
+        "experience audit resolved live range material",
+    );
+    // Event assembly from resolved live inputs. Caller-minted correlation
+    // ids only where the entry contract assigns minting to the caller;
+    // every other field resolved live above.
+    let stamp = correlation_ms();
+    let assessment_id = match ArtifactId::new(format!("eliotd:experience:audit:{stamp}")) {
+        Ok(assessment_id) => assessment_id,
+        Err(error) => {
+            return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                owner: "assessment correlation",
+                reason: error.to_string(),
+            });
+        }
+    };
+    let bank_projection_id = match ArtifactId::new(format!("eliotd:experience:bank:{stamp}")) {
+        Ok(projection_id) => projection_id,
+        Err(error) => {
+            return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                owner: "assessment correlation",
+                reason: error.to_string(),
+            });
+        }
+    };
+    let feedback_projection_id =
+        match ArtifactId::new(format!("eliotd:experience:feedback:{stamp}")) {
+            Ok(projection_id) => projection_id,
+            Err(error) => {
+                return ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                    owner: "assessment correlation",
+                    reason: error.to_string(),
+                });
+            }
+        };
+    let no_obligations: Vec<ArtifactId> = Vec::new();
+    let event = ExperienceQualityEvent {
+        assessment_id,
+        assessment_scope: work_scope_id,
+        scope: observation_scope,
+        scope_id: scope_id.clone(),
+        position_subject: subject,
+        journal: None,
+        bank: ExperienceBankEventInputs {
+            payload: bank_response.payload.clone(),
+            projection_id: bank_projection_id,
+            source_revision: bank_revision,
+            coverage: bank_coverage,
+            omissions: bank_omissions,
+            source_id: bank_source_id,
+        },
+        feedback: ExperienceFeedbackEventInputs {
+            payload: feedback_response.payload.clone(),
+            projection_id: feedback_projection_id,
+            source_revision: feedback_revision,
+            coverage: feedback_coverage,
+            omissions: feedback_omissions,
+            source_id: feedback_source_id,
+        },
+        schedule: &retention,
+        holds: &holds,
+        receipts: receipts.as_slice(),
+        obligation_handles: no_obligations.as_slice(),
+        attested_handles: Vec::new(),
+        memory: None,
+        understanding: None,
+        common_ground: None,
+    };
+    // Terminal read entry: admitted event to reviewed candidate. Anything
+    // drifted, malformed, withheld-but-uncited, or missing fails closed
+    // inside the entry; nothing partial emits as complete and nothing
+    // persists. The output projects observably with bounded identities;
+    // failures record with identities preserved and never fail the
+    // activation loop. The commit entry
+    // (`commit_experience_event_records` with the shared decoded slices
+    // plus live revision expectations and empty ordering expectations)
+    // fires from this same gate once M1 narrows its `&mut` borrow.
+    match run_experience_quality_event(composition, kernel, &context, &event).await {
+        Ok(output) => {
+            tracing::info!(
+                assessment = %crate::diagnostics::sanitize_identity(
+                    output.candidate.assessment_id.as_str()
+                ),
+                candidate_digest = %output.candidate.digest,
+                journal_present = output.journal_view.is_some(),
+                bank_withheld = output.bank_withheld.len(),
+                feedback_withheld = output.feedback_withheld.len(),
+                bank_records = bank_records.len(),
+                feedback_records = feedback_records.len(),
+                "experience audit completed with reviewed candidate",
+            );
+            ExperienceAuditOutcome::Completed
+        }
+        Err(error) => {
+            ExperienceAuditOutcome::Failed(ExecutionChainError::SupplierReadRejected {
+                owner: "experience driver",
+                reason: error.to_string(),
+            })
+        }
+    }
+}
