@@ -40,6 +40,7 @@ mod recovery;
 mod schema_contract;
 pub(crate) mod surreal_automation;
 pub(crate) mod surreal_experience;
+pub(crate) mod surreal_coordination;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 use atomic_write::{TxLane, to_value, write_transaction};
@@ -1086,6 +1087,13 @@ async fn apply_with_retry(
         // row writes beside the automation legs under the same discipline.
         let experience_writes =
             surreal_experience::prepare_experience_writes(db, &adapter.config, &transition).await?;
+        // Issues #959/#960/#962/#975: admitted restore-coordination legs
+        // persist their decision rows beside the automation legs under the
+        // same discipline (recompute from fresh rows, in-transaction
+        // compare-and-set arbitration).
+        let coordination_writes =
+            surreal_coordination::prepare_coordination_writes(db, &adapter.config, &transition)
+                .await?;
 
         let first_attempt = semantic_plan.is_none();
         let plan = if let Some(semantic) = &semantic_plan {
@@ -1128,6 +1136,7 @@ async fn apply_with_retry(
             &reactive_writes,
             &automation_writes,
             &experience_writes,
+            &coordination_writes,
         )
         .await
         {

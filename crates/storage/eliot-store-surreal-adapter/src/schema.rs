@@ -66,6 +66,13 @@ pub(crate) mod table {
     /// carrying the verbatim failure document with first-writer
     /// provenance. Create-or-converge; divergent rewrites fail closed.
     pub(crate) const AUTOMATION_FAILURE: &str = "automation_failure";
+    /// Durable restore-coordination decision row per restore operation
+    /// (issues #959/#960/#962/#975). One row per `coordination_operation_id`
+    /// carrying the six admitted coordination bindings, the admission fence,
+    /// and the Governor-issued proof refs bound as audit evidence.
+    /// Sealed compare-and-set: same-operation byte-exact replay converges,
+    /// divergent rewrites fail closed.
+    pub(crate) const RESTORE_COORDINATION: &str = "restore_coordination";
     /// Last automation failure pointer per automation (issue #1779). One
     /// row per `automation_id` naming the most recently committed
     /// failure key. Last write wins; no compare-and-set.
