@@ -563,17 +563,42 @@ def matched_lines(text: str, needle: str) -> list[str]:
     return [line for line in text.splitlines() if needle in line]
 
 
-def git_diff_names() -> list[str]:
+def candidate_base() -> str:
+    """Live owning-range base: the fork point of this candidate and main.
+
+    Computed from real Git (`merge-base HEAD origin/main`), never from a
+    frozen constant, so unrelated main evolution never enters the owning
+    range and no oracle edit is needed after unrelated main merges or a
+    candidate rebase. A missing/unrelated `origin/main` ref fails closed
+    instead of guessing a base; HEAD-as-its-own-base (empty range) can
+    never satisfy the exact-diff allowlist downstream.
+    """
+    base = subprocess.run(
+        ["git", "merge-base", "HEAD", "origin/main"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if base.returncode != 0:
+        raise GateFailure("candidate owning base is unresolvable: origin/main required")
+    resolved = base.stdout.strip()
+    if not resolved:
+        raise GateFailure("candidate owning base is unresolvable: empty merge-base")
     ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", GATE_BASE_COMMIT, "HEAD"],
+        ["git", "merge-base", "--is-ancestor", resolved, "HEAD"],
         cwd=ROOT,
         capture_output=True,
         text=True,
     )
     if ancestor.returncode != 0:
-        raise GateFailure(f"candidate base is not an ancestor: {GATE_BASE_COMMIT}")
+        raise GateFailure(f"candidate base is not an ancestor: {resolved}")
+    return resolved
+
+
+def git_diff_names() -> list[str]:
+    base = candidate_base()
     diff = subprocess.run(
-        ["git", "diff", "--name-only", GATE_BASE_COMMIT],
+        ["git", "diff", "--name-only", base],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -608,7 +633,6 @@ INCOMPLETE_INCLUDE_MACRO = "include-macro-fixture-bytes"
 INCOMPLETE_MACRO_RULES = "macro-rules-definition"
 INCOMPLETE_UNCLOSED = "unclosed-lexical-input"
 INCOMPLETE_UNKNOWN_ROOT = "unknown-scan-root"
-INCOMPLETE_NON_UTF8 = "non-utf8-input"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -630,15 +654,11 @@ def lexical_closure(text: str) -> list[str]:
 def scan_file_status(relative: str) -> tuple[str, str]:
     """COMPLETE/INCOMPLETE status plus reason for one scanned file.
 
-    A non-UTF8 input is INCOMPLETE with an explicit reason, never a
-    masked zero and never an unhandled decoder error on the verdict
-    path: the lexical denominator cannot prove absence inside bytes it
-    cannot decode.
+    Non-UTF8 inputs fail loud upstream (strict decode in the read path
+    raises before any verdict is formed) and stay fail-closed: nothing
+    here silently skips undecodable bytes.
     """
-    try:
-        text = read_text(relative)
-    except UnicodeDecodeError:
-        return ("INCOMPLETE", INCOMPLETE_NON_UTF8)
+    text = read_text(relative)
     anomalies = lexical_closure(text)
     if anomalies:
         return ("INCOMPLETE", anomalies[0])
@@ -758,17 +778,16 @@ GATE_DESCRIPTOR_REL = ".github/work-units/835.toml"
 GATE_ADMISSION_DIR = "scripts/testdata/cue-kind-retirement/admission"
 GATE_TARGET_DIR = "target/wu837-gate"
 GATE_MANIFEST_REL = "Cargo.toml"
-# Pinned integration base: current-main 8ce704a9, the verified ancestor this
-# candidate was cut from (published authority receipt; enforced below by the
-# merge-base --is-ancestor check in git_diff_names). Exact-diff cases measure
-# the FULL owning change-range (committed + uncommitted) against this base,
-# never just the uncommitted remainder; allowed_diff.txt enumerates exactly
-# that range, and any unrelated file fails. Re-pointing this base is an
-# oracle delta needing its own review: a stale donor-era base (9a676803)
-# makes cases 23/28 fail on main's own evolution, while HEAD-as-both-sides
-# would make them vacuous. The built-binary evidence stays bound separately
-# through the accepted cargo builders below.
-GATE_BASE_COMMIT = "8ce704a90430cbadbc08dafea0d043afb08aae47"
+# Owning change-range identity (F1): the candidate base is derived live
+# from real Git (candidate_base: merge-base of HEAD and origin/main), so
+# the exact-diff cases measure only the owning range and stay passable
+# across unrelated main evolution without oracle edits. The allowlist in
+# allowed_diff.txt enumerates exactly that admitted range; any unrelated
+# file fails. A frozen base constant is deliberately absent: a stale SHA
+# assertion (donor-era 9a676803) made cases 23/28 fail on main's own
+# evolution, while HEAD-as-both-sides would make them vacuous. The
+# built-binary evidence stays bound separately through the accepted cargo
+# builders below.
 GATE_RUST_SELECTION = (
     (
         "eliot-cue-contracts",
@@ -855,7 +874,6 @@ class GateEvidence:
     shape: object
     package_receipt: object
     input_snapshot_before: tuple
-    members_before: tuple
 
 
 def _gate_modules():
@@ -959,44 +977,54 @@ def parse_markers(descriptor):
 
 def protected_snapshot():
     _, _, _, r = _gate_modules()
-    for rel in GATE_PROTECTED_RELS:
-        if any(segment in f"/{rel}/" for segment in PROTECTED_EXCLUDED_SEGMENTS):
-            raise GateFailure(f"protected input must not be a generated output: {rel}")
-        if rel.endswith(PROTECTED_EXCLUDED_SUFFIXES):
-            raise GateFailure(f"protected input must not be a generated output: {rel}")
-    return r.snapshot_protected(ROOT, list(GATE_PROTECTED_RELS))
+    try:
+        return r.snapshot_protected(ROOT, list(_admitted_input_paths()))
+    except Exception as exc:
+        raise GateFailure(f"admitted input snapshot unavailable: {exc}") from None
 
 
-# Admitted scan-membership scopes for the before/after membership guard
-# (F2): every consumed input lives under the workspace scan roots or the
-# fixture directory. The guard uses live uncached I/O only — never the
-# lru_cache scan layer — so stale per-process caches cannot mask
-# membership drift (additions, removals, renames).
-MEMBERSHIP_FIXTURE_DIR = "scripts/testdata/cue-kind-retirement"
+def _is_excluded_output(rel: str) -> bool:
+    """True when a rel names a generated output, never a source input."""
+    if any(segment in f"/{rel}/" for segment in PROTECTED_EXCLUDED_SEGMENTS):
+        return True
+    return rel.endswith(PROTECTED_EXCLUDED_SUFFIXES)
 
 
-def _live_membership() -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Live (uncached) admitted-input membership.
+def _admitted_input_paths() -> tuple[str, ...]:
+    """Full admitted input set: content-hashed before/after/end (F2).
 
-    Returns (workspace .rs members, fixture members), both sorted. Reads
-    the filesystem directly instead of the cached scan wrappers: this
-    function is the independent membership witness for the gate bracket
-    and the end-of-run re-verification.
+    Union of the explicit protected rels (assignment, oracle,
+    coordinator, boundary-test inputs, manifest, seam, fixtures,
+    Rust-evidence inputs, package manifests) and the dynamically
+    enumerated scan domains (every workspace `.rs` file plus every
+    fixture file), in canonical sorted order. Enumeration uses live
+    uncached I/O only — never the lru_cache scan layer — so stale
+    per-process caches cannot mask membership drift, and snapshot keys
+    bind membership (additions/removals/renames) while values bind file
+    bytes. Generated outputs matching the excluded classes are skipped,
+    never hashed as evidence; an excluded class inside the explicit
+    static rels fails fast instead. Bounded cost: one sorted pass over
+    ~1.8k `.rs` files (~58MB) plus the static rels, linear in corpus
+    size, comparable to the scan workload itself.
     """
-    rs: list[str] = []
+    for rel in GATE_PROTECTED_RELS:
+        if _is_excluded_output(rel):
+            raise GateFailure(f"protected input must not be a generated output: {rel}")
+    paths = set(GATE_PROTECTED_RELS)
     for root in SCAN_ROOTS:
         candidate = ROOT / root
         if not candidate.is_dir():
             continue
         for path in sorted(candidate.rglob("*.rs")):
-            rs.append(path.relative_to(ROOT).as_posix())
-    fixture_dir = ROOT / MEMBERSHIP_FIXTURE_DIR
-    fixtures = sorted(
-        path.relative_to(ROOT).as_posix()
-        for path in fixture_dir.rglob("*")
-        if path.is_file()
-    )
-    return (tuple(rs), tuple(fixtures))
+            paths.add(path.relative_to(ROOT).as_posix())
+    for path in sorted((ROOT / MEMBERSHIP_FIXTURE_DIR).rglob("*")):
+        if path.is_file():
+            paths.add(path.relative_to(ROOT).as_posix())
+    return tuple(sorted(path for path in paths if not _is_excluded_output(path)))
+
+
+# Fixture scope root for the admitted-input enumeration above.
+MEMBERSHIP_FIXTURE_DIR = "scripts/testdata/cue-kind-retirement"
 
 
 def _cargo_env():
@@ -1290,7 +1318,6 @@ def run_accepted_gate():
         return _gate_evidence
     _, cb, c, r = _gate_modules()
     before = protected_snapshot()
-    members_before = _live_membership()
     document = acquire_assignment()
     descriptor = load_descriptor(document)
     if descriptor.matrix_cases != 28:
@@ -1321,8 +1348,6 @@ def run_accepted_gate():
     diff = r.compare_snapshots(before, after)
     if diff.get("mutated") or diff.get("added") or diff.get("removed"):
         raise GateFailure(f"source mutation invalidates result: {diff}")
-    if _live_membership() != members_before:
-        raise GateFailure("admitted-input membership drift invalidates result")
     accounting = cb.reconcile_case_bindings(
         document.receipt, descriptor, markers, discoveries, executions, findings=())
     source_items = len(before)
@@ -1358,8 +1383,7 @@ def run_accepted_gate():
         rust_evidence=tuple(rust_evidence), rust_receipts=tuple(rust_receipts),
         rust_gaps=tuple(rust_gaps), accounting=accounting,
         shape=shape, package_receipt=package_receipt,
-        input_snapshot_before=tuple(sorted(before.items())),
-        members_before=members_before)
+        input_snapshot_before=tuple(sorted(before.items())))
     return _gate_evidence
 
 
@@ -1389,26 +1413,25 @@ def case_gate_result(number: int):
 def verify_run_inputs_unchanged():
     """Live end-of-run re-verification of all admitted inputs (F2).
 
-    Re-hashes the full protected set and re-enumerates admitted
-    membership with live I/O only, then compares both against the
-    gate-start evidence bound in run_accepted_gate. Any content or
-    membership drift after the gate bracket — including drift visible
-    only to cached scans — raises GateFailure instead of passing, so
-    stale per-process caches can never turn changed source into PASS.
-    Returns True. Returns None inside the owned gate child (argv carries
-    --_python-child): binding there is the parent's job, never a nested
-    gate.
+    Re-hashes the full dynamic admitted set (explicit protected rels
+    plus live-enumerated scan domains) with live I/O only, then compares
+    against the gate-start evidence bound in run_accepted_gate. Snapshot
+    keys bind membership (additions/removals/renames) and values bind
+    file bytes, so any content or membership drift after the gate
+    bracket — including drift visible only to cached scans — raises
+    GateFailure instead of passing: stale per-process caches can never
+    turn changed source into PASS. Returns True. Returns None inside
+    the owned gate child (argv carries --_python-child): binding there
+    is the parent's job, never a nested gate.
     """
     if "--_python-child" in sys.argv:
         return None
     evidence = run_accepted_gate()
     _, _, _, r = _gate_modules()
-    live = r.snapshot_protected(ROOT, list(GATE_PROTECTED_RELS))
+    live = protected_snapshot()
     diff = r.compare_snapshots(dict(evidence.input_snapshot_before), live)
     if diff.get("mutated") or diff.get("added") or diff.get("removed"):
         raise GateFailure(f"post-gate input drift invalidates result: {diff}")
-    if _live_membership() != evidence.members_before:
-        raise GateFailure("post-gate membership drift invalidates result")
     return True
 
 
