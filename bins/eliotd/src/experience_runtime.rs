@@ -716,12 +716,14 @@ pub async fn run_experience_quality_event(
 ///
 /// Runs [`run_experience_quality_event`] unchanged, then — only when
 /// `revision` is `Some` — proposes one advisory extinction candidate
-/// via [`propose_memory_extinction_candidate`] over the admitted
-/// intake the trigger edge already holds. `None` skips the revision
-/// lane entirely: no intake is synthesized from the quality event's
-/// envelopes, and no automatic trigger exists. This entry calls
+/// via [`propose_memory_extinction_candidate`] over that intake.
+/// `Some` must be an already-admitted [`RevisionIntake`] held by the
+/// trigger edge (the O1-owned daemon trigger assembles it from
+/// owner-issued members); this entry never synthesizes intake from
+/// the quality event's bank/feedback envelopes and owns no automatic
+/// trigger. `None` skips the revision lane entirely. This entry calls
 /// [`run_experience_quality_event`] and then the propose wrapper,
-/// so both new symbols have a production caller in this file; the
+/// so both symbols have a production caller in this file; the
 /// read-only base path is unaffected.
 pub async fn run_experience_quality_event_with_revision(
     composition: &DaemonComposition,

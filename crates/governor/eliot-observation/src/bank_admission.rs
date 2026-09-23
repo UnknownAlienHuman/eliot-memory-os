@@ -1081,6 +1081,131 @@ pub fn assemble_experience_for_consumer_paged(
     })
 }
 
+/// Echo-next-cursor driver for the multi-page consumer read.
+///
+/// Production loop driver over [`assemble_experience_for_consumer_paged`]:
+/// the caller performs each owner-store read with the cursors this driver
+/// exposes ([`ConsumerPagedReadDriver::bank_cursor`] /
+/// [`ConsumerPagedReadDriver::feedback_cursor`]), then hands the fresh
+/// caller-supplied snapshots plus the owner-issued next cursors from that
+/// read to [`ConsumerPagedReadDriver::assemble_next_page`], which runs the
+/// same per-family supply join plus consumer-edge re-resolution and stores
+/// the echoed cursors as the next iteration's selectors. The loop ends when
+/// [`ConsumerPagedReadDriver::is_complete`] reports `None` on both
+/// families; anything else is a partial read, never a complete one.
+///
+/// Boundary: this lane never performs the store read and never parses or
+/// mints cursors. Snapshots stay caller-supplied inputs on every iteration;
+/// the driver only echoes the opaque owner cursors and revalidates through
+/// [`assemble_experience_for_consumer_paged`]. A fence/heads mismatch is
+/// reported by the owner store failing the echoed cursor closed (a commit
+/// advanced a revision head or the fence moved): the caller restarts that
+/// family's enumeration from the headless first page with
+/// [`ConsumerPagedReadDriver::restart_bank_from_head`] /
+/// [`ConsumerPagedReadDriver::restart_feedback_from_head`] — never skip
+/// ahead, never replay rows into a duplicate, never treat a rejected
+/// cursor as truncation. Families paginate independently: restarting one
+/// never touches the other's cursor.
+pub struct ConsumerPagedReadDriver {
+    /// Opaque owner cursor to supply as the next bank read's selector
+    /// (`None` selects the headless first page, or — once pages have been
+    /// assembled — ends that family's enumeration).
+    bank_cursor: Option<String>,
+    /// Opaque owner cursor to supply as the next feedback read's selector.
+    feedback_cursor: Option<String>,
+    /// Pages successfully assembled; keeps the headless `None`/`None`
+    /// start state from reading as complete before the first page.
+    pages_assembled: u64,
+}
+
+impl ConsumerPagedReadDriver {
+    /// Start a headless read: both families enumerate from their first
+    /// page with `None` as the cursor selector.
+    pub fn headless() -> Self {
+        Self {
+            bank_cursor: None,
+            feedback_cursor: None,
+            pages_assembled: 0,
+        }
+    }
+
+    /// Opaque bank cursor for the next owner-store read.
+    pub fn bank_cursor(&self) -> Option<&str> {
+        self.bank_cursor.as_deref()
+    }
+
+    /// Opaque feedback cursor for the next owner-store read. Same
+    /// headless/end rule as [`ConsumerPagedReadDriver::bank_cursor`].
+    pub fn feedback_cursor(&self) -> Option<&str> {
+        self.feedback_cursor.as_deref()
+    }
+
+    /// `true` once at least one page is assembled and both family cursors
+    /// are `None`: `None` on both ends the read.
+    pub fn is_complete(&self) -> bool {
+        self.pages_assembled > 0 && self.bank_cursor.is_none() && self.feedback_cursor.is_none()
+    }
+
+    /// Restart bank enumeration from the headless first page after the
+    /// owner store rejects the echoed bank cursor (fence/heads mismatch).
+    /// Feedback enumeration is untouched: families paginate independently.
+    pub fn restart_bank_from_head(&mut self) {
+        self.bank_cursor = None;
+    }
+
+    /// Restart feedback enumeration from the headless first page. Same
+    /// independence rule as
+    /// [`ConsumerPagedReadDriver::restart_bank_from_head`].
+    pub fn restart_feedback_from_head(&mut self) {
+        self.feedback_cursor = None;
+    }
+
+    /// Assemble the next consumer page from fresh caller-supplied
+    /// snapshots and the owner-issued next cursors of this read, then
+    /// store those cursors as the next iteration's selectors.
+    ///
+    /// Fail-closed once the read has ended (`None` on both families after
+    /// pages were assembled): re-calling would replay the last page into
+    /// a duplicate, so it errors instead of assembling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_next_page(
+        &mut self,
+        ledger: &mut ExperienceRevisionLedger,
+        projection_id: ArtifactId,
+        scope: &ObservationScope,
+        fence: &StateFence,
+        bank: BankStoreSnapshot<'_>,
+        feedback: FeedbackStoreSnapshot<'_>,
+        schedule: &RetentionSchedule,
+        holds: &BTreeMap<String, RetentionHold>,
+        bank_next_cursor: Option<String>,
+        feedback_next_cursor: Option<String>,
+    ) -> Result<PagedExperienceConsumerBundle, GovernorObservationError> {
+        if self.is_complete() {
+            return Err(GovernorObservationError::InvalidField {
+                field: "consumer_page.read",
+                reason: "paged consumer read already ended; None on both families ends the read, never replay the last page",
+            });
+        }
+        let page = assemble_experience_for_consumer_paged(
+            ledger,
+            projection_id,
+            scope,
+            fence,
+            bank,
+            feedback,
+            schedule,
+            holds,
+            bank_next_cursor,
+            feedback_next_cursor,
+        )?;
+        self.bank_cursor.clone_from(&page.bank_next_cursor);
+        self.feedback_cursor.clone_from(&page.feedback_next_cursor);
+        self.pages_assembled = self.pages_assembled.saturating_add(1);
+        Ok(page)
+    }
+}
+
 /// Produce the durable commit payload for one admitted bank record.
 ///
 /// The durable-write join: the record must validate and its exact
