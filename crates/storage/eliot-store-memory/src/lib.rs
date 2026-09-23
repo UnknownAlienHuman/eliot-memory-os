@@ -29,15 +29,15 @@ use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
     DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
     ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
-    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, NamedMutationOperation,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
-    OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, MAX_RECOVERY_RECORD_BYTES,
+    NamedMutationOperation, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
     StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    MAX_RECOVERY_RECORD_BYTES, OWNER_SNAPSHOT_SCHEMA,
     canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
     decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
     decode_resource_content, generated_operation_manifests, genesis_manifest, is_genesis_fence,
@@ -337,8 +337,10 @@ impl MemoryStore {
         // outbox references include the appended automation outbox intents.
         // Rows, receipt, and outbox still commit atomically below.
         dispatch_apply_automation_state(&mut state, &transition, &mut plan)?;
-        // Issue #223 experience state and #325 finish owner records share the
-        // canonical transaction and are applied before its receipt is finalized.
+        // Issue #223: admitted experience bank/feedback legs execute here,
+        // beside the automation legs and before the receipt is built, so the
+        // receipt's outbox references include the appended experience outbox
+        // intents. Rows, receipt, and outbox still commit atomically below.
         dispatch_apply_experience_state(&mut state, &transition, &mut plan)?;
         dispatch_apply_finish_evidence(&mut state, &transition)?;
         dispatch_apply_finish_decision(&mut state, &transition)?;
@@ -617,12 +619,12 @@ fn dispatch_apply_finish_evidence(
                 reason: "missing required parameter",
             })
     };
-    let expected_revision = text_param("expected_canonical_revision")?.parse::<u64>().map_err(|_| {
-        StoreError::InvalidField {
+    let expected_revision = text_param("expected_canonical_revision")?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
             field: "operation.parameter",
             reason: "expected_canonical_revision must be a decimal revision",
-        }
-    })?;
+        })?;
     let snapshot_json = text_param("snapshot_json")?;
     if snapshot_json.is_empty() {
         return Err(StoreError::Empty {
@@ -694,12 +696,12 @@ fn dispatch_apply_finish_decision(
             })
     };
     let _attempt_id = text_param("attempt_id")?;
-    let expected_revision = text_param("expected_finish_revision")?.parse::<u64>().map_err(|_| {
-        StoreError::InvalidField {
+    let expected_revision = text_param("expected_finish_revision")?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
             field: "operation.parameter",
             reason: "expected_finish_revision must be a decimal revision",
-        }
-    })?;
+        })?;
     let receipt_json = text_param("receipt_json")?;
     if receipt_json.len() > MAX_RECOVERY_RECORD_BYTES {
         return Err(StoreError::PayloadTooLarge);
@@ -1716,51 +1718,77 @@ fn experience_range_payload(
         .clone()
         .ok_or_else(|| serde_json::Error::custom("experience range read requires scope_id"))?;
     let limit = usize::from(decoded.max_records.max(1));
+    let heads: Vec<(String, u64)> = state
+        .revision_heads
+        .values()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, fence, &heads)
+                .map_err(|error| serde_json::Error::custom(error.to_string()))?,
+        ),
+    };
     let mut records = Vec::new();
     let mut truncated = false;
+    let mut ordinal: u64 = 0;
+    // Local row walk shared by both families: fence plus scope gating,
+    // deterministic key order, ordinal skip for continuation, and a
+    // limit-plus-probe bound with caller-visible truncation.
+    macro_rules! walk_rows {
+        ($rows:expr) => {
+            for row in $rows {
+                if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
+                    continue;
+                }
+                ordinal = ordinal.saturating_add(1);
+                if start.is_some_and(|start| ordinal <= start) {
+                    continue;
+                }
+                if records.len() > limit {
+                    truncated = true;
+                    break;
+                }
+                records.push(json!({
+                    "handle": row.handle,
+                    "revision": row.revision,
+                    "record_json": row.record_json,
+                    "record_digest": row.record_digest,
+                }));
+            }
+        };
+    }
     if bank {
-        for row in state.experience_bank_rows.values() {
-            if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
-                continue;
-            }
-            if records.len() > limit {
-                truncated = true;
-                break;
-            }
-            records.push(json!({
-                "handle": row.handle,
-                "revision": row.revision,
-                "record_json": row.record_json,
-                "record_digest": row.record_digest,
-            }));
-        }
+        walk_rows!(state.experience_bank_rows.values());
     } else {
-        for row in state.experience_feedback_rows.values() {
-            if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
-                continue;
-            }
-            if records.len() > limit {
-                truncated = true;
-                break;
-            }
-            records.push(json!({
-                "handle": row.handle,
-                "revision": row.revision,
-                "record_json": row.record_json,
-                "record_digest": row.record_digest,
-            }));
-        }
+        walk_rows!(state.experience_feedback_rows.values());
     }
     if records.len() > limit {
         records.pop();
         truncated = true;
     }
     let matched_total = records.len();
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(matched_total).unwrap_or(u64::MAX)),
+            )
+            .map_err(|error| serde_json::Error::custom(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     serde_json::to_value(
         eliot_store_api::ExperienceRangePage {
             records,
             matched_total,
             truncated,
+            next_cursor,
         }
         .payload(fence),
     )
@@ -1777,10 +1805,9 @@ fn experience_range_payload(
 /// carries scope-free gap/control records regardless of scope, so
 /// store-level scope filtering here would silently drop records the
 /// consumer must see (F2 resolution: scope-free catalogue rows per the
-/// established in-catalogue scope-free reads (`GetNotificationState`,
-/// `GetReactiveInjectionState`, `GetResourceSnapshot`) — facade caller
-/// scope required, catalogue rows scope-free — with scope gating at the
-/// decision layer per I12-26). Fence agreement is enforced by the caller: this helper runs
+/// `GetMailbox` precedent — facade caller scope required, catalogue
+/// rows scope-free — with scope gating at the decision layer per
+/// I12-26). Fence agreement is enforced by the caller: this helper runs
 /// only after `execute_named_sync` proves the query fence equals the
 /// state fence. Reads beyond
 /// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
@@ -1795,9 +1822,10 @@ fn experience_range_payload(
 /// [`StoreError::PayloadTooLarge`] past
 /// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
 /// instead of truncating; a present cursor verified by
-/// `audit_cursor_parse` against this fence resumes paging past that
-/// candidate ordinal with the same bound and no overflow failure.
-/// Cross-fence or malformed cursors fail closed.
+/// `audit_cursor_parse` against this fence and the current revision
+/// heads resumes paging past that candidate ordinal with the same bound
+/// and no overflow failure. Cross-fence, stale-heads, or malformed
+/// cursors fail closed (callers restart enumeration).
 fn audit_range_payload(
     state: &MemoryState,
     query: &NamedReadRequest,
@@ -1805,10 +1833,17 @@ fn audit_range_payload(
 ) -> Result<Value, serde_json::Error> {
     let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
         None => None,
-        Some(cursor) => Some(
-            eliot_store_api::audit_cursor_parse(cursor, fence)
-                .map_err(|error| serde_json::Error::custom(error.to_string()))?,
-        ),
+        Some(cursor) => {
+            let heads: Vec<(String, u64)> = state
+                .revision_heads
+                .values()
+                .map(|head| (head.key.as_str().to_owned(), head.revision))
+                .collect();
+            Some(
+                eliot_store_api::audit_cursor_parse(cursor, fence, &heads)
+                    .map_err(|error| serde_json::Error::custom(error.to_string()))?,
+            )
+        }
     };
     let mut records = Vec::new();
     let mut ordinal: u64 = 0;
@@ -2096,16 +2131,13 @@ fn validate_transaction_state(
             .named_operations
             .iter()
             .any(|command| command.operation == NamedMutationOperation::ApplyUserAutomationState)
-        || transition
-            .named_operations
-            .iter()
-            .any(|command| {
-                matches!(
-                    command.operation,
-                    NamedMutationOperation::RecordFinishDecision
-                        | NamedMutationOperation::RecordFinishEvidence
-                )
-            })
+        || transition.named_operations.iter().any(|command| {
+            matches!(
+                command.operation,
+                NamedMutationOperation::RecordFinishDecision
+                    | NamedMutationOperation::RecordFinishEvidence
+            )
+        })
     {
         return transition.validate_against_catalogue(&generated_operation_manifests()?);
     }
@@ -5590,9 +5622,7 @@ mod tests {
         ));
         assert!(
             store
-                .receipt_sync(
-                    &OperationId::new("op-erase-na").map_err(StoreError::Foundation)?
-                )?
+                .receipt_sync(&OperationId::new("op-erase-na").map_err(StoreError::Foundation)?)?
                 .is_none()
         );
         assert_eq!(store.erasure_outcomes("op-erase-na")?, None);
@@ -5606,8 +5636,7 @@ mod tests {
             "doomed-subject",
             vec!["approval-user-1".to_owned()],
         )?;
-        stale.operation_manifest_digest =
-            OperationManifestDigest::new("0".repeat(64))?;
+        stale.operation_manifest_digest = OperationManifestDigest::new("0".repeat(64))?;
         rebind_erasure_hash(&ctx, &mut stale)?;
         assert_eq!(
             store.apply_transaction(&ctx, stale, &[], &[]),
@@ -5645,8 +5674,8 @@ mod tests {
     /// identical receipt (replay of the deletion proof stays legitimate) and
     /// a non-erasure receipt stays rehydratable.
     #[test]
-    fn erasure_receipt_refuses_restore_rehydration_and_replays_identically(
-    ) -> Result<(), StoreError> {
+    fn erasure_receipt_refuses_restore_rehydration_and_replays_identically()
+    -> Result<(), StoreError> {
         use eliot_store_api::ERASURE_STATE_IRREVERSIBLE_CONSTRAINT;
 
         assert_eq!(
@@ -5673,10 +5702,7 @@ mod tests {
         );
         // Replay is not rehydration: the same identity resolves to the
         // identical deletion proof without duplicate destructive work.
-        assert_eq!(
-            store.apply_transaction(&ctx, staged, &[], &[])?,
-            receipt
-        );
+        assert_eq!(store.apply_transaction(&ctx, staged, &[], &[])?, receipt);
 
         // A non-erasure receipt from the same executor stays rehydratable.
         let capture = capture_with_subject("op-guard-seed", "kept-subject", &state_fence, &ctx)?;
@@ -5907,10 +5933,7 @@ mod tests {
             response.payload["records"].as_array().map(Vec::len),
             Some(1)
         );
-        assert_eq!(
-            response.payload["current"]["to"],
-            json!("OPEN"),
-        );
+        assert_eq!(response.payload["current"]["to"], json!("OPEN"),);
         // Unknown task is an exact empty, not an error.
         let empty = store.execute_named_sync(&cognitive_query(
             &state_fence,
@@ -5921,7 +5944,11 @@ mod tests {
                 ("max_records".to_owned(), json!("10")),
             ]),
         )?)?;
-        assert!(empty.payload["records"].as_array().is_some_and(Vec::is_empty));
+        assert!(
+            empty.payload["records"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
         // GetAttentionAndProblems returns the admitted problem record.
         let response = store.execute_named_sync(&cognitive_query(
             &state_fence,
@@ -5957,9 +5984,11 @@ mod tests {
                 ("max_records".to_owned(), json!("10")),
             ]),
         )?)?;
-        assert!(response.payload["records"]
-            .as_array()
-            .is_some_and(Vec::is_empty));
+        assert!(
+            response.payload["records"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
         // GetCapabilityEvidenceState returns the exact skill record.
         let response = store.execute_named_sync(&cognitive_query(
             &state_fence,

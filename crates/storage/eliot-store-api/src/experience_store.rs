@@ -92,6 +92,8 @@ pub const EXPERIENCE_PAGE_RECORDS: &str = "records";
 pub const EXPERIENCE_PAGE_MATCHED_TOTAL: &str = "matched_total";
 /// Read payload field: whether further rows exist past the bound.
 pub const EXPERIENCE_PAGE_TRUNCATED: &str = "truncated";
+/// Read payload field: owner-minted continuation cursor, or null at end.
+pub const EXPERIENCE_PAGE_NEXT_CURSOR: &str = "next_cursor";
 /// Read payload field: projection fence.
 pub const EXPERIENCE_PAGE_STATE_FENCE: &str = "state_fence";
 
@@ -524,6 +526,12 @@ pub struct ExperienceRangePage {
     pub matched_total: usize,
     /// Whether further rows exist past the bound.
     pub truncated: bool,
+    /// Owner-minted continuation cursor for the next page, or `None`
+    /// when this page ends the enumeration. Callers echo it back as the
+    /// `cursor` selector; cursors bind fence plus revision heads exactly
+    /// like the audit range.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 impl ExperienceRangePage {
@@ -533,6 +541,7 @@ impl ExperienceRangePage {
             EXPERIENCE_PAGE_RECORDS: self.records,
             EXPERIENCE_PAGE_MATCHED_TOTAL: self.matched_total,
             EXPERIENCE_PAGE_TRUNCATED: self.truncated,
+            EXPERIENCE_PAGE_NEXT_CURSOR: self.next_cursor,
             EXPERIENCE_PAGE_STATE_FENCE: state_fence,
         })
     }
@@ -560,47 +569,82 @@ pub fn audit_envelope_candidate(subject: &str) -> Option<serde_json::Value> {
 /// Mints one opaque audit-range continuation cursor.
 ///
 /// The cursor binds the exact query fence (digest over its canonical
-/// bytes), the next candidate ordinal, and the page bound in force:
-/// `audit:{fence_digest}:{ordinal:010}:{bound}`. Callers echo cursors;
-/// they must never construct them — only the store owner mints, and
-/// [`audit_cursor_parse`] re-verifies every field before resuming.
+/// bytes), the sorted revision-head set (digest over canonical
+/// `(key, revision)` pairs, key order), the next candidate ordinal, and
+/// the page bound in force:
+/// `audit:{fence_digest}:{heads_digest}:{ordinal:010}:{bound}`.
+/// Callers echo cursors; they must never construct them — only the
+/// store owner mints, and [`audit_cursor_parse`] re-verifies every
+/// binding before resuming. Heads binding makes stale cursors fail
+/// closed: any commit advancing any revision head invalidates
+/// outstanding cursors, so paged enumeration restarts instead of
+/// silently skipping or duplicating rows.
 pub fn audit_cursor_issue(
     fence: &StateFence,
+    heads: &[(String, u64)],
     ordinal: u64,
-    bound: u32,
 ) -> Result<String, StoreError> {
-    let digest = sha256_hex(
+    let fence_digest = sha256_hex(
         &canonical_json_bytes(fence)
             .map_err(|error| StoreError::Serialization(error.to_string()))?,
     );
-    Ok(format!("audit:{digest}:{ordinal:010}:{bound}"))
+    let heads_digest = audit_heads_digest(heads)?;
+    Ok(format!(
+        "audit:{fence_digest}:{heads_digest}:{ordinal:010}:{}",
+        crate::operation_catalogue::MAX_AUDIT_RANGE_RECORDS
+    ))
+}
+
+/// Digests one revision-head set for cursor binding.
+///
+/// Sorts by key so the digest is order-independent; identical head sets
+/// always yield identical bytes on every contour.
+pub fn audit_heads_digest(heads: &[(String, u64)]) -> Result<String, StoreError> {
+    let mut ordered: Vec<(&str, u64)> = heads
+        .iter()
+        .map(|(key, revision)| (key.as_str(), *revision))
+        .collect();
+    ordered.sort_by(|left, right| left.0.cmp(right.0));
+    Ok(sha256_hex(&canonical_json_bytes(&ordered).map_err(
+        |error| StoreError::Serialization(error.to_string()),
+    )?))
 }
 
 /// Verifies one continuation cursor against the current read fence and
-/// returns the candidate ordinal to resume from.
+/// heads, returning the candidate ordinal to resume from.
 ///
-/// Fails closed on any malformed cursor, on a bound that does not match
-/// the enforced page bound (a bound change invalidates old cursors
-/// instead of silently repaging), and on a fence digest that does not
-/// match the current read fence (cross-fence continuation is rejected:
-/// cursors never carry reads across a fence change).
-pub fn audit_cursor_parse(cursor: &str, fence: &StateFence) -> Result<u64, StoreError> {
+/// Only the canonical five-part owner-minted shape verifies:
+/// `audit:{fence_digest}:{heads_digest}:{ordinal:010}:{bound}`.
+/// Every binding is re-verified: bound, fence digest, heads digest (any
+/// commit since issuance restarts enumeration instead of drifting
+/// ordinals). No scaffold or compatibility shape is accepted: cursors
+/// the store owner never minted fail closed here.
+///
+/// A bound that does not match the enforced page bound fails closed
+/// (a bound change invalidates old cursors instead of silently
+/// repaging); cross-fence continuation is rejected (cursors never carry
+/// reads across a fence change).
+pub fn audit_cursor_parse(
+    cursor: &str,
+    fence: &StateFence,
+    heads: &[(String, u64)],
+) -> Result<u64, StoreError> {
     let invalid = || StoreError::InvalidField {
         field: "experience.cursor",
-        reason: "continuation cursor is malformed or foreign",
+        reason: "continuation cursor is malformed, foreign, or stale",
     };
-    let mut parts = cursor.split(':');
-    match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("audit"), Some(digest), Some(ordinal), Some(bound), None) => {
-            let expected = sha256_hex(
-                &canonical_json_bytes(fence)
-                    .map_err(|_| invalid())?,
-            );
-            if digest != expected {
+    let expected_fence = sha256_hex(&canonical_json_bytes(fence).map_err(|_| invalid())?);
+    let bound: u32 = crate::operation_catalogue::MAX_AUDIT_RANGE_RECORDS;
+    match cursor.split(':').collect::<Vec<_>>().as_slice() {
+        ["audit", fence_digest, heads_digest, ordinal, cursor_bound] => {
+            if *fence_digest != expected_fence {
                 return Err(invalid());
             }
-            let bound: u32 = bound.parse().map_err(|_| invalid())?;
-            if bound != crate::operation_catalogue::MAX_AUDIT_RANGE_RECORDS {
+            if *heads_digest != audit_heads_digest(heads).map_err(|_| invalid())? {
+                return Err(invalid());
+            }
+            let cursor_bound: u32 = cursor_bound.parse().map_err(|_| invalid())?;
+            if cursor_bound != bound {
                 return Err(invalid());
             }
             ordinal.parse().map_err(|_| invalid())

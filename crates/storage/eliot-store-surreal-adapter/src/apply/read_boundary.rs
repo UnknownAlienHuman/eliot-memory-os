@@ -507,8 +507,7 @@ fn suppressed_pairs(
     for outcome in outcomes {
         if outcome.outcomes.iter().any(|cell| {
             cell.split_once(':').is_some_and(|(state, surface)| {
-                state == "PURGED"
-                    && matches!(surface, "CanonicalPayload" | "Projection" | "Index")
+                state == "PURGED" && matches!(surface, "CanonicalPayload" | "Projection" | "Index")
             })
         }) {
             purged_by_operation.insert(outcome.operation_id.clone());
@@ -536,8 +535,7 @@ fn suppressed_pairs(
 /// `atomic_write`, owned there — never re-declared here). Defined here (not
 /// in `schema.rs`) because only the `GetEvidencePack` read boundary consumes
 /// it on this slice.
-const READ_ERASURE_INTENTS: &str =
-    "SELECT VALUE { operation_id: operation_id, subject: subject, scope_id: scope_id } FROM erasure_intent;";
+const READ_ERASURE_INTENTS: &str = "SELECT VALUE { operation_id: operation_id, subject: subject, scope_id: scope_id } FROM erasure_intent;";
 
 /// Closed erasure-outcome read: one `(operation_id, outcomes)` row per sealed
 /// outcome (see `READ_ERASURE_OUTCOME` in `atomic_write`, owned there).
@@ -642,9 +640,9 @@ async fn read_erasure_suppression(
         ErasureTable::Absent => Vec::new(),
         ErasureTable::Unknown => return Ok(ErasureSuppression::Unknown),
     };
-    Ok(ErasureSuppression::Known(
-        suppressed_pairs(&intents, &outcomes),
-    ))
+    Ok(ErasureSuppression::Known(suppressed_pairs(
+        &intents, &outcomes,
+    )))
 }
 
 /// Reads all persisted capture-evidence rows through the closed SELECT.
@@ -974,7 +972,8 @@ async fn read_authority_records(
         "BEGIN TRANSACTION; {READ_AUTHORITY_RECORDS} {} COMMIT TRANSACTION;",
         schema::READ_ALL_RECEIPTS,
     );
-    let mut response = client::query(db, config, "read.authority_records", &sql, Map::new()).await?;
+    let mut response =
+        client::query(db, config, "read.authority_records", &sql, Map::new()).await?;
     if !response.take_errors().is_empty() {
         return Err(StoreError::Serialization("authority snapshot query failed".to_owned()).into());
     }
@@ -1042,7 +1041,9 @@ fn record_operation_count(
     // The receipt row carries the transition's total operation count; when
     // absent (pre-authority shape) the record itself cannot be ordered, so
     // fail closed rather than guessing.
-    let count = row.named_operation_count.ok_or(StoreError::InvalidReceipt)?;
+    let count = row
+        .named_operation_count
+        .ok_or(StoreError::InvalidReceipt)?;
     if count == 0 || record.operation_index >= count {
         return Err(StoreError::InvalidReceipt);
     }
@@ -1110,9 +1111,7 @@ struct IndexedAuthority {
 /// length/bytes-vs-parameters) and its receipt is validated (committed
 /// status, envelope, command-count agreement); any mismatch fails closed.
 /// Scope comes from the validated receipt envelope, never from the caller.
-fn indexed_authorities(
-    rows: &[AuthorityReceiptRow],
-) -> Result<Vec<IndexedAuthority>, StoreError> {
+fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthority>, StoreError> {
     let mut ordered: Vec<&AuthorityReceiptRow> = rows.iter().collect();
     ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
     let mut indexed = Vec::new();
@@ -1133,7 +1132,10 @@ fn indexed_authorities(
             {
                 return Err(StoreError::InvalidReceipt);
             }
-            Some((receipt.transition_class, binding.scope_id.as_str().to_owned()))
+            Some((
+                receipt.transition_class,
+                binding.scope_id.as_str().to_owned(),
+            ))
         };
         for record in authorities {
             let parameters = validate_authority_record(row, record)?;
@@ -1424,8 +1426,7 @@ fn capability_evidence_payload(
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()
-                && record.operation
-                    == eliot_store_api::NamedMutationOperation::ApplyLifecyclePolicy
+                && record.operation == eliot_store_api::NamedMutationOperation::ApplyLifecyclePolicy
                 && record.parameters.get("skill_id").and_then(Value::as_str) == Some(skill_id)
         })
         .collect();
@@ -1958,10 +1959,9 @@ async fn automation_failure_payload(
 /// candidates through the shared `audit_envelope_candidate` filter
 /// (memory-contour parity: fence-gated, scope-agnostic, ordinary
 /// non-envelope captures skipped, never failed). F2 resolution: no
-/// store-level scope filtering, per the established in-catalogue
-/// scope-free reads (`GetNotificationState`, `GetReactiveInjectionState`,
-/// `GetResourceSnapshot`: facade caller scope required, catalogue rows
-/// scope-free) with scope gating at the decision layer per I12-26 — filtering here would diverge the
+/// store-level scope filtering, per the `GetMailbox` precedent (facade
+/// caller scope required, catalogue rows scope-free) with scope gating
+/// at the decision layer per I12-26 — filtering here would diverge the
 /// contours and drop scope-free records the consumer must see. Each
 /// candidate row re-validates its bytes/digest provenance before
 /// shaping, so substituted or truncated evidence fails closed instead
@@ -1970,12 +1970,13 @@ async fn automation_failure_payload(
 /// Continuation cursors (optional `cursor` selector): an absent cursor
 /// reads from the start and fails closed with `PayloadTooLarge` past
 /// `MAX_AUDIT_RANGE_RECORDS` instead of truncating; a present cursor
-/// verified by `audit_cursor_parse` against this fence resumes paging
-/// past that candidate ordinal (commit-sequence, evidence-position
-/// order) with the same bound and no overflow failure. Cross-fence or
-/// malformed cursors fail closed; cursors stay valid only while
-/// revision heads are unchanged (the consumer re-proves heads per read
-/// and restarts paging on advance). Candidate-only: full envelope
+/// verified by `audit_cursor_parse` against this fence and the current
+/// revision heads resumes paging past that candidate ordinal
+/// (commit-sequence, evidence-position order) with the same bound and
+/// no overflow failure. Cross-fence, stale-heads, or malformed cursors
+/// fail closed (callers restart enumeration); cursors stay valid only
+/// while revision heads are unchanged (the consumer re-proves heads per
+/// read and restarts paging on advance). Candidate-only: full envelope
 /// validation and live-journal presence binding stay downstream, so a
 /// carried candidate can never become a false journal record here.
 async fn audit_range_payload(
@@ -2009,18 +2010,21 @@ async fn audit_range_payload(
         let sequence = row.commit_sequence.unwrap_or(u64::MAX);
         for (index, evidence) in row.evidence_records.iter().flatten().enumerate() {
             validate_evidence_record(row, evidence).map_err(AdapterError::Store)?;
-            if let Some(candidate) =
-                eliot_store_api::audit_envelope_candidate(&evidence.subject)
-            {
+            if let Some(candidate) = eliot_store_api::audit_envelope_candidate(&evidence.subject) {
                 ordered.push((sequence, index, candidate));
             }
         }
     }
     ordered.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
     let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
         None => None,
         Some(cursor) => Some(
-            eliot_store_api::audit_cursor_parse(cursor, state_fence)
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
                 .map_err(AdapterError::Store)?,
         ),
     };
@@ -2072,19 +2076,41 @@ async fn experience_bank_range_payload(
         reason: "experience range read requires scope_id",
     })?;
     let limit = usize::from(decoded.max_records.max(1));
-    let rows = super::surreal_experience::read_bank_for_read(
-        db,
-        config,
-        scope_id.as_str(),
-        limit.saturating_add(1),
-    )
-    .await?;
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    // Fetch covers the skip window plus one probe row: the row scan is
+    // O(table) like every other range read on this contour, and the
+    // probe decides truncation without a second query.
+    let fetch = start
+        .unwrap_or(0)
+        .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+        .saturating_add(1);
+    let fetch = usize::try_from(fetch).unwrap_or(usize::MAX);
+    let rows =
+        super::surreal_experience::read_bank_for_read(db, config, scope_id.as_str(), fetch).await?;
     let mut records = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
     for row in rows {
         if row.state_fence != *state_fence {
             continue;
         }
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
         if records.len() > limit {
+            truncated = true;
             break;
         }
         records.push(json!({
@@ -2094,16 +2120,30 @@ async fn experience_bank_range_payload(
             "record_digest": row.record_digest,
         }));
     }
-    let mut truncated = false;
     if records.len() > limit {
         records.pop();
         truncated = true;
     }
     let matched_total = projection_len(records.len())?;
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                state_fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX)),
+            )
+            .map_err(AdapterError::Store)?,
+        )
+    } else {
+        None
+    };
     Ok(json!({
         "records": records,
         "matched_total": matched_total,
         "truncated": truncated,
+        "next_cursor": next_cursor,
         "state_fence": state_fence,
     }))
 }
@@ -2131,19 +2171,42 @@ async fn experience_feedback_range_payload(
         reason: "experience range read requires scope_id",
     })?;
     let limit = usize::from(decoded.max_records.max(1));
-    let rows = super::surreal_experience::read_feedback_for_read(
-        db,
-        config,
-        scope_id.as_str(),
-        limit.saturating_add(1),
-    )
-    .await?;
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    // Fetch covers the skip window plus one probe row: the row scan is
+    // O(table) like every other range read on this contour, and the
+    // probe decides truncation without a second query.
+    let fetch = start
+        .unwrap_or(0)
+        .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+        .saturating_add(1);
+    let fetch = usize::try_from(fetch).unwrap_or(usize::MAX);
+    let rows =
+        super::surreal_experience::read_feedback_for_read(db, config, scope_id.as_str(), fetch)
+            .await?;
     let mut records = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
     for row in rows {
         if row.state_fence != *state_fence {
             continue;
         }
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
         if records.len() > limit {
+            truncated = true;
             break;
         }
         records.push(json!({
@@ -2153,16 +2216,30 @@ async fn experience_feedback_range_payload(
             "record_digest": row.record_digest,
         }));
     }
-    let mut truncated = false;
     if records.len() > limit {
         records.pop();
         truncated = true;
     }
     let matched_total = projection_len(records.len())?;
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                state_fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX)),
+            )
+            .map_err(AdapterError::Store)?,
+        )
+    } else {
+        None
+    };
     Ok(json!({
         "records": records,
         "matched_total": matched_total,
         "truncated": truncated,
+        "next_cursor": next_cursor,
         "state_fence": state_fence,
     }))
 }
@@ -2575,9 +2652,8 @@ mod admitted_read_tests {
             validate_named_against_active_catalogue(&query).is_ok(),
             "activated pack passes the gate"
         );
-        let payload =
-            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
-                .expect("pack builds");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+            .expect("pack builds");
         assert_eq!(
             payload.get("version").and_then(Value::as_u64),
             Some(u64::from(EVIDENCE_PACK_PAYLOAD_VERSION))
@@ -2634,9 +2710,8 @@ mod admitted_read_tests {
         let fence = test_fence();
         let rows = vec![evidence_row_for("op-evidence-2", "evidence-alpha", 1)];
         let query = evidence_query("evidence-missing", "10");
-        let payload =
-            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
-                .expect("empty pack builds");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+            .expect("empty pack builds");
         let records = payload
             .get("records")
             .and_then(Value::as_array)
@@ -2716,9 +2791,8 @@ mod admitted_read_tests {
         // successful view of a neighbouring subject.
         for selector in ["observation", "observation-1-extra", "OBSERVATION-1"] {
             let query = evidence_query(selector, "10");
-            let payload =
-                evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
-                    .expect("non-match builds");
+            let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+                .expect("non-match builds");
             assert!(
                 payload
                     .get("records")
@@ -2728,8 +2802,8 @@ mod admitted_read_tests {
             );
         }
         let query = evidence_query("observation-1", "10");
-        let payload =
-            evidence_pack_payload(&query, &fence, &rows, &empty_suppression()).expect("exact builds");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+            .expect("exact builds");
         assert_eq!(
             payload
                 .get("records")
@@ -2748,9 +2822,8 @@ mod admitted_read_tests {
             evidence_row_for("op-bulk-3", "evidence-bulk", 3),
         ];
         let query = evidence_query("evidence-bulk", "2");
-        let payload =
-            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
-                .expect("bounded pack builds");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+            .expect("bounded pack builds");
         let records = payload
             .get("records")
             .and_then(Value::as_array)
@@ -2778,9 +2851,8 @@ mod admitted_read_tests {
             Some(true)
         );
         let query = evidence_query("evidence-bulk", "3");
-        let payload =
-            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
-                .expect("full pack builds");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+            .expect("full pack builds");
         assert_eq!(
             payload
                 .get("provenance")
@@ -2880,9 +2952,7 @@ mod admitted_read_tests {
         )
         .expect("neighbouring subject still reads");
         assert_eq!(
-            kept.get("records")
-                .and_then(Value::as_array)
-                .map(Vec::len),
+            kept.get("records").and_then(Value::as_array).map(Vec::len),
             Some(1)
         );
         // An `UNKNOWN`-only outcome never suppresses: the row stays visible
@@ -2956,7 +3026,10 @@ mod admitted_read_tests {
                 operation: NamedMutationOperation::UpdateTaskState,
                 parameters: BTreeMap::from([
                     ("task_id".to_owned(), json!(task_id)),
-                    ("event_id".to_owned(), json!(format!("event-{operation_id}"))),
+                    (
+                        "event_id".to_owned(),
+                        json!(format!("event-{operation_id}")),
+                    ),
                     ("to".to_owned(), json!(to)),
                     ("expected_revision".to_owned(), json!("1")),
                     ("actor_ref".to_owned(), json!("actor-1")),
@@ -3202,12 +3275,8 @@ mod admitted_read_tests {
         );
         assert!(payload.get("current").is_some_and(Value::is_null));
         // Unknown task over empty rows is also an exact empty.
-        let empty = task_state_payload(
-            &task_query("task-missing", "10"),
-            &fence,
-            &[],
-        )
-        .expect("empty builds");
+        let empty = task_state_payload(&task_query("task-missing", "10"), &fence, &[])
+            .expect("empty builds");
         assert!(
             empty
                 .get("records")
@@ -3245,10 +3314,7 @@ mod admitted_read_tests {
         let empty =
             attention_problems_payload(&attention_query(None, "2"), &fence, &[]).expect("builds");
         assert_eq!(
-            empty
-                .get("records")
-                .and_then(Value::as_array)
-                .map(Vec::len),
+            empty.get("records").and_then(Value::as_array).map(Vec::len),
             Some(0)
         );
         assert_eq!(empty["provenance"]["matched_total"], json!(0));
