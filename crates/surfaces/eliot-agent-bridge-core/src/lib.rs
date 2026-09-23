@@ -498,11 +498,92 @@ impl ActivationGrant {
     }
 }
 
+/// I7.20 agent-facing activation disposition registry (closed control layer).
+///
+/// Per `docs/architecture/I07-20-agent-facing-error-contract.md`, agent-facing
+/// failure control has two layers: `AgentResponseDisposition` (small closed
+/// control enum) and `reason_code` (open versioned registry). Bridges switch
+/// on the stable disposition and MAY specialize known reason codes.
+pub const ACTIVATION_DISPOSITION_INVALID_REQUEST: &str = "INVALID_REQUEST";
+/// I7.20 stale/conflict disposition: retry requires a new ticket, the stale
+/// fence fails closed; the bridge never auto-selects a candidate.
+pub const ACTIVATION_DISPOSITION_STALE_OR_CONFLICT: &str = "STALE_OR_CONFLICT";
+/// I7.20 unavailable/capacity disposition: fail-closed with a failure capsule.
+pub const ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
+/// I7.20 terminal failure disposition: fail-closed with a failure capsule.
+pub const ACTIVATION_DISPOSITION_FAILED: &str = "FAILED";
+
+/// I7.20 directive kind for candidate recovery: present candidates only, the
+/// agent (never the bridge) selects; no auto-selection.
+pub const ACTIVATION_DIRECTIVE_CANDIDATE_RECOVERY: &str = "candidate-recovery-no-auto-selection";
+/// I7.20 directive kind for stale/conflict: the retry requires a new ticket.
+pub const ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET: &str = "retry-requires-new-ticket";
+/// I7.20 directive kind for stale fences: fail closed, never reuse authority.
+pub const ACTIVATION_DIRECTIVE_FENCE_CLOSED: &str = "stale-fence-fail-closed";
+/// I7.20 directive kind for failures: carry the typed failure capsule.
+pub const ACTIVATION_DIRECTIVE_FAILURE_CAPSULE: &str = "failure-capsule";
+
+/// I7.20 activation-denial triple: disposition + exact `reason_code` + directive.
+///
+/// Every non-success response includes the disposition, the exact `reason_code`,
+/// the applicable Recovery or Conflict Directive, and the same operation
+/// identity when one exists. The bridge surfaces the triple read-only and
+/// fails closed; it never auto-selects among candidates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActivationDenialDetails {
+    reason_code: &'static str,
+    disposition: &'static str,
+    directive_kind: &'static str,
+}
+
+impl ActivationDenialDetails {
+    /// Seals one denial triple. All three legs are required; silence and
+    /// generic internal-error prose are not normal control behavior.
+    pub const fn new(
+        reason_code: &'static str,
+        disposition: &'static str,
+        directive_kind: &'static str,
+    ) -> Self {
+        Self {
+            reason_code,
+            disposition,
+            directive_kind,
+        }
+    }
+
+    /// Open versioned registry code; specialized only via bridge-alias mapping.
+    pub const fn reason_code(&self) -> &'static str {
+        self.reason_code
+    }
+
+    /// Closed I7.20 control disposition the bridge switches on.
+    pub const fn disposition(&self) -> &'static str {
+        self.disposition
+    }
+
+    /// Applicable Recovery or Conflict Directive kind; never auto-selected.
+    pub const fn directive_kind(&self) -> &'static str {
+        self.directive_kind
+    }
+}
+
 /// Trusted activation-port disposition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActivationPortOutcome {
     Authenticated(ActivationPortResult),
-    Denied { reason_code: &'static str },
+    Denied {
+        reason_code: &'static str,
+    },
+    /// I7.20 detailed denial carrying the disposition + `reason_code` +
+    /// directive triple. Handled identically to [`Self::Denied`] (fail-closed
+    /// via [`BridgeError::ActivationDenied`]); the extra legs are carried for
+    /// agent-facing projection without creating host-specific semantic
+    /// control enums. Kept additive: [`Self::Denied`] remains for compat.
+    DeniedDetailed {
+        reason_code: &'static str,
+        disposition: &'static str,
+        directive_kind: &'static str,
+    },
 }
 
 /// Injected demand-start boundary. The host owner, not A-16, owns process
@@ -930,7 +1011,8 @@ impl AgentBridgeCore {
         let activation = host.activate(&request)?;
         let grant = match activation {
             ActivationPortOutcome::Authenticated(result) => ActivationGrant::seal(result)?,
-            ActivationPortOutcome::Denied { reason_code } => {
+            ActivationPortOutcome::Denied { reason_code }
+            | ActivationPortOutcome::DeniedDetailed { reason_code, .. } => {
                 validate_text(reason_code, "activation_denial.reason_code")?;
                 return Err(BridgeError::ActivationDenied(reason_code));
             }
