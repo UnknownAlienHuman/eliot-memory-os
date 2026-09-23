@@ -355,6 +355,74 @@ impl ProblemState {
     }
 }
 
+/// Bounded revocation-driven quarantine request for incomplete lineage (I12.20 S4).
+///
+/// Carries exactly the bounded impacted scope plus the revocation evidence.
+/// The scope set is consumed verbatim: it is never expanded by similarity,
+/// and an empty scope is rejected so a caller cannot launder a whole-memory
+/// purge through this entry.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationQuarantine {
+    pub impacted_scopes: Vec<String>,
+    pub revocation_evidence: Vec<ArtifactId>,
+    pub revoked_source_ref: String,
+    pub rebuild_condition: String,
+}
+
+impl RevocationQuarantine {
+    /// Validates the bounded scope, revocation evidence and rebuild requirement.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        nonempty(&self.impacted_scopes, "impacted_scopes")?;
+        unique_text(&self.impacted_scopes, "impacted_scopes")?;
+        nonempty(&self.revocation_evidence, "revocation_evidence")?;
+        let evidence = self
+            .revocation_evidence
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&evidence, "revocation_evidence")?;
+        text(&self.revoked_source_ref, "revoked_source_ref")?;
+        text(&self.rebuild_condition, "rebuild_condition")
+    }
+}
+
+/// Typed rebuild-from-clean-inputs requirement emitted by the revocation
+/// quarantine entry (I12.20 S1).
+///
+/// This crate owns typed transitions only and never persists records: the
+/// caller persists this order alongside the quarantined `Problem`, whose
+/// `evidence_refs` retain the revocation evidence. The quarantined record is
+/// rebuilt from clean inputs satisfying `rebuild_condition`, never from the
+/// revoked source. `validate` re-checks a reloaded order at the caller
+/// boundary.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationRebuildOrder {
+    pub problem_id: ProblemId,
+    pub impacted_scopes: Vec<String>,
+    pub revoked_source_ref: String,
+    pub rebuild_condition: String,
+    pub revocation_evidence: Vec<ArtifactId>,
+}
+
+impl RevocationRebuildOrder {
+    /// Validates the recorded rebuild requirement.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        nonempty(&self.impacted_scopes, "impacted_scopes")?;
+        unique_text(&self.impacted_scopes, "impacted_scopes")?;
+        nonempty(&self.revocation_evidence, "revocation_evidence")?;
+        let evidence = self
+            .revocation_evidence
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&evidence, "revocation_evidence")?;
+        text(&self.revoked_source_ref, "revoked_source_ref")?;
+        text(&self.rebuild_condition, "rebuild_condition")
+    }
+}
+
 /// Durable operational/cognitive/integration/data-quality problem.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -505,6 +573,75 @@ impl Problem {
             self.state,
             ProblemState::Resolved | ProblemState::AcceptedRisk | ProblemState::Superseded
         )
+    }
+
+    /// Revocation-driven quarantine entry for incomplete lineage (I12.20 S4).
+    ///
+    /// Given a bounded impacted scope plus revocation evidence, quarantines
+    /// exactly that bounded scope: the record's own `scope_id` must already
+    /// lie inside `request.impacted_scopes`, and the passed set is consumed
+    /// verbatim — never expanded by similarity and never replaced by a
+    /// whole-memory purge. A terminal record is opened through the existing
+    /// `reopen` entry (which still requires not-yet-attached revocation
+    /// evidence); an active record is reused with deduplicated revocation
+    /// evidence attached and its acknowledgement cleared. The record moves to
+    /// `Quarantined` and the typed rebuild-from-clean-inputs requirement
+    /// (I12.20 S1) is returned for the caller to persist alongside it.
+    /// `transition` and `reopen` are unchanged for non-revocation paths.
+    pub fn open_for_revocation(
+        &mut self,
+        expected_fence: &StateFence,
+        request: &RevocationQuarantine,
+    ) -> Result<RevocationRebuildOrder, ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        request.validate()?;
+        if !request.impacted_scopes.contains(&self.scope_id) {
+            return Err(ProblemError::InvalidField {
+                field: "impacted_scopes",
+                reason: "problem scope lies outside the bounded revocation scope",
+            });
+        }
+        if matches!(
+            self.state,
+            ProblemState::Resolved
+                | ProblemState::AcceptedRisk
+                | ProblemState::Superseded
+                | ProblemState::Quarantined
+        ) {
+            let fresh = request
+                .revocation_evidence
+                .iter()
+                .filter(|evidence| !self.evidence_refs.contains(evidence))
+                .cloned()
+                .collect::<Vec<_>>();
+            if fresh.is_empty() {
+                return Err(ProblemError::ReopenRequiresEvidence);
+            }
+            self.reopen(expected_fence, fresh)?;
+        } else {
+            for evidence in &request.revocation_evidence {
+                if !self.evidence_refs.contains(evidence) {
+                    self.evidence_refs.push(evidence.clone());
+                }
+            }
+            self.acknowledged_by = None;
+        }
+        self.state = ProblemState::Quarantined;
+        self.revision = self.revision.saturating_add(1);
+        if self.revision == 0 {
+            return Err(ProblemError::InvalidField {
+                field: "revision",
+                reason: "revision overflow",
+            });
+        }
+        self.validate()?;
+        Ok(RevocationRebuildOrder {
+            problem_id: self.problem_id.clone(),
+            impacted_scopes: request.impacted_scopes.clone(),
+            revoked_source_ref: request.revoked_source_ref.clone(),
+            rebuild_condition: request.rebuild_condition.clone(),
+            revocation_evidence: request.revocation_evidence.clone(),
+        })
     }
 }
 
