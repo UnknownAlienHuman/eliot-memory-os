@@ -2736,6 +2736,7 @@ mod tests {
             ("eliot-testd.exe", true),
             ("eliot-native-worker.exe", true),
             ("eliot-wasm-host.exe", true),
+            ("eliot-notify.exe", true),
             ("generation.json", false),
             ("eliotd-governor.json", false),
             ("eliotd.json", false),
