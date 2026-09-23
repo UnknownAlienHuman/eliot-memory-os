@@ -273,8 +273,32 @@ impl UserAutomationExecutionRequest {
                 "execution principal",
             ));
         }
+        validate_human_invocation_source(&self.context, &self.identity, &self.invocation)?;
         Ok(())
     }
+}
+
+fn validate_human_invocation_source(
+    context: &RequestMetadata,
+    identity: &OperationIdentity,
+    invocation: &UserAutomationInvocation,
+) -> Result<(), UserAutomationExecutionError> {
+    if invocation.trigger_origin
+        != eliot_kernel_core::user_automation::UserAutomationTriggerOrigin::Human
+    {
+        return Ok(());
+    }
+    let provenance = invocation.require_run_now_provenance(&context.state_fence)?;
+    if provenance.request_metadata != *context
+        || provenance.operation_id != identity.operation_id
+        || provenance.idempotency_key != identity.idempotency_key
+        || provenance.canonical_request_hash != identity.canonical_request_hash
+    {
+        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "human invocation source identity",
+        ));
+    }
+    Ok(())
 }
 
 /// Exact admitted input sent to the existing Durable Job/WakeIntent owners.
@@ -317,6 +341,7 @@ impl UserAutomationRuntimeAdmission {
         )?;
         self.revision.validate()?;
         self.invocation.validate()?;
+        validate_human_invocation_source(&self.context, &self.identity, &self.invocation)?;
         self.preflight
             .source_receipt
             .validate()
@@ -1375,6 +1400,7 @@ mod tests {
             workdir_ref: revision.workdir_ref.clone(),
             trigger_origin: UserAutomationTriggerOrigin::ScheduledWake,
             child_depth: 0,
+            provenance: None,
         };
         let occurrence_id = invocation.occurrence_identity().expect("occurrence");
         let wake_intent = revision

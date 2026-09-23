@@ -89,6 +89,7 @@ impl UserAutomationServiceRequest {
     fn store_request(&self) -> UserAutomationStoreRequest {
         UserAutomationStoreRequest {
             context: self.context.clone(),
+            authenticated_principal: self.authenticated_principal.clone(),
             identity: self.identity.clone(),
             intent: self.intent.clone(),
         }
@@ -101,6 +102,8 @@ impl UserAutomationServiceRequest {
 pub struct UserAutomationStoreRequest {
     /// Request metadata bound to the active State Fence.
     pub context: RequestMetadata,
+    /// Principal established by the authenticated Kernel/Host route.
+    pub authenticated_principal: String,
     /// Canonical Store operation/idempotency/request identity.
     pub identity: OperationIdentity,
     /// Closed UserAutomation operation selected by the authenticated caller.
@@ -115,6 +118,10 @@ impl UserAutomationStoreRequest {
             .map_err(|error| UserAutomationServiceError::Metadata(error.to_string()))?;
         self.identity.validate()?;
         self.intent.validate()?;
+        validate_text(&self.authenticated_principal, "authenticated_principal")?;
+        if self.intent.principal_ref != self.authenticated_principal {
+            return Err(UserAutomationServiceError::PrincipalMismatch);
+        }
         if self.intent.state_fence != self.context.state_fence {
             return Err(UserAutomationServiceError::FenceMismatch);
         }

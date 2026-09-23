@@ -1184,6 +1184,29 @@ impl KernelComposition {
                 ),
             ));
         }
+        let provenance = match invocation.require_run_now_provenance(&lookup.state_fence) {
+            Ok(provenance) => provenance,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(error.to_string()),
+                ));
+            }
+        };
+        let source_identity = OperationIdentity {
+            operation_id: provenance.operation_id.clone(),
+            idempotency_key: provenance.idempotency_key.clone(),
+            canonical_request_hash: provenance.canonical_request_hash.clone(),
+        };
+        if let Err(error) = ensure_user_automation_run_now_receipt(
+            &*gateway,
+            &lookup.state_fence,
+            &source_identity,
+            &invocation,
+        )
+        .await
+        {
+            return Ok(Self::user_automation_runtime_error_response(error));
+        }
         let owner_after = gateway
             .read_user_automation_owner(&lookup)
             .await
@@ -1274,8 +1297,13 @@ impl KernelComposition {
         if persisted != request.invocation {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
-        ensure_user_automation_store_receipt(&*gateway, &lookup.state_fence, &request.identity)
-            .await
+        ensure_user_automation_run_now_receipt(
+            &*gateway,
+            &lookup.state_fence,
+            &request.identity,
+            &request.invocation,
+        )
+        .await
     }
 
     #[cfg(windows)]
@@ -2060,6 +2088,25 @@ fn authenticated_user_automation_principal(
         PeerIdentity::Authenticated { .. } => Err(TransportError::PeerIdentityUnavailable),
         PeerIdentity::Unavailable { .. } => Err(TransportError::PeerIdentityUnavailable),
     }
+}
+
+#[cfg(windows)]
+async fn ensure_user_automation_run_now_receipt(
+    gateway: &eliot_kernel_service::KernelStoreGateway,
+    state_fence: &StateFence,
+    identity: &OperationIdentity,
+    invocation: &eliot_kernel_core::user_automation::UserAutomationInvocation,
+) -> Result<(), UserAutomationRuntimeError> {
+    let provenance = invocation
+        .require_run_now_provenance(state_fence)
+        .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+    if provenance.operation_id != identity.operation_id
+        || provenance.idempotency_key != identity.idempotency_key
+        || provenance.canonical_request_hash != identity.canonical_request_hash
+    {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    ensure_user_automation_store_receipt(gateway, state_fence, identity).await
 }
 
 #[cfg(windows)]

@@ -592,6 +592,18 @@ impl HostDurableJobOwner for HostKernelUserAutomationOwner {
         session
             .validate_authenticated_peer()
             .map_err(|error| owner_unavailable(error.to_string()))?;
+        request
+            .validate()
+            .map_err(|error| HostDurableJobOwnerError::Rejected(error.to_string()))?;
+        if context.state_fence != expected.state_fence
+            || request.request_identity.request.request.metadata.state_fence
+                != expected.state_fence
+        {
+            return Err(HostDurableJobOwnerError::Rejected(
+                "Durable Job request is not bound to the authenticated UserAutomation session fence"
+                    .to_owned(),
+            ));
+        }
         self.execute_dreamer_job(context, request).await
     }
 }

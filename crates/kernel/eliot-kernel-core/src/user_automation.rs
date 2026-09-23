@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
-    ContractIdentity, ContractVersion, PolicyRevision, RequestMetadata, StateFence,
+    ContractIdentity, ContractVersion, OperationId, PolicyRevision, RequestMetadata, StateFence,
     canonical_json_bytes, contract_identity, sha256_hex,
 };
 use eliot_platform::PlatformHandle;
@@ -26,7 +26,7 @@ use thiserror::Error;
 /// Stable contract name for the Kernel-owned UserAutomation domain.
 pub const USER_AUTOMATION_CONTRACT_NAME: &str = "eliot.kernel.user-automation";
 /// Current semantic contract revision.
-pub const USER_AUTOMATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const USER_AUTOMATION_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
 /// Selector used by authenticated Kernel/Host preflight reads.
 pub const USER_AUTOMATION_PREFLIGHT_SELECTOR: &str = "eliot.config.user_automation.v1";
 /// Operation marker used by the preflight read route.
@@ -679,6 +679,75 @@ pub enum UserAutomationTriggerOrigin {
     AutomationChild,
 }
 
+/// Persisted evidence for the request that first admitted this invocation.
+///
+/// The Store writes this alongside a RunNow invocation. It retains the exact
+/// task/session metadata, closed operator payload, and canonical write
+/// identity that produced the invocation; a later daemon selector cannot
+/// replace or manufacture these fields.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationInvocationProvenance {
+    /// Authenticated Kernel request context that admitted the operator action.
+    pub request_metadata: RequestMetadata,
+    /// Closed operation payload that produced this invocation.
+    pub source_operation: UserAutomationOperation,
+    /// Canonical Store operation identity for the source action.
+    pub operation_id: OperationId,
+    /// Idempotency identity for the source action.
+    pub idempotency_key: String,
+    /// Canonical request digest verified by the Store write path.
+    pub canonical_request_hash: String,
+}
+
+impl UserAutomationInvocationProvenance {
+    fn validate_for(
+        &self,
+        invocation: &UserAutomationInvocation,
+        expected_state_fence: &StateFence,
+    ) -> Result<(), UserAutomationError> {
+        self.request_metadata
+            .validate()
+            .map_err(|_| UserAutomationError::Invalid("invocation.provenance.request_metadata"))?;
+        self.source_operation.validate()?;
+        text(&self.idempotency_key, "invocation.provenance.idempotency_key")?;
+        if self.canonical_request_hash.len() != 64
+            || !self
+                .canonical_request_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(UserAutomationError::Invalid(
+                "invocation.provenance.canonical_request_hash",
+            ));
+        }
+        if self.request_metadata.state_fence != *expected_state_fence
+            || self.request_metadata.session_id.is_none()
+            || self.request_metadata.task_id.is_none()
+        {
+            return Err(UserAutomationError::ReceiptBinding);
+        }
+
+        match (&self.source_operation, &invocation.trigger) {
+            (
+                UserAutomationOperation::RunNow {
+                    automation_id,
+                    automation_revision,
+                    nonce,
+                },
+                UserAutomationTrigger::Manual {
+                    nonce: invocation_nonce,
+                },
+            ) if automation_id == &invocation.automation_id
+                && automation_revision == &invocation.automation_revision
+                && nonce == invocation_nonce
+                && invocation.trigger_origin == UserAutomationTriggerOrigin::Human
+                && invocation.child_depth == 0 => Ok(()),
+            _ => Err(UserAutomationError::ReceiptBinding),
+        }
+    }
+}
+
 /// Authenticated invocation selector accepted by the Kernel owner route.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -701,6 +770,11 @@ pub struct UserAutomationInvocation {
     pub trigger_origin: UserAutomationTriggerOrigin,
     /// Child depth carried by the admitted lineage.
     pub child_depth: u16,
+    /// Original owner-admitted request and exact RunNow receipt identity.
+    /// Older persisted invocations deserialize without provenance but are
+    /// rejected by production admission until reconciled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<UserAutomationInvocationProvenance>,
 }
 
 impl UserAutomationInvocation {
@@ -712,6 +786,20 @@ impl UserAutomationInvocation {
         text(&self.principal_ref, "principal_ref")?;
         text(&self.work_scope_ref, "work_scope_ref")?;
         text(&self.workdir_ref, "workdir_ref")
+    }
+
+    /// Requires task/session and exact RunNow receipt provenance at the
+    /// production owner-admission boundary.
+    pub fn require_run_now_provenance(
+        &self,
+        expected_state_fence: &StateFence,
+    ) -> Result<&UserAutomationInvocationProvenance, UserAutomationError> {
+        let provenance = self
+            .provenance
+            .as_ref()
+            .ok_or(UserAutomationError::ReceiptBinding)?;
+        provenance.validate_for(self, expected_state_fence)?;
+        Ok(provenance)
     }
 
     /// Returns the stable revision-bound occurrence identity.
@@ -1806,6 +1894,7 @@ mod tests {
             workdir_ref: active.workdir_ref.clone(),
             trigger_origin: UserAutomationTriggerOrigin::ScheduledWake,
             child_depth: 0,
+            provenance: None,
         };
         let projection = UserAutomationPreflightProjection {
             automation_id: active.automation_id.clone(),
@@ -1890,6 +1979,7 @@ mod tests {
             workdir_ref: base.workdir_ref.clone(),
             trigger_origin: UserAutomationTriggerOrigin::Human,
             child_depth: 0,
+            provenance: None,
         };
         let scheduled = common(UserAutomationTrigger::Scheduled {
             occurrence_key: base.schedule.next_occurrences[0].clone(),

@@ -18,7 +18,7 @@ use std::sync::Mutex;
 
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
-    SourceId, StateFence,
+    SessionId, SourceId, StateFence, TaskId,
 };
 use eliot_kernel_core::user_automation::{
     AutomationCapabilityProfile, AutomationDeliveryTarget, AutomationResourceCeiling,
@@ -55,8 +55,8 @@ fn fence() -> StateFence {
 fn context() -> RequestMeta {
     RequestMeta {
         request_id: RequestId::new("request-automation-port").expect("request"),
-        session_id: None,
-        task_id: None,
+        session_id: Some(SessionId::new("session-automation-port").expect("session")),
+        task_id: Some(TaskId::new("task-automation-port").expect("task")),
         product_id: ProductId::new("product-automation").expect("product"),
         source_id: SourceId::new("owner-1").expect("source"),
         state_fence: fence(),
@@ -460,6 +460,7 @@ fn store_request(
 ) -> UserAutomationStoreRequest {
     UserAutomationStoreRequest {
         context: context(),
+        authenticated_principal: "human-1".to_owned(),
         identity: OperationIdentity {
             operation_id: OperationId::new(operation_id).expect("operation"),
             idempotency_key: format!("idem-{operation_id}"),
@@ -698,6 +699,8 @@ async fn run_now_projects_invocation_and_pending_wake() {
         },
     )
     .await;
+    let expected_identity = response.identity.clone();
+    let expected_fence = response.state_fence.clone();
     let UserAutomationStoreOutcome::Committed { result, .. } = response.outcome else {
         panic!("run-now must commit");
     };
@@ -720,6 +723,41 @@ async fn run_now_projects_invocation_and_pending_wake() {
         invocation.trigger_origin,
         UserAutomationTriggerOrigin::Human
     );
+    let provenance = invocation
+        .require_run_now_provenance(&expected_fence)
+        .expect("RunNow retains authenticated Human provenance");
+    assert!(provenance.request_metadata.session_id.is_some());
+    assert!(provenance.request_metadata.task_id.is_some());
+    assert_eq!(provenance.source_operation, UserAutomationOperation::RunNow {
+        automation_id: "auto-1".to_owned(),
+        automation_revision: "r-1".to_owned(),
+        nonce: "nonce-7".to_owned(),
+    });
+    assert_eq!(provenance.operation_id, expected_identity.operation_id);
+    assert_eq!(provenance.idempotency_key, expected_identity.idempotency_key);
+    assert_eq!(
+        provenance.canonical_request_hash,
+        expected_identity.canonical_request_hash
+    );
+    let mut missing_task = invocation.clone();
+    missing_task
+        .provenance
+        .as_mut()
+        .expect("stored provenance")
+        .request_metadata
+        .task_id = None;
+    assert!(missing_task.require_run_now_provenance(&expected_fence).is_err());
+    let mut changed_nonce = invocation.clone();
+    let UserAutomationTrigger::Manual { nonce } = &mut changed_nonce.trigger else {
+        panic!("RunNow trigger is manual");
+    };
+    *nonce = "different-nonce".to_owned();
+    assert!(changed_nonce
+        .require_run_now_provenance(&expected_fence)
+        .is_err());
+    let mut child = invocation.clone();
+    child.child_depth = 1;
+    assert!(child.require_run_now_provenance(&expected_fence).is_err());
     assert_eq!(
         invocation
             .occurrence_identity()

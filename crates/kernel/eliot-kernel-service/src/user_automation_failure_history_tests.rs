@@ -243,6 +243,7 @@ fn blocked_projection(
         workdir_ref: rev.workdir_ref.clone(),
         trigger_origin: UserAutomationTriggerOrigin::ScheduledWake,
         child_depth: 0,
+        provenance: None,
     };
     let occurrence_id = invocation.occurrence_identity().expect("occurrence");
     let wake_intent = rev

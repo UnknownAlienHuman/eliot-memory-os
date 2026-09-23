@@ -1086,19 +1086,35 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 reason: "nonce must be non-blank text",
             });
         }
-        Ok(UserAutomationInvocation {
+        let invocation = UserAutomationInvocation {
             automation_id: revision.automation_id.clone(),
             automation_revision: revision.revision.clone(),
             trigger: eliot_kernel_core::user_automation::UserAutomationTrigger::Manual {
                 nonce: nonce.to_owned(),
             },
             mode: revision.mode,
-            principal_ref: request.intent.principal_ref.clone(),
+            principal_ref: request.authenticated_principal.clone(),
             work_scope_ref: revision.work_scope.scope_id.clone(),
             workdir_ref: revision.workdir_ref.clone(),
             trigger_origin: eliot_kernel_core::user_automation::UserAutomationTriggerOrigin::Human,
             child_depth: 0,
-        })
+            provenance: Some(
+                eliot_kernel_core::user_automation::UserAutomationInvocationProvenance {
+                    request_metadata: request.context.clone(),
+                    source_operation: request.intent.operation.clone(),
+                    operation_id: request.identity.operation_id.clone(),
+                    idempotency_key: request.identity.idempotency_key.clone(),
+                    canonical_request_hash: request.identity.canonical_request_hash.clone(),
+                },
+            ),
+        };
+        invocation
+            .require_run_now_provenance(&request.context.state_fence)
+            .map_err(|_| StoreError::InvalidField {
+                field: "automation.invocation.provenance",
+                reason: "RunNow requires authenticated task/session and exact source operation",
+            })?;
+        Ok(invocation)
     }
 
     /// Projects the typed mutation result from current store rows.
