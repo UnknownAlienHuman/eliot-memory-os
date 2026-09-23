@@ -1992,14 +1992,27 @@ async fn automation_failure_payload(
 /// Projects durable `CaptureObservation` evidence subjects as envelope
 /// candidates through the shared `audit_envelope_candidate` filter
 /// (memory-contour parity: fence-gated, scope-agnostic, ordinary
-/// non-envelope captures skipped, never failed). Each candidate row
-/// re-validates its bytes/digest provenance before shaping, so
-/// substituted or truncated evidence fails closed instead of projecting.
-/// Reads beyond `MAX_AUDIT_RANGE_RECORDS` fail closed with
-/// `PayloadTooLarge` instead of truncating. Candidate-only: full
-/// envelope validation and live-journal presence binding stay
-/// downstream, so a carried candidate can never become a false journal
-/// record here.
+/// non-envelope captures skipped, never failed). F2 resolution: no
+/// store-level scope filtering, per the established in-catalogue
+/// scope-free reads (`GetNotificationState`, `GetReactiveInjectionState`,
+/// `GetResourceSnapshot`: facade caller scope required, catalogue rows
+/// scope-free) with scope gating at the decision layer per I12-26 — filtering here would diverge the
+/// contours and drop scope-free records the consumer must see. Each
+/// candidate row re-validates its bytes/digest provenance before
+/// shaping, so substituted or truncated evidence fails closed instead
+/// of projecting.
+///
+/// Continuation cursors (optional `cursor` selector): an absent cursor
+/// reads from the start and fails closed with `PayloadTooLarge` past
+/// `MAX_AUDIT_RANGE_RECORDS` instead of truncating; a present cursor
+/// verified by `audit_cursor_parse` against this fence resumes paging
+/// past that candidate ordinal (commit-sequence, evidence-position
+/// order) with the same bound and no overflow failure. Cross-fence or
+/// malformed cursors fail closed; cursors stay valid only while
+/// revision heads are unchanged (the consumer re-proves heads per read
+/// and restarts paging on advance). Candidate-only: full envelope
+/// validation and live-journal presence binding stay downstream, so a
+/// carried candidate can never become a false journal record here.
 async fn audit_range_payload(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -2015,7 +2028,11 @@ async fn audit_range_payload(
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
     let rows = read_evidence_records(db, config).await?;
-    let mut records = Vec::new();
+    // Deterministic candidate order across calls: commit sequence, then
+    // per-receipt evidence position. Cursors resume by ordinal in this
+    // order and stay valid only while revision heads are unchanged (the
+    // consumer re-proves heads per read and restarts paging on advance).
+    let mut ordered: Vec<(u64, usize, Value)> = Vec::new();
     for row in &rows {
         let fenced = match &row.receipt {
             Some(receipt) if receipt.state_fence == *state_fence => true,
@@ -2024,16 +2041,38 @@ async fn audit_range_payload(
         if !fenced {
             continue;
         }
-        for evidence in row.evidence_records.iter().flatten() {
+        let sequence = row.commit_sequence.unwrap_or(u64::MAX);
+        for (index, evidence) in row.evidence_records.iter().flatten().enumerate() {
             validate_evidence_record(row, evidence).map_err(AdapterError::Store)?;
             if let Some(candidate) =
                 eliot_store_api::audit_envelope_candidate(&evidence.subject)
             {
-                records.push(candidate);
+                ordered.push((sequence, index, candidate));
             }
-            if records.len() > eliot_store_api::MAX_AUDIT_RANGE_RECORDS as usize {
+        }
+    }
+    ordered.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    let mut records = Vec::new();
+    let mut ordinal: u64 = 0;
+    for (_, _, candidate) in ordered {
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
+        records.push(candidate);
+        if records.len() > eliot_store_api::MAX_AUDIT_RANGE_RECORDS as usize {
+            if start.is_none() {
                 return Err(AdapterError::Store(StoreError::PayloadTooLarge));
             }
+            records.pop();
+            break;
         }
     }
     Ok(json!({ "records": records }))

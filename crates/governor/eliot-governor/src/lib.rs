@@ -39,6 +39,7 @@ mod composition;
 mod context_inputs;
 mod cue_composition;
 mod epistemic_composition;
+mod experience_commit;
 mod finish_attempt;
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
@@ -50,6 +51,7 @@ pub use cue_composition::{
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
+pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
 pub use finish_attempt::{FinishAttemptError, GovernorFinishAttempt};
 mod controlboard_projection;
 mod observation_reconciliation;

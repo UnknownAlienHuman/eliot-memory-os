@@ -1773,24 +1773,45 @@ fn experience_range_payload(
 /// subjects that parse as JSON objects carrying a string `record_id`
 /// are carried verbatim; ordinary non-envelope captures are skipped
 /// (normal store content, never corruption). No scope filtering: command
-/// scopes need not match event scopes, and the consumer (provider
-/// presence-binding plus Governor scope revalidation) owns scope
-/// gating — store-level scope filtering here would silently drop records
-/// the consumer must see. Fence agreement is enforced by the caller: this
-/// helper runs only after `execute_named_sync` proves the query fence
-/// equals the state fence. Reads beyond
+/// scopes need not match event scopes, and the coordinated consumer
+/// carries scope-free gap/control records regardless of scope, so
+/// store-level scope filtering here would silently drop records the
+/// consumer must see (F2 resolution: scope-free catalogue rows per the
+/// established in-catalogue scope-free reads (`GetNotificationState`,
+/// `GetReactiveInjectionState`, `GetResourceSnapshot`) — facade caller
+/// scope required, catalogue rows scope-free — with scope gating at the
+/// decision layer per I12-26). Fence agreement is enforced by the caller: this helper runs
+/// only after `execute_named_sync` proves the query fence equals the
+/// state fence. Reads beyond
 /// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
 /// fail closed with [`StoreError::PayloadTooLarge`] instead of
 /// truncating: a truncated audit range cannot prove journal
 /// completeness. This projects candidates only — full envelope
 /// validation and live-journal presence binding stay downstream, so a
 /// carried candidate can never become a false journal record here.
-/// Projects durable capture subjects as envelope candidates. Fence
-/// agreement is enforced by the caller: this helper runs only after
-/// `execute_named_sync` proves the query fence equals the state fence.
-fn audit_range_payload(state: &MemoryState) -> Result<Value, serde_json::Error> {
-    use eliot_store_api::MAX_AUDIT_RANGE_RECORDS;
+///
+/// Continuation cursors (optional `cursor` selector): an absent cursor
+/// reads from the start and fails closed with
+/// [`StoreError::PayloadTooLarge`] past
+/// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
+/// instead of truncating; a present cursor verified by
+/// `audit_cursor_parse` against this fence resumes paging past that
+/// candidate ordinal with the same bound and no overflow failure.
+/// Cross-fence or malformed cursors fail closed.
+fn audit_range_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, serde_json::Error> {
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, fence)
+                .map_err(|error| serde_json::Error::custom(error.to_string()))?,
+        ),
+    };
     let mut records = Vec::new();
+    let mut ordinal: u64 = 0;
     for record in &state.named_operations {
         if record.operation.operation != NamedMutationOperation::CaptureObservation {
             continue;
@@ -1803,13 +1824,22 @@ fn audit_range_payload(state: &MemoryState) -> Result<Value, serde_json::Error> 
         else {
             continue;
         };
-        if let Some(candidate) = eliot_store_api::audit_envelope_candidate(subject) {
-            records.push(candidate);
+        let Some(candidate) = eliot_store_api::audit_envelope_candidate(subject) else {
+            continue;
+        };
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
         }
-        if records.len() > MAX_AUDIT_RANGE_RECORDS as usize {
-            return Err(serde_json::Error::custom(
-                "audit range exceeds the bounded maximum",
-            ));
+        records.push(candidate);
+        if records.len() > eliot_store_api::MAX_AUDIT_RANGE_RECORDS as usize {
+            if start.is_none() {
+                return Err(serde_json::Error::custom(
+                    "audit range exceeds the bounded maximum",
+                ));
+            }
+            records.pop();
+            break;
         }
     }
     serde_json::to_value(json!({ "records": records }))
@@ -2641,7 +2671,7 @@ impl MemoryStore {
             NamedReadOperation::GetAgentFeedbackRange => {
                 experience_range_payload(&state, query, &fence, false)
             }
-            NamedReadOperation::GetAuditRange => audit_range_payload(&state),
+            NamedReadOperation::GetAuditRange => audit_range_payload(&state, query, &fence),
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
                 "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),

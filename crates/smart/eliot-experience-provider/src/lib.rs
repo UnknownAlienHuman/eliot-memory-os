@@ -84,6 +84,49 @@
 //! are reused unchanged), and journal-only assessment stays valid
 //! (`assess_self_quality` requires at least one family, not all three).
 //! Durable bank/feedback bridge execution remains the #19 join.
+//!
+//! ## Seam: dreamer-memory-revision consumer (sibling lane, not duplicated)
+//!
+//! The `propose` consumer (`Result<NegativeMemoryExtinctionCandidate,
+//! RevisionError>`) lives ONLY on sibling branch
+//! `work/223-dreamer-memory-revision-scope @
+//! cdd6305ff0ab838e9e2855d5f6f0ac8b940012a79fe0`:
+//! `crates/smart/eliot-dreamer-memory-revision/src/lib.rs` (`propose` at
+//! line 290 over `RevisionIntake` at line 253). Its `RevisionIntake`
+//! input shapes `FailureObservation` (observation-contracts role) and
+//! `MemoryRevisionEvidence` exist nowhere on main (main carries only
+//! that crate's `module.toml`): similarly-named main types do not
+//! satisfy the intake — `FailureObservationState` (dreamer-contracts
+//! failure-curation state enum) is a different type and role, and the
+//! MCP surface `FailureObservation` DTO is explicitly rejected as
+//! owner-neutral contract material by the freeze readback rule. The
+//! sibling crate is not a workspace member, so no path dependency may
+//! target it and vendoring its core would fork sibling-owned source. A caller here
+//! becomes compilable when the sibling crate lands on main as a member:
+//! `RevisionIntake` over owner-held observation, evidence,
+//! `TaskProjection`/`SafetyProjection` (context contracts, on main),
+//! `SelfQueryInput` (dreamer contracts, on main), `AcceptedSourceProjection`
+//! (dreamer contracts, on main), pose digest, and candidate id — then a
+//! `produce_dreamer_revision` caller mirrors the understanding legs
+//! above. Until then this seam is recorded, not fabricated.
+//!
+//! ## Seam: durable commit transition (canonical transition owner)
+//!
+//! Persisting admitted bank/feedback records requires a canonical
+//! transition the Governor canonical owner admits: an envelope carrying
+//! `CommitExperienceBank` / `CommitAgentFeedback` (built from
+//! `ExperienceCommitParameters`, already produced owner-side by
+//! `produce_bank_commit` / `produce_feedback_commit`) admitted through
+//! `CanonicalTransitionOwner::commit(envelope: CanonicalWriteEnvelope)`
+//! (`crates/governor/eliot-canonical/src/lib.rs:723`, type
+//! `PreparedTransition` at `crates/storage/eliot-store-api/src/lib.rs:1442`)
+//! to a `WriteReceipt`. The named commit legs belong to the store bridge
+//! (#19 registration); the Governor-side commit-leg driver belongs to
+//! the canonical-transition owner lane (brief names lane Pascal —
+//! confirm via the M1/root live map; code ownership is unambiguous
+//! above). This cell performs no writes and mints no transitions: the
+//! read legs here consume the same rows that path persists, bound by
+//! digest re-proof on readback.
 
 #![forbid(unsafe_code)]
 
@@ -99,6 +142,13 @@ use eliot_cognitive_quality::{
 use eliot_epistemic_contracts::CurrentEpistemicPosition;
 use eliot_experience_projection::{revalidate_bank_refs, revalidate_feedback_refs};
 use eliot_learning_contracts::HarnessActivationReceiptCandidate;
+use eliot_memory_quality::{MemoryEcologyAssessment, QualityRequest, assess_quality};
+use eliot_memory_quality::QualityError as MemoryQualityError;
+use eliot_understanding_assessment::{
+    CommonGroundAssessment, CommonGroundInput, ScopedInput, ScopedUnderstandingAssessment,
+    assess_common_ground, assess_scoped,
+};
+use eliot_understanding_assessment::AssessmentError as UnderstandingError;
 use eliot_observation_contracts::{
     AgentFeedbackRecord, BankProjection, CoverageDisposition, CoverageEvidence, ExperienceBankRecord,
     ExperienceRetentionReadPosture, ExperienceSourceFamily, FeedbackProjection, JournalProjection,
@@ -170,6 +220,12 @@ pub enum ProviderError {
     /// A Smart consumer assessment rejected the supplied owner inputs.
     #[error("quality consumer: {0}")]
     Quality(#[from] QualityError),
+    /// A memory-quality consumer rejected the supplied owner inputs.
+    #[error("memory quality consumer: {0}")]
+    MemoryQuality(#[from] MemoryQualityError),
+    /// An understanding-assessment consumer rejected the supplied inputs.
+    #[error("understanding consumer: {0}")]
+    Understanding(#[from] UnderstandingError),
     /// A projection or view contract rejected the shaped read.
     #[error("projection contract: {0}")]
     Contract(#[from] ObservationError),
@@ -867,4 +923,50 @@ pub fn assess_and_recheck(
     };
     recheck_candidate(&candidate, &snapshot).map_err(ProviderError::Quality)?;
     Ok(candidate)
+}
+
+/// Memory-quality consumer invocation: assess one owner batch.
+///
+/// Calls the released [`assess_quality`](eliot_memory_quality::assess_quality)
+/// consumer with the edge-supplied owner request (bounded batch, owner
+/// applicability verdict, admitted projections, advisory receipts). The
+/// memory family has no provider read path in this lane: every member
+/// arrives as an owner value through the request, validated there. The
+/// returned assessment carries gravity, maintenance, and counter-metric
+/// sections with explicit coverage; no score, rank, or lifecycle
+/// transition is emitted.
+pub fn produce_memory_quality(
+    request: &QualityRequest,
+) -> Result<MemoryEcologyAssessment, ProviderError> {
+    assess_quality(request).map_err(ProviderError::MemoryQuality)
+}
+
+/// Understanding consumer invocation: assess one subject scope.
+///
+/// Calls the released [`assess_scoped`](eliot_understanding_assessment::assess_scoped)
+/// consumer with the edge-supplied scoped input (owner context with
+/// experience envelopes, scope, cites, closure). The caller binds
+/// outcome-side experience evidence; this function performs no binding
+/// of its own. The returned assessment is finding-free candidate
+/// material for Governor/Human review, never a verdict.
+pub fn produce_understanding_assessment(
+    input: ScopedInput<'_>,
+) -> Result<ScopedUnderstandingAssessment, ProviderError> {
+    assess_scoped(input).map_err(ProviderError::Understanding)
+}
+
+/// Understanding consumer invocation: assess common ground.
+///
+/// Calls the released [`assess_common_ground`](eliot_understanding_assessment::assess_common_ground)
+/// consumer with the edge-supplied common-ground input (owner context
+/// with experience envelopes, scope, per-slot compatibility cites,
+/// requalification scope, closure). Same binding rule as
+/// [`produce_understanding_assessment`]: outcome-side experience
+/// evidence arrives bound by the caller. Terminology, reference,
+/// commitment, action-consequence, survival, and transfer cites stay
+/// caller-supplied; nothing is inferred here.
+pub fn produce_common_ground_assessment(
+    input: CommonGroundInput<'_>,
+) -> Result<CommonGroundAssessment, ProviderError> {
+    assess_common_ground(input).map_err(ProviderError::Understanding)
 }
