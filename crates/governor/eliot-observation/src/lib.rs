@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bank_admission;
 mod classifier;
 
 use std::collections::{BTreeMap, BTreeSet};

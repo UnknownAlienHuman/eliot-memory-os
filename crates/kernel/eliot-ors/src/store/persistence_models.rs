@@ -100,3 +100,31 @@ pub(super) struct DurableSupervisionLeaseResult {
     pub(super) artifact: SignedSupervisionLease,
     pub(super) snapshot: SupervisionLeaseSnapshot,
 }
+
+/// Durable grant-closure row: one committed closure operation identity with
+/// its exact commit bytes, non-semantic phase, and monotonic order.
+///
+/// The row never transitions. An exact recommit replays its receipt; any
+/// changed content under one operation identity is a durable conflict.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DurableGrantClosureRecord {
+    pub(super) commit: crate::GrantClosureCommit,
+    pub(super) phase: OperationalPhase,
+    pub(super) operation_order: u64,
+}
+
+/// Durable grant-graph revision watermark: the greatest graph revision
+/// observed for one lineage root, with the monotonic order of its last
+/// advance.
+///
+/// The watermark only moves forward. It lets the P-07 port enforce revision
+/// monotonicity across restarts instead of trusting a re-presented revision
+/// as the first observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DurableGrantGraphRevision {
+    pub(super) root: crate::OpaqueLabel,
+    pub(super) revision: u64,
+    pub(super) operation_order: u64,
+}

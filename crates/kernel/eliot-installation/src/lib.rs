@@ -44,14 +44,14 @@ use eliot_platform_windows::{
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
     InstallerSecretObservation, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
     ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
-    ServiceRegistrationInspection, ServiceRegistrationOutcome, ServiceRegistrationRequest,
-    ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStartOutcome,
-    ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
-    SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease, WindowsInstallerRootPrimitive,
-    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
-    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
-    fresh_service_registration_nonce, observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
+    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
+    ServiceRegistrationRuntimeReadback, ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
+    StagingReceipt, SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
+    UserOwnedPathLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
+    WindowsPlatform, WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
+    current_user_local_app_data_root, fresh_service_registration_nonce,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
 use eliot_platform_windows::{
@@ -150,8 +150,10 @@ pub use approved_generation_registry::{
     phase_b_digest_state, phase_b_scm_selector,
 };
 use approved_generation_registry::{
-    ActiveVerifiedReceiptBinding, PendingActivationTerminal, PendingActivationTerminalDisposition,
+    ActiveVerifiedReceiptBinding, PendingActivationAbortReceipt, PendingActivationTerminal,
+    PendingActivationTerminalDisposition, activation_abort_receipt_digest,
     activation_terminal_digest, candidate_manifest_digest, phase_b_scm_digest,
+    activation_projection_intent_digest,
     registry_projection_identity, validate_phase_b_scm_digest,
 };
 #[cfg(test)]
@@ -300,17 +302,21 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// Version 22 separates filesystem and Credential Manager create dispositions
 /// and requires the keyed non-secret credential creation proof. Version 23
 /// adds the optional, digest-bound agent-bridge source materialization plan.
+/// Version 24 binds the SCM grant OWNER|GROUP proof from the same live handle
+/// into the durable registration receipt and its canonical marker digest.
 /// Older wires cannot be interpreted as this effect set.
 /// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(23, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(24, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
 /// Registry wire version 12 binds the provisioned supervision authority into
 /// pending Phase-B receipts and committed/rebound live bindings. Version 15
 /// binds each Watchdog approval to the exact installer-read SCM control grant.
+/// Version 16 carries the complete OWNER|GROUP|DACL proof in every durable
+/// service-control grant receipt.
 /// Older projections are never defaulted into current authority.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(15, 0, 0);
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(16, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -4476,8 +4482,8 @@ impl WindowsInstallationEffectPort {
     ) -> Result<InstallationEffectObservation, PortError> {
         let (platform, registration, spec) = Self::service_context(request)?;
         let service_name = registration.service_name().to_owned();
-        match platform.inspect_service_registration(&registration) {
-            ServiceRegistrationInspection::Absent { proof } => {
+        match platform.inspect_service_registration_runtime_with_control_grant(&registration) {
+            ServiceRegistrationRuntimeReadback::Absent { proof } => {
                 if std::fs::symlink_metadata(service_marker_path(request)).is_ok() {
                     return Ok(root_mismatch("service-marker-before-intent"));
                 }
@@ -4489,7 +4495,7 @@ impl WindowsInstallationEffectPort {
                     &spec,
                 )
             }
-            ServiceRegistrationInspection::Matching { control_grant, .. } => {
+            ServiceRegistrationRuntimeReadback::Matching { control_grant, .. } => {
                 let digest = registration.expected_configuration_digest();
                 let control_grant = control_grant
                     .as_ref()
@@ -4505,7 +4511,7 @@ impl WindowsInstallationEffectPort {
                 if matches!(
                     &request.plan,
                     InstallerEffectPlan::RegisterService {
-                        role: InstallerServiceRole::Host,
+                        role: InstallerServiceRole::Host | InstallerServiceRole::Watchdog,
                         ..
                     }
                 ) && control_grant.is_none()
@@ -4531,8 +4537,10 @@ impl WindowsInstallationEffectPort {
                     ),
                 }
             }
-            ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
+            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
+                Ok(root_mismatch("service-readback"))
+            }
         }
     }
 
@@ -4543,15 +4551,17 @@ impl WindowsInstallationEffectPort {
         let (platform, registration, spec) = Self::service_context(request)?;
         let service_name = registration.service_name().to_owned();
         let digest = registration.expected_configuration_digest();
-        match platform.inspect_service_registration(&registration) {
-            ServiceRegistrationInspection::Absent { proof } => service_absent_from_live_inspection(
-                request,
-                &registration,
-                &proof,
-                &self.primitive,
-                &spec,
-            ),
-            ServiceRegistrationInspection::Matching { control_grant, .. } => {
+        match platform.inspect_service_registration_runtime_with_control_grant(&registration) {
+            ServiceRegistrationRuntimeReadback::Absent { proof } => {
+                service_absent_from_live_inspection(
+                    request,
+                    &registration,
+                    &proof,
+                    &self.primitive,
+                    &spec,
+                )
+            }
+            ServiceRegistrationRuntimeReadback::Matching { control_grant, .. } => {
                 let control_grant = control_grant
                     .as_ref()
                     .map(InstallerServiceControlGrantReceipt::from_readback)
@@ -4564,7 +4574,7 @@ impl WindowsInstallationEffectPort {
                 if matches!(
                     &request.plan,
                     InstallerEffectPlan::RegisterService {
-                        role: InstallerServiceRole::Host,
+                        role: InstallerServiceRole::Host | InstallerServiceRole::Watchdog,
                         ..
                     }
                 ) && control_grant.is_none()
@@ -4617,8 +4627,10 @@ impl WindowsInstallationEffectPort {
                     control_grant,
                 )
             }
-            ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
+            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
+                Ok(root_mismatch("service-readback"))
+            }
         }
     }
 
@@ -5843,7 +5855,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             return PortOutcome::Error(PortError::InvalidRequestMetadata);
         };
         // s38 (#1345): Host and Watchdog creations both require the
-        // installer-policy DACL proof before the ownership marker may be
+        // installer-policy OWNER|GROUP|DACL proof before the ownership marker may be
         // minted. Older platform builds never return a Host grant, so Host
         // creation honestly stays `Unknown` until the platform generalizes
         // the grant install/read (WRITER-A); it can never be reported
@@ -6480,7 +6492,9 @@ fn root_mismatch(reason: &str) -> InstallationEffectObservation {
     }
 }
 
-const SERVICE_MARKER_VERSION: u32 = 2;
+// The path namespace stays stable so an older marker is observed and rejected
+// during reconciliation instead of being bypassed by a new marker path.
+const SERVICE_MARKER_VERSION: u32 = 3;
 const SERVICE_MARKER_LIMIT: u64 = 16 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -6613,7 +6627,7 @@ fn service_marker_read(
 /// The proof must bind this exact validated registration; a proof for any
 /// other name or configuration digest is a provider/readback substitution and
 /// fails closed. Evidence binds the effect, plan, observed service identity,
-/// and the `DOES_NOT_EXIST` outcome, mirroring the service-matching-v2
+/// and the `DOES_NOT_EXIST` outcome, mirroring the service-matching-v3
 /// binding. The precondition is cloned unchanged so an admitted snapshot is
 /// preserved verbatim.
 fn service_absent_observation(
@@ -6731,7 +6745,7 @@ fn service_matching_observation(
         .map_or("none", PlatformHandle::as_str);
     let evidence = PlatformHandle::new(sha256_hex(
         format!(
-            "service-matching-v2\0{}\0{}\0{}\0{}\0{}",
+            "service-matching-v3\0{}\0{}\0{}\0{}\0{}",
             request.effect_id.as_str(),
             request.plan_digest.as_str(),
             configuration_digest,
@@ -6743,7 +6757,7 @@ fn service_matching_observation(
     .map_err(|_| PortError::InvalidRequestMetadata)?;
     let postcondition_digest = PlatformHandle::new(sha256_hex(
         format!(
-            "service-postcondition-v2\0{}\0{}\0{}\0{}",
+            "service-postcondition-v3\0{}\0{}\0{}\0{}",
             request.effect_id.as_str(),
             configuration_digest,
             marker_digest.as_str(),
@@ -9264,6 +9278,105 @@ where
 }
 
 impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
+    /// Rolls back a first-install activation intent only after the Host-owned
+    /// registry has durably acknowledged the exact `ABORTED` terminal.
+    ///
+    /// The ordinary `rollback` seam deliberately continues to reject a
+    /// transaction carrying an activation intent.  Production recovery callers
+    /// must supply the already-open Host owner capability and registry through
+    /// this explicit owner-aware seam; no caller-supplied approval fields are
+    /// accepted.
+    pub fn rollback_with_activation_owner(
+        &mut self,
+        registry: &RedbInstallationRegistry,
+        host: &HostOwnerEpochCapability,
+        transaction_id: &PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let transaction = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let Some(intent) = transaction.activation_projection_intent().cloned() else {
+            return self.inner.rollback(transaction_id);
+        };
+        if transaction.stage() != InstallationStage::Activating {
+            return Err(InstallationError::IllegalTransition {
+                from: transaction.stage(),
+                to: InstallationStage::RolledBack,
+            });
+        }
+        if transaction.no_return_boundary.is_some() || transaction.active_verified_receipt.is_some()
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "activation rollback is refused after the no-return or committed-activation boundary"
+                    .to_owned(),
+            ));
+        }
+        if transaction.current_active_manifest.is_some() || transaction.last_known_good.is_some() {
+            return Err(InstallationError::IncompleteObservation(
+                "activation-intent rollback is restricted to a first installation".to_owned(),
+            ));
+        }
+        // This is the pre-no-return contour: service starts, credential, and
+        // Phase-B effects are still pending and carry no runtime receipt.
+        transaction.require_signed_pending_activation_effects()?;
+        let approval = intent.derive_verified_approval(&transaction)?;
+        let manifest_digest = candidate_manifest_digest(&transaction.candidate_manifest)?;
+        let activation_intent_digest = activation_projection_intent_digest(&intent)?;
+        let expected_transaction = TransactionVersion::of(&transaction)?;
+        let abort_evidence = match registry.read_exact_aborted_activation_ack(
+            host,
+            transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest.generation,
+            &manifest_digest,
+            &approval,
+            &activation_intent_digest,
+        )? {
+            Some(evidence) => evidence,
+            None => {
+                let pending_revision = registry.read_exact_pending_activation_revision(
+                    host,
+                    transaction_id,
+                    &transaction.installer_plan_digest,
+                    &approval,
+                    &activation_intent_digest,
+                )?;
+                registry.abort_pending_activation_exact(
+                    host,
+                    pending_revision,
+                    &approval,
+                    &activation_intent_digest,
+                )?;
+                registry
+                    .read_exact_aborted_activation_ack(
+                        host,
+                        transaction_id,
+                        &transaction.installer_plan_digest,
+                        &transaction.candidate_manifest.generation,
+                        &manifest_digest,
+                        &approval,
+                        &activation_intent_digest,
+                    )?
+                    .ok_or_else(|| {
+                        InstallationError::IncompleteObservation(
+                            "Host abort returned without the exact durable ABORTED terminal"
+                                .to_owned(),
+                        )
+                    })?
+            }
+        };
+        let mut cleared = transaction;
+        cleared.prepare_pre_no_return_rollback(abort_evidence)?;
+        <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+            self.inner.store_mut(),
+            expected_transaction,
+            &cleared,
+        )?;
+        self.inner.rollback(transaction_id)
+    }
     /// Projects bootstrap only after the transaction CAS has retained the
     /// activation projection intent.  The registry remains a projection and
     /// cannot become the first durable owner of this handoff.

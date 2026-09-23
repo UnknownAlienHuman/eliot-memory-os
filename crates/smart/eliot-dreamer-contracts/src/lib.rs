@@ -169,7 +169,7 @@ pub use rival::{
 };
 pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};
 pub use self_query::{
-    ArchitectureAnchor, ArchitectureAnchorClass, ArchitectureApplicability,
+    AcceptedSourceProjection, AcceptedSourceRef, ArchitectureAnchor, ArchitectureAnchorClass, ArchitectureApplicability,
     ArchitectureApplicabilityBasis, ArchitectureApplicabilityState, ArchitectureBriefCandidate,
     ArchitectureBriefDisposition, ArchitectureBriefGap, ArchitectureBriefGapClass,
     ArchitectureBriefGapState, ArchitectureBriefOmission, ArchitectureBriefSection,

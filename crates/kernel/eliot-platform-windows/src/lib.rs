@@ -266,12 +266,14 @@ pub use service_registration::{
     ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
     ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME,
-    SERVICE_DACL_READ_SECURITY_INFORMATION, SERVICE_EXPECTED_OWNER_SID,
-    SERVICE_OWNER_READ_SECURITY_INFORMATION, ServiceAbsentProof, ServiceAccount,
-    ServiceBootstrapArguments, ServiceControlGrantReadback, ServiceInspectionUnknownDetail,
-    ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
-    ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection, ServiceRuntimeObservation,
-    ServiceSidType, ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
+    SERVICE_DACL_READ_SECURITY_INFORMATION, SERVICE_EXPECTED_GROUP_AUTHORITY,
+    SERVICE_EXPECTED_GROUP_SID, SERVICE_EXPECTED_OWNER_SID,
+    SERVICE_GROUP_READ_SECURITY_INFORMATION, SERVICE_OWNER_READ_SECURITY_INFORMATION,
+    ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceControlGrantReadback,
+    ServiceInspectionUnknownDetail, ServiceRegistrationCurrent, ServiceRegistrationInspection,
+    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
+    ServiceRegistrationRuntimeReadback, ServiceRuntimeObservation, ServiceSidType,
+    ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
 };
 pub use supervision_authority_key::{
     SealedSupervisionAuthorityKey, SupervisionAuthorityKeyError,
@@ -373,6 +375,9 @@ pub const HOST_OWNER_MUTEX_PREFIX: &str = "Global\\Eliot-Host-Owner-";
 struct HostLeaseAuthority {
     gate: Mutex<()>,
     revoked: AtomicBool,
+    /// Installation identity authenticated when the owner mutex was created.
+    /// A live gate alone does not identify the installation it protects.
+    installation: Option<PlatformHandle>,
 }
 
 /// Failure returned when an explicit owner release cannot classify its
@@ -1427,6 +1432,13 @@ pub struct HostOwnerEpochGuard<'a> {
 }
 
 impl HostOwnerEpochCapability {
+    /// Returns whether this capability was minted for one exact installation.
+    /// The comparison uses the retained owner identity, never caller path text.
+    #[must_use]
+    pub fn is_for_installation(&self, installation: &PlatformHandle) -> bool {
+        self.authority.installation.as_ref() == Some(installation)
+    }
+
     /// Acquires a live guard while this capability is still backed by its
     /// unreleased owner lease.
     ///
@@ -1508,7 +1520,10 @@ impl HostOwnerLease {
                     handle,
                     owns: true,
                     name,
-                    authority: Arc::new(HostLeaseAuthority::default()),
+                    authority: Arc::new(HostLeaseAuthority {
+                        installation: Some(installation.clone()),
+                        ..HostLeaseAuthority::default()
+                    }),
                 }),
                 ERROR_ALREADY_EXISTS => {
                     // Never wait on or join an object we did not create.  Its
@@ -2390,6 +2405,23 @@ impl WindowsPlatform {
         request: &ServiceRegistrationRequest,
     ) -> ServiceRegistrationRuntimeInspection {
         inspect_service_registration_runtime(request)
+    }
+
+    /// Reads back the complete canonical registration and its current SCM
+    /// process state without mutating the service, retaining the exact
+    /// installer control-grant readback from that same observation.
+    ///
+    /// Unlike [`Self::inspect_service_registration_runtime`], this capsule
+    /// also carries a live absence proof. Installation consumers use this
+    /// surface so a legacy `Partial` status sample cannot be promoted into a
+    /// matching registration decision and so DACL/owner/group evidence cannot
+    /// be detached from the runtime observation that admitted it.
+    #[must_use]
+    pub fn inspect_service_registration_runtime_with_control_grant(
+        &self,
+        request: &ServiceRegistrationRequest,
+    ) -> ServiceRegistrationRuntimeReadback {
+        inspect_service_registration_runtime_readback(request)
     }
 
     /// Starts one exact canonical service at most once.
@@ -3716,7 +3748,7 @@ fn last_win32_code() -> u32 {
     50
 }
 
-/// Rich failure from a DACL-only service-grant read.
+/// Rich failure from the OWNER|GROUP|DACL service-grant read.
 ///
 /// `kind` preserves the fail-closed disposition (`AclMismatch`/
 /// `IdentityMismatch` map to `Mismatched`; every other kind maps to
@@ -4056,35 +4088,60 @@ fn service_registration_mutation_access(request: &ServiceRegistrationRequest) ->
 }
 
 #[cfg(windows)]
-fn verify_service_owner_is_system(
+struct ServiceSecurityBinding {
+    protected_dacl: bool,
+    dacl_matches: bool,
+    owner_sid: String,
+    group_sid: String,
+}
+
+#[cfg(windows)]
+fn read_service_security_binding(
     service: windows_sys::Win32::Foundation::HANDLE,
-) -> Result<(), ServiceGrantReadError> {
+    expected_dacl: *const windows_sys::Win32::Security::ACL,
+) -> Result<ServiceSecurityBinding, ServiceGrantReadError> {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_SERVICE};
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        GetSecurityDescriptorControl, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
     };
 
+    if expected_dacl.is_null() {
+        return Err(ServiceGrantReadError::mismatch(
+            WindowsAdapterError::InvalidInput,
+        ));
+    }
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // OWNER-only query on the same handle; READ_CONTROL suffices and no
-    // elevated audit privilege is required. The SACL contour is never opened
-    // here (installer-only).
-    // SAFETY: GetSecurityInfo reads the service owner through a live handle with READ_CONTROL;
-    // descriptor out-pointer is a valid writable local; handle outlives the call; return checked
-    // with LocalFree pairing below; no unwinding across the extern boundary.
+    let mut actual_owner: PSID = std::ptr::null_mut();
+    let mut actual_group: PSID = std::ptr::null_mut();
+    let mut actual_dacl = std::ptr::null_mut();
+    // OWNER, GROUP and DACL are read from one live service handle. The SACL
+    // pointer and security-information bit are deliberately null/absent:
+    // SACL observation remains an installer-only contour.
+    // SAFETY: GetSecurityInfo reads the service security descriptor through a live
+    // READ_CONTROL handle; all requested SID/ACL/descriptor out-pointers are valid
+    // writable locals; the descriptor is paired with LocalFree below.
     let status = unsafe {
         GetSecurityInfo(
             service,
             SE_SERVICE,
-            OWNER_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            SERVICE_OWNER_READ_SECURITY_INFORMATION
+                | SERVICE_GROUP_READ_SECURITY_INFORMATION
+                | SERVICE_DACL_READ_SECURITY_INFORMATION,
+            &raw mut actual_owner,
+            &raw mut actual_group,
+            &raw mut actual_dacl,
             std::ptr::null_mut(),
             &raw mut descriptor,
         )
     };
-    if status != ERROR_SUCCESS || descriptor.is_null() {
+    if status != ERROR_SUCCESS
+        || descriptor.is_null()
+        || actual_owner.is_null()
+        || actual_group.is_null()
+        || actual_dacl.is_null()
+    {
         if !descriptor.is_null() {
             // SAFETY: LocalFree releases the descriptor allocated by GetSecurityInfo; pointer came
             // from this call and is freed exactly once.
@@ -4095,23 +4152,17 @@ fn verify_service_owner_is_system(
         } else {
             WindowsAdapterError::Failed
         };
-        return Err(ServiceGrantReadError::unknown(kind, status, "query-owner"));
+        return Err(ServiceGrantReadError::unknown(kind, status, "read-grant"));
     }
+
     let mut owner: PSID = std::ptr::null_mut();
-    let mut defaulted = 0;
+    let mut owner_defaulted = 0;
     let owner_ok =
         // SAFETY: GetSecurityDescriptorOwner borrows the validated descriptor; owner/defaulted are valid
         // writable out-pointers; descriptor outlives the borrow.
-        unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut defaulted) } != 0
+        unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut owner_defaulted) } != 0
             && !owner.is_null();
-    let owner_text = if owner_ok {
-        // Owner points inside the validated live descriptor; stringified before free.
-        sid_to_string(owner).map_err(|kind| {
-            // SAFETY: LocalFree releases the descriptor allocated above exactly once.
-            unsafe { LocalFree(descriptor.cast()) };
-            ServiceGrantReadError::from_adapter(kind, "query-owner")
-        })?
-    } else {
+    if !owner_ok {
         // SAFETY: LocalFree releases the descriptor allocated above exactly once.
         unsafe { LocalFree(descriptor.cast()) };
         return Err(ServiceGrantReadError::unknown(
@@ -4119,15 +4170,78 @@ fn verify_service_owner_is_system(
             last_win32_code(),
             "query-owner",
         ));
+    }
+    let mut group: PSID = std::ptr::null_mut();
+    let mut group_defaulted = 0;
+    let group_ok =
+        // SAFETY: GetSecurityDescriptorGroup borrows the validated descriptor; group/defaulted are valid
+        // writable out-pointers; descriptor outlives the borrow.
+        unsafe { GetSecurityDescriptorGroup(descriptor, &raw mut group, &raw mut group_defaulted) } != 0
+            && !group.is_null();
+    if !group_ok {
+        // SAFETY: LocalFree releases the descriptor allocated above exactly once.
+        unsafe { LocalFree(descriptor.cast()) };
+        return Err(ServiceGrantReadError::unknown(
+            WindowsAdapterError::Failed,
+            last_win32_code(),
+            "query-group",
+        ));
+    }
+
+    let owner_text = sid_to_string(owner).map_err(|kind| {
+        // SAFETY: LocalFree releases the descriptor allocated above exactly once.
+        unsafe { LocalFree(descriptor.cast()) };
+        ServiceGrantReadError::from_adapter(kind, "query-owner")
+    })?;
+    let group_text = sid_to_string(group).map_err(|kind| {
+        // SAFETY: LocalFree releases the descriptor allocated above exactly once.
+        unsafe { LocalFree(descriptor.cast()) };
+        ServiceGrantReadError::from_adapter(kind, "query-group")
+    })?;
+    let expected_group_sid =
+        resolve_account_sid(SERVICE_EXPECTED_GROUP_AUTHORITY).map_err(|kind| {
+            // SAFETY: LocalFree releases the descriptor allocated above exactly once.
+            unsafe { LocalFree(descriptor.cast()) };
+            ServiceGrantReadError::from_adapter(kind, "resolve-expected-group")
+        })?;
+    let owner_matches = owner_text == SERVICE_EXPECTED_OWNER_SID;
+    let group_matches =
+        group_text == expected_group_sid && expected_group_sid == SERVICE_EXPECTED_GROUP_SID;
+
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: GetSecurityDescriptorControl borrows the validated descriptor; control/revision are valid
+    // writable out-pointers; descriptor outlives the call; SE_DACL_PROTECTED bit read only on success.
+    let protected_dacl = unsafe {
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0
     };
-    // SAFETY: LocalFree releases the descriptor allocated above exactly once; no use after free.
+    // SAFETY: ACL byte compare dereferences the live DACL returned by GetSecurityInfo and the
+    // validated expected DACL for exactly their declared sizes; both pointers are non-null.
+    let dacl_matches = unsafe {
+        (*actual_dacl).AclSize == (*expected_dacl).AclSize
+            && std::slice::from_raw_parts(
+                actual_dacl.cast::<u8>(),
+                usize::from((*actual_dacl).AclSize),
+            ) == std::slice::from_raw_parts(
+                expected_dacl.cast::<u8>(),
+                usize::from((*expected_dacl).AclSize),
+            )
+    };
+    // SAFETY: LocalFree releases the descriptor allocated above exactly once; all SID text and
+    // comparison results were materialized before this point.
     unsafe { LocalFree(descriptor.cast()) };
-    if owner_text != crate::service_registration::SERVICE_EXPECTED_OWNER_SID {
+    if !owner_matches || !group_matches {
         return Err(ServiceGrantReadError::mismatch(
             WindowsAdapterError::AclMismatch,
         ));
     }
-    Ok(())
+    Ok(ServiceSecurityBinding {
+        protected_dacl,
+        dacl_matches,
+        owner_sid: owner_text,
+        group_sid: group_text,
+    })
 }
 
 #[cfg(windows)]
@@ -4135,23 +4249,10 @@ fn read_host_service_control_grant(
     service: windows_sys::Win32::Foundation::HANDLE,
     request: &ServiceRegistrationRequest,
 ) -> Result<Option<ServiceControlGrantReadback>, ServiceGrantReadError> {
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_SERVICE};
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR,
-        SE_DACL_PROTECTED,
-    };
-
     // Host self-grant path: the installer-owned protected Host DACL with the
-    // Host service-SID ACE. Same GetSecurityInfo/protection/byte-compare
-    // mechanism as the Watchdog grant; Host-specific descriptor, mask and
-    // digest. A default (unprotected, no service-SID) DACL yields
-    // `AclMismatch` so inspect classifies it as `Mismatched`, never
-    // `Matching`.
-    // s40 DACL-only (ELIOT #1352): this read uses DACL info only on the live
-    // handle under READ_CONTROL (lib.rs GetSecurityInfo call below); the audit
-    // SACL contour is never opened or hashed here and the digest stays
-    // DACL-scoped. Owner is proven separately via OWNER info below.
+    // Host service-SID ACE. The shared live-handle helper proves OWNER, GROUP
+    // and DACL together; a default/unprotected/wrong-group descriptor yields
+    // `AclMismatch` or `Unknown`, never `Matching`.
     if request.service_name() != ELIOT_HOST_SERVICE_NAME {
         return Ok(None);
     }
@@ -4171,85 +4272,21 @@ fn read_host_service_control_grant(
     let expected_dacl = expected
         .dacl()
         .map_err(|kind| ServiceGrantReadError::from_adapter(kind, "read-grant"))?;
-    let mut actual_dacl = std::ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // `PROTECTED_DACL_SECURITY_INFORMATION` is a SetSecurityInfo-only flag.
-    // Query the DACL under READ_CONTROL, then prove protection from the
-    // returned descriptor's `SE_DACL_PROTECTED` control bit below.
-    // SAFETY: GetSecurityInfo reads the file/service DACL through a live handle with READ_CONTROL;
-    // descriptor and DACL out-pointers are valid writable locals; handle outlives the call; return
-    // checked with LocalFree pairing below; no unwinding across the extern boundary.
-    let status = unsafe {
-        GetSecurityInfo(
-            service,
-            SE_SERVICE,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut actual_dacl,
-            std::ptr::null_mut(),
-            &raw mut descriptor,
-        )
-    };
-    if status != ERROR_SUCCESS || descriptor.is_null() || actual_dacl.is_null() {
-        if !descriptor.is_null() {
-            // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
-            // converter; pointer came from a successful call and is freed exactly once; no use after free; no
-            // null free on failure paths.
-            unsafe { LocalFree(descriptor.cast()) };
-        }
-        // Preserve the GetSecurityInfo status code for Unknown diagnostics (s40):
-        // ACCESS_DENIED (5) stays PermissionDenied with code 5.
-        let kind = if status == ERROR_ACCESS_DENIED {
-            WindowsAdapterError::PermissionDenied
-        } else {
-            WindowsAdapterError::Failed
-        };
-        return Err(ServiceGrantReadError::unknown(kind, status, "read-grant"));
-    }
-    let mut control = 0_u16;
-    let mut revision = 0_u32;
-    // SAFETY: GetSecurityDescriptorControl borrows the validated descriptor; control/revision are valid
-    // writable out-pointers; descriptor outlives the call; SE_DACL_PROTECTED bit read only on success.
-    let protected = unsafe {
-        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
-            && control & SE_DACL_PROTECTED != 0
-    };
-    // SAFETY: ACL byte compare dereferences actual/expected DACL pointers validated by GetSecurityInfo
-    // with AclSize bytes each; pointers non-null after the present check; from_raw_parts borrows both
-    // ACLs for exactly AclSize bytes with no mutation during the compare; layout is the documented ACL
-    // ABI.
-    let dacl_matches = unsafe {
-        (*actual_dacl).AclSize == (*expected_dacl).AclSize
-            && std::slice::from_raw_parts(
-                actual_dacl.cast::<u8>(),
-                usize::from((*actual_dacl).AclSize),
-            ) == std::slice::from_raw_parts(
-                expected_dacl.cast::<u8>(),
-                usize::from((*expected_dacl).AclSize),
-            )
-    };
+    let binding = read_service_security_binding(service, expected_dacl)?;
     let digest = host_service_security_descriptor_digest(&host_service_sid);
-    // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
-    // converter; pointer came from a successful call and is freed exactly once; no use after free; no
-    // null free on failure paths.
-    unsafe { LocalFree(descriptor.cast()) };
-    if !protected || !dacl_matches {
+    if !binding.protected_dacl || !binding.dacl_matches {
         return Err(ServiceGrantReadError::mismatch(
             WindowsAdapterError::AclMismatch,
         ));
     }
-    // Explicit OWNER proof alongside the protected+DACL byte-compare (s40):
-    // the service object must be owned by SYSTEM; a user-owned object fails as
-    // AclMismatch so the caller maps it to Mismatched, never Matching. The
-    // digest stays DACL-scoped; owner is a separate check.
-    verify_service_owner_is_system(service)?;
     let digest = digest.map_err(|kind| ServiceGrantReadError::from_adapter(kind, "read-grant"))?;
     ServiceControlGrantReadback::new(
         ELIOT_HOST_SERVICE_NAME,
         host_service_sid,
         crate::service_registration::ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
         digest,
+        binding.owner_sid,
+        binding.group_sid,
     )
     .map(Some)
     .map_err(|kind| ServiceGrantReadError::from_adapter(kind, "read-grant"))
@@ -4300,17 +4337,8 @@ fn read_watchdog_host_control_grant(
     service: windows_sys::Win32::Foundation::HANDLE,
     request: &ServiceRegistrationRequest,
 ) -> Result<Option<ServiceControlGrantReadback>, ServiceGrantReadError> {
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_SERVICE};
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR,
-        SE_DACL_PROTECTED,
-    };
-
-    // s40 DACL-only (ELIOT #1352): this read uses DACL info only on the live
-    // handle under READ_CONTROL (GetSecurityInfo call below); the audit SACL
-    // contour is never opened or hashed here and the digest stays DACL-scoped.
-    // Owner is proven separately via OWNER info below.
+    // Both canonical roles use the same live-handle OWNER|GROUP|DACL proof;
+    // SACL remains excluded and a missing/wrong group is fail-closed.
     if !request.requires_host_service_control_grant() {
         return Ok(None);
     }
@@ -4332,83 +4360,21 @@ fn read_watchdog_host_control_grant(
     let expected_dacl = expected
         .dacl()
         .map_err(|kind| ServiceGrantReadError::from_adapter(kind, "read-grant"))?;
-    let mut actual_dacl = std::ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // `PROTECTED_DACL_SECURITY_INFORMATION` is a SetSecurityInfo-only flag.
-    // Query the DACL under READ_CONTROL, then prove protection from the
-    // returned descriptor's `SE_DACL_PROTECTED` control bit below.
-    // SAFETY: GetSecurityInfo reads the file/service DACL through a live handle with READ_CONTROL;
-    // descriptor and DACL out-pointers are valid writable locals; handle outlives the call; return
-    // checked with LocalFree pairing below; no unwinding across the extern boundary.
-    let status = unsafe {
-        GetSecurityInfo(
-            service,
-            SE_SERVICE,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut actual_dacl,
-            std::ptr::null_mut(),
-            &raw mut descriptor,
-        )
-    };
-    if status != ERROR_SUCCESS || descriptor.is_null() || actual_dacl.is_null() {
-        if !descriptor.is_null() {
-            // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
-            // converter; pointer came from a successful call and is freed exactly once; no use after free; no
-            // null free on failure paths.
-            unsafe { LocalFree(descriptor.cast()) };
-        }
-        let kind = if status == ERROR_ACCESS_DENIED {
-            WindowsAdapterError::PermissionDenied
-        } else {
-            WindowsAdapterError::Failed
-        };
-        return Err(ServiceGrantReadError::unknown(kind, status, "read-grant"));
-    }
-    let mut control = 0_u16;
-    let mut revision = 0_u32;
-    // SAFETY: GetSecurityDescriptorControl borrows the validated descriptor; control/revision are valid
-    // writable out-pointers; descriptor outlives the call; SE_DACL_PROTECTED bit read only on success.
-    let protected = unsafe {
-        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
-            && control & SE_DACL_PROTECTED != 0
-    };
-    // SAFETY: ACL byte compare dereferences actual/expected DACL pointers validated by GetSecurityInfo
-    // with AclSize bytes each; pointers non-null after the present check; from_raw_parts borrows both
-    // ACLs for exactly AclSize bytes with no mutation during the compare; layout is the documented ACL
-    // ABI.
-    let dacl_matches = unsafe {
-        (*actual_dacl).AclSize == (*expected_dacl).AclSize
-            && std::slice::from_raw_parts(
-                actual_dacl.cast::<u8>(),
-                usize::from((*actual_dacl).AclSize),
-            ) == std::slice::from_raw_parts(
-                expected_dacl.cast::<u8>(),
-                usize::from((*expected_dacl).AclSize),
-            )
-    };
+    let binding = read_service_security_binding(service, expected_dacl)?;
     let digest = watchdog_service_security_descriptor_digest(&host_service_sid);
-    // SAFETY: LocalFree releases a descriptor/text buffer allocated by GetSecurityInfo or the SDDL/SID
-    // converter; pointer came from a successful call and is freed exactly once; no use after free; no
-    // null free on failure paths.
-    unsafe { LocalFree(descriptor.cast()) };
-    if !protected || !dacl_matches {
+    if !binding.protected_dacl || !binding.dacl_matches {
         return Err(ServiceGrantReadError::mismatch(
             WindowsAdapterError::AclMismatch,
         ));
     }
-    // Explicit OWNER proof alongside the protected+DACL byte-compare (s40):
-    // the service object must be owned by SYSTEM; a user-owned object fails as
-    // AclMismatch so the caller maps it to Mismatched, never Matching. The
-    // digest stays DACL-scoped; owner is a separate check.
-    verify_service_owner_is_system(service)?;
     let digest = digest.map_err(|kind| ServiceGrantReadError::from_adapter(kind, "read-grant"))?;
     ServiceControlGrantReadback::new(
         ELIOT_HOST_SERVICE_NAME,
         host_service_sid,
         ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
         digest,
+        binding.owner_sid,
+        binding.group_sid,
     )
     .map(Some)
     .map_err(|kind| ServiceGrantReadError::from_adapter(kind, "read-grant"))
@@ -5197,9 +5163,9 @@ const fn service_runtime_sample_is_stable(
     clippy::too_many_lines,
     reason = "the two-sample SCM/config/process identity contour must remain one ordered fail-closed observation"
 )]
-fn inspect_service_registration_runtime(
+fn inspect_service_registration_runtime_readback(
     request: &ServiceRegistrationRequest,
-) -> ServiceRegistrationRuntimeInspection {
+) -> ServiceRegistrationRuntimeReadback {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
     use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
@@ -5216,7 +5182,11 @@ fn inspect_service_registration_runtime(
     // SAFETY: null machine/database selects the local SCM; access is query-only.
     let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
-        return ServiceRegistrationRuntimeInspection::unknown(last_win32_code(), "open-scm");
+        return runtime_readback_from_inspection(
+            request,
+            ServiceRegistrationRuntimeInspection::unknown(last_win32_code(), "open-scm"),
+            None,
+        );
     }
     // SAFETY: name is NUL-terminated and manager is a live query handle.
     let service = unsafe {
@@ -5237,12 +5207,21 @@ fn inspect_service_registration_runtime(
         // handle with no double close or later use; return drives no dereference.
         unsafe { CloseServiceHandle(manager) };
         return if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST.cast_signed()) {
-            ServiceRegistrationRuntimeInspection::Absent
+            runtime_readback_from_inspection(
+                request,
+                ServiceRegistrationRuntimeInspection::Absent,
+                None,
+            )
         } else {
-            ServiceRegistrationRuntimeInspection::unknown(code, "open-service")
+            runtime_readback_from_inspection(
+                request,
+                ServiceRegistrationRuntimeInspection::unknown(code, "open-service"),
+                None,
+            )
         };
     }
 
+    let mut control_grant = None;
     let result = (|| {
         let configuration = match query_service_configuration(service) {
             Ok(configuration) => configuration,
@@ -5254,7 +5233,7 @@ fn inspect_service_registration_runtime(
             return ServiceRegistrationRuntimeInspection::Mismatched;
         }
         match read_watchdog_host_control_grant(service, request) {
-            Ok(_) => {}
+            Ok(value) => control_grant = value,
             Err(error)
                 if matches!(
                     error.kind,
@@ -5373,14 +5352,75 @@ fn inspect_service_registration_runtime(
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
     }
-    result
+    runtime_readback_from_inspection(request, result, control_grant)
 }
 
 #[cfg(not(windows))]
-fn inspect_service_registration_runtime(
+fn inspect_service_registration_runtime_readback(
     _request: &ServiceRegistrationRequest,
+) -> ServiceRegistrationRuntimeReadback {
+    runtime_readback_from_inspection(
+        _request,
+        ServiceRegistrationRuntimeInspection::unknown(50, "unsupported-platform"),
+        None,
+    )
+}
+
+fn inspect_service_registration_runtime(
+    request: &ServiceRegistrationRequest,
 ) -> ServiceRegistrationRuntimeInspection {
-    ServiceRegistrationRuntimeInspection::unknown(50, "unsupported-platform")
+    runtime_readback_into_inspection(inspect_service_registration_runtime_readback(request))
+}
+
+fn runtime_readback_from_inspection(
+    request: &ServiceRegistrationRequest,
+    inspection: ServiceRegistrationRuntimeInspection,
+    control_grant: Option<ServiceControlGrantReadback>,
+) -> ServiceRegistrationRuntimeReadback {
+    match inspection {
+        ServiceRegistrationRuntimeInspection::Matching { observation } => {
+            ServiceRegistrationRuntimeReadback::Matching {
+                observation,
+                control_grant,
+            }
+        }
+        ServiceRegistrationRuntimeInspection::Absent => {
+            match ServiceAbsentProof::new(
+                request.service_name(),
+                request.expected_configuration_digest(),
+            ) {
+                Ok(proof) => ServiceRegistrationRuntimeReadback::Absent { proof },
+                Err(_) => ServiceRegistrationRuntimeReadback::Unknown {
+                    detail: ServiceInspectionUnknownDetail::new(87, "absent-proof"),
+                },
+            }
+        }
+        ServiceRegistrationRuntimeInspection::Mismatched => {
+            ServiceRegistrationRuntimeReadback::Mismatched
+        }
+        ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+            ServiceRegistrationRuntimeReadback::Unknown { detail }
+        }
+    }
+}
+
+fn runtime_readback_into_inspection(
+    readback: ServiceRegistrationRuntimeReadback,
+) -> ServiceRegistrationRuntimeInspection {
+    match readback {
+        ServiceRegistrationRuntimeReadback::Matching { observation, .. } => {
+            ServiceRegistrationRuntimeInspection::Matching { observation }
+        }
+        ServiceRegistrationRuntimeReadback::Absent { .. } => {
+            ServiceRegistrationRuntimeInspection::Absent
+        }
+        ServiceRegistrationRuntimeReadback::Mismatched => {
+            ServiceRegistrationRuntimeInspection::Mismatched
+        }
+        ServiceRegistrationRuntimeReadback::Unknown { detail } => {
+            ServiceRegistrationRuntimeInspection::Unknown { detail }
+        }
+    }
 }
 
 fn runtime_identity_digest_from_configuration(
@@ -5727,7 +5767,7 @@ fn stop_service_registration(
 #[cfg(windows)]
 #[allow(
     clippy::too_many_lines,
-    reason = "DACL-only plus owner plus typed Unknown diagnostics must remain one ordered fail-closed readback"
+    reason = "OWNER|GROUP|DACL plus typed Unknown diagnostics must remain one ordered fail-closed readback"
 )]
 fn inspect_service_registration(
     request: &ServiceRegistrationRequest,
@@ -5834,7 +5874,7 @@ fn inspect_service_registration(
                     CloseServiceHandle(service);
                     CloseServiceHandle(manager);
                 }
-                // Preserve the DACL/owner GetSecurityInfo status code (s40).
+                // Preserve the OWNER/GROUP/DACL GetSecurityInfo status code (s40).
                 return ServiceRegistrationInspection::Unknown {
                     detail: error.detail,
                 };
