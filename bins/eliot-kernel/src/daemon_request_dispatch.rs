@@ -893,9 +893,8 @@ impl KernelComposition {
                 ))
             }
             "publish_owner_bundle" => {
-                let operation: OwnerPublishOperation =
-                    serde_json::from_value(payload.clone())
-                        .map_err(|_| TransportError::SessionFenced)?;
+                let operation: OwnerPublishOperation = serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
                 if operation.expected_revision == 0 {
                     return Err(TransportError::SessionFenced);
                 }

@@ -134,6 +134,9 @@ pub struct DispatchGrant {
     pub idempotency_key: String,
     /// Grant expiry in Unix milliseconds for `PermitIssuance::new`.
     pub expires_at: u64,
+    /// Kernel-selected TestD owner database protected by the grant digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testd_owner_store_path: Option<String>,
 }
 
 /// Bins-local mirror of the kernel `TestdAdmissionAttemptRequest` (exact
@@ -270,6 +273,9 @@ pub struct ValidatedTestdMaterial {
     /// Validated Kernel-issued launch grant; the dispatch authority
     /// consumes exactly this value at issuance time.
     pub grant: DispatchGrant,
+    /// Canonical TestD database owned by Kernel work_root and bound into the
+    /// grant digest; never inferred from source_root or process cwd.
+    pub owner_store_path: PathBuf,
     /// Rebuilt fence from the validated grant (broker constructors).
     pub fence: FencingToken,
     /// Whether the job was admitted cancelled; cancelled admissions never
@@ -440,6 +446,25 @@ fn validate_material(
     validate_admission(&file.admission, &file.request)?;
     validate_session_binding(&file)?;
     let (fence, _lease) = validate_grant(&file.grant, &file.admission, now_unix_ms)?;
+    let owner_store_path = file
+        .grant
+        .testd_owner_store_path
+        .as_deref()
+        .ok_or_else(|| {
+            TestdMaterialError::Contract(
+                "TestD dispatch grant is missing its owner store path".to_owned(),
+            )
+        })?;
+    let owner_store_path = Path::new(owner_store_path);
+    if !owner_store_path.is_absolute()
+        || !owner_store_path.is_file()
+        || std::fs::canonicalize(owner_store_path).ok().as_deref() != Some(owner_store_path)
+    {
+        return Err(TestdMaterialError::Contract(
+            "TestD owner store path is not a canonical existing file".to_owned(),
+        ));
+    }
+    let owner_store_path = owner_store_path.to_path_buf();
     Ok(ValidatedTestdMaterial {
         job_id: file.request.job_id,
         operation_id: file.admission.operation_id.clone(),
@@ -453,6 +478,7 @@ fn validate_material(
         nonce: file.nonce,
         grant_digest: file.grant.grant_digest.clone(),
         grant: file.grant,
+        owner_store_path,
         fence,
         cancelled: file.admission.cancelled,
     })
@@ -676,6 +702,10 @@ fn recomputed_grant_digest(
     material.push_str(&grant.idempotency_key);
     material.push('|');
     material.push_str(&grant.expires_at.to_string());
+    if let Some(path) = grant.testd_owner_store_path.as_deref() {
+        material.push_str("|testd-owner-store|");
+        material.push_str(path);
+    }
     Ok(sha256_hex(material.as_bytes()))
 }
 

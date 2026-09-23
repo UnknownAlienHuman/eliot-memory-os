@@ -58,6 +58,7 @@ mod testd_terminal_completion_route;
 
 /// Public wire-operation name for the authenticated TestD completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
+pub use testd_terminal_completion_route::OWNER_SUBMIT_OPERATION as TESTD_OWNER_SUBMIT_OPERATION;
 
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
