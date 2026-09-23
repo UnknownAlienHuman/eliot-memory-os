@@ -575,6 +575,12 @@ impl KernelService {
                     reason: "RuntimeLease census requires the authenticated Kernel composition boundary",
                 });
             }
+            KernelControlCommand::ReadIntroductionRows(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "introduction_readback",
+                    reason: "Introduction readback requires the authenticated Kernel composition boundary",
+                });
+            }
             KernelControlCommand::ProbeReady => {
                 // A wire command cannot carry a caller-shaped readiness
                 // receipt. The composition root must perform live

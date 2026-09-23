@@ -411,22 +411,14 @@ struct ActivatedMutationDescriptor {
 /// `CommitExperienceBank` and `CommitAgentFeedback` persist `Candidate`
 /// through the `CaptureCandidate` family (issue #223: Store-owned durable
 /// experience-bank/feedback rows with the closed experience typed
-/// contract). All sixteen address no scope, mirroring the scope-free read
-/// descriptors. Every
-/// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 16] = [
-/// snapshots with the closed reactive typed contract); `ApplyUserAutomationState`
-/// persists `ReversibleMutation` through the `UserAutomation` family (issue
-/// #1779: Store-owned durable operator-automation persistence with the closed
-/// automation typed contract); `CommitExperienceBank` and `CommitAgentFeedback`
 /// contract);
 /// `RecordRestoreCoordination` persists `ReversibleMutation` through the
 /// `RecoverySchema` family (issues #959/#960/#962/#975: Governor-admitted
 /// restore coordination decision rows with the closed six-parameter
-/// coordination typed contract). All
-/// fourteen address no scope, mirroring the scope-free read descriptors. Every
+/// coordination typed contract). All sixteen address no scope, mirroring
+/// the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 14] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 16] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],

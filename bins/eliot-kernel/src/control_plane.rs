@@ -642,6 +642,7 @@ impl KernelComposition {
                 | KernelControlCommand::RebindStore(_)
                 | KernelControlCommand::ReconcileRebindStore(_)
                 | KernelControlCommand::ReadRuntimeLeaseCensus(_)
+                | KernelControlCommand::ReadIntroductionRows(_)
                 | KernelControlCommand::ReportHostStartupEvidence(_) => {}
                 command => {
                     self.apply_control(command.clone())
@@ -691,6 +692,52 @@ impl KernelComposition {
             }
             _ => None,
         };
+        let introduction_rows = match &request.command {
+            KernelControlCommand::ReadIntroductionRows(query) => {
+                query.validate().map_err(|_| TransportError::SessionFenced)?;
+                // Pure owner read: no state gate (nothing is mutated or
+                // admitted here). Each subject resolves through the ORS
+                // owner; an absent row refuses the whole query closed so a
+                // partial view can never read as complete.
+                let fence_bytes = eliot_contracts::canonical_json_bytes(&query.state_fence)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let fence_digest =
+                    eliot_contracts::sha256_hex(&fence_bytes);
+                let mut rows = Vec::with_capacity(query.subjects.len());
+                for subject in &query.subjects {
+                    let subject_id =
+                        eliot_ors::OpaqueLabel::new(subject.clone())
+                            .map_err(|_| TransportError::SessionFenced)?;
+                    let live = self
+                        .generation_gateway
+                        .ors
+                        .load_capability_introduction(&subject_id)
+                        .map_err(|_| TransportError::SessionFenced)?
+                        .ok_or(TransportError::SessionFenced)?;
+                    if live.record().state_fence.sha256 != fence_digest {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let phase = match live.phase() {
+                        eliot_ors::OperationalPhase::Staged => "STAGED",
+                        eliot_ors::OperationalPhase::Applying => "APPLYING",
+                        eliot_ors::OperationalPhase::Active => "ACTIVE",
+                        eliot_ors::OperationalPhase::Suspended => "SUSPENDED",
+                        eliot_ors::OperationalPhase::Reconciling => "RECONCILING",
+                        eliot_ors::OperationalPhase::Terminal => "TERMINAL",
+                        eliot_ors::OperationalPhase::Released => "RELEASED",
+                        eliot_ors::OperationalPhase::Fenced => "FENCED",
+                    };
+                    rows.push(eliot_kernel_service::IntroductionRow {
+                        subject_id: live.record().subject_id.as_str().to_owned(),
+                        phase: phase.to_owned(),
+                        operation_order: live.operation_order(),
+                        fence_digest: live.record().state_fence.sha256.clone(),
+                    });
+                }
+                Some(rows)
+            }
+            _ => None,
+        };
         let state = self
             .service_state()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -714,6 +761,7 @@ impl KernelComposition {
             store_rebind_receipt,
             supervision_lease,
             runtime_lease_census,
+            introduction_rows,
             error: None,
             payload_digest: String::new(),
         }

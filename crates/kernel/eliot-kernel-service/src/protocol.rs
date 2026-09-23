@@ -1415,6 +1415,11 @@ pub struct KernelControlResponse {
     pub supervision_lease: Option<SupervisionLeaseSnapshot>,
     /// Exact-fence ORS census returned only for a read-only retirement query.
     pub runtime_lease_census: Option<RuntimeLeaseCensus>,
+    /// Current ORS capability-introduction rows returned only for a
+    /// read-only introduction readback query (issue #961). Owner-held rows
+    /// the caller compares against presented evidence; never authority by
+    /// themselves.
+    pub introduction_rows: Option<Vec<IntroductionRow>>,
     /// Stable rejection detail, when the command was not accepted.
     pub error: Option<String>,
     /// Digest over all fields except this digest.
@@ -1437,6 +1442,7 @@ impl KernelControlResponse {
             store_rebind_receipt: &'a Option<StoreRebindReceipt>,
             supervision_lease: &'a Option<SupervisionLeaseSnapshot>,
             runtime_lease_census: &'a Option<RuntimeLeaseCensus>,
+            introduction_rows: &'a Option<Vec<IntroductionRow>>,
             error: &'a Option<String>,
         }
         serde_json::to_vec(&Unsigned {
@@ -1451,6 +1457,7 @@ impl KernelControlResponse {
             store_rebind_receipt: &self.store_rebind_receipt,
             supervision_lease: &self.supervision_lease,
             runtime_lease_census: &self.runtime_lease_census,
+            introduction_rows: &self.introduction_rows,
             error: &self.error,
         })
         .map_err(|_| KernelServiceError::InvalidField {
@@ -1554,6 +1561,24 @@ impl KernelControlResponse {
             {
                 return Err(KernelServiceError::InvalidField {
                     field: "control.runtime_lease_census",
+                    reason: "must be returned without unrelated control receipts",
+                });
+            }
+        }
+        if let Some(rows) = &self.introduction_rows {
+            for row in rows {
+                row.validate()?;
+            }
+            if self.receipt.is_some()
+                || self.runtime_health.is_some()
+                || self.activation_receipt.is_some()
+                || self.store_rebind_receipt.is_some()
+                || self.supervision_lease.is_some()
+                || self.runtime_lease_census.is_some()
+                || self.error.is_some()
+            {
+                return Err(KernelServiceError::InvalidField {
+                    field: "control.introduction_rows",
                     reason: "must be returned without unrelated control receipts",
                 });
             }
@@ -3041,6 +3066,88 @@ impl HostStartupEvidence {
     }
 }
 
+/// One Kernel-authored introduction row read from the canonical ORS
+/// current tables (wire-native projection of
+/// `eliot_ors::CapabilityIntroductionProjection`: identity strings and
+/// digests only, so the wire type carries no ORS model dependency beyond
+/// shape validation here).
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntroductionRow {
+    /// Exact subject identity of the introduction row.
+    pub subject_id: String,
+    /// Phase spelling (`SCREAMING_SNAKE_CASE`, e.g. `FENCED`).
+    pub phase: String,
+    /// Monotonic ORS order of the row.
+    pub operation_order: u64,
+    /// Lowercase SHA-256 over the canonical fence bytes the row was read
+    /// under (matches the owner row's fence digest recipe).
+    pub fence_digest: String,
+}
+
+impl IntroductionRow {
+    /// Validates wire shape without performing any read.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        validate_text(&self.subject_id, "introduction_row.subject_id")?;
+        validate_text(&self.phase, "introduction_row.phase")?;
+        if self.phase.bytes().any(|byte| {
+            !(byte.is_ascii_uppercase() || byte == b'_')
+        }) {
+            return Err(KernelServiceError::InvalidField {
+                field: "introduction_row.phase",
+                reason: "must use SCREAMING_SNAKE_CASE spelling",
+            });
+        }
+        if self.fence_digest.len() != 64
+            || self
+                .fence_digest
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "introduction_row.fence_digest",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated read-only query for capability-introduction rows.
+/// The subject list identifies the exact ORS introduction rows whose
+/// readback closes the cutover prior-authority proof; subjects are not
+/// caller-authored authority claims.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntroductionReadbackQuery {
+    /// Complete fence the rows must agree with.
+    pub state_fence: StateFence,
+    /// Exact subject identities to read (non-empty, deduplicated by caller).
+    pub subjects: Vec<String>,
+}
+
+impl IntroductionReadbackQuery {
+    /// Validates the query shape without performing any read.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "introduction_readback.state_fence",
+                reason: "must be valid",
+            })?;
+        if self.subjects.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "introduction_readback.subjects",
+                reason: "at least one subject is required",
+            });
+        }
+        for subject in &self.subjects {
+            validate_text(subject, "introduction_readback.subject")?;
+        }
+        Ok(())
+    }
+}
+
 /// Authenticated read-only query for one complete StateFence. The lease id
 /// identifies the current ORS supervision row whose readback closes the
 /// generation-retirement proof; it is not a caller-authored lease claim.
@@ -3191,6 +3298,13 @@ pub enum KernelControlCommand {
     ReadRuntimeLeaseCensus(RuntimeLeaseCensusQuery),
     /// Close normal admission while retaining recovery control.
     Degrade(PlatformHandle),
+    /// Read current capability-introduction rows for exact subjects from
+    /// the canonical ORS owner (cutover prior-authority evidence, issue
+    /// #961). This cannot issue, renew, fence, or activate authority; it
+    /// returns owner-held rows the caller compares against presented
+    /// evidence. Subjects arrive as exact identity strings and are
+    /// validated before any read.
+    ReadIntroductionRows(IntroductionReadbackQuery),
     /// Drain normal work before stopping.
     Drain,
     /// Record a clean stop.
