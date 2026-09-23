@@ -15,12 +15,17 @@ use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
 use super::native_worker_lifecycle_route::is_native_worker_operation;
+use super::wasm_runtime_port_grant::{
+    HandlerSession, HostBinaryFacts, KernelObservedGrantFacts, WASM_GRANT_REQUEST_WIRE_ID,
+    WASM_GRANT_REQUEST_WIRE_VERSION, WASM_PORT_GRANT_OPERATION, WasmGrantRequest,
+    handle_wasm_port_grant,
+};
 use super::{
     ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorRepairAttemptRequest, Frame, FrameKind,
-    KernelComposition, KernelFrameAction, KernelServiceState, MessageType, ProcessExecutionRequest,
-    ProtocolPayload, Session, TESTD_ADMISSION_WIRE_ID, TestdAdmissionAttemptRequest,
-    TransportError, caller_binding, probe_ready_state_admitted, route_doctor_repair,
-    route_testd_admission, status_frame, unix_ms,
+    KernelComposition, KernelFrameAction, KernelServiceState, MessageType, PeerIdentity,
+    ProcessExecutionRequest, ProtocolPayload, Session, TESTD_ADMISSION_WIRE_ID,
+    TestdAdmissionAttemptRequest, TransportError, caller_binding, probe_ready_state_admitted,
+    route_doctor_repair, route_testd_admission, status_frame, unix_ms,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{
@@ -637,6 +642,37 @@ impl KernelComposition {
                 }
                 return self.dispatch_host_request_frame(session, frame);
             }
+            #[cfg(windows)]
+            if is_wasm_port_grant_operation(native_operation) {
+                // #1780 D3 WASM port-grant issuance rides the same admitted
+                // bridge transport as the host-request route above. Issuance
+                // is new-effect intake (`Request`/`Execute`) and requires
+                // `Ready`; there is no control kind. Peer, correlation, and
+                // fence joins mirror the host-request gate; the live
+                // HostRequest admission, the session/Kernel/host fact
+                // threading, and the pure `handle_wasm_port_grant` call live
+                // in `dispatch_wasm_port_grant_frame`. Stale or
+                // unauthenticated sessions fence here and are never granted
+                // protected input.
+                if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+                    return Err(TransportError::SessionFenced);
+                }
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_wasm_port_grant_frame(session, frame);
+            }
             if is_doctor_operation(native_operation) {
                 // P-07 Doctor repair-attempt intake rides the same admitted
                 // transport through this closed gateway. New-effect intake
@@ -859,6 +895,19 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "local_read_claim"
             | "local_read_result"
     )
+}
+
+/// Returns whether the operation string selects the #1780 D3 WASM port-grant
+/// issuance route.
+///
+/// The operation string is the stable wire identity itself
+/// (`WASM_PORT_GRANT_OPERATION`); there is no second dispatch vocabulary and
+/// no generic JSON command routing. Callers must still prove the exact
+/// (`wire_id`, `wire_version`) pair through `wasm_grant_request_from_payload`
+/// on the decoded typed request: the operation string only selects this
+/// closed entry.
+pub(crate) fn is_wasm_port_grant_operation(operation: &str) -> bool {
+    operation == WASM_PORT_GRANT_OPERATION
 }
 
 #[cfg(test)]
@@ -1439,6 +1488,207 @@ fn testd_request_from_payload(
         .validate_canonical_digest()
         .map_err(|_| TransportError::SessionFenced)?;
     if !route_testd_admission(&request.wire_id, request.wire_version) {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(request)
+}
+
+impl KernelComposition {
+    /// Dispatches one authenticated WASM port-grant issuance frame (#1780 D3).
+    ///
+    /// The caller ([`KernelComposition::dispatch_frame`]) has already run the
+    /// closed-gateway gates (generation poison, session/frame identity,
+    /// daemon-session currency) and the per-kind service gate (new-effect
+    /// intake requires `Ready`); those joins are re-checked here so direct
+    /// callers cannot bypass them. The frame must ride the presenting
+    /// session's connection, the operation string must be the exact
+    /// [`WASM_PORT_GRANT_OPERATION`] identity, and the payload must carry
+    /// both the live host-request envelope under `envelope` and the typed
+    /// [`WasmGrantRequest`] under `request`.
+    ///
+    /// The envelope is admitted live through the unchanged
+    /// `admit_host_request_envelope` gate: the returned Writer-A receipt is
+    /// the same-generation/fence admission decision that
+    /// [`handle_wasm_port_grant`] binds, so a stale fence fails closed here
+    /// and the caller re-admits through the `HostRequest` path instead of
+    /// executing against a rotated fence. The [`HandlerSession`] principal
+    /// is the transport session guard's authenticated peer identity bound to
+    /// the presenting connection; the [`KernelObservedGrantFacts`] are the
+    /// live admitted handshake fence/epoch/connection plus the Kernel clock.
+    /// The issued digest-bound grant projects as a typed reply frame; every
+    /// denial and every mechanical failure fences. No permits are minted, no
+    /// Governor observations are minted, no keys are touched: the grant
+    /// attests transport plus freshness and carries caller digests for
+    /// downstream re-hashing.
+    pub(crate) fn dispatch_wasm_port_grant_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        observe_frame("kernel.frame_wasm_grant_dispatch", "attempt");
+        if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+            return Err(TransportError::SessionFenced);
+        }
+        if self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?
+            != KernelServiceState::Ready
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if frame.connection_id != session.connection_id {
+            return Err(TransportError::SessionFenced);
+        }
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let operation = payload
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if !is_wasm_port_grant_operation(operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        let envelope = super::host_request_route::host_request_envelope_from_payload(&payload)?;
+        let request = wasm_grant_request_from_payload(&payload)?;
+        if envelope.connection_id != session.connection_id {
+            return Err(TransportError::SessionFenced);
+        }
+        if frame.request_id.as_ref() != Some(&envelope.identity.request_id) {
+            return Err(TransportError::SessionFenced);
+        }
+        // Composition readiness before durable side effects: the
+        // installation-approved host binding is required to issue, so its
+        // absence fails here rather than after staging an admission record.
+        let host = wasm_host_binary_facts(
+            self.wasm_host_executable_path.as_ref(),
+            self.wasm_host_artifact_sha256.as_deref(),
+        )?;
+        // Live admission decision: the returned receipt binds the admitted
+        // envelope to the current generation and fence. Stale fences fail
+        // closed here; the caller re-admits through the HostRequest path.
+        let (receipt, _) = self.admit_host_request_envelope(&envelope)?;
+        let principal = match &session.peer {
+            PeerIdentity::Authenticated { user_identity, .. } => user_identity.clone(),
+            PeerIdentity::Unavailable { .. } => {
+                return Err(TransportError::PeerIdentityUnavailable);
+            }
+        };
+        let handler_session = HandlerSession {
+            principal,
+            connection_id: session.connection_id.clone(),
+        };
+        let kernel = KernelObservedGrantFacts {
+            state_fence: session.module_generation.state_fence.clone(),
+            authority_epoch: session.authority_epoch.clone(),
+            connection_id: session.connection_id.clone(),
+            now_unix_ms: unix_ms(),
+        };
+        // Single-snapshot discipline: the admitted envelope must bind the
+        // exact live fence (`handle_wasm_port_grant` re-enforces this as
+        // `envelope-fence`; the early join keeps the terminal obvious).
+        if envelope.state_fence != kernel.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        let grant = handle_wasm_port_grant(
+            &receipt,
+            &envelope,
+            &handler_session,
+            &kernel,
+            &request,
+            &host,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let mut reply = status_frame(
+            session,
+            FrameKind::Response,
+            MessageType::Result,
+            serde_json::json!({
+                "operation": operation,
+                "grant": grant,
+            }),
+        )?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(reply))
+    }
+}
+
+/// Resolves the installation-approved WASM-host binary facts for grant issuance.
+///
+/// The sole approved source is
+/// `eliot_installation::RuntimeLaunchDescriptor::wasm_host_artifact_binding()`,
+/// Reads the installation-approved WASM-host binary facts retained by the
+/// production composition (`KernelConfig::with_wasm_host_executable_path` /
+/// `with_wasm_host_artifact_sha256`, validated at assembly). Missing fails
+/// closed: the arm stages no admission record without an approved binding,
+/// and the live image digest is re-proved at launch, never here.
+fn wasm_host_binary_facts(
+    executable_path: Option<&std::path::PathBuf>,
+    artifact_digest: Option<&str>,
+) -> Result<HostBinaryFacts, TransportError> {
+    let executable_path = executable_path
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or(TransportError::SessionFenced)?;
+    let artifact_digest = artifact_digest
+        .map(str::to_owned)
+        .ok_or(TransportError::SessionFenced)?;
+    if std::path::Path::new(&executable_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("eliot-wasm-host.exe")
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(HostBinaryFacts {
+        executable_path,
+        artifact_digest,
+    })
+}
+
+/// Decodes the exact typed WASM port-grant request from a grant frame payload.
+///
+/// The payload carries the closed operation string plus the full typed request
+/// under `request`; the request shape, its canonical digest, and its exact
+/// wire version are re-validated through the grant module entries, so this is
+/// typed dispatch, not generic JSON routing.
+fn wasm_grant_request_from_payload(
+    payload: &serde_json::Value,
+) -> Result<WasmGrantRequest, TransportError> {
+    let request_value = payload
+        .get("request")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let request: WasmGrantRequest =
+        serde_json::from_value(request_value).map_err(|_| TransportError::SessionFenced)?;
+    request
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if request.wire_id != WASM_GRANT_REQUEST_WIRE_ID
+        || request.wire_version != WASM_GRANT_REQUEST_WIRE_VERSION
+    {
         return Err(TransportError::SessionFenced);
     }
     Ok(request)

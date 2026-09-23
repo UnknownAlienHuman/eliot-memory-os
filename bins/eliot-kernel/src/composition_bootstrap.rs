@@ -18,10 +18,10 @@ use super::{
     AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityEpoch,
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
     AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner,
-    ContractId, DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
-    GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector, IpcImplementation,
-    KernelBuildError, KernelComposition, KernelConfig, KernelDispatchKey, KernelError,
-    KernelPathAdmission, KernelService, KernelStoreRebindProductionBoundary,
+    ContractId, DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId,
+    DispatchSnapshotCodec, GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector,
+    IpcImplementation, KernelBuildError, KernelComposition, KernelConfig, KernelDispatchKey,
+    KernelError, KernelPathAdmission, KernelService, KernelStoreRebindProductionBoundary,
     KernelSupervisionLeaseAuthority, ModuleGeneration, ModuleGenerationState,
     OperationalRecoveryStore, OrsError, OrsGenerationCoordinator, PROTOCOL_VERSION,
     PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
@@ -328,25 +328,22 @@ impl KernelComposition {
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         let store: Arc<dyn OperationalRecoveryStore> =
             Arc::clone(&self.p07_ors) as Arc<dyn OperationalRecoveryStore>;
-        let bound = bind_canonical_owner(restore, expected_revision, store).inspect_err(|_| {
-            observe_entrypoint_with_detail(
-                EntrypointStage::Composition,
-                "kernel.composition.p07_owner_bind_failed",
-            );
-        })
-        .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let bound = bind_canonical_owner(restore, expected_revision, store)
+            .inspect_err(|_| {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.p07_owner_bind_failed",
+                );
+            })
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         let revision = bound.bound_revision();
         self.p07_owner
             .lock()
-            .map_err(|_| {
-                KernelBuildError::Service("P-07 owner lock poisoned".to_owned())
-            })?
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
             .replace(bound);
         self.p07_owner_digest
             .lock()
-            .map_err(|_| {
-                KernelBuildError::Service("P-07 owner lock poisoned".to_owned())
-            })?
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
             .replace(digest);
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
@@ -452,10 +449,7 @@ impl KernelComposition {
         digest: &str,
     ) -> Result<(), KernelBuildError> {
         let (bound, revision, retained) = self.p07_owner_readback();
-        if bound
-            && revision == Some(expected_revision)
-            && retained.as_deref() != Some(digest)
-        {
+        if bound && revision == Some(expected_revision) && retained.as_deref() != Some(digest) {
             observe_entrypoint_with_detail(
                 EntrypointStage::Composition,
                 "kernel.composition.p07_owner_digest_conflict",
@@ -894,6 +888,8 @@ impl KernelComposition {
         let daemon_launch = config.daemon_launch.clone();
         let kernel_artifact_sha256 = config.kernel_artifact_sha256.clone();
         let eliotd_descriptor_artifact_sha256 = config.eliotd_descriptor_artifact_sha256.clone();
+        let wasm_host_executable_path = config.wasm_host_executable_path.clone();
+        let wasm_host_artifact_sha256 = config.wasm_host_artifact_sha256.clone();
         let doctor_artifact_sha256 = config.doctor_artifact_sha256.clone();
         let testd_artifact_sha256 = config.testd_artifact_sha256.clone();
         let native_worker_artifact_sha256 = config.native_worker_artifact_sha256.clone();
@@ -963,6 +959,7 @@ impl KernelComposition {
             (&doctor_artifact_sha256, "Doctor"),
             (&testd_artifact_sha256, "Testd"),
             (&native_worker_artifact_sha256, "native worker"),
+            (&wasm_host_artifact_sha256, "WASM host"),
         ] {
             if let Some(digest) = digest
                 && !is_lower_sha256(digest)
@@ -1283,6 +1280,8 @@ impl KernelComposition {
             eliotd_receipt_binding,
             kernel_artifact_sha256,
             eliotd_descriptor_artifact_sha256,
+            wasm_host_executable_path,
+            wasm_host_artifact_sha256,
             daemon_runtime: Mutex::new(DaemonRuntimeState {
                 status: DaemonRuntimeStatus::NotLaunched,
                 receipt: None,

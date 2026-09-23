@@ -57,6 +57,16 @@ pub struct KernelConfig {
     pub testd_artifact_sha256: Option<String>,
     /// Independent digest of the approved native worker image injected by Host.
     pub native_worker_artifact_sha256: Option<String>,
+    /// Independent digest of the approved WASM-host image injected by Host
+    /// (#1780). Missing fails closed once the WASM grant route is required;
+    /// no in-memory or test signer is fabricated by the production
+    /// composition.
+    pub wasm_host_artifact_sha256: Option<String>,
+    /// Host-injected absolute WASM-host executable path, digest-bound to
+    /// `wasm_host_artifact_sha256`. Missing fails closed once the WASM grant
+    /// route is required; no path is defaulted. Retained for the grant-arm
+    /// host-facts call-in; the live image digest is re-proved at launch.
+    pub wasm_host_executable_path: Option<PathBuf>,
     /// Host-owned manifest root where the Kernel must publish the eliotd
     /// receipt. This is intentionally separate from `work_root`: integrated
     /// manifests use distinct Kernel and Host state roots.
@@ -95,6 +105,8 @@ impl KernelConfig {
             doctor_executable_path: None,
             testd_artifact_sha256: None,
             native_worker_artifact_sha256: None,
+            wasm_host_artifact_sha256: None,
+            wasm_host_executable_path: None,
             eliotd_receipt_binding: None,
             agent_bridge_admission: None,
             #[cfg(windows)]
@@ -192,6 +204,21 @@ impl KernelConfig {
     #[must_use]
     pub fn with_native_worker_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
         self.native_worker_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the independently approved WASM-host executable digest (#1780).
+    #[must_use]
+    pub fn with_wasm_host_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.wasm_host_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the Host-approved absolute WASM-host executable path bound to
+    /// the digested WASM-host role. No default; missing fails closed.
+    #[must_use]
+    pub fn with_wasm_host_executable_path(mut self, path: PathBuf) -> Self {
+        self.wasm_host_executable_path = Some(path);
         self
     }
 
