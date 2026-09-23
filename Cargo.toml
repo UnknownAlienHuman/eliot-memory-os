@@ -186,6 +186,7 @@ members = [
   "crates/smart/eliot-dreamer-self-query",  # agent_order 49
   "crates/smart/eliot-epistemic-context-provider",  # agent_order 50
   "crates/smart/eliot-memory-quality",  # agent_order 76
+  "crates/smart/eliot-dreamer-memory-revision",  # agent_order 79
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`

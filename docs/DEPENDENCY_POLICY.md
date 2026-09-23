@@ -121,11 +121,15 @@ removal/rollback plan.
 
 The verifier constructs the receipt denominator from observed source inputs and
 lock data, then reconciles direct roots against the policy inventory in both
-directions. Rust receipts enumerate every Cargo.lock package identity, source,
-checksum when present, and locked dependency edges. They also retain each
+directions. Rust receipts enumerate every root Cargo.lock package identity,
+source, checksum when present, and locked dependency edge. They also retain each
 observed Cargo manifest edge with its consumer package, declaration kind,
 target condition, alias, requested version/features, optionality, and whether
-the target is an internal workspace package. Explicit internal-edge
+the target is an internal workspace package. The policy inventory is
+reconciled against observed direct names across scanned manifests; identities
+attributed to the root lock cover only root-workspace direct edges. Non-member
+identities remain attached to their own declarations and are admitted only by
+the resolver-to-adjacent-lock join described below. Explicit internal-edge
 dispositions bind the owner, reason, feature profile, exposure boundary, and
 removal plan for selected production edges; they remain separate from the
 third-party inventory. Receipt input digests include every Cargo.toml scanned
@@ -134,22 +138,32 @@ bound alongside Cargo.lock. Unused workspace dependency definitions do not
 become direct roots by themselves.
 
 Each observed Rust edge also carries resolver-binding status. A manifest
-outside the root workspace is not attributed a lock identity merely because
-the root Cargo.lock contains a package with the same name. Until resolver
-metadata binds that manifest's alias, dependency kind, target condition and
-requested version to an exact locked package, the edge remains
-`source_only_incomplete` and the Rust denominator remains incomplete. The
-current verifier does not yet produce a resolver-backed identity for any
-non-member workspace edge; it counts every observed non-member edge as
-incomplete, including an edge with a missing or malformed identity record. The
-current ten non-member manifests each declare an independent `[workspace]` and
-have no adjacent checked-in `Cargo.lock`, so the root lock cannot provide the
-missing resolver binding. Any standalone lockfile later observed for such a
-workspace is included in the receipt's input digests, but its presence alone
-is not treated as a resolved edge. The remaining resolver boundary is to join
-each declaration's manifest, alias, dependency kind, target condition and
-requested version to an exact locked package identity from resolver metadata
-before clearing that incomplete state.
+outside the root workspace is never attributed an identity from a same-name
+entry in the root `Cargo.lock`. For a non-member workspace with its own
+checked-in lock, the verifier runs `cargo metadata --locked --offline
+--all-features` against that workspace, without platform filtering, and records
+the exact metadata digest, Cargo and rustc version output, effective Cargo
+resolver version, and applicable in-repository toolchain/configuration input
+digests. It joins the source consumer manifest and package ID, dependency alias
+(including renames), kind, target condition, requested version, optional and
+default-feature flags, and declared features to one Cargo resolve-node edge and
+one metadata dependency declaration; the resolve nodes must include all
+consumer features and the dependency's requested features. For `workspace = true`
+declarations, requested features are the union of workspace-inherited and
+member-local feature lists before metadata comparison, matching Cargo's additive
+feature semantics. Malformed feature lists remain invalid rather than silently
+replacing either input. The resolved package ID must then match exactly one
+entry in the adjacent `Cargo.lock` by package name, version, source, and
+registry checksum where applicable. A missing lock does not trigger lock
+generation or metadata resolution. Missing tools, metadata errors, malformed
+or ambiguous joins, and identity mismatches remain
+`source_only_incomplete`; missing or malformed identity records are counted as
+incomplete as well. The current ten non-member manifests each declare an
+independent `[workspace]` and have no adjacent checked-in `Cargo.lock`, so they
+remain incomplete and the Rust denominator remains `incomplete`. Only a
+successful declaration-to-resolver-to-lock join clears an individual edge's
+resolver-incomplete state; it does not establish binary advisory
+applicability.
 
 The current-main #2393 source adds three governed production edges from
 `eliot-governor` to `eliot-kernel-core`, `eliot-ors`, and `eliot-platform`.
