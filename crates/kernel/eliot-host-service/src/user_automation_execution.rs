@@ -96,6 +96,14 @@ where
                     wake_ids,
                 })
             }
+            UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
+                let readback = self.wake.read_pending_wake(request).await?;
+                Ok(UserAutomationHostExecutionResponse::WakeRead {
+                    request_sha256,
+                    state_fence,
+                    readback,
+                })
+            }
         }
     }
 
@@ -135,6 +143,14 @@ where
                     request_sha256,
                     state_fence,
                     wake_ids,
+                })
+            }
+            UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
+                let readback = self.wake.read_pending_wake(request).await?;
+                Ok(UserAutomationHostExecutionResponse::WakeRead {
+                    request_sha256,
+                    state_fence,
+                    readback,
                 })
             }
         }

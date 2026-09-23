@@ -191,6 +191,7 @@ pub use user_automation_execution::{
     UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition, UserAutomationRuntimeError,
     UserAutomationRuntimePort, UserAutomationWakeCancellation,
     UserAutomationWakeCancellationTarget, UserAutomationWakePort,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 pub use user_automation_execution_client::{
     USER_AUTOMATION_HOST_EXECUTION_PIPE, USER_AUTOMATION_HOST_EXECUTION_WIRE_ID,

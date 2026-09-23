@@ -13,7 +13,7 @@ use eliot_host_state::{
 };
 use eliot_kernel_service::{
     UserAutomationRuntimeError, UserAutomationWakeCancellation,
-    UserAutomationWakePort,
+    UserAutomationWakePort, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::WakeIntentState;
@@ -33,6 +33,43 @@ impl<'a, B: JournalBackend> HostWakeIntentAdapter<'a, B> {
 }
 
 impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> {
+    async fn read_pending_wake(
+        &self,
+        request: UserAutomationWakeReadRequest,
+    ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+        let occurrence_id = request
+            .validate()
+            .map_err(|error| rejected(format!("Wake read: {error}")))?;
+        let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
+        let mut found = None;
+        for wake in snapshot
+            .wakes
+            .iter()
+            .filter(|wake| wake.wake_id.as_str() == occurrence_id)
+        {
+            if found.is_some() {
+                return Err(UserAutomationRuntimeError::IdentityConflict);
+            }
+            let checksum = record_checksum(&HostStateRecord::Wake(wake.clone()))
+                .map_err(map_journal_error)?;
+            let readback = UserAutomationWakeReadback {
+                intent: wake.intent.clone(),
+                operation_id: wake.operation.operation_id.as_str().to_owned(),
+                idempotency_key: wake.operation.idempotency_key.as_str().to_owned(),
+                record_checksum: checksum,
+            };
+            readback
+                .validate_for(&request)
+                .map_err(|error| rejected(format!("Wake owner readback: {error}")))?;
+            found = Some(readback);
+        }
+        found.ok_or_else(|| {
+            UserAutomationRuntimeError::Unavailable(
+                "exact UserAutomation wake is not retained by the Host journal".to_owned(),
+            )
+        })
+    }
+
     async fn cancel_pending_wakes(
         &self,
         request: UserAutomationWakeCancellation,

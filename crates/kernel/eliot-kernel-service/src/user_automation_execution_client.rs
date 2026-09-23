@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     UserAutomationDurableJobPort, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
     UserAutomationWakeCancellation, UserAutomationWakePort,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 
 /// Stable wire identity for the typed UserAutomation Host execution carrier.
@@ -430,6 +431,11 @@ pub enum UserAutomationHostExecutionOperation {
         /// Same-fence, unadmitted-only cancellation request.
         request: UserAutomationWakeCancellation,
     },
+    /// Read one exact retained Pending wake from the Host journal.
+    ReadPendingWake {
+        /// Original Human RunNow identity and owner-issued invocation.
+        request: UserAutomationWakeReadRequest,
+    },
 }
 
 /// Typed Kernel-to-Host request carrier for one UserAutomation execution
@@ -469,6 +475,17 @@ impl UserAutomationHostExecutionRequest {
         Self::new(
             channel,
             UserAutomationHostExecutionOperation::CancelPendingWakes { request },
+        )
+    }
+
+    /// Builds and hashes one exact pending-wake readback carrier.
+    pub fn read_pending_wake(
+        channel: UserAutomationHostChannelBinding,
+        request: UserAutomationWakeReadRequest,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        Self::new(
+            channel,
+            UserAutomationHostExecutionOperation::ReadPendingWake { request },
         )
     }
 
@@ -553,6 +570,14 @@ impl UserAutomationHostExecutionRequest {
                     return Err(rejected("cancellation channel fence mismatch"));
                 }
             }
+            UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
+                request
+                    .validate()
+                    .map_err(|error| rejected(format!("wake read: {error}")))?;
+                if request.context.state_fence != self.channel.state_fence {
+                    return Err(rejected("wake read channel fence mismatch"));
+                }
+            }
         }
         Ok(())
     }
@@ -579,6 +604,15 @@ pub enum UserAutomationHostExecutionResponse {
         state_fence: StateFence,
         /// Exact wake identities whose cancellation was committed or replayed.
         wake_ids: Vec<String>,
+    },
+    /// Exact retained wake record returned by the Host journal owner.
+    WakeRead {
+        /// Digest of the exact request carrier answered.
+        request_sha256: String,
+        /// Fence observed by the Host owner.
+        state_fence: StateFence,
+        /// Persisted wake intent and record checksum.
+        readback: UserAutomationWakeReadback,
     },
     /// Closed Host-owner failure projection.
     Failed {
@@ -621,6 +655,11 @@ impl UserAutomationHostExecutionResponse {
                 request_sha256,
                 state_fence,
                 ..
+            }
+            | Self::WakeRead {
+                request_sha256,
+                state_fence,
+                ..
             } => (request_sha256, state_fence),
             Self::Failed {
                 request_sha256,
@@ -658,14 +697,36 @@ impl UserAutomationHostExecutionResponse {
                 UserAutomationHostExecutionOperation::CancelPendingWakes { .. },
                 Self::Cancelled { wake_ids, .. },
             ) => validate_unique_text(wake_ids),
+            (
+                UserAutomationHostExecutionOperation::ReadPendingWake { request },
+                Self::WakeRead { readback, .. },
+            ) => readback
+                .validate_for(request)
+                .map_err(|_| UserAutomationRuntimeError::IdentityConflict),
             (_, Self::Failed { .. }) => Ok(()),
             (
                 UserAutomationHostExecutionOperation::AdmitOccurrence { .. },
                 Self::Cancelled { .. },
             )
             | (
+                UserAutomationHostExecutionOperation::AdmitOccurrence { .. },
+                Self::WakeRead { .. },
+            )
+            | (
                 UserAutomationHostExecutionOperation::CancelPendingWakes { .. },
                 Self::Admitted { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::CancelPendingWakes { .. },
+                Self::WakeRead { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::ReadPendingWake { .. },
+                Self::Admitted { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::ReadPendingWake { .. },
+                Self::Cancelled { .. },
             ) => Err(UserAutomationRuntimeError::IdentityConflict),
         }
     }
@@ -676,6 +737,7 @@ fn request_context(request: &UserAutomationHostExecutionRequest) -> &RequestMeta
     match &request.operation {
         UserAutomationHostExecutionOperation::AdmitOccurrence { request } => &request.context,
         UserAutomationHostExecutionOperation::CancelPendingWakes { request } => &request.context,
+        UserAutomationHostExecutionOperation::ReadPendingWake { request } => &request.context,
     }
 }
 
@@ -1185,7 +1247,8 @@ where
         )?;
         match self.execute(carrier).await? {
             UserAutomationHostExecutionResponse::Admitted { execution, .. } => Ok(execution),
-            UserAutomationHostExecutionResponse::Cancelled { .. } => {
+            UserAutomationHostExecutionResponse::Cancelled { .. }
+            | UserAutomationHostExecutionResponse::WakeRead { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
@@ -1199,6 +1262,26 @@ impl<T> UserAutomationWakePort for UserAutomationHostExecutionClient<T>
 where
     T: UserAutomationHostExecutionTransport,
 {
+    async fn read_pending_wake(
+        &self,
+        request: UserAutomationWakeReadRequest,
+    ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+        let carrier = UserAutomationHostExecutionRequest::read_pending_wake(
+            self.transport.channel_binding().clone(),
+            request,
+        )?;
+        match self.execute(carrier).await? {
+            UserAutomationHostExecutionResponse::WakeRead { readback, .. } => Ok(readback),
+            UserAutomationHostExecutionResponse::Admitted { .. }
+            | UserAutomationHostExecutionResponse::Cancelled { .. } => {
+                Err(UserAutomationRuntimeError::IdentityConflict)
+            }
+            UserAutomationHostExecutionResponse::Failed { failure, .. } => {
+                Err(failure.into_runtime_error())
+            }
+        }
+    }
+
     async fn cancel_pending_wakes(
         &self,
         request: UserAutomationWakeCancellation,
@@ -1209,7 +1292,8 @@ where
         )?;
         match self.execute(carrier).await? {
             UserAutomationHostExecutionResponse::Cancelled { wake_ids, .. } => Ok(wake_ids),
-            UserAutomationHostExecutionResponse::Admitted { .. } => {
+            UserAutomationHostExecutionResponse::Admitted { .. }
+            | UserAutomationHostExecutionResponse::WakeRead { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
