@@ -26,6 +26,9 @@ use persistence_models::{
 #[path = "store/restore_journal.rs"]
 mod restore_journal;
 
+#[path = "store/backup_snapshot.rs"]
+mod backup_snapshot;
+
 mod recovery_projection;
 
 use crate::cutover_ownership::{
@@ -697,6 +700,78 @@ pub struct RedbRecoveryStore {
     #[cfg(feature = "test-support")]
     authority_handoff_failpoint:
         std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
+}
+
+impl RedbRecoveryStore {
+    /// Exports one coherent backup page under a single read transaction.
+    ///
+    /// Delegates to the ORS-owned `backup_snapshot` projection; binds the
+    /// request fence token so pages from different fences never mix.
+    pub fn export_backup_page(
+        &self,
+        request: &crate::backup_snapshot::OrsBackupRequest,
+        page_index: u32,
+    ) -> Result<crate::backup_snapshot::OrsBackupPage, OrsError> {
+        backup_snapshot::export_page(&self.database, request, page_index)
+    }
+
+    /// Exports a bounded coherent backup snapshot (all pages, one fence).
+    ///
+    /// Distinct from the report-only `logical_snapshot`: binds source
+    /// installation/generation/schema, canonical fence, high-water/order,
+    /// exact row-family denominator and digest chain.
+    pub fn export_backup_snapshot(
+        &self,
+        request: &crate::backup_snapshot::OrsBackupRequest,
+    ) -> Result<crate::backup_snapshot::OrsBackupSnapshot, OrsError> {
+        backup_snapshot::export_snapshot(&self.database, request)
+    }
+
+    /// Triages one backup page as quarantined import outcomes without writing.
+    ///
+    /// Every entry returns imported/rejected/forensic/blocked/unresolved;
+    /// unresolved entries stay quarantined for the existing canonical
+    /// reconciliation owner. Never activates authority, never advances
+    /// canonical ordering, never writes durable state.
+    pub fn import_backup_page_quarantined(
+        &self,
+        import: &crate::backup_snapshot::OrsBackupImportRequest,
+        page: &crate::backup_snapshot::OrsBackupPage,
+    ) -> Result<Vec<(String, crate::backup_snapshot::PerEntryOutcome)>, OrsError> {
+        backup_snapshot::import_page_quarantined(&self.database, &self.evidence, import, page)
+    }
+
+    /// Exact row-family backup disposition for every ORS row family.
+    pub fn backup_row_family_denominator() -> Vec<crate::backup_snapshot::RowFamilyDisposition> {
+        backup_snapshot::row_family_denominator()
+    }
+
+    /// Reconciles quarantined per-entry outcomes into one import receipt.
+    ///
+    /// Pure receipt binding over already-triaged outcomes; emits no store
+    /// writes. A new empty target never means old effects are resolved:
+    /// `unresolved_count` is counted from the outcomes, and
+    /// `known_zero_unresolved` must attest complete current-owner validation
+    /// before zero is trusted.
+    pub fn reconcile_backup_import(
+        import: &crate::backup_snapshot::OrsBackupImportRequest,
+        per_entry: &[(String, crate::backup_snapshot::PerEntryOutcome)],
+        import_at_ms: i64,
+    ) -> Result<crate::backup_snapshot::OrsBackupImportReceipt, OrsError> {
+        backup_snapshot::reconcile_import_receipt(import, per_entry, import_at_ms)
+    }
+
+    /// Replays a lost import response without any duplicate effect.
+    ///
+    /// Idempotent clone of the prior receipt: no store read, no store write,
+    /// no re-triage, so a retried response can never double-apply outcomes.
+    /// Unknown import outcomes stay quarantined for the existing canonical
+    /// reconciliation owner; never blindly retried here.
+    pub fn reconcile_lost_backup_import_response(
+        prior: &crate::backup_snapshot::OrsBackupImportReceipt,
+    ) -> crate::backup_snapshot::OrsBackupImportReceipt {
+        backup_snapshot::reconcile_lost_import_response(prior)
+    }
 }
 
 fn same_store_rebind_binding(
