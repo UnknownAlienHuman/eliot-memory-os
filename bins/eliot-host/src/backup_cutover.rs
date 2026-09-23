@@ -35,17 +35,30 @@
 //!   (`crates/eliot-types/src/safety.rs:166`, stringly plan/check shape) is
 //!   NOT the accepted contract and is not consumed here.
 //! - Pending dependency edge (#974 owns Cargo/root/lock per #959/#960):
-//!   `eliot-backup` is not in `bins/eliot-host/Cargo.toml`, so typed
-//!   `eliot_backup::` imports land with that edge. Until then this module
-//!   carries the owner receipts as opaque digest-bound handles plus
-//!   owner-attested standing facts (never a parallel class vocabulary, never
-//!   a `From` bridge): `bundle_receipt` (real `BackupBundle::validate`
-//!   receipt), `restore_receipt` (real `RestoreReceipt` from
-//!   `execute_with_journal`/`finalize_isolated`), `operational_validation`
-//!   (real `OperationalValidationEvidence`), `archive_full_recovery`
-//!   (owner-attested `is_full_recovery` outcome),
-//!   `archive_scope_transfer` (owner-attested scope-declared outcome of
-//!   `select`: a scope transfer never carries installation recovery).
+//!   `eliot-backup` is not in `bins/eliot-host/Cargo.toml` (precedent:
+//!   `bins/eliot/Cargo.toml:22` carries its own path edge), so the typed
+//!   `eliot_backup::{BackupClass, RestoreReceipt,
+//!   OperationalValidationEvidence}` imports in this module resolve once
+//!   #974 takes the one-line edge hunk (in the report, never applied here).
+//!   Nothing here is an opaque substitute: class gates run through
+//!   `is_full_recovery`/`is_canonical_only`/`evidence_level`, receipt gates
+//!   through `RestoreReceipt::validate` plus bundle/fence/level bindings,
+//!   validation gates through `OperationalValidationEvidence::validate`
+//!   plus the observed-fence binding. No `From` bridges, no parallel
+//!   vocabulary.
+//! - Prior-introduction fencing rides the real ORS readback rows
+//!   (`eliot_ors::CapabilityIntroductionProjection`, `model.rs:2043`, and
+//!   `OperationalPhase::Fenced` at `model.rs:1928`, both on current main
+//!   past #2388 via `pub use model::*`): every row must read `Fenced`.
+//!   These names postdate this branch's base, so they resolve after root
+//!   moves integration past `b452be52` (same standing as the barrier).
+//!   The module-route cutover machinery in
+//!   `eliot-ors/src/cutover_ownership.rs` was read and deliberately NOT
+//!   consumed: it switches module route scopes under scalar
+//!   `ResourceGeneration`/`AuthorityEpoch`, a different authority domain
+//!   from installation cutover. The #2389 bank/feedback records were read
+//!   and likewise not consumed: observation-bank semantics for #223, not
+//!   operational recovery evidence.
 //! - Retirement barrier (#1751, Parfit, Host owner): `super::
 //!   GenerationRetirementFence`, `super::GenerationRetirementBarrier`, and
 //!   `HostComposition::require_generation_retirement_barrier` are Parfit-owned
@@ -106,12 +119,14 @@
 //! I1.5 activation/drain generations never overlap; I14.14 cutover record
 //! owns the linearization point (here: the journal append receipt).
 
+use eliot_backup::{BackupClass, OperationalValidationEvidence, RestoreReceipt};
 use eliot_contracts::{fences_match_exact, StateFence};
 use eliot_host_state::{
     AppendReceipt, EpochRetirementRecord, EpochTransition, HostInstallationEpoch, HostStateRecord,
     IdempotencyIdentity, RecordFence,
 };
 use eliot_installation::ApprovedGenerationRegistry;
+use eliot_ors::{CapabilityIntroductionProjection, OperationalPhase};
 use eliot_platform::PlatformHandle;
 use eliot_protocol::{
     host_request_operation_id, HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestKind,
@@ -159,16 +174,11 @@ pub struct CutoverRequest {
     pub source_installation: PlatformHandle,
     pub destination_installation: PlatformHandle,
     pub archive_digest: PlatformHandle,
-    /// Opaque handle of the real `BackupBundle::validate` receipt for
-    /// `archive_digest` (typed import pending the #974 dependency edge).
-    pub bundle_receipt: PlatformHandle,
-    /// Owner-attested `BackupClass::is_full_recovery` outcome for the
-    /// validated bundle.
-    pub archive_full_recovery: bool,
-    /// Owner-attested scope-declared outcome (`BackupClass::select` with a
-    /// declared scope): a scope transfer never carries installation
-    /// recovery and can never enter cutover.
-    pub archive_scope_transfer: bool,
+    /// Real archive class from the backup owner (`eliot_backup::BackupClass`,
+    /// `crates/storage/eliot-backup/src/lib.rs:122`). Gates run through its
+    /// real methods (`is_full_recovery`, `is_canonical_only`,
+    /// `evidence_level`); no parallel vocabulary lives here.
+    pub archive_class: BackupClass,
     /// Explicit degraded-installation policy reference; required when the
     /// archive is canonical-only. Degraded recovery keeps this policy and
     /// can never silently claim `FullRecovery`.
@@ -190,13 +200,14 @@ pub struct CutoverRequest {
 /// Current recovery evidence consumed from the actual owners (#960 shape).
 ///
 /// Every denominator is complete-current: partial/unknown ORS/spool/effect
-/// denominators block cutover. `restore_receipt` is the opaque handle of the
-/// real `RestoreReceipt` from `RestorePlan::execute_with_journal` /
-/// `RestoreTarget::finalize_isolated` (which performs no cutover), and
-/// `operational_validation` is the opaque handle of the real owner-issued
-/// `OperationalValidationEvidence`: per
+/// denominators block cutover. The typed `RestoreReceipt` (from
+/// `RestorePlan::execute_with_journal` / `RestoreTarget::finalize_isolated`,
+/// which performs no cutover) and the typed owner-issued
+/// `OperationalValidationEvidence` carry the recovery proof: per
 /// `RestoreEvidenceLevel::permits_operational_readiness`, no
-/// library-emitted level alone qualifies, so both handles are required.
+/// library-emitted level alone qualifies, so both values are required.
+/// Lease quiescence is proven separately by the barrier, never by a local
+/// flag: there is no live-lease boolean here by design.
 #[derive(Clone, Debug)]
 pub struct IsolatedRecoveryEvidence {
     /// All mandatory recovery phases completed with current receipts.
@@ -214,18 +225,28 @@ pub struct IsolatedRecoveryEvidence {
     pub purge_key_reference_fresh: bool,
     /// External-source revalidation performed (never a stub).
     pub external_source_revalidated: bool,
-    /// Prior session/lease/route/generation/UI authority invalidated
-    /// (old authority returns only as historical/suspended evidence).
-    pub prior_authority_invalidated: bool,
-    /// No active source leases copied; old Host audit stays forensic-only.
-    pub no_live_lease_carryover: bool,
     /// Fresh destination readiness observed.
     pub destination_ready: bool,
-    /// Opaque handle of the real isolated-restore `RestoreReceipt`.
-    pub restore_receipt: PlatformHandle,
-    /// Opaque handle of the real owner-issued operational-validation
-    /// evidence (typed import pending the #974 dependency edge).
-    pub operational_validation: PlatformHandle,
+    /// Real isolated-restore receipt from `RestorePlan::execute_with_journal`
+    /// / `RestoreTarget::finalize_isolated` (`eliot_backup`, lib.rs:2612; "It
+    /// is not a cutover receipt"). Gates run through its real `validate()`,
+    /// bundle/fence/level bindings, and `cutover_performed == false`.
+    pub restore_receipt: RestoreReceipt,
+    /// Real owner-issued operational-validation evidence (`eliot_backup`,
+    /// lib.rs:2102; only the named owner may issue it, only for the exact
+    /// isolated destination). Gates run through its real `validate()` and
+    /// the observed-fence binding.
+    pub operational_validation: OperationalValidationEvidence,
+    /// Real ORS introduction readback rows for every prior capability
+    /// introduction (`eliot_ors::CapabilityIntroductionProjection`,
+    /// `model.rs:2043` on current main past #2388; empty when the restored
+    /// generation carries no prior introductions). Every row must read
+    /// `OperationalPhase::Fenced`: a fenced introduction can never read as
+    /// usable again, while any `Active` row blocks cutover. Readback
+    /// completeness is the admitted contour's obligation; lease quiescence
+    /// is independently proven by the barrier, whose ORS enumeration is
+    /// Parfit's (#1751) domain.
+    pub fenced_introductions: Vec<CapabilityIntroductionProjection>,
     /// Degraded recovery under its explicit stricter policy, if set.
     pub degraded_policy: Option<PlatformHandle>,
 }
@@ -292,6 +313,8 @@ pub enum CutoverError {
     IdentityConflict,
     #[error("retirement barrier denied: {0}")]
     BarrierDenied(String),
+    #[error("owner recovery receipt rejected: {0}")]
+    InvalidRecoveryReceipt(String),
     #[error("host owner transition failed: {0}")]
     HostTransition(#[from] HostError),
     #[error("installation registry rejected cutover evidence: {0}")]
@@ -316,18 +339,31 @@ fn admission_handle(
     PlatformHandle::new(admission.operation_id.clone()).map_err(|_| CutoverError::BindingMismatch)
 }
 
+/// Projects one owner receipt digest field into the bounded evidence set.
+/// The digest was already validated by its owner (`RestoreReceipt::validate`
+/// / `OperationalValidationEvidence::validate` during admission); this only
+/// carries the exact field into journaled evidence refs.
+fn receipt_handle(digest: &str) -> Result<PlatformHandle, CutoverError> {
+    PlatformHandle::new(digest).map_err(|_| CutoverError::BindingMismatch)
+}
+
 /// Validates one exact cutover request against current owner evidence.
 ///
-/// Real owner calls: `envelope.validate()`, `admission.validate()`, and the
+/// Real owner calls: `envelope.validate()`, `admission.validate()`, the
 /// digest binding through `host_request_operation_id` (a rehearsal envelope
-/// derives a different `hostreq:` handle and fails here, never as cutover).
+/// derives a different `hostreq:` handle and fails here, never as cutover),
+/// `RestoreReceipt::validate` (which itself rejects `cutover_performed`
+/// with `CutoverNotAuthorized`), `OperationalValidationEvidence::validate`,
+/// and the class ceiling through `BackupClass::evidence_level`.
 /// Fail-closed gates: separately admitted `Invocation` envelope whose fence
-/// exactly matches the activation fence; bindings exact; scope transfers
-/// rejected; degraded policy explicit, never upgraded; every mandatory phase
-/// receipt current; complete denominators; fresh purge/key/reference plus
-/// external-source revalidation; prior authority invalidated with no live
-/// lease carryover; owner-issued operational validation plus destination
-/// readiness; expected predecessor matches the registry projection.
+/// exactly matches the activation fence; bindings exact, including the
+/// receipt's bundle digest, restored fence, and class ceiling against the
+/// request; scope transfers rejected; degraded policy explicit, never
+/// upgraded; every mandatory phase receipt current; complete denominators;
+/// fresh purge/key/reference plus external-source revalidation; every prior
+/// introduction row fenced (lease quiescence proven separately by the
+/// barrier); observed operational-validation fence exact; expected
+/// predecessor and approved target match the registry projection.
 ///
 /// # Errors
 ///
@@ -366,11 +402,48 @@ pub fn validate_cutover_request(
     if !fences_match_exact(&request.envelope.state_fence, &request.activation_fence) {
         return Err(CutoverError::BindingMismatch);
     }
-    if request.archive_scope_transfer {
+    if request.archive_class == BackupClass::ScopeExport {
         return Err(CutoverError::ScopeExportForbidden);
     }
-    if !request.archive_full_recovery && request.archive_canonical_only_policy.is_none() {
+    if request.archive_class.is_canonical_only() && request.archive_canonical_only_policy.is_none()
+    {
         return Err(CutoverError::DegradedPolicyViolation);
+    }
+    evidence
+        .restore_receipt
+        .validate()
+        .map_err(|error| CutoverError::InvalidRecoveryReceipt(error.to_string()))?;
+    if evidence.restore_receipt.cutover_performed {
+        // The owner forbids this too (`CutoverNotAuthorized` inside
+        // `validate`); the distinct disposition names the rehearsal
+        // exclusion at the cutover boundary.
+        return Err(CutoverError::RehearsalCannotCutover);
+    }
+    if evidence.restore_receipt.bundle_sha256 != request.archive_digest.as_str() {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if evidence.restore_receipt.canonical_only != request.archive_class.is_canonical_only() {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if evidence.restore_receipt.evidence_level != request.archive_class.evidence_level() {
+        return Err(CutoverError::BindingMismatch);
+    }
+    if evidence.restore_receipt.restored_fence.authority_epoch
+        != request.activation_fence.authority_epoch
+        || evidence.restore_receipt.restored_fence.resource_generation
+            != request.activation_fence.resource_generation
+    {
+        return Err(CutoverError::BindingMismatch);
+    }
+    evidence
+        .operational_validation
+        .validate()
+        .map_err(|error| CutoverError::InvalidRecoveryReceipt(error.to_string()))?;
+    if !fences_match_exact(
+        &evidence.operational_validation.observed_at_state_fence,
+        &request.activation_fence,
+    ) {
+        return Err(CutoverError::BindingMismatch);
     }
     if request.source_installation == request.destination_installation {
         return Err(CutoverError::BindingMismatch);
@@ -397,7 +470,11 @@ pub fn validate_cutover_request(
     if !evidence.purge_key_reference_fresh || !evidence.external_source_revalidated {
         return Err(CutoverError::StalePurgeKeyReference);
     }
-    if !evidence.prior_authority_invalidated || !evidence.no_live_lease_carryover {
+    if !evidence
+        .fenced_introductions
+        .iter()
+        .all(|introduction| introduction.phase() == OperationalPhase::Fenced)
+    {
         return Err(CutoverError::PriorAuthorityStillActive);
     }
     if !evidence.destination_ready {
@@ -635,9 +712,9 @@ pub fn retire_prior_generation(
         retirement_evidence_refs: bounded_evidence(vec![
             admission_handle(&validated.request.admission)?,
             validated.request.archive_digest.clone(),
-            validated.request.bundle_receipt.clone(),
-            validated.evidence.restore_receipt.clone(),
-            validated.evidence.operational_validation.clone(),
+            receipt_handle(&validated.evidence.restore_receipt.receipt_id)?,
+            receipt_handle(&validated.evidence.restore_receipt.effect_receipt_sha256)?,
+            receipt_handle(&validated.evidence.operational_validation.validation_digest)?,
             retirement_authorization.clone(),
         ]),
         retired_at,
