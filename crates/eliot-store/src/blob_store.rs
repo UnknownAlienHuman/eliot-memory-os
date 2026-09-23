@@ -1,3 +1,7 @@
+//! D1 internal blob backend under the store/daemon contract (I5.2): same
+//! contract and extractable on-disk format as the bridge generation.
+//! `BlobStore::open` refuses roots held live by the bridge via the shared
+//! `.eliot-root.lock` handle protocol; one data-root owner is active at a time.
 use crate::StoreError;
 use crate::blob_validation::{expected_blob_relative_path, validate_blob_ref};
 use crate::error::{
@@ -134,6 +138,10 @@ impl CanonicalMemoryWritePlan {
 #[derive(Clone, Debug)]
 pub struct BlobStore {
     root: PathBuf,
+    /// Held open for the store lifetime: the handle hold (never the lock
+    /// record content) is the mutual-exclusion authority on this root.
+    /// Underscore-prefixed: never read, only held for exclusion.
+    _lease: Option<std::sync::Arc<std::fs::File>>,
 }
 
 struct StorageExhaustedDetails {
@@ -197,8 +205,10 @@ impl BlobStore {
             }
             Err(error) => return Err(error.into()),
         };
+        let lease = claim_root_lease(&canonical_root)?;
         Ok(Self {
             root: canonical_root,
+            _lease: Some(lease),
         })
     }
 
@@ -581,6 +591,104 @@ impl BlobStore {
     }
 }
 
+// Bridge lock file name from crates/storage/eliot-blob/src/lib.rs:87.
+const ROOT_LEASE_FILE: &str = ".eliot-root.lock";
+
+fn root_lease_conflict() -> StoreError {
+    StoreError::PolicyViolation(
+        "blob root is already owned by a live store-bridge generation; \
+         internal and process backends may never write the same root concurrently"
+            .to_owned(),
+    )
+}
+
+fn root_lease_is_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        // 0x400 = FILE_ATTRIBUTE_REPARSE_POINT.
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn reject_root_lease_reparse(lock_path: &Path) -> Result<(), StoreError> {
+    match std::fs::symlink_metadata(lock_path) {
+        Ok(metadata) if root_lease_is_reparse(&metadata) => Err(StoreError::PolicyViolation(
+            "blob root lease reparse points are not permitted".to_owned(),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn claim_root_lease(canonical_root: &Path) -> Result<std::sync::Arc<std::fs::File>, StoreError> {
+    let lock_path = canonical_root.join(ROOT_LEASE_FILE);
+    reject_root_lease_reparse(&lock_path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // 1 = FILE_SHARE_READ: the held handle (never the record content)
+        // is the ownership authority; a live owner denies the reopen below.
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .share_mode(1)
+            .open(&lock_path)
+        {
+            Ok(file) => Ok(std::sync::Arc::new(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A crashed owner leaves the record but not the handle, so a
+                // successful reopen takes over; leave the content untouched.
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .share_mode(1)
+                    .open(&lock_path)
+                    .map(std::sync::Arc::new)
+                    .map_err(|error| {
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                        ) {
+                            root_lease_conflict()
+                        } else {
+                            error.into()
+                        }
+                    })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // Production is native Windows x86_64-pc-windows-msvc: fail closed on
+        // an existing path rather than pretending exclusion holds elsewhere.
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => Ok(std::sync::Arc::new(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(root_lease_conflict())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 fn inspect_blob_secret_bytes(bytes: &[u8]) -> Result<(), StoreError> {
     const OVERLAP: usize = 1024;
     let step = MAX_SECRET_BOUNDARY_BYTES.saturating_sub(OVERLAP).max(1);
@@ -847,8 +955,9 @@ mod tests {
         StorageCleanup, StorageExhaustedEffect, StorageExhaustedRetry, StorageExhaustedStage,
     };
     use eliot_types::{
-        AgentId, BlobStoreConfig, CommandContext, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength,
-        LifecycleStatus, ProjectId, SemanticCommand, TaintClass, Visibility, WriteId,
+        AgentId, BlobStoreConfig, CommandContext, CueBinding, CueMatchMode, CueStrength,
+        LegacyCueKindV1, LifecycleStatus, ProjectId, SemanticCommand, TaintClass, Visibility,
+        WriteId,
     };
 
     #[test]
