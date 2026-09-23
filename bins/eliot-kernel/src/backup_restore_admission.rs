@@ -49,6 +49,26 @@
 //! a Store admission and vice versa: no caller digest masquerades as
 //! authority across wires.
 //!
+//! Anchor repair (F1, kernel wire): the importer re-fetches the anchor
+//! instead of trusting admission fields. `import_restore_transition`
+//! re-reads the owner-held stream binding live from the journal handle at
+//! import time and requires stream key, binding digest, transaction,
+//! destination, source archive, and writer-fence continuity against the
+//! presented admission — a self-consistent admission the journal does not
+//! anchor refuses with `RestoreJournalMismatch`. What the importer
+//! re-fetches (owner-held journal truth) versus what travels caller-carried
+//! (the admission struct): the struct is the claim, the readback is the
+//! proof.
+//!
+//! Provisional scope (honest labeling): this admission is fully anchored
+//! and enforced on the kernel import wire above. The Store-wire crossing —
+//! `StoreRestoreAdmission` construction from these fields, the committed
+//! coordination row keyed by operation identity the 975 bridge reads back,
+//! dispatch capability enforcement, deployment-role provisioning, and the
+//! provision pin — stays with the Store lane (which answered F2–F6 on its
+//! side; its minter/coordination-row writer is still open) and is proposed
+//! as hunks for root, never claimed as done here.
+//!
 //! The Store wire crossing (`StoreRestoreAdmission` construction, dispatch
 //! capability enforcement, bridge anchor check, replay conflict,
 //! deployment-role provisioning, provision pin verification — F1/F2/F3/F4/F6)
@@ -193,6 +213,8 @@ pub struct KernelRestoreAdmission {
     plan_id: String,
     bundle_sha256: String,
     target_id: String,
+    transaction_id: String,
+    source_archive_id: String,
     destination_binding_digest: String,
     journal_stream: String,
     journal_binding_digest: String,
@@ -222,6 +244,18 @@ impl KernelRestoreAdmission {
         &self.target_id
     }
 
+    /// Restore transaction this admission was minted for, bound to the
+    /// owner-held journal stream at mint and re-fetched at import.
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    /// Source archive identity this admission was minted against, bound
+    /// to the owner-held journal stream at mint and re-fetched at import.
+    pub fn source_archive_id(&self) -> &str {
+        &self.source_archive_id
+    }
+
     /// Host-issued destination binding digest this admission binds.
     pub fn destination_binding_digest(&self) -> &str {
         &self.destination_binding_digest
@@ -230,6 +264,11 @@ impl KernelRestoreAdmission {
     /// Owner-held journal stream this admission was read back from.
     pub fn journal_stream(&self) -> &str {
         &self.journal_stream
+    }
+
+    /// Digest of the owner-held stream binding read back at mint.
+    pub fn journal_binding_digest(&self) -> &str {
+        &self.journal_binding_digest
     }
 
     /// Live fence at mint; imports under a newer fence refuse.
@@ -269,6 +308,10 @@ impl KernelRestoreAdmission {
         material.push(b'\n');
         material.extend_from_slice(self.target_id.as_bytes());
         material.push(b'\n');
+        material.extend_from_slice(self.transaction_id.as_bytes());
+        material.push(b'\n');
+        material.extend_from_slice(self.source_archive_id.as_bytes());
+        material.push(b'\n');
         material.extend_from_slice(&identity_bytes);
         material.push(b'\n');
         material.extend_from_slice(RESTORE_ADMISSION_CLASS_MARKER.as_bytes());
@@ -297,6 +340,8 @@ impl KernelRestoreAdmission {
         non_blank(&self.plan_id, "restore.plan_id")?;
         hex64(&self.bundle_sha256, "restore.bundle_sha256")?;
         non_blank(&self.target_id, "restore.target_id")?;
+        non_blank(&self.transaction_id, "restore.transaction_id")?;
+        non_blank(&self.source_archive_id, "restore.source_archive_id")?;
         if self.destination_binding_digest.is_empty() {
             return Err(BackupError::InvalidField {
                 field: "restore.destination_binding_digest",
@@ -419,6 +464,8 @@ pub fn mint_restore_admission(
         plan_id: plan.plan_id.clone(),
         bundle_sha256,
         target_id: plan.target.target_id.clone(),
+        transaction_id: transaction.transaction_id.clone(),
+        source_archive_id: bundle.manifest.backup_id.clone(),
         destination_binding_digest,
         journal_stream: stream.to_owned(),
         journal_binding_digest: sha256_hex(&journal_binding_bytes),

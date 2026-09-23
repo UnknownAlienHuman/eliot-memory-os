@@ -571,6 +571,54 @@ impl CanonicalStoreImportClient {
             .map_err(OwnerChannelError::Backup)
     }
 
+    /// Re-fetches the independent journal anchor live and requires it to
+    /// anchor the presented admission.
+    ///
+    /// The stream key comes from the owner-held journal handle (never
+    /// caller spelling) and the binding is the owner's durably held value
+    /// read back now, not a presented copy: stream key, binding digest,
+    /// transaction, destination, and source archive must all match the
+    /// admission, and the writer fence digest must match the fence
+    /// presented at import (a rotated authority refuses instead of
+    /// importing under stale bindings). Self-consistency was already
+    /// proven by `admission.validate()`; this proves anchoring.
+    fn require_journal_anchor(
+        journal: &KernelRestoreJournal,
+        admission: &KernelRestoreAdmission,
+        live_fence: &StateFence,
+    ) -> Result<(), BackupError> {
+        let live_stream = journal
+            .bound_stream()
+            .ok_or(BackupError::RestoreJournalMismatch)?;
+        if live_stream != admission.journal_stream() {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        let live = journal
+            .read_durable_binding(live_stream)
+            .map_err(|error| BackupError::Target(error.to_string()))?
+            .ok_or(BackupError::RestoreJournalMismatch)?;
+        if live.transaction_id != admission.transaction_id() {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        if live.destination_ref != admission.target_id() {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        if live.source_archive_id != admission.source_archive_id() {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        let live_bytes = canonical_json_bytes(&live)
+            .map_err(|error| BackupError::Target(error.to_string()))?;
+        if sha256_hex(&live_bytes) != admission.journal_binding_digest() {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        let fence_bytes = canonical_json_bytes(live_fence)
+            .map_err(|error| BackupError::Target(error.to_string()))?;
+        if sha256_hex(&fence_bytes) != live.writer_fence_digest {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        Ok(())
+    }
+
     /// Executes one Governor-admitted restore transition through the gateway.
     ///
     /// The admitted-restore wire: restore imports run only under a
@@ -579,8 +627,13 @@ impl CanonicalStoreImportClient {
     /// before any store effect — a restore-class transition without one,
     /// an admission bound to a different transition or destination, a
     /// fence-diverged admission, or a diverged decision digest refuses
-    /// (conflict, never retry-as-same). Ordinary canonical imports keep
-    /// using [`Self::import_transition`]; this wire never admits them.
+    /// (conflict, never retry-as-same). The journal anchor is re-fetched
+    /// live below: the importer reads the owner-held stream binding from
+    /// the journal handle at import time and requires it to anchor the
+    /// presented admission, so a self-consistent admission the journal
+    /// does not anchor refuses with `RestoreJournalMismatch`. Ordinary
+    /// canonical imports keep using [`Self::import_transition`]; this wire
+    /// never admits them.
     pub async fn import_restore_transition(
         &self,
         verified: &VerifiedDestinationBinding,
@@ -590,6 +643,7 @@ impl CanonicalStoreImportClient {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         admission: &KernelRestoreAdmission,
+        journal: &KernelRestoreJournal,
     ) -> Result<WriteReceipt, OwnerChannelError> {
         self.gate(verified)?;
         transition
@@ -615,6 +669,8 @@ impl CanonicalStoreImportClient {
         }
         admission
             .validate()
+            .map_err(OwnerChannelError::Backup)?;
+        Self::require_journal_anchor(journal, admission, &context.state_fence)
             .map_err(OwnerChannelError::Backup)?;
         self.gateway
             .apply(
