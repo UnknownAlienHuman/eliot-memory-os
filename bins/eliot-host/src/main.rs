@@ -865,11 +865,38 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
     let _ = report_service_status(&handle, &report);
     let mut idle_drain = HostIdleDrainSupervisor::default();
     let mut stop_pending_reported = false;
+    let mut stop_deadline_gap_recorded = false;
+    let mut next_stop_gap_attempt = std::time::Instant::now();
     let mut next_stop_census = std::time::Instant::now();
+    let mut next_stop_status = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut stop_requested_at = None;
     while host.running() {
         process_phase_b_requests(&mut host, &phase_b_queue);
-        process_runtime_control_requests(&mut host, &runtime_queue);
+        if process_runtime_control_requests(&mut host, &runtime_queue) {
+            idle_drain.note_observable_use();
+        }
+        if idle_drain.recovery_gap_due(std::time::Instant::now()) {
+            match host.record_drain_recovery_gap(
+                "idle-runtime-lease-census-deadline",
+                eliot_observation_contracts::GapDisposition::BlockDependentTransition,
+                &[],
+            ) {
+                Ok(()) => idle_drain.mark_recovery_gap_recorded(),
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: idle census recovery deadline reached but the durable recovery record failed; automatic drain stays paused: {error}"
+                    );
+                }
+            }
+        }
         if STOP_REQUESTED.load(Ordering::Acquire) {
+            let now = std::time::Instant::now();
+            if stop_requested_at.is_none() {
+                stop_deadline_gap_recorded = false;
+                next_stop_gap_attempt = now;
+            }
+            let requested_at = *stop_requested_at.get_or_insert(now);
             if !stop_pending_reported {
                 report.current_state = SERVICE_STOP_PENDING;
                 report.controls_accepted = 0;
@@ -884,27 +911,106 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                         io::stderr().lock(),
                         "eliot-host: pre-commit SCM drain could not start: {error}"
                     );
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    continue;
-                }
-                let now = std::time::Instant::now();
-                if now >= next_stop_census {
+                } else if now >= next_stop_census {
                     next_stop_census = now + std::time::Duration::from_secs(5);
-                    match host.has_active_generation_runtime_leases() {
-                        Ok(false) => break,
-                        Ok(true) => {}
+                    match host.snapshot() {
+                        Ok(state) if state.drain_commit.is_some() => {
+                            if let Err(error) = host.stop() {
+                                let _ = writeln!(
+                                    io::stderr().lock(),
+                                    "eliot-host: committed generation retirement remains recoverable: {error}"
+                                );
+                            } else {
+                                break;
+                            }
+                        }
+                        Ok(_) => match host.has_active_generation_runtime_leases() {
+                            Ok(false) => match host.stop() {
+                                Ok(()) => break,
+                                Err(error) => {
+                                    let _ = writeln!(
+                                        io::stderr().lock(),
+                                        "eliot-host: committed drain attempt remains recoverable: {error}"
+                                    );
+                                }
+                            },
+                            Ok(true) => {}
+                            Err(error) => {
+                                let _ = writeln!(
+                                    io::stderr().lock(),
+                                    "eliot-host: Kernel owner census is not ready for drain: {error}"
+                                );
+                            }
+                        },
                         Err(error) => {
                             let _ = writeln!(
                                 io::stderr().lock(),
-                                "eliot-host: Kernel owner census is not ready for drain: {error}"
+                                "eliot-host: durable drain state cannot be read: {error}"
                             );
                         }
                     }
+                }
+                if now >= next_stop_status {
+                    report.check_point = report.check_point.saturating_add(1);
+                    report.wait_hint = 30_000;
+                    let _ = report_service_status(&handle, &report);
+                    next_stop_status = now + std::time::Duration::from_secs(5);
+                }
+                if now.duration_since(requested_at)
+                    >= HostIdleDrainSupervisor::OWNER_RECOVERY_DEADLINE
+                {
+                    if !stop_deadline_gap_recorded && now >= next_stop_gap_attempt {
+                        match host.record_drain_recovery_gap(
+                            "scm-stop-owner-census-deadline",
+                            eliot_observation_contracts::GapDisposition::BlockDependentTransition,
+                            &[],
+                        ) {
+                            Ok(()) => stop_deadline_gap_recorded = true,
+                            Err(error) => {
+                                let _ = writeln!(
+                                    io::stderr().lock(),
+                                    "eliot-host: stop recovery deadline reached but its durable recovery record failed; keeping SCM stop pending: {error}"
+                                );
+                                next_stop_gap_attempt = now + std::time::Duration::from_secs(5);
+                            }
+                        }
+                    }
+                    if !stop_deadline_gap_recorded {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        continue;
+                    }
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: stop deferred at the owner recovery deadline; the durable drain remains recoverable and no Job fallback ran"
+                    );
+                    STOP_REQUESTED.store(false, Ordering::Release);
+                    report.current_state = SERVICE_RUNNING;
+                    report.controls_accepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+                    report.check_point = 0;
+                    report.wait_hint = 0;
+                    let _ = report_service_status(&handle, &report);
+                    stop_pending_reported = false;
+                    stop_requested_at = None;
+                    idle_drain.pause_for_manual_recovery();
+                    next_stop_census = std::time::Instant::now();
+                    next_stop_status = next_stop_census + std::time::Duration::from_secs(5);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 continue;
             }
             break;
+        }
+        stop_requested_at = None;
+        if host
+            .snapshot()
+            .is_ok_and(|state| state.drain_commit.is_some())
+        {
+            // A committed drain cannot be cancelled. Keep processing only
+            // authenticated runtime-control requests (which may persist a
+            // next-generation WakeIntent) while retaining the Kernel Job for
+            // owner recovery or a later explicit SCM stop retry.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            continue;
         }
         match host.has_durable_branch_fence() {
             Ok(true) => {
@@ -940,7 +1046,12 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 Ok(true) => STOP_REQUESTED.store(true, Ordering::Release),
                 Ok(false) => {}
                 Err(error) => {
-                    idle_drain.note_probe_failure();
+                    if idle_drain.note_probe_failure(std::time::Instant::now()) {
+                        let _ = writeln!(
+                            io::stderr().lock(),
+                            "eliot-host: idle drain paused for manual recovery after repeated owner-census failures"
+                        );
+                    }
                     let _ = writeln!(
                         io::stderr().lock(),
                         "eliot-host: idle RuntimeLease owner census deferred drain: {error}"
@@ -958,7 +1069,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
     report.check_point = 1;
     report.wait_hint = 10_000;
     let _ = report_service_status(&handle, &report);
-    let stop_result = host.stop();
+    let stop_result = if host.running() { host.stop() } else { Ok(()) };
     report.current_state = SERVICE_STOPPED;
     report.controls_accepted = 0;
     if let Err(error) = stop_result {
@@ -1090,7 +1201,8 @@ fn process_reactive_context_request(
 fn process_runtime_control_requests(
     host: &mut HostComposition,
     queue: &eliot_host::HostRuntimeControlQueue,
-) {
+) -> bool {
+    let mut observed_demand = false;
     loop {
         let request = match queue.lock() {
             Ok(mut q) => q.pop_front(),
@@ -1106,11 +1218,13 @@ fn process_runtime_control_requests(
                 process_reactive_context_request(host, envelope.request())
             }
             RuntimeControlDispatch::DemandStart => {
-                host.handle_demand_start_request(envelope.request())
+                observed_demand = true;
+                host.handle_demand_start_request(envelope.request(), envelope.peer())
             }
         };
         let _ = envelope.respond(response);
     }
+    observed_demand
 }
 
 #[cfg(windows)]
@@ -1215,6 +1329,10 @@ struct HostIdleDrainSupervisor {
     last_census_at: Option<std::time::Instant>,
     staged_census_complete: bool,
     last_census_had_active_owner: bool,
+    census_failure_since: Option<std::time::Instant>,
+    manual_recovery_required: bool,
+    recovery_gap_recorded: bool,
+    next_recovery_gap_attempt: Option<std::time::Instant>,
 }
 
 #[cfg(windows)]
@@ -1226,6 +1344,10 @@ impl Default for HostIdleDrainSupervisor {
             last_census_at: None,
             staged_census_complete: false,
             last_census_had_active_owner: false,
+            census_failure_since: None,
+            manual_recovery_required: false,
+            recovery_gap_recorded: false,
+            next_recovery_gap_attempt: None,
         }
     }
 }
@@ -1235,6 +1357,7 @@ impl HostIdleDrainSupervisor {
     const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
     const CENSUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
     const PRECOMMIT_CANCEL_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+    const OWNER_RECOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
     /// Returns true once the exact-fence owner census remains idle through the
     /// five-minute grace and a cancellable pre-commit SCM tick has completed.
@@ -1243,6 +1366,9 @@ impl HostIdleDrainSupervisor {
         host: &mut HostComposition,
         now: std::time::Instant,
     ) -> Result<bool, HostError> {
+        if self.manual_recovery_required {
+            return Ok(false);
+        }
         if !host.idle_drain_eligible()? {
             self.reset();
             return Ok(false);
@@ -1282,6 +1408,7 @@ impl HostIdleDrainSupervisor {
         }
 
         let active = host.has_active_generation_runtime_leases()?;
+        self.census_failure_since = None;
         self.last_census_at = Some(now);
         self.last_census_had_active_owner = active;
         if self.drain_staged_at.is_some() {
@@ -1308,14 +1435,53 @@ impl HostIdleDrainSupervisor {
         Ok(false)
     }
 
-    fn note_probe_failure(&mut self) {
+    fn note_probe_failure(&mut self, now: std::time::Instant) -> bool {
         self.last_census_at = None;
         self.last_census_had_active_owner = true;
+        let failure_since = *self.census_failure_since.get_or_insert(now);
         if self.drain_staged_at.is_none() {
             self.idle_since = None;
         } else {
             self.staged_census_complete = false;
         }
+        if now.duration_since(failure_since) >= Self::OWNER_RECOVERY_DEADLINE {
+            self.manual_recovery_required = true;
+            return true;
+        }
+        false
+    }
+
+    fn recovery_gap_due(&mut self, now: std::time::Instant) -> bool {
+        if !self.manual_recovery_required || self.recovery_gap_recorded {
+            return false;
+        }
+        if self
+            .next_recovery_gap_attempt
+            .is_some_and(|next| now < next)
+        {
+            return false;
+        }
+        self.next_recovery_gap_attempt = Some(now + Self::CENSUS_INTERVAL);
+        true
+    }
+
+    fn mark_recovery_gap_recorded(&mut self) {
+        self.recovery_gap_recorded = true;
+    }
+
+    fn pause_for_manual_recovery(&mut self) {
+        self.reset();
+        self.manual_recovery_required = true;
+        // SCM's deadline record is the durable recovery owner for this pause.
+        self.recovery_gap_recorded = true;
+    }
+
+    fn note_observable_use(&mut self) {
+        self.census_failure_since = None;
+        self.manual_recovery_required = false;
+        self.recovery_gap_recorded = false;
+        self.next_recovery_gap_attempt = None;
+        self.idle_since = None;
     }
 
     fn reset(&mut self) {
@@ -1324,6 +1490,10 @@ impl HostIdleDrainSupervisor {
         self.last_census_at = None;
         self.staged_census_complete = false;
         self.last_census_had_active_owner = false;
+        self.census_failure_since = None;
+        self.manual_recovery_required = false;
+        self.recovery_gap_recorded = false;
+        self.next_recovery_gap_attempt = None;
     }
 }
 

@@ -123,7 +123,8 @@ impl Drop for HostTerminalGuard<'_> {
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 pub use eliot_host_control_endpoint::{
-    HOST_RUNTIME_CONTROL_PIPE, HostRuntimeControl, HostRuntimeControlQueue,
+    AuthenticatedHostRuntimePeer, HOST_RUNTIME_CONTROL_PIPE, HostRuntimeControl,
+    HostRuntimeControlQueue,
 };
 use eliot_host_service::runtime_control::runtime_control_unknown_ref;
 pub use eliot_host_service::runtime_control::{
@@ -2054,7 +2055,9 @@ impl HostJobBranches {
     fn acquire_runtime_lease_for_demand(
         &mut self,
         demand: &HostDemandStartRuntimeRequest,
+        peer: &AuthenticatedHostRuntimePeer,
     ) -> Result<(), HostError> {
+        validate_authenticated_demand_peer(demand, peer)?;
         let admission = demand.runtime_lease_admission.as_ref().ok_or_else(|| {
             HostError::OwnerLeaseRecovery(
                 "demand-start has no authenticated RuntimeLease owner admission".to_owned(),
@@ -3906,13 +3909,107 @@ fn bind_demand_activation(
     activation: &mut EliotActivationRecord,
     request: &HostRuntimeControlRequest,
     demand: &HostDemandStartRuntimeRequest,
+    peer: &AuthenticatedHostRuntimePeer,
 ) -> Result<(), HostError> {
+    if demand.requester_principal.as_str() != peer.principal_sid() {
+        return Err(HostError::RecoveryRequired(
+            "demand-start principal differs from the authenticated pipe peer".to_owned(),
+        ));
+    }
     activation.operation = demand_operation(request, "activation")?;
     activation.trigger_class = demand.trigger_class.clone();
     activation.trigger_evidence = demand.trigger_evidence.clone();
-    activation.requester_principal_session_or_scheduler = demand.requester_principal.clone();
+    activation
+        .trigger_evidence
+        .extend(authenticated_demand_peer_evidence(
+            peer,
+            &demand.state_fence,
+            demand.runtime_lease_admission.as_ref(),
+        )?);
+    activation.requester_principal_session_or_scheduler =
+        PlatformHandle::new(format!("{}@{}", peer.principal_sid(), peer.session_id()))
+            .map_err(|error| HostError::Platform(error.to_string()))?;
     activation.requested_capabilities = demand.requested_capabilities.clone();
     activation.candidate_scope = demand.candidate_scope.clone();
+    Ok(())
+}
+
+#[cfg(windows)]
+fn authenticated_demand_peer_evidence(
+    peer: &AuthenticatedHostRuntimePeer,
+    state_fence: &eliot_contracts::StateFence,
+    admission: Option<&eliot_kernel_service::RuntimeLeaseAdmission>,
+) -> Result<Vec<PlatformHandle>, HostError> {
+    let process = peer.process_binding();
+    let image_binding = sha256_json(&(process.image_path(), process.executable_file_identity()))?;
+    let fence_binding = sha256_json(state_fence)?;
+    let mut evidence = vec![
+        format!("host-control-session:{}", peer.session_id()),
+        format!("host-control-connection:{}", peer.connection_id()),
+        format!("host-control-process-id:{}", process.process_id()),
+        format!(
+            "host-control-process-start-100ns:{}",
+            process.start_time_100ns()
+        ),
+        format!("host-control-process-image:{image_binding}"),
+        format!("host-control-state-fence:{fence_binding}"),
+    ];
+    if let Some(admission) = admission {
+        let owner = admission.owner_admission.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "authenticated demand has no durable RuntimeLease owner binding".to_owned(),
+            )
+        })?;
+        let admission_digest = sha256_json(admission)?;
+        evidence.extend([
+            format!("host-control-runtime-owner:{}", owner.owner_ref.as_str()),
+            format!(
+                "host-control-runtime-owner-admission:{}",
+                owner.admission_digest
+            ),
+            format!("host-control-runtime-admission:{admission_digest}"),
+        ]);
+    }
+    evidence
+        .into_iter()
+        .map(|value| {
+            PlatformHandle::new(value).map_err(|error| HostError::Platform(error.to_string()))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn validate_authenticated_demand_peer(
+    demand: &HostDemandStartRuntimeRequest,
+    peer: &AuthenticatedHostRuntimePeer,
+) -> Result<(), HostError> {
+    if demand.requester_principal.as_str() != peer.principal_sid() {
+        return Err(HostError::RecoveryRequired(
+            "demand-start principal differs from the authenticated pipe peer".to_owned(),
+        ));
+    }
+    let admission = demand.runtime_lease_admission.as_ref().ok_or_else(|| {
+        HostError::OwnerLeaseRecovery(
+            "demand-start has no durable RuntimeLease owner admission".to_owned(),
+        )
+    })?;
+    admission
+        .validate()
+        .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
+    let owner = admission.owner_admission.as_ref().ok_or_else(|| {
+        HostError::OwnerLeaseRecovery(
+            "demand-start RuntimeLease admission has no owner readback reference".to_owned(),
+        )
+    })?;
+    if owner.kind != eliot_kernel_service::RuntimeLeaseOwnerKind::Session
+        || !owner.owner_ref.as_str().starts_with("owner:host-request:")
+        || admission.state_fence != demand.state_fence
+    {
+        return Err(HostError::OwnerLeaseRecovery(
+            "demand-start lease is not bound to the current HostRequest session and fence"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -5248,6 +5345,7 @@ impl HostComposition {
     pub fn handle_demand_start_request(
         &mut self,
         request: &HostRuntimeControlRequest,
+        peer: &AuthenticatedHostRuntimePeer,
     ) -> HostRuntimeControlResponse {
         host_lifecycle_observe_scm("host.demand-start requested");
         if request.operation != HostRuntimeControlOperation::RequestDemandStart
@@ -5278,7 +5376,14 @@ impl HostComposition {
                 runtime_control_unknown_ref("demand-start-validation", request),
             );
         };
-        match self.execute_demand_start(request, demand) {
+        if validate_authenticated_demand_peer(demand, peer).is_err() {
+            host_lifecycle_observe_terminal("host-demand-start-unknown");
+            return HostRuntimeControlResponse::unknown_for(
+                request,
+                runtime_control_unknown_ref("demand-start-authenticated-owner", request),
+            );
+        }
+        match self.execute_demand_start(request, demand, peer) {
             Ok(receipt) => {
                 host_lifecycle_observe_scm("host.demand-start active");
                 HostRuntimeControlResponse::demand_started_for(request, receipt)
@@ -5356,6 +5461,7 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
         demand: &HostDemandStartRuntimeRequest,
+        peer: &AuthenticatedHostRuntimePeer,
     ) -> Result<HostDemandStartReceipt, HostError> {
         self.ensure_admission_open()?;
         let initial = self.journal.snapshot()?;
@@ -5383,6 +5489,7 @@ impl HostComposition {
                     Path::new(store_path.as_str()),
                     request,
                     demand,
+                    peer,
                 )?;
                 self.bind_verified_demand_leases(demand)?;
                 self.transition_activation(ActivationState::Active, "host-demand-start-active")?;
@@ -5395,13 +5502,13 @@ impl HostComposition {
                         "demand-start reconcile did not prove readiness: {disposition:?}"
                     )));
                 }
-                self.jobs.acquire_runtime_lease_for_demand(demand)?;
+                self.jobs.acquire_runtime_lease_for_demand(demand, peer)?;
                 self.bind_verified_demand_leases(demand)?;
                 self.transition_activation_with_drain_disposition(
                     ActivationState::Active,
                     "host-demand-start-active",
                     None,
-                    Some((request, demand)),
+                    Some((request, demand, peer)),
                 )?;
             }
             ActivationState::Active => {
@@ -5432,13 +5539,13 @@ impl HostComposition {
                         "demand-start reconcile did not prove readiness: {disposition:?}"
                     )));
                 }
-                self.jobs.acquire_runtime_lease_for_demand(demand)?;
+                self.jobs.acquire_runtime_lease_for_demand(demand, peer)?;
                 self.bind_verified_demand_leases(demand)?;
             }
             ActivationState::Draining => {
                 if initial.drain_commit.is_some() {
                     if let Some(wake) = demand.wake.as_ref() {
-                        self.persist_demand_wake(request, demand, wake)?;
+                        self.persist_demand_wake(request, demand, wake, peer)?;
                     } else {
                         return Err(HostError::RecoveryRequired(
                             "demand-start drain commit requires a durable WakeIntent".to_owned(),
@@ -5477,13 +5584,13 @@ impl HostComposition {
                         "demand-start drain cancellation could not revalidate readiness".to_owned(),
                     ));
                 }
-                self.jobs.acquire_runtime_lease_for_demand(demand)?;
+                self.jobs.acquire_runtime_lease_for_demand(demand, peer)?;
                 self.bind_verified_demand_leases(demand)?;
                 self.transition_activation_with_drain_disposition(
                     ActivationState::Active,
                     "host-demand-start-drain-cancelled",
                     Some(WakeDisposition::CancelDrain),
-                    Some((request, demand)),
+                    Some((request, demand, peer)),
                 )?;
                 drain_disposition = Some(
                     PlatformHandle::new("CANCEL_DRAIN")
@@ -5559,6 +5666,7 @@ impl HostComposition {
         request: &HostRuntimeControlRequest,
         demand: &HostDemandStartRuntimeRequest,
         wake: &HostDemandStartWakeRequest,
+        peer: &AuthenticatedHostRuntimePeer,
     ) -> Result<(), HostError> {
         let snapshot = self.journal.snapshot()?;
         let activation = snapshot.activation.ok_or_else(|| {
@@ -5587,7 +5695,16 @@ impl HostComposition {
             operation: origin_operation,
             wake_id: wake.wake_id.clone(),
             intent,
-            reason_evidence_refs: demand.trigger_evidence.clone(),
+            reason_evidence_refs: demand
+                .trigger_evidence
+                .iter()
+                .cloned()
+                .chain(authenticated_demand_peer_evidence(
+                    peer,
+                    &demand.state_fence,
+                    demand.runtime_lease_admission.as_ref(),
+                )?)
+                .collect(),
             earliest_start: wake.earliest_start.clone(),
             deadline: wake.deadline.clone(),
             expiry: wake.expiry.clone(),
@@ -6105,14 +6222,18 @@ impl HostComposition {
         state: ActivationState,
         label: &str,
         disposition: Option<WakeDisposition>,
-        demand: Option<(&HostRuntimeControlRequest, &HostDemandStartRuntimeRequest)>,
+        demand: Option<(
+            &HostRuntimeControlRequest,
+            &HostDemandStartRuntimeRequest,
+            &AuthenticatedHostRuntimePeer,
+        )>,
     ) -> Result<(), HostError> {
         let current = self.journal.snapshot()?.activation.ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
         let mut next = transition_activation_record(&current, state, label)?;
-        if let Some((request, demand)) = demand {
-            bind_demand_activation(&mut next, request, demand)?;
+        if let Some((request, demand, peer)) = demand {
+            bind_demand_activation(&mut next, request, demand, peer)?;
         }
         next.wake_during_drain_disposition = disposition;
         self.append_record(HostStateRecord::Activation(next))?;
@@ -6622,6 +6743,7 @@ impl HostComposition {
         store_executable: impl AsRef<Path>,
         request: &HostRuntimeControlRequest,
         demand: &HostDemandStartRuntimeRequest,
+        peer: &AuthenticatedHostRuntimePeer,
     ) -> Result<(), HostError> {
         self.ensure_admission_open()?;
         let active =
@@ -6638,7 +6760,7 @@ impl HostComposition {
             store_executable.as_ref(),
             store_artifact,
             None,
-            Some((request, demand)),
+            Some((request, demand, peer)),
         )
     }
 
@@ -6726,7 +6848,11 @@ impl HostComposition {
         store_executable: &Path,
         store_artifact: &PlatformHandle,
         pending: Option<&eliot_installation::PendingActivation>,
-        demand: Option<(&HostRuntimeControlRequest, &HostDemandStartRuntimeRequest)>,
+        demand: Option<(
+            &HostRuntimeControlRequest,
+            &HostDemandStartRuntimeRequest,
+            &AuthenticatedHostRuntimePeer,
+        )>,
     ) -> Result<(), HostError> {
         // F-LOG-HOST-1: inner phase only; outer `start_approved_contour`/`open`
         // owns the single terminal. Requested vs started vs ready preserved:
@@ -6770,8 +6896,8 @@ impl HostComposition {
             next.trigger_evidence
                 .push(pending_activation_binding(pending)?);
         }
-        if let Some((request, demand)) = demand {
-            bind_demand_activation(&mut next, request, demand)?;
+        if let Some((request, demand, peer)) = demand {
+            bind_demand_activation(&mut next, request, demand, peer)?;
         }
         next.trigger_evidence
             .push(phase_b_activation_binding(&phase_b)?);
@@ -6853,7 +6979,7 @@ impl HostComposition {
             kernel_generation,
             kernel_authority_epoch,
             manifest,
-            demand.map(|(_, demand)| demand),
+            demand.map(|(_, demand, _peer)| demand),
         ) {
             Ok(value) => value,
             Err(error) => return self.cleanup_launched_contour(error),
@@ -8066,7 +8192,11 @@ impl HostComposition {
                 let barrier = match self.require_generation_retirement_barrier(&expected) {
                     Ok(barrier) => barrier,
                     Err(error) => {
-                        self.shutdown_failed = true;
+                        self.record_drain_recovery_gap(
+                            "committed-retirement-barrier-unavailable",
+                            GapDisposition::BlockDependentTransition,
+                            &[],
+                        )?;
                         return Err(error);
                     }
                 };
@@ -8095,27 +8225,161 @@ impl HostComposition {
                     || barrier.kernel_process_id() != kernel_process.process_id
                     || barrier.kernel_process_start_time_100ns() != kernel_process.start_time_100ns
                 {
-                    self.shutdown_failed = true;
+                    self.record_drain_recovery_gap(
+                        "committed-retirement-barrier-diverged",
+                        GapDisposition::BlockDependentTransition,
+                        &[],
+                    )?;
                     return Err(HostError::RecoveryRequired(
                         "retirement barrier does not match the exact current Kernel termination target"
                             .to_owned(),
                     ));
                 }
-                let graceful_request = self
-                    .request_kernel_shutdown_after_retirement(&barrier)
-                    .is_ok();
-                let kernel_reaped = graceful_request
-                    && matches!(
+                let shutdown_request = self.request_kernel_shutdown_after_retirement(&barrier);
+                let mut kernel_reaped = match &shutdown_request {
+                    Ok(false) => false,
+                    Ok(true) | Err(_) => matches!(
                         self.jobs.forget_kernel_after_observed_exit(
                             &kernel_process,
                             std::time::Duration::from_secs(20),
                         ),
                         Ok(true)
-                    );
+                    ),
+                };
+                if kernel_reaped && matches!(&shutdown_request, Err(_)) {
+                    let census_digest = sha256_json(barrier.runtime_lease_census())?;
+                    let evidence =
+                        PlatformHandle::new(format!("runtime-census-sha256:{census_digest}"))
+                            .map_err(|error| HostError::Platform(error.to_string()))?;
+                    self.record_drain_recovery_gap(
+                        "kernel-shutdown-outcome-unknown-process-exit-observed",
+                        GapDisposition::Escalate,
+                        &[evidence],
+                    )?;
+                }
+                let mut retry_shutdown = None;
                 if !kernel_reaped {
-                    // The exact retirement barrier remains the authority for
-                    // this bounded fallback. Kernel's complete Job is closed
-                    // before the Store dependency is stopped.
+                    // A refusal or lost response is never permission to kill.
+                    // Re-read the exact committed fence and current ORS owners;
+                    // only a fresh terminal census authorizes bounded fallback.
+                    let refreshed = match self.require_generation_retirement_barrier(&expected) {
+                        Ok(barrier) => barrier,
+                        Err(error) => {
+                            self.record_drain_recovery_gap(
+                                "kernel-shutdown-refused-or-unknown-owner-state",
+                                GapDisposition::BlockDependentTransition,
+                                &[],
+                            )?;
+                            return Err(HostError::RecoveryRequired(format!(
+                                "DrainCommit remains durable and Kernel/Store remain running; fresh owner census did not authorize termination: {error}"
+                            )));
+                        }
+                    };
+                    let census_digest = sha256_json(refreshed.runtime_lease_census())?;
+                    let evidence =
+                        PlatformHandle::new(format!("runtime-census-sha256:{census_digest}"))
+                            .map_err(|error| HostError::Platform(error.to_string()))?;
+                    if refreshed.kernel_process_id() != kernel_process.process_id
+                        || refreshed.kernel_process_start_time_100ns()
+                            != kernel_process.start_time_100ns
+                    {
+                        self.record_drain_recovery_gap(
+                            "kernel-process-identity-changed-during-committed-drain",
+                            GapDisposition::BlockDependentTransition,
+                            &[evidence],
+                        )?;
+                        return Err(HostError::RecoveryRequired(
+                            "committed drain Kernel process identity changed; retaining the current contour for recovery"
+                                .to_owned(),
+                        ));
+                    }
+                    let divergence = match &shutdown_request {
+                        Ok(false) => "kernel-shutdown-explicit-owner-refusal-rechecked",
+                        Ok(true) => "kernel-shutdown-acknowledged-exit-unobserved",
+                        Err(_) => "kernel-shutdown-delivery-outcome-unknown-rechecked",
+                    };
+                    self.record_drain_recovery_gap(
+                        divergence,
+                        GapDisposition::Escalate,
+                        &[evidence],
+                    )?;
+
+                    // One retry follows the fresh owner readback. If it still
+                    // does not yield an observed exit, a second exact census is
+                    // required immediately before the bounded Job fallback.
+                    let retry = self.request_kernel_shutdown_after_retirement(&refreshed);
+                    if matches!(&retry, Ok(false)) {
+                        self.record_drain_recovery_gap(
+                            "kernel-shutdown-retry-explicit-owner-refusal",
+                            GapDisposition::BlockDependentTransition,
+                            std::slice::from_ref(&evidence),
+                        )?;
+                        return Err(HostError::RecoveryRequired(
+                            "Kernel explicitly refused the fresh owner pass; DrainCommit remains durable and Kernel/Store remain running for recovery"
+                                .to_owned(),
+                        ));
+                    }
+                    if matches!(&retry, Ok(true)) {
+                        kernel_reaped = matches!(
+                            self.jobs.forget_kernel_after_observed_exit(
+                                &kernel_process,
+                                std::time::Duration::from_secs(20),
+                            ),
+                            Ok(true)
+                        );
+                    }
+                    retry_shutdown = Some(retry);
+                }
+                if !kernel_reaped {
+                    let final_barrier = match self.require_generation_retirement_barrier(&expected)
+                    {
+                        Ok(barrier) => barrier,
+                        Err(error) => {
+                            self.record_drain_recovery_gap(
+                                "kernel-forced-termination-owner-state-unproven",
+                                GapDisposition::BlockDependentTransition,
+                                &[],
+                            )?;
+                            return Err(HostError::RecoveryRequired(format!(
+                                "DrainCommit remains durable; refusing Kernel Job termination without a fresh terminal owner census: {error}"
+                            )));
+                        }
+                    };
+                    if final_barrier.kernel_process_id() != kernel_process.process_id
+                        || final_barrier.kernel_process_start_time_100ns()
+                            != kernel_process.start_time_100ns
+                    {
+                        self.record_drain_recovery_gap(
+                            "kernel-process-identity-changed-before-forced-termination",
+                            GapDisposition::BlockDependentTransition,
+                            &[],
+                        )?;
+                        return Err(HostError::RecoveryRequired(
+                            "fresh retirement census belongs to a different Kernel process; refusing Job termination"
+                                .to_owned(),
+                        ));
+                    }
+                    let census_digest = sha256_json(final_barrier.runtime_lease_census())?;
+                    let evidence =
+                        PlatformHandle::new(format!("runtime-census-sha256:{census_digest}"))
+                            .map_err(|error| HostError::Platform(error.to_string()))?;
+                    if let Some(retry) = retry_shutdown.as_ref() {
+                        let retry_divergence = match retry {
+                            Ok(false) => "kernel-shutdown-retry-owner-refusal",
+                            Ok(true) => "kernel-shutdown-retry-acknowledged-exit-unobserved",
+                            Err(_) => "kernel-shutdown-retry-outcome-unknown",
+                        };
+                        self.record_drain_recovery_gap(
+                            retry_divergence,
+                            GapDisposition::Escalate,
+                            std::slice::from_ref(&evidence),
+                        )?;
+                    }
+                    self.record_drain_recovery_gap(
+                        "kernel-forced-termination-after-terminal-owner-readback",
+                        GapDisposition::Escalate,
+                        std::slice::from_ref(&evidence),
+                    )?;
                     host_lifecycle_observe_drain("host.kernel-shutdown bounded fallback");
                     if let Err(error) = self.jobs.terminate_kernel() {
                         self.shutdown_failed = true;

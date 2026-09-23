@@ -431,6 +431,7 @@ impl KernelComposition {
             KernelControlCommand::BootstrapStore(handoff) => Some(handoff.clone()),
             _ => None,
         };
+        let mut control_error = None;
         #[cfg(windows)]
         let _store_rebind_guard = if matches!(
             &request.command,
@@ -828,7 +829,29 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?,
                 KernelControlCommand::Drain => {
                     #[cfg(windows)]
-                    self.terminalize_generation_leases_for_drain(&request)?;
+                    {
+                        match self
+                            .service_state()
+                            .map_err(|_| TransportError::SessionFenced)?
+                        {
+                            KernelServiceState::Ready => {
+                                // Host has already committed this generation's drain.
+                                // Close normal admission before re-reading owners so a
+                                // late acquisition cannot cross the commit boundary.
+                                self.apply_control(KernelControlCommand::Drain)
+                                    .map_err(|_| TransportError::SessionFenced)?;
+                            }
+                            KernelServiceState::Draining => {}
+                            _ => return Err(TransportError::SessionFenced),
+                        }
+                        if !self.terminalize_generation_leases_for_drain(&request)? {
+                            // This is a typed, correlated refusal, not a transport
+                            // failure. The Kernel remains alive in Draining with the
+                            // current owner obligation intact for exact-fence retry.
+                            control_error = Some("runtime_lease_owner_active".to_owned());
+                        }
+                    }
+                    #[cfg(not(windows))]
                     match self
                         .service_state()
                         .map_err(|_| TransportError::SessionFenced)?
@@ -940,36 +963,44 @@ impl KernelComposition {
                 {
                     return Err(TransportError::SessionFenced);
                 }
-                let supervision_lease_id =
-                    eliot_ors::OperationIdentity::new(query.supervision_lease_id.clone())
+                if !self.terminalize_generation_leases_for_drain(&request)? {
+                    control_error = Some("runtime_lease_owner_active".to_owned());
+                    None
+                } else {
+                    let supervision_lease_id =
+                        eliot_ors::OperationIdentity::new(query.supervision_lease_id.clone())
+                            .map_err(|_| TransportError::SessionFenced)?;
+                    let (runtime_leases, supervision_lease) = self
+                        .generation_gateway
+                        .ors
+                        .load_runtime_lease_census_by_state_fence(
+                            &query.state_fence,
+                            Some(&supervision_lease_id),
+                        )
                         .map_err(|_| TransportError::SessionFenced)?;
-                let (runtime_leases, supervision_lease) = self
-                    .generation_gateway
-                    .ors
-                    .load_runtime_lease_census_by_state_fence(
-                        &query.state_fence,
-                        Some(&supervision_lease_id),
-                    )
-                    .map_err(|_| TransportError::SessionFenced)?;
-                let supervision_lease = supervision_lease.ok_or(TransportError::SessionFenced)?;
-                let census = eliot_kernel_service::RuntimeLeaseCensus {
-                    state_fence: query.state_fence.clone(),
-                    supervision_lease_id: query.supervision_lease_id.clone(),
-                    runtime_leases,
-                    supervision_lease,
-                };
-                census
-                    .validate()
-                    .map_err(|_| TransportError::SessionFenced)?;
-                if !census.is_fully_retired() {
-                    return Err(TransportError::SessionFenced);
+                    let supervision_lease =
+                        supervision_lease.ok_or(TransportError::SessionFenced)?;
+                    let census = eliot_kernel_service::RuntimeLeaseCensus {
+                        state_fence: query.state_fence.clone(),
+                        supervision_lease_id: query.supervision_lease_id.clone(),
+                        runtime_leases,
+                        supervision_lease,
+                    };
+                    census
+                        .validate()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    if !census.is_fully_retired() {
+                        control_error = Some("runtime_lease_owner_active".to_owned());
+                        None
+                    } else {
+                        // The Host has already persisted DrainCommit and presented
+                        // the exact activation fence. Re-readback above is the Kernel
+                        // owner gate; this signal enters the existing composition
+                        // shutdown/drain path instead of terminating the Job directly.
+                        let _ = self.request_shutdown();
+                        Some(census)
+                    }
                 }
-                // The Host has already persisted DrainCommit and presented the
-                // exact activation fence. Re-readback above is the Kernel
-                // owner gate; this signal enters the existing composition
-                // shutdown/drain path instead of terminating the Job directly.
-                let _ = self.request_shutdown();
-                Some(census)
             }
             _ => None,
         };
@@ -997,7 +1028,7 @@ impl KernelComposition {
             supervision_lease,
             runtime_lease,
             runtime_lease_census,
-            error: None,
+            error: control_error,
             payload_digest: String::new(),
         }
         .with_computed_digest()
@@ -1535,8 +1566,10 @@ impl KernelComposition {
                     }
                     continue;
                 }
-                LeaseState::Active | LeaseState::Expiring | LeaseState::Reconciling => {}
-                LeaseState::Requested => return Err(TransportError::SessionFenced),
+                LeaseState::Requested
+                | LeaseState::Active
+                | LeaseState::Expiring
+                | LeaseState::Reconciling => {}
             }
             if lease.state_fence != state_fence {
                 return Err(TransportError::SessionFenced);
@@ -1552,6 +1585,16 @@ impl KernelComposition {
             )?;
             let owner =
                 self.resolve_runtime_lease_owner(request, &owner_ref, None, Some(&state_fence))?;
+            if lease.state == LeaseState::Requested {
+                if owner.active && lease.obligation.expires_at_ms <= unix_ms() {
+                    // Keep an expired request non-authorizing and visible as a
+                    // live owner obligation. A later exact-fence pass releases
+                    // it only after the durable owner becomes inactive.
+                    continue;
+                }
+                self.resolve_requested_runtime_lease(request, &lease, &owner)?;
+                continue;
+            }
             if owner.active {
                 if lease.state == LeaseState::Active
                     && unix_ms() >= lease.obligation.renew_before_ms
@@ -1625,14 +1668,53 @@ impl KernelComposition {
         Ok(census)
     }
 
+    fn resolve_requested_runtime_lease(
+        &self,
+        request: &KernelControlRequest,
+        lease: &RuntimeLease,
+        owner: &RuntimeLeaseOwnerObservation,
+    ) -> Result<RuntimeLease, TransportError> {
+        if lease.state != LeaseState::Requested
+            || lease.state_fence
+                != StateFence::new(request.candidate.kernel_epoch.clone(), request.generation)
+            || owner.renewal_evidence.is_empty()
+            || owner.renewal_evidence_refs.is_empty()
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut next = lease.clone();
+        next.revision = lease
+            .revision
+            .checked_add(1)
+            .ok_or(TransportError::SessionFenced)?;
+        next.obligation.renewal_evidence = owner.renewal_evidence.clone();
+        if owner.active {
+            next.state = LeaseState::Active;
+            next.obligation.terminal_disposition = None;
+        } else {
+            next.state = LeaseState::Released;
+            next.obligation.terminal_disposition =
+                Some("kernel-requested-lease-owner-inactive".to_owned());
+        }
+        next.validate().map_err(|_| TransportError::SessionFenced)?;
+        let readback = self
+            .generation_gateway
+            .ors
+            .resolve_requested_runtime_lease(lease, &next)
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.validate_runtime_lease_owner(request, &readback)?;
+        Ok(readback)
+    }
+
     /// Terminalizes only owner-inactive lease rows from this exact Kernel
-    /// StateFence before the service enters Draining. An active owner leaves
-    /// Kernel Ready and makes the Host keep the drain recoverable pre-commit.
+    /// StateFence after normal admission has closed. An active owner remains a
+    /// durable obligation; the Kernel returns a typed refusal while Draining
+    /// so Host can retry from the same committed fence after owner readback.
     #[cfg(windows)]
     fn terminalize_generation_leases_for_drain(
         &self,
         request: &KernelControlRequest,
-    ) -> Result<(), TransportError> {
+    ) -> Result<bool, TransportError> {
         if !matches!(
             self.service_state()
                 .map_err(|_| TransportError::SessionFenced)?,
@@ -1663,13 +1745,15 @@ impl KernelComposition {
         let mut pending = Vec::new();
         for lease in leases {
             match lease.state {
-                LeaseState::Active | LeaseState::Expiring | LeaseState::Reconciling => {}
+                LeaseState::Requested
+                | LeaseState::Active
+                | LeaseState::Expiring
+                | LeaseState::Reconciling => {}
                 LeaseState::Released
-                | LeaseState::Expired
                 | LeaseState::Revoked
                 | LeaseState::Superseded
                 | LeaseState::Closed => continue,
-                LeaseState::Requested => return Err(TransportError::SessionFenced),
+                LeaseState::Expired => {}
             }
             if lease.state_fence != state_fence {
                 return Err(TransportError::SessionFenced);
@@ -1686,7 +1770,14 @@ impl KernelComposition {
             let observation =
                 self.resolve_runtime_lease_owner(request, &owner_ref, None, Some(&state_fence))?;
             if observation.active {
-                return Err(TransportError::SessionFenced);
+                // A committed drain closes admission: an outstanding request
+                // must remain non-authorizing and every expired owner remains
+                // visible until its durable operation finishes or cancels.
+                // Never trust an `Expired` lease state as proof of no work.
+                return Ok(false);
+            }
+            if lease.state == LeaseState::Expired {
+                continue;
             }
             pending.push((lease, owner_ref));
         }
@@ -1704,7 +1795,17 @@ impl KernelComposition {
             let owner =
                 self.resolve_runtime_lease_owner(request, &owner_ref, None, Some(&state_fence))?;
             if owner.active {
-                return Err(TransportError::SessionFenced);
+                return Ok(false);
+            }
+            if current.state == LeaseState::Requested {
+                let resolved = self.resolve_requested_runtime_lease(request, &current, &owner)?;
+                if resolved.state == LeaseState::Active {
+                    return Ok(false);
+                }
+                continue;
+            }
+            if current.state == LeaseState::Expired {
+                continue;
             }
             let evidence_refs = owner.renewal_evidence_refs;
             if evidence_refs.is_empty() {
@@ -1728,7 +1829,8 @@ impl KernelComposition {
             self.transition_runtime_lease(request, &terminal, next_state)?;
         }
 
-        self.revoke_current_supervision_lease_for_drain(request, &state_fence, &supervision)
+        self.revoke_current_supervision_lease_for_drain(request, &state_fence, &supervision)?;
+        Ok(true)
     }
 
     #[cfg(windows)]

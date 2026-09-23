@@ -1936,6 +1936,7 @@ dependencies = [
  "eliot-platform-windows",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

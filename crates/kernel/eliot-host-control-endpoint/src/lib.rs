@@ -25,7 +25,7 @@ pub use eliot_host_service::runtime_control::{
     runtime_control_unknown_ref,
 };
 use eliot_host_service::runtime_control::{operation_unknown_ref, response_matches_request};
-use eliot_ipc::{NamedPipeServer, TransportLimits};
+use eliot_ipc::{NamedPipeServer, PeerIdentity, ProcessBinding, TransportLimits};
 use tokio::sync::oneshot;
 
 pub const HOST_RUNTIME_CONTROL_PIPE: &str = r"\\.\pipe\eliot\host\runtime-control-v1";
@@ -42,13 +42,80 @@ struct HostRuntimeControlReply {
 
 pub struct HostRuntimeControlEnvelope {
     request: HostRuntimeControlRequest,
+    peer: AuthenticatedHostRuntimePeer,
     reply: oneshot::Sender<HostRuntimeControlReply>,
     correlation: ResponseCorrelation,
+}
+
+/// Handle-authenticated caller binding for one Host runtime-control pipe
+/// connection. The connection identifier is minted by the server; frame
+/// fields supplied by the caller are correlation data only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedHostRuntimePeer {
+    peer: PeerIdentity,
+    principal_sid: String,
+    session_id: String,
+    process: ProcessBinding,
+    connection_id: String,
+}
+
+impl AuthenticatedHostRuntimePeer {
+    fn from_transport(peer: &PeerIdentity) -> Result<Self, String> {
+        peer.validate().map_err(|error| error.to_string())?;
+        let (principal_sid, session_id) = Self::principal_session(peer)?;
+        let process = peer
+            .process_binding()
+            .ok_or_else(|| "authenticated Host peer has no process binding".to_owned())?;
+        Ok(Self {
+            peer: peer.clone(),
+            principal_sid: principal_sid.to_owned(),
+            session_id: session_id.to_owned(),
+            process: process.clone(),
+            connection_id: format!("host-runtime-control:{}", uuid::Uuid::new_v4().simple()),
+        })
+    }
+
+    fn principal_session(peer: &PeerIdentity) -> Result<(&str, &str), String> {
+        match peer {
+            PeerIdentity::Authenticated {
+                user_identity,
+                session_identity,
+                ..
+            } => Ok((user_identity, session_identity)),
+            PeerIdentity::Unavailable { .. } => {
+                Err("Host runtime-control peer identity is unavailable".to_owned())
+            }
+        }
+    }
+
+    pub fn peer_identity(&self) -> &PeerIdentity {
+        &self.peer
+    }
+
+    pub fn principal_sid(&self) -> &str {
+        &self.principal_sid
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn process_binding(&self) -> &ProcessBinding {
+        &self.process
+    }
+
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
 }
 
 impl HostRuntimeControlEnvelope {
     pub fn request(&self) -> &HostRuntimeControlRequest {
         &self.request
+    }
+
+    pub fn peer(&self) -> &AuthenticatedHostRuntimePeer {
+        &self.peer
     }
 
     pub fn respond(
@@ -94,7 +161,11 @@ impl HostRuntimeControl {
         Arc::clone(&self.queue)
     }
 
-    async fn handle(&self, request: &HostRuntimeControlRequest) -> HostRuntimeControlResponse {
+    async fn handle(
+        &self,
+        request: &HostRuntimeControlRequest,
+        peer: AuthenticatedHostRuntimePeer,
+    ) -> HostRuntimeControlResponse {
         if request.validate().is_err() {
             return HostRuntimeControlResponse::unknown_for(
                 request,
@@ -118,6 +189,7 @@ impl HostRuntimeControl {
             }
             queue.push_back(HostRuntimeControlEnvelope {
                 request: request.clone(),
+                peer,
                 reply,
                 correlation: correlation.clone(),
             });
@@ -157,7 +229,8 @@ impl HostRuntimeControl {
             .map_err(|error| error.to_string())?;
         let connection_id = frame.connection_id.clone();
         let request = decode_runtime_control_request_frame(&frame)?;
-        let response = self.handle(&request).await;
+        let peer = AuthenticatedHostRuntimePeer::from_transport(server.peer_identity())?;
+        let response = self.handle(&request, peer).await;
         let response_frame = runtime_control_response_frame(connection_id, &response)?;
         server
             .send_frame(&response_frame, limits)

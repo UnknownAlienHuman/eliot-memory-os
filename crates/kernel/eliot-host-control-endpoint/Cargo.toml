@@ -18,6 +18,7 @@ eliot-host-service.workspace = true
 eliot-ipc.workspace = true
 eliot-platform-windows.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 eliot-platform.workspace = true

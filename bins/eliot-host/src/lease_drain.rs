@@ -59,6 +59,83 @@ impl GenerationRetirementBarrier {
 }
 
 impl HostComposition {
+    /// Persists a protected recovery gap bound to the current activation and
+    /// drain commit. The caller must keep the Kernel process alive until a
+    /// later exact-fence owner census proves termination safe.
+    pub fn record_drain_recovery_gap(
+        &mut self,
+        reason_ref: &str,
+        disposition: GapDisposition,
+        extra_evidence: &[PlatformHandle],
+    ) -> Result<(), HostError> {
+        let state = self.journal.snapshot()?;
+        let activation = state.activation.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "drain recovery observation has no durable activation".to_owned(),
+            )
+        })?;
+        let mut evidence = vec![
+            PlatformHandle::new(format!("drain-recovery-reason:{reason_ref}"))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            PlatformHandle::new(format!("activation:{}", activation.activation_id.as_str()))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            PlatformHandle::new(format!(
+                "activation-fence:{}",
+                sha256_json(&activation.fence)?
+            ))
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        ];
+        if let Some(commit) = state.drain_commit.as_ref() {
+            evidence.push(
+                PlatformHandle::new(format!(
+                    "drain-commit:{}",
+                    commit.operation.operation_id.as_str()
+                ))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            );
+        }
+        evidence.extend(extra_evidence.iter().cloned());
+        evidence.sort();
+        evidence.dedup();
+        if state.observations.iter().any(|record| {
+            record.fence == activation.fence
+                && record.binding_evidence_refs == evidence
+                && record
+                    .observation
+                    .coverage_gap
+                    .as_ref()
+                    .is_some_and(|gap| gap.reason_ref == reason_ref && gap.protected)
+        }) {
+            return Ok(());
+        }
+        let record_id = fresh_identity("host-drain-recovery-gap")?;
+        self.append_record(HostStateRecord::Observation(HostObservationRecord {
+            fence: activation.fence.clone(),
+            operation: operation("host-drain-recovery-observation")?,
+            observation: ObservationRecordEnvelope {
+                record_id: record_id.as_str().to_owned(),
+                kind: ObservationRecordKind::CoverageGap,
+                event: None,
+                coverage_gap: Some(CoverageGap {
+                    gap_id: record_id.as_str().to_owned(),
+                    obligation_profile_ref: "windows-host-generation-retirement-v1".to_owned(),
+                    reason_ref: reason_ref.to_owned(),
+                    affected_interval: None,
+                    disposition,
+                    protected: true,
+                    evidence_refs: evidence
+                        .iter()
+                        .map(|item| item.as_str().to_owned())
+                        .collect(),
+                }),
+                journal_control_event: false,
+                parent_record_id: None,
+            },
+            binding_evidence_refs: evidence,
+        }))?;
+        Ok(())
+    }
+
     /// Starts or resumes the durable pre-commit drain for the current
     /// activation. Kernel remains Ready until the Host has crossed the durable
     /// DrainCommit boundary, so an authenticated demand can still cancel and
@@ -73,11 +150,11 @@ impl HostComposition {
     }
 
     fn begin_precommit_drain(&mut self, evidence: &str) -> Result<(), HostError> {
-        self.ensure_admission_open()?;
         let mut state = self.journal.snapshot()?;
         if state.drain_commit.is_some() {
             return Ok(());
         }
+        self.ensure_admission_open()?;
         let activation = state.activation.clone().ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
@@ -261,7 +338,7 @@ impl HostComposition {
             .enable_all()
             .build()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let response = runtime.block_on(async {
+        let (drain_refused, response) = runtime.block_on(async {
             let mut transport =
                 connect_authenticated_kernel_front_door(candidate, &kernel_process).await?;
             validate_authenticated_kernel_peer(
@@ -514,10 +591,12 @@ impl HostComposition {
             drain_response
                 .validate()
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let drain_refused =
+                drain_response.error.as_deref() == Some("runtime_lease_owner_active");
             if drain_response.message_id != drain_request.message_id
                 || drain_response.request_digest != drain_request.payload_digest
                 || drain_response.state != KernelServiceState::Draining
-                || drain_response.error.is_some()
+                || (drain_response.error.is_some() && !drain_refused)
                 || drain_response.receipt.is_some()
                 || drain_response.runtime_health.is_some()
                 || drain_response.activation_receipt.is_some()
@@ -546,8 +625,9 @@ impl HostComposition {
                 .receive_frame(limits)
                 .await
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-            eliot_kernel_service::decode_control_response_frame(&frame)
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))
+            let response = eliot_kernel_service::decode_control_response_frame(&frame)
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            Ok((drain_refused, response))
         })?;
         response
             .validate()
@@ -578,7 +658,6 @@ impl HostComposition {
         let supervision = &census.supervision_lease;
         if census.state_fence != expected.state_fence
             || census.supervision_lease_id != supervision_lease_ref.as_str()
-            || !census.is_fully_retired()
             || supervision.record.binding.activation_id.as_str() != expected.activation_id.as_str()
             || supervision.record.binding.activation_generation
                 != expected.state_fence.resource_generation
@@ -586,7 +665,39 @@ impl HostComposition {
             || supervision.record.binding.state_fence != expected.state_fence
         {
             return Err(HostError::RecoveryRequired(
-                "canonical ORS still has active or foreign generation lease authority".to_owned(),
+                "canonical ORS census is not bound to the committed generation".to_owned(),
+            ));
+        }
+        if !census.is_fully_retired() {
+            let census_digest = sha256_json(&census)?;
+            let evidence = PlatformHandle::new(format!("runtime-census-sha256:{census_digest}"))
+                .map_err(|error| HostError::Platform(error.to_string()))?;
+            self.record_drain_recovery_gap(
+                if drain_refused {
+                    "kernel-drain-refused-active-owner"
+                } else {
+                    "kernel-retirement-census-active-owner"
+                },
+                GapDisposition::BlockDependentTransition,
+                &[evidence],
+            )?;
+            return Err(HostError::RecoveryRequired(
+                "committed drain retained: exact-fence ORS still has a live owner obligation; Kernel and Store remain running"
+                .to_owned(),
+            ));
+        }
+        if drain_refused {
+            let census_digest = sha256_json(&census)?;
+            let evidence = PlatformHandle::new(format!("runtime-census-sha256:{census_digest}"))
+                .map_err(|error| HostError::Platform(error.to_string()))?;
+            self.record_drain_recovery_gap(
+                "kernel-drain-refusal-requires-new-owner-pass",
+                GapDisposition::BlockDependentTransition,
+                &[evidence],
+            )?;
+            return Err(HostError::RecoveryRequired(
+                "Kernel refused the current owner pass; the raw ORS census cannot clear that typed refusal. Retry the same committed fence for a new Kernel owner readback before termination"
+                    .to_owned(),
             ));
         }
 
@@ -606,7 +717,7 @@ impl HostComposition {
     pub(crate) fn request_kernel_shutdown_after_retirement(
         &mut self,
         barrier: &GenerationRetirementBarrier,
-    ) -> Result<(), HostError> {
+    ) -> Result<bool, HostError> {
         let state = self.journal.snapshot()?;
         let activation = state.activation.as_ref().ok_or_else(|| {
             HostError::OwnerLeaseRecovery(
@@ -690,10 +801,7 @@ impl HostComposition {
                 "host-retirement-shutdown:{}:{}:{}",
                 fence.activation_id.as_str(),
                 fence.state_fence.resource_generation.value(),
-                barrier
-                    .drain_commit_operation()
-                    .operation_id
-                    .as_str()
+                barrier.drain_commit_operation().operation_id.as_str()
             ),
             &request,
         )
@@ -734,6 +842,20 @@ impl HostComposition {
         response
             .validate()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if response.message_id == request.message_id
+            && response.request_digest == request.payload_digest
+            && response.state == KernelServiceState::Draining
+            && response.error.as_deref() == Some("runtime_lease_owner_active")
+            && response.receipt.is_none()
+            && response.runtime_health.is_none()
+            && response.activation_receipt.is_none()
+            && response.store_rebind_receipt.is_none()
+            && response.supervision_lease.is_none()
+            && response.runtime_lease.is_none()
+            && response.runtime_lease_census.is_none()
+        {
+            return Ok(false);
+        }
         let returned_census = response.runtime_lease_census.as_ref();
         if response.message_id != request.message_id
             || response.request_digest != request.payload_digest
@@ -751,6 +873,6 @@ impl HostComposition {
                 "Kernel did not acknowledge shutdown with the exact retired census".to_owned(),
             ));
         }
-        Ok(())
+        Ok(true)
     }
 }

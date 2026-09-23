@@ -5,14 +5,97 @@
 
 use super::{
     OrsError, RUNTIME_LEASE_CURRENT, RedbRecoveryStore, SUPERVISION_LEASE_CURRENT, decode,
-    decode_named, storage,
+    decode_named, encode, storage,
 };
 use crate::{OperationIdentity, SupervisionLeaseSnapshot};
 use eliot_contracts::StateFence;
-use eliot_runtime_contracts::RuntimeLease;
+use eliot_runtime_contracts::{LeaseState, RuntimeLease};
 use redb::{ReadableDatabase, ReadableTable};
 
 impl RedbRecoveryStore {
+    /// Recovers one exact Requested lease after the Kernel has re-read its
+    /// durable owner. The caller supplies the owner-derived next projection;
+    /// this method provides the ORS compare-and-swap and durable readback.
+    pub fn resolve_requested_runtime_lease(
+        &self,
+        expected: &RuntimeLease,
+        next: &RuntimeLease,
+    ) -> Result<RuntimeLease, OrsError> {
+        expected
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        next.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let legal_state = matches!(
+            next.state,
+            LeaseState::Active | LeaseState::Released | LeaseState::Expired | LeaseState::Revoked
+        );
+        let same_owner = expected.lease_id == next.lease_id
+            && expected.scope_ref == next.scope_ref
+            && expected.authority_epoch == next.authority_epoch
+            && expected.state_fence == next.state_fence
+            && expected.obligation.holder == next.obligation.holder
+            && expected.obligation.reason == next.obligation.reason
+            && expected.obligation.required_runtime_branches
+                == next.obligation.required_runtime_branches
+            && expected.obligation.required_capabilities == next.obligation.required_capabilities
+            && expected.obligation.obligation_refs == next.obligation.obligation_refs
+            && expected.obligation.issued_at_ms == next.obligation.issued_at_ms
+            && expected.obligation.expires_at_ms == next.obligation.expires_at_ms
+            && expected.obligation.renew_before_ms == next.obligation.renew_before_ms;
+        if expected.state != LeaseState::Requested
+            || !legal_state
+            || !same_owner
+            || next.revision != expected.revision.checked_add(1).unwrap_or_default()
+            || expected.transition_to(next.state).is_err()
+            || next.obligation.renewal_evidence.is_empty()
+            || (next.state == LeaseState::Active && next.obligation.terminal_disposition.is_some())
+            || (next.state != LeaseState::Active && next.obligation.terminal_disposition.is_none())
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut table = write.open_table(RUNTIME_LEASE_CURRENT).map_err(storage)?;
+            let current: RuntimeLease = {
+                let current = table
+                    .get(expected.lease_id.as_str())
+                    .map_err(storage)?
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "runtime_lease",
+                        reason: "requested recovery target is absent".to_owned(),
+                    })?;
+                decode(current.value())?
+            };
+            if current != *expected {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "runtime_lease",
+                    reason: "requested recovery revision or owner changed".to_owned(),
+                });
+            }
+            let payload = encode(next)?;
+            table
+                .insert(next.lease_id.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        let readback = self
+            .load_current_runtime_lease(&next.lease_id)?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "runtime_lease",
+                reason: "requested recovery row disappeared before readback".to_owned(),
+            })?;
+        if readback != *next {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "runtime_lease",
+                reason: "requested recovery readback differs from owner-derived transition"
+                    .to_owned(),
+            });
+        }
+        Ok(readback)
+    }
+
     /// Reads every current RuntimeLease whose complete StateFence equals the
     /// requested fence from one durable ORS snapshot.
     ///
