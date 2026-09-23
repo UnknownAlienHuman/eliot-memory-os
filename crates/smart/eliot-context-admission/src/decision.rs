@@ -123,10 +123,23 @@ impl RetrievalAdmissionDecision {
 ///
 /// Every field comes from an owning record: the membership disposition from
 /// the admission decision, the optional warning text from explicit caller
-/// evidence (no warning owner exists in-tree; a future warning producer
-/// supplies it here), the rule identity from the admission rule owner, the
+/// evidence, the rule identity from the admission rule owner, the
 /// availability from the candidate's freshness owner, and the floor flag
 /// from the Safety Floor owner.
+///
+/// Warning-text ownership (I12.26 `include_with_warning`: framing,
+/// staleness bound, or contradiction risk staying below suppression) is
+/// assigned, not invented here: risk-derived warnings belong to the
+/// Governor risk owner for reactive admission (1942 C1 per-item risk and
+/// attestation), contradiction-risk warnings to the conflict-analysis
+/// owner, and staleness-bound warnings with expected source/projection
+/// revision comparands to the reactive projection owners. No producer is
+/// bound to this field yet — the Governor lane mints risk tiers for bridge
+/// transport, not admission warning text, and mapping tiers to warnings
+/// here would invent a cross-vocabulary quotient — so the field remains
+/// explicit caller evidence and [`classify_admission`] keeps the total
+/// unable-path for its absence. The first bound producer supplies text
+/// through this field; no new outcome kind is created.
 pub struct ClassificationEvidence<'a> {
     /// Evaluated membership disposition for the candidate.
     pub disposition: AdmissionDisposition,
@@ -455,8 +468,11 @@ pub fn trace_material(
             disposition: decision.disposition,
             outcome: classify_admission(&ClassificationEvidence {
                 disposition: decision.disposition,
-                // No warning owner exists in-tree: explicit caller evidence
-                // arrives here once its producer lands.
+                // Warning text is owner-assigned (Governor risk /
+                // conflict-analysis / projection owners; see
+                // `ClassificationEvidence`) but no producer is bound yet,
+                // so the traced entrypoint classifies with no warning
+                // evidence rather than synthesizing any.
                 warning: None,
                 rule: &input.rule,
                 availability: candidate.availability,

@@ -133,6 +133,47 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 /// and the explicit suppression evidence. The traces re-validate the result
 /// against the input closure fail-closed, so the pair always corresponds;
 /// no separate join by the caller can drift.
+///
+/// ## Runtime join contract (M2/O1 daemon feed callee)
+///
+/// This entrypoint is the sole supplier-side callee the daemon retrieval
+/// drive joins against; the drive builds nothing admission-side and mints
+/// no identities. Caller obligations, in order:
+///
+/// 1. Resolve both suppliers from their owners only: the retrieval plan
+///    through the retrieval-plan compiler
+///    (`eliot-reactive-context-plan` compiler) and the [`AdmissionInput`]
+///    through the closure assembler ([`assemble_closure`]). Absent
+///    suppliers idle with a named pending outcome; they are never
+///    fabricated at the call site.
+/// 2. Validate the plan fail-closed through its canonical digest before
+///    calling; a refused plan never reaches selection.
+/// 3. Call exactly once per changed supplier bundle and bind the returned
+///    pair verbatim: the result and selection digests, the decision
+///    anchor, and every trace handle with its staleness obligation.
+/// 4. Map `Err(`[`ContextError::InvalidFence`])` to the packet-refresh arm
+///    ([`RetrievalStaleness::PacketRefreshRequired`]); it names a closure
+///    compiled under another fence and can never admit. Every other
+///    boundary refusal is named by its refusing stage, never coerced into
+///    an admission outcome.
+/// 5. Read per-material staleness only from
+///    [`MaterialRankTrace::staleness`], capacity pressure only from
+///    [`MaterialRankTrace::capacity_constrained`], and suppression text
+///    only from [`MaterialRankTrace::suppression_reason`]; none of these
+///    signals reclassifies the trace outcome, which [`classify_admission`]
+///    alone determines.
+///
+/// Supplier anchors (this crate): fence arm in [`admit_context`], the
+/// trichotomy gate in [`check_retrieval_freshness`], the total classifier
+/// in [`classify_admission`], and the trace join in [`trace_material`].
+/// In-copy consumption anchors (foreign-owned, verified read-only at
+/// `ecd54e5f`): the daemon tick invokes the retrieval drive
+/// (`bins/eliotd/src/daemon_runtime.rs:664`), which performs this exact
+/// join (`bins/eliotd/src/reactive_feed.rs:236-306`, fence arm at
+/// `:250-255`, admitted binding at `:260-304`) with idempotent ticks
+/// (`:317-357`); supplier postures arrive through the daemon composition
+/// injection setter (`bins/eliotd/src/lib.rs:411-426`), and named absence
+/// idles at `:91-115`.
 pub fn admit_context_traced(
     input: &AdmissionInput,
 ) -> Result<(AdmissionResult, Vec<MaterialRankTrace>), ContextError> {
