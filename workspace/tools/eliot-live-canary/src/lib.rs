@@ -3140,6 +3140,12 @@ fn operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
         HostRuntimeControlOperation::RecoverStore => "RecoverStore",
         HostRuntimeControlOperation::ReconcileStoreRecovery => "ReconcileStoreRecovery",
         HostRuntimeControlOperation::DeliverReactiveContext => "DeliverReactiveContext",
+        HostRuntimeControlOperation::AdmitUserAutomationOccurrence => {
+            "AdmitUserAutomationOccurrence"
+        }
+        HostRuntimeControlOperation::CancelUserAutomationPendingWakes => {
+            "CancelUserAutomationPendingWakes"
+        }
     }
 }
 

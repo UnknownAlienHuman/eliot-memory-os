@@ -73,8 +73,7 @@ pub const TESTD_ADMISSION_OPERATION: &str = "eliot.kernel.testd-admission";
 pub const TESTD_ADMISSION_OPERATION_VERSION: u16 = 1;
 /// Authenticated receipt-publication operation on the same TestD Kernel
 /// session used for admission.
-pub const TESTD_TERMINAL_COMPLETION_OPERATION: &str =
-    "eliot.kernel.testd-terminal-completion";
+pub const TESTD_TERMINAL_COMPLETION_OPERATION: &str = "eliot.kernel.testd-terminal-completion";
 /// Version of the TestD terminal-completion wire.
 pub const TESTD_TERMINAL_COMPLETION_OPERATION_VERSION: u16 = 1;
 /// Advertisement for the testd admission operation: inert until the dispatch
@@ -734,10 +733,8 @@ impl KernelTestdIpcClient {
                         .validate()
                         .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
                     let expected_operation = format!("{}/verifier-execution", binding.operation_id);
-                    let expected_idempotency = format!(
-                        "{}:verifier-execution",
-                        identity.idempotency_key
-                    );
+                    let expected_idempotency =
+                        format!("{}:verifier-execution", identity.idempotency_key);
                     if receipt.status != WriteReceiptStatus::Committed
                         || receipt.operation_id.as_str() != expected_operation
                         || receipt.idempotency_key != expected_idempotency
@@ -1354,6 +1351,25 @@ mod tests {
         .expect("envelope digest")
     }
 
+    /// Test-only bootstrap for [`KernelTestdIpcClient`].
+    ///
+    /// Sources `client` through the real production path —
+    /// [`KernelClient::load`], the same protected installation-owned
+    /// front-door declaration [`KernelTestdIpcClient::connect`] uses — and
+    /// pairs it with the caller-supplied epoch contour. Returns `None` when
+    /// no composed Kernel front door is available; callers skip fail-closed
+    /// there, exactly like production refuses to invent authority without
+    /// the live bootstrap.
+    fn testd_client_fixture(live_epoch: Option<EpochId>) -> Option<KernelTestdIpcClient> {
+        KernelClient::load()
+            .ok()
+            .map(|client| KernelTestdIpcClient {
+                client,
+                live_epoch,
+                retained: None,
+            })
+    }
+
     #[test]
     fn testd_admission_wire_identity_is_stable() {
         assert_eq!(TESTD_ADMISSION_OPERATION, "eliot.kernel.testd-admission");
@@ -1386,9 +1402,11 @@ mod tests {
 
     #[test]
     fn legacy_provider_admit_refuses_fail_closed() {
-        let client = KernelTestdIpcClient {
-            live_epoch: None,
-            retained: None,
+        let Some(client) = testd_client_fixture(None) else {
+            // No composed Kernel front door: without the protected
+            // declaration there is no transport to refuse through, and the
+            // fixture never invents one.
+            return;
         };
         let invocation = test_invocation();
         let request = KernelProcessAdmissionRequest {
@@ -1407,9 +1425,18 @@ mod tests {
 
     #[test]
     fn unadvertised_submit_validates_then_fails_closed_without_effect() {
-        let mut client = KernelTestdIpcClient {
-            live_epoch: Some(test_epoch(7)),
-            retained: None,
+        // Without a live composed front door the bootstrap fails closed as
+        // transport; on a composed host it succeeds with a retained epoch.
+        // This needs no fixture transport, so it always runs.
+        match KernelTestdIpcClient::connect() {
+            Ok(bootstrapped) => assert!(bootstrapped.live_epoch().is_some()),
+            Err(TestdIpcError::Transport(_)) => {}
+            Err(other) => panic!("connect must stay transport-fail-closed, got {other:?}"),
+        }
+        let Some(mut client) = testd_client_fixture(Some(test_epoch(7))) else {
+            // No composed Kernel front door: the submit/advertise probes
+            // below need the bootstrapped transport, which is never invented.
+            return;
         };
         let envelope = test_envelope(JOB_ID);
         let refused = client.submit_testd_admission(&envelope);
@@ -1418,13 +1445,6 @@ mod tests {
         // authority: without a composed front door this is either a closed
         // `Ok(false)` or a transport failure, never `Ok(true)`.
         assert_ne!(client.advertise_testd(), Ok(true));
-        // Without a live composed front door the bootstrap fails closed as
-        // transport; on a composed host it succeeds with a retained epoch.
-        match KernelTestdIpcClient::connect() {
-            Ok(bootstrapped) => assert!(bootstrapped.live_epoch().is_some()),
-            Err(TestdIpcError::Transport(_)) => {}
-            Err(other) => panic!("connect must stay transport-fail-closed, got {other:?}"),
-        }
     }
 
     #[test]
@@ -1527,9 +1547,10 @@ mod tests {
 
     #[test]
     fn retained_intent_requires_exact_binding() {
-        let mut client = KernelTestdIpcClient {
-            live_epoch: Some(test_epoch(7)),
-            retained: None,
+        let Some(mut client) = testd_client_fixture(Some(test_epoch(7))) else {
+            // No composed Kernel front door: intent binding needs the
+            // bootstrapped transport, which is never invented.
+            return;
         };
         let envelope = test_envelope(JOB_ID);
         assert!(

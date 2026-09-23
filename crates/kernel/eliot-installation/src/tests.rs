@@ -8128,6 +8128,7 @@ fn registry_rejects_pending_while_active_rebind_is_active() {
         runtime_state_roots_digest: pending_manifest.runtime_state_roots_digest.clone(),
         manifest: pending_manifest.clone(),
         manifest_digest: must(candidate_manifest_digest(&pending_manifest)),
+        activation_intent_digest: Some(test_handle("c".repeat(64))),
         prior_active_generation: both.active_generation.clone(),
         approval: pending_approval,
         phase_b_intent: None,

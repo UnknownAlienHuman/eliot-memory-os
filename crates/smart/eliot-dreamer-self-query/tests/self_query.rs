@@ -143,8 +143,8 @@ fn exact_triples_pass_citation() {
 #[test]
 fn revised_triple_is_stale() {
     let sources = projection();
-    let error = check_citations(&[cited("src-1", "r2")], &sources)
-        .expect_err("revised triple must fail");
+    let error =
+        check_citations(&[cited("src-1", "r2")], &sources).expect_err("revised triple must fail");
     assert!(matches!(
         error,
         eliot_dreamer_contracts::self_query::SelfQueryContractError::BindingMismatch { .. }
@@ -154,8 +154,8 @@ fn revised_triple_is_stale() {
 #[test]
 fn unknown_handle_is_uncited() {
     let sources = projection();
-    let error = check_citations(&[cited("src-9", "r1")], &sources)
-        .expect_err("unknown handle must fail");
+    let error =
+        check_citations(&[cited("src-9", "r1")], &sources).expect_err("unknown handle must fail");
     assert!(matches!(
         error,
         eliot_dreamer_contracts::self_query::SelfQueryContractError::BindingMismatch { .. }
@@ -190,6 +190,7 @@ fn receipt() -> SelfQueryPoseReceipt {
     SelfQueryPoseReceipt {
         input_digest: hex64("e5"),
         schema_version: 1,
+        cited: Vec::new(),
     }
 }
 
@@ -221,7 +222,6 @@ fn unknown_wire_fields_are_rejected() {
 fn receipt_roundtrips_over_the_wire() {
     let made = receipt();
     let wire = serde_json::to_string(&made).expect("serialize receipt");
-    let back: SelfQueryPoseReceipt =
-        serde_json::from_str(&wire).expect("deserialize receipt");
+    let back: SelfQueryPoseReceipt = serde_json::from_str(&wire).expect("deserialize receipt");
     assert_eq!(made, back);
 }
