@@ -59,6 +59,7 @@ mod kernel_transition_client;
 pub mod notification_board_attach;
 mod observation_adapters;
 mod process_origin;
+mod restore_coordination_builder;
 mod route_receipts;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -165,6 +166,11 @@ pub use process_origin::{
     PhysicalProcessBinding, ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError,
     ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
     request_origin_control,
+};
+pub use restore_coordination_builder::{
+    COORD_PARAM_ADMISSION_DIGEST, COORD_PARAM_DECISION_DIGEST, COORD_PARAM_DESTINATION,
+    COORD_PARAM_FENCE_DIGEST, COORD_PARAM_OPERATION_ID, COORD_PARAM_PAYLOAD_DIGEST,
+    CoordinationBuildError, CoordinationTransitionRequest, build_coordination_transition,
 };
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
