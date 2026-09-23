@@ -38,7 +38,7 @@
 //! deterministic restore identity, no receipt synthesis, no blind retry,
 //! no cutover/activation/retirement.
 
-use eliot_backup::{BackupBundle, RestorePlan};
+use eliot_backup::{BackupBundle, BackupError, RestorePlan};
 use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_store_api::{
     OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, WriteReceipt,
@@ -46,14 +46,16 @@ use eliot_store_api::{
 
 use super::backup_coordination::CoordinationDecision;
 use super::backup_owner_clients::{
-    BackupOwnerChannels, CanonicalStoreImportClient, ImportReconciliation, OwnerChannelError,
-    VerifiedDestinationBinding,
+    AuthorizationExpectation, BackupOwnerChannels, CanonicalStoreImportClient, ImportReconciliation,
+    OwnerChannelError, VerifiedDestinationBinding, verify_destination_authorization,
 };
 use super::backup_restore_admission::{
     KernelRestoreAdmission, RestoreAdmissionMintRequest, RestoreProvisioningProof,
     mint_restore_admission,
 };
-use super::backup_restore_ports::{KernelIsolatedDestination, KernelRestoreJournal};
+use super::backup_restore_ports::{
+    KernelIsolatedDestination, KernelRestoreJournal, kernel_to_backup,
+};
 
 /// One Governor-built coordination commit: the coordination transition
 /// plus its execution context and expectations.
@@ -235,4 +237,100 @@ pub async fn drive_production_restore(
         decision,
         imports: outcomes,
     })
+}
+
+/// Operator-bound production restore call (#963, H5 contract).
+///
+/// Everything the driver needs arrives already bound: the owner-held
+/// journal and channels, Host-issued destination authorization bytes with
+/// their binding expectation, the compiled plan and validated bundle, the
+/// constructed destination, the live fence, provisioning proofs, and the
+/// Governor-built coordination commit plus restore-class imports. The two
+/// Governor-built transitions are REQUIRED inputs owned by the
+/// Governor/eliotd lane (open): this caller never synthesizes, defaults,
+/// or re-spells them. Truly-missing inputs are a caller-side refusal to
+/// invoke, never fabricated material.
+#[allow(
+    dead_code,
+    reason = "no H5 operator path calls into the driver yet (#963 open); remove when wired"
+)]
+pub struct ProductionRestoreCall<'a> {
+    /// Owner-held restore journal (must already admit production).
+    pub journal: &'a KernelRestoreJournal,
+    /// Live owner channels (from `KernelComposition::backup_owner_channels`).
+    pub channels: &'a BackupOwnerChannels,
+    /// Host-issued destination authorization bytes (operator-supplied).
+    pub destination_authorization: &'a [u8],
+    /// Binding expectation the authorization must satisfy.
+    pub authorization: AuthorizationExpectation<'a>,
+    /// Compiled restore plan being executed.
+    pub plan: &'a RestorePlan,
+    /// Archive the plan was compiled from.
+    pub bundle: &'a BackupBundle,
+    /// Constructed isolated destination bound to the plan target.
+    pub destination: &'a KernelIsolatedDestination,
+    /// Caller-live authority fence.
+    pub live_fence: &'a StateFence,
+    /// Destination-store provisioning attestations.
+    pub provisioning: RestoreProvisioningProof,
+    /// Governor-built coordination commit (owning lane: Governor/eliotd).
+    pub coordination: CoordinationCommit,
+    /// Governor-built restore-class imports in execution order (owning
+    /// lane: Governor/eliotd).
+    pub imports: Vec<RestoreImport>,
+}
+
+/// Invokes production restore for the H5 operator path.
+///
+/// Real gates before delegating to [`drive_production_restore`]: the
+/// journal must already admit production durable recovery, the
+/// destination authorization must verify against its expectation, and the
+/// bundle must validate with its digest equal to the plan's bound archive.
+/// Any refusal fails closed with the exact owner cause; nothing is
+/// defaulted, minted, or retried here.
+#[allow(
+    dead_code,
+    reason = "no H5 operator path calls into the driver yet (#963 open); remove when wired"
+)]
+pub async fn drive_production(
+    call: ProductionRestoreCall<'_>,
+) -> Result<ProductionRestoreOutcome, OwnerChannelError> {
+    let ProductionRestoreCall {
+        journal,
+        channels,
+        destination_authorization,
+        authorization,
+        plan,
+        bundle,
+        destination,
+        live_fence,
+        provisioning,
+        coordination,
+        imports,
+    } = call;
+    journal
+        .require_production_admitted()
+        .map_err(kernel_to_backup)
+        .map_err(OwnerChannelError::Backup)?;
+    let verified =
+        verify_destination_authorization(destination_authorization, &authorization)
+            .map_err(OwnerChannelError::Backup)?;
+    bundle.validate().map_err(OwnerChannelError::Backup)?;
+    let bundle_sha256 = bundle.bundle_sha256().map_err(OwnerChannelError::Backup)?;
+    if plan.bundle_sha256 != bundle_sha256 {
+        return Err(OwnerChannelError::Backup(BackupError::PlanMismatch));
+    }
+    drive_production_restore(ProductionRestoreRequest {
+        journal,
+        channels,
+        verified: &verified,
+        plan,
+        bundle,
+        destination,
+        live_fence,
+        provisioning,
+        coordination,
+        imports,
+    })
+    .await
 }
