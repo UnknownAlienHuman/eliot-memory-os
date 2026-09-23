@@ -2999,6 +2999,12 @@ fn normalize_nextest_run(
                     ))
                 })?;
                 value["raw_artifact_handles"] = serde_json::json!(handles);
+                // Preserve the typed nextest item identity and outcome in the
+                // normalized owner evidence. FinishAttempt joins these exact
+                // fields to the canonical required-test set; diagnostic prose
+                // and run-level status are not item-level acceptance proof.
+                value["nextest_test_id"] = serde_json::json!(catalog_test_id(name));
+                value["nextest_status"] = serde_json::json!(status_label);
                 normalized.push(NormalizedEvidence {
                     evidence_id,
                     raw_artifact_id: raw_observation_ref,

@@ -19,6 +19,7 @@ use eliot_finish::{
     FinishAdmission, FinishAttempt, FinishClosureIntent, FinishContext, FinishDecisionReceipt,
     FinishError, FinishService, TaskLifecycleState,
 };
+use eliot_instrument_api::EvidenceFreshness;
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     generated_operation_manifests, operation_manifest_set_digest, EffectClass,
@@ -125,8 +126,6 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
     ) -> Result<ProducedFinishEvidence, FinishAttemptError> {
         let mut frame_refs = BTreeSet::new();
         let mut finish_authority_ref = None;
-        let mut executed_verifier_run_refs = BTreeSet::new();
-        let mut stale_verifier_run_refs = BTreeSet::new();
         for event in self.task.events().iter().filter(|event| {
             event.task_id == *task_id && event.state_fence == *fence
         }) {
@@ -171,11 +170,10 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             )));
         }
         let verifier_run_ref = verifier_fact.verification_run.run_id.to_string();
-        if verifier_fact.certifies_completion() {
-            executed_verifier_run_refs.insert(verifier_run_ref);
-        } else {
-            stale_verifier_run_refs.insert(verifier_run_ref);
-        }
+        // This fact has already been rehydrated and validated against the
+        // current task, plan, fence, and durable terminal TestD receipt. A
+        // failed or partial verifier is still an executed run; its outcome is
+        // represented per required test below, not mislabeled as stale.
 
         let coordination = self
             .coordination
@@ -191,73 +189,100 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             )));
         }
 
-        let mut evidence_refs = BTreeSet::new();
-        let mut acceptance_digests = BTreeSet::new();
-        for entry in self.observation.snapshot() {
-            let ObservationAdmissionResult::Accepted { receipt } = entry.result else {
-                continue;
+        let has_accepted_task_observation = self.observation.snapshot().iter().any(|entry| {
+            let ObservationAdmissionResult::Accepted { receipt } = &entry.result else {
+                return false;
             };
-            if receipt.state_fence != *fence {
-                continue;
-            }
-            let Some(selection) = receipt.task_selection.as_ref() else {
-                continue;
-            };
-            if selection.task_ref != task_id.as_str() || selection.task_revision != task.revision {
-                continue;
-            }
-            if !matches_plan(receipt.plan.as_ref(), plan, fence) {
-                continue;
-            }
-            acceptance_digests.insert(selection.acceptance_digest.clone());
-            evidence_refs.insert(receipt.record_id.clone());
-            evidence_refs.insert(selection.evidence_ref.clone());
-            if let Some(event) = &receipt.record.event {
-                for reference in &event.evidence_and_raw_handles {
-                    evidence_refs.insert(reference.clone());
-                }
-            }
-        }
-        if evidence_refs.is_empty() {
+            receipt.state_fence == *fence
+                && receipt.task_selection.as_ref().is_some_and(|selection| {
+                    selection.task_ref == task_id.as_str()
+                        && selection.task_revision == task.revision
+                })
+                && matches_plan(receipt.plan.as_ref(), plan, fence)
+        });
+        if !has_accepted_task_observation {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
                 "canonical finish evidence has no accepted task-and-plan-bound observation"
                     .to_owned(),
             )));
         }
-        evidence_refs.extend(coordination.artifact_refs.iter().cloned());
 
-        let mut acceptance = Vec::with_capacity(frame_refs.len() + acceptance_digests.len() + 1);
-        let mut requirement_ids: Vec<String> = frame_refs
-            .into_iter()
-            .map(|frame_ref| format!("task-acceptance:{frame_ref}"))
-            .collect();
-        requirement_ids.extend(
-            acceptance_digests
-                .into_iter()
-                .map(|digest| format!("acceptance:{digest}")),
+        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+            FinishAttemptError::Composition(CompositionError::Recovery(
+                "canonical finish plan has no verifier item bindings".to_owned(),
+            ))
+        })?;
+        let run_is_current = matches!(
+            verifier_fact.verification_run.freshness,
+            EvidenceFreshness::ExactCandidate
+                | EvidenceFreshness::ExactCommit
+                | EvidenceFreshness::ExactQuiescedWorktree
         );
-        requirement_ids.push(format!(
-            "plan-requirement:{}:{}",
-            plan.plan_id, plan.plan_revision
-        ));
-        requirement_ids.sort();
-        requirement_ids.dedup();
-        let mut verifier_refs: Vec<String> = executed_verifier_run_refs.iter().cloned().collect();
-        verifier_refs.sort();
-        let mut stale_refs: Vec<String> = stale_verifier_run_refs.into_iter().collect();
-        stale_refs.sort();
-        let complete = verifier_fact.certifies_completion()
-            && !coordination.artifact_refs.is_empty()
-            && !verifier_refs.is_empty()
-            && stale_refs.is_empty()
-            && coordination.unresolved_refs.is_empty()
-            && coordination.descendant_receipt_ref.is_some();
-        for item_id in requirement_ids {
+        let stale_verifier_run_refs = if run_is_current {
+            Vec::new()
+        } else {
+            vec![verifier_run_ref.clone()]
+        };
+        let mut acceptance = Vec::with_capacity(verifier_plan.required_test_ids.len());
+        for item_id in &verifier_plan.required_test_ids {
+            let item_events = verifier_fact
+                .verification_run
+                .evidence
+                .iter()
+                .filter(|event| {
+                    event
+                        .value
+                        .get("nextest_test_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(item_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            let mut item_evidence_refs = BTreeSet::new();
+            for event in &item_events {
+                item_evidence_refs.insert(event.evidence_id.to_string());
+                item_evidence_refs.insert(event.raw_artifact_id.to_string());
+                if let Some(handles) = event
+                    .value
+                    .get("raw_artifact_handles")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    item_evidence_refs.extend(
+                        handles.iter().filter_map(serde_json::Value::as_str).map(str::to_owned),
+                    );
+                }
+            }
+            if item_events.is_empty() {
+                // A missing required event is still an explicit unsatisfied
+                // item. Bind the complete raw run artifact set inspected for
+                // it so the canonical validator can retain that negative
+                // coverage without borrowing another item's event evidence.
+                item_evidence_refs.extend(
+                    verifier_fact
+                        .verification_run
+                        .raw_evidence
+                        .iter()
+                        .map(ToString::to_string),
+                );
+            }
+            let item_passed = run_is_current
+                && !item_events.is_empty()
+                && item_events.iter().all(|event| {
+                    event
+                        .value
+                        .get("nextest_status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("PASS")
+                });
+            let item_verifier_refs = if item_events.is_empty() {
+                Vec::new()
+            } else {
+                vec![verifier_run_ref.clone()]
+            };
             acceptance.push(AcceptanceCoverage {
-                item_id,
-                satisfied: complete,
-                evidence_refs: evidence_refs.iter().cloned().collect(),
-                verifier_run_refs: verifier_refs.clone(),
+                item_id: item_id.clone(),
+                satisfied: item_passed,
+                evidence_refs: item_evidence_refs.into_iter().collect(),
+                verifier_run_refs: item_verifier_refs,
                 requires_verifier: true,
             });
         }
@@ -279,8 +304,8 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             current_task_revision: task.revision,
             artifact_refs,
             acceptance,
-            executed_verifier_run_refs: verifier_refs,
-            stale_verifier_run_refs: stale_refs,
+            executed_verifier_run_refs: vec![verifier_run_ref],
+            stale_verifier_run_refs,
             unresolved_effect_refs,
         };
         evidence
@@ -291,7 +316,11 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             evidence,
             descendant_closure,
             finish_authority_ref: finish_authority_ref.clone(),
-            closure_authority_ref: Some(finish_authority_ref.clone()),
+            // Action authorization permits the governed task action; it is
+            // not a separate owner disposition to close partial/cancelled
+            // work. Leave closure authority absent until its owner receipt is
+            // joined explicitly.
+            closure_authority_ref: None,
         };
         let snapshot = self.canonical.prepare_finish_evidence(canonical.clone())?;
         Ok(ProducedFinishEvidence { canonical, snapshot })

@@ -963,7 +963,7 @@ impl CoordinationOwner {
         let mut found = false;
         let mut artifact_refs = Vec::new();
         let mut unresolved_refs = Vec::new();
-        let mut terminal_refs = Vec::new();
+        let mut terminal_event_bindings = Vec::new();
         for item in self.work.values().filter(|item| item.task_id == task_id) {
             found = true;
             if item.state_fence != *state_fence {
@@ -982,11 +982,41 @@ impl CoordinationOwner {
                         .as_deref()
                         .filter(|reference| !reference.trim().is_empty())
                         .ok_or(CoordinationError::InvalidState)?;
-                    artifact_refs.push(result_ref.to_owned());
-                    terminal_refs.push(format!("result:{result_ref}"));
+                    let latest_event = self
+                        .events
+                        .iter()
+                        .filter(|event| event.subject_id == item.work_item_id)
+                        .max_by_key(|event| event.sequence);
+                    match latest_event.filter(|event| {
+                        event.kind == CoordinationEventKind::ResultSubmitted
+                            && event.state_fence == *state_fence
+                            && event.authority_epoch == state_fence.authority_epoch
+                            && event.payload_digest == result_ref
+                            && event.sequence != 0
+                    }) {
+                        Some(event) => {
+                            artifact_refs.push(result_ref.to_owned());
+                            artifact_refs.push(format!("coordination:event:{}", event.event_id));
+                            terminal_event_bindings.push((
+                                item.work_item_id.as_str(),
+                                event.sequence,
+                                event.event_id.as_str(),
+                                event.payload_digest.as_str(),
+                            ));
+                        }
+                        None => unresolved_refs.push(format!(
+                            "work:{}:result-not-joined-to-current-terminal-event",
+                            item.work_item_id
+                        )),
+                    }
                 }
                 WorkState::Cancelled | WorkState::Failed => {
-                    terminal_refs.push(format!("work:terminal:{}", item.work_item_id));
+                    // These states have no canonical terminal event kind yet.
+                    // A state label alone cannot close a descendant.
+                    unresolved_refs.push(format!(
+                        "work:{}:terminal-state-has-no-owner-receipt",
+                        item.work_item_id
+                    ));
                 }
                 WorkState::Ready
                 | WorkState::Claimed
@@ -1005,10 +1035,16 @@ impl CoordinationOwner {
         artifact_refs.dedup();
         unresolved_refs.sort();
         unresolved_refs.dedup();
-        terminal_refs.sort();
-        terminal_refs.dedup();
-        let descendant_receipt_ref = if found && unresolved_refs.is_empty() {
-            let digest_input = (&task_id, state_fence, &terminal_refs);
+        terminal_event_bindings.sort();
+        terminal_event_bindings.dedup();
+        let descendant_receipt_ref = if found
+            && unresolved_refs.is_empty()
+            && !terminal_event_bindings.is_empty()
+        {
+            // Content-address the joined immutable owner events, rather than
+            // terminal state labels or result strings. Their event references
+            // are also retained in artifact_refs for direct readback.
+            let digest_input = (task_id, state_fence, &terminal_event_bindings);
             let bytes = canonical_json_bytes(&digest_input)
                 .map_err(|_| CoordinationError::InvalidState)?;
             Some(format!("coordination:descendants:{}", sha256_hex(&bytes)))
