@@ -59,6 +59,13 @@ pub trait ResearchBridge {
     type Error: std::error::Error + Send + Sync + 'static;
     fn submit(&mut self, request: &ResearchQueryRequest) -> Result<String, Self::Error>;
     fn cancel(&mut self, job_id: &str) -> Result<(), Self::Error>;
+
+    /// Whether this bridge is the explicit no-admission provider gap. Other
+    /// bridges must leave the default false so an execution/transport failure
+    /// is not mislabeled as source unavailability.
+    fn provider_unavailable(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -85,6 +92,12 @@ impl<B> GovernedExchange<B> {
     #[must_use]
     pub fn snapshot(&self) -> &ExchangeSnapshot {
         &self.snapshot
+    }
+    /// Read-only bridge identity/accessor; mutable exchange state remains
+    /// private to the governed Researcher composition root.
+    #[must_use]
+    pub fn bridge(&self) -> &B {
+        &self.bridge
     }
     pub fn into_parts(self) -> (B, ExchangeSnapshot) {
         (self.bridge, self.snapshot)

@@ -4,7 +4,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::StateFence;
+use serde::{Deserialize, Serialize};
+
+use eliot_contracts::{StateFence, TaskId};
+use eliot_task::TaskGraphCompilationRequest;
 
 use super::inquiry_governance::{
     InquiryGovernanceError, InquiryProtocolProfile, digest, freeze, push_count, push_field, text,
@@ -12,7 +15,7 @@ use super::inquiry_governance::{
 };
 
 /// The certificate kind required to satisfy an obligation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AcceptanceCertificateKind {
     KernelCheckedProof,
     ReproducibleBuildAndContractTests,
@@ -39,7 +42,7 @@ impl AcceptanceCertificateKind {
 }
 
 /// Obligation lifecycle status from I21.5.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InquiryObligationStatus {
     Stub,
     Ready,
@@ -70,7 +73,7 @@ impl InquiryObligationStatus {
 }
 
 /// A certificate is the only evidence that can verify an obligation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptanceCertificate {
     pub certificate_id: String,
     pub obligation_id: String,
@@ -123,7 +126,7 @@ impl AcceptanceCertificate {
 }
 
 /// Caller-supplied obligation fields before profile binding/validation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InquiryObligationInput {
     pub obligation_id: String,
     pub parent_question: String,
@@ -146,7 +149,7 @@ pub struct InquiryObligationInput {
 }
 
 /// A validated obligation bound to one exact profile revision.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InquiryObligation {
     pub obligation_id: String,
     pub parent_question: String,
@@ -318,60 +321,34 @@ impl InquiryObligation {
     }
 }
 
-/// Port implemented by the existing `TaskGraphCompiler`. It receives typed
-/// obligations and does not expose a second graph owned by Researcher.
-pub trait TaskGraphCompiler {
-    fn compile(&mut self, obligations: &[InquiryObligation]) -> Result<(), InquiryGovernanceError>;
-}
-
-/// Receipt for consumption by the existing work-graph owner.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TaskGraphCompilationReceipt {
-    pub compiler_id: String,
-    pub profile_id: String,
-    pub profile_revision: u64,
-    pub profile_digest: String,
-    pub obligation_ids: Vec<String>,
-    pub state_fence: StateFence,
-    pub candidate_only: bool,
-    pub canonical_write_authorized: bool,
-    pub digest: String,
-}
-
-impl TaskGraphCompilationReceipt {
-    pub(crate) fn new(
-        compiler_id: String,
-        profile: &InquiryProtocolProfile,
-        obligations: &[InquiryObligation],
-    ) -> Result<Self, InquiryGovernanceError> {
-        text(&compiler_id, "compiler.compiler_id")?;
-        let mut obligation_ids = obligations
-            .iter()
-            .map(|item| item.obligation_id.clone())
-            .collect::<Vec<_>>();
-        obligation_ids.sort();
-        let mut p = String::from("task-graph-obligation-compilation/v1;");
-        push_field(&mut p, "compiler_id", &compiler_id);
-        push_field(&mut p, "profile_id", &profile.profile_id);
-        push_field(&mut p, "profile_revision", &profile.revision.to_string());
-        push_field(&mut p, "profile_digest", &profile.digest);
-        push_count(&mut p, "obligations", obligation_ids.len());
-        for id in &obligation_ids {
-            push_field(&mut p, "obligation", id);
-        }
-        let digest = freeze(&p);
-        Ok(Self {
-            compiler_id,
-            profile_id: profile.profile_id.clone(),
-            profile_revision: profile.revision,
-            profile_digest: profile.digest.clone(),
-            obligation_ids,
-            state_fence: profile.state_fence.clone(),
-            candidate_only: true,
-            canonical_write_authorized: false,
-            digest,
-        })
-    }
+/// Projects validated Researcher obligations into the existing Task
+/// Controller request contract. The owner, not Researcher, validates and
+/// issues the successful receipt.
+pub(crate) fn task_graph_request(
+    profile: &InquiryProtocolProfile,
+    obligations: &[InquiryObligation],
+    task_id: &TaskId,
+) -> Result<TaskGraphCompilationRequest, InquiryGovernanceError> {
+    let mut pairs = obligations
+        .iter()
+        .map(|obligation| (obligation.obligation_id.clone(), obligation.digest.clone()))
+        .collect::<Vec<_>>();
+    pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    let (obligation_ids, obligation_digests) = pairs.into_iter().unzip();
+    let request = TaskGraphCompilationRequest {
+        task_id: task_id.clone(),
+        task_definition_digest: profile.task_definition_digest.clone(),
+        profile_id: profile.profile_id.clone(),
+        profile_revision: profile.revision,
+        profile_digest: profile.digest.clone(),
+        obligation_ids,
+        obligation_digests,
+        state_fence: profile.state_fence.clone(),
+    };
+    request
+        .validate()
+        .map_err(|error| InquiryGovernanceError::TaskOwnerRejected { error })?;
+    Ok(request)
 }
 
 pub(crate) fn compile_obligation_inputs(

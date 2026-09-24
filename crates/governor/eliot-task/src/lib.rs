@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::{ClockReading, EpochId, StateFence, TaskId};
+use eliot_contracts::{
+    ClockReading, EpochId, StateFence, TaskId, canonical_json_bytes, fences_match_exact, sha256_hex,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -45,6 +47,8 @@ pub enum TaskError {
     EpochMismatch,
     #[error("illegal task transition from {from:?} to {to:?}")]
     IllegalTransition { from: TaskState, to: TaskState },
+    #[error("task state does not permit this operation")]
+    InvalidState,
     #[error("{field} is required for this transition")]
     MissingEvidence { field: &'static str },
     #[error("event sequence must follow the current causal sequence")]
@@ -474,5 +478,318 @@ fn allowed(from: TaskState, command: &TaskCommand) -> bool {
             from.is_active()
         }
         TaskCommand::Reopen { .. } => from.is_terminal(),
+    }
+}
+
+/// Stable owner identity for the existing Task Controller compilation seam.
+///
+/// The value is fixed by the owner implementation. Consumers may read it from
+/// a receipt, but cannot supply it as a compiler identity and thereby mint an
+/// authority receipt.
+pub const TASK_GRAPH_COMPILER_OWNER: &str = "eliot.task-controller";
+
+/// Version of the owner-issued task-graph compilation projection.
+pub const TASK_GRAPH_COMPILATION_RECEIPT_VERSION: &str = "eliot.task.graph-compilation-receipt.v1";
+
+fn digest_text(value: &str, field: &'static str) -> Result<(), TaskError> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(TaskError::InvalidField(field));
+    }
+    Ok(())
+}
+
+/// A typed, owner-neutral request for the existing Task Controller to bind
+/// inquiry obligations to a live task definition.
+///
+/// This is a compilation projection, not a graph. The owner checks the request
+/// against its current task record before issuing [`TaskGraphCompilationReceipt`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskGraphCompilationRequest {
+    /// Exact task whose current definition is being compiled against.
+    pub task_id: TaskId,
+    /// Digest derived by the Task Controller from the current task record.
+    pub task_definition_digest: String,
+    /// Inquiry profile identity being compiled.
+    pub profile_id: String,
+    /// Inquiry profile revision being compiled.
+    pub profile_revision: u64,
+    /// Exact inquiry profile digest.
+    pub profile_digest: String,
+    /// Stable obligation identities, paired with `obligation_digests`.
+    pub obligation_ids: Vec<String>,
+    /// Exact obligation digests, paired with `obligation_ids`.
+    pub obligation_digests: Vec<String>,
+    /// Exact fence at which the task definition and profile are valid.
+    pub state_fence: StateFence,
+}
+
+impl TaskGraphCompilationRequest {
+    /// Validates the request shape without granting compilation authority.
+    pub fn validate(&self) -> Result<(), TaskError> {
+        text(self.task_id.as_str(), "task_graph.task_id")?;
+        digest_text(
+            &self.task_definition_digest,
+            "task_graph.task_definition_digest",
+        )?;
+        text(&self.profile_id, "task_graph.profile_id")?;
+        if self.profile_revision == 0 {
+            return Err(TaskError::InvalidField("task_graph.profile_revision"));
+        }
+        digest_text(&self.profile_digest, "task_graph.profile_digest")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| TaskError::FenceMismatch)?;
+        if self.obligation_ids.is_empty()
+            || self.obligation_ids.len() != self.obligation_digests.len()
+        {
+            return Err(TaskError::InvalidField("task_graph.obligation_set"));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for (id, digest) in self.obligation_ids.iter().zip(&self.obligation_digests) {
+            text(id, "task_graph.obligation_id")?;
+            digest_text(digest, "task_graph.obligation_digest")?;
+            if !ids.insert(id) {
+                return Err(TaskError::InvalidField("task_graph.obligation_id"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Typed receipt issued by the existing Task Controller owner.
+///
+/// Fields are private on purpose: a caller can consume and validate this
+/// receipt, but cannot construct a successful owner receipt by choosing an
+/// issuer string. The receipt carries no graph state and no canonical/admission
+/// authority; it is a candidate binding for the existing work-graph owner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskGraphCompilationReceipt {
+    owner: String,
+    version: String,
+    task_id: TaskId,
+    task_revision: u64,
+    task_definition_digest: String,
+    profile_id: String,
+    profile_revision: u64,
+    profile_digest: String,
+    obligation_ids: Vec<String>,
+    obligation_digests: Vec<String>,
+    state_fence: StateFence,
+    candidate_only: bool,
+    canonical_write_authorized: bool,
+    digest: String,
+}
+
+impl TaskGraphCompilationReceipt {
+    fn compute_digest(&self) -> Result<String, TaskError> {
+        let bytes = canonical_json_bytes(&(
+            &self.owner,
+            &self.version,
+            &self.task_id,
+            &self.task_revision,
+            &self.task_definition_digest,
+            &self.profile_id,
+            &self.profile_revision,
+            &self.profile_digest,
+            &self.obligation_ids,
+            &self.obligation_digests,
+            &self.state_fence,
+            &self.candidate_only,
+            &self.canonical_write_authorized,
+        ))
+        .map_err(|_| TaskError::InvalidField("task_graph.receipt_digest"))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Returns the fixed owner identity that issued this receipt.
+    #[must_use]
+    pub fn owner_id(&self) -> &str {
+        &self.owner
+    }
+
+    /// Returns the receipt wire version.
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Returns the exact task identity.
+    #[must_use]
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    /// Returns the task revision observed by the owner.
+    #[must_use]
+    pub const fn task_revision(&self) -> u64 {
+        self.task_revision
+    }
+
+    /// Returns the exact task-definition digest.
+    #[must_use]
+    pub fn task_definition_digest(&self) -> &str {
+        &self.task_definition_digest
+    }
+
+    /// Returns the profile identity and revision bound by the owner.
+    #[must_use]
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    /// Returns the profile revision bound by the owner.
+    #[must_use]
+    pub const fn profile_revision(&self) -> u64 {
+        self.profile_revision
+    }
+
+    /// Returns the exact profile digest bound by the owner.
+    #[must_use]
+    pub fn profile_digest(&self) -> &str {
+        &self.profile_digest
+    }
+
+    /// Returns the sorted obligation identities.
+    #[must_use]
+    pub fn obligation_ids(&self) -> &[String] {
+        &self.obligation_ids
+    }
+
+    /// Returns the sorted obligation digests paired with [`Self::obligation_ids`].
+    #[must_use]
+    pub fn obligation_digests(&self) -> &[String] {
+        &self.obligation_digests
+    }
+
+    /// Returns the exact fence used by the owner.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Receipts are always candidate-only.
+    #[must_use]
+    pub const fn candidate_only(&self) -> bool {
+        self.candidate_only
+    }
+
+    /// Receipts never authorize a canonical write.
+    #[must_use]
+    pub const fn canonical_write_authorized(&self) -> bool {
+        self.canonical_write_authorized
+    }
+
+    /// Returns the recomputed receipt digest.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Checks that this owner receipt is still exactly bound to the request
+    /// that the caller is compiling. This is deliberately explicit at the
+    /// consumer edge rather than trusting a serialized issuer field.
+    pub fn validate_against(&self, request: &TaskGraphCompilationRequest) -> Result<(), TaskError> {
+        request.validate()?;
+        if self.owner != TASK_GRAPH_COMPILER_OWNER
+            || self.version != TASK_GRAPH_COMPILATION_RECEIPT_VERSION
+            || self.task_id != request.task_id
+            || self.task_definition_digest != request.task_definition_digest
+            || self.profile_id != request.profile_id
+            || self.profile_revision != request.profile_revision
+            || self.profile_digest != request.profile_digest
+            || self.obligation_ids != request.obligation_ids
+            || self.obligation_digests != request.obligation_digests
+            || !fences_match_exact(&self.state_fence, &request.state_fence)
+            || !self.candidate_only
+            || self.canonical_write_authorized
+            || self.digest != self.compute_digest()?
+        {
+            return Err(TaskError::InvalidField("task_graph.receipt_binding"));
+        }
+        Ok(())
+    }
+}
+
+impl TaskLifecycleOwner {
+    /// Derives the exact definition identity for a live task record.
+    ///
+    /// The digest covers the current task ID, project, goal, revision and full
+    /// fence. It is recomputed on every compilation request; a caller cannot
+    /// substitute a free-standing task-definition string.
+    pub fn task_definition_digest(&self, task_id: &TaskId) -> Result<String, TaskError> {
+        let record = self
+            .task(task_id)
+            .ok_or_else(|| TaskError::TaskNotFound(task_id.clone()))?;
+        let bytes = canonical_json_bytes(&(
+            task_id,
+            &record.project_ref,
+            &record.goal,
+            record.revision,
+            &record.state_fence,
+        ))
+        .map_err(|_| TaskError::InvalidField("task_graph.task_definition_digest"))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Issues the only successful task-graph compilation receipt for an
+    /// inquiry obligation set.
+    ///
+    /// The method is on the existing Task Controller lifecycle owner and
+    /// deliberately does not retain obligations or construct a second graph.
+    /// It re-reads the live task record and rejects stale or caller-forged
+    /// bindings before returning the typed owner receipt.
+    pub fn compile_inquiry_obligations(
+        &self,
+        request: TaskGraphCompilationRequest,
+    ) -> Result<TaskGraphCompilationReceipt, TaskError> {
+        request.validate()?;
+        let record = self
+            .task(&request.task_id)
+            .ok_or_else(|| TaskError::TaskNotFound(request.task_id.clone()))?;
+        if !record.state.is_active() {
+            return Err(TaskError::InvalidState);
+        }
+        if !fences_match_exact(&record.state_fence, &self.state_fence)
+            || !fences_match_exact(&request.state_fence, &self.state_fence)
+        {
+            return Err(TaskError::FenceMismatch);
+        }
+        let current_task_definition = self.task_definition_digest(&request.task_id)?;
+        if request.task_definition_digest != current_task_definition || record.revision == 0 {
+            return Err(TaskError::InvalidField("task_graph.task_definition_digest"));
+        }
+
+        let mut pairs = request
+            .obligation_ids
+            .iter()
+            .cloned()
+            .zip(request.obligation_digests.iter().cloned())
+            .collect::<Vec<_>>();
+        pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        let (obligation_ids, obligation_digests) = pairs.into_iter().unzip();
+        let mut receipt = TaskGraphCompilationReceipt {
+            owner: TASK_GRAPH_COMPILER_OWNER.to_owned(),
+            version: TASK_GRAPH_COMPILATION_RECEIPT_VERSION.to_owned(),
+            task_id: request.task_id,
+            task_revision: record.revision,
+            task_definition_digest: request.task_definition_digest,
+            profile_id: request.profile_id,
+            profile_revision: request.profile_revision,
+            profile_digest: request.profile_digest,
+            obligation_ids,
+            obligation_digests,
+            state_fence: request.state_fence,
+            candidate_only: true,
+            canonical_write_authorized: false,
+            digest: String::new(),
+        };
+        receipt.digest = receipt.compute_digest()?;
+        Ok(receipt)
     }
 }

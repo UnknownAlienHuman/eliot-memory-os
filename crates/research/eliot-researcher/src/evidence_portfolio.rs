@@ -23,7 +23,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{StateFence, sha256_hex};
+use serde::{Deserialize, Serialize};
+
+use eliot_contracts::{ArtifactId, StateFence, TaskId, sha256_hex};
+use eliot_epistemic_contracts::{
+    CoverageDenominator, CoverageDenominatorParams, CoverageReceipt, CoverageReceiptParams,
+    DenominatorKind, FrontierSpec, MemberDisposition, MemberOutcome, OmittedMember,
+    PaginationBounds, QuerySpec, SnapshotRef, ValidityBounds,
+};
 use eliot_research_exchange_api::{CompletionDisposition, DisclosureClass, SourceClass};
 
 /// Stable identity of this discipline surface.
@@ -128,6 +135,11 @@ pub enum PortfolioError {
         /// Failing field path.
         field: &'static str,
     },
+    /// The canonical epistemic coverage contract rejected a projection.
+    CanonicalCoverage {
+        /// Bounded contract failure detail.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for PortfolioError {
@@ -163,6 +175,12 @@ impl std::fmt::Display for PortfolioError {
             }
             Self::InvalidTerminal { field } => {
                 write!(f, "{field} cannot decode as complete")
+            }
+            Self::CanonicalCoverage { detail } => {
+                write!(
+                    f,
+                    "canonical coverage contract rejected projection: {detail}"
+                )
             }
         }
     }
@@ -1459,7 +1477,7 @@ pub fn assess_absence(
 /// Structured precision kinds for already-structured claim/reference records.
 /// No prose is parsed: assertions arrive structured and are checked against
 /// structured support.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrecisionKind {
     /// Quantified numeric assertion with unit and denominator.
     Numeric,
@@ -1473,7 +1491,7 @@ pub enum PrecisionKind {
 
 /// One structured precision assertion: what a claim asserts and what the
 /// supporting evidence actually supports.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrecisionAssertion {
     /// Precision kind under check.
     pub kind: PrecisionKind,
@@ -1488,7 +1506,7 @@ pub struct PrecisionAssertion {
 /// Typed unsupported-precision residue (I21.7): what was asserted, the
 /// highest supported precision, the basis, the false-precision risk, and the
 /// probe or narrower wording required.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsupportedPrecisionItem {
     /// Asserted reference or coordinate.
     pub asserted: String,
@@ -1673,7 +1691,7 @@ pub struct AuditedClaim {
 }
 
 /// Claim audit outcome for one structured claim.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClaimOutcome {
     /// Every material citation resolves to supporting in-manifest evidence.
     Supported,
@@ -1708,7 +1726,7 @@ impl ClaimOutcome {
 
 /// Audit verdict for one structured claim with preserved counterevidence,
 /// unknowns and the structured claim-to-evidence map.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimVerdict {
     /// Audited claim identity.
     pub claim_id: String,
@@ -1785,6 +1803,20 @@ impl EvidencePortfolio {
             .record(member, record.acquisition, Some(record.handle.clone()))?;
         self.records.insert(record.handle.clone(), record);
         Ok(IngestResult::Inserted)
+    }
+
+    /// Exact digest of the frozen portfolio shape, including its inquiry,
+    /// source records, and coverage account.
+    pub fn digest(&self) -> String {
+        let mut preimage = String::from("evidence-portfolio/v1;");
+        push_field(&mut preimage, "inquiry_digest", &self.inquiry_digest);
+        push_count(&mut preimage, "records", self.records.len());
+        for (handle, record) in &self.records {
+            push_field(&mut preimage, "record", handle);
+            push_field(&mut preimage, "record_digest", &record.digest());
+        }
+        push_field(&mut preimage, "coverage_digest", &self.coverage.digest());
+        freeze(&preimage)
     }
 
     /// Lineage table derived from the ingested records.
@@ -2246,4 +2278,160 @@ pub fn require_finished(outcome: &PortfolioOutcome) -> Result<&str, PortfolioErr
             field: "portfolio.outcome",
         }),
     }
+}
+
+/// A store-neutral projection of the Researcher portfolio into the existing
+/// canonical epistemic coverage owner. It carries no new denominator or
+/// receipt vocabulary; both values are the canonical contracts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalCoverageProjection {
+    pub portfolio_digest: String,
+    pub denominator: CoverageDenominator,
+    pub receipt: CoverageReceipt,
+}
+
+impl CanonicalCoverageProjection {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.denominator.kind == DenominatorKind::CompleteScope && self.receipt.is_terminal()
+    }
+}
+
+fn canonical_contract_error(error: impl std::fmt::Display) -> PortfolioError {
+    PortfolioError::CanonicalCoverage {
+        detail: error.to_string(),
+    }
+}
+
+fn canonical_member_disposition(disposition: SourceDisposition) -> MemberDisposition {
+    match disposition {
+        SourceDisposition::Observed => MemberDisposition::Observed,
+        SourceDisposition::Unavailable => MemberDisposition::Unavailable,
+        SourceDisposition::Blocked => MemberDisposition::Blocked,
+        SourceDisposition::Stale => MemberDisposition::Stale,
+        SourceDisposition::Malformed => MemberDisposition::Malformed,
+        SourceDisposition::Exhausted => MemberDisposition::Exhaustion,
+        SourceDisposition::Unknown | SourceDisposition::Partial => MemberDisposition::Unknown,
+    }
+}
+
+/// Projects an already-accounted Researcher portfolio into the canonical
+/// `CoverageDenominator`/`CoverageReceipt` pair. No absent or failed member is
+/// silently converted into completeness; callers must provide the exact query,
+/// frontier, owner snapshot and validity bounds used for the enumeration.
+#[allow(clippy::too_many_lines)]
+pub fn project_canonical_coverage(
+    inquiry: &FrozenInquiry,
+    portfolio: &EvidencePortfolio,
+    query: QuerySpec,
+    frontier: FrontierSpec,
+    snapshot: SnapshotRef,
+    validity: &ValidityBounds,
+) -> Result<CanonicalCoverageProjection, PortfolioError> {
+    if portfolio.inquiry_digest != inquiry.digest || !portfolio.coverage.is_accounted() {
+        return Err(PortfolioError::IncompleteDenominator {
+            field: "portfolio.coverage",
+        });
+    }
+    if validity.scope != inquiry.scope {
+        return Err(PortfolioError::VagueScope {
+            field: "portfolio.validity.scope",
+        });
+    }
+    let members = inquiry
+        .denominator_members()
+        .into_iter()
+        .map(|member| ArtifactId::new(member).map_err(canonical_contract_error))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let roles = inquiry
+        .roles
+        .iter()
+        .map(|role| role.role.clone())
+        .collect::<BTreeSet<_>>();
+    let complete = portfolio.coverage.all_closed();
+    let denominator = CoverageDenominator::new(CoverageDenominatorParams {
+        class: "research-source-portfolio".to_owned(),
+        schema: inquiry.schema.clone(),
+        revision: inquiry.protocol.clone(),
+        scope: inquiry.scope.clone(),
+        fence: inquiry.fence.clone(),
+        members: members.clone(),
+        roles: roles.clone(),
+        query: Some(query.clone()),
+        frontier: Some(frontier.clone()),
+        snapshot,
+        exclusions: Vec::new(),
+        bounds: PaginationBounds::new(
+            0,
+            u64::try_from(members.len().max(1)).map_err(|_| {
+                PortfolioError::IncompleteDenominator {
+                    field: "portfolio.coverage.size",
+                }
+            })?,
+            u64::try_from(members.len()).map_err(|_| PortfolioError::IncompleteDenominator {
+                field: "portfolio.coverage.size",
+            })?,
+            !complete,
+        )
+        .map_err(canonical_contract_error)?,
+        validity: validity.clone(),
+        kind: if complete {
+            DenominatorKind::CompleteScope
+        } else {
+            DenominatorKind::Unknown
+        },
+    })
+    .map_err(canonical_contract_error)?;
+
+    let mut member_outcomes = Vec::new();
+    for (member, (disposition, _handle)) in &portfolio.coverage.outcomes {
+        let artifact = ArtifactId::new(member).map_err(canonical_contract_error)?;
+        let role = member.split('#').next().unwrap_or(member);
+        member_outcomes.push(
+            MemberOutcome::new(artifact, role, canonical_member_disposition(*disposition))
+                .map_err(canonical_contract_error)?,
+        );
+    }
+    let mut omissions = Vec::new();
+    for (member, reason) in &portfolio.coverage.exclusions {
+        omissions.push(
+            OmittedMember::new(
+                ArtifactId::new(member).map_err(canonical_contract_error)?,
+                reason.clone(),
+            )
+            .map_err(canonical_contract_error)?,
+        );
+    }
+    member_outcomes.sort_by(|left, right| left.member.cmp(&right.member));
+    omissions.sort_by(|left, right| left.member.cmp(&right.member));
+    let groups = portfolio
+        .records
+        .values()
+        .filter_map(|record| record.lineage_root.clone())
+        .collect::<BTreeSet<_>>();
+    let task_id = TaskId::new(inquiry.task.clone()).map_err(canonical_contract_error)?;
+    let receipt = CoverageReceipt::new(CoverageReceiptParams {
+        query,
+        frontier,
+        denominator: denominator.digest.clone(),
+        denominator_size: u64::try_from(members.len()).map_err(|_| {
+            PortfolioError::IncompleteDenominator {
+                field: "portfolio.coverage.size",
+            }
+        })?,
+        task_id,
+        scope: inquiry.scope.clone(),
+        fence: inquiry.fence.clone(),
+        policy: inquiry.policy.clone(),
+        groups,
+        members: member_outcomes,
+        omissions,
+        proof_digest: portfolio.coverage.digest(),
+    })
+    .map_err(canonical_contract_error)?;
+    Ok(CanonicalCoverageProjection {
+        portfolio_digest: portfolio.digest(),
+        denominator,
+        receipt,
+    })
 }
