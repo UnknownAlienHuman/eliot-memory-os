@@ -986,20 +986,25 @@ fn forward_stage(error: &BridgeError) -> &'static str {
 /// Shapes one forward-dispatch failure with staged typed recovery.
 ///
 /// Keeps the exact [`bridge_error`] code mapping and fail-closed behavior;
-/// only the detail is sharpened to name the failing stage, the durable
-/// owner (the Kernel observation route, which this bridge holds unadmitted),
-/// and the reconcile path. No ledger is built and no readiness is claimed:
-/// pending entries stay pending for explicit reconcile under their original
-/// identity.
+/// only the detail is sharpened to name the failing stage, the unadmitted
+/// event-delivery capability with its durable owner reference (the Kernel
+/// observation route, #77 req 4), and the pending-identity preservation.
+/// No ledger is built and no readiness is claimed: pending entries stay
+/// pending under their original identity, and no reconcile-then-retry loop
+/// is advertised because retry cannot succeed until the owner route admits
+/// this bridge.
 fn forward_dispatch_error(error: &BridgeError) -> (Response, bool) {
     let provider_failed = is_provider_failure(error);
     let response = match bridge_error(error) {
         Response::Error { code, detail } => Response::Error {
             code,
             detail: format!(
-                "forward {} stage: {detail}; durable owner: Kernel observation route (not admitted); \
-                reconcile pending entries under their original stream, event, and sequence identity \
-                with explicit reconcile, then retry the forward",
+                "forward {} stage: {detail}; event delivery unavailable: no admitted Kernel \
+                observation/ORS event route (front door admits activation and host-request \
+                envelopes only); owner: Kernel observation route (#77 req 4 allocates the \
+                event-delivery/reconciliation child there); pending entries stay pending \
+                under their original stream, event, and sequence identity; retry cannot \
+                succeed until that route is admitted",
                 forward_stage(error),
             ),
         },

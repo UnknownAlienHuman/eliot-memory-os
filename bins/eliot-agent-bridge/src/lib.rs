@@ -147,12 +147,13 @@ type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 /// Durability, normalization, and application are owned by the Kernel
 /// observation route, which has not admitted this bridge — so no Kernel ORS
 /// durable record is staged, nothing is normalized, and nothing is applied.
-/// The replay/ack owner for an already-observed event is therefore the Kernel
-/// observation route, not this port: the exact recovery is to re-present the
-/// event via `ReconcileExternal` (or re-read status on the next admitted
-/// connection). Host-request submit/cancel/reconcile entries carry invocation
-/// intent and are not event delivery; never resubmit a refused event as a
-/// host request.
+/// The event-delivery capability is therefore exposed as unavailable with
+/// its owner/dependency reference (#77 req 4 allocates the bounded
+/// event-delivery/reconciliation child to the Kernel observation/ORS
+/// owner): neither `ReconcileExternal` (also unadmitted here) nor a retry
+/// can succeed until that route is admitted. Host-request
+/// submit/cancel/reconcile entries carry invocation intent and are not
+/// event delivery; never resubmit a refused event as a host request.
 struct KernelMcpForwardingPort;
 
 impl McpForwardingPort for KernelMcpForwardingPort {
@@ -163,9 +164,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<(), ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "hook forwarding not admitted: receipt stands in the bridge journal, \
-             no Kernel durable record staged, nothing normalized or applied; \
-             re-present via ReconcileExternal",
+            "hook forwarding unavailable: no admitted Kernel observation/ORS event route \
+             (front door admits activation and host-request envelopes only); receipt stands \
+             in the bridge journal, no Kernel durable record staged, nothing normalized or \
+             applied; owner: Kernel observation route (#77 req 4 allocates the \
+             event-delivery/reconciliation child there); retry cannot succeed until that \
+             route is admitted; host-request submit is not event delivery",
         ))
     }
     fn forward_event(
@@ -175,9 +179,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<EventPortOutcome, ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "event forwarding not admitted: receipt stands in the bridge journal, \
-             no Kernel ORS durable record staged, nothing normalized or applied; \
-             re-present via ReconcileExternal; host-request submit is not event delivery",
+            "event forwarding unavailable: no admitted Kernel observation/ORS event route \
+             (front door admits activation and host-request envelopes only); receipt stands \
+             in the bridge journal, no Kernel ORS durable record staged, nothing normalized \
+             or applied; owner: Kernel observation route (#77 req 4 allocates the \
+             event-delivery/reconciliation child there); retry cannot succeed until that \
+             route is admitted; host-request submit is not event delivery",
         ))
     }
     fn forward_gap(
@@ -187,8 +194,10 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<(), ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "gap forwarding not admitted: no durable, normalized, or applied phase \
-             reached; re-present via ReconcileExternal",
+            "gap forwarding unavailable: no admitted Kernel observation/ORS event route, so \
+             no durable, normalized, or applied phase reached; owner: Kernel observation \
+             route (#77 req 4 allocates the event-delivery/reconciliation child there); \
+             retry cannot succeed until that route is admitted",
         ))
     }
     fn reconcile_external(
@@ -197,10 +206,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "event-route reconciliation not admitted: durable idempotency and \
-             unknown-outcome belong to the Kernel ORS record; re-read status via \
-             the KernelHostRequestClient reconcile entry; host-request forwarding \
-             is not event delivery",
+            "event-route reconciliation unavailable: no admitted Kernel observation/ORS \
+             event route; durable idempotency and unknown-outcome belong to the Kernel ORS \
+             record once that route admits this bridge; owner: Kernel observation route \
+             (#77 req 4 allocates the event-delivery/reconciliation child there); the \
+             KernelHostRequestClient reconcile entry settles host-request operations only \
+             and is not event durability; host-request forwarding is not event delivery",
         ))
     }
 }
@@ -254,8 +265,10 @@ fn load_declaration(path: &Path) -> Result<LoadedAgentBridgeDeclaration, Runtime
 /// (`agent_host_request_reconcile`, `REACTIVE_RESTORE_OPERATION`) reuse it,
 /// so no second transport and no duplicated envelope state machine exist
 /// here. The forwarding face deliberately holds no transport: refused events
-/// are re-presented through `ReconcileExternal`, never by resubmitting them
-/// as host requests.
+/// expose the unadmitted event-delivery capability with its Kernel
+/// observation-route owner reference, never by resubmitting them
+/// as host requests and never through a reconcile-then-retry loop that
+/// cannot succeed until that route is admitted.
 pub fn kernel_ports_with_declaration(
     declaration_path: &Path,
 ) -> Result<KernelPorts, RuntimeBuildError> {
@@ -402,8 +415,9 @@ impl BridgeRunner {
         // (or later) ack, durable-observation cursors only on Normalized (or
         // later). The production forwarding face (`KernelMcpForwardingPort`)
         // fails closed, so no ack ever arrives here: no cursor advances, no
-        // outstanding delivery is recorded, and recovery stays on the
-        // ReconcileExternal / Kernel ORS reconcile path. The policy still
+        // outstanding delivery is recorded, and recovery awaits the admitted
+        // Kernel observation route (#77 req 4). `ReconcileExternal` stays
+        // fail-closed on this face until that route is admitted. The policy still
         // declares the honest requirement for any future admitted route.
         let cursor_policy = CursorPolicy::new(AckPhase::Durable, AckPhase::Normalized)
             .map_err(RuntimeBuildError::BridgeContract)?;
