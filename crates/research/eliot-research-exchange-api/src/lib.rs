@@ -385,6 +385,19 @@ impl ResearchEvidenceBundle {
         if self.disposition.requires_typed_coverage_gaps() && self.coverage_gaps.is_empty() {
             return Err(ResearchContractError::InvalidDisposition);
         }
+        if self.disposition == CompletionDisposition::NoMatchInCompleteScope
+            && (!self.sources.is_empty()
+                || !self.claims.is_empty()
+                || !self.coverage_gaps.is_empty()
+                || !self.coverage_unknowns.is_empty()
+                || !self.failed_acquisition.is_empty())
+        {
+            // A negative closure is meaningful only over a complete, declared
+            // scope. The exchange layer cannot infer that scope from an empty
+            // result, so the R6 consumer additionally joins the exact
+            // denominator before accepting this disposition.
+            return Err(ResearchContractError::InvalidDisposition);
+        }
         for source in &self.sources {
             text(&source.source_handle, "source.source_handle")?;
             digest(&source.snapshot_digest, "source.snapshot_digest")?;
