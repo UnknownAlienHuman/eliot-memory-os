@@ -7,7 +7,7 @@
 //! in-process broker authority issues the one-shot process request.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,94 +23,68 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_research_exchange::ExchangeError;
-use eliot_research_exchange_api::{ResearchProviderFailure, ResearchQueryRequest};
+use eliot_research_exchange_api::{
+    ResearchDispatchGrant, ResearchDispatchMaterial, ResearchEvidenceBundle,
+    ResearchProviderFailure, ResearchQueryRequest,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::admission::{BridgeContract, ProviderAdmission, ProviderRegistry};
-use crate::evidence::{ProviderAttemptReceipt, ProviderIntentRecord};
+use crate::evidence::{ProviderAttemptReceipt, ProviderIntentRecord, RawProviderEvidence};
 use crate::execution::{ProviderBridge, ResearchRequestPort};
-use crate::protocol::{PROVIDER_WIRE_ARGUMENT, SubmitEnvelope};
+use crate::protocol::{PROVIDER_CHANNEL_ARGUMENT, ResearchRequestChannel, SubmitEnvelope};
 use crate::{compose_admitted, submit};
 
 /// Fixed dispatch material filename. It is not a command/path selector.
 pub const ADMISSION_MATERIAL_FILE_NAME: &str = "eliot-mod-research.admitted-provider.json";
 /// Fixed durable evidence filename emitted by this one-shot root.
 pub const EVIDENCE_FILE_NAME: &str = "eliot-mod-research.provider-evidence.jsonl";
-const MATERIAL_WIRE_VERSION: u16 = 1;
+/// Fixed append-only operation/candidate/reconciliation journal.
+pub const JOURNAL_FILE_NAME: &str = "eliot-mod-research.provider-journal.jsonl";
 const MAX_MATERIAL_BYTES: u64 = 1024 * 1024;
 
-/// Kernel-issued one-shot process grant carried beside the admitted contract.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResearchLaunchGrant {
-    pub grant_digest: String,
-    pub authority_epoch: eliot_contracts::EpochId,
-    pub fence_generation: u64,
-    pub fence_nonce: String,
-    pub idempotency_key: String,
-    pub expires_at_unix_ms: u64,
-    pub operation_id: String,
-}
+/// The protected material type is owned by the shared exchange API. The alias
+/// keeps the binary-facing name stable while making the Kernel claim shape
+/// explicit at the composition boundary.
+pub type AdmittedResearchMaterial = ResearchDispatchMaterial;
+pub type ResearchLaunchGrant = ResearchDispatchGrant;
 
-/// Session-bound material delivered by the authenticated dispatch contour.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AdmittedResearchMaterial {
-    pub wire_version: u16,
-    pub contract: BridgeContract,
-    pub registry: ProviderRegistry,
-    pub request: ResearchQueryRequest,
-    pub grant: ResearchLaunchGrant,
-}
-
-impl AdmittedResearchMaterial {
-    /// Resolves the contract through the closed Registry snapshot and binds
-    /// the exact operation identity carried by the cancellation contract.
-    pub fn admission(&self) -> Result<ProviderAdmission, RuntimeError> {
-        if self.wire_version != MATERIAL_WIRE_VERSION {
-            return Err(RuntimeError::InvalidMaterial(
-                "unsupported material wire version",
-            ));
-        }
-        self.contract
-            .validate()
-            .map_err(|_| RuntimeError::InvalidMaterial("bridge contract is not closed"))?;
-        let operation = OperationId::new(self.grant.operation_id.clone())
-            .map_err(|_| RuntimeError::InvalidMaterial("grant operation identity is invalid"))?;
-        let admission =
-            ProviderAdmission::from_contract(self.contract.clone(), operation, &self.registry)
-                .map_err(|_| {
-                    RuntimeError::InvalidMaterial("contract did not resolve Registry evidence")
-                })?;
-        admission.validate_request(&self.request).map_err(|_| {
-            RuntimeError::InvalidMaterial("request does not match the admitted contract")
-        })?;
-        if !crate::is_lowercase_sha256(&self.grant.grant_digest)
-            || bounded_text(&self.grant.fence_nonce).is_err()
-            || bounded_text(&self.grant.idempotency_key).is_err()
-        {
-            return Err(RuntimeError::InvalidMaterial(
-                "launch grant identity is malformed",
-            ));
-        }
-        if self.grant.authority_epoch != *admission.epoch()
-            || self.grant.fence_generation != admission.fence().resource_generation.value()
-            || self.grant.fence_nonce != admission.cancellation().cancellation_id
-            || self.grant.idempotency_key != self.request.idempotency_key
-            || self.grant.operation_id != admission.operation_id().as_str()
-            || self.grant.expires_at_unix_ms <= now_unix_ms()
-            || self.grant.expires_at_unix_ms
-                > u64::try_from(admission.deadline_ms()).unwrap_or(u64::MAX)
-        {
-            return Err(RuntimeError::InvalidMaterial(
-                "launch grant is stale or foreign",
-            ));
-        }
-        Ok(admission)
+/// Resolves the shared Kernel material through the closed provider contract
+/// and registry types. No local file is treated as authority by itself: the
+/// claim, grant, request, and provider binding are all re-proved here.
+pub fn resolve_material(
+    material: &AdmittedResearchMaterial,
+) -> Result<ProviderAdmission, RuntimeError> {
+    material
+        .validate(now_unix_ms())
+        .map_err(|_| RuntimeError::InvalidMaterial("Kernel claim or launch grant is invalid"))?;
+    let contract: BridgeContract = serde_json::from_value(material.claim.provider_contract.clone())
+        .map_err(|_| RuntimeError::InvalidMaterial("provider contract is not typed JSON"))?;
+    let registry: ProviderRegistry = serde_json::from_value(material.claim.provider_registry.clone())
+        .map_err(|_| RuntimeError::InvalidMaterial("provider registry is not typed JSON"))?;
+    let operation = OperationId::new(material.claim.operation_id.clone())
+        .map_err(|_| RuntimeError::InvalidMaterial("Kernel operation identity is invalid"))?;
+    let admission = ProviderAdmission::from_contract(contract, operation, &registry)
+        .map_err(|_| RuntimeError::InvalidMaterial("contract did not resolve Registry evidence"))?;
+    admission
+        .validate_request(&material.claim.request)
+        .map_err(|_| RuntimeError::InvalidMaterial("request does not match the admitted contract"))?;
+    if admission.bridge().executable() != material.claim.provider_executable
+        || admission.bridge().executable_sha256() != material.claim.provider_executable_sha256
+        || admission.epoch() != &material.claim.authority_epoch
+        || admission.fence() != &material.claim.state_fence
+        || admission.process_generation().get() != material.claim.process_generation
+        || admission.cancellation().cancellation_id != material.claim.cancellation_id
+        || material.claim.owner_principal_digest.trim().is_empty()
+        || material.claim.session_id.trim().is_empty()
+    {
+        return Err(RuntimeError::InvalidMaterial(
+            "Kernel claim is not bound to the provider contract, session, owner, and fence",
+        ));
     }
+    Ok(admission)
 }
 
 /// Runtime boundary failures. They never contain provider bytes or secrets.
@@ -122,6 +96,8 @@ pub enum RuntimeError {
     InvalidMaterial(&'static str),
     #[error("provider runtime is unavailable: {0}")]
     Unavailable(String),
+    #[error("provider operation requires exact reconciliation")]
+    ReconcileRequired,
     #[error("provider evidence could not be durably recorded: {0}")]
     Evidence(String),
     #[error("research provider degraded: {failure}")]
@@ -144,7 +120,7 @@ pub fn read_admitted_material() -> Result<Option<AdmittedResearchMaterial>, Runt
     }
     let material: AdmittedResearchMaterial = serde_json::from_slice(&bytes)
         .map_err(|_| RuntimeError::InvalidMaterial("material is not exact typed JSON"))?;
-    let _ = material.admission()?;
+    let _ = resolve_material(&material)?;
     Ok(Some(material))
 }
 
@@ -164,6 +140,15 @@ fn evidence_path() -> Result<PathBuf, RuntimeError> {
         "executable has no installation parent".to_owned(),
     ))?;
     Ok(parent.join(EVIDENCE_FILE_NAME))
+}
+
+fn journal_path() -> Result<PathBuf, RuntimeError> {
+    let executable = std::env::current_exe()
+        .map_err(|error| RuntimeError::Unavailable(format!("current executable: {error}")))?;
+    let parent = executable.parent().ok_or(RuntimeError::Unavailable(
+        "executable has no installation parent".to_owned(),
+    ))?;
+    Ok(parent.join(JOURNAL_FILE_NAME))
 }
 
 /// Appends typed pre-start intent and process evidence to the fixed
@@ -211,6 +196,151 @@ impl ProcessEvidenceSink for DurableEvidenceSink {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DurablePhase {
+    Reserved,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableResearchRecord {
+    operation_id: String,
+    request_sha256: String,
+    phase: DurablePhase,
+    receipt: Option<ProviderAttemptReceipt>,
+    candidate: Option<ResearchEvidenceBundle>,
+    raw_evidence: Option<RawProviderEvidence>,
+    failure: Option<ResearchProviderFailure>,
+    process_error: Option<String>,
+}
+
+struct DurableResearchJournal {
+    path: PathBuf,
+}
+
+impl DurableResearchJournal {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn append(&self, record: &DurableResearchRecord) -> Result<(), RuntimeError> {
+        let line = serde_json::to_vec(record)
+            .map_err(|error| RuntimeError::Evidence(error.to_string()))?;
+        if line.len() > 2 * 1024 * 1024 {
+            return Err(RuntimeError::Evidence(
+                "durable research record exceeds its bound".to_owned(),
+            ));
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|error| RuntimeError::Evidence(error.to_string()))?;
+        file.write_all(&line)
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| RuntimeError::Evidence(error.to_string()))
+    }
+
+    fn latest(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<DurableResearchRecord>, RuntimeError> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(RuntimeError::Evidence(error.to_string())),
+        };
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(RuntimeError::Evidence(
+                "durable research journal exceeds its bound".to_owned(),
+            ));
+        }
+        let mut latest = None;
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let record: DurableResearchRecord = serde_json::from_slice(line)
+                .map_err(|error| RuntimeError::Evidence(error.to_string()))?;
+            if record.operation_id == operation_id {
+                latest = Some(record);
+            }
+        }
+        Ok(latest)
+    }
+
+    fn reserve(
+        &self,
+        material: &AdmittedResearchMaterial,
+        request_sha256: &str,
+    ) -> Result<Option<ProviderAttemptReceipt>, RuntimeError> {
+        let operation_id = material.claim.operation_id.as_str();
+        if let Some(existing) = self.latest(operation_id)? {
+            if existing.request_sha256 != request_sha256 {
+                return Err(RuntimeError::InvalidMaterial(
+                    "durable operation identity is already bound to another request",
+                ));
+            }
+            return match existing.phase {
+                DurablePhase::Completed
+                | DurablePhase::Failed
+                | DurablePhase::Cancelled => Ok(existing.receipt),
+                DurablePhase::Reserved | DurablePhase::Running | DurablePhase::Unknown => {
+                    Err(RuntimeError::ReconcileRequired)
+                }
+            };
+        }
+        self.append(&DurableResearchRecord {
+            operation_id: operation_id.to_owned(),
+            request_sha256: request_sha256.to_owned(),
+            phase: DurablePhase::Reserved,
+            receipt: None,
+            candidate: None,
+            raw_evidence: None,
+            failure: None,
+            process_error: None,
+        })?;
+        Ok(None)
+    }
+
+    fn finish(
+        &self,
+        operation_id: &str,
+        request_sha256: &str,
+        receipt: Option<ProviderAttemptReceipt>,
+        candidate: Option<ResearchEvidenceBundle>,
+        failure: Option<ResearchProviderFailure>,
+        process_error: Option<String>,
+    ) -> Result<(), RuntimeError> {
+        let phase = receipt.as_ref().map_or(DurablePhase::Failed, |receipt| {
+            match receipt.outcome {
+                crate::execution::ProviderOutcome::Completed => DurablePhase::Completed,
+                crate::execution::ProviderOutcome::Cancelled => DurablePhase::Cancelled,
+                crate::execution::ProviderOutcome::Unknown => DurablePhase::Unknown,
+                crate::execution::ProviderOutcome::Crashed
+                | crate::execution::ProviderOutcome::TimedOut => DurablePhase::Failed,
+            }
+        });
+        self.append(&DurableResearchRecord {
+            operation_id: operation_id.to_owned(),
+            request_sha256: request_sha256.to_owned(),
+            phase,
+            raw_evidence: receipt.as_ref().map(|value| value.raw_evidence.clone()),
+            receipt,
+            candidate,
+            failure,
+            process_error,
+        })
+    }
+}
+
 /// Ephemeral broker authority for the single process request. The key is
 /// generated in this process and never crosses the material or wire boundary.
 pub struct ResearchDispatchAuthority {
@@ -219,14 +349,19 @@ pub struct ResearchDispatchAuthority {
 }
 
 impl ResearchDispatchAuthority {
-    fn new() -> Result<Self, RuntimeError> {
-        let authority_id =
-            DispatchAuthorityId::new(format!("research-dispatch-{}", std::process::id()))
-                .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
-        let nonce = Uuid::new_v4();
+    /// Creates the child-side broker view from the Kernel-issued grant. The
+    /// key material is deterministically bound to the public claim digest;
+    /// there is no random local identity and no caller-selected authority.
+    fn from_grant(grant: &ResearchDispatchGrant) -> Result<Self, RuntimeError> {
+        let authority_id = DispatchAuthorityId::new(format!(
+            "research-kernel-{}",
+            &grant.claim_sha256[..16]
+        ))
+        .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
         let mut key_bytes = [0_u8; 32];
-        key_bytes[..16].copy_from_slice(nonce.as_bytes());
-        key_bytes[16..].copy_from_slice(&Sha256::digest(nonce.as_bytes())[..16]);
+        key_bytes.copy_from_slice(&Sha256::digest(
+            format!("eliot-research-kernel-grant:{}", grant.claim_sha256).as_bytes(),
+        ));
         let key = KernelDispatchKey::from_secret_bytes(key_bytes)
             .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
         Ok(Self {
@@ -240,21 +375,22 @@ impl ResearchDispatchAuthority {
         material: &AdmittedResearchMaterial,
         admission: &ProviderAdmission,
         envelope: &SubmitEnvelope,
-        wire_bytes: &[u8],
+        request: &ResearchQueryRequest,
+        channel: &ResearchRequestChannel,
         now: u64,
     ) -> Result<ProcessRequest, RuntimeError> {
-        let delivered: SubmitEnvelope = serde_json::from_slice(wire_bytes).map_err(|_| {
-            RuntimeError::InvalidMaterial("wire bytes are not the admitted envelope")
-        })?;
-        if &delivered != envelope {
+        if envelope.request_sha256 != channel.request_sha256()
+            || envelope.budget_units != request.budget_units
+            || envelope.deadline_unix_ms != request.deadline_ms
+        {
             return Err(RuntimeError::InvalidMaterial(
-                "wire bytes do not match the admitted envelope",
+                "request channel is not bound to the exact request terms",
             ));
         }
         let generation = Generation::new(admission.process_generation().get())
             .map_err(|error| RuntimeError::InvalidMaterial(error.to_string().leak()))?;
         let fence = FencingToken::new(
-            admission.epoch().clone(),
+            material.grant.authority_epoch.clone(),
             generation,
             material.grant.fence_nonce.clone(),
         )
@@ -263,8 +399,8 @@ impl ResearchDispatchAuthority {
         let working_directory = PathBuf::from(executable)
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let remaining = admission
-            .deadline_ms()
+        let remaining = request
+            .deadline_ms
             .saturating_sub(i64::try_from(now).unwrap_or(i64::MAX))
             .max(1);
         let limits = ResourceLimits::new(
@@ -284,14 +420,14 @@ impl ResearchDispatchAuthority {
                 .map_err(|error| RuntimeError::InvalidMaterial(error.to_string().leak()))?,
             ImageId::new(format!("image-{}", admission.bridge().executable_sha256()))
                 .map_err(|error| RuntimeError::InvalidMaterial(error.to_string().leak()))?,
-            SessionId::new("session-research-provider")
+            SessionId::new(material.claim.session_id.clone())
                 .map_err(|error| RuntimeError::InvalidMaterial(error.to_string().leak()))?,
             generation,
             executable,
             admission.bridge().executable_sha256(),
             vec![
-                PROVIDER_WIRE_ARGUMENT.to_owned(),
-                String::from_utf8_lossy(wire_bytes).into_owned(),
+                PROVIDER_CHANNEL_ARGUMENT.to_owned(),
+                channel.token().to_owned(),
             ],
             working_directory.to_string_lossy().into_owned(),
             EnvironmentProjection::new(
@@ -303,10 +439,16 @@ impl ResearchDispatchAuthority {
             limits,
         )
         .map_err(|error| RuntimeError::InvalidMaterial(error.to_string().leak()))?;
-        let heads = BTreeMap::from([(
-            "research-launch-grant".to_owned(),
-            material.grant.grant_digest.clone(),
-        )]);
+        let heads = BTreeMap::from([
+            (
+                "research-launch-grant".to_owned(),
+                material.grant.grant_sha256.clone(),
+            ),
+            (
+                "research-claim".to_owned(),
+                material.claim.claim_sha256.clone(),
+            ),
+        ]);
         let issuance = PermitIssuance::new(
             ActionLeaseRef::new(material.grant.idempotency_key.clone())
                 .map_err(|error| RuntimeError::InvalidMaterial(error.to_string().leak()))?,
@@ -314,7 +456,7 @@ impl ResearchDispatchAuthority {
             heads.clone(),
             now.saturating_sub(1).max(1),
             material.grant.expires_at_unix_ms,
-            material.grant.grant_digest.clone(),
+            material.grant.grant_sha256.clone(),
         )
         .map_err(|error| RuntimeError::InvalidMaterial(error.to_string().leak()))?;
         let permit = self
@@ -331,7 +473,7 @@ impl ResearchDispatchAuthority {
                 monotonic_ns: Some(1),
             },
             fence,
-            admission.epoch().clone(),
+            material.grant.authority_epoch.clone(),
             heads,
             1,
         )
@@ -381,16 +523,37 @@ impl ResearchRequestPort for MaterialResearchRequestPort {
         &self,
         admission: &ProviderAdmission,
         envelope: &SubmitEnvelope,
-        wire_bytes: &[u8],
+        request: &ResearchQueryRequest,
+        channel: &ResearchRequestChannel,
     ) -> Result<ProcessRequest, crate::RequestPortError> {
         if envelope.operation_id != admission.operation_id().as_str()
             || envelope.route_id != admission.route().route_id
+            || envelope.request_sha256 != channel.request_sha256()
+            || envelope.budget_units != request.budget_units
+            || envelope.deadline_unix_ms != request.deadline_ms
         {
+            return Err(crate::RequestPortError::WireDeliveryRefused);
+        }
+        let working_directory = Path::new(admission.bridge().executable())
+            .parent()
+            .ok_or(crate::RequestPortError::WireDeliveryRefused)?;
+        let request_path = working_directory.join(channel.request_file_name());
+        let result_path = working_directory.join(channel.result_file_name());
+        let mut request_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&request_path)
+            .map_err(|_| crate::RequestPortError::EvidenceUnavailable)?;
+        request_file
+            .write_all(channel.request_bytes())
+            .and_then(|()| request_file.sync_all())
+            .map_err(|_| crate::RequestPortError::EvidenceUnavailable)?;
+        if result_path.exists() {
             return Err(crate::RequestPortError::WireDeliveryRefused);
         }
         let intent = ProviderIntentRecord {
             operation_id: envelope.operation_id.clone(),
-            wire_sha256: crate::sha256_hex(wire_bytes),
+            wire_sha256: channel.request_sha256().to_owned(),
             artifact_sha256: admission.bridge().executable_sha256().to_owned(),
             config_digest: admission.config_digest().to_owned(),
             protocol_digest: admission.protocol_digest().to_owned(),
@@ -422,56 +585,70 @@ impl ResearchRequestPort for MaterialResearchRequestPort {
                 &self.material,
                 admission,
                 envelope,
-                wire_bytes,
+                request,
+                channel,
                 now_unix_ms().max(1),
             )
-            .map_err(|error| {
-                let _ = error;
-                crate::RequestPortError::Refused
-            })
+            .map_err(|_| crate::RequestPortError::Refused)
     }
 }
 
 /// One-shot production entry. A missing material file is a typed unavailable
-/// source; a present material file drives the real shared executor.
+/// source; a present material file drives the real shared executor and the
+/// same operation is never relaunched after a durable reservation.
 pub fn run_once() -> Result<Option<ProviderAttemptReceipt>, RuntimeError> {
     let Some(material) = read_admitted_material()? else {
         return Err(RuntimeError::MaterialUnavailable);
     };
-    let admission = material.admission()?;
+    let admission = resolve_material(&material)?;
+    let request = material.claim.request.clone();
+    let request_sha256 = material.claim.request_sha256.clone();
+    let journal = DurableResearchJournal::new(journal_path()?);
+    if let Some(receipt) = journal.reserve(&material, &request_sha256)? {
+        return Ok(Some(receipt));
+    }
+    if journal.latest(&material.claim.operation_id)?.is_some() {
+        return Err(RuntimeError::ReconcileRequired);
+    }
     let sink = Arc::new(DurableEvidenceSink::new(evidence_path()?));
-    let authority = Arc::new(ResearchDispatchAuthority::new()?);
+    let authority = Arc::new(ResearchDispatchAuthority::from_grant(&material.grant)?);
     let port = Arc::new(MaterialResearchRequestPort {
         material: material.clone(),
         authority: Arc::clone(&authority),
         sink: Arc::clone(&sink),
     });
-    let executor = Arc::new(WindowsProcessExecutor::new(authority));
+    let executor = Arc::new(WindowsProcessExecutor::new(
+        authority as Arc<dyn DispatchValidationPort>,
+    ));
     let runner = ProviderBridge::new(executor, port, sink);
     let mut researcher = compose_admitted(runner, admission);
-    let request = material.request.clone();
-    match submit(&mut researcher, request) {
-        Ok(job) => {
-            let (bridge, _) = researcher.into_exchange().into_parts();
-            let _ = job;
-            Ok(bridge.last_receipt().cloned())
-        }
-        Err(ExchangeError::Provider { failure, .. }) => {
-            let (bridge, _) = researcher.into_exchange().into_parts();
-            Err(RuntimeError::Provider {
-                failure,
-                receipt: bridge.last_receipt().cloned().map(Box::new),
-            })
-        }
+    let submit_result = submit(&mut researcher, request);
+    let (bridge, snapshot) = researcher.into_exchange().into_parts();
+    let receipt = bridge.last_receipt().cloned();
+    let candidate = snapshot
+        .jobs
+        .get(&material.claim.operation_id)
+        .and_then(|job| job.result.clone());
+    let failure = bridge.last_failure();
+    let process_error = match &submit_result {
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
+    };
+    journal.finish(
+        &material.claim.operation_id,
+        &request_sha256,
+        receipt.clone(),
+        candidate,
+        failure.clone(),
+        process_error,
+    )?;
+    match submit_result {
+        Ok(_) => Ok(receipt),
+        Err(ExchangeError::Provider { failure, .. }) => Err(RuntimeError::Provider {
+            failure,
+            receipt: receipt.map(Box::new),
+        }),
         Err(error) => Err(RuntimeError::Unavailable(error.to_string())),
-    }
-}
-
-fn bounded_text(value: &str) -> Result<(), &'static str> {
-    if value.trim().is_empty() || value.chars().any(char::is_control) {
-        Err("grant text is blank or carries control characters")
-    } else {
-        Ok(())
     }
 }
 
@@ -483,9 +660,3 @@ fn now_unix_ms() -> u64 {
         })
 }
 
-#[allow(dead_code)]
-fn _assert_no_direct_launch() {
-    // The composition root owns no process constructor. The shared executor
-    // type is the only process implementation in this crate's dependency path.
-    let _ = std::any::TypeId::of::<WindowsProcessExecutor>();
-}

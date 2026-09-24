@@ -1884,6 +1884,22 @@ impl ExitStatus {
     pub const fn disposition(&self) -> ExitDisposition {
         self.disposition
     }
+
+    /// Returns the exact process exit code when the disposition is `Completed`.
+    ///
+    /// A zero code is a physical observation only. Callers must still retain
+    /// the exit disposition, process lineage, and all other evidence before
+    /// projecting an operation outcome.
+    #[must_use]
+    pub const fn code(&self) -> Option<i32> {
+        self.code
+    }
+
+    /// Returns the exact terminating signal when the disposition is `Signalled`.
+    #[must_use]
+    pub const fn signal(&self) -> Option<i32> {
+        self.signal
+    }
 }
 
 /// Cancellation progress independent of lifecycle.

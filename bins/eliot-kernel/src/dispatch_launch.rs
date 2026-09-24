@@ -116,6 +116,10 @@ use eliot_ors::{
 };
 use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
+use eliot_research_exchange_api::{
+    ResearchDispatchClaim, ResearchDispatchMaterial, ResearchProviderRegistration,
+    ResearchQueryRequest, RESEARCH_DISPATCH_WIRE_ID,
+};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     JobState as TestdJobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
@@ -136,6 +140,11 @@ use serde::{Deserialize, Serialize};
 #[path = "dreamer_dispatch_launch.rs"]
 pub(crate) mod dreamer_dispatch_launch;
 
+/// Stable module identity for the governed research-provider child.
+pub const RESEARCH_MODULE_ID: &str = "eliot-mod-research";
+/// Protected material filename written beside the research child.
+pub const RESEARCH_MATERIAL_FILE_NAME: &str = "eliot-mod-research.admitted-provider.json";
+
 use dreamer_dispatch_launch::{
     DreamerChildBinding, DreamerDispatchedEnvelope, DreamerLaunchKeys, DreamerLaunchPhase,
     DreamerLaunchRecord, DreamerLeaseExpectation, DreamerMaterialError, DreamerReconcileOutcome,
@@ -149,7 +158,7 @@ use super::{
     ActionLeaseRef, EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation,
     ImageId, JobId, KernelComposition, ProcessExecutionAdmissionRequest, ProcessExecutionError,
     ProcessIntent, ProcessOwnerBinding, ProcessStartReceipt, ProcessTreeId, RequestIdentity,
-    ResourceLimits, SessionId,
+    ResourceLimits, Session, SessionId,
 };
 
 /// One-shot worker kind served by the dispatch-launch contour.
@@ -174,6 +183,8 @@ pub enum DispatchedWorkerKind {
     NativeWorker,
     /// The one-shot Dreamer job worker (`eliot-dreamer`, T12-09).
     Dreamer,
+    /// The governed research-provider child (`eliot-mod-research`).
+    Research,
 }
 
 impl DispatchedWorkerKind {
@@ -189,6 +200,7 @@ impl DispatchedWorkerKind {
             Self::Testd => TESTD_MODULE_ID,
             Self::NativeWorker => NATIVE_MODULE_ID,
             Self::Dreamer => dreamer_dispatch_launch::DREAMER_MODULE_ID,
+            Self::Research => RESEARCH_MODULE_ID,
         }
     }
 
@@ -200,6 +212,7 @@ impl DispatchedWorkerKind {
             Self::Testd => eliot_kernel_service::TESTD_ADMISSION_WIRE_ID,
             Self::NativeWorker => NATIVE_WORKER_CLAIM_WIRE_ID,
             Self::Dreamer => super::dreamer_job_dispatch::DREAMER_JOB_WIRE_ID,
+            Self::Research => RESEARCH_DISPATCH_WIRE_ID,
         }
     }
 
@@ -238,6 +251,7 @@ impl DispatchedWorkerKind {
             Self::Testd => Some("eliot-testd.admitted-attempt.json"),
             Self::NativeWorker => Some("eliot-native-worker.admitted-claim.json"),
             Self::Dreamer => Some(dreamer_dispatch_launch::DREAMER_MATERIAL_FILE_NAME),
+            Self::Research => Some(RESEARCH_MATERIAL_FILE_NAME),
         }
     }
 
@@ -249,6 +263,7 @@ impl DispatchedWorkerKind {
             Self::Testd => "testd-dispatch",
             Self::NativeWorker => "native-worker-dispatch",
             Self::Dreamer => dreamer_dispatch_launch::DREAMER_NONCE_PREFIX,
+            Self::Research => "research-dispatch",
         }
     }
 
@@ -260,6 +275,7 @@ impl DispatchedWorkerKind {
             Self::Testd => "testd-launch",
             Self::NativeWorker => "native-worker-launch",
             Self::Dreamer => dreamer_dispatch_launch::DREAMER_OPERATION_PREFIX,
+            Self::Research => "research-launch",
         }
     }
 }
@@ -660,6 +676,53 @@ struct DoctorFrontDoorState {
     registry: DoctorRecipeRegistry,
 }
 
+/// Host/approved-composition binding for the research child and provider
+/// generation. The provider contract and registry are not request fields;
+/// they are pinned once here and copied only into a Kernel-issued claim.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchDispatchBinding {
+    /// Closed provider registration delivered by Host.
+    pub registration: ResearchProviderRegistration,
+    /// Absolute path of the approved `eliot-mod-research` child image.
+    pub child_executable: PathBuf,
+    /// Expected child image digest.
+    pub child_executable_sha256: String,
+    /// Absolute child working directory.
+    pub child_working_directory: PathBuf,
+}
+
+impl ResearchDispatchBinding {
+    pub fn new(
+        registration: ResearchProviderRegistration,
+        child_executable: PathBuf,
+        child_executable_sha256: String,
+        child_working_directory: PathBuf,
+    ) -> Result<Self, DispatchLaunchError> {
+        registration
+            .validate()
+            .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+        require_digest(
+            &child_executable_sha256,
+            "research child executable digest must be a lowercase SHA-256 digest",
+        )?;
+        if !child_executable.is_absolute()
+            || child_working_directory.as_os_str().is_empty()
+            || !child_working_directory.is_absolute()
+        {
+            return Err(DispatchLaunchError::Path(
+                "research child executable and working directory must be absolute".to_owned(),
+            ));
+        }
+        Ok(Self {
+            registration,
+            child_executable,
+            child_executable_sha256,
+            child_working_directory,
+        })
+    }
+}
+
 /// Launch phase of one retained dispatched attempt, keyed by its original
 /// identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -734,6 +797,7 @@ pub struct ComposedDispatchContour {
     doctor: Mutex<Option<DoctorFrontDoorState>>,
     testd_installed_digest: Mutex<Option<String>>,
     native_worker_installed_digest: Mutex<Option<String>>,
+    research: Mutex<Option<ResearchDispatchBinding>>,
     launches: Mutex<LaunchRecords>,
 }
 
@@ -850,6 +914,7 @@ pub fn compose_dispatch_contour(principal_owner: String) -> Result<(), DispatchL
             doctor: Mutex::new(None),
             testd_installed_digest: Mutex::new(None),
             native_worker_installed_digest: Mutex::new(None),
+            research: Mutex::new(None),
             launches: Mutex::new(LaunchRecords::default()),
         })
         .map_err(|_| DispatchLaunchError::AlreadyComposed("dispatch contour"))?;
@@ -984,6 +1049,36 @@ pub fn compose_production_native_worker_front_door(
     }
     *composed = Some(installed_native_worker_digest.to_owned());
     Ok(())
+}
+
+/// Composes the Host-approved research provider registration and child image.
+/// The registration is read from protected installation material by the
+/// composition root; the request path never supplies a provider path or
+/// registry. Set-once replacement is refused.
+pub fn compose_production_research_front_door(
+    binding: ResearchDispatchBinding,
+) -> Result<(), DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("dispatch contour"))?;
+    let mut composed = contour
+        .research
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("research front-door lock poisoned".to_owned()))?;
+    if composed.is_some() {
+        return Err(DispatchLaunchError::AlreadyComposed("research front door"));
+    }
+    *composed = Some(binding);
+    Ok(())
+}
+
+/// Returns whether a Host-approved research binding is composed.
+#[must_use]
+pub fn research_provider_composed() -> bool {
+    DISPATCH_CONTOUR
+        .get()
+        .and_then(|contour| contour.research.lock().ok())
+        .is_some_and(|binding| binding.is_some())
 }
 
 /// Returns whether the production testd side is composed with its installed
@@ -3669,6 +3764,368 @@ pub fn reconcile_launched_testd_attempt(
     Ok(ReconcileLaunchedOutcome::Unreconciled {
         kind: DispatchedWorkerKind::Testd,
         identity: job_id.to_owned(),
+    })
+}
+
+/// Prepared research launch: the Kernel claim is already written and the
+/// child binding is ready, or the exact operation is already retained.
+#[allow(clippy::large_enum_variant)]
+pub enum PreparedResearchLaunch {
+    Ready(ReadyResearchLaunch),
+    ReplayOriginal {
+        claim: Box<ResearchDispatchClaim>,
+        operation_id: OperationId,
+    },
+}
+
+/// A research child launch pinned to the authenticated Kernel contour.
+pub struct ReadyResearchLaunch {
+    pub claim: Box<ResearchDispatchClaim>,
+    pub material: Box<ResearchDispatchMaterial>,
+    pub operation_id: OperationId,
+    pub material_path: PathBuf,
+    pub executable: PathBuf,
+    pub executable_sha256: String,
+    pub working_directory: PathBuf,
+    pub authority_epoch: EpochId,
+    pub generation: Generation,
+}
+
+/// Outcome of one Kernel-delivered research child launch.
+pub enum ResearchLaunchOutcome {
+    Launched {
+        claim: Box<ResearchDispatchClaim>,
+        operation_id: OperationId,
+        receipt: Box<ProcessStartReceipt>,
+    },
+    LaunchUnknown {
+        claim: Box<ResearchDispatchClaim>,
+        operation_id: OperationId,
+    },
+    ReplayOriginal {
+        claim: Box<ResearchDispatchClaim>,
+        operation_id: OperationId,
+    },
+}
+
+/// Reconcile result for a retained research launch. A valid material file is
+/// not treated as proof that the child completed; the caller receives an
+/// explicit retained/unknown disposition and must use the child's durable
+/// journal for terminal closure.
+pub enum ResearchReconcileOutcome {
+    MaterialRetained {
+        operation_id: String,
+        claim_sha256: String,
+    },
+    Unknown {
+        operation_id: String,
+    },
+}
+
+/// Admits and prepares one authenticated research request. The request is
+/// decoded and validated by the caller; all provider/registry/executable
+/// material comes from the Host-composed registration, while epoch,
+/// generation, session, and owner facts come from live Kernel state.
+pub fn prepare_research_launch(
+    kernel: &KernelComposition,
+    session: &Session,
+    request: &ResearchQueryRequest,
+    now_unix_nanos: u64,
+) -> Result<PreparedResearchLaunch, DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("research front door"))?;
+    let binding = {
+        let composed = contour
+            .research
+            .lock()
+            .map_err(|_| DispatchLaunchError::Gate("research front-door lock poisoned".to_owned()))?;
+        composed
+            .clone()
+            .ok_or(DispatchLaunchError::Uncomposed("research provider binding"))?
+    };
+    request
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    session
+        .peer
+        .validate()
+        .map_err(|_| DispatchLaunchError::Gate("research session peer is unavailable".to_owned()))?;
+    if now_unix_nanos == 0 {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "research admission time must be non-zero".to_owned(),
+        ));
+    }
+    let (authority_epoch, generation) = {
+        let service = kernel
+            .service
+            .lock()
+            .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+        if !matches!(
+            service.state(),
+            KernelServiceState::Ready | KernelServiceState::Degraded
+        ) {
+            return Err(DispatchLaunchError::Gate(
+                "research provider dispatch requires a live Kernel service".to_owned(),
+            ));
+        }
+        let generation = service
+            .activation_receipt()
+            .map_or(0, |receipt| receipt.generation.value());
+        (service.authority_epoch(), generation)
+    };
+    if generation == 0
+        || !authority_epoch.is_same_authority(&session.authority_epoch)
+        || session.module_generation.state_fence.authority_epoch != authority_epoch
+        || binding.registration.authority_epoch != authority_epoch
+        || binding.registration.state_fence != session.module_generation.state_fence
+        || binding.registration.process_generation != generation
+    {
+        return Err(DispatchLaunchError::Gate(
+            "research registration is not bound to the live Kernel epoch/generation/fence"
+                .to_owned(),
+        ));
+    }
+    let request_digest = sha256_hex(
+        &canonical_json_bytes(request)
+            .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?,
+    );
+    let operation_id = OperationId::new(format!(
+        "{}-{}",
+        DispatchedWorkerKind::Research.operation_prefix(),
+        short_identity(&request_digest)?
+    ))
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let (owner, _session_binding) = super::caller_binding(session)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let claim = ResearchDispatchClaim::from_registration(
+        &binding.registration,
+        request.clone(),
+        operation_id.as_str(),
+        owner.principal_digest(),
+        binding.registration.owner_principal_digest.clone(),
+        session.connection_id.clone(),
+        session.launch_nonce.clone(),
+        now_unix_nanos / 1_000_000,
+    )
+    .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let material = ResearchDispatchMaterial::from_claim(claim)
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let material_dir = binding
+        .child_executable
+        .parent()
+        .ok_or_else(|| DispatchLaunchError::Path("research child has no installation parent".to_owned()))?;
+    let material_path = material_dir.join(RESEARCH_MATERIAL_FILE_NAME);
+    let identity = operation_id_string(&operation_id);
+    {
+        let mut launches = launches_table(contour)?;
+        if let Some(existing) = launches.by_identity.get(&identity) {
+            if existing.kind != DispatchedWorkerKind::Research {
+                return Err(DispatchLaunchError::ChangedTerms(
+                    "research operation identity is already owned by another worker".to_owned(),
+                ));
+            }
+            if existing.request_digest != request_digest {
+                return Err(DispatchLaunchError::ChangedTerms(
+                    "research operation identity presents changed request terms".to_owned(),
+                ));
+            }
+            return Ok(PreparedResearchLaunch::ReplayOriginal {
+                claim: Box::new(material.claim),
+                operation_id,
+            });
+        }
+        launches.by_identity.insert(
+            identity.clone(),
+            LaunchRecord {
+                kind: DispatchedWorkerKind::Research,
+                identity,
+                admission_digest: material.claim.claim_sha256.clone(),
+                request_digest,
+                effect_digest: None,
+                material_path: Some(material_path.clone()),
+                testd_owner_binding: None,
+                nonce: material.claim.claim_nonce.clone(),
+                operation_id: operation_id_string(&operation_id),
+                phase: LaunchPhase::Reserved,
+                testd_admission: None,
+                native_receipt: None,
+                native_request: None,
+            },
+        );
+    }
+    let bytes = serde_json::to_vec(&material)
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    if let Err(error) = write_material_file(&material_path, &bytes) {
+        release_launch(contour, &operation_id_string(&operation_id));
+        return Err(error);
+    }
+    Ok(PreparedResearchLaunch::Ready(ReadyResearchLaunch {
+        claim: Box::new(material.claim.clone()),
+        material: Box::new(material),
+        operation_id,
+        material_path,
+        executable: binding.child_executable,
+        executable_sha256: binding.child_executable_sha256,
+        working_directory: binding.child_working_directory,
+        authority_epoch,
+        generation: Generation::new(generation)
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+    }))
+}
+
+/// Starts one prepared research child through the shared process gateway.
+pub async fn start_ready_research_launch(
+    kernel: &KernelComposition,
+    ready: &ReadyResearchLaunch,
+) -> Result<ChildStartOutcome, DispatchLaunchError> {
+    match spawn_ready_child(
+        kernel,
+        &SpawnInputs {
+            kind: DispatchedWorkerKind::Research,
+            operation_id: &ready.operation_id,
+            executable: &ready.executable,
+            executable_sha256: &ready.executable_sha256,
+            working_directory: &ready.working_directory,
+            generation: ready.generation,
+            authority_epoch: &ready.authority_epoch,
+            material_path: Some(ready.material_path.as_path()),
+        },
+    )
+    .await?
+    {
+        SpawnOutcome::Started(receipt) => Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
+            receipt: *receipt,
+            operation_id: ready.operation_id.clone(),
+        }))),
+        SpawnOutcome::Unknown(operation_id) => {
+            Ok(ChildStartOutcome::Unknown(UncertainSpawn { operation_id }))
+        }
+    }
+}
+
+/// Admits, writes protected material, and launches the real research child.
+/// This is the production Kernel caller used by the authenticated frame arm.
+pub async fn launch_admitted_research_attempt(
+    kernel: &KernelComposition,
+    session: &Session,
+    request: &ResearchQueryRequest,
+    now_unix_nanos: u64,
+) -> Result<ResearchLaunchOutcome, DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("research front door"))?;
+    let ready = match prepare_research_launch(kernel, session, request, now_unix_nanos)? {
+        PreparedResearchLaunch::Ready(ready) => ready,
+        PreparedResearchLaunch::ReplayOriginal { claim, operation_id } => {
+            return Ok(ResearchLaunchOutcome::ReplayOriginal { claim, operation_id });
+        }
+    };
+    let identity = operation_id_string(&ready.operation_id);
+    let material_path = ready.material_path.clone();
+    match start_ready_research_launch(kernel, &ready).await {
+        Ok(ChildStartOutcome::Started(spawned)) => {
+            retain_launch(
+                contour,
+                LaunchRecord {
+                    kind: DispatchedWorkerKind::Research,
+                    identity: identity.clone(),
+                    admission_digest: ready.claim.claim_sha256.clone(),
+                    request_digest: ready.claim.request_sha256.clone(),
+                    effect_digest: None,
+                    material_path: Some(material_path),
+                    testd_owner_binding: None,
+                    nonce: ready.claim.claim_nonce.clone(),
+                    operation_id: operation_id_string(&ready.operation_id),
+                    phase: LaunchPhase::Launched,
+                    testd_admission: None,
+                    native_receipt: None,
+                    native_request: None,
+                },
+            )?;
+            Ok(ResearchLaunchOutcome::Launched {
+                claim: ready.claim,
+                operation_id: ready.operation_id,
+                receipt: Box::new(spawned.receipt),
+            })
+        }
+        Ok(ChildStartOutcome::Unknown(uncertain)) => {
+            retain_launch(
+                contour,
+                LaunchRecord {
+                    kind: DispatchedWorkerKind::Research,
+                    identity: identity.clone(),
+                    admission_digest: ready.claim.claim_sha256.clone(),
+                    request_digest: ready.claim.request_sha256.clone(),
+                    effect_digest: None,
+                    material_path: Some(material_path),
+                    testd_owner_binding: None,
+                    nonce: ready.claim.claim_nonce.clone(),
+                    operation_id: operation_id_string(&uncertain.operation_id),
+                    phase: LaunchPhase::Unreconciled,
+                    testd_admission: None,
+                    native_receipt: None,
+                    native_request: None,
+                },
+            )?;
+            Ok(ResearchLaunchOutcome::LaunchUnknown {
+                claim: ready.claim,
+                operation_id: ready.operation_id,
+            })
+        }
+        Err(error) => {
+            reap_material_file(&material_path);
+            release_launch(contour, &identity);
+            Err(error)
+        }
+    }
+}
+
+/// Reconciles a retained research launch without minting a new claim or
+/// relaunching the child. The durable material is re-proved against live
+/// Kernel authority; terminal provider state remains owned by the child
+/// journal and is not inferred from a successful spawn.
+pub fn reconcile_launched_research_attempt(
+    kernel: &KernelComposition,
+    operation_id: &str,
+) -> Result<ResearchReconcileOutcome, DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("research front door"))?;
+    let retained = {
+        let launches = launches_table(contour)?;
+        launches.by_identity.get(operation_id).cloned()
+    };
+    let Some(retained) = retained.filter(|record| record.kind == DispatchedWorkerKind::Research)
+    else {
+        return Ok(ResearchReconcileOutcome::Unknown {
+            operation_id: operation_id.to_owned(),
+        });
+    };
+    let live_epoch = kernel
+        .service
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?
+        .authority_epoch();
+    let Some(material_path) = retained.material_path.as_deref() else {
+        return Ok(ResearchReconcileOutcome::Unknown {
+            operation_id: operation_id.to_owned(),
+        });
+    };
+    let bytes = std::fs::read(material_path).map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
+    let material: ResearchDispatchMaterial = serde_json::from_slice(&bytes)
+        .map_err(|_| DispatchLaunchError::InvalidMaterial("research material is not typed".to_owned()))?;
+    if material.claim.operation_id != operation_id
+        || material.claim.authority_epoch != live_epoch
+        || material.validate(super::unix_ms()).is_err()
+    {
+        return Ok(ResearchReconcileOutcome::Unknown {
+            operation_id: operation_id.to_owned(),
+        });
+    }
+    Ok(ResearchReconcileOutcome::MaterialRetained {
+        operation_id: operation_id.to_owned(),
+        claim_sha256: material.claim.claim_sha256,
     })
 }
 

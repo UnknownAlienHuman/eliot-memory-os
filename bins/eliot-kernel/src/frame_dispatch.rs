@@ -33,6 +33,10 @@ use eliot_kernel_core::{
     KernelRuntimeHealthEvidence, NormativePairReceipt, ProcessHealthStatus, ProcessHealthVector,
     StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
 };
+use eliot_research_exchange_api::{
+    ResearchDispatchRequest, ResearchReconcileRequest, RESEARCH_DISPATCH_WIRE_ID,
+    RESEARCH_RECONCILE_OPERATION,
+};
 use eliot_runtime_contracts::{GenerationCutoverState, HealthDimension};
 #[cfg(windows)]
 use eliot_runtime_contracts::{LeaseState, SupervisionLeaseVerifier};
@@ -424,6 +428,7 @@ impl KernelComposition {
                     KernelFrameAction::Doctor { .. } => "doctor_admitted",
                     KernelFrameAction::Testd { .. } => "testd_admitted",
                     KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
+                    KernelFrameAction::Research { .. } => "research_admitted",
                     KernelFrameAction::Fence(_) => "fenced_reply",
                 };
                 observe_frame("kernel.frame_validated", "success");
@@ -672,6 +677,34 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 return self.dispatch_wasm_port_grant_frame(session, frame);
+            }
+            if is_research_operation(native_operation) {
+                let control = frame.kind == FrameKind::Cancel
+                    && frame.message_type == MessageType::Cancel;
+                if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER
+                    || (!control
+                        && !matches!(
+                            self.service_state()
+                                .map_err(|_| TransportError::SessionFenced)?,
+                            KernelServiceState::Ready
+                        ))
+                    || (control
+                        && !matches!(
+                            self.service_state()
+                                .map_err(|_| TransportError::SessionFenced)?,
+                            KernelServiceState::Ready | KernelServiceState::Degraded
+                        ))
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_research_frame(session, frame);
             }
             if is_doctor_operation(native_operation) {
                 // P-07 Doctor repair-attempt intake rides the same admitted
@@ -947,10 +980,237 @@ pub(crate) fn is_doctor_operation(operation: &str) -> bool {
 /// Returns whether the operation string selects one of the closed TestD
 /// admission or terminal-completion routes. Each entry still validates its
 /// own exact wire id/version and typed payload.
+/// Returns whether the operation selects the closed Kernel research route.
+pub(crate) fn is_research_operation(operation: &str) -> bool {
+    operation == RESEARCH_DISPATCH_WIRE_ID || operation == RESEARCH_RECONCILE_OPERATION
+}
+
 pub(crate) fn is_testd_operation(operation: &str) -> bool {
     operation == TESTD_ADMISSION_WIRE_ID
         || operation == super::testd_terminal_completion_route::OPERATION
         || operation == super::testd_terminal_completion_route::OWNER_SUBMIT_OPERATION
+}
+
+impl KernelComposition {
+    /// Dispatches one authenticated research dispatch/reconcile frame after
+    /// the closed gateway has checked session, connection, operation, and
+    /// service state. The actual claim is issued only by the execute arm.
+    pub(crate) fn dispatch_research_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        if frame.connection_id != session.connection_id
+            || !session
+                .module_generation
+                .state_fence
+                .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let operation = payload
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if operation == RESEARCH_DISPATCH_WIRE_ID {
+            if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+                return Err(TransportError::SessionFenced);
+            }
+            research_dispatch_request_from_payload(&payload)?;
+        } else if operation == RESEARCH_RECONCILE_OPERATION {
+            if frame.kind != FrameKind::Cancel || frame.message_type != MessageType::Cancel {
+                return Err(TransportError::SessionFenced);
+            }
+            research_reconcile_request_from_payload(&payload)?;
+        } else {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(KernelFrameAction::Research {
+            request_id,
+            identity,
+            operation: operation.to_owned(),
+            payload,
+        })
+    }
+
+    /// Executes a validated research dispatch or reconciliation request.
+    /// This is the production call site that supplies the authenticated
+    /// session/owner claim to the shared dispatch contour.
+    pub async fn execute_research_request(
+        &self,
+        session: &Session,
+        request_id: super::RequestId,
+        identity: &super::RequestIdentity,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<Frame, TransportError> {
+        if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER
+            || !is_research_operation(operation)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let response = if operation == RESEARCH_DISPATCH_WIRE_ID {
+            if self.service_state().map_err(|_| TransportError::SessionFenced)?
+                != KernelServiceState::Ready
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let request = research_dispatch_request_from_payload(&payload)?;
+            if identity.idempotency_key != request.request.idempotency_key
+                || identity.request.state_fence != request.request.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let outcome = super::dispatch_launch::launch_admitted_research_attempt(
+                self,
+                session,
+                &request.request,
+                unix_ms().saturating_mul(1_000_000),
+            )
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+            research_launch_response(&outcome)
+        } else {
+            if !matches!(
+                self.service_state().map_err(|_| TransportError::SessionFenced)?,
+                KernelServiceState::Ready | KernelServiceState::Degraded
+            ) {
+                return Err(TransportError::SessionFenced);
+            }
+            let request = research_reconcile_request_from_payload(&payload)?;
+            if identity.idempotency_key != request.operation_id {
+                return Err(TransportError::SessionFenced);
+            }
+            let outcome = super::dispatch_launch::reconcile_launched_research_attempt(
+                self,
+                &request.operation_id,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+            research_reconcile_response(&outcome)
+        };
+        let mut reply = status_frame(
+            session,
+            FrameKind::Response,
+            MessageType::Result,
+            serde_json::json!({ "operation": operation, "result": response }),
+        )?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(reply)
+    }
+}
+
+/// Decodes the exact typed research dispatch request from a frame payload.
+fn research_dispatch_request_from_payload(
+    payload: &serde_json::Value,
+) -> Result<ResearchDispatchRequest, TransportError> {
+    let value = payload
+        .get("request")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let request: ResearchDispatchRequest =
+        serde_json::from_value(value).map_err(|_| TransportError::SessionFenced)?;
+    request.validate().map_err(|_| TransportError::SessionFenced)?;
+    Ok(request)
+}
+
+/// Decodes the exact typed research reconcile request from a frame payload.
+fn research_reconcile_request_from_payload(
+    payload: &serde_json::Value,
+) -> Result<ResearchReconcileRequest, TransportError> {
+    let value = payload
+        .get("request")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let request: ResearchReconcileRequest =
+        serde_json::from_value(value).map_err(|_| TransportError::SessionFenced)?;
+    request.validate().map_err(|_| TransportError::SessionFenced)?;
+    Ok(request)
+}
+
+fn research_launch_response(
+    outcome: &super::dispatch_launch::ResearchLaunchOutcome,
+) -> serde_json::Value {
+    use super::dispatch_launch::ResearchLaunchOutcome;
+    match outcome {
+        ResearchLaunchOutcome::Launched {
+            claim,
+            operation_id,
+            receipt,
+        } => serde_json::json!({
+            "state": "launched",
+            "operation_id": operation_id.as_str(),
+            "claim_sha256": claim.claim_sha256,
+            "request_sha256": claim.request_sha256,
+            "receipt": receipt,
+        }),
+        ResearchLaunchOutcome::LaunchUnknown {
+            claim,
+            operation_id,
+        } => serde_json::json!({
+            "state": "unknown",
+            "operation_id": operation_id.as_str(),
+            "claim_sha256": claim.claim_sha256,
+            "request_sha256": claim.request_sha256,
+        }),
+        ResearchLaunchOutcome::ReplayOriginal {
+            claim,
+            operation_id,
+        } => serde_json::json!({
+            "state": "replayed",
+            "operation_id": operation_id.as_str(),
+            "claim_sha256": claim.claim_sha256,
+            "request_sha256": claim.request_sha256,
+        }),
+    }
+}
+
+fn research_reconcile_response(
+    outcome: &super::dispatch_launch::ResearchReconcileOutcome,
+) -> serde_json::Value {
+    use super::dispatch_launch::ResearchReconcileOutcome;
+    match outcome {
+        ResearchReconcileOutcome::MaterialRetained {
+            operation_id,
+            claim_sha256,
+        } => serde_json::json!({
+            "state": "reconcile_required",
+            "operation_id": operation_id,
+            "claim_sha256": claim_sha256,
+        }),
+        ResearchReconcileOutcome::Unknown { operation_id } => serde_json::json!({
+            "state": "unknown",
+            "operation_id": operation_id,
+        }),
+    }
 }
 
 impl KernelComposition {

@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use eliot_contracts::sha256_hex;
-use eliot_kernel::AuthorityDescriptorContour;
+use eliot_kernel::{AuthorityDescriptorContour, ResearchDispatchBinding};
 #[cfg(windows)]
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{EliotdLaunchDescriptor, HostStoreBootstrapRequirement};
@@ -194,6 +194,10 @@ pub(crate) struct KernelLaunchOptions {
     pub(crate) doctor_executable_path: Option<PathBuf>,
     pub(crate) testd_artifact_sha256: Option<String>,
     pub(crate) native_worker_artifact_sha256: Option<String>,
+    /// Optional Host-owned protected research-provider descriptor.
+    pub(crate) research_provider_descriptor: Option<PathBuf>,
+    /// Host-verified digest of the research-provider descriptor bytes.
+    pub(crate) research_provider_sha256: Option<String>,
 }
 
 pub(crate) struct PreparedStoreBootstrap {
@@ -208,7 +212,34 @@ pub(crate) fn parse_launch_options<I>(args: I) -> Result<KernelLaunchOptions, st
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    let args = args.into_iter().collect::<Vec<_>>();
+    let mut args = args.into_iter().collect::<Vec<_>>();
+    let mut research_provider_descriptor = None;
+    let mut research_provider_sha256 = None;
+    if args.len() == 28 {
+        let suffix = &args[24..];
+        if suffix[0] != "--research-provider-descriptor"
+            || suffix[2] != "--research-provider-descriptor-sha256"
+        {
+            return Err(invalid_input(
+                "Host launch research descriptor flags must be exact and paired",
+            ));
+        }
+        let descriptor = PathBuf::from(&suffix[1]);
+        if !descriptor.is_absolute() {
+            return Err(invalid_input(
+                "research provider descriptor path must be absolute",
+            ));
+        }
+        let digest = suffix[3].to_string_lossy();
+        if !is_lower_sha256(&digest) {
+            return Err(invalid_input(
+                "research provider descriptor digest must be lowercase SHA-256",
+            ));
+        }
+        research_provider_descriptor = Some(descriptor);
+        research_provider_sha256 = Some(digest.into_owned());
+        args.truncate(24);
+    }
     match args.as_slice() {
         [] => Err(invalid_input("exact Host launch arguments are required")),
         [
@@ -295,6 +326,8 @@ where
                 doctor_executable_path: Some(doctor_executable_path),
                 testd_artifact_sha256: Some(testd_artifact_digest.into_owned()),
                 native_worker_artifact_sha256: Some(native_worker_artifact_digest.into_owned()),
+                research_provider_descriptor,
+                research_provider_sha256,
             })
         }
         [
@@ -394,6 +427,32 @@ pub(crate) fn prepare_eliotd_launch(
         .validate()
         .map_err(|error| format!("validate eliotd launch descriptor: {error}"))?;
     Ok(Some(descriptor))
+}
+
+/// Reads and validates the optional Host-owned research provider binding.
+pub(crate) fn prepare_research_dispatch_binding(
+    options: &KernelLaunchOptions,
+) -> Result<Option<ResearchDispatchBinding>, String> {
+    let (Some(path), Some(expected_digest)) = (
+        options.research_provider_descriptor.as_ref(),
+        options.research_provider_sha256.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let bytes = read_descriptor_bounded(path, &options.work_root)?;
+    if sha256_hex(&bytes) != expected_digest {
+        return Err("research provider descriptor digest mismatch".to_owned());
+    }
+    let binding: ResearchDispatchBinding = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse research provider descriptor: {error}"))?;
+    ResearchDispatchBinding::new(
+        binding.registration,
+        binding.child_executable,
+        binding.child_executable_sha256,
+        binding.child_working_directory,
+    )
+    .map(Some)
+    .map_err(|error| error.to_string())
 }
 
 impl KernelLaunchOptions {

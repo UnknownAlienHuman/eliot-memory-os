@@ -37,6 +37,7 @@ eliot-security-contracts.workspace = true
 eliot-store-api.workspace = true
 eliot-testd-core.workspace = true
 eliot-process.workspace = true
+eliot-research-exchange-api.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 sha2.workspace = true

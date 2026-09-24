@@ -7,6 +7,7 @@ use eliot_mod_research::runtime::{self, RuntimeError};
 const EXIT_KERNEL_ADMISSION_REQUIRED: i32 = 78;
 const EXIT_PROVIDER_UNAVAILABLE: i32 = 79;
 const EXIT_PROVIDER_FAILED: i32 = 1;
+const EXIT_RECONCILIATION_REQUIRED: i32 = 75;
 
 fn main() {
     std::process::exit(run());
@@ -64,6 +65,13 @@ fn run() -> i32 {
         Err(error @ RuntimeError::Unavailable(_)) => {
             emit("RESEARCH_SOURCE_UNAVAILABLE", &error.to_string());
             EXIT_PROVIDER_UNAVAILABLE
+        }
+        Err(RuntimeError::ReconcileRequired) => {
+            emit(
+                "RESEARCH_RECONCILIATION_REQUIRED",
+                "durable provider operation is unresolved; reconcile before retry",
+            );
+            EXIT_RECONCILIATION_REQUIRED
         }
         Err(error @ RuntimeError::Evidence(_)) => {
             emit("RESEARCH_PROVIDER_FAILED", &error.to_string());

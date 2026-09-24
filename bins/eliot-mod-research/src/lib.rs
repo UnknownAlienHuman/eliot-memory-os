@@ -42,8 +42,10 @@ pub use execution::{
     RequestPortError, ResearchRequestPort,
 };
 pub use protocol::{
-    CoverageDenominator, MAX_WIRE_BYTES, MAX_WIRE_LINES, PROVIDER_WIRE_ARGUMENT,
-    RESEARCH_PROVIDER_WIRE_VERSION, ResultFrame, SubmitAck, SubmitEnvelope,
+    CoverageDenominator, MAX_CHANNEL_BYTES, MAX_WIRE_BYTES, MAX_WIRE_LINES,
+    PROVIDER_CHANNEL_ARGUMENT, PROVIDER_REQUEST_FILE_PREFIX, PROVIDER_RESULT_FILE_PREFIX,
+    RESEARCH_PROVIDER_WIRE_VERSION, ResearchRequestChannel, ResearchResultDocument, ResultFrame,
+    SubmitAck, SubmitEnvelope,
 };
 
 /// Stable gap code emitted when no governed provider execution is available.

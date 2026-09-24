@@ -7,7 +7,7 @@
 //! Provider-local job identifiers remain correlation evidence only.
 
 use eliot_contracts::ContractVersion;
-use eliot_research_exchange_api::DisclosureClass;
+use eliot_research_exchange_api::{DisclosureClass, ResearchEvidenceBundle, ResearchQueryRequest};
 use serde::{Deserialize, Serialize};
 
 use crate::admission::ProviderAdmission;
@@ -17,10 +17,16 @@ use crate::{is_lowercase_sha256, sha256_hex};
 pub const RESEARCH_PROVIDER_WIRE_VERSION: u16 = 2;
 /// Maximum accepted wire payload in bytes (one envelope or one frame).
 pub const MAX_WIRE_BYTES: usize = 64 * 1024;
+/// Maximum accepted full request/result channel payload.
+pub const MAX_CHANNEL_BYTES: usize = 1024 * 1024;
 /// Maximum accepted stdout lines scanned for ack/result frames.
 pub const MAX_WIRE_LINES: usize = 4096;
-/// Exact argv marker used to deliver the admitted request envelope.
-pub const PROVIDER_WIRE_ARGUMENT: &str = "--eliot-research-wire";
+/// Exact argv marker used to deliver the protected request-channel token.
+pub const PROVIDER_CHANNEL_ARGUMENT: &str = "--eliot-research-channel";
+/// Fixed request file suffix inside the provider's protected working directory.
+pub const PROVIDER_REQUEST_FILE_PREFIX: &str = "eliot-research-request-";
+/// Fixed result file suffix inside the provider's protected working directory.
+pub const PROVIDER_RESULT_FILE_PREFIX: &str = "eliot-research-result-";
 
 /// Stable refusal reasons for wire violations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +60,142 @@ impl ProtocolRefusal {
             Self::AmbiguousResultFrame => "provider output carries multiple terminal result frames",
             Self::TooManyLines => "provider output exceeds the wire line bound",
         }
+    }
+}
+
+/// Request/result channel material created before the provider process starts.
+///
+/// The complete typed [`ResearchQueryRequest`] is stored in a bounded,
+/// operation-specific file. The process argument carries only the opaque
+/// channel token, never request bytes, an executable path, or credentials.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResearchRequestChannel {
+    token: String,
+    request_bytes: Vec<u8>,
+    request_sha256: String,
+}
+
+impl ResearchRequestChannel {
+    pub fn new(
+        request: &ResearchQueryRequest,
+        operation_id: &str,
+    ) -> Result<Self, ProtocolRefusal> {
+        request.validate().map_err(|_| ProtocolRefusal::MalformedWire)?;
+        let request_bytes = eliot_contracts::canonical_json_bytes(request)
+            .map_err(|_| ProtocolRefusal::MalformedWire)?;
+        if request_bytes.len() > MAX_CHANNEL_BYTES {
+            return Err(ProtocolRefusal::WireTooLarge);
+        }
+        let request_sha256 = sha256_hex(&request_bytes);
+        let token = format!(
+            "operation-{}-{}",
+            &sha256_hex(operation_id.as_bytes())[..16],
+            &request_sha256[..16]
+        );
+        if token.is_empty()
+            || token.len() > 256
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ProtocolRefusal::BlankCorrelation);
+        }
+        Ok(Self {
+            token,
+            request_bytes,
+            request_sha256,
+        })
+    }
+
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    #[must_use]
+    pub fn request_bytes(&self) -> &[u8] {
+        &self.request_bytes
+    }
+
+    #[must_use]
+    pub fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+
+    #[must_use]
+    pub fn request_file_name(&self) -> String {
+        format!("{PROVIDER_REQUEST_FILE_PREFIX}{}.json", self.token)
+    }
+
+    #[must_use]
+    pub fn result_file_name(&self) -> String {
+        format!("{PROVIDER_RESULT_FILE_PREFIX}{}.json", self.token)
+    }
+}
+
+/// Typed result document written by the provider to the protected result
+/// channel. The stdout frame remains a correlation/evidence projection; the
+/// candidate itself is carried as a validated typed bundle in this document.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchResultDocument {
+    pub frame: ResultFrame,
+    pub candidate: Option<ResearchEvidenceBundle>,
+}
+
+impl ResearchResultDocument {
+    pub fn decode(
+        bytes: &[u8],
+        request: &ResearchQueryRequest,
+        expected_operation: &str,
+        expected_request_sha256: &str,
+        expected_route: &str,
+    ) -> Result<Self, ProtocolRefusal> {
+        if bytes.len() > MAX_CHANNEL_BYTES {
+            return Err(ProtocolRefusal::WireTooLarge);
+        }
+        let document: Self = serde_json::from_slice(bytes)
+            .map_err(|_| ProtocolRefusal::MalformedWire)?;
+        let frame = ResultFrame::decode(
+            &serde_json::to_vec(&document.frame)
+                .map_err(|_| ProtocolRefusal::MalformedWire)?,
+            expected_operation,
+            expected_request_sha256,
+            expected_route,
+        )?;
+        if frame != document.frame {
+            return Err(ProtocolRefusal::MalformedWire);
+        }
+        if let Some(candidate) = &document.candidate {
+            candidate
+                .validate_against(request)
+                .map_err(|_| ProtocolRefusal::MalformedWire)?;
+            let candidate_sources = candidate
+                .sources
+                .iter()
+                .map(|source| source.source_handle.as_str())
+                .collect::<Vec<_>>();
+            let frame_sources = frame
+                .source_handles
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            if candidate_sources != frame_sources
+                || !candidate
+                    .artifact_handles
+                    .contains(&format!("provider-candidate:{}", frame.candidate_sha256))
+                || frame.provenance_handles.iter().any(|handle| {
+                    !candidate.artifact_handles.contains(handle)
+                        && !candidate
+                            .sources
+                            .iter()
+                            .any(|source| source.source_handle == *handle)
+                })
+            {
+                return Err(ProtocolRefusal::MalformedWire);
+            }
+        }
+        Ok(document)
     }
 }
 
@@ -132,8 +274,8 @@ impl SubmitEnvelope {
             credential_binding_id: contract.credential_binding().binding_id.clone(),
             credential_owner_principal: contract.credential_binding().owner_principal.clone(),
             credential_acting_principal: contract.credential_binding().acting_principal.clone(),
-            budget_units: contract.budget_units,
-            deadline_unix_ms: contract.deadline_ms,
+            budget_units: request.budget_units,
+            deadline_unix_ms: request.deadline_ms,
             cancellation_id: contract.cancellation().cancellation_id.clone(),
             registry_evidence_sha256: contract.registry_evidence_sha256().to_owned(),
             process_generation: contract.process_generation.get(),

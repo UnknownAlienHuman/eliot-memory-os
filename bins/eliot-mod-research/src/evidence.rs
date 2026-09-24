@@ -284,6 +284,11 @@ pub struct ProviderAttemptReceipt {
     /// Sanitized executor error retained when a start/terminal observation
     /// could not be completed; it is never replaced by a clean refusal.
     pub process_error: Option<String>,
+    /// Cancellation failure retained instead of being discarded after a timeout.
+    pub cancellation_error: Option<String>,
+    /// Reconciliation failure retained instead of being discarded after an
+    /// unknown or timed-out outcome.
+    pub reconciliation_error: Option<String>,
     /// Terminal provider/process classification carried by this receipt.
     pub outcome: ProviderOutcome,
     /// Exact executor start receipt, retained when start was proven.
@@ -321,6 +326,8 @@ pub struct ProviderAttemptReceipt {
     pub raw_evidence: RawProviderEvidence,
     /// Optional durable typed stream/process evidence returned by reconcile.
     pub reconciliation: Option<ProcessEvidence>,
+    /// Path of the bounded provider result channel, when one was delivered.
+    pub result_channel_path: Option<String>,
     /// Cancellation receipt, retained rather than discarded.
     pub cancellation: Option<CancellationReceipt>,
     /// Cleanup/descendant receipt.

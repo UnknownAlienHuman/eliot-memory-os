@@ -42,7 +42,8 @@ use eliot_kernel::kernel_diagnostics::{
 use eliot_kernel::{
     EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig,
     KernelDoctorRecoveryLedger, compose_dispatch_contour, compose_production_doctor_front_door,
-    compose_production_native_worker_front_door, compose_production_testd_front_door,
+    compose_production_native_worker_front_door, compose_production_research_front_door,
+    compose_production_testd_front_door,
 };
 
 #[cfg(windows)]
@@ -222,6 +223,15 @@ async fn main() {
         };
         if let Err(error) = compose_production_native_worker_front_door(&native_worker_digest) {
             exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
+        }
+        match startup_binding::prepare_research_dispatch_binding(&options) {
+            Ok(Some(binding)) => {
+                if let Err(error) = compose_production_research_front_door(binding) {
+                    exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
+                }
+            }
+            Ok(None) => {}
+            Err(error) => exit_error("RESEARCH_PROVIDER_DESCRIPTOR_INVALID", &error),
         }
     }
     #[cfg(windows)]

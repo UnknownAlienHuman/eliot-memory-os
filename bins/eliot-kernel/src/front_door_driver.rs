@@ -346,6 +346,26 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::Research {
+                request_id,
+                identity,
+                operation,
+                payload,
+            } => {
+                let reply = kernel
+                    .execute_research_request(
+                        &session,
+                        request_id,
+                        &identity,
+                        &operation,
+                        payload,
+                    )
+                    .await?;
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
             KernelFrameAction::Dreamer {
                 request_id,
                 operation,
@@ -529,6 +549,7 @@ async fn serve_admitted_bridge_host_requests(
             | KernelFrameAction::Daemon { .. }
             | KernelFrameAction::Doctor { .. }
             | KernelFrameAction::Testd { .. }
+            | KernelFrameAction::Research { .. }
             | KernelFrameAction::Dreamer { .. } => {
                 // Bridge transports never carry process, daemon, Doctor,
                 // testd, or Dreamer authority: the Doctor serves only its own
