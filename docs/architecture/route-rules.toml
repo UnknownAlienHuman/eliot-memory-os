@@ -234,6 +234,7 @@ description = "Root-level repository identity, licensing, tool pins, and contrib
 path_globs = [
   ".gitattributes", ".gitignore", "LICENSE", "README.md", "WORKFLOW.md", "START.md",
   ".typos.toml", "Cargo.toml", "Cargo.lock", "Justfile", "deny.toml", "mcpls.toml", "rust-toolchain.toml", "tool-versions.json",
+  "PLAN-1942.md", "REPORT-957.md", "status.md",
 ]
 topic_keywords = ["repository root", "license", "toolchain pin"]
 required_handles = ["A0.4", "A14.8", "I0.14", "I2.17", "I18"]
