@@ -46,8 +46,37 @@ pub use reactive_context::{
     ReactiveContextViewBinding, reactive_context_contract_identity,
 };
 
+pub mod backup;
 pub mod dreamer_job;
 pub mod reactive_restore;
+pub use backup::contract_identity as backup_contract_identity;
+pub use backup::{
+    BACKUP_ARCHIVE_VALIDITY_ATTESTATION_WIRE_ID, BACKUP_ARCHIVE_VALIDITY_ATTESTATION_WIRE_VERSION,
+    BACKUP_ARCHIVE_VERIFICATION_WIRE_ID, BACKUP_ARCHIVE_VERIFICATION_WIRE_VERSION,
+    BACKUP_CANONICAL_ENCODING, BACKUP_CAPTURE_RECEIPT_WIRE_ID, BACKUP_CAPTURE_RECEIPT_WIRE_VERSION,
+    BACKUP_CAPTURE_REQUEST_WIRE_ID, BACKUP_CAPTURE_REQUEST_WIRE_VERSION, BACKUP_CONTRACT_NAME,
+    BACKUP_CONTRACT_VERSION, BACKUP_CUTOVER_ADMISSION_WIRE_ID,
+    BACKUP_CUTOVER_ADMISSION_WIRE_VERSION, BACKUP_CUTOVER_RECEIPT_WIRE_ID,
+    BACKUP_CUTOVER_RECEIPT_WIRE_VERSION, BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID,
+    BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_VERSION, BACKUP_PAYLOAD_TYPE,
+    BACKUP_PHASE_ATTESTATION_WIRE_ID, BACKUP_PHASE_ATTESTATION_WIRE_VERSION, BACKUP_PRODUCER_ID,
+    BACKUP_REHEARSAL_COMPLETE_WIRE_ID, BACKUP_REHEARSAL_COMPLETE_WIRE_VERSION,
+    BACKUP_REQUEST_IDENTITY_WIRE_ID, BACKUP_REQUEST_IDENTITY_WIRE_VERSION,
+    BACKUP_RESTORE_RECONCILE_WIRE_ID, BACKUP_RESTORE_RECONCILE_WIRE_VERSION,
+    BACKUP_RESTORE_STATUS_WIRE_ID, BACKUP_RESTORE_STATUS_WIRE_VERSION, BACKUP_RESTORE_STEP_WIRE_ID,
+    BACKUP_RESTORE_STEP_WIRE_VERSION, BACKUP_SNAPSHOT_PAGE_READ_WIRE_ID,
+    BACKUP_SNAPSHOT_PAGE_READ_WIRE_VERSION, BackupAdmissionRef, BackupArchiveValidityAttestation,
+    BackupArchiveVerification, BackupArtifactHandle, BackupAuthenticatedPrincipal,
+    BackupCapability, BackupCaptureReceipt, BackupCaptureRequest, BackupClassWire,
+    BackupCutoverAdmission, BackupCutoverReceipt, BackupDisposition, BackupError,
+    BackupIsolatedRestorePrepare, BackupMutationBinding, BackupOperationKind, BackupPageRef,
+    BackupPhaseAttestation, BackupRehearsalComplete, BackupReplayDisposition, BackupReplayLedger,
+    BackupRequestIdentity, BackupRestoreReconcile, BackupRestoreStatus, BackupRestoreStep,
+    BackupRole, BackupSnapshotPageRead, BackupStage, Denominator, HostAuditRef,
+    MAX_BACKUP_CONTENT_BYTES, MAX_BACKUP_OBSERVED_DISPOSITIONS, MAX_BACKUP_PAGE_MEMBERS,
+    MAX_BACKUP_PAYLOAD_BYTES, MAX_BACKUP_TEXT_BYTES, ack_phase_stage, attesting_roles,
+    operation_for_phase,
+};
 pub use dreamer_job::{
     AdmissionRef, CancellationState, DURABLE_JOB_CANONICAL_ENCODING, DURABLE_JOB_CONTRACT_NAME,
     DURABLE_JOB_CONTRACT_VERSION, DurableJobError, DurableJobRecord, DurableJobRequest,

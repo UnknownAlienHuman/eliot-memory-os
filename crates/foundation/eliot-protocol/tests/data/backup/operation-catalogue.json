@@ -1,0 +1,17 @@
+{
+  "contract": "eliot.foundation.backup",
+  "contract_version": "1.0.0",
+  "wire_version": 1,
+  "count": 9,
+  "operations": [
+    { "wire": "REQUEST_CAPTURE", "meaning": "requester asks capture owner for bounded capture", "attesting_owner": "CAPTURE_OWNER" },
+    { "wire": "READ_SNAPSHOT_PAGE", "meaning": "bounded page read via opaque handle", "attesting_owner": "OWNING_PHASE_OWNER" },
+    { "wire": "VERIFY_ARCHIVE", "meaning": "verifier checks archive validity", "attesting_owner": "VERIFIER" },
+    { "wire": "PREPARE_ISOLATED_RESTORE", "meaning": "provision isolated destination, never source", "attesting_owner": "INSTALLATION_AUTHORITY" },
+    { "wire": "RESTORE_STEP", "meaning": "one operation-bound restore step", "attesting_owner": "EXECUTING_PHASE_OWNER" },
+    { "wire": "RECONCILE_RESTORE", "meaning": "lost-ack reconcile from retained digests only", "attesting_owner": "RETAINING_OWNER" },
+    { "wire": "RESTORE_STATUS", "meaning": "read-only status and cancel query", "attesting_owner": "NONE" },
+    { "wire": "COMPLETE_REHEARSAL", "meaning": "rehearsal completion, never cutover or retirement", "attesting_owner": "VERIFIER" },
+    { "wire": "ADMIT_CUTOVER", "meaning": "explicit separately-admitted installation cutover", "attesting_owner": "INSTALLATION_AUTHORITY" }
+  ]
+}
