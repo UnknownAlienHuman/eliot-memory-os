@@ -2584,6 +2584,8 @@ pub fn restore_controller(
     Ok(snapshot.clone())
 }
 
+pub mod adapter_launch;
+pub mod coverage_surface;
 /// Durable staged work and the no-lost-child state machine (issue #698).
 ///
 /// Caller: an [`durable_work::AdmittedWorkDefinition`] (admitted definition
@@ -2600,7 +2602,6 @@ pub fn restore_controller(
 /// Durable-job attachment and admitted child-dispatch lineage (issue #1126).
 /// See [`durable_dispatch`] for the binding rules.
 pub mod durable_dispatch;
-pub mod adapter_launch;
 /// Production swarm consumption of Governor-owned plan attachment (issue
 /// #2017 item 6). New production callers attach through
 /// [`swarm_plan_attachment_consumer`] over a Governor-vended consumer port;

@@ -369,10 +369,7 @@ pub enum SwarmCompositionError {
 /// Deterministic fake owners prove the order protocol, not disk behavior.
 pub trait LaunchIntentLedger: Send + Sync {
     /// Appends one immutable launch intent and echoes its durable sequence.
-    fn append_intent(
-        &self,
-        intent: &ChildLaunchIntent,
-    ) -> Result<u64, SwarmCompositionError>;
+    fn append_intent(&self, intent: &ChildLaunchIntent) -> Result<u64, SwarmCompositionError>;
     /// Loads every persisted intent in append order.
     fn intents(&self) -> Vec<ChildLaunchIntent>;
 }
@@ -521,9 +518,7 @@ pub fn plan_drain(
     let mut seen = std::collections::BTreeSet::new();
     for (slot, _) in children {
         if !seen.insert(slot.clone()) {
-            return Err(SwarmCompositionError::DuplicateSlot {
-                slot: slot.clone(),
-            });
+            return Err(SwarmCompositionError::DuplicateSlot { slot: slot.clone() });
         }
     }
     let bound = max_cancels.min(MAX_DRAIN_CANCELS_PER_PASS);
@@ -651,22 +646,25 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         require_text(plan_revision, "plan_revision")?;
         require_text(fence_digest, "fence_digest")?;
         require_text(job_handle, "job_handle")?;
-        let consumer =
-            self.attachment
-                .vend_consumer(admission_digest, plan_revision, fence_digest)
-                .map_err(|error| {
-                    classify_inner_decision(
-                        &strip_vend_prefix(&error.to_string()),
-                        &format!("{error:?}"),
-                    )
-                })?;
-        let binding = self.attachment.attach(&consumer, job_handle).map_err(|error| {
-            classify_attach_error(
-                &error.to_string(),
-                source_display_chain(&error).as_deref(),
-                &format!("{error:?}"),
-            )
-        })?;
+        let consumer = self
+            .attachment
+            .vend_consumer(admission_digest, plan_revision, fence_digest)
+            .map_err(|error| {
+                classify_inner_decision(
+                    &strip_vend_prefix(&error.to_string()),
+                    &format!("{error:?}"),
+                )
+            })?;
+        let binding = self
+            .attachment
+            .attach(&consumer, job_handle)
+            .map_err(|error| {
+                classify_attach_error(
+                    &error.to_string(),
+                    source_display_chain(&error).as_deref(),
+                    &format!("{error:?}"),
+                )
+            })?;
         let attached = AttachedPlan {
             admission_digest: binding.admission_digest().to_owned(),
             plan_revision: binding.plan_revision().to_owned(),
@@ -721,7 +719,10 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         route_class: &str,
         generation: u64,
     ) -> Result<ChildLaunchIntent, SwarmCompositionError> {
-        let plan = self.plan.clone().ok_or(SwarmCompositionError::PlanNotAttached)?;
+        let plan = self
+            .plan
+            .clone()
+            .ok_or(SwarmCompositionError::PlanNotAttached)?;
         if !self.reconciled {
             return Err(SwarmCompositionError::ReconcileRequired);
         }
@@ -827,16 +828,16 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
                     &format!("{error:?}"),
                 )
             })?;
-        let binding =
-            self.attachment
-                .attach(&consumer, &sealed.job_handle)
-                .map_err(|error| {
-                    classify_attach_error(
-                        &error.to_string(),
-                        source_display_chain(&error).as_deref(),
-                        &format!("{error:?}"),
-                    )
-                })?;
+        let binding = self
+            .attachment
+            .attach(&consumer, &sealed.job_handle)
+            .map_err(|error| {
+                classify_attach_error(
+                    &error.to_string(),
+                    source_display_chain(&error).as_deref(),
+                    &format!("{error:?}"),
+                )
+            })?;
         let rebuilt = AttachedPlan {
             admission_digest: binding.admission_digest().to_owned(),
             plan_revision: binding.plan_revision().to_owned(),

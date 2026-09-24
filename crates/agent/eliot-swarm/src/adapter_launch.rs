@@ -647,7 +647,13 @@ mod tests {
             };
             assert_eq!(
                 launch_admitted_child(
-                    &store, &executor, &attachment, &item, &request, &registry, None,
+                    &store,
+                    &executor,
+                    &attachment,
+                    &item,
+                    &request,
+                    &registry,
+                    None,
                 ),
                 Err(SwarmError::RouteBlocked)
             );
@@ -668,7 +674,13 @@ mod tests {
         };
         assert_eq!(
             launch_admitted_child(
-                &store, &executor, &attachment, &item, &stale_request, &registry, None,
+                &store,
+                &executor,
+                &attachment,
+                &item,
+                &stale_request,
+                &registry,
+                None,
             ),
             Err(SwarmError::RouteBlocked)
         );

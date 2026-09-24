@@ -624,10 +624,7 @@ fn plan_lease() -> Result<WorkLeaseId, Box<dyn Error>> {
     }))?)
 }
 
-fn plan_binding_for(
-    lane: &str,
-    plan_revision: &str,
-) -> Result<ProviderBinding, Box<dyn Error>> {
+fn plan_binding_for(lane: &str, plan_revision: &str) -> Result<ProviderBinding, Box<dyn Error>> {
     let scope = scope_binding("scope-1")?;
     Ok(ProviderBinding {
         task_id: "task-1".to_owned(),
@@ -836,12 +833,7 @@ fn admitted_dag_plan(
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let branch_roots = roots
         .iter()
-        .map(|lane| {
-            Ok((
-                BranchId::new(*lane)?,
-                WorkItemId::new(*lane)?,
-            ))
-        })
+        .map(|lane| Ok((BranchId::new(*lane)?, WorkItemId::new(*lane)?)))
         .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
     let proposal = SwarmPlanProposal {
         plan_revision: RevisionId::new(plan_revision)?,
@@ -879,8 +871,13 @@ fn attached_through_port(
     plan: &eliot_swarm::AdmittedSwarmPlan,
     port: &SwarmPlanAttachmentLedger,
     job_handle: &str,
-) -> Result<(eliot_swarm::durable_dispatch::DurableJobAttachment, ReceiptEnvelope), Box<dyn Error>>
-{
+) -> Result<
+    (
+        eliot_swarm::durable_dispatch::DurableJobAttachment,
+        ReceiptEnvelope,
+    ),
+    Box<dyn Error>,
+> {
     let request = attach_request_for(plan, job_handle)?;
     let receipt = plan_receipt_for(JOB_OWNER, &request, None)?;
     let attachment =
@@ -1062,16 +1059,16 @@ fn swarm_real_cases_drain_terminal_ready_blocked_on_unknown_descendant() -> Test
         &[
             (running.clone(), ChildDisposition::Running),
             (unknown.clone(), ChildDisposition::UnknownBlocked),
-            (done.clone(), ChildDisposition::Terminal(TerminalKind::Completed)),
+            (
+                done.clone(),
+                ChildDisposition::Terminal(TerminalKind::Completed),
+            ),
         ],
         16,
     )?;
     assert_eq!(drain.cancel, vec![running]);
     assert_eq!(drain.unknown, vec![unknown]);
-    assert_eq!(
-        drain.terminal,
-        vec![(done, TerminalKind::Completed)]
-    );
+    assert_eq!(drain.terminal, vec![(done, TerminalKind::Completed)]);
     assert!(
         !drain.terminal_ready,
         "terminal aggregate must wait for the unknown descendant"
@@ -1171,7 +1168,11 @@ fn swarm_real_cases_coverage_dimensions_preserved_separately() -> TestResult {
     let kinds = eliot_swarm::durable_work::terminal_inventory();
     assert_eq!(kinds.len(), 6);
     assert_eq!(
-        kinds.iter().map(|(kind, _)| *kind).collect::<BTreeSet<_>>().len(),
+        kinds
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<BTreeSet<_>>()
+            .len(),
         6
     );
     Ok(())
@@ -1496,8 +1497,7 @@ fn swarm_real_cases_stale_route_and_result_rejection() -> TestResult {
     // Rehydration against a drifted plan revision is stale before any owner
     // contact: the canonical decision stays the source of truth.
     let (expected, receipt) = attached_through_port(&plan, &owner, "job-stale-1")?;
-    let other =
-        admitted_dag_plan("plan-stale-2", &[("lane-a", &[] as &[&str])], &["lane-a"])?;
+    let other = admitted_dag_plan("plan-stale-2", &[("lane-a", &[] as &[&str])], &["lane-a"])?;
     assert_eq!(
         rehydrate_attachment_through_port(&other, &owner, &expected, receipt, Some(&Trusted)),
         Err(SwarmError::StaleLineage)

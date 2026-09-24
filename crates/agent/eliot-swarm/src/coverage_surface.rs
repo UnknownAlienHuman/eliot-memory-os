@@ -51,17 +51,7 @@ impl ChildSlot {
 /// and partial coverage stay separate here exactly as they do at the owner.
 /// Candidate only.
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    Deserialize,
-    Eq,
-    Hash,
-    JsonSchema,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TerminalKindName {
@@ -92,9 +82,7 @@ impl TerminalKindName {
 ///
 /// Candidate only: a suggestion for the caller, never an admission, launch
 /// authorization, or finish.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NextSafeAction {
     /// Every child is terminally accounted, nothing is unknown, and local
@@ -237,14 +225,8 @@ pub fn project_coverage(
     SwarmCoverage {
         plan_revision,
         accounted: drain.terminal.len(),
-        missing: missing
-            .into_iter()
-            .map(ChildSlot::new)
-            .collect::<Vec<_>>(),
-        unknown: unknown
-            .into_iter()
-            .map(ChildSlot::new)
-            .collect::<Vec<_>>(),
+        missing: missing.into_iter().map(ChildSlot::new).collect::<Vec<_>>(),
+        unknown: unknown.into_iter().map(ChildSlot::new).collect::<Vec<_>>(),
         terminal_by_kind,
         budget_spent: budget.spent,
         budget_reserved: budget.reserved,

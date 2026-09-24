@@ -58,10 +58,7 @@ impl EventLog {
     }
 
     fn events(&self) -> Vec<String> {
-        self.events
-            .lock()
-            .expect("event log lock holds")
-            .clone()
+        self.events.lock().expect("event log lock holds").clone()
     }
 }
 
@@ -83,10 +80,7 @@ impl<'a> FakeLedger<'a> {
 }
 
 impl LaunchIntentLedger for FakeLedger<'_> {
-    fn append_intent(
-        &self,
-        intent: &ChildLaunchIntent,
-    ) -> Result<u64, SwarmCompositionError> {
+    fn append_intent(&self, intent: &ChildLaunchIntent) -> Result<u64, SwarmCompositionError> {
         let mut intents = self
             .intents
             .lock()
@@ -94,16 +88,12 @@ impl LaunchIntentLedger for FakeLedger<'_> {
                 detail: "fake ledger lock is poisoned".to_owned(),
             })?;
         intents.push(intent.clone());
-        self.log
-            .push(format!("persist:{}", intent.operation_id));
+        self.log.push(format!("persist:{}", intent.operation_id));
         Ok(intents.len() as u64)
     }
 
     fn intents(&self) -> Vec<ChildLaunchIntent> {
-        self.intents
-            .lock()
-            .expect("fake ledger lock holds")
-            .clone()
+        self.intents.lock().expect("fake ledger lock holds").clone()
     }
 }
 
@@ -134,13 +124,13 @@ impl<'a> FakeRunner<'a> {
 
     fn lock_states(
         &self,
-    ) -> Result<
-        std::sync::MutexGuard<'_, BTreeMap<String, ChildState>>,
-        SwarmCompositionError,
-    > {
-        self.states.lock().map_err(|_| SwarmCompositionError::OwnerFailure {
-            detail: "fake runner lock is poisoned".to_owned(),
-        })
+    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, ChildState>>, SwarmCompositionError>
+    {
+        self.states
+            .lock()
+            .map_err(|_| SwarmCompositionError::OwnerFailure {
+                detail: "fake runner lock is poisoned".to_owned(),
+            })
     }
 }
 
@@ -185,9 +175,7 @@ fn composition<'a>(
     SwarmComposition::new(attachment, ledger, runner)
 }
 
-fn attach(
-    composition: &mut SwarmComposition<'_, FakeLedger<'_>, FakeRunner<'_>>,
-) -> AttachedPlan {
+fn attach(composition: &mut SwarmComposition<'_, FakeLedger<'_>, FakeRunner<'_>>) -> AttachedPlan {
     composition
         .attach_admitted_plan(ADMISSION, PLAN, FENCE, JOB)
         .expect("plan attaches through the Governor owner")
@@ -241,10 +229,7 @@ fn attach_launches_two_children_with_persist_before_launch_order() {
         .launch_child("slot-a", RegistryRouteStatus::Admitted, "native-worker", 3)
         .expect("first child launches");
     assert_eq!(first.operation_id, format!("{JOB}:{PLAN}:slot-a"));
-    assert_eq!(
-        first.attempt_id,
-        format!("{JOB}:{PLAN}:slot-a-attempt")
-    );
+    assert_eq!(first.attempt_id, format!("{JOB}:{PLAN}:slot-a-attempt"));
     assert_persist_before_launch(&log, &first.operation_id);
 
     let second = composition
@@ -468,10 +453,7 @@ fn plan_drain_decision_is_pure_bounded_and_exact() {
             .expect("slot shape")
             .parse()
             .expect("slot index parses");
-        assert_eq!(
-            Some(*kind),
-            children[index].1.terminal_kind()
-        );
+        assert_eq!(Some(*kind), children[index].1.terminal_kind());
     }
 
     // Empty denominator and duplicate slots fail closed.
