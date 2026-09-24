@@ -275,9 +275,12 @@ fn known_positive_unaccounted_remainder_fails_before_evaluation() {
 
 #[test]
 fn independently_deserialized_set_cannot_claim_a_short_complete_denominator() {
-    let mut set = evaluate(vec![record("mem-1")]);
-    set.denominator = DenominatorState::Known { total: 2 };
-    let error = set
+    let set = evaluate(vec![record("mem-1")]);
+    let mut wire = serde_json::to_value(&set).expect("serialize set");
+    wire["denominator"] = serde_json::json!({ "state": "KNOWN", "total": 2 });
+    let decoded: ApplicableMemorySet =
+        serde_json::from_value(wire).expect("deserialize set independently");
+    let error = decoded
         .validate()
         .expect_err("a short set without revalidation must fail closed");
     assert!(matches!(
@@ -288,11 +291,13 @@ fn independently_deserialized_set_cannot_claim_a_short_complete_denominator() {
 
 #[test]
 fn independently_deserialized_unknown_set_fails_closed() {
-    let mut set = evaluate(vec![record("mem-1")]);
-    set.denominator = DenominatorState::Unknown {
-        reason: "read side could not count".to_owned(),
-    };
-    let error = set
+    let set = evaluate(vec![record("mem-1")]);
+    let mut wire = serde_json::to_value(&set).expect("serialize set");
+    wire["denominator"] =
+        serde_json::json!({ "state": "UNKNOWN", "reason": "read side could not count" });
+    let decoded: ApplicableMemorySet =
+        serde_json::from_value(wire).expect("deserialize set independently");
+    let error = decoded
         .validate()
         .expect_err("an applicability verdict requires a known denominator");
     assert!(matches!(
@@ -302,7 +307,7 @@ fn independently_deserialized_unknown_set_fails_closed() {
 }
 
 #[test]
-fn truncated_batch_preserves_exact_recovery_state() {
+fn truncated_batch_keeps_recovery_identity_batch_owned() {
     let mut candidate = request(vec![record("mem-1")]);
     candidate.batch.coverage.denominator = DenominatorState::Known { total: 3 };
     candidate.batch.coverage.truncated = true;
@@ -312,10 +317,9 @@ fn truncated_batch_preserves_exact_recovery_state() {
     assert!(set.truncated);
     assert!(set.revalidation_required);
     assert_eq!(set.applicable.len(), 1);
-    assert_eq!(set.frontier, vec!["mem-2", "mem-3"]);
-    assert!(set.omissions.is_empty());
+    assert_eq!(candidate.batch.coverage.frontier, vec!["mem-2", "mem-3"]);
     set.validate()
-        .expect("set preserves the incomplete proof ceiling");
+        .expect("set carries the explicit incomplete proof ceiling");
 }
 
 #[test]
@@ -329,27 +333,27 @@ fn truncation_and_revalidation_echo_to_the_set() {
     assert!(set.truncated);
     assert!(set.revalidation_required);
     assert_eq!(set.applicable.len(), 1);
-    assert_eq!(set.frontier, vec!["resume-after-mem-1"]);
+    assert_eq!(
+        candidate.batch.coverage.frontier,
+        vec!["resume-after-mem-1"]
+    );
 }
 
 #[test]
-fn omitted_recovery_identity_is_preserved_in_the_set() {
+fn omission_recovery_identity_remains_batch_owned() {
     let mut candidate = request(vec![record("mem-1")]);
     candidate.batch.coverage.denominator = DenominatorState::Known { total: 2 };
-    candidate
-        .batch
-        .coverage
-        .omissions
-        .push(eliot_memory_projection_contracts::CoverageOmission {
-            handle: aid("mem-2"),
-            reason: "fence-mismatch".to_owned(),
-        });
+    let omission = eliot_memory_projection_contracts::CoverageOmission {
+        handle: aid("mem-2"),
+        reason: "fence-mismatch".to_owned(),
+    };
+    candidate.batch.coverage.omissions.push(omission.clone());
     candidate.batch.coverage.revalidation_required = true;
     let set = evaluate_applicability(&candidate).expect("lossy evaluation");
-    assert_eq!(set.omissions.len(), 1);
-    assert_eq!(set.omissions[0].handle, aid("mem-2"));
+    assert!(set.revalidation_required);
+    assert_eq!(candidate.batch.coverage.omissions, vec![omission]);
     set.validate()
-        .expect("set preserves omission recovery identity");
+        .expect("set carries the explicit incomplete proof ceiling");
 }
 
 #[test]

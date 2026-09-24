@@ -6,7 +6,9 @@
 //! handle with its exact substantive reason. Cue-hit evidence travels as a
 //! per-disposition flag only: a cue hit never promotes a record into
 //! `applicable`, and exclusion always names the rule that excluded the
-//! record, never the cue hit itself.
+//! record, never the cue hit itself. Exact omission/frontier identities remain
+//! on the batch; this frozen verdict carries only the revalidation proof
+//! ceiling for an incomplete result.
 
 use std::collections::BTreeSet;
 
@@ -138,6 +140,12 @@ impl ExcludedMemory {
 }
 
 /// Task-local applicability verdict over one projection batch.
+///
+/// The frozen set schema intentionally carries disposition handles and the
+/// proof-ceiling flags only. Exact omission and frontier identities remain
+/// owned by [`MemoryProjectionBatch`](crate::contracts::batch::MemoryProjectionBatch);
+/// a standalone set cannot recheck a lossy remainder and must not be treated as
+/// a complete coverage artifact when revalidation is required.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApplicableMemorySet {
@@ -155,66 +163,30 @@ pub struct ApplicableMemorySet {
     pub truncated: bool,
     /// Revalidation requirement echoed from the evaluated batch.
     pub revalidation_required: bool,
-    /// Recovery identities deferred by truncation, echoed from the batch.
-    pub frontier: Vec<String>,
-    /// Named omission identities and reasons, echoed from the batch.
-    pub omissions: Vec<crate::contracts::batch::CoverageOmission>,
     /// Cue-hit handles considered during evaluation (advisory only).
     pub cue_hits_considered: usize,
 }
 
 impl ApplicableMemorySet {
-    /// Validate set shape: binding, handle uniqueness across both lists,
-    /// exclusion reasons, and denominator accounting.
+    /// Validate set shape, handle uniqueness, exclusion reasons, and its
+    /// disposition-volume ceiling.
+    ///
+    /// A known denominator with a short result is accepted only when the
+    /// batch's revalidation proof ceiling is carried. The frozen set has no
+    /// omission/frontier fields, so exact recovery validation remains the
+    /// responsibility of the batch owner and its downstream assessment.
     pub fn validate(&self) -> Result<(), MemoryProjectionError> {
         if self.contract_version != crate::CONTRACT_VERSION {
             return Err(MemoryProjectionError::VersionMismatch);
         }
         self.binding.validate()?;
         self.denominator.validate()?;
-        if self.frontier.len() > crate::MAX_BATCH_FRONTIER {
-            return Err(MemoryProjectionError::Bounds {
-                field: "set.frontier",
-            });
-        }
-        for handle in &self.frontier {
-            text(handle, "set.frontier")?;
-        }
-        if self.omissions.len() > crate::MAX_BATCH_OMISSIONS {
-            return Err(MemoryProjectionError::Bounds {
-                field: "set.omissions",
-            });
-        }
-        let mut recovery = BTreeSet::new();
-        for omission in &self.omissions {
-            omission.validate()?;
-            let handle = omission.handle.as_str();
-            if !recovery.insert(handle.to_owned()) {
-                return Err(MemoryProjectionError::Duplicate {
-                    field: "set.omissions",
-                    value: handle.to_owned(),
-                });
-            }
-        }
-        for handle in &self.frontier {
-            if !recovery.insert(handle.clone()) {
-                return Err(MemoryProjectionError::Duplicate {
-                    field: "set.frontier",
-                    value: handle.clone(),
-                });
-            }
-        }
         let mut seen = BTreeSet::new();
         for record in &self.applicable {
             if !seen.insert(record.handle.as_str().to_owned()) {
                 return Err(MemoryProjectionError::Duplicate {
                     field: "set.applicable",
                     value: record.handle.as_str().to_owned(),
-                });
-            }
-            if recovery.contains(record.handle.as_str()) {
-                return Err(MemoryProjectionError::CoverageMismatch {
-                    reason: "dispositions cannot overlap recovery identities",
                 });
             }
         }
@@ -226,36 +198,22 @@ impl ApplicableMemorySet {
                     value: record.handle.as_str().to_owned(),
                 });
             }
-            if recovery.contains(record.handle.as_str()) {
-                return Err(MemoryProjectionError::CoverageMismatch {
-                    reason: "dispositions cannot overlap recovery identities",
-                });
-            }
         }
 
-        // The set can be deserialized independently of its batch, so its
-        // recovery identities are part of the exact denominator partition.
-        let disposition_count = self
+        // The set can be deserialized independently of its batch. It may
+        // therefore enforce the disposition ceiling and the explicit
+        // revalidation ceiling, but it cannot reconstruct the omitted or
+        // deferred identities that remain on the batch.
+        let accounted = self
             .applicable
             .len()
             .checked_add(self.excluded.len())
             .ok_or(MemoryProjectionError::CoverageMismatch {
                 reason: "set disposition volume overflows",
             })?;
-        let accounted = disposition_count
-            .checked_add(self.omissions.len())
-            .and_then(|volume| volume.checked_add(self.frontier.len()))
-            .ok_or(MemoryProjectionError::CoverageMismatch {
-                reason: "set recovery-accounting volume overflows",
-            })?;
         if self.truncated && !self.revalidation_required {
             return Err(MemoryProjectionError::CoverageMismatch {
                 reason: "truncated set requires revalidation",
-            });
-        }
-        if !self.omissions.is_empty() && !self.revalidation_required {
-            return Err(MemoryProjectionError::CoverageMismatch {
-                reason: "set omissions require revalidation",
             });
         }
         let DenominatorState::Known { total } = &self.denominator else {
@@ -263,9 +221,14 @@ impl ApplicableMemorySet {
                 reason: "an applicability set requires a known denominator",
             });
         };
-        if *total != accounted {
+        if accounted > *total {
             return Err(MemoryProjectionError::CoverageMismatch {
-                reason: "set must exactly partition dispositions, omissions, and frontier identities",
+                reason: "set dispositions exceed the known denominator",
+            });
+        }
+        if !self.revalidation_required && accounted != *total {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "non-revalidation set must account for the exact known denominator",
             });
         }
         Ok(())

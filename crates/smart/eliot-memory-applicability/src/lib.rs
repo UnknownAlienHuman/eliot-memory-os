@@ -13,6 +13,9 @@
 //!   read, because the contract carries none;
 //! - exact negative-memory triggers match on equality against the request
 //!   task key; semantic similarity is never a block (A14.3);
+//! - the frozen [`ApplicableMemorySet`] shape carries only disposition
+//!   handles and proof-ceiling flags; exact omission/frontier identities stay
+//!   on the input [`MemoryProjectionBatch`] for downstream recovery checks;
 //! - evaluation order is deterministic input order; the output preserves it.
 //!
 //! Record checks run in a fixed documented order and the first failing rule
@@ -238,6 +241,9 @@ pub fn evaluate_applicability(
             }),
         }
     }
+    // The frozen set shape does not carry batch omission/frontier identities.
+    // Keep those identities on the caller-owned batch and emit only the
+    // verdict plus the explicit proof ceiling here.
     let set = ApplicableMemorySet {
         contract_version: eliot_memory_projection_contracts::CONTRACT_VERSION,
         binding: request.batch.binding.clone(),
@@ -246,8 +252,6 @@ pub fn evaluate_applicability(
         denominator: request.batch.coverage.denominator.clone(),
         truncated: request.batch.coverage.truncated,
         revalidation_required: request.batch.coverage.revalidation_required,
-        frontier: request.batch.coverage.frontier.clone(),
-        omissions: request.batch.coverage.omissions.clone(),
         cue_hits_considered: request.cue_hits.len(),
     };
     set.validate()?;

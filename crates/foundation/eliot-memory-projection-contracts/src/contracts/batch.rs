@@ -1,11 +1,11 @@
 //! Bounded projection batches with shared-fence gating and coverage.
 //!
 //! A [`MemoryProjectionBatch`] carries one [`MemoryScopeBinding`]: every
-//! record must name exactly the batch task, scope, and session, and every
-//! record fence must be compatible with the batch fence. The batch also
-//! carries the denominator context every consumer needs: how many canonical
-//! records the read side observed, what was truncated or omitted, and whether
-//! revalidation is required before use.
+//! record must name exactly the batch task, scope, and session, its nested
+//! binding fence must equal the batch binding fence, and its record fence must
+//! be compatible with that batch fence. The batch also carries the exact
+//! projected/omitted/frontier denominator partition, what was truncated or
+//! omitted, and whether revalidation is required before use.
 
 use std::collections::BTreeSet;
 

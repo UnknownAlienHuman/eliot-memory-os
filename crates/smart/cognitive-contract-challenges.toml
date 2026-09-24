@@ -179,3 +179,18 @@ resolution_evidence = ["crates/smart/cognitive-rev12-contract-schema-freeze.toml
 proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
+
+[[issue_196_reconciliation]]
+issue = 196
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6"
+disposition = "OPEN_REMAINS"
+accepted_challenges = []
+open_challenges = [
+  "CC-MEMORY-PROJECTION-SCHEMA",
+  "CC-FAILURE-OBSERVATION-SCHEMA",
+  "CC-PROVIDER-CONTRIBUTION-SCHEMA",
+]
+unregistered_blockers = ["CC-WAVE0-PROOF-IDENTITY"]
+freeze_challenge_closure = "NOT_ACCEPTED_FOR_ISSUE_196"
+proof_ceiling = "STATIC_SOURCE_REPAIR_ONLY"
+note = "The r6 freeze is byte-preserved. Its challenge_closure rows are not accepted as current owner acceptance or provider/consumer conformance for issue #196; the active registry remains open."

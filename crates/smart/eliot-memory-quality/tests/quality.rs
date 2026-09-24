@@ -194,8 +194,6 @@ fn set_for(
         denominator: batch.coverage.denominator.clone(),
         truncated: batch.coverage.truncated,
         revalidation_required: batch.coverage.revalidation_required,
-        frontier: batch.coverage.frontier.clone(),
-        omissions: batch.coverage.omissions.clone(),
         cue_hits_considered: cue_hits.len(),
     }
 }
@@ -483,6 +481,7 @@ fn truncated_coverage_is_inconclusive_with_frontier() {
     assessment.validate().expect("assessment validates");
     assert_eq!(assessment.status, CoverageStatus::Inconclusive);
     assert_eq!(assessment.frontier, vec!["resume-1".to_owned()]);
+    assert_eq!(assessment.counter_metrics.unaccounted_volume, 1);
     let mut complete = assessment.clone();
     complete.status = CoverageStatus::Complete;
     assert!(complete.validate().is_err());

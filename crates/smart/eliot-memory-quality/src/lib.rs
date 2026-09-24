@@ -184,6 +184,9 @@ impl QualityRequest {
     pub fn validate(&self) -> Result<(), QualityError> {
         check_consumed_freeze()?;
         self.batch.validate()?;
+        let DenominatorState::Known { .. } = &self.batch.coverage.denominator else {
+            return Err(QualityError::MissingDenominator);
+        };
         self.applicable.validate()?;
         if self.applicable.binding != self.batch.binding {
             return Err(QualityError::BindingMismatch {
@@ -194,8 +197,6 @@ impl QualityRequest {
         if self.applicable.denominator != self.batch.coverage.denominator
             || self.applicable.truncated != self.batch.coverage.truncated
             || self.applicable.revalidation_required != self.batch.coverage.revalidation_required
-            || self.applicable.frontier != self.batch.coverage.frontier
-            || self.applicable.omissions != self.batch.coverage.omissions
         {
             return Err(QualityError::BindingMismatch {
                 left: "applicable.denominator",
@@ -516,7 +517,9 @@ pub struct CounterMetrics {
     pub records_assessed: usize,
     /// Named batch omissions carried alongside the records.
     pub omissions_carried: usize,
-    /// Declared volume with no carried record or omission: unaccounted.
+    /// Declared volume not represented by an assessed record or named batch
+    /// omission. Deferred frontier identities are carried separately on the
+    /// assessment and remain part of this residual metric until rechecked.
     pub unaccounted_volume: usize,
     /// Admitted projection omissions carried alongside the batch.
     pub projection_omissions: usize,
@@ -656,12 +659,6 @@ impl MemoryEcologyAssessment {
         for omission in &self.projection_omissions {
             omission.validate(&self.projections_binding)?;
         }
-        for omission in &self.batch_omissions {
-            omission.validate()?;
-        }
-        for handle in &self.frontier {
-            text(handle, "assessment.frontier")?;
-        }
         let mut seen = BTreeSet::new();
         for item in &self.items {
             item.validate()?;
@@ -673,6 +670,7 @@ impl MemoryEcologyAssessment {
             }
         }
         self.validate_section_handles(&seen)?;
+        self.validate_recovery_partition(&seen)?;
         for observation in &self.receipts {
             observation.validate()?;
         }
@@ -701,6 +699,74 @@ impl MemoryEcologyAssessment {
                     reason: "maintenance notes must name assessed records",
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Validate that carried recovery identities are unique, disjoint from
+    /// assessed records, and exactly partition the known denominator.
+    fn validate_recovery_partition(&self, assessed: &BTreeSet<String>) -> Result<(), QualityError> {
+        let mut recovery = BTreeSet::new();
+        for handle in &self.frontier {
+            text(handle, "assessment.frontier")?;
+            if !recovery.insert(handle.clone()) {
+                return Err(QualityError::HandleMismatch {
+                    field: "assessment.frontier",
+                    reason: "frontier handles must be unique",
+                });
+            }
+        }
+        for omission in &self.batch_omissions {
+            omission.validate()?;
+            if !recovery.insert(omission.handle.as_str().to_owned()) {
+                return Err(QualityError::HandleMismatch {
+                    field: "assessment.batch_omissions",
+                    reason: "batch omission handles must be unique and disjoint from the frontier",
+                });
+            }
+        }
+        if assessed.iter().any(|handle| recovery.contains(handle)) {
+            return Err(QualityError::HandleMismatch {
+                field: "assessment.coverage",
+                reason: "recovery identities cannot overlap assessed records",
+            });
+        }
+
+        let accounted = self
+            .items
+            .len()
+            .checked_add(self.batch_omissions.len())
+            .and_then(|volume| volume.checked_add(self.frontier.len()))
+            .ok_or(QualityError::InvalidField {
+                field: "assessment.coverage",
+                reason: "recovery-accounting volume overflows",
+            })?;
+        let DenominatorState::Known { total } = &self.denominator else {
+            return Err(QualityError::MissingDenominator);
+        };
+        if *total != accounted {
+            return Err(QualityError::InvalidField {
+                field: "assessment.coverage",
+                reason: "known denominator must exactly partition items, omissions, and frontier",
+            });
+        }
+        if self.truncated == self.frontier.is_empty() {
+            return Err(QualityError::InvalidField {
+                field: "assessment.truncated",
+                reason: "truncation flag must exactly match frontier presence",
+            });
+        }
+        if (self.truncated || !self.batch_omissions.is_empty()) && !self.revalidation_required {
+            return Err(QualityError::InvalidField {
+                field: "assessment.revalidation_required",
+                reason: "lossy recovery requires revalidation",
+            });
+        }
+        if self.counter_metrics.unaccounted_volume != self.frontier.len() {
+            return Err(QualityError::InvalidField {
+                field: "counter_metrics.unaccounted_volume",
+                reason: "unaccounted volume must equal the carried frontier remainder",
+            });
         }
         Ok(())
     }
@@ -995,10 +1061,16 @@ pub fn assess_quality(request: &QualityRequest) -> Result<MemoryEcologyAssessmen
         verdicts.insert(entry.handle.as_str(), (Some(&entry.reason), entry.cue_hit));
     }
     let (items, gravity, maintenance, rules) = derive_sections(request, &verdicts)?;
-    let unaccounted_volume = 0usize;
+    // The exact batch owner has already checked projected + omitted +
+    // frontier = total. The quality counter schema has no frontier slot, so
+    // its residual intentionally includes the deferred frontier volume; the
+    // exact identities remain on the batch/assessment for recheck.
+    let unaccounted_volume =
+        total.saturating_sub(request.batch.records.len() + request.batch.coverage.omissions.len());
     let lossy = request.batch.coverage.truncated
         || !request.batch.coverage.omissions.is_empty()
-        || !request.projections.omissions.is_empty();
+        || !request.projections.omissions.is_empty()
+        || unaccounted_volume != 0;
     let receipts = request
         .receipts
         .iter()
