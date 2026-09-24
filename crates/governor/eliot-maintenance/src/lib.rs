@@ -24,12 +24,22 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod improvement_admission;
+pub mod improvement_pipeline;
 
 pub use improvement_admission::{
     IMPROVEMENT_CLOSURE_MODULE, IMPROVEMENT_PRODUCT_PULSE, IMPROVEMENT_PROMOTION_MODULE,
     IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT, ImprovementAdmissionDecision,
     ImprovementAdmissionError, ImprovementAdmissionPolicy, ImprovementCandidateView,
     ImprovementEvidenceView, ImprovementPulseOutcome, admit_improvement_candidate,
+};
+pub use improvement_pipeline::{
+    ActivationEvidence, ExperimentPlan, IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_PIPELINE_OWNER,
+    IMPROVEMENT_RISK_MARKER, ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal,
+    ImprovementTerminalDisposition, KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT,
+    OP_CANARY_ACTIVATE, OP_EVALUATE, OP_EXECUTE_EXPERIMENT, OP_MEASURE, OP_PROMOTE, OP_PROPOSE,
+    OP_ROLLBACK, PipelineError, RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
+    detect_no_progress, proposal_digest, reconcile_unknown_activation,
+    run_improvement_candidate_pipeline,
 };
 
 /// Stable wire name for the maintenance governor contract.
