@@ -31,6 +31,7 @@ component_contract_ref = ""
 eliot-contracts = { workspace = true }
 eliot-evidence = { workspace = true }
 eliot-observation-contracts = { workspace = true }
+eliot-store-api = { workspace = true }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

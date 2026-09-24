@@ -56,9 +56,10 @@ use eliot_observation::{
     GovernorObservationError,
     bank_admission::{
         BankStoreSnapshot, ConsumerPagedReadDriver, ExperienceRevisionLedger,
-        FeedbackStoreSnapshot, PagedExperienceConsumerBundle, bank_records_from_range_payload,
-        feedback_records_from_range_payload, produce_bank_commit, produce_feedback_commit,
-        supply_bank_projection_from_store, supply_feedback_projection_from_store,
+        FeedbackStoreSnapshot, PageBoundary, PagedExperienceConsumerBundle, bank_records_from_page,
+        feedback_records_from_page, parse_experience_range_page, produce_bank_commit,
+        produce_feedback_commit, supply_bank_projection_from_store,
+        supply_feedback_projection_from_store, validate_experience_range_page_fence,
     },
 };
 use eliot_observation_contracts::{
@@ -68,9 +69,9 @@ use eliot_observation_contracts::{
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{RequestBinding, WorkScopeId};
 use eliot_store_api::{
-    CanonicalReadClient, EXPERIENCE_PAGE_NEXT_CURSOR, NamedReadOperation, NamedReadRequest,
-    OrderingHeadExpectation, ReadConsistency, RevisionHeadExpectation, RevisionKey, ScopeId,
-    StoreError, WriteReceipt, epistemic_revision::EpistemicPositionReadback,
+    CanonicalReadClient, NamedReadOperation, NamedReadRequest, OrderingHeadExpectation,
+    ReadConsistency, RevisionHeadExpectation, RevisionKey, ScopeId, StoreError, WriteReceipt,
+    epistemic_revision::EpistemicPositionReadback,
 };
 use eliot_understanding_assessment::{
     AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
@@ -231,8 +232,8 @@ pub fn assemble_experience_consumer_page(
     holds: &BTreeMap<String, RetentionHold>,
     bank_selector: Option<&str>,
     feedback_selector: Option<&str>,
-    bank_next_cursor: Option<String>,
-    feedback_next_cursor: Option<String>,
+    bank_next_cursor: PageBoundary,
+    feedback_next_cursor: PageBoundary,
 ) -> Result<PagedExperienceConsumerBundle, ExperienceDriverError> {
     Ok(driver.assemble_next_page_with_selectors(
         ledger,
@@ -400,11 +401,12 @@ pub async fn produce_journal_projection(
     .map_err(ExperienceDriverError::Provider)
 }
 
-/// Bank-family event inputs: durable range payload plus the read
+/// Bank-family event inputs: durable owner range envelope plus the read
 /// context the edge owns.
 pub struct ExperienceBankEventInputs {
-    /// Verbatim durable range payload (`records` array of wrapper rows or
-    /// owner-held bare documents) from the bank range read.
+    /// Verbatim owner range envelope (`records` contains wrapper rows or
+    /// owner-held bare documents, and `next_cursor` is explicit `null` or
+    /// continuation text) from the bank range read.
     pub payload: serde_json::Value,
     /// Stable identity minted by the caller for the bank envelope.
     pub projection_id: ArtifactId,
@@ -419,9 +421,9 @@ pub struct ExperienceBankEventInputs {
     pub source_id: String,
 }
 
-/// Feedback-family event inputs. Same durable-read rule as bank.
+/// Feedback-family event inputs. Same owner-envelope rule as bank.
 pub struct ExperienceFeedbackEventInputs {
-    /// Verbatim durable range payload from the feedback range read.
+    /// Verbatim owner range envelope from the feedback range read.
     pub payload: serde_json::Value,
     /// Stable identity minted by the caller for the feedback envelope.
     pub projection_id: ArtifactId,
@@ -461,10 +463,10 @@ pub struct PagedExperiencePageInput<'a> {
     pub bank_selector: Option<&'a str>,
     /// Exact selector used for the feedback store read.
     pub feedback_selector: Option<&'a str>,
-    /// Owner-issued next cursor returned by the bank read.
-    pub bank_next_cursor: Option<String>,
-    /// Owner-issued next cursor returned by the feedback read.
-    pub feedback_next_cursor: Option<String>,
+    /// Typed owner boundary returned by the bank read.
+    pub bank_next_cursor: PageBoundary,
+    /// Typed owner boundary returned by the feedback read.
+    pub feedback_next_cursor: PageBoundary,
 }
 
 /// Governed trigger event for one terminal experience-quality run.
@@ -619,55 +621,18 @@ pub struct ExperienceQualityEventOutput {
     /// Advisory extinction candidate, when an exact admitted revision intake
     /// was supplied to the terminal event.
     pub extinction_candidate: Option<NegativeMemoryExtinctionCandidate>,
-    /// Owner-minted bank continuation cursor echoed verbatim from the
-    /// consumed range payload (`next_cursor`), or `None` when the page
-    /// ends the enumeration.
-    ///
-    /// Multi-page enumeration contract: the trigger edge re-issues the
-    /// owner range read with this cursor echoed back as the `cursor`
-    /// selector and runs this entry again per page until the echoed
-    /// cursor is `None`. Cursors bind fence plus revision heads exactly
-    /// like the audit range, so a cursor read under drifted fence/heads
-    /// fails closed at the store and the caller restarts from the head
-    /// page; this entry never synthesizes or advances a cursor itself.
-    pub bank_next_cursor: Option<String>,
-    /// Owner-minted feedback continuation cursor, same contract as
-    /// `bank_next_cursor` above.
-    pub feedback_next_cursor: Option<String>,
+    /// Typed owner boundary parsed from the consumed bank range page.
+    /// `MissingCursor` is never produced by a validated owner page and can
+    /// never be interpreted as completion; `ExplicitEnd` is the sole end
+    /// proof.
+    pub bank_next_cursor: PageBoundary,
+    /// Typed owner boundary parsed from the consumed feedback range page,
+    /// with the same `MissingCursor`/`ExplicitEnd`/`Continuation` rule.
+    pub feedback_next_cursor: PageBoundary,
     /// Scoped understanding assessment, when the understanding family ran.
     pub understanding: Option<ScopedUnderstandingAssessment>,
     /// Common-ground assessment, when the common-ground family ran.
     pub common_ground: Option<CommonGroundAssessment>,
-}
-
-/// Echo the owner-minted range continuation cursor from a consumed
-/// bank/feedback range payload.
-///
-/// The owner page envelope must explicitly carry either `null` (the current
-/// page is the validated end) or a nonblank string cursor. A missing member,
-/// a non-string member, or a blank cursor is malformed bridge evidence and
-/// fails closed; it is never silently converted into end-of-stream.
-fn range_next_cursor(payload: &serde_json::Value) -> Result<Option<String>, ExperienceDriverError> {
-    match payload.get(EXPERIENCE_PAGE_NEXT_CURSOR) {
-        Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(cursor))
-            if !cursor.trim().is_empty() && !cursor.chars().any(char::is_control) =>
-        {
-            Ok(Some(cursor.clone()))
-        }
-        Some(serde_json::Value::String(_)) => Err(ExperienceDriverError::Cursor {
-            field: EXPERIENCE_PAGE_NEXT_CURSOR,
-            reason: "owner continuation cursor must be nonblank text or explicit null",
-        }),
-        Some(_) => Err(ExperienceDriverError::Cursor {
-            field: EXPERIENCE_PAGE_NEXT_CURSOR,
-            reason: "owner continuation cursor must be text or explicit null",
-        }),
-        None => Err(ExperienceDriverError::Cursor {
-            field: EXPERIENCE_PAGE_NEXT_CURSOR,
-            reason: "owner page envelope omitted the required continuation cursor member",
-        }),
-    }
 }
 
 /// Terminal event entry: trigger event to reviewed candidate.
@@ -723,7 +688,9 @@ pub async fn run_experience_quality_event(
         None => (None, None),
     };
     let mut ledger = ExperienceRevisionLedger::new();
-    let bank_records = bank_records_from_range_payload(&event.bank.payload)?;
+    let bank_page = parse_experience_range_page(&event.bank.payload)?;
+    validate_experience_range_page_fence(&bank_page, &ctx.state_fence)?;
+    let bank_records = bank_records_from_page(&bank_page)?;
     let bank_live = supply_bank_projection_from_store(
         &mut ledger,
         BankStoreSnapshot {
@@ -749,7 +716,9 @@ pub async fn run_experience_quality_event(
             holds: event.holds,
         },
     })?;
-    let feedback_records = feedback_records_from_range_payload(&event.feedback.payload)?;
+    let feedback_page = parse_experience_range_page(&event.feedback.payload)?;
+    validate_experience_range_page_fence(&feedback_page, &ctx.state_fence)?;
+    let feedback_records = feedback_records_from_page(&feedback_page)?;
     let feedback_live = supply_feedback_projection_from_store(
         &mut ledger,
         FeedbackStoreSnapshot {
@@ -866,8 +835,8 @@ pub async fn run_experience_quality_event(
         memory_assessment,
         memory_projection,
         extinction_candidate,
-        bank_next_cursor: range_next_cursor(&event.bank.payload)?,
-        feedback_next_cursor: range_next_cursor(&event.feedback.payload)?,
+        bank_next_cursor: bank_page.next_cursor,
+        feedback_next_cursor: feedback_page.next_cursor,
         understanding,
         common_ground,
     })

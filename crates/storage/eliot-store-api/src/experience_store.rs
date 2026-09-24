@@ -28,14 +28,18 @@
 //! same-fence, same-scope record sets with explicit truncation.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{Deserializer, Visitor};
+use serde::ser::Error as _;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
     ReadConsistency, ScopeId, StateFence, StoreError, canonical_json_bytes, sha256_hex,
+    validate_text,
 };
 
 /// Versioned wire/schema identity for canonical experience state.
@@ -516,6 +520,107 @@ fn validate_experience_handle(handle: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Parsed owner-page boundary for one bounded experience range response.
+///
+/// The owner wire has three distinct states. A missing `next_cursor` member is
+/// [`PageBoundary::MissingCursor`] and is never a successful end marker; an
+/// explicit JSON `null` is [`PageBoundary::ExplicitEnd`]; and a nonblank string
+/// is [`PageBoundary::Continuation`]. The custom serde implementation keeps
+/// those states distinct while retaining the wire shape (`null` or text).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PageBoundary {
+    /// The owner omitted the required continuation member.
+    #[default]
+    MissingCursor,
+    /// The owner explicitly proved that this page ends the enumeration.
+    ExplicitEnd,
+    /// The owner issued a cursor for the next page.
+    Continuation(String),
+}
+
+/// Explicit owner-page spelling for callers that prefer the longer name.
+pub type ExperiencePageBoundary = PageBoundary;
+
+impl PageBoundary {
+    /// Validates this boundary using the canonical owner field path.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.validate_field(EXPERIENCE_PAGE_NEXT_CURSOR)
+    }
+
+    /// Validates this boundary while retaining a family-specific error path.
+    pub fn validate_field(&self, field: &'static str) -> Result<(), StoreError> {
+        match self {
+            Self::MissingCursor => Err(StoreError::InvalidField {
+                field,
+                reason: "owner page envelope omitted the required continuation cursor member",
+            }),
+            Self::ExplicitEnd => Ok(()),
+            Self::Continuation(cursor) => validate_text(cursor, field),
+        }
+    }
+}
+
+impl Serialize for PageBoundary {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::MissingCursor => Err(S::Error::custom(
+                "missing owner page continuation cursor cannot be serialized",
+            )),
+            Self::ExplicitEnd => serializer.serialize_none(),
+            Self::Continuation(cursor) => serializer.serialize_str(cursor),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PageBoundary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PageBoundaryVisitor;
+
+        impl<'de> Visitor<'de> for PageBoundaryVisitor {
+            type Value = PageBoundary;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("null or a nonblank continuation cursor string")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(PageBoundary::ExplicitEnd)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(PageBoundary::ExplicitEnd)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let cursor = String::deserialize(deserializer)?;
+                if cursor.trim().is_empty() || cursor.chars().any(char::is_control) {
+                    return Err(serde::de::Error::custom(
+                        "owner continuation cursor must be nonblank text without control characters",
+                    ));
+                }
+                Ok(PageBoundary::Continuation(cursor))
+            }
+        }
+
+        deserializer.deserialize_option(PageBoundaryVisitor)
+    }
+}
+
 /// Versioned JSON envelope helpers shared by backend read payloads.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -526,24 +631,60 @@ pub struct ExperienceRangePage {
     pub matched_total: usize,
     /// Whether further rows exist past the bound.
     pub truncated: bool,
-    /// Owner-minted continuation cursor for the next page, or `None`
-    /// when this page ends the enumeration. Callers echo it back as the
-    /// `cursor` selector; cursors bind fence plus revision heads exactly
-    /// like the audit range.
+    /// Typed owner proof of continuation or explicit end-of-stream.
     #[serde(default)]
-    pub next_cursor: Option<String>,
+    pub next_cursor: PageBoundary,
+    /// Exact owner fence carried by the page envelope.
+    pub state_fence: StateFence,
 }
 
 impl ExperienceRangePage {
+    /// Parses and validates one owner page envelope.
+    pub fn from_value(value: &Value) -> Result<Self, StoreError> {
+        let page: Self =
+            serde_json::from_value(value.clone()).map_err(|_| StoreError::InvalidField {
+                field: "experience.page",
+                reason: "owner page envelope is not the closed range-page shape",
+            })?;
+        page.validate()?;
+        Ok(page)
+    }
+
+    /// Validates the page and its typed owner boundary.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if self.records.len() != self.matched_total {
+            return Err(StoreError::InvalidField {
+                field: EXPERIENCE_PAGE_MATCHED_TOTAL,
+                reason: "must equal the number of returned records",
+            });
+        }
+        if self.records.len() > usize::from(MAX_EXPERIENCE_PAGE_RECORDS) {
+            return Err(StoreError::InvalidField {
+                field: EXPERIENCE_PAGE_RECORDS,
+                reason: "page exceeds the bounded experience range size",
+            });
+        }
+        self.next_cursor.validate()?;
+        match (&self.next_cursor, self.truncated) {
+            (PageBoundary::ExplicitEnd, true) => Err(StoreError::InvalidField {
+                field: EXPERIENCE_PAGE_TRUNCATED,
+                reason: "explicit end cannot also be marked truncated",
+            }),
+            (PageBoundary::Continuation(_), false) => Err(StoreError::InvalidField {
+                field: EXPERIENCE_PAGE_TRUNCATED,
+                reason: "continuation cursor requires a truncated page",
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Builds the closed page object bound into read payloads.
-    pub fn payload(&self, state_fence: &StateFence) -> serde_json::Value {
-        serde_json::json!({
-            EXPERIENCE_PAGE_RECORDS: self.records,
-            EXPERIENCE_PAGE_MATCHED_TOTAL: self.matched_total,
-            EXPERIENCE_PAGE_TRUNCATED: self.truncated,
-            EXPERIENCE_PAGE_NEXT_CURSOR: self.next_cursor,
-            EXPERIENCE_PAGE_STATE_FENCE: state_fence,
-        })
+    pub fn payload(&self) -> Result<Value, StoreError> {
+        self.validate()?;
+        serde_json::to_value(self).map_err(|error| StoreError::Serialization(error.to_string()))
     }
 }
 

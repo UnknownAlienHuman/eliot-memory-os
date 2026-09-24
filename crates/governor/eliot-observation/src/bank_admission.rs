@@ -96,6 +96,9 @@
 
 use std::collections::BTreeMap;
 
+use eliot_store_api::StoreError;
+pub use eliot_store_api::{ExperiencePageBoundary, ExperienceRangePage, PageBoundary};
+
 use eliot_contracts::{ArtifactId, StateFence};
 use eliot_observation_contracts::{
     AgentFeedbackRecord, BankProjection, ExperienceBankRecord, ExperienceCommitParameters,
@@ -736,11 +739,10 @@ fn retention_omission(
 /// envelope at partial posture: completeness still requires the owner
 /// `Complete` disposition with empty omissions.
 ///
-/// Single-page entry: the owner continuation cursor is not threaded
-/// here (this predates the five-part fence+heads `next_cursor` the
-/// owner store mints). Multi-page callers use
-/// [`supply_bank_projection_from_store_paged`], which echoes the opaque
-/// owner cursor alongside the identical projection join.
+/// Single-page entry: it deliberately exposes only the projection and does
+/// not manufacture a page boundary. Multi-page callers use
+/// [`supply_bank_projection_from_store_paged`], which carries the typed owner
+/// boundary alongside the identical projection join.
 pub fn supply_bank_projection_from_store(
     ledger: &mut ExperienceRevisionLedger,
     snapshot: BankStoreSnapshot<'_>,
@@ -788,8 +790,9 @@ pub fn supply_bank_projection_from_store(
 
 /// Supply a validated feedback projection from a durable store snapshot.
 /// Same durable-read join as [`supply_bank_projection_from_store`].
-/// Single-page entry (cursor dropped); multi-page callers use
-/// [`supply_feedback_projection_from_store_paged`].
+/// Single-page entry (boundary not threaded); multi-page callers use
+/// [`supply_feedback_projection_from_store_paged`] with the typed owner
+/// boundary.
 pub fn supply_feedback_projection_from_store(
     ledger: &mut ExperienceRevisionLedger,
     snapshot: FeedbackStoreSnapshot<'_>,
@@ -835,56 +838,63 @@ pub fn supply_feedback_projection_from_store(
     Ok(projection)
 }
 
-/// Fail-closed gate for an owner-minted continuation cursor.
+/// Fail-closed gate for a parsed owner-page boundary.
 ///
-/// The cursor is opaque here: the store owner mints the five-part
-/// fence+heads shape (`audit:{fence_digest}:{heads_digest}:{ordinal}:{bound}`)
-/// and the store owner alone parses it (`audit_cursor_issue` /
-/// `audit_cursor_parse` in the store-api owner). This lane never parses,
-/// rebuilds, or re-mints a cursor; it only echoes what the owner issued.
-/// A present-but-blank or control-bearing cursor is malformed owner
-/// evidence and fails closed rather than silently starting, skipping,
-/// or duplicating a page.
-fn check_owner_cursor(
-    cursor: Option<String>,
+/// The owner wire distinguishes an omitted member, an explicit `null`, and a
+/// continuation cursor. This lane accepts only the latter two; an omitted
+/// member is never converted into an end marker.
+fn check_owner_page_boundary(
+    boundary: PageBoundary,
     field: &'static str,
-) -> Result<Option<String>, GovernorObservationError> {
-    match cursor {
-        None => Ok(None),
-        Some(cursor) if cursor.trim().is_empty() || cursor.chars().any(char::is_control) => {
-            Err(GovernorObservationError::InvalidField {
-                field,
-                reason: "owner continuation cursor is malformed; fail closed, never skip or duplicate a page",
-            })
+) -> Result<PageBoundary, GovernorObservationError> {
+    boundary
+        .validate_field(field)
+        .map_err(map_owner_page_error)?;
+    Ok(boundary)
+}
+
+fn map_owner_page_error(error: StoreError) -> GovernorObservationError {
+    match error {
+        StoreError::InvalidField { field, reason } => {
+            GovernorObservationError::InvalidField { field, reason }
         }
-        Some(cursor) => Ok(Some(cursor)),
+        StoreError::Foundation(error) => GovernorObservationError::Foundation(error),
+        _ => GovernorObservationError::InvalidField {
+            field: "experience.page",
+            reason: "owner page envelope failed typed boundary validation",
+        },
     }
 }
 
-/// One bank page: the validated projection plus the opaque owner
-/// continuation cursor for the next page (`None` ends enumeration).
+/// Parse one owner range envelope before any record or cursor is consumed.
 ///
-/// `BankProjection` itself stays frozen in its owner crate (digest-bound,
-/// `deny_unknown_fields`): the cursor travels alongside the projection,
-/// never inside it.
+/// The returned page retains the typed boundary, including the distinct
+/// [`PageBoundary::MissingCursor`] state. Callers must validate/consume that
+/// proof; deserialization alone never grants completion.
+pub fn parse_experience_range_page(
+    payload: &Value,
+) -> Result<ExperienceRangePage, GovernorObservationError> {
+    ExperienceRangePage::from_value(payload).map_err(map_owner_page_error)
+}
+
+/// One bank page: the validated projection plus the typed owner proof of
+/// continuation or explicit end-of-stream.
 pub struct PagedBankProjection {
     /// Validated bank envelope for this page, same join as
     /// [`supply_bank_projection_from_store`].
     pub projection: BankProjection,
-    /// Opaque owner-minted cursor for the next page, or `None` when this
-    /// page ends the enumeration. Echoed verbatim from the owner store;
-    /// never constructed or parsed in this lane.
-    pub next_cursor: Option<String>,
+    /// Owner-issued page boundary proof; `MissingCursor` is rejected before
+    /// this value can reach a consumer.
+    pub next_cursor: PageBoundary,
 }
 
-/// One feedback page: same alongside-cursor rule as
-/// [`PagedBankProjection`].
+/// One feedback page: same typed-boundary rule as [`PagedBankProjection`].
 pub struct PagedFeedbackProjection {
     /// Validated feedback envelope for this page.
     pub projection: FeedbackProjection,
-    /// Opaque owner-minted cursor for the next page, or `None` when this
-    /// page ends the enumeration.
-    pub next_cursor: Option<String>,
+    /// Owner-issued page boundary proof; `MissingCursor` is rejected before
+    /// this value can reach a consumer.
+    pub next_cursor: PageBoundary,
 }
 
 /// Supply one validated bank page from a durable store snapshot.
@@ -893,9 +903,9 @@ pub struct PagedFeedbackProjection {
 /// the extra `next_cursor` is the opaque owner-minted continuation
 /// cursor for the page the snapshot was read from. It is echoed into
 /// [`PagedBankProjection::next_cursor`] with only the fail-closed
-/// malformed gate ([`check_owner_cursor`]): no parsing, no authority
-/// invention. The pre-existing single-page supplier delegates here with
-/// `None`, so external single-page callers keep compiling unchanged.
+/// malformed gate ([`check_owner_page_boundary`]): no parsing, no authority
+/// invention. The pre-existing single-page supplier remains boundary-free;
+/// paged callers must supply and validate the typed owner proof explicitly.
 #[allow(clippy::too_many_arguments)]
 pub fn supply_bank_projection_from_store_paged(
     ledger: &mut ExperienceRevisionLedger,
@@ -905,9 +915,9 @@ pub fn supply_bank_projection_from_store_paged(
     fence: StateFence,
     schedule: &RetentionSchedule,
     holds: &BTreeMap<String, RetentionHold>,
-    next_cursor: Option<String>,
+    next_cursor: PageBoundary,
 ) -> Result<PagedBankProjection, GovernorObservationError> {
-    let next_cursor = check_owner_cursor(next_cursor, "bank_page.next_cursor")?;
+    let next_cursor = check_owner_page_boundary(next_cursor, "bank_page.next_cursor")?;
     let projection = supply_bank_projection_from_store(
         ledger,
         snapshot,
@@ -935,9 +945,9 @@ pub fn supply_feedback_projection_from_store_paged(
     fence: StateFence,
     schedule: &RetentionSchedule,
     holds: &BTreeMap<String, RetentionHold>,
-    next_cursor: Option<String>,
+    next_cursor: PageBoundary,
 ) -> Result<PagedFeedbackProjection, GovernorObservationError> {
-    let next_cursor = check_owner_cursor(next_cursor, "feedback_page.next_cursor")?;
+    let next_cursor = check_owner_page_boundary(next_cursor, "feedback_page.next_cursor")?;
     let projection = supply_feedback_projection_from_store(
         ledger,
         snapshot,
@@ -1007,29 +1017,30 @@ pub fn assemble_experience_for_consumer(
     Ok(ExperienceConsumerBundle { bank, feedback })
 }
 
-/// Both owner envelopes for one page, edge-re-resolved, plus the opaque
-/// owner continuation cursors for the next page.
+/// Both owner envelopes for one page, edge-re-resolved, plus the typed
+/// owner boundary proof for the next page.
 ///
 /// Multi-page contract (owner five-part fence+heads cursors):
-/// the consumer iterates a family by echoing that family's cursor back
-/// to the owner store as the next read's cursor selector until the
-/// cursor is `None`. Bank and feedback paginate independently: each
-/// family's cursor resumes only its own enumeration. A fence/heads
-/// mismatch on the next page (the owner store fails the cursor closed
-/// because a commit advanced a revision head or the fence moved) means
-/// restart that family's enumeration from the headless first page —
-/// never skip ahead, never replay rows into a duplicate, never treat a
-/// rejected cursor as truncation. `None` on both families ends the read;
-/// anything else is a partial read, never a complete one.
+/// the consumer iterates a family by echoing that family's continuation
+/// cursor back to the owner store as the next read's cursor selector until
+/// the owner returns `PageBoundary::ExplicitEnd`. Bank and feedback
+/// paginate independently: each family's cursor resumes only its own
+/// enumeration. A fence/heads mismatch on the next page (the owner store
+/// fails the cursor closed because a commit advanced a revision head or the
+/// fence moved) means restart that family's enumeration from the headless
+/// first page — never skip ahead, never replay rows into a duplicate, never
+/// treat a rejected cursor as truncation. `ExplicitEnd` on both families
+/// ends the read; anything else is a partial read, never a complete one.
+/// `MissingCursor` is always a refusal, never an end marker.
 pub struct PagedExperienceConsumerBundle {
     /// Assembled bank envelope for this page.
     pub bank: BankProjection,
     /// Assembled feedback envelope for this page.
     pub feedback: FeedbackProjection,
-    /// Opaque owner cursor for the next bank page (`None` ends it).
-    pub bank_next_cursor: Option<String>,
-    /// Opaque owner cursor for the next feedback page (`None` ends it).
-    pub feedback_next_cursor: Option<String>,
+    /// Typed owner proof for the next bank page.
+    pub bank_next_cursor: PageBoundary,
+    /// Typed owner proof for the next feedback page.
+    pub feedback_next_cursor: PageBoundary,
     generation: ConsumerPagedReadGeneration,
 }
 
@@ -1037,10 +1048,10 @@ pub struct PagedExperienceConsumerBundle {
 ///
 /// Paged entry of [`assemble_experience_for_consumer`]: runs the same
 /// per-family supply join plus consumer-edge re-resolution, then echoes
-/// the opaque owner continuation cursors (fail-closed on malformed, no
-/// parsing in this lane) into [`PagedExperienceConsumerBundle`]. See its
-/// multi-page contract for iteration, per-family independence, and the
-/// restart-instead-of-skip/dup rule.
+/// the typed owner boundary proofs (fail-closed on missing or malformed
+/// values, no cursor parsing or minting in this lane) into
+/// [`PagedExperienceConsumerBundle`]. See its multi-page contract for
+/// iteration, per-family independence, and the restart-instead-of-skip/dup rule.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_experience_for_consumer_paged(
     ledger: &mut ExperienceRevisionLedger,
@@ -1051,8 +1062,8 @@ pub fn assemble_experience_for_consumer_paged(
     feedback: FeedbackStoreSnapshot<'_>,
     schedule: &RetentionSchedule,
     holds: &BTreeMap<String, RetentionHold>,
-    bank_next_cursor: Option<String>,
-    feedback_next_cursor: Option<String>,
+    bank_next_cursor: PageBoundary,
+    feedback_next_cursor: PageBoundary,
 ) -> Result<PagedExperienceConsumerBundle, GovernorObservationError> {
     let bank = supply_bank_projection_from_store_paged(
         ledger,
@@ -1121,15 +1132,16 @@ impl ConsumerPagedReadGeneration {
     }
 }
 
-/// Echo-next-cursor driver for the multi-page consumer read.
+/// Echo-next-boundary driver for the multi-page consumer read.
 ///
 /// Production loop driver over the owner page suppliers. The caller performs
 /// each owner-store read with the selectors exposed by this driver, then
-/// hands fresh snapshots and the owner-issued next cursors to
+/// hands fresh snapshots and the owner-issued typed boundaries to
 /// [`ConsumerPagedReadDriver::assemble_next_page`]. Each family has an
-/// explicit first-page/continuation/completed state, so `None` cannot make a
-/// restart look complete. The loop ends only when both families have reached
-/// a validated end page in the same current enumeration generation.
+/// explicit first-page/continuation/completed state, so a missing boundary
+/// cannot make a restart look complete. The loop ends only when both families
+/// have reached a validated `PageBoundary::ExplicitEnd` in the same current
+/// enumeration generation.
 ///
 /// Boundary: this lane never performs the store read and never parses or
 /// mints cursors. A fence/heads mismatch is reported by the owner store
@@ -1261,8 +1273,8 @@ impl ConsumerPagedReadDriver {
         feedback: FeedbackStoreSnapshot<'_>,
         schedule: &RetentionSchedule,
         holds: &BTreeMap<String, RetentionHold>,
-        bank_next_cursor: Option<String>,
-        feedback_next_cursor: Option<String>,
+        bank_next_cursor: PageBoundary,
+        feedback_next_cursor: PageBoundary,
     ) -> Result<PagedExperienceConsumerBundle, GovernorObservationError> {
         if matches!(self.bank_state, ConsumerPagedFamilyState::Continuing(_))
             || matches!(self.feedback_state, ConsumerPagedFamilyState::Continuing(_))
@@ -1311,8 +1323,8 @@ impl ConsumerPagedReadDriver {
         holds: &BTreeMap<String, RetentionHold>,
         bank_selector: Option<&str>,
         feedback_selector: Option<&str>,
-        bank_next_cursor: Option<String>,
-        feedback_next_cursor: Option<String>,
+        bank_next_cursor: PageBoundary,
+        feedback_next_cursor: PageBoundary,
     ) -> Result<PagedExperienceConsumerBundle, GovernorObservationError> {
         self.assemble_next_page_inner(
             ledger,
@@ -1345,8 +1357,8 @@ impl ConsumerPagedReadDriver {
         validate_selectors: bool,
         bank_selector: Option<&str>,
         feedback_selector: Option<&str>,
-        bank_next_cursor: Option<String>,
-        feedback_next_cursor: Option<String>,
+        bank_next_cursor: PageBoundary,
+        feedback_next_cursor: PageBoundary,
     ) -> Result<PagedExperienceConsumerBundle, GovernorObservationError> {
         if self.is_complete() {
             return Err(GovernorObservationError::InvalidField {
@@ -1368,12 +1380,12 @@ impl ConsumerPagedReadDriver {
         }
         validate_completed_family_cursor(
             &self.bank_state,
-            bank_next_cursor.as_deref(),
+            &bank_next_cursor,
             "consumer_page.bank_next_cursor",
         )?;
         validate_completed_family_cursor(
             &self.feedback_state,
-            feedback_next_cursor.as_deref(),
+            &feedback_next_cursor,
             "consumer_page.feedback_next_cursor",
         )?;
 
@@ -1410,7 +1422,6 @@ impl ConsumerPagedReadDriver {
             Some(page) => {
                 let next = page.next_cursor;
                 let projection = page.projection;
-                revalidate_bank_projection_for_consumer(&projection, scope, fence)?;
                 Some((projection, next))
             }
             None => None,
@@ -1419,17 +1430,16 @@ impl ConsumerPagedReadDriver {
             Some(page) => {
                 let next = page.next_cursor;
                 let projection = page.projection;
-                revalidate_feedback_projection_for_consumer(&projection, scope, fence)?;
                 Some((projection, next))
             }
             None => None,
         };
 
-        let (bank_projection, bank_next) = match bank_result {
+        let (bank_projection, bank_next, bank_next_state) = match bank_result {
             Some((projection, next)) => {
-                self.bank_state = state_after_page(next.clone());
-                self.bank_projection = Some(projection.clone());
-                (projection, next)
+                revalidate_bank_projection_for_consumer(&projection, scope, fence)?;
+                let next_state = state_after_page(next.clone())?;
+                (projection, next, Some(next_state))
             }
             None => (
                 self.bank_projection
@@ -1438,14 +1448,15 @@ impl ConsumerPagedReadDriver {
                         field: "consumer_page.bank_projection",
                         reason: "completed bank enumeration has no retained page",
                     })?,
+                PageBoundary::ExplicitEnd,
                 None,
             ),
         };
-        let (feedback_projection, feedback_next) = match feedback_result {
+        let (feedback_projection, feedback_next, feedback_next_state) = match feedback_result {
             Some((projection, next)) => {
-                self.feedback_state = state_after_page(next.clone());
-                self.feedback_projection = Some(projection.clone());
-                (projection, next)
+                revalidate_feedback_projection_for_consumer(&projection, scope, fence)?;
+                let next_state = state_after_page(next.clone())?;
+                (projection, next, Some(next_state))
             }
             None => (
                 self.feedback_projection
@@ -1454,9 +1465,22 @@ impl ConsumerPagedReadDriver {
                         field: "consumer_page.feedback_projection",
                         reason: "completed feedback enumeration has no retained page",
                     })?,
+                PageBoundary::ExplicitEnd,
                 None,
             ),
         };
+
+        // Commit both family transitions only after both pages and both
+        // boundary proofs have validated. A malformed feedback page must not
+        // leave the bank family advanced in the driver.
+        if let Some(next_state) = bank_next_state {
+            self.bank_state = next_state;
+            self.bank_projection = Some(bank_projection.clone());
+        }
+        if let Some(next_state) = feedback_next_state {
+            self.feedback_state = next_state;
+            self.feedback_projection = Some(feedback_projection.clone());
+        }
 
         Ok(PagedExperienceConsumerBundle {
             bank: bank_projection,
@@ -1468,11 +1492,17 @@ impl ConsumerPagedReadDriver {
     }
 }
 
-fn state_after_page(next_cursor: Option<String>) -> ConsumerPagedFamilyState {
-    next_cursor.map_or(
-        ConsumerPagedFamilyState::Complete,
-        ConsumerPagedFamilyState::Continuing,
-    )
+fn state_after_page(
+    next_cursor: PageBoundary,
+) -> Result<ConsumerPagedFamilyState, GovernorObservationError> {
+    match next_cursor {
+        PageBoundary::MissingCursor => Err(GovernorObservationError::InvalidField {
+            field: "consumer_page.next_cursor",
+            reason: "owner page omitted next_cursor; missing is not an end proof",
+        }),
+        PageBoundary::ExplicitEnd => Ok(ConsumerPagedFamilyState::Complete),
+        PageBoundary::Continuation(cursor) => Ok(ConsumerPagedFamilyState::Continuing(cursor)),
+    }
 }
 
 fn validate_family_selector(
@@ -1498,13 +1528,15 @@ fn validate_family_selector(
 
 fn validate_completed_family_cursor(
     state: &ConsumerPagedFamilyState,
-    next_cursor: Option<&str>,
+    next_cursor: &PageBoundary,
     field: &'static str,
 ) -> Result<(), GovernorObservationError> {
-    if matches!(state, ConsumerPagedFamilyState::Complete) && next_cursor.is_some() {
+    if matches!(state, ConsumerPagedFamilyState::Complete)
+        && !matches!(next_cursor, PageBoundary::ExplicitEnd)
+    {
         return Err(GovernorObservationError::InvalidField {
             field,
-            reason: "completed family cannot be reopened with another owner next cursor",
+            reason: "completed family requires an explicit owner end proof and cannot reopen",
         });
     }
     Ok(())
@@ -1586,14 +1618,20 @@ pub fn produce_feedback_commit(
 pub fn bank_records_from_range_payload(
     payload: &Value,
 ) -> Result<Vec<ExperienceBankRecord>, GovernorObservationError> {
-    let members = payload.get("records").and_then(Value::as_array).ok_or(
-        GovernorObservationError::InvalidField {
-            field: "audit_range.records",
-            reason: "range payload must carry a records array",
-        },
-    )?;
-    let mut records = Vec::with_capacity(members.len());
-    for member in members {
+    let page = parse_experience_range_page(payload)?;
+    bank_records_from_page(&page)
+}
+
+/// Decode records from an already parsed owner range page.
+///
+/// The page boundary is deliberately not re-read here: callers that need a
+/// paged result consume the same parsed envelope and carry its typed proof
+/// into [`supply_bank_projection_from_store_paged`].
+pub fn bank_records_from_page(
+    page: &ExperienceRangePage,
+) -> Result<Vec<ExperienceBankRecord>, GovernorObservationError> {
+    let mut records = Vec::with_capacity(page.records.len());
+    for member in &page.records {
         let document = unwrap_range_member(member, "bank_revision")?;
         records.push(parse_bank_record(&document)?);
     }
@@ -1606,14 +1644,16 @@ pub fn bank_records_from_range_payload(
 pub fn feedback_records_from_range_payload(
     payload: &Value,
 ) -> Result<Vec<AgentFeedbackRecord>, GovernorObservationError> {
-    let members = payload.get("records").and_then(Value::as_array).ok_or(
-        GovernorObservationError::InvalidField {
-            field: "audit_range.records",
-            reason: "range payload must carry a records array",
-        },
-    )?;
-    let mut records = Vec::with_capacity(members.len());
-    for member in members {
+    let page = parse_experience_range_page(payload)?;
+    feedback_records_from_page(&page)
+}
+
+/// Decode feedback records from an already parsed owner range page.
+pub fn feedback_records_from_page(
+    page: &ExperienceRangePage,
+) -> Result<Vec<AgentFeedbackRecord>, GovernorObservationError> {
+    let mut records = Vec::with_capacity(page.records.len());
+    for member in &page.records {
         let document = unwrap_range_member(member, "feedback_revision")?;
         records.push(parse_feedback_record(&document)?);
     }
@@ -1693,6 +1733,23 @@ fn unwrap_range_member(
     Ok(document.to_owned())
 }
 
+/// Require an owner page's exact state fence to equal the consumer fence.
+///
+/// A syntactically valid page from another fence is not a usable page: it must
+/// be rejected before records or continuation state can advance.
+pub fn validate_experience_range_page_fence(
+    page: &ExperienceRangePage,
+    fence: &StateFence,
+) -> Result<(), GovernorObservationError> {
+    if page.state_fence != *fence {
+        return Err(GovernorObservationError::InvalidField {
+            field: "experience.page.state_fence",
+            reason: "owner page fence does not equal the consumer fence",
+        });
+    }
+    Ok(())
+}
+
 /// Consume one bank range payload into a validated bank projection.
 ///
 /// The payload-to-projection caller: decodes the bridge payload, then
@@ -1716,7 +1773,9 @@ pub fn consume_bank_range_payload(
     coverage: ProjectionCoverage,
     omissions: Vec<ProjectionOmission>,
 ) -> Result<BankProjection, GovernorObservationError> {
-    let records = bank_records_from_range_payload(payload)?;
+    let page = parse_experience_range_page(payload)?;
+    validate_experience_range_page_fence(&page, &fence)?;
+    let records = bank_records_from_page(&page)?;
     supply_bank_projection_from_store(
         ledger,
         BankStoreSnapshot {
@@ -1750,7 +1809,9 @@ pub fn consume_feedback_range_payload(
     coverage: ProjectionCoverage,
     omissions: Vec<ProjectionOmission>,
 ) -> Result<FeedbackProjection, GovernorObservationError> {
-    let records = feedback_records_from_range_payload(payload)?;
+    let page = parse_experience_range_page(payload)?;
+    validate_experience_range_page_fence(&page, &fence)?;
+    let records = feedback_records_from_page(&page)?;
     supply_feedback_projection_from_store(
         ledger,
         FeedbackStoreSnapshot {
@@ -1767,42 +1828,13 @@ pub fn consume_feedback_range_payload(
     )
 }
 
-/// Extract the opaque owner continuation cursor from a bridge
-/// range-payload envelope.
-///
-/// The store backends bind `next_cursor` into the payload (`None`
-/// serializes as `null` when the page ends enumeration). A present
-/// non-text member is a malformed bridge envelope and fails closed;
-/// text passes through the same blank/control gate as
-/// [`check_owner_cursor`]. No cursor is ever parsed or minted here.
-fn owner_cursor_from_range_payload(
-    payload: &Value,
-) -> Result<Option<String>, GovernorObservationError> {
-    let cursor = payload
-        .get("next_cursor")
-        .ok_or(GovernorObservationError::InvalidField {
-            field: "audit_range.next_cursor",
-            reason: "owner page envelope omitted the required continuation cursor member",
-        })?;
-    match cursor {
-        Value::Null => Ok(None),
-        Value::String(cursor) => {
-            check_owner_cursor(Some(cursor.clone()), "audit_range.next_cursor")
-        }
-        _ => Err(GovernorObservationError::InvalidField {
-            field: "audit_range.next_cursor",
-            reason: "owner continuation cursor must be text or explicit null",
-        }),
-    }
-}
-
 /// Consume one bank range payload into one validated bank page.
 ///
-/// Same payload-to-projection rule as [`consume_bank_range_payload`],
-/// plus the opaque owner `next_cursor` echoed from the payload envelope
-/// into [`PagedBankProjection::next_cursor`]. Single-page callers stay
-/// on [`consume_bank_range_payload`]; multi-page callers iterate per
-/// the contract on [`PagedExperienceConsumerBundle`].
+/// The owner envelope is parsed exactly once. Its records and typed
+/// `next_cursor` boundary are then consumed from the same parsed page, so a
+/// missing member can never be re-read as an end-of-stream `None`. Single-page
+/// callers stay on [`consume_bank_range_payload`]; multi-page callers iterate
+/// per the contract on [`PagedExperienceConsumerBundle`].
 #[allow(clippy::too_many_arguments)]
 pub fn consume_bank_range_payload_paged(
     ledger: &mut ExperienceRevisionLedger,
@@ -1816,8 +1848,9 @@ pub fn consume_bank_range_payload_paged(
     coverage: ProjectionCoverage,
     omissions: Vec<ProjectionOmission>,
 ) -> Result<PagedBankProjection, GovernorObservationError> {
-    let records = bank_records_from_range_payload(payload)?;
-    let next_cursor = owner_cursor_from_range_payload(payload)?;
+    let page = parse_experience_range_page(payload)?;
+    validate_experience_range_page_fence(&page, &fence)?;
+    let records = bank_records_from_page(&page)?;
     supply_bank_projection_from_store_paged(
         ledger,
         BankStoreSnapshot {
@@ -1831,12 +1864,14 @@ pub fn consume_bank_range_payload_paged(
         fence,
         schedule,
         holds,
-        next_cursor,
+        page.next_cursor,
     )
 }
 
 /// Consume one feedback range payload into one validated feedback page.
-/// Same opaque-cursor echo rule as [`consume_bank_range_payload_paged`].
+///
+/// The same parsed-envelope rule as [`consume_bank_range_payload_paged`]
+/// applies: records and the typed boundary come from one owner page parse.
 #[allow(clippy::too_many_arguments)]
 pub fn consume_feedback_range_payload_paged(
     ledger: &mut ExperienceRevisionLedger,
@@ -1850,8 +1885,9 @@ pub fn consume_feedback_range_payload_paged(
     coverage: ProjectionCoverage,
     omissions: Vec<ProjectionOmission>,
 ) -> Result<PagedFeedbackProjection, GovernorObservationError> {
-    let records = feedback_records_from_range_payload(payload)?;
-    let next_cursor = owner_cursor_from_range_payload(payload)?;
+    let page = parse_experience_range_page(payload)?;
+    validate_experience_range_page_fence(&page, &fence)?;
+    let records = feedback_records_from_page(&page)?;
     supply_feedback_projection_from_store_paged(
         ledger,
         FeedbackStoreSnapshot {
@@ -1865,6 +1901,6 @@ pub fn consume_feedback_range_payload_paged(
         fence,
         schedule,
         holds,
-        next_cursor,
+        page.next_cursor,
     )
 }

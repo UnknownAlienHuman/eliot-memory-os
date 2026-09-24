@@ -2161,9 +2161,9 @@ async fn experience_bank_range_payload(
         records.pop();
         truncated = true;
     }
-    let matched_total = projection_len(records.len())?;
+    let matched_total = records.len();
     let next_cursor = if truncated {
-        Some(
+        eliot_store_api::PageBoundary::Continuation(
             eliot_store_api::audit_cursor_issue(
                 state_fence,
                 &heads,
@@ -2174,15 +2174,17 @@ async fn experience_bank_range_payload(
             .map_err(AdapterError::Store)?,
         )
     } else {
-        None
+        eliot_store_api::PageBoundary::ExplicitEnd
     };
-    Ok(json!({
-        "records": records,
-        "matched_total": matched_total,
-        "truncated": truncated,
-        "next_cursor": next_cursor,
-        "state_fence": state_fence,
-    }))
+    eliot_store_api::ExperienceRangePage {
+        records,
+        matched_total,
+        truncated,
+        next_cursor,
+        state_fence: state_fence.clone(),
+    }
+    .payload()
+    .map_err(AdapterError::Store)
 }
 
 /// Reads feedback rows and projects the bounded same-fence, same-scope
@@ -2257,9 +2259,9 @@ async fn experience_feedback_range_payload(
         records.pop();
         truncated = true;
     }
-    let matched_total = projection_len(records.len())?;
+    let matched_total = records.len();
     let next_cursor = if truncated {
-        Some(
+        eliot_store_api::PageBoundary::Continuation(
             eliot_store_api::audit_cursor_issue(
                 state_fence,
                 &heads,
@@ -2270,15 +2272,17 @@ async fn experience_feedback_range_payload(
             .map_err(AdapterError::Store)?,
         )
     } else {
-        None
+        eliot_store_api::PageBoundary::ExplicitEnd
     };
-    Ok(json!({
-        "records": records,
-        "matched_total": matched_total,
-        "truncated": truncated,
-        "next_cursor": next_cursor,
-        "state_fence": state_fence,
-    }))
+    eliot_store_api::ExperienceRangePage {
+        records,
+        matched_total,
+        truncated,
+        next_cursor,
+        state_fence: state_fence.clone(),
+    }
+    .payload()
+    .map_err(AdapterError::Store)
 }
 
 /// Converts a projected row count into the `revision` cardinality

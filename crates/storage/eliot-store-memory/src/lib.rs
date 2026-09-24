@@ -1771,7 +1771,7 @@ fn experience_range_payload(
     }
     let matched_total = records.len();
     let next_cursor = if truncated {
-        Some(
+        eliot_store_api::PageBoundary::Continuation(
             eliot_store_api::audit_cursor_issue(
                 fence,
                 &heads,
@@ -1782,17 +1782,17 @@ fn experience_range_payload(
             .map_err(|error| serde_json::Error::custom(error.to_string()))?,
         )
     } else {
-        None
+        eliot_store_api::PageBoundary::ExplicitEnd
     };
-    serde_json::to_value(
-        eliot_store_api::ExperienceRangePage {
-            records,
-            matched_total,
-            truncated,
-            next_cursor,
-        }
-        .payload(fence),
-    )
+    eliot_store_api::ExperienceRangePage {
+        records,
+        matched_total,
+        truncated,
+        next_cursor,
+        state_fence: fence.clone(),
+    }
+    .payload()
+    .map_err(|error| serde_json::Error::custom(error.to_string()))
 }
 
 /// Builds the same-fence audit-range payload (issue #223).
