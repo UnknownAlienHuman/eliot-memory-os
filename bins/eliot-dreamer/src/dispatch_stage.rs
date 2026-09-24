@@ -646,6 +646,8 @@ pub(crate) fn dispatch_curation(
 pub(crate) fn dispatch_screened_curation(route: NativeCurationRoute) -> DreamResult {
     let NativeCurationRoute {
         job_id,
+        screen_binding,
+        source_manifest_digest,
         screen,
         sample,
         plan,
@@ -712,9 +714,11 @@ pub(crate) fn dispatch_screened_curation(route: NativeCurationRoute) -> DreamRes
     }
     let product_pulse = CurationProductPulse::from_native(
         &screen,
+        &screen_binding,
+        &source_manifest_digest,
         &omissions,
-        &sample.coverage_digest,
-        &plan.plan_digest,
+        &sample,
+        &plan,
     );
     DreamResult::Curation {
         job_id,

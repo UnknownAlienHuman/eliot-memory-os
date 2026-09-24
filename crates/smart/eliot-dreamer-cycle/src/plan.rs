@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::contract::{
     CYCLE_SCHEMA_VERSION, CyclePhase, CyclePolicy, DreamerCycleState, InertOwnerRequest,
     MAX_CANONICAL_BYTES, MAX_REQUESTS, MAX_TEXT_BYTES, ObservedOutcome, OutcomeDisposition,
-    PendingRequest, validate_text,
+    PendingRequest, RequestKind, validate_text,
 };
 use crate::error::CycleError;
 use crate::sample::CycleSample;
@@ -91,8 +91,11 @@ struct PlanProjection {
 /// Keeping this projection in one pure helper prevents the constructor and the
 /// independently deserialized plan validator from growing different notions
 /// of which owner operation a sampled request represents.
-fn project_pending_request(pending: &PendingRequest) -> InertOwnerRequest {
-    InertOwnerRequest {
+fn project_pending_request(
+    state: &DreamerCycleState,
+    pending: &PendingRequest,
+) -> InertOwnerRequest {
+    let mut request = InertOwnerRequest {
         request_id: pending.request_id.clone(),
         operation_id: pending.operation_id.clone(),
         attempt_id: pending.attempt_id.clone(),
@@ -105,7 +108,18 @@ fn project_pending_request(pending: &PendingRequest) -> InertOwnerRequest {
         state_fence: pending.state_fence.clone(),
         predecessor_receipt_id: pending.predecessor_receipt_id.clone(),
         reason: OWNER_REQUEST_REASON.to_owned(),
+    };
+    if let Some(outcome) = latest_outcome_for(state, pending)
+        && matches!(
+            outcome.disposition,
+            OutcomeDisposition::Accepted | OutcomeDisposition::Unknown
+        )
+    {
+        request.predecessor_receipt_id = Some(outcome.receipt.identity.receipt_id.clone());
+        request.kind = RequestKind::EffectReconciliation;
+        request.reason = "reconcile the same operation; do not issue a replacement retry".to_owned();
     }
+    request
 }
 
 fn latest_outcome_for<'a>(
@@ -192,7 +206,7 @@ fn derive_plan_projection(
             continue;
         }
         validate_plan_pending(pending, policy, to_phase)?;
-        requests.push(project_pending_request(pending));
+        requests.push(project_pending_request(state, pending));
         if planned_targets.insert(identity.as_str().to_owned()) {
             experiments.push(ExperimentCandidate {
                 target: identity.as_str().to_owned(),

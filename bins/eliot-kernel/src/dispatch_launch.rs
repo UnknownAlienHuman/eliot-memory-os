@@ -101,6 +101,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
+use eliot_dreamer_contracts::AdmittedCurationMaterial;
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
@@ -4338,6 +4339,10 @@ pub struct DreamerLaunchMaterial<'a> {
     /// ledger stays the terminal authority; this arm binds from the
     /// response and never mints ledger state.
     pub queued: &'a DurableJobResponse,
+    /// Exact owner-admitted Curation semantic/source/evidence closure. The
+    /// Kernel only transports and binds it; the Dreamer contract owner and
+    /// child revalidate its semantics.
+    pub admitted_curation: &'a AdmittedCurationMaterial,
     /// Composition-pinned child binary anchor.
     pub child: DreamerChildBinding<'a>,
 }
@@ -4534,6 +4539,29 @@ pub fn prepare_dreamer_launch(
             "admitted dreamer response does not answer the presented job attempt".to_owned(),
         ));
     }
+    let admitted_curation_digest = material
+        .admitted_curation
+        .source_manifest_digest()
+        .map_err(|error| DreamerMaterialError::InvalidMaterial(error.to_string()))?;
+    material
+        .admitted_curation
+        .validate_for_launch(
+            material.keys.job_id,
+            material.keys.attempt_id,
+            material
+                .queued
+                .request_identity
+                .request
+                .request
+                .metadata
+                .request_id
+                .as_str(),
+            material.queued.request_identity.operation.operation_id.as_str(),
+            &material.admitted_curation.admission.idempotency_key,
+            material.queued.scope.scope_id.as_str(),
+            &material.queued.scope.state_fence,
+        )
+        .map_err(|error| DreamerMaterialError::InvalidMaterial(error.to_string()))?;
     let (authority_epoch, generation) = {
         let service = kernel
             .service
@@ -4586,6 +4614,11 @@ pub fn prepare_dreamer_launch(
         None,
     )
     .map_err(dreamer_launch_error)?;
+    if grant.idempotency_key != material.admitted_curation.admission.idempotency_key {
+        return Err(DreamerMaterialError::InvalidMaterial(
+            "dreamer launch grant does not bind the owner admission idempotency key".to_owned(),
+        ));
+    }
     // Single-flight reservation under the original job identity: a
     // reserved or launched identity replays by that identity instead of
     // spawning a second child. The reservation releases below when the
@@ -4596,6 +4629,7 @@ pub fn prepare_dreamer_launch(
         revision,
         scope_id: scope_id.clone(),
         fence: fence.clone(),
+        admitted_curation_digest: admitted_curation_digest.clone(),
         executable_sha256: material.child.executable_sha256.to_owned(),
         material_path: None,
         nonce: nonce.clone(),
@@ -4612,6 +4646,7 @@ pub fn prepare_dreamer_launch(
         revision,
         scope_id,
         fence,
+        admitted_curation: material.admitted_curation.clone(),
         epoch: authority_epoch.clone(),
         generation: generation.get(),
         nonce: nonce.clone(),

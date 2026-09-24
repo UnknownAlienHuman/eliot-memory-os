@@ -5,15 +5,13 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
-use eliot_contracts::StateFence;
-use eliot_dreamer_contracts::ContractViolation;
-use eliot_dreamer_contracts::ScreenBinding;
+use eliot_contracts::{StateFence, fences_match_exact};
+use eliot_dreamer_contracts::{ContractViolation, ScreenBinding};
 use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobState};
 use serde::{Deserialize, Serialize};
 
 use crate::curation_screen_stage::CurationSourceCarrier;
-use crate::dispatch_stage::CurationExecutionCarrier;
 use crate::kernel_port::{ClaimTransport, KernelClaimTransport};
 
 mod admitted_material;
@@ -32,15 +30,12 @@ mod validation_stage;
 #[cfg(test)]
 mod pipeline_e2e;
 
-pub use curation_screen_stage::BoundedCurationSource;
 pub use error::DreamerError;
 pub use product_pulse::{CurationProductPulse, CurationProofCeiling};
 
 pub const SERVICE_NAME: &str = "eliot-dreamer";
 pub const PROTOCOL_VERSION: &str = "eliot.dreamer.v1";
 pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
-/// Stable route identity recorded by the native Curation Product Pulse.
-pub const CURATION_PRODUCT_ROUTE_ID: &str = "eliot-dreamer.curation.screen.v1";
 const MAX_TEXT: usize = 16_384;
 
 /// The canonical nine work classes of I9.3, owned by `eliot-dreamer-contracts`.
@@ -106,57 +101,6 @@ impl KernelJobAdmission {
     }
 }
 
-/// Builds the bounded semantic carrier used by the current daemon's native
-/// Curation screen route.
-///
-/// The current claim material does not yet carry a Governor-resolved source
-/// body.  This projection therefore names exactly one immutable handle and
-/// records that limitation as an explicit unknown; it does not fetch source
-/// content, select a semantic kind, or grant an execution effect.  A future
-/// source-owner carrier can replace this bounded projection without changing
-/// the native screen/cycle/dispatch contracts.
-pub fn bounded_curation_job_input(
-    admission: &KernelJobAdmission,
-) -> Result<DreamJobInput, DreamerError> {
-    admission.validate()?;
-    let deadline_ms = i64::try_from(admission.deadline_unix_ms)
-        .map_err(|_| DreamerError::InvalidAdmission("Kernel deadline exceeds semantic range"))?;
-    let job = DreamJobInput {
-        job_id: admission.job_id.clone(),
-        job_class: JobClass::Curation,
-        exact_question: "Screen the admitted bounded source carrier for reversible curation candidates."
-            .to_owned(),
-        requester: "current-daemon".to_owned(),
-        scope_id: admission.scope_id.clone(),
-        task_id: Some(format!("{}:task", admission.job_id)),
-        state_fence: admission.state_fence.clone(),
-        evidence_handles: vec![format!("{}:bounded-source-carrier", admission.job_id)],
-        memory_handles: Vec::new(),
-        architecture_handles: Vec::new(),
-        implementation_handles: Vec::new(),
-        conformance_handles: Vec::new(),
-        conflicts_and_unknowns: vec![
-            "current-daemon supplied a bounded handle carrier; canonical source content and owner protection evidence are not loaded"
-                .to_owned(),
-        ],
-        privacy_profile: "local_only".to_owned(),
-        allowed_tools: Vec::new(),
-        allowed_model_routes: vec!["native-screen-only".to_owned()],
-        budget_units: 1,
-        deadline_ms,
-        output_schema: PROTOCOL_VERSION.to_owned(),
-        forbidden_effects: vec![
-            "source_mutation".to_owned(),
-            "semantic_kind_selection".to_owned(),
-            "model_execution".to_owned(),
-            "tool_execution".to_owned(),
-            "authority_mutation".to_owned(),
-        ],
-    };
-    job.validate().map_err(|error| job_denied(&error))?;
-    Ok(job)
-}
-
 /// The authenticated Kernel handshake snapshot bound to this process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelHandshake {
@@ -179,32 +123,6 @@ pub trait KernelJobPort {
     fn reconcile(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError>;
 }
 
-/// Governor injection point for the A-31 Curation execution carrier.
-///
-/// The current daemon's production route supplies the separate bounded native
-/// screen carrier and does not fabricate the ten live handler ports required
-/// by A-31. A Governor or focused test harness may still supply this
-/// execution carrier via
-/// [`AuthenticatedKernelJobPort::with_curation_source`]; `submit` resolves it
-/// only when no bounded native source is wired.
-///
-/// Object-safe by construction: no generic parameters and no lifetime on the
-/// trait itself, so it is usable as `&dyn CurationCarrierSource`.
-pub trait CurationCarrierSource {
-    /// Resolves the execution carrier for one screened Curation admission.
-    ///
-    /// The returned carrier borrows the source (`'s`), so the caller must
-    /// consume it before any `&mut` use of the port holding the source;
-    /// `submit` complies by running the admitted pipeline to an owned
-    /// [`DreamResult`] before observing the live view.
-    fn resolve_carrier<'s>(
-        &'s self,
-        screen: &ScreenBinding,
-        admission: &KernelJobAdmission,
-        job: &DreamJobInput,
-    ) -> Result<CurationExecutionCarrier<'s>, DreamerError>;
-}
-
 /// Authenticated production adapter over the installation-owned Kernel client.
 ///
 /// The port owns the validated one-shot claim: connecting loads the
@@ -214,7 +132,7 @@ pub trait CurationCarrierSource {
 /// dispatch permit exactly once, and performs `LeaseExact` then `Start`
 /// through the authenticated worker session. Any step failing closed refuses
 /// with [`DreamerError::KernelAdmissionRequired`] without effect.
-pub struct AuthenticatedKernelJobPort<'a> {
+pub struct AuthenticatedKernelJobPort {
     material: kernel_port::ValidatedDreamerMaterial,
     admission: KernelJobAdmission,
     view: JobView,
@@ -225,17 +143,9 @@ pub struct AuthenticatedKernelJobPort<'a> {
     /// `status_once` call sites need no changes (the blanket `Box<T>` impl
     /// forwards).
     transport: Box<dyn ClaimTransport>,
-    /// Optional Governor-injected Curation execution carrier source. `None`
-    /// in the current daemon (live handler ports are absent in-binary); a
-    /// test/Governor harness may wire one via `with_curation_source`.
-    curation_source: Option<&'a dyn CurationCarrierSource>,
-    /// Bounded native Curation source carrier. The current daemon wires this
-    /// in `main`; it is separate from the A-31 execution carrier and never
-    /// supplies handler ports or semantic effects.
-    bounded_curation_source: Option<&'a BoundedCurationSource>,
 }
 
-impl<'a> AuthenticatedKernelJobPort<'a> {
+impl AuthenticatedKernelJobPort {
     pub fn connect() -> Result<Self, DreamerError> {
         let mut session = KernelClient::load().map_err(|error| kernel_admission_error(&error))?;
         let health = session
@@ -266,7 +176,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         let mut transport = KernelClaimTransport::new(session);
         let started = kernel_port::claim_once(&material, &mut transport)
             .map_err(|error| port_denied(&error))?;
-        let admission = claim_admission(&material);
+        let admission = claim_admission(&material)?;
         admission.validate()?;
         let handshake = KernelHandshake {
             authority_epoch: material.epoch.sequence.get(),
@@ -279,36 +189,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             view,
             handshake,
             transport: Box::new(transport),
-            curation_source: None,
-            bounded_curation_source: None,
         })
-    }
-
-    /// Wires a Governor-injected Curation carrier source into the port.
-    ///
-    /// The Governor calls this after `connect()`; `submit` resolves the
-    /// execution carrier from the A-20 screen binding through this source for
-    /// Curation jobs only. Non-Curation jobs never consult it.
-    #[must_use]
-    pub fn with_curation_source(self, source: &'a dyn CurationCarrierSource) -> Self {
-        Self {
-            curation_source: Some(source),
-            ..self
-        }
-    }
-
-    /// Wires the current daemon's bounded native screen carrier.
-    ///
-    /// This carrier contains only the admitted handle projection and explicit
-    /// omissions.  It is deliberately independent of the A-31 execution
-    /// carrier: wiring it never constructs a handler port, model, tool, lease,
-    /// reservation, or source mutation path.
-    #[must_use]
-    pub fn with_bounded_curation_source(self, source: &'a BoundedCurationSource) -> Self {
-        Self {
-            bounded_curation_source: Some(source),
-            ..self
-        }
     }
 
     /// Test-only constructor mirroring `connect()`'s tail with an injected
@@ -324,7 +205,6 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         material: kernel_port::ValidatedDreamerMaterial,
         admission: KernelJobAdmission,
         transport: Box<dyn ClaimTransport>,
-        curation_source: Option<&'a dyn CurationCarrierSource>,
     ) -> Result<Self, DreamerError> {
         admission.validate()?;
         let view = JobView {
@@ -332,7 +212,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             state: JobState::Running,
             result: None,
         };
-        let claimed = claim_admission(&material);
+        let claimed = claim_admission(&material)?;
         claimed.validate()?;
         let handshake = KernelHandshake {
             authority_epoch: material.epoch.sequence.get(),
@@ -344,8 +224,6 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             view,
             handshake,
             transport,
-            curation_source,
-            bounded_curation_source: None,
         })
     }
 
@@ -365,12 +243,27 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         &self.admission
     }
 
+    /// Returns the exact owner-admitted semantic input carried by the
+    /// protected Kernel handoff. The daemon never synthesizes its class,
+    /// question, requester, source handles, privacy, or policy route.
+    pub fn claimed_job(&self) -> Result<&DreamJobInput, DreamerError> {
+        self.material
+            .admitted_curation
+            .as_ref()
+            .map(|material| &material.job)
+            .ok_or(DreamerError::KernelAdmissionRequired(
+                "protected launch omitted owner-admitted semantic material".to_owned(),
+            ))
+    }
+
     /// Refuses any admission that is not the claimed dreamer job.
     fn check_claimed(&self, admission: &KernelJobAdmission) -> Result<(), DreamerError> {
         admission.validate()?;
         if admission.job_id != self.material.job_id
+            || admission.attempt_id != self.material.attempt_id
             || admission.scope_id != self.material.scope_id
-            || admission.state_fence != self.material.fence
+            || admission.request_id != self.admission.request_id
+            || !fences_match_exact(&admission.state_fence, &self.material.fence)
             || admission.idempotency_key != self.admission.idempotency_key
         {
             return Err(DreamerError::KernelAdmissionRequired(
@@ -380,43 +273,22 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         Ok(())
     }
 
-    /// Resolves the Governor-injected Curation execution carrier, if any.
-    ///
-    /// Copies the source reference out of `self` first (`Option<&dyn>` is
-    /// `Copy`, ending the borrow), so the resolved carrier borrows the source
-    /// rather than this port. `None` (production) flows to the carrier check
-    /// inside the admitted pipeline, which refuses with the precise typed
-    /// reason; `Some` delegates to the Governor source with the A-20 screen
-    /// binding.
-    ///
-    /// The caller must consume the carrier before any `&mut` use of the port:
-    /// `submit` runs the admitted pipeline to an owned [`DreamResult`] first
-    /// and only then observes the live view.
-    fn resolve_curation_carrier(
+    /// Projects the owner-admitted native source closure into the owned carrier
+    /// consumed by the read-only native screen. No source, profile, evidence,
+    /// policy revision, fence, task, or request identity is synthesized here.
+    fn resolve_admitted_curation_source(
         &self,
-        screen: &ScreenBinding,
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
-    ) -> Result<Option<CurationExecutionCarrier<'_>>, DreamerError> {
-        let source = self.curation_source;
-        match source {
-            None => Ok(None),
-            Some(source) => source.resolve_carrier(screen, admission, job).map(Some),
-        }
-    }
-
-    /// Resolves the bounded native screen carrier, if the current daemon wired
-    /// one.  It returns an owned carrier so no borrow of `self` survives into
-    /// the mutable Kernel readback tail.
-    fn resolve_bounded_curation_source(
-        &self,
-        screen: &ScreenBinding,
-        admission: &KernelJobAdmission,
-        job: &DreamJobInput,
-    ) -> Result<Option<CurationSourceCarrier>, DreamerError> {
-        self.bounded_curation_source.map_or(Ok(None), |_| {
-            BoundedCurationSource::resolve(screen, admission, job).map(Some)
-        })
+    ) -> Result<CurationSourceCarrier, DreamerError> {
+        let material = self
+            .material
+            .admitted_curation
+            .as_ref()
+            .ok_or(DreamerError::KernelAdmissionRequired(
+                "protected launch omitted owner-admitted Curation material".to_owned(),
+            ))?;
+        CurationSourceCarrier::from_admitted(material, admission, job)
     }
 
     /// Observes the live Kernel-proved disposition of the claimed job.
@@ -448,24 +320,31 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
     }
 }
 
-/// Binds the validated claim to the Kernel-owned admission identity.
+/// Binds the validated claim to the exact owner-admitted request identity.
 ///
-/// The stable half reuses the Kernel-issued grant lineage (idempotency key
-/// plus expiry as the freshness bound, so [`KernelJobAdmission::validate`]
-/// re-proves liveness); the correlation half is derived from the grant
-/// digest. Nothing is taken from argv, stdin, or environment.
-fn claim_admission(material: &kernel_port::ValidatedDreamerMaterial) -> KernelJobAdmission {
-    let short: String = material.grant.grant_digest.chars().take(16).collect();
-    KernelJobAdmission {
+/// The request correlation comes from the owner-native Curation request, not
+/// from a locally synthesized claim label. The stable grant lineage still
+/// supplies idempotency and expiry. A launch without the owner material is a
+/// fail-closed Kernel admission, never a reconstructed Curation request.
+fn claim_admission(
+    material: &kernel_port::ValidatedDreamerMaterial,
+) -> Result<KernelJobAdmission, DreamerError> {
+    let owner_material = material.admitted_curation.as_ref().ok_or_else(|| {
+        DreamerError::KernelAdmissionRequired(
+            "protected launch omitted owner-admitted semantic material".to_owned(),
+        )
+    })?;
+    let request_id = owner_material.request.binding.request_id.as_str().to_owned();
+    Ok(KernelJobAdmission {
         job_id: material.job_id.clone(),
         attempt_id: material.attempt_id.clone(),
         scope_id: material.scope_id.clone(),
-        request_id: format!("dreamer-claim-{short}"),
+        cancellation_id: format!("{request_id}:cancel"),
+        request_id,
         idempotency_key: material.grant.idempotency_key.clone(),
-        cancellation_id: format!("dreamer-claim-{short}:cancel"),
         deadline_unix_ms: material.grant.expires_at,
         state_fence: material.fence.clone(),
-    }
+    })
 }
 
 fn port_denied(error: &kernel_port::KernelPortError) -> DreamerError {
@@ -585,54 +464,26 @@ fn dispatch_admission_with(
     Ok((arm, digest))
 }
 
-/// Runs the admitted stage chain for one Kernel-bound job without the
-/// current-daemon native source carrier.
-///
-/// This compatibility entry preserves the historical A-31 execution-carrier
-/// proof used by the focused pipeline tests.  The real `submit` path uses
-/// [`run_admitted_pipeline_with_source`] when `main` has wired its bounded
-/// native carrier.
+/// Runs the admitted non-native stage chain. The production native Curation
+/// route branches in `submit`; this entry preserves the explicit A-31 test and
+/// Governor carrier seam without creating an A-20 binding of its own.
 fn run_admitted_pipeline(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     curation_carrier: Option<dispatch_stage::CurationExecutionCarrier<'_>>,
+    owner_binding: Option<ScreenBinding>,
 ) -> Result<DreamResult, DreamerError> {
-    run_admitted_pipeline_with_source(admission, job, curation_carrier, None)
-}
-
-/// Runs the admitted stage chain with an optional native source carrier.
-///
-/// A bounded native carrier is resolved by the authenticated current-daemon
-/// port and takes precedence over the historical A-31 execution carrier.  It
-/// invokes the real native screen, freezes one cycle sample/plan, and maps the
-/// result to a candidate-only Product Pulse.  With no native carrier, the
-/// existing A-31 carrier route remains available for its explicit test/
-/// Governor harness and still refuses closed when no execution carrier is
-/// supplied.
-fn run_admitted_pipeline_with_source(
-    admission: &KernelJobAdmission,
-    job: &DreamJobInput,
-    curation_carrier: Option<dispatch_stage::CurationExecutionCarrier<'_>>,
-    native_source: Option<CurationSourceCarrier>,
-) -> Result<DreamResult, DreamerError> {
-    let screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
+    let screen = curation_screen_stage::resolve_screen_inputs(
+        admission,
+        job,
+        owner_binding.as_ref(),
+    )?;
     if job.job_class == JobClass::Curation {
-        let binding = match screen {
-            curation_screen_stage::ScreenDecision::Screened { binding, .. } => binding,
-            curation_screen_stage::ScreenDecision::PassThrough(_) => {
-                return Err(DreamerError::InvalidAdmission(
-                    "admitted curation dispatch requires Governor-resolved screen binding",
-                ));
-            }
+        let curation_screen_stage::ScreenDecision::Screened { binding, .. } = screen else {
+            return Err(DreamerError::InvalidAdmission(
+                "admitted curation dispatch requires owner-resolved screen binding",
+            ));
         };
-        if let Some(source) = native_source {
-            let route =
-                curation_screen_stage::run_native_screen_route(admission, job, &binding, source)?;
-            return Ok(dispatch_stage::dispatch_screened_curation(route));
-        }
-        // Carrier check before any generic model/grounding work: without a
-        // Governor-injected execution carrier there is nothing downstream to
-        // run, so refuse here with the precise reason.
         let carrier = curation_carrier.ok_or(DreamerError::InvalidAdmission(
             dispatch_stage::CURATION_CARRIER_REFUSAL,
         ))?;
@@ -642,27 +493,21 @@ fn run_admitted_pipeline_with_source(
     let draft = model_stage::run_admitted_model(model_inputs)?;
     let grounding_request = grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
     let grounded = grounding_stage::ground_admitted_draft(grounding_request)?;
-    // Non-Curation classes pass the screen through with no binding to carry:
-    // the resolve above already proved the pass-through.
-    let screen_binding = None;
     let _validation = validation_stage::resolve_validation_inputs(admission, job)?;
     let validation_input =
         admitted_material::validation_input_for(admission, job, grounded, Some(0))?;
-    // The structured A-05 gate runs exactly once here; the validated receipt
-    // threads into dispatch, which proves its binding before any native
-    // handler runs and never re-runs the owner validation.
     let validated = validation_stage::validate_admitted_draft(&validation_input)?;
     dispatch_stage::dispatch_admitted(
         admission,
         job,
-        screen_binding,
+        None,
         None,
         job.job_class,
         Some(&validated),
     )
 }
 
-impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
+impl KernelJobPort for AuthenticatedKernelJobPort {
     fn handshake(&mut self) -> Result<KernelHandshake, DreamerError> {
         Ok(self.handshake)
     }
@@ -695,23 +540,39 @@ impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
         // stdout.
         let (_arm, _digest) = dispatch_admission(job)?;
         self.check_claimed(admission)?;
+        let claimed_job = self.claimed_job()?;
+        if job != claimed_job {
+            return Err(DreamerError::KernelAdmissionRequired(
+                "semantic input differs from the owner-admitted protected handoff".to_owned(),
+            ));
+        }
         if job.job_class == JobClass::Curation {
-            let screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
-            let binding = match screen {
-                curation_screen_stage::ScreenDecision::Screened { binding, .. } => binding,
-                curation_screen_stage::ScreenDecision::PassThrough(_) => {
-                    return Err(DreamerError::InvalidAdmission(
-                        "admitted curation dispatch requires Governor-resolved screen binding",
-                    ));
-                }
+            let owner_binding = &self
+                .material
+                .admitted_curation
+                .as_ref()
+                .ok_or(DreamerError::KernelAdmissionRequired(
+                    "protected launch omitted owner-admitted Curation material".to_owned(),
+                ))?
+                .screen_binding;
+            let screen = curation_screen_stage::resolve_screen_inputs(
+                admission,
+                job,
+                Some(owner_binding),
+            )?;
+            let curation_screen_stage::ScreenDecision::Screened { binding, .. } = screen else {
+                return Err(DreamerError::InvalidAdmission(
+                    "admitted curation dispatch requires owner-resolved screen binding",
+                ));
             };
-            let native_source = self.resolve_bounded_curation_source(&binding, admission, job)?;
-            let result = if let Some(source) = native_source {
-                run_admitted_pipeline_with_source(admission, job, None, Some(source))?
-            } else {
-                let carrier = self.resolve_curation_carrier(&binding, admission, job)?;
-                run_admitted_pipeline_with_source(admission, job, carrier, None)?
-            };
+            let source = self.resolve_admitted_curation_source(admission, job)?;
+            if source.screen_binding != binding {
+                return Err(DreamerError::InvalidAdmission(
+                    "native source differs from the owner A-20 screen binding",
+                ));
+            }
+            let route = curation_screen_stage::run_native_screen_route(admission, job, source)?;
+            let result = dispatch_stage::dispatch_screened_curation(route);
             return self.finish_with_result(result);
         }
         let (state, observed, policy, observation_time_ms) =
@@ -720,7 +581,7 @@ impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
             controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
         let request = bundle_stage::resolve_bundle_request(admission, job)?;
         let _plan = bundle_stage::plan_admitted_bundle(request)?;
-        let result = run_admitted_pipeline(admission, job, None)?;
+        let result = run_admitted_pipeline(admission, job, None, None)?;
         self.finish_with_result(result)
     }
 

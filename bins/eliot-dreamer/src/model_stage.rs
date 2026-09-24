@@ -136,7 +136,7 @@ fn build_model_draft(
     // The canonical shared bundle: byte-identical to the value the grounding
     // stage derives, so draft and request preimages cannot drift.
     let bundle = bundle_of(admission, job)?;
-    let screen = screen_binding_for(admission, job)?;
+    let screen = screen_binding_for(job, None)?;
     let mut draft = StructuredModelDraft {
         schema_version: GROUNDING_SCHEMA_VERSION,
         job_id: canonical_id.clone(),

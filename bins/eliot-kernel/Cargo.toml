@@ -22,6 +22,7 @@ path = "src/main.rs"
 eliot-authority.workspace = true
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-dreamer-contracts = { path = "../../crates/smart/eliot-dreamer-contracts", version = "0.1.0" }
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true

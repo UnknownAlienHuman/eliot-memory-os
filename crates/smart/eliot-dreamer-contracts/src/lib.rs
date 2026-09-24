@@ -16,6 +16,7 @@ pub mod candidate;
 pub mod classification;
 pub mod concept;
 pub mod curation;
+pub mod curation_admission;
 pub mod curation_invocation;
 pub mod diagnosis;
 pub mod draft;
@@ -79,6 +80,7 @@ pub use concept::{
     concept_proposal_digest, seal_concept, validate_concept, validate_concept_acceptance,
 };
 pub use curation::{CURATION_WIRE_KINDS, CurationKind, CurationPayload, kind_family, parse_kind};
+pub use curation_admission::AdmittedCurationMaterial;
 pub use curation_invocation::{
     BoundCurationCall, FullCurationResult, NativeCurationHandler, ProducedCurationContent, invoke,
     request_digest_of,

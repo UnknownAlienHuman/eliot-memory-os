@@ -53,6 +53,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use eliot_contracts::{EpochId, StateFence};
+use eliot_dreamer_contracts::AdmittedCurationMaterial;
 use serde::{Deserialize, Serialize};
 
 use super::DispatchGrant;
@@ -174,6 +175,9 @@ pub struct DreamerDispatchedEnvelope {
     pub scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
     pub fence: StateFence,
+    /// Owner-admitted Curation job, A-20 binding, and native source/evidence
+    /// closure. The child revalidates it against the claimed launch identity.
+    pub admitted_curation: AdmittedCurationMaterial,
     /// Live authority epoch bound at launch (never envelope bytes).
     pub epoch: EpochId,
     /// Live activation generation bound at launch (non-zero).
@@ -207,6 +211,8 @@ pub struct ValidatedDreamerMaterial {
     pub scope_id: String,
     /// Fence the ledger bound to this job.
     pub fence: StateFence,
+    /// Fully validated owner-admitted Curation semantic/source closure.
+    pub admitted_curation: AdmittedCurationMaterial,
     /// Live epoch this material bound against.
     pub epoch: EpochId,
     /// Generation this material bound against.
@@ -283,6 +289,8 @@ pub struct DreamerLaunchRecord {
     pub scope_id: String,
     /// Fence the ledger bound to this job.
     pub fence: StateFence,
+    /// Digest of the exact owner-admitted Curation semantic/source closure.
+    pub admitted_curation_digest: String,
     /// Composition-pinned installed Dreamer image digest bound at launch.
     pub executable_sha256: String,
     /// Protected dispatch file path the child reads, once staged.
@@ -672,12 +680,25 @@ pub(crate) fn validate_dreamer_material(
             envelope.grant.fence_generation, envelope.generation,
         )));
     }
+    envelope
+        .admitted_curation
+        .validate_for_launch(
+            &envelope.job_id,
+            &envelope.attempt_id,
+            envelope.admitted_curation.request.binding.request_id.as_str(),
+            envelope.admitted_curation.admission.operation_id.as_str(),
+            &envelope.grant.idempotency_key,
+            &envelope.scope_id,
+            &envelope.fence,
+        )
+        .map_err(|error| DreamerMaterialError::InvalidMaterial(error.to_string()))?;
     Ok(ValidatedDreamerMaterial {
         job_id: envelope.job_id.clone(),
         attempt_id: envelope.attempt_id.clone(),
         revision: envelope.revision,
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
+        admitted_curation: envelope.admitted_curation.clone(),
         epoch: envelope.epoch.clone(),
         generation: envelope.generation,
         nonce: envelope.nonce.clone(),
@@ -707,6 +728,7 @@ pub(crate) fn reserve_dreamer_launch(
             && existing.revision == record.revision
             && existing.scope_id == record.scope_id
             && existing.fence == record.fence
+            && existing.admitted_curation_digest == record.admitted_curation_digest
             && existing.executable_sha256 == record.executable_sha256
         {
             return Ok(DreamerReserveOutcome::ReplayOriginal(Box::new(
@@ -899,6 +921,241 @@ pub(crate) fn retained_dreamer_launch(job_id: &str) -> Option<DreamerLaunchRecor
         .and_then(|launches| launches.get(job_id).cloned())
 }
 
+/// Builds a complete owner-admitted Curation fixture for Kernel handoff tests.
+///
+/// This is test support only: it makes the same typed closure that an owner
+/// must supply to production visible to the launch/claim edge. It is never
+/// used as a production default or a substitute for a missing admission.
+#[cfg(test)]
+pub(crate) fn test_admitted_curation_material(
+    job_id: &str,
+    attempt_id: &str,
+    scope_id: &str,
+    request_id: &str,
+    operation_id: &str,
+    idempotency_key: &str,
+    state_fence: &StateFence,
+) -> AdmittedCurationMaterial {
+    use eliot_agent_contracts::AgentAttemptId;
+    use eliot_contracts::{
+        ArtifactId, OperationId, PolicyRevision, ProductId, RequestId, SourceId, TaskId,
+        TaskRevision,
+    };
+    use eliot_dreamer_contracts::{
+        BudgetLimits, DREAM_JOB_SCHEMA_VERSION, DreamJobAdmission, DreamJobInput, JobClass,
+        PRIVACY_LOCAL_ONLY, Requester, RequesterOrigin, ScreenBinding, ScreenState,
+    };
+    use eliot_memory_curation_contracts::{
+        CurationScreenRequest, DenominatorCoverage, DisclosureCeiling, FindingClass,
+        FiniteDenominator, MemberEvidenceRefs, MemberId, MemberPartition, ProfileId,
+        ProtectionClass, ProtectionEvidence, ProtectionEvidenceId, ProtectionEvidenceState,
+        ProtectionOutcome, QueryIdentity, RuleId, RuleSpec, ScreenLimits, ScreenProfile,
+        SourceAvailability, SourceIdentity, SourceMember, SourceMemberKind, SourcePage,
+        SourceSnapshot,
+    };
+    use eliot_receipts::WorkScopeId;
+
+    let policy_revision = state_fence
+        .policy_revision
+        .expect("owner material fixture requires an exact policy revision");
+    let task_id = format!("task-{job_id}");
+    let member_id = MemberId::new(format!("member-{job_id}")).expect("member identity");
+    let source_scope = WorkScopeId::new(scope_id).expect("source scope");
+    let source_identity = SourceIdentity {
+        product_id: ProductId::new("eliot").expect("product identity"),
+        source_id: SourceId::new("canonical-memory").expect("source identity"),
+        snapshot_id: eliot_memory_curation_contracts::SnapshotId::new(format!(
+            "snapshot-{job_id}"
+        ))
+        .expect("snapshot identity"),
+        query: QueryIdentity {
+            query_id: eliot_memory_curation_contracts::QueryId::new(format!("query-{job_id}"))
+                .expect("query identity"),
+            query_digest: eliot_memory_curation_contracts::Digest::new(&"11".repeat(32))
+                .expect("query digest"),
+        },
+        revision: 1,
+        digest: eliot_memory_curation_contracts::Digest::new(&"12".repeat(32))
+            .expect("source digest"),
+        scope: source_scope.clone(),
+        state_fence: state_fence.clone(),
+    };
+    let source = SourceSnapshot {
+        identity: source_identity,
+        denominator: FiniteDenominator {
+            coverage: DenominatorCoverage::Complete,
+            total_members: 1,
+            declared_member_ids: vec![member_id.clone()],
+        },
+        partition: MemberPartition {
+            changed_targets: std::collections::BTreeSet::from([member_id.clone()]),
+            immutable_references: std::collections::BTreeSet::new(),
+        },
+        availability: SourceAvailability::Available,
+        members: vec![SourceMember {
+            member_id: member_id.clone(),
+            kind: SourceMemberKind::Observation,
+            revision: TaskRevision::genesis(),
+            content_digest: eliot_memory_curation_contracts::Digest::new(&"13".repeat(32))
+                .expect("member digest"),
+            evidence: MemberEvidenceRefs::default(),
+        }],
+        page: SourcePage {
+            page_number: 0,
+            has_more: false,
+            frontier: Vec::new(),
+        },
+    };
+    let rule_id = RuleId::new(format!("rule-{job_id}")).expect("rule identity");
+    let profile = ScreenProfile {
+        profile_id: ProfileId::new(format!("profile-{job_id}")).expect("profile identity"),
+        schema_revision: PolicyRevision::genesis(),
+        policy_revision,
+        rules: vec![RuleSpec {
+            rule_id: rule_id.clone(),
+            finding_class: FindingClass::ProtectionGap,
+            precedence: 1,
+            required_protection: std::collections::BTreeSet::from([
+                ProtectionClass::CurrentTruth,
+            ]),
+        }],
+        requested_findings: std::collections::BTreeSet::from([FindingClass::ProtectionGap]),
+        precedence: vec![rule_id],
+        limits: ScreenLimits {
+            max_items: 1,
+            max_references: 1,
+            max_bytes: 1_024,
+            max_work_units: 1,
+            max_output_bytes: 1_024,
+            deadline_ms: Some(1_000),
+            cancellation_grace_ms: Some(1),
+        },
+    };
+    let request = CurationScreenRequest {
+        source: source.identity.clone(),
+        denominator: source.denominator.clone(),
+        partition: source.partition.clone(),
+        binding: eliot_memory_curation_contracts::RequestBinding {
+            request_id: RequestId::new(request_id).expect("request identity"),
+            operation_id: OperationId::new(operation_id).expect("operation identity"),
+            task_id: Some(TaskId::new(task_id.clone()).expect("task identity")),
+            attempt_id: AgentAttemptId::new(attempt_id).expect("attempt identity"),
+            scope: source_scope.clone(),
+            state_fence: state_fence.clone(),
+        },
+        profile,
+        cursor: None,
+        cancellation_requested: false,
+    };
+    let admission = DreamJobAdmission {
+        schema_version: DREAM_JOB_SCHEMA_VERSION,
+        job_class: JobClass::Curation,
+        requester: Requester {
+            origin: RequesterOrigin::Human,
+            principal: "kernel-test-owner".to_owned(),
+            session: None,
+        },
+        operation_id: operation_id.to_owned(),
+        idempotency_key: idempotency_key.to_owned(),
+        task_id: task_id.clone(),
+        scope_id: scope_id.to_owned(),
+        state_fence: state_fence.clone(),
+        privacy_profile: PRIVACY_LOCAL_ONLY.to_owned(),
+        contract_ref: "curation-screen.v1".to_owned(),
+        policy_ref: "curation-profile.v1".to_owned(),
+        budget: BudgetLimits {
+            input_bytes: Some(1_024),
+            output_bytes: Some(1_024),
+            source_width: Some(1),
+            reference_width: Some(1),
+            model_calls: Some(1),
+            attempts: Some(1),
+            candidates: Some(1),
+            wall_ms: Some(1_000),
+            work_fan_out: Some(1),
+            report_bytes: Some(1_024),
+            max_stu: Some(1),
+        },
+        deadline_ms: Some(1_000),
+        frozen_manifest_digest: "00".repeat(32),
+    };
+    let job = DreamJobInput {
+        job_id: job_id.to_owned(),
+        job_class: JobClass::Curation,
+        exact_question: "Screen the owner-admitted Curation source snapshot.".to_owned(),
+        requester: "kernel-test-owner".to_owned(),
+        scope_id: scope_id.to_owned(),
+        task_id: Some(task_id),
+        state_fence: state_fence.clone(),
+        evidence_handles: vec![format!("source:{job_id}")],
+        memory_handles: Vec::new(),
+        architecture_handles: Vec::new(),
+        implementation_handles: Vec::new(),
+        conformance_handles: Vec::new(),
+        conflicts_and_unknowns: Vec::new(),
+        privacy_profile: PRIVACY_LOCAL_ONLY.to_owned(),
+        allowed_tools: Vec::new(),
+        allowed_model_routes: vec!["owner-native-curation".to_owned()],
+        budget_units: 1,
+        deadline_ms: 1_000,
+        output_schema: "native-curation-screen.v1".to_owned(),
+        forbidden_effects: vec!["semantic-mutation".to_owned()],
+    };
+    let screen_binding = ScreenBinding {
+        request_id: RequestId::new(request_id).expect("screen request identity"),
+        receipt_id: eliot_contracts::ReceiptId::new(format!("receipt-{request_id}"))
+            .expect("screen receipt identity"),
+        screened_targets: vec![member_id.as_str().to_owned()],
+        source_snapshot: source.identity.snapshot_id.as_str().to_owned(),
+        source_revision: source.identity.revision.to_string(),
+        profile: request.profile.profile_id.as_str().to_owned(),
+        task_id: request
+            .binding
+            .task_id
+            .as_ref()
+            .expect("owner task binding")
+            .as_str()
+            .to_owned(),
+        scope_id: scope_id.to_owned(),
+        state_fence: state_fence.clone(),
+        state: ScreenState::Eligible,
+        result_digest: "14".repeat(32),
+        item_digest: "15".repeat(32),
+    };
+    let evidence = ProtectionEvidence {
+        evidence_id: ProtectionEvidenceId::new(format!("evidence-{job_id}"))
+            .expect("evidence identity"),
+        member_id,
+        source_id: source.identity.source_id.clone(),
+        snapshot_id: source.identity.snapshot_id.clone(),
+        class: ProtectionClass::CurrentTruth,
+        state: ProtectionEvidenceState::CurrentVerified,
+        outcome: ProtectionOutcome::Absent,
+        references: std::collections::BTreeSet::from([ArtifactId::new(format!(
+            "protection-{job_id}"
+        ))
+        .expect("protection artifact")]),
+        state_fence: state_fence.clone(),
+        scope: source_scope,
+        disclosure_ceiling: DisclosureCeiling::ReferenceOnly,
+        invalidated_by: None,
+        digest: eliot_memory_curation_contracts::Digest::new(&"16".repeat(32))
+            .expect("evidence digest"),
+    };
+    let mut material = AdmittedCurationMaterial {
+        admission,
+        job,
+        screen_binding,
+        request,
+        source,
+        protection_evidence: vec![evidence],
+        omissions: vec![format!("owner-omission:{job_id}")],
+        source_manifest_digest: String::new(),
+    };
+    material.bind_frozen_manifest().expect("fixture manifest binds");
+    material
+}
+
 /// Bounds third-party error detail carried into deny lines.
 #[allow(
     dead_code,
@@ -938,7 +1195,9 @@ mod dreamer_dispatch_launch_tests {
     }
 
     fn test_fence() -> StateFence {
-        StateFence::new(test_epoch(1), ResourceGeneration::genesis())
+        let mut fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+        fence.policy_revision = Some(eliot_contracts::PolicyRevision::genesis());
+        fence
     }
 
     fn test_grant(epoch: &EpochId, generation: u64, identity_digest: &str) -> DispatchGrant {
@@ -973,12 +1232,23 @@ mod dreamer_dispatch_launch_tests {
         .expect("nonce mints");
         let identity_digest =
             crate::sha256_hex(format!("dreamer-launch|{job_tag}|attempt-t12-09-01|1").as_bytes());
+        let short = identity_digest.get(..16).expect("short identity");
+        let admitted_curation = test_admitted_curation_material(
+            job_tag,
+            "attempt-t12-09-01",
+            "scope-t12-09",
+            "request-t12-09",
+            "operation-t12-09",
+            &format!("dreamer-launch-lease-{short}"),
+            &test_fence(),
+        );
         DreamerDispatchedEnvelope {
             job_id: job_tag.to_owned(),
             attempt_id: "attempt-t12-09-01".to_owned(),
             revision: 1,
             scope_id: "scope-t12-09".to_owned(),
             fence: test_fence(),
+            admitted_curation,
             epoch: epoch.clone(),
             generation,
             nonce,
@@ -1073,6 +1343,7 @@ mod dreamer_dispatch_launch_tests {
             revision: 1,
             scope_id: "scope-lineage".to_owned(),
             fence: fence.clone(),
+            admitted_curation_digest: "17".repeat(32),
             executable_sha256: "ef".repeat(32),
             material_path: None,
             nonce: "dreamer-dispatch-lineage-nonce".to_owned(),

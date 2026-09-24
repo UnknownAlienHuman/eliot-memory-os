@@ -1289,6 +1289,60 @@ fn possible_effect_stays_same_operation_reconciliation() {
     assert!(done.next_state.pending.is_empty());
 }
 
+#[test]
+fn plan_reprojects_accepted_and_unknown_reconciliation_requests() {
+    let fence = fence();
+    let policy = policy(&fence, "bundle_validation");
+    for disposition in [OutcomeDisposition::Accepted, OutcomeDisposition::Unknown] {
+        let request = pending(&policy);
+        let current = state(&policy, request.clone());
+        let observed_receipt = match disposition {
+            OutcomeDisposition::Accepted => receipt(
+                &request,
+                ReceiptDisposition::Success {
+                    proof: ProofCeiling::Observation,
+                },
+                None,
+            ),
+            OutcomeDisposition::Unknown => receipt(
+                &request,
+                ReceiptDisposition::Unknown {
+                    reason: "owner outcome is unresolved".to_owned(),
+                },
+                None,
+            ),
+            _ => unreachable!("the matrix contains only reconciliation dispositions"),
+        };
+        let observed = outcome(
+            &request,
+            observed_receipt.clone(),
+            disposition,
+            disposition == OutcomeDisposition::Unknown,
+        );
+        let step = step_dreamer_cycle(&current, &[observed], &policy).unwrap();
+        assert_eq!(step.disposition, StepDisposition::ReconciliationRequired);
+        let sample = sample_cycle(
+            &step.next_state,
+            &policy,
+            &SampleLimits { max_sampled: 1 },
+        )
+        .unwrap();
+        let plan = plan_cycle(&sample, &step.next_state, &policy, None).unwrap();
+        assert_eq!(plan.requests.len(), 1);
+        assert_eq!(plan.requests[0].operation_id, request.operation_id);
+        assert_eq!(plan.requests[0].kind, RequestKind::EffectReconciliation);
+        assert_eq!(
+            plan.requests[0].predecessor_receipt_id,
+            Some(observed_receipt.identity.receipt_id.clone())
+        );
+        assert_eq!(
+            plan.requests[0].reason,
+            "reconcile the same operation; do not issue a replacement retry"
+        );
+        assert_eq!(plan.experiments[0].kind, ExperimentKind::ReconciliationProbe);
+    }
+}
+
 // WORK_UNIT_CASE: 806/9
 #[test]
 fn missing_observation_remains_unknown_without_progress() {

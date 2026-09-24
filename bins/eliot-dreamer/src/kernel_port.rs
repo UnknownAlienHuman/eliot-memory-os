@@ -60,6 +60,7 @@ use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::{
     ClockReading, EpochId, ProductId, RequestId, RequestMetadata, SourceId, StateFence, sha256_hex,
 };
+use eliot_dreamer_contracts::AdmittedCurationMaterial;
 use eliot_platform::ClockObservation;
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
@@ -176,6 +177,9 @@ pub(crate) struct DreamerDispatchedEnvelope {
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
     pub(crate) fence: StateFence,
+    /// Owner-admitted Curation job, A-20 binding, and native source/evidence
+    /// closure carried through the protected launch seam.
+    pub(crate) admitted_curation: AdmittedCurationMaterial,
     /// Live authority epoch bound at launch (never envelope bytes alone).
     pub(crate) epoch: EpochId,
     /// Live activation generation bound at launch (non-zero).
@@ -203,6 +207,10 @@ pub(crate) struct ValidatedDreamerMaterial {
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job.
     pub(crate) fence: StateFence,
+    /// Fully revalidated owner-admitted Curation semantic/source closure.
+    /// Production envelopes always carry `Some`; direct unit-test material
+    /// may omit it only to exercise fail-closed claim/admission boundaries.
+    pub(crate) admitted_curation: Option<AdmittedCurationMaterial>,
     /// Live epoch this material bound against.
     pub(crate) epoch: EpochId,
     /// Generation this material bound against.
@@ -438,12 +446,25 @@ fn validate_envelope(
     }
     validate_nonce(&envelope.nonce)?;
     validate_grant(&envelope.grant, live_epoch, envelope.generation)?;
+    envelope
+        .admitted_curation
+        .validate_for_launch(
+            &envelope.job_id,
+            &envelope.attempt_id,
+            envelope.admitted_curation.request.binding.request_id.as_str(),
+            envelope.admitted_curation.admission.operation_id.as_str(),
+            &envelope.grant.idempotency_key,
+            &envelope.scope_id,
+            &envelope.fence,
+        )
+        .map_err(|error| KernelPortError::InvalidMaterial(error.to_string()))?;
     Ok(ValidatedDreamerMaterial {
         job_id: envelope.job_id.clone(),
         attempt_id: envelope.attempt_id.clone(),
         revision: envelope.revision,
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
+        admitted_curation: Some(envelope.admitted_curation.clone()),
         epoch: envelope.epoch.clone(),
         generation: envelope.generation,
         nonce: envelope.nonce.clone(),

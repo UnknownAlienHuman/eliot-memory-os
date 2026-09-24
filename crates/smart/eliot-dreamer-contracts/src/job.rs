@@ -11,7 +11,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, fences_match_exact};
 #[cfg(test)]
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
 #[cfg(test)]
@@ -223,6 +223,33 @@ impl DreamJobInput {
             return Err(ContractViolation::MissingField("allowed_model_routes"));
         }
         check_fence(&self.state_fence)?;
+        Ok(())
+    }
+
+    /// Validates that this semantic input belongs to the exact closed intake
+    /// envelope that admitted it. The two I9.4 objects remain distinct, but
+    /// class, requester, task, scope, privacy, deadline, and fence must agree
+    /// without a synthesized task, class, or fence.
+    pub fn validate_against(&self, admission: &DreamJobAdmission) -> Result<(), ContractViolation> {
+        self.validate()?;
+        admission.validate()?;
+        let deadline_matches = admission
+            .deadline_ms
+            .and_then(|deadline| u64::try_from(self.deadline_ms).ok().map(|value| value == deadline))
+            .unwrap_or(false);
+        if self.job_class != admission.job_class
+            || self.requester != admission.requester.principal
+            || self.task_id.as_deref() != Some(admission.task_id.as_str())
+            || self.scope_id != admission.scope_id
+            || self.privacy_profile != admission.privacy_profile
+            || !deadline_matches
+            || !fences_match_exact(&self.state_fence, &admission.state_fence)
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "job_admission.binding",
+                reason: "semantic input differs from the admitted class, requester, task, scope, privacy, deadline, or fence".to_owned(),
+            });
+        }
         Ok(())
     }
 }
