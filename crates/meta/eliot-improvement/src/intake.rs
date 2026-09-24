@@ -10,9 +10,11 @@
 use crate::application_class::{ChangeDescriptor, check_class_gate, classify};
 use crate::brief::{ImprovementBrief, SafeBoundary, brief_at_safe_boundary};
 use crate::budget_proof::{BudgetProof, require_matched_budget_for_promotion};
-use crate::candidate_bounds::{AdmitOutcome, BoundedBacklog};
+use crate::candidate_bounds::{
+    AdmitOutcome, ArchiveCause, ArchivedCandidate, BoundedBacklog, BoundsError,
+};
 use crate::evidence_sources::{SourcedEvidence, candidate_from_evidence};
-use crate::{ImprovementError, ImprovementSurface, ReplayPlan};
+use crate::{ImprovementError, ImprovementLifecycle, ImprovementSurface, ReplayPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -54,6 +56,41 @@ pub struct IntakeOutcome {
     pub admitted: bool,
     pub merged_into: Option<String>,
     pub brief: ImprovementBrief,
+    /// Explicit archive record produced when capacity pressure required
+    /// retiring an already-ineligible active candidate before retrying intake.
+    pub archived_candidate: Option<ArchivedCandidate>,
+}
+
+/// Archive one already-ineligible active entry when the surface is full.
+///
+/// This is deliberately limited to evidence already owned by the candidate
+/// record: an explicit stale lifecycle, an absent normalized owner, or a value
+/// below the existing surface policy floor. A full bound never silently
+/// evicts an owned, high-value candidate.
+fn archive_capacity_candidate(
+    backlog: &mut BoundedBacklog,
+    surface: ImprovementSurface,
+) -> Result<Option<ArchivedCandidate>, BoundsError> {
+    let floor = backlog.policy_for(surface)?.min_value;
+    let selected = backlog.active_for(surface).into_iter().find_map(|entry| {
+        let cause = if entry.candidate.lifecycle == ImprovementLifecycle::Stale {
+            ArchiveCause::Stale
+        } else if entry.owner.is_none() {
+            ArchiveCause::Ownerless
+        } else if entry.value < floor {
+            ArchiveCause::LowValue
+        } else {
+            return None;
+        };
+        Some((entry.candidate.candidate_id.clone(), cause))
+    });
+    let Some((candidate_id, cause)) = selected else {
+        return Ok(None);
+    };
+    let summary = format!(
+        "capacity bound reached; archived {cause:?} candidate {candidate_id} with explicit lifecycle transition"
+    );
+    backlog.archive(&candidate_id, cause, summary).map(Some)
 }
 
 pub fn intake_from_evidence(
@@ -134,9 +171,26 @@ pub fn intake_from_evidence(
         migration_proof_ref.as_deref(),
     )?;
     require_matched_budget_for_promotion(Some(&budget_proof))?;
-    let outcome = backlog
-        .admit(candidate, value, owner)
-        .map_err(|e| ImprovementError::BacklogRefused(e.to_string()))?;
+    let (outcome, archived_candidate) = match backlog.admit(candidate.clone(), value, owner.clone())
+    {
+        Ok(outcome) => (outcome, None),
+        Err(error @ BoundsError::BoundExceeded { .. }) => {
+            let archived =
+                archive_capacity_candidate(backlog, target_surface).map_err(|archive_error| {
+                    ImprovementError::BacklogRefused(archive_error.to_string())
+                })?;
+            if archived.is_none() {
+                return Err(ImprovementError::BacklogRefused(error.to_string()));
+            }
+            let outcome = backlog
+                .admit(candidate, value, owner)
+                .map_err(|retry_error| ImprovementError::BacklogRefused(retry_error.to_string()))?;
+            (outcome, archived)
+        }
+        Err(error) => {
+            return Err(ImprovementError::BacklogRefused(error.to_string()));
+        }
+    };
     let (candidate_id, admitted, merged_into) = match outcome {
         AdmitOutcome::Admitted { candidate_id } => (candidate_id, true, None),
         AdmitOutcome::Merged {
@@ -149,5 +203,6 @@ pub fn intake_from_evidence(
         admitted,
         merged_into,
         brief,
+        archived_candidate,
     })
 }
