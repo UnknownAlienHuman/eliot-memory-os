@@ -1776,6 +1776,8 @@ pub enum AdmittedAttemptError {
     AttemptTerminal,
     #[error("child session {child_id} remains open; parent cannot close")]
     OpenChildSession { child_id: String },
+    #[error("admitted slot continuity broken between dispatch and seal")]
+    SlotMismatch,
     #[error("read-only run request is invalid: {0}")]
     RequestRejected(RunRequestError),
     #[error("sealed candidate rejects the run result: {reason}")]
@@ -2046,17 +2048,33 @@ fn slot_digest(value: &impl Serialize) -> String {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmittedSlotConsumption {
-    pub attempt_id: AgentAttemptId,
-    pub lease_digest: String,
-    pub fence_digest: String,
-    pub generation_digest: String,
-    pub consumed: bool,
+    attempt_id: AgentAttemptId,
+    lease_digest: String,
+    fence_digest: String,
+    generation_digest: String,
+    consumed: bool,
 }
 
 impl AdmittedSlotConsumption {
     /// Returns the exact admitted attempt identity this slot was consumed for.
     pub fn attempt_id(&self) -> &AgentAttemptId {
         &self.attempt_id
+    }
+
+    /// Confirms the consumed slot still matches the governing admission.
+    /// By-value so one snapshot confirms at most once: a dispatch/seal gap
+    /// that changed attempt, lease, fence, or generation rejects with
+    /// [`AdmittedAttemptError::SlotMismatch`].
+    pub fn confirm(self, admitted: &AdmittedOpenCodeAttempt) -> Result<(), AdmittedAttemptError> {
+        if self.attempt_id != admitted.admission.attempt_id
+            || self.lease_digest != slot_digest(&admitted.admission.lease_id)
+            || self.fence_digest != slot_digest(&admitted.admission.state_fence)
+            || self.generation_digest != slot_digest(&admitted.admission.runtime_generation)
+            || !self.consumed
+        {
+            return Err(AdmittedAttemptError::SlotMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -2067,8 +2085,10 @@ pub fn ensure_no_open_child_sessions(
     parent_session_id: &str,
     children: &[(String, bool)],
 ) -> Result<(), AdmittedAttemptError> {
-    let _ = parent_session_id;
     for (child_id, is_open) in children {
+        if child_id == parent_session_id {
+            continue;
+        }
         if *is_open {
             return Err(AdmittedAttemptError::OpenChildSession {
                 child_id: child_id.clone(),

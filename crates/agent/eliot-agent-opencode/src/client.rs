@@ -1,11 +1,12 @@
 use crate::{
-    AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedOpenCodeAttempt, AuthorityCeiling,
-    BasicAuth, HealthResponse, HttpMethod, HttpRequest, LoopbackEndpoint, LoopbackHttpClient,
-    LoopbackHttpError, ModelSelection, NoAuthorityRunResult, OpenCodeEvent,
-    OpenCodeWireRouteReceipt, ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest,
-    RunRequestError, RunStatus, Session, SessionDiff, SessionStatus, SessionStatusMap,
-    SseConnection, SseDecodeError, SseDecoder, SseLimits, UnknownFields, UsageAvailability,
-    UsageTelemetry,
+    AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedObservation, AdmittedObservationKind,
+    AdmittedOpenCodeAttempt, AuthorityCeiling, BasicAuth, EnvironmentAllowlist,
+    ExecutableFingerprint, HealthResponse, HttpMethod, HttpRequest, LoopbackEndpoint,
+    LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
+    OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE, OpenCodeEvent, OpenCodeWireRouteReceipt,
+    ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError, RunStatus, Session,
+    SessionDiff, SessionStatus, SessionStatusMap, SseConnection, SseDecodeError, SseDecoder,
+    SseLimits, UnknownFields, UsageAvailability, UsageTelemetry,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
 use serde_json::{Value, json};
@@ -166,6 +167,14 @@ impl OpenCodeRunPolicy {
                 "OpenCode environment allowlist entries must be nonblank".to_owned(),
             ));
         }
+        if let Some(fingerprint) = &self.executable_fingerprint {
+            ExecutableFingerprint::new(fingerprint.clone()).map_err(|error| {
+                OpenCodeRunError::InvalidPolicy(format!(
+                    "OpenCode executable fingerprint is invalid: {error}"
+                ))
+            })?;
+        }
+        let _allowlist = EnvironmentAllowlist::new(self.environment_allowlist.clone());
         Ok(())
     }
 }
@@ -554,6 +563,13 @@ impl OpenCodeClient {
         &self,
         request: &ReadOnlyRunRequest,
     ) -> Result<NoAuthorityRunResult, OpenCodeRunError> {
+        Ok(self.execute_read_only(request).await?.0)
+    }
+
+    async fn execute_read_only(
+        &self,
+        request: &ReadOnlyRunRequest,
+    ) -> Result<(NoAuthorityRunResult, SessionStatusMap), OpenCodeRunError> {
         request.validate()?;
         self.policy.validate()?;
         let deadline = Instant::now() + self.policy.overall_timeout;
@@ -590,7 +606,7 @@ impl OpenCodeClient {
             Ok(collection) => collection,
             Err(failure) => {
                 if failure.may_reconcile_success
-                    && let Ok(projection) = self
+                    && let Ok((projection, statuses)) = self
                         .reconcile_success(
                             &prepared.session.id,
                             &prepared.message_id,
@@ -601,7 +617,10 @@ impl OpenCodeClient {
                         )
                         .await
                 {
-                    return Ok(self.success_result(request, prepared, projection, failure.events));
+                    return Ok((
+                        self.success_result(request, prepared, projection, failure.events),
+                        statuses,
+                    ));
                 }
                 return self
                     .fail_after_dispatch(
@@ -614,7 +633,7 @@ impl OpenCodeClient {
             }
         };
 
-        let projection = self
+        let (projection, statuses) = self
             .reconcile_success(
                 &prepared.session.id,
                 &prepared.message_id,
@@ -624,7 +643,10 @@ impl OpenCodeClient {
                 &prepared.baseline_diff,
             )
             .await?;
-        Ok(self.success_result(request, prepared, projection, collection.events))
+        Ok((
+            self.success_result(request, prepared, projection, collection.events),
+            statuses,
+        ))
     }
 
     /// Runs one admitted read-only attempt through the supervised loopback
@@ -653,30 +675,56 @@ impl OpenCodeClient {
     ) -> Result<AdmittedAttemptOutcome, AdmittedAttemptError> {
         admitted.verify(current_fence, runtime_generation)?;
         admitted.verify_request(request)?;
-        let _slot = admitted.consume_one_slot();
-        let run = self.run_read_only(request).await?;
-        if let Some(session_id) = &run.session_id {
-            let statuses = self.session_statuses().await.map_err(|error| {
-                OpenCodeRunError::Protocol(format!(
-                    "admitted child-session gate could not list session statuses: {error}"
-                ))
-            })?;
-            let children: Vec<(String, bool)> = statuses
-                .iter()
-                .filter(|(id, _)| id.as_str() != session_id)
-                .map(|(id, status)| {
-                    let is_open = !matches!(status, SessionStatus::Idle { .. });
-                    (id.clone(), is_open)
-                })
-                .collect();
-            crate::ensure_no_open_child_sessions(session_id, &children)?;
-        }
-        let candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
-        let _observation = crate::AdmittedObservation::new(
-            admitted,
-            crate::AdmittedObservationKind::Terminal,
-            candidate.compute_digest()?.to_string(),
+        let slot = admitted.consume_one_slot();
+        let (mut run, statuses) = self.execute_read_only(request).await?;
+        let Some(session_id) = run.session_id.clone() else {
+            return Err(AdmittedAttemptError::Run(OpenCodeRunError::Protocol(
+                "admitted run returned no session identity".to_owned(),
+            )));
+        };
+        let children: Vec<(String, bool)> = statuses
+            .iter()
+            .filter(|(id, _)| id.as_str() != session_id)
+            .map(|(id, status)| {
+                let is_open = !matches!(status, SessionStatus::Idle { .. });
+                (id.clone(), is_open)
+            })
+            .collect();
+        crate::ensure_no_open_child_sessions(&session_id, &children)?;
+        // The sealed candidate is the terminal observation: attempt-bound
+        // heartbeat/progress/quota summaries sealed into the result extra,
+        // reusing the already-reconciled status map with no new HTTP call.
+        let observations = vec![
+            AdmittedObservation::new(
+                admitted,
+                AdmittedObservationKind::Heartbeat,
+                format!(
+                    "{} correlated events observed; stream complete",
+                    run.events.len()
+                ),
+            ),
+            AdmittedObservation::new(
+                admitted,
+                AdmittedObservationKind::Progress,
+                "correlated completion reconciled; terminal disposition reached".to_owned(),
+            ),
+            AdmittedObservation::new(
+                admitted,
+                AdmittedObservationKind::Quota,
+                format!("{:?}", run.quota),
+            ),
+        ];
+        run.extra.insert(
+            "admitted_observations".to_owned(),
+            serde_json::to_value(&observations)
+                .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
         );
+        run.extra.insert(
+            "edge".to_owned(),
+            Value::String(OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE.to_owned()),
+        );
+        let candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
+        slot.confirm(admitted)?;
         Ok(AdmittedAttemptOutcome { run, candidate })
     }
 
@@ -910,8 +958,8 @@ impl OpenCodeClient {
         requested_model: &ModelSelection,
         expected_output_schema: &Value,
         baseline_diff: &[SessionDiff],
-    ) -> Result<MessageProjection, OpenCodeRunError> {
-        self.wait_until_idle(session_id).await?;
+    ) -> Result<(MessageProjection, SessionStatusMap), OpenCodeRunError> {
+        let statuses = self.wait_until_idle(session_id).await?;
         let messages = timeout(RECONCILIATION_CALL_TIMEOUT, self.messages(session_id))
             .await
             .map_err(|_| OpenCodeRunError::Timeout {
@@ -931,10 +979,13 @@ impl OpenCodeClient {
                 phase: "diff reconciliation",
             })??;
         attest_unchanged_diff(baseline_diff, &diff)?;
-        Ok(projection)
+        Ok((projection, statuses))
     }
 
-    async fn wait_until_idle(&self, session_id: &str) -> Result<(), OpenCodeRunError> {
+    async fn wait_until_idle(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionStatusMap, OpenCodeRunError> {
         let deadline = Instant::now() + RECONCILIATION_TIMEOUT;
         loop {
             let statuses = timeout(RECONCILIATION_CALL_TIMEOUT, self.session_statuses())
@@ -943,7 +994,7 @@ impl OpenCodeClient {
                     phase: "status reconciliation",
                 })??;
             match statuses.get(session_id) {
-                Some(SessionStatus::Idle { .. }) => return Ok(()),
+                Some(SessionStatus::Idle { .. }) => return Ok(statuses),
                 None => {
                     let session =
                         timeout(RECONCILIATION_CALL_TIMEOUT, self.get_session(session_id))
@@ -962,7 +1013,7 @@ impl OpenCodeClient {
                                 .to_owned(),
                         ));
                     }
-                    return Ok(());
+                    return Ok(statuses);
                 }
                 Some(SessionStatus::Unknown { kind, .. }) => {
                     return Err(OpenCodeRunError::Protocol(format!(
@@ -1015,7 +1066,7 @@ impl OpenCodeClient {
             .map_err(|_| OpenCodeRunError::Timeout {
                 phase: "abort acknowledgement",
             })??;
-        self.wait_until_idle(session_id).await?;
+        self.wait_until_idle(session_id).await.map(|_| ())?;
         let messages = timeout(RECONCILIATION_CALL_TIMEOUT, self.messages(session_id))
             .await
             .map_err(|_| OpenCodeRunError::Timeout {

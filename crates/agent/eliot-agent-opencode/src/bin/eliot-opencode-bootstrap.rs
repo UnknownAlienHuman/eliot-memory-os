@@ -15,7 +15,7 @@ use std::process::ExitCode;
 const MAX_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 const PROVIDER_ID: &str = "opencode-go";
 const MODEL_ID: &str = "deepseek-v4-flash";
-const USAGE: &str = "usage: eliot-opencode-bootstrap <loopback-endpoint> <absolute-directory> <prompt-file>\n       eliot-opencode-bootstrap --admitted <loopback-endpoint> <absolute-directory> <prompt-file> <admission-envelope-json-file>";
+const USAGE: &str = "usage: eliot-opencode-bootstrap <loopback-endpoint> <absolute-directory> <prompt-file>\n       eliot-opencode-bootstrap --admitted <loopback-endpoint> <absolute-directory> <prompt-file> <admission-envelope-json-file>\n\noptional admitted-route environment:\n  ELIOT_OPENCODE_EXECUTABLE_FP  expected server executable fingerprint\n  ELIOT_OPENCODE_ENV_ALLOWLIST  comma-separated environment allowlist";
 
 #[derive(Debug, Eq, PartialEq)]
 struct CliArgs {
@@ -302,8 +302,41 @@ async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
     let model = model_selection()?;
     let request = ReadOnlyRunRequest::new(prompt, model.clone())
         .map_err(|error| CliError::Request(sanitize_error(&error.to_string(), &password)))?;
-    let policy = OpenCodeRunPolicy::new(args.directory)
+    let mut policy = OpenCodeRunPolicy::new(args.directory)
         .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), &password)))?;
+    match std::env::var("ELIOT_OPENCODE_EXECUTABLE_FP") {
+        Ok(fingerprint) => {
+            if fingerprint.trim().is_empty() {
+                return Err(CliError::Environment("ELIOT_OPENCODE_EXECUTABLE_FP"));
+            }
+            policy = policy.with_executable_fingerprint(fingerprint);
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(CliError::Environment("ELIOT_OPENCODE_EXECUTABLE_FP"));
+        }
+    }
+    match std::env::var("ELIOT_OPENCODE_ENV_ALLOWLIST") {
+        Ok(allowlist) => {
+            if allowlist.trim().is_empty() {
+                return Err(CliError::Environment("ELIOT_OPENCODE_ENV_ALLOWLIST"));
+            }
+            let entries: Vec<String> = allowlist
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if entries.is_empty() {
+                return Err(CliError::Environment("ELIOT_OPENCODE_ENV_ALLOWLIST"));
+            }
+            policy = policy.with_environment_allowlist(entries);
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(CliError::Environment("ELIOT_OPENCODE_ENV_ALLOWLIST"));
+        }
+    }
     let client = OpenCodeClient::new(endpoint, auth, policy)
         .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), &password)))?;
     // Single production caller of the admitted read-only path: construction
