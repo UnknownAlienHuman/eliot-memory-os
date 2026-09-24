@@ -1500,10 +1500,10 @@ mod tests {
 
     use std::num::NonZeroU64;
 
-    use eliot_contracts::EpochLineageId;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use eliot_kernel_core::{
-        CapabilityReadiness, DurableCompatibilityState, NormativePairReceipt, ProcessHealthVector,
-        StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
+        CapabilityReadiness, DurableCompatibilityState, NormativePairReceipt, ProcessHealthStatus,
+        ProcessHealthVector, StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
     };
     use eliot_runtime_contracts::{
         GenerationCutoverState, HealthDimension, HealthVector, ModuleGenerationState,
