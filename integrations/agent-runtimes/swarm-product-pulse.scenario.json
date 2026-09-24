@@ -220,10 +220,10 @@
       "attempt_id": "attempt:antigravity-001",
       "provider_cancel_requested": false,
       "terminal_readback": "simulated_not_started",
-      "process_tree_closed": true,
-      "descendants_closed": true,
+      "expected_process_tree_closed": true,
+      "expected_descendants_closed": true,
       "unknown_live_descendants": false,
-      "outcome": "cancelled_confirmed"
+      "outcome": "expected_cancelled_confirmed"
     }
   ],
   "mailbox": [
