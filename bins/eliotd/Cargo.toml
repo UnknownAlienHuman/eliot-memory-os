@@ -40,6 +40,7 @@ eliot-instrument-api.workspace = true
 eliot-testd-core.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
+eliot-kernel-service.workspace = true
 eliot-learning-contracts.workspace = true
 eliot-maintenance.workspace = true
 eliot-memory-quality = { path = "../../crates/smart/eliot-memory-quality", version = "0.1.0" }

@@ -3419,6 +3419,7 @@ dependencies = [
  "eliot-instrument-api",
  "eliot-ipc",
  "eliot-kernel-core",
+ "eliot-kernel-service",
  "eliot-learning-contracts",
  "eliot-maintenance",
  "eliot-memory-quality",
