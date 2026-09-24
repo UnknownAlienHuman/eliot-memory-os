@@ -8,18 +8,18 @@ use eliot_learning_activation_assessment::{
     MAX_INPUT_BYTES, MAX_METRICS, MAX_OUTPUT_BYTES, MAX_STAGES, MissingAssessmentField,
 };
 use eliot_learning_contracts::{
-    AgentAttemptId, AssessmentDimension, CampaignActiveOverlayPolicy, CampaignHarnessOverlayCandidate,
-    CampaignHistoryPlanReference, CampaignId, CampaignLearningStateProvenance,
-    CampaignLearningStateView, CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind,
-    CampaignPositionRef, CampaignSourceRequirement, CampaignSourceResolution,
-    CampaignSlotProjectionDigest, CampaignSourceBinding, CampaignSourceResolutionStatus,
-    CampaignSourceRevisionRef,
-    CampaignSourceRole, CausalCeiling, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+    AgentAttemptId, AssessmentDimension, CampaignActiveOverlayPolicy,
+    CampaignHarnessOverlayCandidate, CampaignHistoryPlanReference, CampaignId,
+    CampaignLearningStateProvenance, CampaignLearningStateView, CampaignOwnerRecordId,
+    CampaignOwnerRevision, CampaignPositionKind, CampaignPositionRef, CampaignSlotProjectionDigest,
+    CampaignSourceBinding, CampaignSourceRequirement, CampaignSourceResolution,
+    CampaignSourceResolutionStatus, CampaignSourceRevisionRef, CampaignSourceRole, CausalCeiling,
     ChangeOperation, ChangeSurface, Completeness, DimensionAssessment, DimensionStatus,
     InverseChange, LearningStateViewRecipe, LifecycleStage, MemberId, MemberProjection,
     MetricObservation, OmissionPolicy, OverlayChange, OverlayId, OverlayOrigin, OwnerId,
     ProofCeiling, SlotDisposition, SlotId, SlotProjection, SlotRequirement, SlotSpec,
-    SourceDenominator, StageDisposition, StageObservation, TargetId, ValueState, WorkScopeId,
+    SourceDenominator, StageDisposition, StageObservation, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+    TargetId, ValueState, WorkScopeId,
 };
 
 fn aid(value: &str) -> Result<ArtifactId, Box<dyn std::error::Error>> {
@@ -93,16 +93,31 @@ fn campaign_source_contract(
         (CampaignSourceRole::EvaluatorHoldout, "evaluator-holdout"),
         (CampaignSourceRole::EvaluationResults, "evaluation-results"),
         (CampaignSourceRole::MemoryProjection, "memory-projection"),
-        (CampaignSourceRole::ExperienceProjection, "experience-projection"),
-        (CampaignSourceRole::ArtifactProjection, "artifact-projection"),
+        (
+            CampaignSourceRole::ExperienceProjection,
+            "experience-projection",
+        ),
+        (
+            CampaignSourceRole::ArtifactProjection,
+            "artifact-projection",
+        ),
         (CampaignSourceRole::FrozenAnchor, "frozen-anchor"),
         (CampaignSourceRole::StableHarness, "stable-harness"),
         (CampaignSourceRole::TaskFamilyHarness, "task-family-harness"),
         (CampaignSourceRole::ActiveOverlay, "active-overlay"),
         (CampaignSourceRole::CurrentPosition, "current-position"),
-        (CampaignSourceRole::ExperiencePosition, "experience-position"),
-        (CampaignSourceRole::AdaptationPosition, "adaptation-position"),
-        (CampaignSourceRole::EvaluationPosition, "evaluation-position"),
+        (
+            CampaignSourceRole::ExperiencePosition,
+            "experience-position",
+        ),
+        (
+            CampaignSourceRole::AdaptationPosition,
+            "adaptation-position",
+        ),
+        (
+            CampaignSourceRole::EvaluationPosition,
+            "evaluation-position",
+        ),
         (CampaignSourceRole::EconomicsProgress, "economics-progress"),
     ];
     let mut source_requirements = Vec::with_capacity(roles.len());
@@ -123,9 +138,7 @@ fn campaign_source_contract(
                 | CampaignSourceRole::TaskOpenItems => {
                     CampaignOwnerRecordId::Task(binding.task_id.clone())
                 }
-                _ => CampaignOwnerRecordId::Artifact(aid(&format!(
-                    "source-record-{tag}-{label}"
-                ))?),
+                _ => CampaignOwnerRecordId::Artifact(aid(&format!("source-record-{tag}-{label}"))?),
             };
             let content_digest = digest(&format!("source-content-{tag}-{label}"));
             Some(CampaignSourceRevisionRef {
@@ -144,7 +157,11 @@ fn campaign_source_contract(
                 owner: owner.clone(),
                 record_id: CampaignOwnerRecordId::Task(binding.task_id.clone()),
                 revision: CampaignOwnerRevision::Task(
-                    binding.state_fence.task_revision.clone().expect("task anchor revision"),
+                    binding
+                        .state_fence
+                        .task_revision
+                        .clone()
+                        .expect("task anchor revision"),
                 ),
                 content_digest: digest(&format!("task-anchor-{tag}")),
                 slot_projection_digests: vec![],
@@ -336,9 +353,9 @@ fn owner_revision(
         }
         CampaignSourceRole::MemoryProjection
         | CampaignSourceRole::StableHarness
-        | CampaignSourceRole::TaskFamilyHarness => CampaignOwnerRevision::ResourceGeneration(
-            binding.state_fence.resource_generation,
-        ),
+        | CampaignSourceRole::TaskFamilyHarness => {
+            CampaignOwnerRevision::ResourceGeneration(binding.state_fence.resource_generation)
+        }
         CampaignSourceRole::FrozenAnchor | CampaignSourceRole::ArtifactProjection => {
             CampaignOwnerRevision::ResourceSnapshot(content_digest.to_owned())
         }

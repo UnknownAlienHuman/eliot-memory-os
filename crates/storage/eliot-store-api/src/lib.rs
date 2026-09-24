@@ -11,15 +11,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, ContractId, ResourceGeneration, TaskId, TransactionSequence};
-pub use eliot_learning_contracts::{
-    CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind, CampaignPositionRef,
-    CampaignSlotProjectionDigest, CampaignSourceBinding, CampaignSourceRole,
-    OwnerDisagreement, SlotProjection, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
-};
-pub use eliot_learning_contracts::{CampaignLearningStateView, LearningStateViewRecipe, OwnerId};
 pub use eliot_contracts::{
     ContractError, ContractVersion, ErrorCode, OperationId, RequestMetadata, StateFence,
     canonical_json_bytes, sha256_hex,
+};
+pub use eliot_learning_contracts::{CampaignLearningStateView, LearningStateViewRecipe, OwnerId};
+pub use eliot_learning_contracts::{
+    CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind, CampaignPositionRef,
+    CampaignSlotProjectionDigest, CampaignSourceBinding, CampaignSourceRole, OwnerDisagreement,
+    SlotProjection, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
 };
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, CausalBinding, OperationBinding, ProofCeiling, ReceiptCore,
@@ -813,7 +813,9 @@ pub enum ReadConsistency {
 /// source record. Publisher and consumer edges must decode this body as the
 /// named concrete contract and call its validator; the discriminator by
 /// itself is not owner proof.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CampaignSourceDocumentSchema {
     LearningStateViewRecipe,
@@ -888,9 +890,9 @@ impl CampaignSourceDocument {
             let recipe: LearningStateViewRecipe = serde_json::from_value(self.body.clone())
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             recipe.validate().map_err(|_| StoreError::InvalidField {
-                    field: "campaign_source.learning_state_view_recipe",
-                    reason: "typed recipe validation failed",
-                })?;
+                field: "campaign_source.learning_state_view_recipe",
+                reason: "typed recipe validation failed",
+            })?;
         }
         if self.schema == CampaignSourceDocumentSchema::CampaignLearningStateView {
             let view: CampaignLearningStateView = serde_json::from_value(self.body.clone())
@@ -979,10 +981,7 @@ impl CampaignSourceRecord {
             .validate()
             .map_err(StoreError::Foundation)?;
         self.document.validate()?;
-        validate_campaign_slot_payloads(
-            &self.slot_projection_digests,
-            &self.slot_projections,
-        )?;
+        validate_campaign_slot_payloads(&self.slot_projection_digests, &self.slot_projections)?;
         unique(
             self.required_references.iter().map(ArtifactId::as_str),
             "campaign_source.required_references",
@@ -994,10 +993,12 @@ impl CampaignSourceRecord {
             });
         }
         for disagreement in &self.disagreements {
-            disagreement.validate().map_err(|_| StoreError::InvalidField {
-                field: "campaign_source.disagreements",
-                reason: "contains an invalid owner disagreement",
-            })?;
+            disagreement
+                .validate()
+                .map_err(|_| StoreError::InvalidField {
+                    field: "campaign_source.disagreements",
+                    reason: "contains an invalid owner disagreement",
+                })?;
         }
         if self.history_plans.len() > 64 {
             return Err(StoreError::InvalidField {
@@ -1059,7 +1060,7 @@ struct CampaignSourceRecordDigestInput<'a> {
     document: &'a CampaignSourceDocument,
 }
 
-/// Exact RetrievalPlan plus its bounded result references from an owner read.
+/// Exact `RetrievalPlan` plus its bounded result references from an owner read.
 /// `plan` is decoded as the native
 /// `eliot_reactive_context_plan::RetrievalPlan`
 /// and validated by its owner at both publication and consumption boundaries.
@@ -1089,7 +1090,10 @@ impl CampaignHistoryPlanRecord {
                 reason: "must be a typed RetrievalPlan object",
             });
         }
-        validate_digest(&self.plan_digest, "campaign_source.history_plan.plan_digest")?;
+        validate_digest(
+            &self.plan_digest,
+            "campaign_source.history_plan.plan_digest",
+        )?;
         let bytes = canonical_json_bytes(&self.plan)
             .map_err(|error| StoreError::Serialization(error.to_string()))?;
         let observed = sha256_hex(&bytes);
@@ -1135,11 +1139,16 @@ fn validate_campaign_slot_payloads(
     }
     let mut by_slot = BTreeMap::new();
     for projection in projections {
-        projection.validate().map_err(|_| StoreError::InvalidField {
-            field: "campaign_source.slot_projections",
-            reason: "contains an invalid slot projection",
-        })?;
-        if by_slot.insert(projection.slot_id.as_str(), projection).is_some() {
+        projection
+            .validate()
+            .map_err(|_| StoreError::InvalidField {
+                field: "campaign_source.slot_projections",
+                reason: "contains an invalid slot projection",
+            })?;
+        if by_slot
+            .insert(projection.slot_id.as_str(), projection)
+            .is_some()
+        {
             return Err(StoreError::Duplicate {
                 field: "campaign_source.slot_projections.slot_id",
             });
@@ -1153,10 +1162,13 @@ fn validate_campaign_slot_payloads(
                 field: "campaign_source.slot_projection_digests.slot_id",
             });
         }
-        digest.slot_id.validate().map_err(|_| StoreError::InvalidField {
-            field: "campaign_source.slot_projection_digests.slot_id",
-            reason: "invalid slot identity",
-        })?;
+        digest
+            .slot_id
+            .validate()
+            .map_err(|_| StoreError::InvalidField {
+                field: "campaign_source.slot_projection_digests.slot_id",
+                reason: "invalid slot identity",
+            })?;
         validate_digest(&digest.digest, "campaign_source.slot_projection_digest")?;
         let projection = by_slot.get(slot_id).ok_or(StoreError::InvalidField {
             field: "campaign_source.slot_projection_digests",
@@ -1286,6 +1298,10 @@ fn campaign_head_matches_record_key(
         && head.record_id == record.record_id
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the closed publisher/role matrix keeps each owner rejection explicit"
+)]
 fn campaign_publisher_accepts_record(
     publisher: CampaignSourcePublisher,
     record: &CampaignSourceRecord,
@@ -1329,11 +1345,7 @@ fn campaign_publisher_accepts_record(
             // equality rejects a detached/self-selected outer owner label;
             // the Kernel caller separately requires the exact retained
             // snapshot owner and digest readback before publication.
-            if record
-                .document
-                .body
-                .get("owner_id")
-                .and_then(Value::as_str)
+            if record.document.body.get("owner_id").and_then(Value::as_str)
                 != Some(record.owner_id.as_str())
             {
                 return false;
@@ -1346,7 +1358,12 @@ fn campaign_publisher_accepts_record(
         }
         P::GovernorAuthority
             if !matches!(
-                (record.role, record.owner_id.as_str(), &record.record_id, &record.revision),
+                (
+                    record.role,
+                    record.owner_id.as_str(),
+                    &record.record_id,
+                    &record.revision
+                ),
                 (
                     R::GovernorAdmission,
                     "owner:eliot-governor/canonical",
@@ -1381,29 +1398,45 @@ fn campaign_publisher_accepts_record(
             return false;
         }
         P::TaskController
-        | P::ContextCompiler
         | P::ProductEvaluation
         | P::GovernorAuthority
         | P::ExperienceObservation => {}
     }
     matches!(
         (record.role, &record.record_id, &record.revision),
-        (R::TaskObjective | R::TaskAcceptance | R::TaskPlan | R::TaskOpenItems,
-            CampaignOwnerRecordId::Task(_), CampaignOwnerRevision::Task(_))
-        | (R::GovernorAdmission,
-            CampaignOwnerRecordId::Task(_), CampaignOwnerRevision::Counter(_))
-        | (R::GovernorEpoch,
-            CampaignOwnerRecordId::Resource(_), CampaignOwnerRevision::AuthorityEpoch(_))
-        | (R::GovernorPolicy,
-            CampaignOwnerRecordId::Resource(_), CampaignOwnerRevision::Policy(_))
-        | (R::ExperienceProjection,
-            CampaignOwnerRecordId::Resource(_), CampaignOwnerRevision::Counter(_))
-        | (R::ContextRecipe | R::ContextToolPolicy,
-            CampaignOwnerRecordId::Decision(_), CampaignOwnerRevision::Task(_))
-        | (R::ContextDelivery,
-            CampaignOwnerRecordId::Resource(_), CampaignOwnerRevision::ResourceSnapshot(_))
-        | (R::EvaluatorContract | R::EvaluatorHoldout | R::EvaluationResults,
-            CampaignOwnerRecordId::Contract(_), CampaignOwnerRevision::ResourceSnapshot(_))
+        (
+            R::TaskObjective | R::TaskAcceptance | R::TaskPlan | R::TaskOpenItems,
+            CampaignOwnerRecordId::Task(_),
+            CampaignOwnerRevision::Task(_)
+        ) | (
+            R::GovernorAdmission,
+            CampaignOwnerRecordId::Task(_),
+            CampaignOwnerRevision::Counter(_)
+        ) | (
+            R::GovernorEpoch,
+            CampaignOwnerRecordId::Resource(_),
+            CampaignOwnerRevision::AuthorityEpoch(_)
+        ) | (
+            R::GovernorPolicy,
+            CampaignOwnerRecordId::Resource(_),
+            CampaignOwnerRevision::Policy(_)
+        ) | (
+            R::ExperienceProjection,
+            CampaignOwnerRecordId::Resource(_),
+            CampaignOwnerRevision::Counter(_)
+        ) | (
+            R::ContextRecipe | R::ContextToolPolicy,
+            CampaignOwnerRecordId::Decision(_),
+            CampaignOwnerRevision::Task(_)
+        ) | (
+            R::ContextDelivery,
+            CampaignOwnerRecordId::Resource(_),
+            CampaignOwnerRevision::ResourceSnapshot(_)
+        ) | (
+            R::EvaluatorContract | R::EvaluatorHoldout | R::EvaluationResults,
+            CampaignOwnerRecordId::Contract(_),
+            CampaignOwnerRevision::ResourceSnapshot(_)
+        )
     )
 }
 
@@ -1527,9 +1560,7 @@ impl CampaignSourceRevisionRead {
 
     /// Decode the stable `payload.campaign_source_revision` field of a named
     /// read and require the exact response operation/fence.
-    pub fn from_named_read_response(
-        response: &NamedReadResponse,
-    ) -> Result<Self, StoreError> {
+    pub fn from_named_read_response(response: &NamedReadResponse) -> Result<Self, StoreError> {
         if response.operation != NamedReadOperation::GetCampaignSourceRevision {
             return Err(StoreError::InvalidField {
                 field: "campaign_source_read.operation",
@@ -1580,8 +1611,14 @@ impl CampaignLearningStateViewPublication {
         self.state_fence
             .validate()
             .map_err(StoreError::Foundation)?;
-        validate_text(self.task_id.as_str(), "campaign_learning_state_view.task_id")?;
-        validate_text(self.scope_id.as_str(), "campaign_learning_state_view.scope_id")?;
+        validate_text(
+            self.task_id.as_str(),
+            "campaign_learning_state_view.task_id",
+        )?;
+        validate_text(
+            self.scope_id.as_str(),
+            "campaign_learning_state_view.scope_id",
+        )?;
         validate_digest(
             &self.content_digest,
             "campaign_learning_state_view.content_digest",
@@ -1633,9 +1670,18 @@ pub struct CampaignLearningStateViewLookup {
 impl CampaignLearningStateViewLookup {
     /// Validate selectors; they narrow the read and never grant authority.
     pub fn validate(&self) -> Result<(), StoreError> {
-        validate_text(self.view_id.as_str(), "campaign_learning_state_view_lookup.view_id")?;
-        validate_text(self.task_id.as_str(), "campaign_learning_state_view_lookup.task_id")?;
-        validate_text(self.scope_id.as_str(), "campaign_learning_state_view_lookup.scope_id")
+        validate_text(
+            self.view_id.as_str(),
+            "campaign_learning_state_view_lookup.view_id",
+        )?;
+        validate_text(
+            self.task_id.as_str(),
+            "campaign_learning_state_view_lookup.task_id",
+        )?;
+        validate_text(
+            self.scope_id.as_str(),
+            "campaign_learning_state_view_lookup.scope_id",
+        )
     }
 
     /// Serialize the exact key into the named read parameter map.
@@ -1701,9 +1747,7 @@ impl CampaignLearningStateViewRead {
 
     /// Decode the stable `payload.campaign_learning_state_view` field and
     /// require an exact operation and read fence.
-    pub fn from_named_read_response(
-        response: &NamedReadResponse,
-    ) -> Result<Self, StoreError> {
+    pub fn from_named_read_response(response: &NamedReadResponse) -> Result<Self, StoreError> {
         if response.operation != NamedReadOperation::GetCampaignLearningStateView {
             return Err(StoreError::InvalidField {
                 field: "campaign_learning_state_view_read.operation",
@@ -1730,10 +1774,18 @@ impl CampaignLearningStateViewRead {
 
 fn validate_campaign_record_id(record_id: &CampaignOwnerRecordId) -> Result<(), StoreError> {
     match record_id {
-        CampaignOwnerRecordId::Artifact(value) => validate_text(value.as_str(), "campaign_source.record_id"),
-        CampaignOwnerRecordId::Contract(value) => validate_text(value.as_str(), "campaign_source.record_id"),
-        CampaignOwnerRecordId::Decision(value) => validate_text(value.as_str(), "campaign_source.record_id"),
-        CampaignOwnerRecordId::Task(value) => validate_text(value.as_str(), "campaign_source.record_id"),
+        CampaignOwnerRecordId::Artifact(value) => {
+            validate_text(value.as_str(), "campaign_source.record_id")
+        }
+        CampaignOwnerRecordId::Contract(value) => {
+            validate_text(value.as_str(), "campaign_source.record_id")
+        }
+        CampaignOwnerRecordId::Decision(value) => {
+            validate_text(value.as_str(), "campaign_source.record_id")
+        }
+        CampaignOwnerRecordId::Task(value) => {
+            validate_text(value.as_str(), "campaign_source.record_id")
+        }
         CampaignOwnerRecordId::Resource(value) => validate_text(value, "campaign_source.record_id"),
     }
 }
@@ -1757,7 +1809,10 @@ fn campaign_role_accepts_schema(
             | (R::TaskObjective, D::TaskObjective)
             | (R::TaskAcceptance, D::TaskAcceptance)
             | (R::TaskOpenItems, D::TaskOpenItems)
-            | (R::AttemptLineageLatestOutcomes, D::AttemptLineageLatestOutcomes)
+            | (
+                R::AttemptLineageLatestOutcomes,
+                D::AttemptLineageLatestOutcomes
+            )
             | (R::GovernorAdmission, D::GovernorAdmission)
             | (R::GovernorEpoch, D::GovernorEpoch)
             | (R::GovernorPolicy, D::GovernorPolicy)

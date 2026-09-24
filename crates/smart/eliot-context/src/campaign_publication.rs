@@ -9,9 +9,7 @@ use eliot_context_contracts::{
     SessionDeliverySnapshot,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_learning_contracts::{
-    CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceRole,
-};
+use eliot_learning_contracts::{CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceRole};
 use eliot_protocol::ReactiveContextStage;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,8 +17,7 @@ use thiserror::Error;
 use crate::{ContextError, ContextInput};
 
 /// Canonical owner identity for the immutable Context Compiler recipe.
-pub const CONTEXT_RECIPE_CAMPAIGN_OWNER_ID: &str =
-    "owner:eliot-context/context-compiler";
+pub const CONTEXT_RECIPE_CAMPAIGN_OWNER_ID: &str = "owner:eliot-context/context-compiler";
 
 /// Closed source document selected by the campaign source schema.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -190,9 +187,7 @@ pub fn context_delivery_publication(
         // authenticated delivery owner.
         owner_id: prior_delivery.owner_id.clone(),
         record_id: CampaignOwnerRecordId::Resource(prior_delivery.source_id.as_str().to_owned()),
-        revision: CampaignOwnerRevision::ResourceSnapshot(
-            prior_delivery.snapshot_revision.clone(),
-        ),
+        revision: CampaignOwnerRevision::ResourceSnapshot(prior_delivery.snapshot_revision.clone()),
         recorded_state_fence: prior_delivery.state_fence.clone(),
         document,
         body_digest,
