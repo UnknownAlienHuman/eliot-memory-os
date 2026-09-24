@@ -1,0 +1,17 @@
+{
+  "handle": {
+    "consistency_point": "cp-975-1",
+    "snapshot_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "operation_id": "op-975-begin-1",
+    "idempotency_key": "idem-975-begin-1"
+  },
+  "operation": {
+    "operation_id": "op-975-begin-1",
+    "idempotency_key": "idem-975-begin-1",
+    "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "member_count": 2,
+  "byte_count": 384,
+  "completeness": "COMPLETE",
+  "validation_revision": 1
+}

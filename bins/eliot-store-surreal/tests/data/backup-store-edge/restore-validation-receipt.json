@@ -1,0 +1,25 @@
+{
+  "operation": {
+    "operation_id": "op-975-restore-1",
+    "idempotency_key": "idem-975-restore-1",
+    "canonical_request_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "destination": {
+    "destination_id": "dest-975-1",
+    "destination_class": "ISOLATED_RESTORE",
+    "source_store_id": "store-975-1",
+    "source_installation_id": "install-975-active",
+    "evidence": {
+      "admission_handle": "admit-975-1",
+      "admitted_at_unix_ms": 1700000000000,
+      "purge_policy_revision": 7
+    },
+    "target_schema": "eliot.store.snapshot.v1"
+  },
+  "archive_member_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+  "resolved_members": 2,
+  "unresolved_members": 0,
+  "denominator_members": 2,
+  "completeness": "COMPLETE",
+  "disposition": "COMMITTED"
+}

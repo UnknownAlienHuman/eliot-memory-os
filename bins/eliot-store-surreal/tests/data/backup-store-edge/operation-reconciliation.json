@@ -1,0 +1,10 @@
+{
+  "operation": {
+    "operation_id": "op-975-reconcile-1",
+    "idempotency_key": "idem-975-reconcile-1",
+    "canonical_request_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "first_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "second_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "outcome": "REPLAY_IDENTITY"
+}

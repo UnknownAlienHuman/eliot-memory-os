@@ -38,11 +38,11 @@ use eliot_store_api::{
     NamedReadRequest, NamedReadResponse, OperationIdentity, OperationManifestDigest,
     OrderingHeadExpectation, OrderingScopeId, ReadConsistency, RecoveryRecord, RequestMeta,
     ReservedScopeBinding, ReservedWriteRequest, Resubmission, RevisionHeadExpectation, RevisionKey,
-    ScopeId, ScopeRevisionView, SecurityContext, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreHealthStatus, StoreRecoveryRequest, StoreRequest, TransitionClass,
-    WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
-    WriteReceiptStatus, WriterEpochBinding, bind_issue18_digests, render_semantic_source_revisions,
-    sha256_hex,
+    ScopeId, ScopeRevisionView, SecurityContext, StoreBackupOperation, StoreBackupRequest,
+    StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
+    StoreRequest, TransitionClass, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
+    WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus, WriterEpochBinding,
+    bind_issue18_digests, render_semantic_source_revisions, sha256_hex,
 };
 use serde_json::{Value, json};
 
@@ -786,6 +786,29 @@ fn dreamer_wire_request() -> StoreRequest {
     }
 }
 
+/// Minimal backup wire request (issue #975).
+///
+/// The `Status` operation carries no fenced payload beyond the context, so
+/// it is the smallest shape that still proves the closed `Backup` variant,
+/// its fixed `op` tag, and its declared-but-unadvertised capability. The
+/// envelope identity matches the status operation, satisfying the #975
+/// envelope/payload coherence rule.
+fn backup_wire_request() -> StoreRequest {
+    StoreRequest::Backup {
+        request: StoreBackupRequest {
+            context: context(),
+            identity: OperationIdentity {
+                operation_id: OperationId::new("op-admit-backup-1").unwrap(),
+                idempotency_key: "idem-admit-backup-1".to_owned(),
+                canonical_request_hash: "c".repeat(64),
+            },
+            operation: StoreBackupOperation::Status {
+                operation_id: OperationId::new("op-admit-backup-1").unwrap(),
+            },
+        },
+    }
+}
+
 /// Fixed `op` tag for one wire variant.
 ///
 /// Exhaustive on purpose: adding a `StoreRequest` variant breaks this match
@@ -799,6 +822,7 @@ fn store_request_op_tag(request: &StoreRequest) -> &'static str {
         StoreRequest::Named { .. } => "named",
         StoreRequest::Apply { .. } => "apply",
         StoreRequest::ReservedWrite { .. } => "reserved_write",
+        StoreRequest::Backup { .. } => "backup",
         StoreRequest::Recovery { .. } => "recovery",
         StoreRequest::InitializeGenesis { .. } => "initialize_genesis",
         StoreRequest::Receipt { .. } => "receipt",
@@ -827,10 +851,11 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
     assert!(serde_json::from_value::<StoreRequest>(reserved_json).is_err());
     // Closed wire-variant catalogue: every exported `StoreRequest` variant
     // encodes under its fixed `op` tag, round-trips, and validates. Slice
-    // #991 adds exactly one variant (`reserved_write`), covered in the
-    // catalogue below; the legacy eleven keep their exact tags, encodings,
-    // and advertised capabilities unchanged, while the reserved-write
-    // capability stays declared-but-unadvertised (proven in the loop and
+    // #991 adds exactly one variant (`reserved_write`) and slice #975 adds
+    // exactly one variant (`backup`), covered in the catalogue below; the
+    // legacy eleven keep their exact tags, encodings, and advertised
+    // capabilities unchanged, while the reserved-write and backup
+    // capabilities stay declared-but-unadvertised (proven in the loop and
     // again explicitly below).
     let catalogue = vec![
         StoreRequest::Health,
@@ -853,6 +878,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         StoreRequest::ReservedWrite {
             request: valid_request(),
         },
+        backup_wire_request(),
     ];
     let mut tags = Vec::new();
     for variant in &catalogue {
@@ -865,14 +891,16 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         let decoded: StoreRequest = serde_json::from_value(encoded).unwrap();
         assert_eq!(&decoded, variant);
         assert!(decoded.validate().is_ok());
-        if store_request_op_tag(variant) == "reserved_write" {
-            assert_eq!(
-                decoded.capability(),
+        if matches!(store_request_op_tag(variant), "reserved_write" | "backup") {
+            let expected = if store_request_op_tag(variant) == "reserved_write" {
                 eliot_store_api::CAPABILITY_RESERVED_WRITE
-            );
+            } else {
+                eliot_store_api::CAPABILITY_STORE_BACKUP
+            };
+            assert_eq!(decoded.capability(), expected);
             assert!(
                 !CAPABILITIES.contains(&decoded.capability()),
-                "the reserved-write capability is declared but stays unadvertised"
+                "the reserved-write/backup capability is declared but stays unadvertised"
             );
         } else {
             assert!(
@@ -886,6 +914,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         tags,
         vec![
             "apply",
+            "backup",
             "dreamer_job",
             "health",
             "initialize_genesis",
@@ -898,7 +927,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
             "revision_heads",
             "validation_snapshot",
         ],
-        "closed wire catalogue contains the legacy variants plus the single #991 reserved-write variant"
+        "closed wire catalogue contains the legacy variants plus the single #991 reserved-write variant and the single #975 backup variant"
     );
     // Reserved-write evidence selects no wire operation by itself: the bare
     // projection carries no `op` tag while every `StoreRequest` encoding

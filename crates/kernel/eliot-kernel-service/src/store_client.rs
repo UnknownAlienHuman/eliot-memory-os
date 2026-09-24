@@ -18,11 +18,14 @@ use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use eliot_protocol::{ClientHello, Frame, ProtocolRange, ProtocolVersion, ServerHello};
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
-    CAPABILITIES, CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReadConsistency,
-    RecoveryRecordKey, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
+    BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
+    CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, IsolatedDestination,
+    IsolationEvidence, NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId,
+    OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    ReadConsistency, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
+    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
+    SnapshotPage, StoreBackupStatus, StoreError, StoreGenesisRequest, StoreHealth,
     StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError,
     WriteReceipt, dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
     verify_canonical_request_hash,
@@ -32,6 +35,8 @@ use tokio::sync::Mutex;
 
 use crate::{HostStoreBootstrapRequirement, STORE_MODULE_IDENTITY};
 
+#[path = "store_backup_client.rs"]
+mod store_backup_client;
 #[path = "store_exchange.rs"]
 mod store_exchange;
 
@@ -888,6 +893,113 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             StoreResponse::Health { record } => Ok(record),
             _ => Err(StoreError::InvalidReceipt),
         }
+    }
+}
+
+impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
+    /// Opens one bounded coherent snapshot capture (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue, which sends once through the existing
+    /// bounded `execute_raw` machinery. Consumed by #959/#960 orchestration.
+    pub async fn backup_begin(
+        &self,
+        ctx: &RequestMeta,
+        request: SnapshotBeginRequest,
+    ) -> Result<SnapshotHandle, StoreError> {
+        self.backup_begin_inner(ctx, request).await
+    }
+
+    /// Reads one bounded page of an open capture (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_page(
+        &self,
+        ctx: &RequestMeta,
+        handle: SnapshotHandle,
+        cursor: SnapshotCursor,
+    ) -> Result<SnapshotPage, StoreError> {
+        self.backup_page_inner(ctx, handle, cursor).await
+    }
+
+    /// Closes one capture with its owner-issued end receipt (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_end(
+        &self,
+        ctx: &RequestMeta,
+        handle: SnapshotHandle,
+    ) -> Result<SnapshotEndReceipt, StoreError> {
+        self.backup_end_inner(ctx, handle).await
+    }
+
+    /// Prepares one isolated restore destination (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_prepare_destination(
+        &self,
+        ctx: &RequestMeta,
+        destination: IsolatedDestination,
+    ) -> Result<IsolationEvidence, StoreError> {
+        self.backup_prepare_destination_inner(ctx, destination)
+            .await
+    }
+
+    /// Restores one bounded canonical batch into its isolated destination
+    /// (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_restore_batch(
+        &self,
+        ctx: &RequestMeta,
+        batch: CanonicalRestoreBatch,
+    ) -> Result<RestoreValidationReceipt, StoreError> {
+        self.backup_restore_batch_inner(ctx, batch).await
+    }
+
+    /// Validates one canonical restore batch without applying it (issue
+    /// #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    /// Returns the wire `Validation` outcome type
+    /// (`RestoreValidationReceipt`; wire.rs is authority).
+    pub async fn backup_validate(
+        &self,
+        ctx: &RequestMeta,
+        batch: CanonicalRestoreBatch,
+    ) -> Result<RestoreValidationReceipt, StoreError> {
+        self.backup_validate_inner(ctx, batch).await
+    }
+
+    /// Observes the status of one backup operation (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_status(
+        &self,
+        ctx: &RequestMeta,
+        operation_id: OperationId,
+    ) -> Result<StoreBackupStatus, StoreError> {
+        self.backup_status_inner(ctx, operation_id).await
+    }
+
+    /// Reconciles one uncertain backup mutation by exact identity (issue
+    /// #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_reconcile(
+        &self,
+        ctx: &RequestMeta,
+        first: OperationIdentity,
+        second: OperationIdentity,
+    ) -> Result<BackupOperationReconciliation, StoreError> {
+        self.backup_reconcile_inner(ctx, first, second).await
     }
 }
 

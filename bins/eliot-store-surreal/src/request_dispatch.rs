@@ -18,6 +18,8 @@ use eliot_protocol::dreamer_job::DurableJobResponse;
 use eliot_store_api::CanonicalStoreClient;
 use eliot_store_api::MAX_STORE_FAILURE_REFERENCE_LEN;
 use eliot_store_api::RequestMeta;
+use eliot_store_api::StoreBackupOperation;
+use eliot_store_api::StoreBackupRequest;
 use eliot_store_api::StoreError;
 use eliot_store_api::StoreFailure;
 use eliot_store_api::StoreFailureIdentityContext;
@@ -152,6 +154,54 @@ fn failure_context_for_operation(
         operation_id: Some(operation_id),
         idempotency_key_ref_or_digest: Some(idempotency_key),
         state_fence_ref_or_exact_safe_projection: Some(context.state_fence.clone()),
+        ..StoreFailureIdentityContext::default()
+    }
+}
+
+/// Builds the typed-failure identity context for one admitted backup
+/// envelope (issue #975).
+///
+/// The stable mutation identity comes from the operation payload itself:
+/// capture/restore/reconcile operations carry their `OperationIdentity`,
+/// page/close carry the owner-issued handle identity, and status carries
+/// the queried operation. Isolated-destination preparation carries no
+/// mutation identity by construction, so the destination digest stands in
+/// as the correlation ref — mirroring `failure_context_for_recovery` —
+/// with `operation_id` left `None`. The fence always comes from the
+/// admitted envelope context, never from payload mirrors.
+pub(crate) fn failure_context_for_backup(
+    request: &StoreBackupRequest,
+) -> StoreFailureIdentityContext {
+    let (operation_id, idempotency_key_ref_or_digest) = match &request.operation {
+        StoreBackupOperation::Begin(begin) => (
+            Some(begin.operation.operation_id.clone()),
+            Some(begin.operation.idempotency_key.clone()),
+        ),
+        StoreBackupOperation::Page { handle, .. } | StoreBackupOperation::End { handle } => (
+            Some(handle.operation_id.clone()),
+            Some(handle.idempotency_key.clone()),
+        ),
+        StoreBackupOperation::PrepareDestination(destination) => (
+            None,
+            canonical_json_bytes(destination)
+                .ok()
+                .map(|bytes| sha256_hex(&bytes)),
+        ),
+        StoreBackupOperation::RestoreBatch(batch) | StoreBackupOperation::Validate(batch) => (
+            Some(batch.operation.operation_id.clone()),
+            Some(batch.operation.idempotency_key.clone()),
+        ),
+        StoreBackupOperation::Status { operation_id } => (Some(operation_id.clone()), None),
+        StoreBackupOperation::Reconcile { first, .. } => (
+            Some(first.operation_id.clone()),
+            Some(first.idempotency_key.clone()),
+        ),
+    };
+    StoreFailureIdentityContext {
+        request_id: Some(request.context.request_id.clone()),
+        operation_id,
+        idempotency_key_ref_or_digest,
+        state_fence_ref_or_exact_safe_projection: Some(request.context.state_fence.clone()),
         ..StoreFailureIdentityContext::default()
     }
 }
@@ -362,6 +412,24 @@ impl StoreDispatchBackend for StoreComposition {
                     Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
                     Err(error) => map_composition_error(error, failure_context),
                 }
+            }
+            // Issue #975: one authenticated backup arm. The closed envelope
+            // carries its fence-bound context beside the operation; the
+            // failure context binds the admitted envelope identity and the
+            // arm delegates once to the backup dispatch seam. An
+            // unimplemented/default port refuses with a typed failure
+            // before any provider I/O and never falls back to `Apply` or
+            // any other operation.
+            Request::Backup { request } => {
+                let failure_context = failure_context_for_backup(&request);
+                // Boxed: restore batches carry bounded head lists plus the
+                // admitted context across provider awaits.
+                Box::pin(crate::backup_dispatch::dispatch_backup(
+                    self,
+                    request,
+                    failure_context,
+                ))
+                .await
             }
             Request::RevisionHeads { keys } => match self.revision_heads(keys).await {
                 Ok(heads) => Response::RevisionHeads { heads },

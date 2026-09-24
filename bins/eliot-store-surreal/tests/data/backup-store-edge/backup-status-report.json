@@ -1,0 +1,31 @@
+{
+  "operation": {
+    "operation_id": "op-975-begin-1",
+    "idempotency_key": "idem-975-begin-1",
+    "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "handle": {
+    "consistency_point": "cp-975-1",
+    "snapshot_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "operation_id": "op-975-begin-1",
+    "idempotency_key": "idem-975-begin-1"
+  },
+  "phase": "capture_closed",
+  "completeness": "COMPLETE",
+  "member_count": 2,
+  "byte_count": 384,
+  "cumulative_pages": 2,
+  "cumulative_bytes": 384,
+  "validation_revision": 1,
+  "state_fence": {
+    "authority_epoch": {
+      "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+      "sequence": 1
+    },
+    "resource_generation": 1,
+    "task_revision": null,
+    "policy_revision": null,
+    "integration_revision": null
+  },
+  "reconciliation": null
+}

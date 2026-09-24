@@ -1,0 +1,27 @@
+{
+  "malformed_wire_samples": [
+    "not-a-frame",
+    "{\"op\":\"backup\"}",
+    "{\"op\":\"backup\",\"request\":null}",
+    "{\"op\":\"backup_begin\"}",
+    "{\"op\":\"Backup\",\"request\":{}}"
+  ],
+  "duplicate_member_ids": ["member-975-1", "member-975-1"],
+  "oversized_member_count": 1025,
+  "credential_probes": [
+    "eliot/store/v1/0123456789abcdef0123456789abcdef",
+    "password=hunter2-secret",
+    "Authorization: Bearer live-token-975"
+  ],
+  "query_probes": [
+    "SELECT * FROM snapshot WHERE true",
+    "FOR UPDATE",
+    "DEFINE TABLE snapshot SCHEMAFULL"
+  ],
+  "payload_probes": [
+    "DROP TABLE snapshot",
+    "; rm -rf /",
+    "__proto__",
+    "constructor.prototype.polluted"
+  ]
+}

@@ -1,0 +1,146 @@
+{
+  "context": {
+    "request_id": "request-991-d1",
+    "session_id": null,
+    "task_id": null,
+    "product_id": "product-991-d",
+    "source_id": "source-991-d",
+    "state_fence": {
+      "authority_epoch": {
+        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 1
+      },
+      "resource_generation": 1,
+      "task_revision": null,
+      "policy_revision": null,
+      "integration_revision": null
+    },
+    "clock": {
+      "valid_time_ms": null,
+      "known_time_ms": null,
+      "transaction_sequence": null,
+      "monotonic_ns": null
+    }
+  },
+  "transition": {
+    "identity": {
+      "operation_id": "op-991-d1",
+      "idempotency_key": "idem-991-d1",
+      "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "state_fence": {
+      "authority_epoch": {
+        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 1
+      },
+      "resource_generation": 1,
+      "task_revision": null,
+      "policy_revision": null,
+      "integration_revision": null
+    },
+    "scope_id": "scope-991-d1",
+    "task_id": null,
+    "ordering_scopes": [
+      "scope-991-d1"
+    ],
+    "transition_class": "capture_candidate",
+    "requested_effect_ceiling": "CANDIDATE",
+    "admission_contract_set_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "operation_manifest_digest": "51c1b8b56bab1a59ade0faff196b2fa79c93da1fb278aebb909ea797b3844caf",
+    "admission_digest": "b48873b17eff11b124a49ad35500d4352ef8e0f6af43589b5cbe023313005d6a",
+    "mutation_plan_digest": "1d8b49a2e3bd0a42255f538bbe6ba12d454cc4f68c38aa700e9dea381927a78c",
+    "semantic_source_revisions": [],
+    "named_operations": [
+      {
+        "operation": "CaptureObservation",
+        "parameters": {
+          "subject": "observation-991-d1"
+        }
+      }
+    ],
+    "event_projection_relation_intents": {
+      "event_ids": [],
+      "projection_kinds": [],
+      "relation_kinds": []
+    },
+    "security": {
+      "source_assurance": [],
+      "disclosure_closure": null,
+      "transformation_lineage": [],
+      "influence_closure": null,
+      "purge_entry": null,
+      "selection_integrity": null
+    },
+    "required_proof_and_approval_refs": []
+  },
+  "admission": {
+    "contract_version": 1,
+    "reservation_id": "reservation-991-d1",
+    "reservation_order": 42,
+    "operation_id": "op-991-d1",
+    "idempotency_key": "idem-991-d1",
+    "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "prepared_transition_digest": "19239f861d6ea28e0318f43caa91db8276066f5484607f241e7df80322b5b3ef",
+    "reservation_token_digest": "3651df7a7af9250a6cfa75591e288961965933ccd905dd03f1dcd0ff25a8df57",
+    "scopes": [
+      {
+        "scope": "scope-991-d1",
+        "reserved_sequence": 7,
+        "expected_sequence": 6,
+        "expected_head_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      }
+    ],
+    "writer_epoch": {
+      "lineage_id": "epoch-lineage-991-d",
+      "epoch": 5,
+      "predecessor_lineage_id": null,
+      "predecessor_epoch": null
+    },
+    "state_fence": {
+      "authority_epoch": {
+        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 1
+      },
+      "resource_generation": 1,
+      "task_revision": null,
+      "policy_revision": null,
+      "integration_revision": null
+    },
+    "source_id": "source-991-d",
+    "created_at_ms": 1700000000000,
+    "expires_at_ms": 1700000060000,
+    "recovery_owner": "recovery-owner-991-d"
+  },
+  "expected_revision_heads": [
+    {
+      "key": "rev-991-d1",
+      "expected_revision": 3,
+      "state_fence": {
+        "authority_epoch": {
+          "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+          "sequence": 1
+        },
+        "resource_generation": 1,
+        "task_revision": null,
+        "policy_revision": null,
+        "integration_revision": null
+      }
+    }
+  ],
+  "expected_ordering_heads": [
+    {
+      "scope": "scope-991-d1",
+      "expected_sequence": 6,
+      "state_fence": {
+        "authority_epoch": {
+          "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+          "sequence": 1
+        },
+        "resource_generation": 1,
+        "task_revision": null,
+        "policy_revision": null,
+        "integration_revision": null
+      }
+    }
+  ]
+}

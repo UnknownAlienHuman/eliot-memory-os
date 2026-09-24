@@ -260,6 +260,13 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             StoreRequest::DreamerJob { request, .. } => {
                 Some(request.request_identity.operation.operation_id.clone())
             }
+            // Issue #975: the backup family carries its stable admitted
+            // mutation identity in the envelope, bound separately from the
+            // payload. Extracting it here binds every unknown/transport arm
+            // below to the admitted operation, so an uncertain backup send
+            // reconciles the same operation with no retry instead of
+            // surfacing an unbound contract error.
+            StoreRequest::Backup { request } => Some(request.operation_id()),
             _ => None,
         };
         let frame = eliot_store_api::request_frame(

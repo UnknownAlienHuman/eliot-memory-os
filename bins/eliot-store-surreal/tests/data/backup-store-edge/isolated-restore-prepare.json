@@ -1,0 +1,12 @@
+{
+  "destination_id": "dest-975-1",
+  "destination_class": "ISOLATED_RESTORE",
+  "source_store_id": "store-975-1",
+  "source_installation_id": "install-975-active",
+  "evidence": {
+    "admission_handle": "admit-975-1",
+    "admitted_at_unix_ms": 1700000000000,
+    "purge_policy_revision": 7
+  },
+  "target_schema": "eliot.store.snapshot.v1"
+}
