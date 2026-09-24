@@ -88,6 +88,10 @@ fn non_runtime_disposition_is_recorded() -> TestResult {
         text.contains(EXPECTED_ADMISSION),
         "workspace_admission must record the #1715 non-runtime disposition"
     );
+    assert!(
+        eliot_store_memory::NON_PRODUCTION_REFERENCE.contains(EXPECTED_ADMISSION),
+        "the code-level non-production marker must agree with the manifest admission"
+    );
     Ok(())
 }
 

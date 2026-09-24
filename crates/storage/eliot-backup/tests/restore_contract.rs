@@ -106,6 +106,8 @@ fn degraded_bundle_with_class(class: BackupClass, scope: bool) -> BackupBundle {
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-1".to_owned(),
+            installation_id: "installation-1".to_owned(),
+            schema_generation: "schema-1".to_owned(),
             store_generation: "store-1".to_owned(),
             state_fence: source_fence,
             scope_id: if scope {
@@ -1089,6 +1091,8 @@ fn full_bundle_with_events_body() -> BackupBundle {
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-947-b".to_owned(),
+            installation_id: "installation-947-b".to_owned(),
+            schema_generation: "schema-1".to_owned(),
             store_generation: "store-947-b".to_owned(),
             state_fence: source_fence.clone(),
             scope_id: None,
@@ -1155,6 +1159,8 @@ fn scope_bundle() -> BackupBundle {
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-947-b-scope".to_owned(),
+            installation_id: "installation-947-b-scope".to_owned(),
+            schema_generation: "schema-1".to_owned(),
             store_generation: "store-947-b-scope".to_owned(),
             state_fence: source_fence,
             scope_id: Some(eliot_store_api::ScopeId::new("scope-947-b").expect("scope")),
@@ -2228,6 +2234,8 @@ fn probe_bundle_with_events_and_receipts(
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-1712".to_owned(),
+            installation_id: "installation-1712".to_owned(),
+            schema_generation: "schema-1".to_owned(),
             store_generation: "store-1712".to_owned(),
             state_fence: source_fence,
             scope_id: None,

@@ -1,12 +1,14 @@
-//! Explicit-disposition proof for `eliot-ecxf` (issue #1716).
+//! Explicit-disposition proof for `eliot-ecxf` (issues #1141/#1716).
 //!
-//! The crate is currently reachable from no production binary and has no
-//! admitted contract surface or selected process owner. Until the owning
-//! decision (delete, or admit with a bounded non-runtime support role bound
-//! to the governed export path of #1871) lands, this test pins the explicit
-//! `[package.metadata.eliot].workspace_admission` disposition plus the
-//! current no-production-binary consumer state, so the crate cannot become a
-//! silent production fallback.
+//! The crate is the live governed ECXF/1 interchange source: sole owner of
+//! `ExportFence`/`EventRange`, consumed by `eliot-backup` on every backup
+//! build/validate/restore path bound to the governed export path of #1871.
+//! No production binary selects it directly, and it is not a selectable
+//! production fallback. This test pins the explicit
+//! `[package.metadata.eliot].workspace_admission` disposition, the
+//! no-production-binary state, and the exact live library consumer, so the
+//! crate can neither become a silent production fallback nor lose its
+//! governed consumer silently.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -14,8 +16,10 @@ use std::path::PathBuf;
 type TestResult = Result<(), Box<dyn Error>>;
 
 const PACKAGE: &str = "eliot-ecxf";
-const EXPECTED_ADMISSION: &str =
-    "unreachable pending explicit owner disposition per #1716";
+const EXPECTED_ADMISSION: &str = "live governed interchange source per #1141";
+/// Exact live library consumer: `eliot-backup` selects the crate for the
+/// governed export/restore fence contract. Losing this edge fails the gate.
+const LIVE_CONSUMER_MANIFEST: &str = "crates/storage/eliot-backup/Cargo.toml";
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -84,7 +88,31 @@ fn owner_disposition_is_recorded() -> TestResult {
     let text = std::fs::read_to_string(manifest_dir().join("Cargo.toml"))?;
     assert!(
         text.contains(EXPECTED_ADMISSION),
-        "workspace_admission must record the #1716 pending-disposition state"
+        "workspace_admission must record the #1141 live interchange-source state"
+    );
+    Ok(())
+}
+
+#[test]
+fn live_governed_consumer_selects_the_crate() -> TestResult {
+    let root = workspace_root()?;
+    let text = std::fs::read_to_string(root.join(LIVE_CONSUMER_MANIFEST))?;
+    let value: toml::Value = toml::from_str(&text)?;
+    let selected = value
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| {
+            table.keys().any(|name| name == PACKAGE)
+                || table.values().any(|spec| {
+                    spec.as_table()
+                        .and_then(|spec| spec.get("package"))
+                        .and_then(toml::Value::as_str)
+                        == Some(PACKAGE)
+                })
+        });
+    assert!(
+        selected,
+        "live governed consumer {LIVE_CONSUMER_MANIFEST} must select {PACKAGE}"
     );
     Ok(())
 }

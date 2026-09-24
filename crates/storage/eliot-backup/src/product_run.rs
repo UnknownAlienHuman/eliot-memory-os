@@ -243,6 +243,56 @@ fn resolve_epoch(
     }
 }
 
+/// Serializable integrity report for one independent artifact readback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyReport {
+    pub backup_id: String,
+    pub issued_class: BackupClass,
+    pub bundle_sha256: String,
+    pub manifest_integrity_sha256: String,
+    pub export_fence_sha256: String,
+    pub canonical_events: u64,
+    pub projections: u64,
+    pub receipts: u64,
+    pub blobs: u64,
+    pub canonical_only: bool,
+}
+
+/// Independently revalidates one persisted export artifact (issue #1141).
+///
+/// Reads only the supplied bundle bytes — never a live database root — through
+/// `BackupBundle::decode` (full validation) plus a recomputed `bundle_sha256`.
+/// When `expected_sha256` is present the recomputed digest must match exactly;
+/// a mismatch is `IntegrityMismatch`, never a successful absence. Reports carry
+/// identity only; no restore, mutation, or cutover occurs here.
+pub fn verify_backup_artifact(
+    bundle_bytes: &[u8],
+    expected_sha256: Option<&str>,
+) -> Result<VerifyReport, BackupError> {
+    let bundle = BackupBundle::decode(bundle_bytes)?;
+    let bundle_sha256 = bundle.bundle_sha256()?;
+    if let Some(expected) = expected_sha256
+        && bundle_sha256 != expected
+    {
+        return Err(BackupError::IntegrityMismatch {
+            subject: "bundle digest".to_owned(),
+        });
+    }
+    Ok(VerifyReport {
+        backup_id: bundle.manifest.backup_id.clone(),
+        issued_class: bundle.manifest.class,
+        bundle_sha256,
+        manifest_integrity_sha256: bundle.manifest.integrity_sha256.clone(),
+        export_fence_sha256: bundle.manifest.export_fence_sha256.clone(),
+        canonical_events: bundle.canonical_events.len() as u64,
+        projections: bundle.projections.len() as u64,
+        receipts: bundle.receipts.len() as u64,
+        blobs: bundle.blobs.len() as u64,
+        canonical_only: bundle.manifest.class.is_canonical_only(),
+    })
+}
+
 /// Executes one isolated restore and reports the observed outcome.
 ///
 /// Resolves the target lineage (explicit triple or fresh genesis lineage),

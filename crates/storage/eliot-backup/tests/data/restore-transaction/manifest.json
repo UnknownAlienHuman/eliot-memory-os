@@ -5,6 +5,7 @@
   "schema_generation": "schema-949-1",
   "purge_ledger_revision": 3,
   "export_id": "export-949",
+  "installation_id": "installation-949",
   "store_generation": "store-949",
   "lineage_id": "550e8400-e29b-41d4-a716-446655440001",
   "source_epoch_sequence": 1,

@@ -107,6 +107,8 @@ fn export_fence(blobs: &[BackupBlob], event_count: u64) -> ExportFence {
     };
     ExportFence {
         export_id: "export-948-b".to_owned(),
+        installation_id: "installation-948-b".to_owned(),
+        schema_generation: "schema-1".to_owned(),
         store_generation: "store-948-b".to_owned(),
         state_fence: fence(),
         scope_id: None,
@@ -186,6 +188,8 @@ fn full_input() -> BackupInput {
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-948-b-full".to_owned(),
+            installation_id: "installation-948-b".to_owned(),
+            schema_generation: "schema-1".to_owned(),
             store_generation: "store-948-b".to_owned(),
             state_fence: source_fence.clone(),
             scope_id: None,

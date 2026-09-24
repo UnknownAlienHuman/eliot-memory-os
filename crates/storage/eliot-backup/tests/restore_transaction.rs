@@ -293,6 +293,8 @@ fn bundle_input(class: BackupClass, with_ors: bool, scoped: bool) -> BackupInput
         schema_generation: manifest_string(&manifest, "schema_generation"),
         export_fence: ExportFence {
             export_id: manifest_string(&manifest, "export_id"),
+            installation_id: manifest_string(&manifest, "installation_id"),
+            schema_generation: manifest_string(&manifest, "schema_generation"),
             store_generation: manifest_string(&manifest, "store_generation"),
             state_fence: source_fence(),
             scope_id: if scoped {

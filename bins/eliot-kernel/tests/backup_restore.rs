@@ -45,6 +45,8 @@ fn test_bundle(target: &str) -> BackupBundle {
         schema_generation: "1".to_owned(),
         export_fence: ExportFence {
             export_id: format!("export-960-{target}"),
+            installation_id: format!("installation-960-{target}"),
+            schema_generation: "1".to_owned(),
             store_generation: "store-960".to_owned(),
             state_fence: source_fence,
             scope_id: None,

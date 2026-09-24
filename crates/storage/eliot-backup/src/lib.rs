@@ -14,12 +14,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_blob_api::{
-    BlobError, BlobHash, BlobId, BlobLocator, CompressionDescriptor, CryptoDescriptor,
-};
+use eliot_blob_api::{BlobError, BlobId, BlobLocator, CompressionDescriptor, CryptoDescriptor};
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::PurgeLedgerEntry;
-use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, StoreError, WriteReceipt};
+use eliot_store_api::{StoreError, WriteReceipt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -55,7 +53,10 @@ pub use product_command::{
     BackupCreateArgs, BackupCreatePreview, RestorePreview, parse_backup_class,
     preview_backup_create, preview_restore,
 };
-pub use product_run::{IssueReport, RestoreEpochSpec, RestoreRunReport, issue_backup, run_restore};
+pub use product_run::{
+    IssueReport, RestoreEpochSpec, RestoreRunReport, VerifyReport, issue_backup, run_restore,
+    verify_backup_artifact,
+};
 pub use restore_runner::{
     FileRestoreJournal, FileRestoreTarget, RunnerOutcome, execute_isolated_restore,
 };
@@ -174,56 +175,26 @@ impl BackupClass {
 pub use eliot_ecxf::EventRange;
 
 /// The coherent logical boundary of an ECXF export.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportFence {
-    pub export_id: String,
-    pub store_generation: String,
-    pub state_fence: StateFence,
-    pub scope_id: Option<ScopeId>,
-    pub revision_heads: Vec<RevisionHead>,
-    pub ordering_heads: Vec<OrderingHead>,
-    pub event_range: EventRange,
-    pub blob_reachability_manifest: Vec<BlobHash>,
-    /// False means the exporter did not prove one coherent boundary.
-    pub consistent: bool,
-}
+///
+/// The type is owned solely by `eliot-ecxf` (issue #1141, following the #862
+/// `EventRange` precedent): `eliot-backup` consumes the interchange contract
+/// and keeps no second fence definition or validator. The reexport keeps
+/// existing `eliot_backup::ExportFence` paths compiling against the single
+/// owner. The owner validator additionally binds `schema_generation`,
+/// `installation_id`, and head↔fence coherence, so mixed-revision, stale-head,
+/// and mixed-schema views refuse on every backup build/validate path.
+pub use eliot_ecxf::ExportFence;
 
-impl ExportFence {
-    pub fn validate(&self) -> Result<(), BackupError> {
-        text(&self.export_id, "export_fence.export_id")?;
-        text(&self.store_generation, "export_fence.store_generation")?;
-        self.state_fence
-            .validate()
-            .map_err(|error| BackupError::Foundation(error.to_string()))?;
-        if !self.consistent {
-            return Err(BackupError::InconsistentBoundary);
+/// Maps an owner fence rejection into the backup error contract without a
+/// second validator: exact field rejections pass through, boundary incoherence
+/// keeps its variant, and anything else is foundation evidence, never silence.
+fn map_ecxf_fence_error(error: eliot_ecxf::EcxfError) -> BackupError {
+    match error {
+        eliot_ecxf::EcxfError::InvalidField { field, reason } => {
+            BackupError::InvalidField { field, reason }
         }
-        self.event_range.validate().map_err(|error| match error {
-            eliot_ecxf::EcxfError::InvalidField { field, reason } => {
-                BackupError::InvalidField { field, reason }
-            }
-            error => BackupError::Foundation(error.to_string()),
-        })?;
-        unique(
-            self.revision_heads.iter().map(|head| head.key.clone()),
-            "revision_heads",
-        )?;
-        for head in &self.revision_heads {
-            head.validate().map_err(BackupError::Store)?;
-        }
-        unique(
-            self.ordering_heads.iter().map(|head| head.scope.clone()),
-            "ordering_heads",
-        )?;
-        for head in &self.ordering_heads {
-            head.validate().map_err(BackupError::Store)?;
-        }
-        unique(
-            self.blob_reachability_manifest.iter().cloned(),
-            "blob_reachability_manifest",
-        )?;
-        Ok(())
+        eliot_ecxf::EcxfError::InconsistentBoundary => BackupError::InconsistentBoundary,
+        error => BackupError::Foundation(error.to_string()),
     }
 }
 
@@ -603,6 +574,13 @@ pub struct BackupBundle {
 impl BackupBundle {
     /// Builds, hashes, and validates one complete logical export.
     pub fn build(input: BackupInput) -> Result<Self, BackupError> {
+        // A fence from one schema generation carrying records admitted under
+        // another is a mixed-schema view, never a quiesced export.
+        if input.export_fence.schema_generation != input.schema_generation {
+            return Err(BackupError::FenceMismatch {
+                subject: "schema_generation".to_owned(),
+            });
+        }
         let mut bundle = Self {
             manifest: EcxfManifest {
                 format: FORMAT_VERSION.to_owned(),
@@ -650,7 +628,7 @@ impl BackupBundle {
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), BackupError> {
         self.manifest.validate_shape()?;
-        self.export_fence.validate()?;
+        self.export_fence.validate().map_err(map_ecxf_fence_error)?;
         if sha256(&self.export_fence)? != self.manifest.export_fence_sha256 {
             return Err(BackupError::IntegrityMismatch {
                 subject: "export fence".to_owned(),
@@ -3173,6 +3151,8 @@ mod restore_tests {
             schema_generation: "1".to_owned(),
             export_fence: ExportFence {
                 export_id: "export".to_owned(),
+                installation_id: "installation-test".to_owned(),
+                schema_generation: "1".to_owned(),
                 store_generation: "store".to_owned(),
                 state_fence: source_fence,
                 scope_id: None,
@@ -3219,6 +3199,8 @@ mod restore_tests {
             schema_generation: "1".to_owned(),
             export_fence: ExportFence {
                 export_id: "export".to_owned(),
+                installation_id: "installation-test".to_owned(),
+                schema_generation: "1".to_owned(),
                 store_generation: "store".to_owned(),
                 state_fence: source_fence,
                 scope_id: None,
@@ -3607,11 +3589,11 @@ mod backup_verify_tests_948 {
     #![allow(clippy::expect_used)]
 
     use super::*;
-    use eliot_blob_api::{ObjectResidencyKey, VersionedContentDigest};
+    use eliot_blob_api::{BlobHash, ObjectResidencyKey, VersionedContentDigest};
     use eliot_contracts::{EpochLineageId, OperationId};
     use eliot_store_api::{
         CommitId, EventId, OperationManifestDigest, OrderingHead, OrderingScopeId, Resubmission,
-        RevisionHead, RevisionKey, TransitionClass, WriteReceiptStatus,
+        RevisionHead, RevisionKey, ScopeId, TransitionClass, WriteReceiptStatus,
     };
     use serde_json::json;
     use std::num::NonZeroU64;
@@ -3761,6 +3743,8 @@ mod backup_verify_tests_948 {
     fn export_fence(scope: bool) -> ExportFence {
         ExportFence {
             export_id: "export-948".to_owned(),
+            installation_id: "installation-948".to_owned(),
+            schema_generation: "schema-1".to_owned(),
             store_generation: "store-948".to_owned(),
             state_fence: fence(),
             scope_id: if scope {

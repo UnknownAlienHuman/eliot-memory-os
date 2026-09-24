@@ -7,7 +7,7 @@ license.workspace = true
 description = "Governed ECXF logical backup and isolated restore contracts"
 
 [package.metadata.eliot]
-workspace_admission = "admitted bounded non-runtime product surface per #1873 (operator CLI previews/coverage plus isolated rehearsal runner; governed export path: #1871); production execution/cutover stays with #960/#961 owners; not a selectable storage fallback"
+workspace_admission = "admitted bounded non-runtime product surface per #1873 (operator CLI previews/coverage/issuance/isolated runs plus isolated rehearsal runner; Kernel-owned governed capture/restore coordination per #959/#960; #1141 disposition; governed export path: #1871); production execution/cutover stays with #960/#961 owners; not a selectable storage fallback"
 
 [dependencies]
 aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }

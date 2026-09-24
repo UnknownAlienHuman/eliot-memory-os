@@ -15,7 +15,8 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use eliot_backup::{
     BackupBundle, BackupCreateArgs, RestoreContext, RestoreEpochSpec, WrappedKeyManifest,
-    issue_backup, preview_backup_create, preview_restore, run_restore, verify_key_coverage,
+    issue_backup, preview_backup_create, preview_restore, run_restore, verify_backup_artifact,
+    verify_key_coverage,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
 use serde_json::json;
@@ -64,6 +65,17 @@ pub enum BackupCommand {
         /// Absolute path to the wrapped-key manifest JSON file.
         #[arg(long, value_parser = crate::absolute_path)]
         key_manifest_json: PathBuf,
+    },
+    /// Independently revalidate one persisted bundle file: fresh decode plus a
+    /// recomputed bundle digest, optionally checked against an expected digest.
+    /// No restore, mutation, or cutover occurs.
+    Verify {
+        /// Absolute path to the bundle JSON file.
+        #[arg(long, value_parser = crate::absolute_path)]
+        bundle_json: PathBuf,
+        /// Expected bundle digest; a mismatch fails instead of passing.
+        #[arg(long)]
+        expected_sha256: Option<String>,
     },
     /// Issue one backup archive from an exporter-assembled export file.
     Issue {
@@ -159,6 +171,10 @@ pub fn run_backup(command: BackupCommand) -> Result<i32> {
             bundle_json,
             key_manifest_json,
         } => run_key_coverage(&bundle_json, &key_manifest_json),
+        BackupCommand::Verify {
+            bundle_json,
+            expected_sha256,
+        } => run_verify(&bundle_json, expected_sha256.as_deref()),
         BackupCommand::Issue {
             export_json,
             key_manifest_json,
@@ -268,6 +284,20 @@ fn run_key_coverage(bundle_json: &Path, key_manifest_json: &Path) -> Result<i32>
         }
         Err(error) => {
             crate::write_installation_error("BACKUP_KEY_COVERAGE_INVALID", &error.to_string());
+            Ok(crate::INVALID_REQUEST_EXIT)
+        }
+    }
+}
+
+fn run_verify(bundle_json: &Path, expected_sha256: Option<&str>) -> Result<i32> {
+    let bundle_bytes = read_json(bundle_json, "bundle file")?;
+    match verify_backup_artifact(&bundle_bytes, expected_sha256) {
+        Ok(report) => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(0)
+        }
+        Err(error) => {
+            crate::write_installation_error("BACKUP_VERIFY_INVALID", &error.to_string());
             Ok(crate::INVALID_REQUEST_EXIT)
         }
     }

@@ -103,6 +103,8 @@ fn full_input_with_blob() -> BackupInput {
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-1873p".to_owned(),
+            installation_id: "installation-1873p".to_owned(),
+            schema_generation: "schema-1".to_owned(),
             store_generation: "store-1873p".to_owned(),
             state_fence: source_fence.clone(),
             scope_id: None,

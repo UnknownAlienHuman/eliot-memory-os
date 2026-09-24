@@ -83,6 +83,7 @@ struct CaptureFixture {
     source_adapter: String,
     schema_generation: String,
     scope_id: Option<String>,
+    installation_id: String,
     store_generation: String,
     lineage: String,
     capture_times_match: bool,
@@ -273,6 +274,8 @@ fn valid_full_input() -> BackupInput {
         schema_generation: fixture.schema_generation.clone(),
         export_fence: ExportFence {
             export_id: "export-959-full".to_owned(),
+            installation_id: fixture.installation_id.clone(),
+            schema_generation: fixture.schema_generation.clone(),
             store_generation: fixture.store_generation.clone(),
             state_fence: fence.clone(),
             scope_id: None,
@@ -314,6 +317,8 @@ fn degraded_input() -> BackupInput {
         schema_generation: fixture.schema_generation.clone(),
         export_fence: ExportFence {
             export_id: "export-959-degraded".to_owned(),
+            installation_id: fixture.installation_id.clone(),
+            schema_generation: fixture.schema_generation.clone(),
             store_generation: fixture.store_generation.clone(),
             state_fence: fence.clone(),
             scope_id: None,
@@ -352,6 +357,8 @@ fn scope_input() -> BackupInput {
         schema_generation: fixture.schema_generation.clone(),
         export_fence: ExportFence {
             export_id: "export-959-scope".to_owned(),
+            installation_id: fixture.installation_id.clone(),
+            schema_generation: fixture.schema_generation.clone(),
             store_generation: fixture.store_generation.clone(),
             state_fence: fence.clone(),
             scope_id: Some(

@@ -61,6 +61,8 @@ fn write_degraded_bundle(path: &Path) -> TestResult {
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-cli".to_owned(),
+            installation_id: "installation-cli".to_owned(),
+            schema_generation: "schema-1".to_owned(),
             store_generation: "store-cli".to_owned(),
             state_fence: source_fence.clone(),
             scope_id: None,
@@ -305,6 +307,8 @@ fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
         };
         ExportFence {
             export_id: "export-cli".to_owned(),
+            installation_id: "installation-cli".to_owned(),
+            schema_generation: "schema-1".to_owned(),
             store_generation: "store-cli".to_owned(),
             state_fence: fence(),
             scope_id: None,

@@ -11,7 +11,7 @@
 use std::error::Error;
 use std::num::NonZeroU64;
 
-use eliot_backup::{BackupError, EventRange, ExportFence};
+use eliot_backup::{EventRange, ExportFence};
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use serde::Deserialize;
 
@@ -55,6 +55,8 @@ fn fence() -> StateFence {
 fn consumer_fence(range: EventRange) -> ExportFence {
     ExportFence {
         export_id: "export-862".to_owned(),
+        installation_id: "installation-862".to_owned(),
+        schema_generation: "schema-862".to_owned(),
         store_generation: "store-862".to_owned(),
         state_fence: fence(),
         scope_id: None,
@@ -90,13 +92,13 @@ fn backup_names_the_single_ecxf_owner_with_manifest_and_lock_handoff() -> TestRe
     owned.validate()?;
 
     // The same value validates through the backup consumer boundary, which
-    // maps the owner's typed rejection into `BackupError` without a second
-    // validator.
+    // now names the owner's fence type directly, so the owner's typed
+    // rejection surfaces without a second validator.
     consumer_fence(owned).validate()?;
     let sparse: EventRange = serde_json::from_str(&fixture("sparse")?.wire)?;
     assert!(matches!(
         consumer_fence(sparse).validate(),
-        Err(BackupError::InvalidField { field, .. }) if field == "event_range"
+        Err(eliot_ecxf::EcxfError::InvalidField { field, .. }) if field == "event_range"
     ));
 
     // Minimal dependency handoff: backup declares the existing sibling owner.
@@ -170,7 +172,7 @@ fn backup_and_ecxf_agree_on_the_full_shared_corpus() -> TestResult {
     let sparse: EventRange = serde_json::from_str(&fixture("sparse")?.wire)?;
     assert!(matches!(
         consumer_fence(sparse).validate(),
-        Err(BackupError::InvalidField {
+        Err(eliot_ecxf::EcxfError::InvalidField {
             field: "event_range",
             reason: "bounds and count do not describe one interval",
         })

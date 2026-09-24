@@ -124,6 +124,10 @@ impl EventRange {
 #[serde(deny_unknown_fields)]
 pub struct ExportFence {
     pub export_id: String,
+    /// Owning source installation whose quiesced view produced this export.
+    /// Bound to the manifest installation identity at archive build; a fence
+    /// never floats free of its installation.
+    pub installation_id: String,
     pub schema_generation: String,
     pub store_generation: String,
     pub state_fence: StateFence,
@@ -138,6 +142,7 @@ pub struct ExportFence {
 impl ExportFence {
     pub fn validate(&self) -> Result<(), EcxfError> {
         text(&self.export_id, "export_id")?;
+        text(&self.installation_id, "installation_id")?;
         text(&self.schema_generation, "schema_generation")?;
         text(&self.store_generation, "store_generation")?;
         self.state_fence
@@ -340,6 +345,16 @@ pub struct EcxfManifest {
     pub format: String,
     pub source_adapter: String,
     pub source_adapter_version: String,
+    /// Owning source installation of the exported view. Checked for equality
+    /// with the export-fence installation identity at archive build, so a
+    /// manifest read alone still names the exact source installation.
+    pub installation_id: String,
+    /// Schema generation of the exported canonical shape. Checked for equality
+    /// with the fence schema generation at build; mixed-schema views refuse.
+    pub schema_generation: String,
+    /// Store generation of the exported view. Checked for equality with the
+    /// fence store generation at build.
+    pub store_generation: String,
     pub architecture_source_digest: String,
     pub normative_pair_identity_receipt_digest: String,
     pub scope_id: Option<ScopeId>,
@@ -363,6 +378,9 @@ impl EcxfManifest {
         }
         text(&self.source_adapter, "source_adapter")?;
         text(&self.source_adapter_version, "source_adapter_version")?;
+        text(&self.installation_id, "installation_id")?;
+        text(&self.schema_generation, "schema_generation")?;
+        text(&self.store_generation, "store_generation")?;
         digest(
             &self.architecture_source_digest,
             "architecture_source_digest",
@@ -482,6 +500,26 @@ impl EcxfArchive {
         input.manifest.validate()?;
         if input.manifest.scope_id != input.export_fence.scope_id {
             return Err(EcxfError::InconsistentBoundary);
+        }
+        if input.manifest.installation_id != input.export_fence.installation_id
+            || input.manifest.schema_generation != input.export_fence.schema_generation
+            || input.manifest.store_generation != input.export_fence.store_generation
+        {
+            return Err(EcxfError::InconsistentBoundary);
+        }
+        // Start/end heads must be recorded exactly: a bounded fence without a
+        // recorded revision interval is an incomplete snapshot, a recorded
+        // interval that disagrees with the fence bounds is a mixed-revision
+        // view, and a half-recorded interval is neither.
+        match (
+            input.manifest.revision_start,
+            input.manifest.revision_end,
+            input.export_fence.event_range.first_sequence,
+            input.export_fence.event_range.last_sequence,
+        ) {
+            (None, None, None, None) => {}
+            (Some(start), Some(end), Some(first), Some(last)) if start == first && end == last => {}
+            _ => return Err(EcxfError::InconsistentBoundary),
         }
         let mut sections = BTreeMap::new();
         for section in input.sections {

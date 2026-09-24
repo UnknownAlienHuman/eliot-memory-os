@@ -61,6 +61,17 @@ use serde_json::{Value, json};
 /// before interpreting `records` / `provenance`; any shape change bumps it.
 const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
 
+/// Explicit non-production marker (issue #1141 disposition).
+///
+/// `MemoryStore` is a deterministic reference/test contour behind the same
+/// closed store contract: it must never become a production canonical writer,
+/// share production state, or read production credentials. The disposition
+/// proof (`tests/disposition.rs`) pins this marker against the manifest
+/// admission so a future production selection must update the disposition
+/// first instead of happening silently.
+pub const NON_PRODUCTION_REFERENCE: &str =
+    "non-runtime implementation-support reference per #1715; never a production storage fallback";
+
 /// 688-B store-side erasure execution (memory contour).
 ///
 /// Local intent/outcome model only: the store depends solely on existing
@@ -216,6 +227,11 @@ const CAPABILITY_EVIDENCE_PAYLOAD_VERSION: u32 = 1;
 /// fn needs_clone<T: Clone>() {}
 /// needs_clone::<MemoryStore>();
 /// ```
+///
+/// Explicit non-production ceiling (issue #1141): see
+/// [`NON_PRODUCTION_REFERENCE`]. The store implements the same closed contract
+/// as production backends for deterministic reference tests, but must never
+/// be selected as a production canonical writer or share production state.
 #[derive(Debug)]
 pub struct MemoryStore {
     state: Mutex<MemoryState>,
@@ -229,6 +245,11 @@ impl Default for MemoryStore {
 
 impl MemoryStore {
     /// Creates an empty deterministic model.
+    ///
+    /// Each instance owns fully isolated in-memory state: construction takes
+    /// no root, no credentials, and no environment, and the store performs no
+    /// I/O. See [`NON_PRODUCTION_REFERENCE`]: a reference contour, never
+    /// production.
     pub fn new() -> Self {
         Self {
             state: Mutex::new(MemoryState::default()),
