@@ -213,6 +213,11 @@ fn validate_limits(
     if limits.epoch.deadline_ticks == 0 || limits.epoch.deadline_ticks > MAX_EPOCH_DEADLINE_TICKS {
         return Err(TypedExecutionError::LimitDenied("epoch".to_owned()));
     }
+    // Zero `max_host_calls` is an explicit closed-world declaration (issue
+    // #21): the empty-linker provider admits no host calls, so a
+    // no-host-call component states zero instead of carrying a nonzero
+    // budget that implies a hidden capability. Usage enforcement still
+    // denies any actual host call above the budget.
     if [
         limits.max_input_bytes,
         limits.max_output_bytes,
@@ -221,7 +226,6 @@ fn validate_limits(
         limits.wall_deadline_ms,
     ]
     .contains(&0)
-        || limits.max_host_calls == 0
         || limits.max_table_elements == 0
         || limits.max_instances == 0
         || limits.artifact_access.max_reads == 0
