@@ -974,6 +974,160 @@ async fn rendezvous_before_transaction(adapter: &SurrealStoreAdapter) -> Result<
     Ok(())
 }
 
+/// Verified pre-transaction read state for one apply attempt.
+///
+/// Groups the fence plus the freshly read revision/ordering heads that the
+/// retry loop verifies before planning, so `apply_with_retry` stays under
+/// the line-count lint without changing the read/verify order.
+struct VerifiedAttemptState {
+    fence: Option<FenceRecord>,
+    current_revisions: Vec<RevisionHead>,
+    current_orderings: Vec<OrderingHead>,
+}
+
+/// Admitted side-leg row writes for one apply attempt.
+///
+/// Groups the sealed erasure dispatch plus the notification, reactive,
+/// automation and experience writes computed after every fallible
+/// precondition and before receipt planning.
+struct AttemptLegWrites {
+    notification_writes: Vec<surreal_notification::SurrealNotificationWrite>,
+    reactive_writes: surreal_reactive::ReactiveWrites,
+    automation_writes: surreal_automation::AutomationWrites,
+    experience_writes: surreal_experience::ExperienceWrites,
+}
+
+/// Same-operation reuse check for one apply attempt (issue #63).
+///
+/// Reads idempotency with the recomputed canonical hash and validates a
+/// replay receipt before returning it. Returns `Ok(None)` when no prior
+/// attempt exists so the caller proceeds to the pre-transaction reads.
+async fn reuse_idempotent_receipt(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    ctx: &eliot_store_api::RequestMeta,
+    transition: &eliot_store_api::PreparedTransition,
+    expected_revision_heads: &[eliot_store_api::RevisionHeadExpectation],
+    expected_ordering_heads: &[eliot_store_api::OrderingHeadExpectation],
+) -> Result<Option<WriteReceipt>, AdapterError> {
+    match read_idempotency(
+        db,
+        &adapter.config,
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+    .await?
+    {
+        Idempotency::Replay(receipt) => {
+            validate_receipt_identity_with_expected_heads(
+                &receipt,
+                ctx,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )?;
+            Ok(Some(receipt))
+        }
+        Idempotency::Conflict => Err(AdapterError::Store(StoreError::IdentityConflict)),
+        Idempotency::None => Ok(None),
+    }
+}
+
+/// Fence and head reads with expected-state verification for one attempt.
+///
+/// Reads the fence, rejects a fence mismatch, re-reads the union heads and
+/// verifies every declared expected revision and ordering head plus the
+/// fence, exactly as the retry loop did inline.
+async fn load_verified_attempt_state(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    transition: &eliot_store_api::PreparedTransition,
+    expected_revision_heads: &[eliot_store_api::RevisionHeadExpectation],
+    expected_ordering_heads: &[eliot_store_api::OrderingHeadExpectation],
+) -> Result<VerifiedAttemptState, AdapterError> {
+    let fence = read_fence(db, &adapter.config).await?;
+    if let Some(fence) = &fence
+        && fence.state_fence != transition.state_fence
+    {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let revision_keys = union_revision_keys(expected_revision_heads, transition);
+    let ordering_scopes = union_ordering_scopes(expected_ordering_heads, transition);
+    let current_revisions =
+        read_revision_heads_inner(db, &adapter.config, &revision_keys).await?;
+    let current_orderings =
+        read_ordering_heads_inner(db, &adapter.config, &ordering_scopes).await?;
+    check_expected_revisions(
+        &current_revisions,
+        expected_revision_heads,
+        &transition.state_fence,
+    )?;
+    check_expected_orderings(
+        &current_orderings,
+        expected_ordering_heads,
+        &transition.state_fence,
+    )?;
+    Ok(VerifiedAttemptState {
+        fence,
+        current_revisions,
+        current_orderings,
+    })
+}
+
+/// Admitted side-leg dispatch for one apply attempt.
+///
+/// Issue #1712: the admitted erasure operation dispatches its recorded
+/// intent-before-delete plan here, after every fallible precondition and
+/// before receipt planning. Dispatched once per operation: the sealed
+/// intent/outcome rows make a same-operation re-dispatch replay without
+/// duplicate destructive work, but allocation retries must not re-dispatch
+/// what the first attempt already sealed. Same-operation replay returns the
+/// sealed outcomes without duplicate destructive work; a lost commit
+/// response reconciles by same-operation retry through the receipt path,
+/// never by blind retry.
+///
+/// Issue #1780: admitted notification-state legs compute their record writes
+/// here, after every fallible precondition and before receipt planning. Each
+/// attempt recomputes from fresh rows (no dispatched flag): the
+/// in-transaction revision compare-and-set arbitrates concurrent writers,
+/// and drift retries through allocation contention, never as a semantic
+/// conflict.
+///
+/// Issue #1941 C4: admitted reactive legs compute their row writes beside
+/// the notification legs: same position (after every fallible precondition,
+/// before receipt planning), same recompute-from-fresh-rows retry
+/// discipline, same in-transaction compare-and-set arbitration. Issue #1779
+/// admits the automation legs and issue #223 the experience bank/feedback
+/// legs beside the reactive legs under the same discipline.
+async fn prepare_attempt_leg_writes(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    transition: &eliot_store_api::PreparedTransition,
+    erasure_dispatched: &mut bool,
+) -> Result<AttemptLegWrites, AdapterError> {
+    if transition.transition_class == TransitionClass::Erasure && !*erasure_dispatched {
+        let intent = surreal_intent_from_transition(transition)?;
+        apply_surreal_erasure(adapter, &intent).await?;
+        *erasure_dispatched = true;
+    }
+    let notification_writes =
+        surreal_notification::prepare_notification_writes(db, &adapter.config, transition).await?;
+    let reactive_writes =
+        surreal_reactive::prepare_reactive_writes(db, &adapter.config, transition).await?;
+    let automation_writes =
+        surreal_automation::prepare_automation_writes(db, &adapter.config, transition).await?;
+    let experience_writes =
+        surreal_experience::prepare_experience_writes(db, &adapter.config, transition).await?;
+    Ok(AttemptLegWrites {
+        notification_writes,
+        reactive_writes,
+        automation_writes,
+        experience_writes,
+    })
+}
+
 /// Bounded in-transaction allocation loop (S-CONC-TX, issue #989).
 ///
 /// Allocation lives in the canonical transaction: every attempt re-reads the
