@@ -21,13 +21,13 @@ use std::collections::BTreeMap;
 use eliot_conformance_contracts::SelfQualityHandoff;
 use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_improvement::{
-    intake_from_evidence, record_owner_decision, sourced_evidence, stamp_outcome_budget,
     BudgetProof, EvidenceSource, ImprovementBrief, ImprovementError, ImprovementSurface,
     IntakeOutcome, IntakeRequest, OutcomeEvidence, OwnerDecision, OwnerDecisionKind, ReplayPlan,
-    SafeBoundary, SourcedEvidence,
+    SafeBoundary, SourcedEvidence, intake_from_evidence, record_owner_decision, sourced_evidence,
+    stamp_outcome_budget,
 };
-use eliot_self_quality::improvement_handoff::sourced_evidence_from_handoff;
 use eliot_self_quality::SelfQualityError;
+use eliot_self_quality::improvement_handoff::sourced_evidence_from_handoff;
 use thiserror::Error;
 
 /// Failures of the daemon improvement-intake bridge.
