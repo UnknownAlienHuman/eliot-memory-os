@@ -647,7 +647,7 @@ fn check_rollback_contract(contract: &RollbackContract) -> Result<(), PipelineEr
 /// Maps a Governor admission decision to the advisory-only terminal disposition.
 fn map_decision(
     decision: &ImprovementAdmissionDecision,
-    _proposal: &ImprovementProposal,
+    proposal: &ImprovementProposal,
     experiment: &ExperimentPlan,
     evidence: &ActivationEvidence,
     rollback: &RollbackContract,
@@ -660,8 +660,11 @@ fn map_decision(
             ..
         } => ImprovementTerminalDisposition::CanaryAdmitted {
             canary_permit_request: format!(
-                "canary-handoff: candidate {candidate_id} experiment {} evaluator {evaluator_id} rollback-owner {rollback_owner_id}; #11 Kernel activation required, not executed here; verifier {} evidence {}",
-                experiment.experiment_id, evidence.verifier_id, evidence.evidence_id
+                "canary-handoff: candidate {candidate_id} proposal-digest {} experiment {} evaluator {evaluator_id} rollback-owner {rollback_owner_id}; #11 Kernel activation required, not executed here; verifier {} evidence {}",
+                proposal_digest(proposal),
+                experiment.experiment_id,
+                evidence.verifier_id,
+                evidence.evidence_id
             ),
         },
         ImprovementAdmissionDecision::Reject { reason, .. } => {

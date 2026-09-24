@@ -164,7 +164,8 @@ pub use governor_local_read::{
     serve_admitted_local_read,
 };
 pub use improvement_candidate_route::{
-    ImprovementRouteRequest, improvement_route_owner, route_improvement_candidate,
+    ImprovementRouteRequest, check_improvement_repeat, improvement_operation_owners,
+    improvement_route_owner, reconcile_improvement_unknown, route_improvement_candidate,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};

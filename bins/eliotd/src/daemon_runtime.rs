@@ -262,6 +262,17 @@ pub(super) fn run() -> Result<(), String> {
     if let Some(facts) = kernel.owner_session_facts() {
         composition.note_owner_session_binding(facts);
     }
+    // #1145: root the Governor-owned improvement candidate route in the
+    // production daemon: report the pipeline owner at startup (diagnostics
+    // only). The candidate → experiment → evaluation → admission path itself
+    // runs through `eliotd::govern_improvement_candidate` on live requests;
+    // this reference keeps the owner identity observable without adding
+    // policy semantics to the composition root.
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.improvement_pipeline_owner",
+        owner = eliotd::governed_improvement_pipeline_owner(),
+    );
     // #1780: attach canonical notification records where the concrete
     // client and the composition meet (same site as the owner-session
     // facts above). A cold/unbound read degrades to the empty inbox with
