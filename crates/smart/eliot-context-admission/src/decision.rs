@@ -283,8 +283,14 @@ fn validate_warning_text(value: &str) -> Result<(), ContextError> {
 ///
 /// ## Canonical grounding (exact, no quotient)
 ///
-/// [`ContextCandidate::validate`] imposes the coherence lattice this
-/// derivation reads, it invents nothing:
+/// Governing fragment
+/// `docs/architecture/I12-26-memory-admission-and-retrieval-trace.md:29-40`
+/// requires the decision to evaluate epistemic status/freshness (`:33`)
+/// and contradiction and framing risk (`:37`); `:42-51` closes the outcome
+/// to the six kinds with `include_with_warning` (`:47`); `:71` forces the
+/// pre-firing revision/fence compare. [`ContextCandidate::validate`]
+/// (`crates/smart/eliot-context-contracts/src/atom.rs:570-624`) imposes
+/// the coherence lattice this derivation reads, it invents nothing:
 ///
 /// - `Observed`/`Unknown` or `Stale`/`Contested`/`Superseded`/`Rejected`
 ///   status can never pair with `Assertable`; `Verified` requires it.
