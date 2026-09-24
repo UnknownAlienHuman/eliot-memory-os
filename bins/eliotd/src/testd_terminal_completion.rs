@@ -5,10 +5,15 @@
 //! and the exact pre-dispatch canonical verifier plan from the `TestD` owner,
 //! then re-reads the current Governor plan before publishing.
 
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{OperationId, TaskId, canonical_json_bytes};
-use eliot_governor::CanonicalPlanBinding;
+use eliot_governor::{CanonicalPlanBinding, LearningAdmissionRequest};
+use eliot_improvement::{
+    BudgetProof, ComplexityEconomicsDelta, ImprovementSurface, ReplayPlan, SafeBoundary,
+    sourced_evidence_from_repeated_verifier_failure,
+};
 use eliot_instrument_api::InstrumentInvocation;
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
@@ -19,6 +24,7 @@ use eliot_testd_core::{
 };
 
 use crate::daemon_kernel_client::TESTD_OWNER_POLL_LIMIT;
+use crate::improvement_intake::HandoffIntakeParams;
 use crate::{DaemonComposition, DaemonError, DaemonKernelClient};
 
 fn completion_error(error: impl std::fmt::Display) -> DaemonError {
@@ -388,6 +394,114 @@ impl DaemonComposition {
         Ok(())
     }
 
+    /// Converts one authenticated failed TestD terminal row into a bounded
+    /// governed improvement event. The Kernel/TestD owner row supplies the
+    /// evidence and operation identities; the current Governor owner supplies
+    /// every authority-bearing ref and the value floor.
+    fn enqueue_failed_verifier_improvement(
+        &mut self,
+        evidence: &TestdTerminalCompletionEvidence,
+    ) -> Result<(), DaemonError> {
+        if evidence.job.state != TestdJobState::Failed {
+            return Ok(());
+        }
+        let task_id = evidence
+            .request_identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .ok_or_else(|| completion_error("failed verifier event has no task binding"))?;
+        let owner = self
+            .governor
+            .learning_admission_owner_record(task_id)
+            .map_err(completion_error)?;
+        let owner_evidence = owner.owner_evidence();
+        let failure_refs = vec![
+            format!("testd-terminal:{}", evidence.job.job_id),
+            format!("testd-operation:{}", evidence.job.process.operation_id),
+        ];
+        let trace_refs = vec![
+            format!("testd-job:{}", evidence.job.job_id),
+            format!("testd-payload:{}", evidence.job.payload_digest),
+        ];
+        let sourced = sourced_evidence_from_repeated_verifier_failure(
+            owner.evaluator_ref(),
+            &failure_refs,
+            &trace_refs,
+            owner.authority_ref(),
+            &format!("verifier terminal failure:{}", evidence.job.job_id),
+        )
+        .map_err(completion_error)?;
+        let params = HandoffIntakeParams {
+            project_id: evidence.job.project_id.clone(),
+            target_surface: ImprovementSurface::Verifier,
+            proposed_change: format!(
+                "diagnose bounded verifier failure for TestD job {}",
+                evidence.job.job_id
+            ),
+            replay_plan: ReplayPlan {
+                fixed_replay_refs: vec![evidence.job.job_id.clone()],
+                holdout_refs: vec![format!("testd-payload:{}", evidence.job.payload_digest)],
+                transfer_refs: vec![owner.evaluator_ref().to_owned()],
+                counter_metric_names: vec!["verifier-failure-count".to_owned()],
+                verifier_refs: vec![owner.evaluator_ref().to_owned()],
+            },
+            baseline_metrics: BTreeMap::new(),
+            delivery_target: owner.scope_ref().to_owned(),
+            canary_plan: format!("canary:{}", owner.evaluator_ref()),
+            rollback: owner.rollback_ref().to_owned(),
+            stop_condition: format!("stop-on-regression:{}", owner.evaluator_ref()),
+            value: owner.bounds().min_value,
+            owner: None,
+            problem: format!("verifier failure in {}", evidence.job.job_id),
+            likely_benefit: "preserve the evaluator's independent failure evidence".to_owned(),
+            risk: "diagnostic intake only; no automatic policy or verifier change".to_owned(),
+            proposed_owner: owner.authority_ref().to_owned(),
+            cost: "owner-budget-ledger-required-before-promotion".to_owned(),
+            next_reversible_step: "owner reviews the diagnostic brief at a safe boundary"
+                .to_owned(),
+            unknowns: vec!["owner disposition and root cause remain open".to_owned()],
+            boundary: SafeBoundary {
+                active_main_agent_or_human_ref: owner.authority_ref().to_owned(),
+                boundary_ref: owner.rollback_ref().to_owned(),
+            },
+            bounded_tuning: false,
+            touches_protected: false,
+            has_work_item_ref: true,
+            live_experiments_on_surface: 0,
+            work_item_ref: Some(evidence.job.job_id.clone()),
+            owner_approved: false,
+            migration_proof_ref: None,
+            budget_proof: BudgetProof {
+                budget_ledger_ref: owner.retention_ref().to_owned(),
+                ledger_matched: false,
+                complexity_delta: ComplexityEconomicsDelta {
+                    delta_ref: owner.evaluator_ref().to_owned(),
+                    conclusive: false,
+                    detail: "diagnostic intake; promotion evidence is not asserted".to_owned(),
+                },
+                affected_check_refs: vec![evidence.job.job_id.clone()],
+                live_shadow_refs: Vec::new(),
+                live_canary_refs: Vec::new(),
+                delayed_harm_window_ref: owner.rollback_ref().to_owned(),
+            },
+        };
+        let admission = LearningAdmissionRequest {
+            source_campaign_id: owner_evidence.campaign_ref().to_owned(),
+            target_task_id: task_id.as_str().to_owned(),
+            overlay_id: Some(owner_evidence.overlay_ref().to_owned()),
+            candidate_id: None,
+        };
+        self.enqueue_kernel_improvement_intake(
+            sourced,
+            params,
+            admission,
+            evidence.request_identity.clone(),
+        )
+        .map_err(completion_error)
+    }
+
     /// Drains one terminal evidence row: publishes the verifier-execution
     /// fact, submits the evidence-led finish candidate through the Governor
     /// production caller, then acknowledges the terminal owner-side.
@@ -416,6 +530,7 @@ impl DaemonComposition {
         let draft = finish_draft_from_testd_terminal_evidence(job, identity)?;
         let operation_id = OperationId::new(format!("testd-owner-finish-{}", job.job_id))
             .map_err(completion_error)?;
+        self.enqueue_failed_verifier_improvement(evidence)?;
         let _decision = self.finish_attempt(identity, operation_id, draft).await?;
         kernel
             .acknowledge_testd_terminal_completion_async(&job.job_id, *committed)

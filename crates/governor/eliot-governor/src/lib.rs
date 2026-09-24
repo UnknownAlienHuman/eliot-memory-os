@@ -95,9 +95,11 @@ pub use eliot_finish::FinishDecisionReceipt;
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
 pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
 pub use learning_admission::{
-    LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
-    LearningAdmissionError, LearningAdmissionOwnerRecord, LearningAdmissionPermit,
-    LearningAdmissionRequest, VerifiedLearningAdmission, issue_learning_admission,
+    CrossTaskAdmissionReceipt, LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION,
+    LEARNING_BACKLOG_MAX_ACTIVE_SETTING, LEARNING_BACKLOG_MIN_VALUE_SETTING,
+    LearningAdmissionClaim, LearningAdmissionError, LearningAdmissionOwnerRecord,
+    LearningAdmissionPermit, LearningAdmissionRequest, LearningBoundDecision,
+    LearningOwnerEvidence, VerifiedLearningAdmission, issue_learning_admission,
     issue_learning_ticket, verify_learning_admission, verify_learning_ticket,
 };
 pub use learning_delta_integration::{
