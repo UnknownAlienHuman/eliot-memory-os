@@ -1774,6 +1774,10 @@ pub enum AdmittedAttemptError {
     ModelMismatch,
     #[error("bound attempt is already terminal; a closed attempt never re-executes")]
     AttemptTerminal,
+    #[error("child session {child_id} remains open; parent cannot close")]
+    OpenChildSession { child_id: String },
+    #[error("admitted slot continuity broken between dispatch and seal")]
+    SlotMismatch,
     #[error("read-only run request is invalid: {0}")]
     RequestRejected(RunRequestError),
     #[error("sealed candidate rejects the run result: {reason}")]
@@ -1932,6 +1936,20 @@ impl AdmittedOpenCodeAttempt {
         serde_json::from_value(Value::String(sha256_hex(&bytes)))
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))
     }
+
+    /// Consumes exactly one admitted slot once, snapshotting the
+    /// attempt/lease/fence/generation identities from the governing
+    /// admission. The supervised runner calls this before dispatch so the
+    /// dispatched execution is bound to one exact admitted slot.
+    pub fn consume_one_slot(&self) -> AdmittedSlotConsumption {
+        AdmittedSlotConsumption {
+            attempt_id: self.admission.attempt_id.clone(),
+            lease_digest: slot_digest(&self.admission.lease_id),
+            fence_digest: slot_digest(&self.admission.state_fence),
+            generation_digest: slot_digest(&self.admission.runtime_generation),
+            consumed: true,
+        }
+    }
 }
 
 /// Sealed candidate-only outcome of one admitted read-only attempt.
@@ -2003,6 +2021,174 @@ impl AdmittedAttemptCandidate {
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
         serde_json::from_value(Value::String(sha256_hex(&bytes)))
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))
+    }
+}
+
+/// Edge-candidate marker for the admitted-attempt edge (issue #487).
+///
+/// Names the issue #487 proof ceiling ([`AuthorityCeiling::CandidateOnly`]):
+/// every artifact this edge emits is candidate evidence only and can never
+/// become a task completion or authority grant.
+pub const OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE: &str =
+    "OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE";
+
+/// Canonical digest of one admitted identity value for slot accounting.
+/// Serialization of a validated identity never fails in practice; a
+/// failure degrades to the debug rendering so slot consumption stays total.
+fn slot_digest(value: &impl Serialize) -> String {
+    canonical_json_bytes(value).map_or_else(|error| error.to_string(), |bytes| sha256_hex(&bytes))
+}
+
+/// Exactly one consumed admitted slot.
+///
+/// Snapshots the attempt identity plus the lease/fence/generation digests
+/// from the governing admission at dispatch time. Constructed only via
+/// [`AdmittedOpenCodeAttempt::consume_one_slot`]; `consumed` is always true
+/// on construction and records that one exact slot was taken once.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedSlotConsumption {
+    attempt_id: AgentAttemptId,
+    lease_digest: String,
+    fence_digest: String,
+    generation_digest: String,
+    consumed: bool,
+}
+
+impl AdmittedSlotConsumption {
+    /// Returns the exact admitted attempt identity this slot was consumed for.
+    pub fn attempt_id(&self) -> &AgentAttemptId {
+        &self.attempt_id
+    }
+
+    /// Confirms the consumed slot still matches the governing admission.
+    /// By-value so one snapshot confirms at most once: a dispatch/seal gap
+    /// that changed attempt, lease, fence, or generation rejects with
+    /// [`AdmittedAttemptError::SlotMismatch`].
+    pub fn confirm(self, admitted: &AdmittedOpenCodeAttempt) -> Result<(), AdmittedAttemptError> {
+        if self.attempt_id != admitted.admission.attempt_id
+            || self.lease_digest != slot_digest(&admitted.admission.lease_id)
+            || self.fence_digest != slot_digest(&admitted.admission.state_fence)
+            || self.generation_digest != slot_digest(&admitted.admission.runtime_generation)
+            || !self.consumed
+        {
+            return Err(AdmittedAttemptError::SlotMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Enumerates and reconciles child sessions before a parent terminal
+/// disposition. An open child blocks the parent close: the first open child
+/// rejects with [`AdmittedAttemptError::OpenChildSession`].
+pub fn ensure_no_open_child_sessions(
+    parent_session_id: &str,
+    children: &[(String, bool)],
+) -> Result<(), AdmittedAttemptError> {
+    for (child_id, is_open) in children {
+        if child_id == parent_session_id {
+            continue;
+        }
+        if *is_open {
+            return Err(AdmittedAttemptError::OpenChildSession {
+                child_id: child_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Observation axis bound to one exact admitted attempt.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmittedObservationKind {
+    Heartbeat,
+    Progress,
+    Quota,
+    Terminal,
+}
+
+/// One heartbeat/progress/quota/terminal observation bound to the exact
+/// attempt it was observed under. The attempt identity is copied from the
+/// admitted attempt at construction; observations never invent, retarget, or
+/// widen attempt authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedObservation {
+    pub attempt_id: AgentAttemptId,
+    pub kind: AdmittedObservationKind,
+    pub detail: String,
+}
+
+impl AdmittedObservation {
+    /// Binds one observation to the exact admitted attempt.
+    pub fn new(
+        attempt: &AdmittedOpenCodeAttempt,
+        kind: AdmittedObservationKind,
+        detail: String,
+    ) -> Self {
+        Self {
+            attempt_id: attempt.attempt().id.clone(),
+            kind,
+            detail,
+        }
+    }
+}
+
+/// Attested executable identity for the policy owner (consumed by
+/// `client.rs`). Carries the executable fingerprint text only; it proves
+/// nothing by itself until the policy owner admits it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutableFingerprint(String);
+
+/// Rejected executable fingerprint text. The supplied value is never echoed.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ExecutableFingerprintError {
+    #[error("executable fingerprint must not be blank")]
+    Blank,
+}
+
+impl ExecutableFingerprint {
+    /// Constructs a validated non-blank executable fingerprint.
+    pub fn new(value: impl Into<String>) -> Result<Self, ExecutableFingerprintError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(ExecutableFingerprintError::Blank);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the canonical fingerprint text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes this fingerprint and returns its text.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// Attested environment allowlist for the policy owner (consumed by
+/// `client.rs`). Membership is exact-text equality; entries carry no
+/// authority until the policy owner admits them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentAllowlist(Vec<String>);
+
+impl EnvironmentAllowlist {
+    /// Constructs an allowlist from its exact entries.
+    pub fn new(entries: Vec<String>) -> Self {
+        Self(entries)
+    }
+
+    /// Returns whether the exact entry text is allowlisted.
+    pub fn contains(&self, entry: &str) -> bool {
+        self.0.iter().any(|item| item == entry)
+    }
+
+    /// Returns the exact allowlisted entries.
+    pub fn list(&self) -> &[String] {
+        &self.0
     }
 }
 
