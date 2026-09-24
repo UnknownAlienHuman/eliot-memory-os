@@ -18,6 +18,7 @@ mod caller;
 mod guard;
 mod identity;
 mod issuance;
+mod readiness;
 mod resolver;
 mod scanner;
 
@@ -37,6 +38,11 @@ pub use identity::{
 };
 pub use issuance::{
     IssuanceRefusal, admit_initial_binding, issuance_refusal, issue_resolution_receipt,
+};
+pub use readiness::{
+    ExplicitAbsenceRecord, GoverningCoverage, MaterialAdmission, MaterialReadinessDirective,
+    MaterialReadinessInputs, MaterialReadinessReport, RequestedEffect, allowed_effects,
+    assess_material_readiness, evaluate_material_request,
 };
 pub use resolver::{
     BindingToken, HostObservedHandles, ManifestBoundaryClaim, RegisteredInstanceEvidence,
