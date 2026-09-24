@@ -23,8 +23,10 @@ pub use contracts::{
 pub use error::ActivationAssessmentError;
 
 pub use eliot_learning_contracts::{
-    AssessmentDimension, AttemptLearningDeltaCandidate, CampaignHarnessOverlayCandidate,
-    CampaignLearningStateView, CausalCeiling, ContractBinding, DimensionAssessment,
+    ActivationSection, ActivationStatus, AdherenceSection, AdherenceStatus, AssessmentDimension,
+    AttemptLearningDeltaCandidate, CampaignHarnessOverlayCandidate, CampaignLearningStateView,
+    CausalCeiling, ContractBinding, DeliverySection, DeliveryStatus, DimensionAssessment,
     DimensionStatus, HarnessActivationReceiptCandidate, LearningAssessmentCandidate,
-    LifecycleStage, MetricObservation, SourceDenominator, StageDisposition, StageObservation,
+    LifecycleStage, MetricObservation, RetrievalSection, RetrievalStatus, SourceDenominator,
+    StageDisposition, StageObservation,
 };

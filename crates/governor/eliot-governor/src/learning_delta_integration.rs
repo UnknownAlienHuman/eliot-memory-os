@@ -10,14 +10,23 @@
 //! (`read_file`/`grep`) are not consequential and never derive (line 181).
 
 use eliot_contracts::{ArtifactId, StateFence};
+use eliot_learning_activation_assessment::{
+    ActivationAssessmentError, AssessmentInput, AssessmentPolicy, AssessmentResultOrIncomplete,
+    assess_learning_activation,
+};
 use eliot_learning_contracts::{
-    AgentAttemptId, AttemptLearningOutcome, CampaignId, CampaignLearningStateView, OverlayId,
+    ActivationSection, AdherenceSection, AgentAttemptId, AttemptLearningDeltaCandidate,
+    AttemptLearningOutcome, CampaignHarnessOverlayCandidate, CampaignId, CampaignLearningStateView,
+    ContractBinding, DeliverySection, DimensionAssessment, HarnessActivationReceiptCandidate,
+    LearningStateViewRecipe, MetricObservation, OverlayId, RetrievalSection, StageObservation,
+    TargetId,
 };
 use eliot_learning_delta::{
     AdmissionReceipt, AttemptCloseDisposition, AttemptEvidence, ConsequentialBoundary,
     DerivationContext, DerivationPolicy, LearningDeltaError, RefinerDraft, StoredDeltaDisposition,
     StoredLearningDelta, delivery_allowed, derive_attempt_learning_outcome,
 };
+use thiserror::Error;
 
 use crate::Governor;
 use crate::learning_admission::{
@@ -186,4 +195,240 @@ pub fn delta_delivery_allowed(
 /// the digest so the retry binds to the exact prior observable and evidence.
 pub fn retry_lineage_for_delta(delta: &StoredLearningDelta) -> (&ArtifactId, &str) {
     delta.lineage_for_retry()
+}
+
+/// Fail-closed error for the attempt-close composition below.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum AttemptCloseError {
+    /// Storing the derived delta failed; no receipt was attempted.
+    #[error(transparent)]
+    Delta(#[from] LearningDeltaError),
+    /// Activation assessment failed or the evidence was incomplete.
+    #[error(transparent)]
+    Activation(#[from] ActivationAssessmentError),
+}
+
+/// Emit the per-attempt activation receipt candidate at attempt close.
+///
+/// Candidate-only composition over caller-supplied attempt-close evidence
+/// (I12.24 l224): the receipt records whether the admitted learning surface
+/// was eligible, compiled, retrieved and delivered, whether qualifying
+/// observable activation occurred, and whether its prescription was followed
+/// or violated. Receipt existence never implies successful delivery, use,
+/// adherence or benefit. It does not grant authority, schedule an attempt,
+/// promote a candidate, or infer causal benefit.
+///
+/// Retrieval, delivery, observable activation, adherence and outcome stay
+/// orthogonal (I12.24 l256): the fields are not a success ladder, so every
+/// section arrives as an explicit caller-supplied param and is passed through
+/// to [`assess_learning_activation`] unchanged. In particular:
+/// - `first_qualifying_observable_use_ref` is the caller's; nothing is
+///   fabricated here. An acknowledgement is a delivery/attention signal only
+///   and never substitutes for the qualifying use ref (enforced by assess).
+/// - Delivery packet facts (position, digest, bytes, tokens) arrive as params
+///   from the Context Compiler owner; nothing is synthesized here.
+/// - Missing or inconclusive observability arrives as `UNKNOWN`/`NOT_ASSESSED`
+///   statuses from the caller; nothing defaults to compliance.
+///
+/// The caller is the Task-Controller attempt-close path, which supplies the
+/// compiled view/delta/overlay refs, the compiler and render revisions, and
+/// the retrieval/delivery/activation/adherence sections from the Context
+/// Compiler and observability owners. On the `Candidate` arm the constructed
+/// [`HarnessActivationReceiptCandidate`] is returned; on the `Incomplete` arm
+/// (caller omitted mandatory receipt identities) an error is returned and no
+/// receipt is fabricated.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_activation_receipt_at_attempt_close(
+    binding: &ContractBinding,
+    target: &TargetId,
+    view: &CampaignLearningStateView,
+    recipe: &LearningStateViewRecipe,
+    delta: &AttemptLearningDeltaCandidate,
+    overlay: &CampaignHarnessOverlayCandidate,
+    activation_id: Option<&ArtifactId>,
+    admission_receipt: Option<&ArtifactId>,
+    activation_request_receipt: Option<&ArtifactId>,
+    assessment_receipt: Option<&ArtifactId>,
+    stages: &[StageObservation],
+    metrics: &[MetricObservation],
+    attrition: &[ArtifactId],
+    confounders: &[ArtifactId],
+    independent_evaluator_receipt: Option<&ArtifactId>,
+    dimensions: &[DimensionAssessment],
+    external_review_refs: &[ArtifactId],
+    policy: &AssessmentPolicy,
+    compiled_view_ref: &ArtifactId,
+    context_compiler_revision: &str,
+    render_profile_revision: &str,
+    stable_harness_refs: &[ArtifactId],
+    task_family_harness_refs: &[ArtifactId],
+    skill_refs: &[ArtifactId],
+    memory_refs: &[ArtifactId],
+    procedure_refs: &[ArtifactId],
+    preserved_success_ref: Option<&ArtifactId>,
+    eligibility_and_retrieval_reason: Option<&str>,
+    retrieval: &RetrievalSection,
+    delivery: &DeliverySection,
+    activation: &ActivationSection,
+    adherence: &AdherenceSection,
+    conflicts_suppression_or_compaction_loss: &[ArtifactId],
+    downstream_refs: &[ArtifactId],
+    receipt_completeness_and_missing_fields: &[String],
+    invalidation_expiry_and_missingness: &[String],
+) -> Result<HarnessActivationReceiptCandidate, ActivationAssessmentError> {
+    let input = AssessmentInput {
+        binding,
+        target,
+        view,
+        recipe,
+        delta,
+        overlay,
+        activation_id,
+        admission_receipt,
+        activation_request_receipt,
+        assessment_receipt,
+        stages,
+        metrics,
+        attrition,
+        confounders,
+        independent_evaluator_receipt,
+        dimensions,
+        external_review_refs,
+        policy,
+        compiled_view_ref,
+        context_compiler_revision,
+        render_profile_revision,
+        stable_harness_refs,
+        task_family_harness_refs,
+        skill_refs,
+        memory_refs,
+        procedure_refs,
+        preserved_success_ref,
+        eligibility_and_retrieval_reason,
+        retrieval,
+        delivery,
+        activation,
+        adherence,
+        conflicts_suppression_or_compaction_loss,
+        downstream_refs,
+        receipt_completeness_and_missing_fields,
+        invalidation_expiry_and_missingness,
+    };
+    match assess_learning_activation(&input)? {
+        AssessmentResultOrIncomplete::Candidate(result) => Ok(result.activation),
+        AssessmentResultOrIncomplete::Incomplete(_) => {
+            Err(ActivationAssessmentError::LineageMismatch {
+                field: "activation.mandatory_ids",
+            })
+        }
+    }
+}
+
+/// Attempt-close production path: store the derived delta, then emit the
+/// activation receipt candidate.
+///
+/// This is the Governor-side composition the Task-Controller attempt-close
+/// path calls with the evidence already available at close: the derived
+/// `outcome` plus identity for [`store_derived_delta`], and the compiled
+/// view/delta/overlay refs with compiler/delivery/observability evidence for
+/// [`emit_activation_receipt_at_attempt_close`]. Both outputs stay
+/// candidate-only; neither grants authority, schedules work, or promotes a
+/// delta (I12.24 l224). Retrieval, delivery, activation, adherence and
+/// outcome remain orthogonal fields, not a success ladder (I12.24 l256).
+#[allow(clippy::too_many_arguments)]
+pub fn close_attempt_with_activation_receipt(
+    outcome: &AttemptLearningOutcome,
+    campaign_id: CampaignId,
+    attempt_id: AgentAttemptId,
+    fence: StateFence,
+    actor_id: &str,
+    route_id: &str,
+    overlay_id: OverlayId,
+    prior: Option<(&ArtifactId, &str)>,
+    binding: &ContractBinding,
+    target: &TargetId,
+    view: &CampaignLearningStateView,
+    recipe: &LearningStateViewRecipe,
+    delta: &AttemptLearningDeltaCandidate,
+    overlay: &CampaignHarnessOverlayCandidate,
+    activation_id: Option<&ArtifactId>,
+    admission_receipt: Option<&ArtifactId>,
+    activation_request_receipt: Option<&ArtifactId>,
+    assessment_receipt: Option<&ArtifactId>,
+    stages: &[StageObservation],
+    metrics: &[MetricObservation],
+    attrition: &[ArtifactId],
+    confounders: &[ArtifactId],
+    independent_evaluator_receipt: Option<&ArtifactId>,
+    dimensions: &[DimensionAssessment],
+    external_review_refs: &[ArtifactId],
+    policy: &AssessmentPolicy,
+    compiled_view_ref: &ArtifactId,
+    context_compiler_revision: &str,
+    render_profile_revision: &str,
+    stable_harness_refs: &[ArtifactId],
+    task_family_harness_refs: &[ArtifactId],
+    skill_refs: &[ArtifactId],
+    memory_refs: &[ArtifactId],
+    procedure_refs: &[ArtifactId],
+    preserved_success_ref: Option<&ArtifactId>,
+    eligibility_and_retrieval_reason: Option<&str>,
+    retrieval: &RetrievalSection,
+    delivery: &DeliverySection,
+    activation: &ActivationSection,
+    adherence: &AdherenceSection,
+    conflicts_suppression_or_compaction_loss: &[ArtifactId],
+    downstream_refs: &[ArtifactId],
+    receipt_completeness_and_missing_fields: &[String],
+    invalidation_expiry_and_missingness: &[String],
+) -> Result<(StoredLearningDelta, HarnessActivationReceiptCandidate), AttemptCloseError> {
+    let stored = store_derived_delta(
+        outcome,
+        campaign_id,
+        attempt_id,
+        fence,
+        actor_id,
+        route_id,
+        overlay_id,
+        prior,
+    )?;
+    let receipt = emit_activation_receipt_at_attempt_close(
+        binding,
+        target,
+        view,
+        recipe,
+        delta,
+        overlay,
+        activation_id,
+        admission_receipt,
+        activation_request_receipt,
+        assessment_receipt,
+        stages,
+        metrics,
+        attrition,
+        confounders,
+        independent_evaluator_receipt,
+        dimensions,
+        external_review_refs,
+        policy,
+        compiled_view_ref,
+        context_compiler_revision,
+        render_profile_revision,
+        stable_harness_refs,
+        task_family_harness_refs,
+        skill_refs,
+        memory_refs,
+        procedure_refs,
+        preserved_success_ref,
+        eligibility_and_retrieval_reason,
+        retrieval,
+        delivery,
+        activation,
+        adherence,
+        conflicts_suppression_or_compaction_loss,
+        downstream_refs,
+        receipt_completeness_and_missing_fields,
+        invalidation_expiry_and_missingness,
+    )?;
+    Ok((stored, receipt))
 }

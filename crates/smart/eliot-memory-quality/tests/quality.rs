@@ -12,8 +12,8 @@ use std::num::NonZeroU64;
 use eliot_agent_contracts::{AgentAttemptId, TargetId};
 use eliot_context_contracts::{
     AffordanceProjection, CanonicalProjectionSet, ContextBinding, ContinuityProjection,
-    DecisionRevision, LossPolicy, NonRecoverableReason, OmissionReason, OmissionRecord,
-    ProviderId, ProviderRole, SafetyProjection, SemanticRole, TaskProjection,
+    DecisionRevision, LossPolicy, NonRecoverableReason, OmissionReason, OmissionRecord, ProviderId,
+    ProviderRole, SafetyProjection, SemanticRole, TaskProjection,
 };
 use eliot_contracts::{
     ArtifactId, DecisionId, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId,
@@ -21,11 +21,12 @@ use eliot_contracts::{
 };
 use eliot_evidence::{Assertability, EpistemicStatus, LifecycleState, Provenance};
 use eliot_learning_contracts::identity::{
-    ContractBinding, SourceLineage, LEARNING_SCHEMA_VERSION, digest_without_field,
+    ContractBinding, LEARNING_SCHEMA_VERSION, SourceLineage, digest_without_field,
 };
 use eliot_learning_contracts::{
-    HarnessActivationReceiptCandidate, LifecycleStage, OverlayId, ProofCeiling, SourceDenominator,
-    StageDisposition, StageObservation,
+    ActivationSection, ActivationStatus, AdherenceSection, AdherenceStatus, DeliverySection,
+    DeliveryStatus, HarnessActivationReceiptCandidate, LifecycleStage, OverlayId, ProofCeiling,
+    RetrievalSection, RetrievalStatus, SourceDenominator, StageDisposition, StageObservation,
 };
 use eliot_memory_projection_contracts::{
     ApplicableMemory, ApplicableMemorySet, CoverageOmission, DenominatorState, ExcludedMemory,
@@ -317,6 +318,42 @@ fn receipt() -> HarnessActivationReceiptCandidate {
         attrition: vec![],
         confounders: vec![],
         independent_evaluator_receipt: None,
+        compiled_view_ref: aid("compiled-view-memq"),
+        context_compiler_revision: "compiler-rev-memq".to_owned(),
+        render_profile_revision: "render-rev-memq".to_owned(),
+        stable_harness_refs: vec![],
+        task_family_harness_refs: vec![],
+        skill_refs: vec![],
+        memory_refs: vec![],
+        procedure_refs: vec![],
+        preserved_success_ref: None,
+        eligibility_and_retrieval_reason: None,
+        retrieval: RetrievalSection {
+            status: RetrievalStatus::Unknown,
+            expansion_or_tool_query_refs: vec![],
+        },
+        delivery: DeliverySection {
+            status: DeliveryStatus::Missing,
+            packet_position: None,
+            serialized_digest: None,
+            bytes: None,
+            actual_tokens: None,
+        },
+        activation: ActivationSection {
+            status: ActivationStatus::Unknown,
+            acknowledgement_ref: None,
+            observation_limit_reason: None,
+            first_qualifying_observable_use_ref: None,
+        },
+        adherence: AdherenceSection {
+            status: AdherenceStatus::Unknown,
+            early_mid_final_checkpoint_refs: vec![],
+            prescribed_or_avoided_action_and_required_verifier_refs: vec![],
+        },
+        conflicts_suppression_or_compaction_loss: vec![],
+        downstream_decision_action_artifact_and_verifier_refs: vec![],
+        receipt_completeness_and_missing_fields: vec![],
+        invalidation_expiry_and_missingness: vec![],
         canonical_digest: String::new(),
     };
     candidate.canonical_digest =
@@ -368,10 +405,7 @@ fn happy_path_emits_complete_assessment_with_exact_denominator() {
     assert_eq!(assessment.counter_metrics.excluded_by_rule[0].rule, "STALE");
     assert_eq!(assessment.counter_metrics.excluded_by_rule[0].count, 1);
     assert_eq!(assessment.receipts.len(), 1);
-    assert_eq!(
-        assessment.receipts[0].activation_id,
-        aid("activation-memq")
-    );
+    assert_eq!(assessment.receipts[0].activation_id, aid("activation-memq"));
     assert_eq!(
         assessment.receipts[0].member_denominator,
         SourceDenominator {
@@ -379,11 +413,7 @@ fn happy_path_emits_complete_assessment_with_exact_denominator() {
             observed: 0,
         }
     );
-    let gravity: Vec<GravityNoteKind> = assessment
-        .gravity
-        .iter()
-        .map(|note| note.kind)
-        .collect();
+    let gravity: Vec<GravityNoteKind> = assessment.gravity.iter().map(|note| note.kind).collect();
     assert!(gravity.contains(&GravityNoteKind::SafetySurfacedNegativeTrigger));
     assert!(gravity.contains(&GravityNoteKind::MinorityPreserved));
     assert!(gravity.contains(&GravityNoteKind::CueHitButExcluded));
@@ -512,10 +542,7 @@ fn projection_omissions_block_completeness() {
     assessment.validate().expect("assessment validates");
     assert_eq!(assessment.status, CoverageStatus::Inconclusive);
     assert_eq!(assessment.projection_omissions.len(), 1);
-    assert_eq!(
-        assessment.counter_metrics.projection_omissions,
-        1
-    );
+    assert_eq!(assessment.counter_metrics.projection_omissions, 1);
 }
 
 #[test]
@@ -623,10 +650,7 @@ fn tampered_assessment_version_is_rejected() {
     let candidate = request(batch_value, &[], &[], vec![]);
     let mut assessment = assess_quality(&candidate).expect("quality assessment");
     assessment.contract_version = eliot_contracts::ContractVersion::new(9, 9, 9);
-    assert_eq!(
-        assessment.validate(),
-        Err(QualityError::VersionMismatch)
-    );
+    assert_eq!(assessment.validate(), Err(QualityError::VersionMismatch));
 }
 
 #[test]
