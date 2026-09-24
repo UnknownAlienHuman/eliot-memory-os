@@ -1,7 +1,7 @@
 //! Admitted canonical experience-bank and agent-feedback records (B223).
 //!
 //! This module closes the record side of the #223 experience freeze that
-//! `experience_projection.rs` leaves explicitly open: "no bank record type
+//! `experience::projection` leaves explicitly open: "no bank record type
 //! exists upstream" and "no feedback receipt type exists upstream". It adds
 //! the missing admitted record schemas **without** touching the frozen r5
 //! wire shapes (`JournalProjection`, `BankProjection`, `FeedbackProjection`,
@@ -244,13 +244,13 @@ impl ExperienceBankRecord {
             }
             seen.push(id);
         }
-        if let Some(prior) = &predecessor {
-            if prior == &handle {
-                return Err(ObservationError::InvalidField {
-                    field: "bank_record.predecessor",
-                    reason: "predecessor must differ from the record handle",
-                });
-            }
+        if let Some(prior) = &predecessor
+            && prior == &handle
+        {
+            return Err(ObservationError::InvalidField {
+                field: "bank_record.predecessor",
+                reason: "predecessor must differ from the record handle",
+            });
         }
         scope.validate()?;
         fence_shape(&fence, "bank_record.fence")?;
@@ -329,13 +329,13 @@ impl ExperienceBankRecord {
                 reason: "exceeds bounded length",
             });
         }
-        if let Some(prior) = &self.predecessor {
-            if prior == &self.handle {
-                return Err(ObservationError::InvalidField {
-                    field: "bank_record.predecessor",
-                    reason: "predecessor must differ from the record handle",
-                });
-            }
+        if let Some(prior) = &self.predecessor
+            && prior == &self.handle
+        {
+            return Err(ObservationError::InvalidField {
+                field: "bank_record.predecessor",
+                reason: "predecessor must differ from the record handle",
+            });
         }
         self.scope.validate()?;
         fence_shape(&self.fence, "bank_record.fence")?;

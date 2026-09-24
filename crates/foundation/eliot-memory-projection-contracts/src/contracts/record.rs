@@ -22,7 +22,7 @@ use eliot_receipts::WorkScopeId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::MemoryProjectionError;
+use crate::contracts::error::MemoryProjectionError;
 
 /// Maximum roles carried by one record.
 pub const MAX_RECORD_ROLES: usize = 8;

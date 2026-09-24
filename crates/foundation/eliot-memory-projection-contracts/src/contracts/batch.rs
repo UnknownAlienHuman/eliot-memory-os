@@ -12,9 +12,9 @@ use std::collections::BTreeSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::MemoryProjectionError;
-use crate::record::MemoryProjectionRecord;
-use crate::record::MemoryScopeBinding;
+use crate::contracts::error::MemoryProjectionError;
+use crate::contracts::record::MemoryProjectionRecord;
+use crate::contracts::record::MemoryScopeBinding;
 
 /// Hard ceiling on records carried by one projection batch.
 ///

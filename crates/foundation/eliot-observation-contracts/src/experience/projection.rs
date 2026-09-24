@@ -61,7 +61,11 @@ fn text(value: &str, field: &'static str) -> Result<(), ObservationError> {
     Ok(())
 }
 
-fn bounded_text(value: &str, field: &'static str, max_chars: usize) -> Result<(), ObservationError> {
+fn bounded_text(
+    value: &str,
+    field: &'static str,
+    max_chars: usize,
+) -> Result<(), ObservationError> {
     text(value, field)?;
     if value.chars().count() > max_chars {
         return Err(ObservationError::InvalidField {
@@ -87,10 +91,12 @@ fn digest(value: &str, field: &'static str) -> Result<(), ObservationError> {
 }
 
 fn fence_shape(value: &StateFence, field: &'static str) -> Result<(), ObservationError> {
-    value.validate().map_err(|_| ObservationError::InvalidField {
-        field,
-        reason: "fence interval is invalid",
-    })
+    value
+        .validate()
+        .map_err(|_| ObservationError::InvalidField {
+            field,
+            reason: "fence interval is invalid",
+        })
 }
 
 /// Closed source-family marker for experience projections.
@@ -195,13 +201,7 @@ impl ProjectionCoverage {
     /// Validate evidence, digest shape, and denominator ref bound.
     pub fn validate(&self) -> Result<(), ObservationError> {
         self.evidence.validate()?;
-        if self
-            .evidence
-            .denominator_source_ref
-            .chars()
-            .count()
-            > MAX_DENOMINATOR_REF_CHARS
-        {
+        if self.evidence.denominator_source_ref.chars().count() > MAX_DENOMINATOR_REF_CHARS {
             return Err(ObservationError::InvalidField {
                 field: "projection_coverage.denominator_source_ref",
                 reason: "exceeds bounded length",
@@ -244,7 +244,7 @@ impl EnvelopeHeader<'_> {
             });
         }
         self.scope.validate()?;
-        fence_shape(&self.fence, "projection.fence")?;
+        fence_shape(self.fence, "projection.fence")?;
         bounded_text(
             self.source_revision,
             "projection.source_revision",
