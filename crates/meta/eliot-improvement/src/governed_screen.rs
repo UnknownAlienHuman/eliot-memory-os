@@ -231,7 +231,7 @@ pub fn check_governed_carriage(
         admission.validate()?;
         if admission.source_campaign_id != source
             || admission.target_task_id != target
-            || !admission.matches_permit(presented.verified)
+            || !admission.matches_governor_permit(presented.verified)
         {
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }

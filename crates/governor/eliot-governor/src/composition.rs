@@ -23,11 +23,13 @@ use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
+use crate::learning_admission::issue_learning_admission_with_owner_evidence;
 use crate::{
     FinishAttemptError, Governor, GovernorConfig, GovernorFinishAttempt, GovernorState,
     LearningAdmissionError, LearningAdmissionOwnerRecord, LearningAdmissionPermit,
-    LearningAdmissionRequest, QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
-    VerifiedLearningAdmission, issue_learning_admission, verify_learning_admission,
+    LearningAdmissionRequest, LearningBoundDecision, LearningOwnerEvidence,
+    CrossTaskAdmissionReceipt, QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
+    VerifiedLearningAdmission, verify_learning_admission,
 };
 use eliot_authority::{
     GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
@@ -3686,7 +3688,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "policy_scope",
             ));
         }
-        let rollback_ref = self
+        let (rollback_ref, overlay_ref) = self
             .owners
             .task
             .events()
@@ -3697,15 +3699,43 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     return None;
                 }
                 match &event.command {
-                    Some(TaskCommand::AuthorizeAction { authority_ref, .. }) => {
-                        Some(authority_ref.clone())
-                    }
+                    Some(TaskCommand::AuthorizeAction {
+                        authority_ref,
+                        understanding_ref,
+                    }) => Some((authority_ref.clone(), understanding_ref.clone())),
                     _ => None,
                 }
             })
             .ok_or(LearningAdmissionError::OwnerEvidenceUnavailable(
                 "task_action_authority",
             ))?;
+        let closure_ref = self
+            .owners
+            .task
+            .events()
+            .iter()
+            .rev()
+            .find_map(|event| {
+                if event.task_id != *task_id || event.state_fence != fence {
+                    return None;
+                }
+                match &event.command {
+                    Some(TaskCommand::Verify { verification_ref }) => {
+                        Some(verification_ref.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or_else(|| task.last_event_id.clone());
+        let bounds = LearningBoundDecision::from_policy_snapshot(policy.snapshot())?;
+        let owner_evidence = LearningOwnerEvidence {
+            task_ref: task.task_id.as_str().to_owned(),
+            recipe_ref: format!("{}@{}", plan.plan_id, plan.plan_revision),
+            closure_ref,
+            campaign_ref: task.project_ref.clone(),
+            overlay_ref,
+            cross_task_admission_ref: None,
+        };
         LearningAdmissionOwnerRecord::from_owner_projection(
             fence,
             plan.work_scope_id,
@@ -3714,6 +3744,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             verifier.evaluator.as_str().to_owned(),
             rollback_ref,
             policy.revision(),
+            bounds,
+            owner_evidence,
         )
     }
 
@@ -3743,7 +3775,30 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let owner = self.learning_admission_owner_record_for_task(&task_id)?;
         let fence = self.snapshot.state_fence();
         let claim = owner.claim_for(request, &fence)?;
-        issue_learning_admission(&self.governor, &claim)
+        issue_learning_admission_with_owner_evidence(
+            &self.governor,
+            &claim,
+            owner.owner_evidence(),
+        )
+    }
+
+    /// Issue the distinct cross-task receipt after re-reading the target task's
+    /// live owner projection. The ordinary permit remains subject to the same
+    /// fence; this receipt is the additional carryover authority.
+    pub fn issue_cross_task_admission_for_owner<'a>(
+        &self,
+        verified: &'a VerifiedLearningAdmission<'a>,
+    ) -> Result<CrossTaskAdmissionReceipt, LearningAdmissionError> {
+        let permit = verified.permit();
+        let task_id = TaskId::new(permit.target_task_id().to_owned())
+            .map_err(|_| LearningAdmissionError::InvalidTargetTask)?;
+        let owner = self.learning_admission_owner_record_for_task(&task_id)?;
+        if permit.owner_evidence() != Some(owner.owner_evidence()) {
+            return Err(LearningAdmissionError::OwnerEvidenceMismatch(
+                "cross_task_owner_evidence",
+            ));
+        }
+        CrossTaskAdmissionReceipt::issue(verified, owner.owner_evidence())
     }
 
     /// Revalidates a permit against both live Governor state and the current
@@ -3762,6 +3817,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || permit.retention_ref() != owner.retention_ref()
             || permit.evaluator_ref() != owner.evaluator_ref()
             || permit.rollback_ref() != owner.rollback_ref()
+            || permit.owner_evidence() != Some(owner.owner_evidence())
         {
             return Err(LearningAdmissionError::OwnerEvidenceMismatch(
                 "current_owner_projection",

@@ -18,9 +18,12 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use eliot_conformance_contracts::SelfQualityHandoff;
 use eliot_contracts::TaskId;
 use eliot_governor::{LearningAdmissionError, LearningAdmissionRequest};
+use eliot_protocol::RequestIdentity;
 use eliot_improvement::candidate_bounds::{BoundedBacklog, CandidateBoundPolicy};
 use eliot_improvement::{
     BudgetProof, EvidenceSource, ImprovementBrief, ImprovementError, ImprovementSurface,
@@ -103,15 +106,44 @@ pub struct HandoffIntakeParams {
 /// The event contains request material and the subject identity only. The
 /// five authorization/revalidation refs are not accepted here; the daemon
 /// obtains them from the current Governor owner when it drains the event.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GovernedImprovementIntakeEvent {
     pub request: IntakeRequest,
     pub admission: LearningAdmissionRequest,
+    /// Exact authenticated owner request which produced this event, when the
+    /// event came through a real Kernel/TestD owner drain. `None` is reserved
+    /// for explicitly owner-issued API submissions and cannot create a
+    /// durable archive receipt.
+    #[serde(default)]
+    pub source_identity: Option<RequestIdentity>,
+}
+
+/// Immutable receipt for an event that cannot enter the active backlog.
+///
+/// A permanent refusal is not retried forever and is not silently dropped:
+/// the event digest, subject, and exact reason remain available for the
+/// owner-backed persistence adapter and later audit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedIntakeRejectionReceipt {
+    pub event_digest: String,
+    pub candidate_subject: Option<String>,
+    pub reason: String,
+}
+
+impl GovernedIntakeRejectionReceipt {
+    fn from_event(event: &GovernedImprovementIntakeEvent, reason: String) -> Result<Self, IntakeBridgeError> {
+        let bytes = eliot_contracts::canonical_json_bytes(event)
+            .map_err(|error| IntakeBridgeError::Composition(error.to_string()))?;
+        Ok(Self {
+            event_digest: eliot_contracts::sha256_hex(&bytes),
+            candidate_subject: event.admission.candidate_id.clone(),
+            reason,
+        })
+    }
 }
 
 const MAX_PENDING_GOVERNED_INTAKES: usize = 64;
-const GOVERNED_BACKLOG_MAX_ACTIVE: usize = 32;
-const GOVERNED_BACKLOG_MIN_VALUE: f64 = 0.0;
+const MAX_RETAINED_INTAKE_REJECTIONS: usize = 64;
 
 /// Route one real conformance-diagnosis handoff into the improvement backlog
 /// for crate-internal legacy preparation.
@@ -234,6 +266,7 @@ impl DaemonComposition {
     ) -> Result<(), IntakeBridgeError> {
         event.admission.validate()?;
         if self.pending_governed_improvement_intakes.len() >= MAX_PENDING_GOVERNED_INTAKES {
+            self.retain_intake_rejection(&event, "queue_full".to_owned())?;
             return Err(IntakeBridgeError::QueueFull);
         }
         self.pending_governed_improvement_intakes.push_back(event);
@@ -254,25 +287,74 @@ impl DaemonComposition {
         self.enqueue_governed_improvement_intake(GovernedImprovementIntakeEvent {
             request: intake_request_from_params(evidence, params),
             admission,
+            source_identity: None,
         })
     }
 
-    /// Drain at most one retained intake event.
+    /// Enqueue an event produced from an already owner-issued evidence read.
     ///
-    /// The existing daemon run loop invokes this bounded step. A failed
-    /// event is put back at the head of the same owner queue, preserving the
-    /// evidence and preventing a refusal from becoming silent loss.
+    /// This is the narrow production seam used by the Kernel/TestD owner
+    /// drain. It accepts no caller-owned authority or backlog handle; the
+    /// request is still re-bound to the current Governor owner when drained.
+    pub(crate) fn enqueue_owner_evidence_improvement_intake(
+        &mut self,
+        evidence: SourcedEvidence,
+        params: HandoffIntakeParams,
+        admission: LearningAdmissionRequest,
+    ) -> Result<(), IntakeBridgeError> {
+        self.enqueue_governed_improvement_intake(GovernedImprovementIntakeEvent {
+            request: intake_request_from_params(evidence, params),
+            admission,
+            source_identity: None,
+        })
+    }
+
+    pub(crate) fn enqueue_kernel_improvement_intake(
+        &mut self,
+        evidence: SourcedEvidence,
+        params: HandoffIntakeParams,
+        admission: LearningAdmissionRequest,
+        source_identity: RequestIdentity,
+    ) -> Result<(), IntakeBridgeError> {
+        self.enqueue_governed_improvement_intake(GovernedImprovementIntakeEvent {
+            request: intake_request_from_params(evidence, params),
+            admission,
+            source_identity: Some(source_identity),
+        })
+    }
+
+    /// queued for a later live read; permanently invalid events are converted
+    /// into a retained receipt instead of spinning forever.
     pub fn drive_governed_improvement_intake_once(
         &mut self,
     ) -> Result<Option<IntakeOutcome>, IntakeBridgeError> {
         let Some(event) = self.pending_governed_improvement_intakes.pop_front() else {
             return Ok(None);
         };
-        let result = self.admit_governed_improvement_event(event.clone());
-        if result.is_err() {
-            self.pending_governed_improvement_intakes.push_front(event);
+        match self.admit_governed_improvement_event(event.clone()) {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(error) if permanent_intake_refusal(&error) => {
+                self.retain_intake_rejection(&event, error.to_string())?;
+                Ok(None)
+            }
+            Err(error) => {
+                self.pending_governed_improvement_intakes.push_front(event);
+                Err(error)
+            }
         }
-        result.map(Some)
+    }
+
+    fn retain_intake_rejection(
+        &mut self,
+        event: &GovernedImprovementIntakeEvent,
+        reason: String,
+    ) -> Result<(), IntakeBridgeError> {
+        let receipt = GovernedIntakeRejectionReceipt::from_event(event, reason)?;
+        if self.governed_intake_rejections.len() == MAX_RETAINED_INTAKE_REJECTIONS {
+            self.governed_intake_rejections.remove(0);
+        }
+        self.governed_intake_rejections.push(receipt);
+        Ok(())
     }
 
     /// Read-only retained backlog access for the single daemon owner.
@@ -287,6 +369,14 @@ impl DaemonComposition {
         self.pending_governed_improvement_intakes.len()
     }
 
+    /// Returns retained permanent-refusal receipts for owner/audit readback.
+    #[must_use]
+    pub fn governed_intake_rejection_receipts(
+        &self,
+    ) -> &[GovernedIntakeRejectionReceipt] {
+        &self.governed_intake_rejections
+    }
+
     fn admit_governed_improvement_event(
         &mut self,
         event: GovernedImprovementIntakeEvent,
@@ -298,15 +388,22 @@ impl DaemonComposition {
             .learning_admission_owner_record(&task_id)
             .map_err(|error| IntakeBridgeError::Composition(error.to_string()))?;
         let prepared = prepare_intake_for_owner(event.request, &owner)?;
-        if event.admission.candidate_id.as_deref() != Some(prepared.candidate_id()) {
+        if let Some(candidate_id) = event.admission.candidate_id.as_deref()
+            && candidate_id != prepared.candidate_id()
+        {
             return Err(IntakeBridgeError::Admission(
                 LearningAdmissionError::OwnerEvidenceMismatch("candidate_subject"),
             ));
         }
+        let mut admission = event.admission.clone();
+        if admission.candidate_id.is_none() {
+            admission.candidate_id = Some(prepared.candidate_id().to_owned());
+        }
+        let bounds = owner.bounds();
         let policy = CandidateBoundPolicy {
             target_surface: prepared.candidate().target_surface,
-            max_active: GOVERNED_BACKLOG_MAX_ACTIVE,
-            min_value: GOVERNED_BACKLOG_MIN_VALUE,
+            max_active: bounds.max_active,
+            min_value: bounds.min_value,
             governor_authority_ref: owner.authority_ref().to_owned(),
             policy_revision: owner.policy_revision(),
         };
@@ -317,13 +414,40 @@ impl DaemonComposition {
             })?;
         let permit = self
             .governor
-            .issue_learning_admission_for_owner(&event.admission)?;
+            .issue_learning_admission_for_owner(&admission)?;
         let fence = self.governor.kernel_snapshot().state_fence();
         let verified = self
             .governor
             .verify_learning_admission_for_owner(&permit, &fence)?;
         intake_from_evidence_governed(&mut self.improvement_backlog, prepared, &verified)
             .map_err(IntakeBridgeError::from)
+    }
+}
+
+fn permanent_intake_refusal(error: &IntakeBridgeError) -> bool {
+    match error {
+        IntakeBridgeError::Intake(
+            ImprovementError::MissingField(_)
+            | ImprovementError::ConflictingScopeRule
+            | ImprovementError::NonFiniteMetric
+            | ImprovementError::SelfPromotionForbidden
+            | ImprovementError::UnsafeBoundary
+            | ImprovementError::ApplicationClassViolation
+            | ImprovementError::MissingBudgetProof,
+        ) => true,
+        IntakeBridgeError::Intake(ImprovementError::BacklogRefused(detail)) => {
+            !detail.contains("active bound exceeded")
+                && !detail.contains("no bound policy")
+                && !detail.contains("full bound")
+        }
+        IntakeBridgeError::Admission(
+            LearningAdmissionError::OwnerEvidenceMismatch(_)
+            | LearningAdmissionError::InvalidTargetTask
+            | LearningAdmissionError::UnsupportedSchema { .. }
+            | LearningAdmissionError::NoInfluenceSubject
+            | LearningAdmissionError::InvalidFence,
+        ) => true,
+        _ => false,
     }
 }
 

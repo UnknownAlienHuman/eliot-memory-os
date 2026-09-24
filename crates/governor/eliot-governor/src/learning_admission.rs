@@ -35,10 +35,11 @@
 //! one-shot nonce (no registry to consume it). Overlay wall-clock expiry is
 //! enforced by the retrieval gate holding the overlay record.
 
+use eliot_config::ConfigPolicySnapshot;
 use eliot_context_contracts::{
     LEARNING_TICKET_SCHEMA_VERSION, LearningAdmissionTicket, learning_ticket_digest,
 };
-use eliot_contracts::{StateFence, fences_match_exact};
+use eliot_contracts::{StateFence, canonical_json_bytes, fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -152,6 +153,203 @@ impl LearningAdmissionRequest {
     }
 }
 
+/// Policy setting key carrying the Governor-owned active-backlog bound.
+pub const LEARNING_BACKLOG_MAX_ACTIVE_SETTING: &str = "meta.learning.backlog.max_active";
+/// Policy setting key carrying the Governor-owned value floor.
+pub const LEARNING_BACKLOG_MIN_VALUE_SETTING: &str = "meta.learning.backlog.min_value";
+
+/// Bounds derived from the current Policy owner snapshot.
+///
+/// These values are not daemon defaults. The daemon may install them only
+/// after the authenticated Governor has read both settings from the live
+/// policy owner and rebound them to the current policy revision.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LearningBoundDecision {
+    pub max_active: usize,
+    pub min_value: f64,
+}
+
+impl LearningBoundDecision {
+    /// Parse the two closed policy settings from an admitted policy snapshot.
+    pub fn from_policy_snapshot(
+        snapshot: &ConfigPolicySnapshot,
+    ) -> Result<Self, LearningAdmissionError> {
+        let value_for = |key: &str| {
+            let setting = snapshot
+                .settings
+                .iter()
+                .find(|setting| setting.key == key)
+                .ok_or(LearningAdmissionError::OwnerEvidenceUnavailable(
+                    "learning_bounds",
+                ))?;
+            if setting.owner_ref != snapshot.policy_owner.owner_ref {
+                return Err(LearningAdmissionError::OwnerEvidenceMismatch(
+                    "learning_bounds_owner",
+                ));
+            }
+            setting
+                .value_ref
+                .strip_prefix("literal:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or(LearningAdmissionError::OwnerEvidenceUnavailable(
+                    "learning_bounds_value",
+                ))
+        };
+        let max_active = value_for(LEARNING_BACKLOG_MAX_ACTIVE_SETTING)
+            .and_then(|value| {
+                value.parse::<usize>().map_err(|_| {
+                    LearningAdmissionError::OwnerEvidenceMismatch("learning_max_active")
+                })
+            })?;
+        if max_active == 0 {
+            return Err(LearningAdmissionError::OwnerEvidenceMismatch(
+                "learning_max_active",
+            ));
+        }
+        let min_value = value_for(LEARNING_BACKLOG_MIN_VALUE_SETTING)
+            .and_then(|value| {
+                value.parse::<f64>().map_err(|_| {
+                    LearningAdmissionError::OwnerEvidenceMismatch("learning_min_value")
+                })
+            })?;
+        if !min_value.is_finite() || min_value < 0.0 {
+            return Err(LearningAdmissionError::OwnerEvidenceMismatch(
+                "learning_min_value",
+            ));
+        }
+        Ok(Self {
+            max_active,
+            min_value,
+        })
+    }
+}
+
+/// Immutable owner evidence carried by a production learning permit.
+///
+/// The opaque permit keeps this projection private to the owner-issued
+/// handle. Every field is copied from a live Task/Canonical/Policy owner
+/// record; a requester can name a subject but cannot replace these refs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningOwnerEvidence {
+    pub task_ref: String,
+    pub recipe_ref: String,
+    pub closure_ref: String,
+    pub campaign_ref: String,
+    pub overlay_ref: String,
+    pub cross_task_admission_ref: Option<String>,
+}
+
+impl LearningOwnerEvidence {
+    fn validate(&self) -> Result<(), LearningAdmissionError> {
+        for (field, value) in [
+            ("task_ref", &self.task_ref),
+            ("recipe_ref", &self.recipe_ref),
+            ("closure_ref", &self.closure_ref),
+            ("campaign_ref", &self.campaign_ref),
+            ("overlay_ref", &self.overlay_ref),
+        ] {
+            if value.trim().is_empty() {
+                return Err(LearningAdmissionError::OwnerEvidenceUnavailable(field));
+            }
+        }
+        if self
+            .cross_task_admission_ref
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(LearningAdmissionError::OwnerEvidenceUnavailable(
+                "cross_task_admission_ref",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> Result<String, LearningAdmissionError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(self)
+            .map_err(|_| LearningAdmissionError::InvalidFence)?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    #[must_use]
+    pub fn task_ref(&self) -> &str { &self.task_ref }
+    #[must_use]
+    pub fn recipe_ref(&self) -> &str { &self.recipe_ref }
+    #[must_use]
+    pub fn closure_ref(&self) -> &str { &self.closure_ref }
+    #[must_use]
+    pub fn campaign_ref(&self) -> &str { &self.campaign_ref }
+    #[must_use]
+    pub fn overlay_ref(&self) -> &str { &self.overlay_ref }
+    #[must_use]
+    pub fn cross_task_admission_ref(&self) -> Option<&str> {
+        self.cross_task_admission_ref.as_deref()
+    }
+}
+
+/// Owner-issued cross-task receipt.
+///
+/// This is distinct from the ordinary learning permit: it is minted only by
+/// the live Governor composition after the target task, plan, policy,
+/// evaluator, and rollback projections have been re-read. The receipt is
+/// still candidate evidence; it grants no task, policy, or activation
+/// authority by itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrossTaskAdmissionReceipt {
+    pub admission_id: String,
+    pub permit_digest: String,
+    pub source_campaign_id: String,
+    pub target_task_id: String,
+    pub scope_ref: String,
+    pub authority_ref: String,
+    pub retention_ref: String,
+    pub evaluator_ref: String,
+    pub rollback_ref: String,
+    pub owner_evidence_digest: String,
+    pub digest: String,
+}
+
+impl CrossTaskAdmissionReceipt {
+    pub(crate) fn issue(
+        verified: &VerifiedLearningAdmission<'_>,
+        owner_evidence: &LearningOwnerEvidence,
+    ) -> Result<Self, LearningAdmissionError> {
+        let permit = verified.permit();
+        let owner_evidence_digest = owner_evidence.digest()?;
+        let admission_id = format!("governor-cross-task:{}", permit.digest());
+        let mut receipt = Self {
+            admission_id,
+            permit_digest: permit.digest().to_owned(),
+            source_campaign_id: permit.source_campaign_id().to_owned(),
+            target_task_id: permit.target_task_id().to_owned(),
+            scope_ref: permit.scope_ref().to_owned(),
+            authority_ref: permit.authority_ref().to_owned(),
+            retention_ref: permit.retention_ref().to_owned(),
+            evaluator_ref: permit.evaluator_ref().to_owned(),
+            rollback_ref: permit.rollback_ref().to_owned(),
+            owner_evidence_digest,
+            digest: String::new(),
+        };
+        receipt.digest = receipt.compute_digest()?;
+        Ok(receipt)
+    }
+
+    fn compute_digest(&self) -> Result<String, LearningAdmissionError> {
+        let bytes = canonical_json_bytes(self)
+            .map_err(|_| LearningAdmissionError::InvalidFence)?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    #[must_use]
+    pub fn validate(&self) -> bool {
+        self.compute_digest().is_ok_and(|digest| digest == self.digest)
+    }
+}
+
 /// Owner projection used to bind a learning permit to the current canonical
 /// task, plan, policy, and evaluator records.
 ///
@@ -159,7 +357,7 @@ impl LearningAdmissionRequest {
 /// The Governor composition is the only constructor and refreshes the
 /// projection from its single retained owner set on every issuance or
 /// verification.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LearningAdmissionOwnerRecord {
     state_fence: StateFence,
     scope_ref: String,
@@ -168,9 +366,12 @@ pub struct LearningAdmissionOwnerRecord {
     evaluator_ref: String,
     rollback_ref: String,
     policy_revision: u64,
+    bounds: LearningBoundDecision,
+    owner_evidence: LearningOwnerEvidence,
 }
 
 impl LearningAdmissionOwnerRecord {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_owner_projection(
         state_fence: StateFence,
         scope_ref: String,
@@ -179,6 +380,8 @@ impl LearningAdmissionOwnerRecord {
         evaluator_ref: String,
         rollback_ref: String,
         policy_revision: u64,
+        bounds: LearningBoundDecision,
+        owner_evidence: LearningOwnerEvidence,
     ) -> Result<Self, LearningAdmissionError> {
         let record = Self {
             state_fence,
@@ -188,6 +391,8 @@ impl LearningAdmissionOwnerRecord {
             evaluator_ref,
             rollback_ref,
             policy_revision,
+            bounds,
+            owner_evidence,
         };
         record.validate()?;
         Ok(record)
@@ -213,6 +418,15 @@ impl LearningAdmissionOwnerRecord {
                 "policy_revision",
             ));
         }
+        if self.bounds.max_active == 0
+            || !self.bounds.min_value.is_finite()
+            || self.bounds.min_value < 0.0
+        {
+            return Err(LearningAdmissionError::OwnerEvidenceMismatch(
+                "learning_bounds",
+            ));
+        }
+        self.owner_evidence.validate()?;
         Ok(())
     }
 
@@ -249,6 +463,16 @@ impl LearningAdmissionOwnerRecord {
     #[must_use]
     pub const fn policy_revision(&self) -> u64 {
         self.policy_revision
+    }
+
+    #[must_use]
+    pub const fn bounds(&self) -> LearningBoundDecision {
+        self.bounds
+    }
+
+    #[must_use]
+    pub const fn owner_evidence(&self) -> &LearningOwnerEvidence {
+        &self.owner_evidence
     }
 
     pub(crate) fn claim_for(
@@ -316,6 +540,7 @@ pub enum LearningAdmissionError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LearningAdmissionPermit {
     ticket: LearningAdmissionTicket,
+    owner_evidence: Option<LearningOwnerEvidence>,
 }
 
 impl LearningAdmissionPermit {
@@ -357,6 +582,21 @@ impl LearningAdmissionPermit {
     /// ticket alone authorizes nothing without live verification.
     pub fn ticket(&self) -> &LearningAdmissionTicket {
         &self.ticket
+    }
+
+    /// Owner evidence attached by the live composition path.
+    ///
+    /// Generic claim issuance remains available for low-level contract
+    /// proofs, but production daemon admission must carry this projection.
+    #[must_use]
+    pub fn owner_evidence(&self) -> Option<&LearningOwnerEvidence> {
+        self.owner_evidence.as_ref()
+    }
+
+    /// Deterministic identity a Governor-issued cross-task receipt must use.
+    #[must_use]
+    pub fn cross_task_admission_id(&self) -> String {
+        format!("governor-cross-task:{}", self.digest())
     }
 }
 
@@ -433,6 +673,25 @@ pub fn issue_learning_admission(
     check_live_admission(governor, claim)?;
     Ok(LearningAdmissionPermit {
         ticket: mint_ticket(claim)?,
+        owner_evidence: None,
+    })
+}
+
+/// Mint a production permit with the live owner evidence projection attached.
+///
+/// This is crate-visible so only [`crate::GovernorComposition`] can attach the
+/// task/plan/policy/recipe/closure/campaign projection. The public generic
+/// issuer above remains a shape/epoch contract primitive, not a daemon root.
+pub(crate) fn issue_learning_admission_with_owner_evidence(
+    governor: &Governor,
+    claim: &LearningAdmissionClaim,
+    owner_evidence: &LearningOwnerEvidence,
+) -> Result<LearningAdmissionPermit, LearningAdmissionError> {
+    owner_evidence.validate()?;
+    check_live_admission(governor, claim)?;
+    Ok(LearningAdmissionPermit {
+        ticket: mint_ticket(claim)?,
+        owner_evidence: Some(owner_evidence.clone()),
     })
 }
 

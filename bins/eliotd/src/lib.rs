@@ -421,6 +421,11 @@ pub struct DaemonComposition {
     /// Bounded owner-bound intake events drained by the existing daemon loop.
     pending_governed_improvement_intakes:
         VecDeque<improvement_intake::GovernedImprovementIntakeEvent>,
+    /// Bounded owner receipts for permanently refused intake events. They are
+    /// retained for the Kernel/canonical persistence hand-off and are never
+    /// mistaken for active candidates.
+    governed_intake_rejections:
+        Vec<improvement_intake::GovernedIntakeRejectionReceipt>,
 }
 
 impl DaemonComposition {
@@ -486,6 +491,7 @@ impl DaemonComposition {
             capability_admission: GovernorCapabilityAdmission::new(),
             improvement_backlog: eliot_improvement::candidate_bounds::BoundedBacklog::default(),
             pending_governed_improvement_intakes: VecDeque::new(),
+            governed_intake_rejections: Vec::new(),
         })
     }
 

@@ -215,7 +215,16 @@ fn prepare_intake_with_owner(
         owner_approved,
         migration_proof_ref.as_deref(),
     )?;
-    require_matched_budget_for_promotion(Some(&budget_proof))?;
+    if owner_projection.is_some() {
+        // A Governor-admitted diagnostic intake is still candidate-only. It
+        // must carry a structurally valid owner-bound budget reference, but
+        // it is not a promotion request and therefore does not claim matched
+        // live canary/shadow evidence at intake time. Promotion remains
+        // separately gated by `require_matched_budget_for_promotion`.
+        budget_proof.validate()?;
+    } else {
+        require_matched_budget_for_promotion(Some(&budget_proof))?;
+    }
     Ok(PreparedIntake {
         candidate,
         brief,

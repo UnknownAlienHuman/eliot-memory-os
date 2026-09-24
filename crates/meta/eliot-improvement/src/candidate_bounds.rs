@@ -28,7 +28,7 @@
 
 use blake3::Hasher;
 use eliot_contracts::{StateFence, fences_match_exact};
-use eliot_governor::VerifiedLearningAdmission;
+use eliot_governor::{CrossTaskAdmissionReceipt, VerifiedLearningAdmission};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -165,6 +165,36 @@ pub enum ArchiveCause {
     LowValue,
 }
 
+/// Owner receipt for one explicit archive transition.
+///
+/// The receipt is deliberately separate from the advisory archive row: a
+/// persistence adapter can submit this immutable projection through the
+/// existing Kernel/canonical receipt path and read it back without granting
+/// any retrieval authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveTransitionReceipt {
+    pub archive: ArchivedCandidate,
+    pub transition_digest: String,
+}
+
+impl ArchiveTransitionReceipt {
+    fn for_archive(archive: &ArchivedCandidate) -> Result<Self, BoundsError> {
+        let bytes = eliot_contracts::canonical_json_bytes(archive)
+            .map_err(|_| BoundsError::InvalidPolicy("archive receipt could not be encoded"))?;
+        Ok(Self {
+            archive: archive.clone(),
+            transition_digest: eliot_contracts::sha256_hex(&bytes),
+        })
+    }
+
+    #[must_use]
+    pub fn validate(&self) -> bool {
+        eliot_contracts::canonical_json_bytes(&self.archive)
+            .ok()
+            .is_some_and(|bytes| eliot_contracts::sha256_hex(&bytes) == self.transition_digest)
+    }
+}
+
 /// Reachable bounded backlog: the production candidate/overlay admission path.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BoundedBacklog {
@@ -176,6 +206,11 @@ pub struct BoundedBacklog {
     /// from looking like a silent eviction.
     #[serde(default)]
     archives: Vec<ArchivedCandidate>,
+    /// Immutable receipts for the archive transitions. This is the durable
+    /// hand-off projection; adapters must persist it through their owner
+    /// receipt channel rather than treating the in-memory row as durability.
+    #[serde(default)]
+    archive_receipts: Vec<ArchiveTransitionReceipt>,
 }
 
 impl BoundedBacklog {
@@ -187,6 +222,7 @@ impl BoundedBacklog {
             policies,
             entries: Vec::new(),
             archives: Vec::new(),
+            archive_receipts: Vec::new(),
         })
     }
 
@@ -200,21 +236,38 @@ impl BoundedBacklog {
             .ok_or(BoundsError::NoPolicyForSurface)
     }
 
-    /// Active (non-terminal) entries for one surface.
+    /// Active (and immediately eligible) entries for one surface.
+    ///
+    /// Eligibility is deliberately checked at the registry boundary rather
+    /// than only at admission time. A lifecycle transition to `Stale`, loss
+    /// of an owner, or a value below the currently installed floor therefore
+    /// removes the row from every active read on the very next observation;
+    /// the retained row and archive projection remain available for history.
     pub fn active_for(&self, surface: ImprovementSurface) -> Vec<&TrackedCandidate> {
         self.entries
             .iter()
             .filter(|entry| {
-                entry.candidate.target_surface == surface && entry.candidate.state.is_experimental()
+                entry.candidate.target_surface == surface && self.entry_is_eligible(entry)
             })
             .collect()
     }
 
-    /// Active backlog entry for one candidate id, if currently active.
+    /// Active backlog entry for one candidate id, if currently eligible.
     pub fn entry_for(&self, candidate_id: &str) -> Option<&TrackedCandidate> {
         self.entries.iter().find(|entry| {
-            entry.candidate.candidate_id == candidate_id && entry.candidate.state.is_experimental()
+            entry.candidate.candidate_id == candidate_id && self.entry_is_eligible(entry)
         })
+    }
+
+    fn entry_is_eligible(&self, entry: &TrackedCandidate) -> bool {
+        if !entry.candidate.state.is_experimental()
+            || entry.candidate.lifecycle == crate::ImprovementLifecycle::Stale
+            || entry.owner.as_deref().is_none_or(str::is_empty)
+        {
+            return false;
+        }
+        self.policy_for(entry.candidate.target_surface)
+            .is_ok_and(|policy| entry.value >= policy.min_value)
     }
 
     /// Returns the retained terminal/active row for readback, including an
@@ -235,6 +288,12 @@ impl BoundedBacklog {
     #[must_use]
     pub fn archives(&self) -> &[ArchivedCandidate] {
         &self.archives
+    }
+
+    /// Returns the immutable archive-transition receipts in transition order.
+    #[must_use]
+    pub fn archive_receipts(&self) -> &[ArchiveTransitionReceipt] {
+        &self.archive_receipts
     }
 
     /// Installs the owner-derived policy for a surface, or verifies that the
@@ -281,8 +340,12 @@ impl BoundedBacklog {
     ) -> Result<Vec<ArchivedCandidate>, BoundsError> {
         let floor = self.policy_for(surface)?.min_value;
         let selected = self
-            .active_for(surface)
-            .into_iter()
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.candidate.target_surface == surface
+                    && entry.candidate.state.is_experimental()
+            })
             .filter_map(|entry| {
                 let cause = if entry.candidate.lifecycle == crate::ImprovementLifecycle::Stale {
                     Some(ArchiveCause::Stale)
@@ -328,6 +391,21 @@ impl BoundedBacklog {
             .candidate
             .transition_lifecycle(crate::ImprovementLifecycle::Stale)
             .map_err(BoundsError::Candidate)
+    }
+
+    /// Mark a row stale and complete the archive transition in one owner step.
+    ///
+    /// This is the production lifecycle edge for an observed stale signal. The
+    /// row is ineligible immediately after `mark_stale`; this method then
+    /// records the required summary and terminal archive receipt without
+    /// relying on a later capacity pass to discover the transition.
+    pub fn mark_stale_and_archive(
+        &mut self,
+        candidate_id: &str,
+        summary: String,
+    ) -> Result<ArchivedCandidate, BoundsError> {
+        self.mark_stale(candidate_id)?;
+        self.archive(candidate_id, ArchiveCause::Stale, summary)
     }
 
     /// Admit a candidate: dedup-merge on overlapping canonical evidence
@@ -383,6 +461,23 @@ impl BoundedBacklog {
             return Err(BoundsError::EmptyEvidenceLineage);
         }
         let digest = evidence_lineage_digest(&lineage);
+        let normalized_owner = owner
+            .as_deref()
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+            .map(str::to_owned);
+        if normalized_owner.is_none() {
+            return Err(BoundsError::OwnerlessRecord);
+        }
+        // The incoming value is screened before any lineage merge. A low-value
+        // event must not become active merely by overlapping an older,
+        // higher-value row.
+        if value < policy.min_value {
+            return Err(BoundsError::BelowValueFloor {
+                value,
+                floor: policy.min_value,
+            });
+        }
 
         // Dedup: same surface with overlapping canonical lineage merges.
         let mut merge_target: Option<usize> = None;
@@ -407,19 +502,19 @@ impl BoundedBacklog {
         if let Some(index) = merge_target {
             let surviving_id = self.entries[index].candidate.candidate_id.clone();
             let absorbed_id = candidate.candidate_id.clone();
-            self.merge_into(index, &candidate, value, owner, governed_authority)?;
+            self.merge_into(
+                index,
+                &candidate,
+                value,
+                normalized_owner.clone(),
+                governed_authority,
+            )?;
             return Ok(AdmitOutcome::Merged {
                 surviving_candidate_id: surviving_id,
                 absorbed_candidate_id: absorbed_id,
             });
         }
 
-        if value < policy.min_value {
-            return Err(BoundsError::BelowValueFloor {
-                value,
-                floor: policy.min_value,
-            });
-        }
         let active = self.active_for(candidate.target_surface).len();
         if active >= policy.max_active {
             return Err(BoundsError::BoundExceeded {
@@ -431,9 +526,7 @@ impl BoundedBacklog {
         self.entries.push(TrackedCandidate {
             candidate,
             value,
-            owner: owner
-                .map(|o| o.trim().to_string())
-                .filter(|o| !o.is_empty()),
+            owner: normalized_owner,
             lineage_digest: digest,
             merged_from: Vec::new(),
             admitted_under_authority: governed_authority.map(str::to_string),
@@ -538,6 +631,8 @@ impl BoundedBacklog {
             archived_revision: entry.candidate.revision,
         };
         self.archives.push(archived.clone());
+        self.archive_receipts
+            .push(ArchiveTransitionReceipt::for_archive(&archived)?);
         Ok(archived)
     }
 }
@@ -746,6 +841,50 @@ impl CrossTaskAdmission {
             && self.retention_ref == permit.retention_ref()
             && self.evaluator_ref == permit.evaluator_ref()
             && self.rollback_ref == permit.rollback_ref()
+    }
+
+    /// Project a Governor-issued cross-task receipt into the consumer gate.
+    /// The receipt itself is not caller-populated evidence; this constructor
+    /// copies its owner-issued fields and deterministic identity.
+    #[must_use]
+    pub fn from_governor_receipt(receipt: &CrossTaskAdmissionReceipt) -> Self {
+        Self {
+            admission_id: receipt.admission_id.clone(),
+            source_campaign_id: receipt.source_campaign_id.clone(),
+            target_task_id: receipt.target_task_id.clone(),
+            scope_ref: receipt.scope_ref.clone(),
+            authority_ref: receipt.authority_ref.clone(),
+            retention_ref: receipt.retention_ref.clone(),
+            evaluator_ref: receipt.evaluator_ref.clone(),
+            rollback_ref: receipt.rollback_ref.clone(),
+        }
+    }
+
+    /// Strict owner-channel check used by governed retrieval and delivery.
+    ///
+    /// A bare legacy record can still pass the explicitly legacy
+    /// `matches_permit` helper, but the governed path additionally requires
+    /// the deterministic Governor cross-task identity. This prevents a
+    /// caller-populated string bundle from masquerading as a fresh
+    /// cross-task admission.
+    #[must_use]
+    pub fn matches_governor_permit(&self, verified: &VerifiedLearningAdmission<'_>) -> bool {
+        self.matches_permit(verified)
+            && self.admission_id == verified.permit().cross_task_admission_id()
+    }
+
+    /// Validate the projection against the exact owner-issued receipt.
+    #[must_use]
+    pub fn matches_governor_receipt(&self, receipt: &CrossTaskAdmissionReceipt) -> bool {
+        receipt.validate()
+            && self.admission_id == receipt.admission_id
+            && self.source_campaign_id == receipt.source_campaign_id
+            && self.target_task_id == receipt.target_task_id
+            && self.scope_ref == receipt.scope_ref
+            && self.authority_ref == receipt.authority_ref
+            && self.retention_ref == receipt.retention_ref
+            && self.evaluator_ref == receipt.evaluator_ref
+            && self.rollback_ref == receipt.rollback_ref
     }
 }
 
@@ -1047,7 +1186,7 @@ pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDeci
             .cross_task_admission
             .ok_or(BoundsError::CrossTaskAdmissionMissing)?;
         admission.validate()?;
-        if !admission.matches_permit(request.verified) {
+        if !admission.matches_governor_permit(request.verified) {
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }
         if request.requesting_task_id != target {
