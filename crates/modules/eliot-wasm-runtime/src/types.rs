@@ -262,6 +262,17 @@ pub struct InvocationLimits {
 }
 
 impl InvocationLimits {
+    /// Validates the resolved limit envelope before admission.
+    ///
+    /// A zero `max_host_calls` budget is valid: it declares the closed
+    /// world (issue #21 — no host calls are introducible through the
+    /// empty-linker provider, so a no-host-call component states zero
+    /// instead of carrying a nonzero budget that implies a hidden
+    /// capability). Usage enforcement still denies any actual host call
+    /// above the budget, so zero never executes one. Every other
+    /// zero ceiling remains invalid: an invocation with no input, output,
+    /// fuel, memory, stack, time, epoch, table, instance, or artifact
+    /// budget cannot execute anything.
     pub(crate) fn validate(&self, artifact: &Sha256Digest) -> Result<(), RuntimeError> {
         if [
             self.max_input_bytes,
@@ -275,7 +286,6 @@ impl InvocationLimits {
         ]
         .contains(&0)
             || self.epoch.deadline_ticks > MAX_EPOCH_DEADLINE_TICKS
-            || self.max_host_calls == 0
             || self.max_table_elements == 0
             || self.max_instances == 0
             || self.artifact_access.max_reads == 0
@@ -989,6 +999,23 @@ mod epoch_limit_tests {
         );
         assert_eq!(
             limits(artifact.clone(), MAX_EPOCH_DEADLINE_TICKS + 1).validate(&artifact),
+            Err(RuntimeError::InvalidLimits)
+        );
+    }
+
+    #[test]
+    fn zero_host_call_budget_declares_closed_world() {
+        // Issue #21: a no-host-call component states zero instead of
+        // carrying a nonzero budget that implies a hidden capability.
+        let artifact = Sha256Digest::of_bytes(b"artifact");
+        let mut closed = limits(artifact.clone(), MAX_EPOCH_DEADLINE_TICKS);
+        closed.max_host_calls = 0;
+        assert!(closed.validate(&artifact).is_ok());
+        // Every other zero ceiling still cannot execute anything.
+        let mut starved = limits(artifact.clone(), MAX_EPOCH_DEADLINE_TICKS);
+        starved.max_fuel = 0;
+        assert_eq!(
+            starved.validate(&artifact),
             Err(RuntimeError::InvalidLimits)
         );
     }
