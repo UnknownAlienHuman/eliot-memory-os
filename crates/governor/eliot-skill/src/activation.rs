@@ -15,7 +15,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
 
-use super::{DependencyVersion, SkillError, SkillLifecycleView, SkillStatus, digest, text, unique};
+use super::{
+    DependencyVersion, ExecutionOutcome, LifecycleAction, LifecycleCounters, SkillCatalogueEntry,
+    SkillError, SkillExecutionEvidence, SkillInteractionView, SkillLifecycleView, SkillRef,
+    SkillScope, SkillStatus, digest, text, unique,
+};
 
 /// How retrieval of the Skill for one attempt was observed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -528,6 +532,238 @@ pub fn apply_dependency_staleness(
     marked.lifecycle_revision = view.lifecycle_revision.saturating_add(1);
     marked.validate()?;
     Ok(Some(marked))
+}
+
+/// Immutable evidence bundle for deriving one [`SkillLifecycleView`].
+///
+/// Every field traces to a Governor-owned record; nothing is inferred:
+/// `skill_ref` is the install identity (skill/revision/name/package digest),
+/// `scope` the Governor admission scope, `applies_when` the package behavior
+/// applicability the catalogue entry does not retain, `entry` the installed
+/// catalogue body/dependencies/applicability, `attempts` the per-attempt
+/// harness receipts, `executions` the step/artifact/verifier/outcome evidence,
+/// `conflicts` the recorded instruction conflicts, and `current_dependencies`
+/// the live world versions the pinned set is compared against.
+pub struct LifecycleEvidence<'a> {
+    pub skill_ref: SkillRef,
+    pub scope: SkillScope,
+    pub applies_when: Vec<String>,
+    pub entry: &'a SkillCatalogueEntry,
+    pub attempts: &'a [SkillHarnessActivationReceipt],
+    pub executions: &'a [SkillExecutionEvidence],
+    pub conflicts: &'a [InstructionConflict],
+    pub current_dependencies: &'a [DependencyVersion],
+    pub observed_decision_or_verifier_delta: Option<String>,
+    pub state_fence: StateFence,
+}
+
+/// Derives one lifecycle view strictly from immutable evidence.
+///
+/// Counter bijection (mirrors the surface `DeliveryProjection` rule that every
+/// counter value equals its exact evidence-list length): `installed` is 1 for
+/// the presented entry; `delivered`/`expanded` count the bound attempts with
+/// delivery/expansion evidence; `executed`/`failed`/`uncertain` count the
+/// execution evidence by outcome and `verified` counts observed executions
+/// with verifier refs; `useful` counts attempts whose exact receipt summary is
+/// useful. Installed, delivered, executed and useful stay distinct; aggregate
+/// counts never substitute for the per-attempt receipts the caller keeps.
+/// Status is `Stale` with the detection reason exactly when the pinned
+/// dependencies disagree with the live set, else `Current`: quarantine only
+/// arrives through governed review, never through derivation. Interaction refs
+/// fold validated conflicts (conflict id, preserved first-skill ordering,
+/// rival id on mutual exclusion); packet order is never read. Attempts from a
+/// foreign skill revision or package digest fail closed with `IdentityMismatch`.
+/// A coherent evidence window is required: incoherent sets (more deliveries
+/// than installs, usefulness without verifier-backed execution evidence) are
+/// rejected by the final validation, never adjusted — the runtime accumulates
+/// coherent windows across install revisions.
+pub fn derive_lifecycle_view(
+    evidence: LifecycleEvidence<'_>,
+) -> Result<SkillLifecycleView, SkillError> {
+    evidence.skill_ref.validate()?;
+    evidence.scope.validate()?;
+    if evidence.entry.index.skill_id != evidence.skill_ref.skill_id() {
+        return Err(SkillError::IdentityMismatch);
+    }
+    let skill_id = evidence.skill_ref.skill_id().to_owned();
+    let attempts = fold_attempt_evidence(
+        &skill_id,
+        &evidence.skill_ref.registration.revision,
+        &evidence.skill_ref.package_digest,
+        evidence.attempts,
+    )?;
+    let executions = fold_execution_evidence(evidence.executions)?;
+    let interactions = fold_interaction_evidence(&skill_id, evidence.conflicts)?;
+    let (status, stale_or_quarantine_reason) = match detect_dependency_staleness(
+        &evidence.entry.dependencies,
+        evidence.current_dependencies,
+    ) {
+        Some(reason) => (SkillStatus::Stale, Some(reason)),
+        None => (SkillStatus::Current, None),
+    };
+    let view = SkillLifecycleView {
+        skill_ref: evidence.skill_ref,
+        scope: evidence.scope,
+        applies_when: evidence.applies_when,
+        does_not_apply_when: evidence.entry.body.where_not_apply.clone(),
+        dependencies: evidence.entry.dependencies.clone(),
+        counters: LifecycleCounters {
+            installed: 1,
+            delivered: attempts.delivered,
+            expanded: attempts.expanded,
+            executed: executions.executed,
+            verified: executions.verified,
+            failed: executions.failed,
+            uncertain: executions.uncertain,
+            useful: attempts.useful,
+        },
+        execution_evidence: evidence.executions.to_vec(),
+        observed_decision_or_verifier_delta: evidence.observed_decision_or_verifier_delta,
+        false_activation_refs: attempts.false_activation_refs,
+        interactions,
+        status,
+        stale_or_quarantine_reason,
+        proposed_action: LifecycleAction::Keep,
+        review: None,
+        state_fence: evidence.state_fence,
+        lifecycle_revision: 1,
+    };
+    view.validate()?;
+    Ok(view)
+}
+
+/// Per-attempt counts folded from exact harness receipts bound to one skill
+/// revision and package digest.
+struct AttemptFold {
+    delivered: u64,
+    expanded: u64,
+    useful: u64,
+    false_activation_refs: Vec<String>,
+}
+
+/// Folds delivery/expansion/usefulness counts from receipts bound to the exact
+/// skill identity. Retrieval, delivery, activation, adherence and outcome stay
+/// orthogonal per receipt; retrieved-but-unobserved attempts contribute their
+/// attempt ref to the false-activation history (a history ref, never a
+/// non-use verdict). Foreign revisions or digests fail closed.
+fn fold_attempt_evidence(
+    skill_id: &str,
+    skill_revision: &str,
+    package_digest: &str,
+    attempts: &[SkillHarnessActivationReceipt],
+) -> Result<AttemptFold, SkillError> {
+    let mut fold = AttemptFold {
+        delivered: 0,
+        expanded: 0,
+        useful: 0,
+        false_activation_refs: Vec::new(),
+    };
+    for receipt in attempts {
+        receipt.validate()?;
+        if receipt.skill_id != skill_id
+            || receipt.skill_revision != skill_revision
+            || receipt.package_digest != package_digest
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        let summary = derive_attempt_summary(receipt);
+        if summary.delivered {
+            fold.delivered = fold.delivered.saturating_add(1);
+        }
+        if receipt.retrieval == SkillRetrievalStatus::Expanded {
+            fold.expanded = fold.expanded.saturating_add(1);
+        }
+        if summary.useful {
+            fold.useful = fold.useful.saturating_add(1);
+        }
+        if summary.retrieved
+            && receipt.activation == SkillActivationStatus::NotObserved
+            && !fold.false_activation_refs.contains(&receipt.attempt_ref)
+        {
+            fold.false_activation_refs.push(receipt.attempt_ref.clone());
+        }
+    }
+    Ok(fold)
+}
+
+/// Execution counters folded from exact step/artifact/verifier evidence.
+struct ExecutionFold {
+    executed: u64,
+    verified: u64,
+    failed: u64,
+    uncertain: u64,
+}
+
+/// Counts execution evidence by outcome; observed executions with verifier
+/// refs count as verified. Causal credit is never assigned: evidence
+/// validation already forces `NoCausalCredit`.
+fn fold_execution_evidence(
+    executions: &[SkillExecutionEvidence],
+) -> Result<ExecutionFold, SkillError> {
+    let mut fold = ExecutionFold {
+        executed: 0,
+        verified: 0,
+        failed: 0,
+        uncertain: 0,
+    };
+    for execution in executions {
+        execution.validate()?;
+        match execution.outcome {
+            ExecutionOutcome::Observed => {
+                fold.executed = fold.executed.saturating_add(1);
+                if !execution.verifier_refs.is_empty() {
+                    fold.verified = fold.verified.saturating_add(1);
+                }
+            }
+            ExecutionOutcome::Failed => {
+                fold.failed = fold.failed.saturating_add(1);
+            }
+            ExecutionOutcome::Uncertain => {
+                fold.uncertain = fold.uncertain.saturating_add(1);
+            }
+        }
+    }
+    Ok(fold)
+}
+
+/// Folds validated conflicts involving one skill into its interaction view:
+/// conflict id, preserved first-skill ordering, rival id on mutual exclusion.
+/// Packet order is never read; conflicts that name neither skill are skipped.
+fn fold_interaction_evidence(
+    skill_id: &str,
+    conflicts: &[InstructionConflict],
+) -> Result<SkillInteractionView, SkillError> {
+    let mut interactions = SkillInteractionView::default();
+    for conflict in conflicts {
+        conflict.validate()?;
+        if conflict.skill_a_id != skill_id && conflict.skill_b_id != skill_id {
+            continue;
+        }
+        if !interactions.conflict_refs.contains(&conflict.conflict_id) {
+            interactions
+                .conflict_refs
+                .push(conflict.conflict_id.clone());
+        }
+        if !interactions
+            .ordering_refs
+            .contains(&conflict.first_skill_id)
+        {
+            interactions
+                .ordering_refs
+                .push(conflict.first_skill_id.clone());
+        }
+        if conflict.mutual_exclusion {
+            let rival = if conflict.skill_a_id == skill_id {
+                &conflict.skill_b_id
+            } else {
+                &conflict.skill_a_id
+            };
+            if !interactions.mutual_exclusion_refs.contains(rival) {
+                interactions.mutual_exclusion_refs.push(rival.clone());
+            }
+        }
+    }
+    Ok(interactions)
 }
 
 #[cfg(test)]
