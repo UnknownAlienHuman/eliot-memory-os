@@ -28,7 +28,10 @@
 //! in `main.rs`. Every numeric limit, the oversize disposition, the redaction
 //! bound, and the limit table are retained unchanged from the accepted
 //! baseline; no replacement value is invented here. This preparation is
-//! offered for independent re-review and is NOT self-accepted.
+//! offered for independent re-review and is NOT self-accepted. Issue #77 adds
+//! a third arm, `detach` (bearer-claim shape mirroring `reconnect` minus
+//! `new_connection_id`), tracking the owner-driven `Request::Detach` variant
+//! in `main.rs`; limits, dispositions, and redaction stay unchanged.
 //!
 //! Time bounds (`idle_timeout_ms`, `lifetime_timeout_ms`) are declared here so
 //! the profile is complete, but they are NOT enforced on blocking stdin by
@@ -615,7 +618,8 @@ const GLOBAL_ENVELOPE_KEYS: [&str; 12] = [
 /// ignore extra members, so the exact key set is enforced here per operation:
 /// attach/invoke/cancel carry exactly `request`; forward_hook/forward_event
 /// carry exactly `event`; reconnect carries exactly its seven authority-claim
-/// members; the terminal operations carry only `op`. Keys outside the global
+/// members; detach carries exactly its six bearer-claim members (the reconnect
+/// set minus `new_connection_id`); the terminal operations carry only `op`. Keys outside the global
 /// allowlist are unknown protected fields; known keys on the wrong operation
 /// are mismatched payloads. Unknown operation names are rejected with a
 /// bounded control name following the shared-contract precedent, never with
@@ -722,6 +726,14 @@ fn check_operation_shape(operation: &str, keys: &[String]) -> Result<(), DecodeR
             "op",
             "expected_connection_id",
             "new_connection_id",
+            "session_id",
+            "activation_generation",
+            "authority_epoch",
+            "fence_nonce",
+        ],
+        "detach" => &[
+            "op",
+            "expected_connection_id",
             "session_id",
             "activation_generation",
             "authority_epoch",
