@@ -297,6 +297,18 @@ fn unix_ms_i64() -> i64 {
     i64::try_from(unix_ms()).unwrap_or(i64::MAX)
 }
 
+/// Reports whether a finish may carry pending learning-closure debt.
+///
+/// Thin composition-root tag only (issue #1866 W1/W4/A1/A2, I12.24): the
+/// named closure owner and review condition come from Governor policy, never
+/// from this crate. `terminal` is supplied by the caller owning finish
+/// semantics; this helper only forwards it so the finish hook stays honest
+/// and non-blocking.
+#[must_use]
+pub fn closure_debt_pending(terminal: bool) -> bool {
+    terminal
+}
+
 /// Readiness/status projection emitted by the daemon. It is derived only
 /// after exact Kernel and recovery admission.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -674,6 +686,20 @@ impl DaemonComposition {
             .finish_attempt(identity, operation_id, draft)
             .await
             .map_err(DaemonError::Finish)?;
+        // Issue #1866 W1/W4/A1/A2 (I12.24): best-effort non-blocking closure
+        // assessment. Closure never blocks the finish ceremony: the honest
+        // decision above is already durable, owner/review semantics live in
+        // the Governor/eliot-improvement owners, and this hook only emits
+        // observability. No `?`, no propagation, return path unchanged.
+        {
+            let _closure_span = tracing::info_span!("eliotd.finish_closure_assessment").entered();
+            let debt_pending = closure_debt_pending(true);
+            tracing::info!(
+                decision_id = %decision.decision_id,
+                debt_pending,
+                "campaign closure assessment: honest finish while learning closure completes asynchronously; owner/review condition from Governor policy"
+            );
+        }
         if self.governor.refresh_from_kernel().is_err() {
             self.view_stale = true;
         }
