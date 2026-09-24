@@ -1,0 +1,7 @@
+{
+  "description": "Capture admission in the prepare domain (issue #962). Bounded digest binding only: no archive bytes, paths, or credentials.",
+  "domain": "prepare",
+  "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "operation": "PREPARE_ISOLATED_RESTORE",
+  "effect_count": 1
+}

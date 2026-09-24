@@ -1,0 +1,9 @@
+{
+  "description": "Replay reconciliation ledger (issue #962). Exact digest replay is idempotent with no duplicate effect; changed content under the same identity conflicts.",
+  "completed": {
+    "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "bytes": "eyJvcCI6IlJFU1RPUkVfU1RBVFVTIn0="
+  },
+  "exact_replay": { "verdict": "idempotent", "duplicate_effect": false },
+  "changed_bytes_replay": { "verdict": "conflict", "duplicate_effect": false }
+}

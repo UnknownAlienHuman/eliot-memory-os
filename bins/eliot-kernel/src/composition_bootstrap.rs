@@ -52,6 +52,38 @@ use crate::kernel_diagnostics::{
     EntrypointStage, observe_entrypoint, observe_entrypoint_with_detail, observe_terminal_error,
 };
 
+/// Exact-owner backup channel clients (issue #962, Writer-D).
+///
+/// Declared here (rather than in `lib.rs`) so the client-injection turn
+/// touches only this composition file: production assembly binds the actual
+/// Host/Watchdog owner clients over the canonical pipes, with no new pipe
+/// family, no Host/Watchdog implementation dependency, and no behavior
+/// change to any other composition path.
+#[path = "backup_owner_clients.rs"]
+#[allow(
+    dead_code,
+    reason = "owner-channel surface is exercised per-method across production assembly and the wire test; a single surface-level allow keeps the private-module declaration warning-clean"
+)]
+mod backup_owner_clients;
+pub use backup_owner_clients::{
+    HostBackupOwnerClient, OwnerClientError, WatchdogBackupOwnerClient,
+};
+
+impl KernelComposition {
+    /// Returns a production Host backup owner client bound to the exact
+    /// canonical Host pipe. Fails closed when the canonical binding is
+    /// unavailable; never substitutes a default.
+    pub fn host_backup_owner_client() -> Result<HostBackupOwnerClient, OwnerClientError> {
+        HostBackupOwnerClient::production()
+    }
+
+    /// Returns a production Watchdog backup owner client bound to the exact
+    /// canonical Watchdog pipe. Fails closed; never substitutes a default.
+    pub fn watchdog_backup_owner_client() -> Result<WatchdogBackupOwnerClient, OwnerClientError> {
+        WatchdogBackupOwnerClient::production()
+    }
+}
+
 /// Maps one build failure to its stable owner-typed diagnostic code.
 ///
 /// The code is the `KernelBuildError` variant name only; any `String`
@@ -1267,6 +1299,17 @@ impl KernelComposition {
         // so no second database is opened here and unrelated Kernel work is
         // unaffected while no restore executes.
         let backup_restore = KernelBackupRestore::bind(work_root.clone());
+        // Issue #962 (Writer-D): bind the exact-owner backup channel
+        // clients in production assembly. Both constructors bind the
+        // actual canonical pipes and fail closed on any fake or
+        // mismatched binding, so a missing binding is never replaced by
+        // a default. The marker records the injection for diagnostics;
+        // no other composition behavior changes.
+        HostBackupOwnerClient::production()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        WatchdogBackupOwnerClient::production()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        backup_owner_clients::mark_owner_clients_bound();
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.

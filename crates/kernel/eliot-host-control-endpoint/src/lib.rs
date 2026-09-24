@@ -35,6 +35,12 @@ use eliot_host_service::{UserAutomationHostExecutionSession, UserAutomationHostO
 use eliot_ipc::{NamedPipeServer, TransportLimits};
 use tokio::sync::oneshot;
 
+pub mod backup;
+pub use backup::{
+    AcceptedOwnerMethod, BackupOperationKind, accepted_host_backup_methods, authority_matches,
+    is_supported, register_backup_methods, rehearsal_resolves_cutover, requires_cutover_admission,
+};
+
 pub const HOST_RUNTIME_CONTROL_PIPE: &str = r"\\.\pipe\eliot\host\runtime-control-v1";
 const MAX_QUEUE_DEPTH: usize = 32;
 const QUEUE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);

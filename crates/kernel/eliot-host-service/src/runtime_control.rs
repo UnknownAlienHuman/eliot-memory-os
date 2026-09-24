@@ -1191,6 +1191,469 @@ pub fn decode_runtime_control_response_frame(
     Ok(response)
 }
 
+// ---------------------------------------------------------------------------
+// #954 backup envelope/method bridge (#962).
+//
+// Provider-neutral, fail-closed envelope around the closed #954 backup
+// operation vocabulary (`eliot_protocol::backup`). This bridge mints no
+// backup authority and changes none of the seven existing
+// `HostRuntimeControlOperation` variants or the v2 wire above: it binds the
+// operation, role, capability, session, nonce, generation, fence, and
+// installation identities into digests and frames on the same SessionFenced
+// contour. `eliot-protocol` is already a dependency of this crate, so the
+// closed #954 types and MAX bounds are reused directly; no local vocabulary
+// is introduced and no version distinction is widened.
+// ---------------------------------------------------------------------------
+
+/// Stable wire identifier for Host backup runtime-control envelopes.
+/// Distinct from [`HOST_RUNTIME_CONTROL_WIRE`]; existing v2 version
+/// distinctions are unchanged.
+pub const HOST_BACKUP_RUNTIME_CONTROL_WIRE: &str = "eliot.host.backup-control.v1";
+/// Maximum canonical JSON bytes accepted for one backup envelope payload.
+/// Reuses the closed #954 bound.
+pub const MAX_BACKUP_RUNTIME_CONTROL_PAYLOAD_BYTES: usize =
+    eliot_protocol::backup::MAX_BACKUP_PAYLOAD_BYTES;
+/// Maximum bytes for one bounded backup envelope text field.
+/// Reuses the closed #954 bound.
+pub const MAX_BACKUP_RUNTIME_CONTROL_TEXT_BYTES: usize =
+    eliot_protocol::backup::MAX_BACKUP_TEXT_BYTES;
+const BACKUP_WIRE: &str = HOST_BACKUP_RUNTIME_CONTROL_WIRE;
+
+/// Closed capability projection for one #954 backup operation. The envelope
+/// capability is always derived from the operation; a stored capability that
+/// diverges fails closed.
+fn backup_capability_for_operation(
+    operation: &eliot_protocol::backup::BackupOperationKind,
+) -> eliot_protocol::backup::BackupCapability {
+    use eliot_protocol::backup::{BackupCapability as Capability, BackupOperationKind as Kind};
+    match operation {
+        Kind::RequestCapture => Capability::RequestCapture,
+        Kind::ReadSnapshotPage => Capability::ReadSnapshotPage,
+        Kind::VerifyArchive => Capability::VerifyArchive,
+        Kind::PrepareIsolatedRestore => Capability::PrepareIsolatedRestore,
+        Kind::RestoreStep => Capability::RestoreStep,
+        Kind::ReconcileRestore => Capability::ReconcileRestore,
+        Kind::RestoreStatus => Capability::RestoreStatus,
+        Kind::CompleteRehearsal => Capability::CompleteRehearsal,
+        Kind::AdmitCutover => Capability::AdmitCutover,
+    }
+}
+
+fn backup_mutation_digest_for(
+    wire: &PlatformHandle,
+    operation: &eliot_protocol::backup::BackupOperationKind,
+    request_id: &PlatformHandle,
+    session_id: &PlatformHandle,
+    nonce: &PlatformHandle,
+    generation: &PlatformHandle,
+    fence: &PlatformHandle,
+    source: &PlatformHandle,
+    destination: &PlatformHandle,
+    owner: &PlatformHandle,
+) -> String {
+    sha256_hex(
+        format!(
+            "{}:backup:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            wire.as_str(),
+            operation.as_str(),
+            request_id.as_str(),
+            session_id.as_str(),
+            nonce.as_str(),
+            generation.as_str(),
+            fence.as_str(),
+            source.as_str(),
+            destination.as_str(),
+            owner.as_str()
+        )
+        .as_bytes(),
+    )
+}
+
+fn backup_request_digest_for(
+    wire: &PlatformHandle,
+    operation: &eliot_protocol::backup::BackupOperationKind,
+    request_id: &PlatformHandle,
+    mutation_digest: &PlatformHandle,
+) -> String {
+    sha256_hex(
+        format!(
+            "{}:backup:{}:{}:{}",
+            wire.as_str(),
+            operation.as_str(),
+            request_id.as_str(),
+            mutation_digest.as_str()
+        )
+        .as_bytes(),
+    )
+}
+
+fn backup_bounded_text(value: &PlatformHandle, field: &'static str) -> Result<(), String> {
+    if value.as_str().trim().is_empty() || value.as_str().chars().any(char::is_control) {
+        return Err(format!("backup {field} invalid"));
+    }
+    if value.as_str().len() > MAX_BACKUP_RUNTIME_CONTROL_TEXT_BYTES {
+        return Err(format!("backup {field} exceeds the bounded wire limit"));
+    }
+    Ok(())
+}
+
+/// Authenticated backup envelope binding one closed #954 operation to its
+/// session, nonce, generation, fence, and installation identities.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupRuntimeControlRequest {
+    pub wire: PlatformHandle,
+    pub operation: eliot_protocol::backup::BackupOperationKind,
+    pub role: eliot_protocol::backup::BackupRole,
+    pub capability: eliot_protocol::backup::BackupCapability,
+    pub source: PlatformHandle,
+    pub destination: PlatformHandle,
+    pub owner: PlatformHandle,
+    pub request_id: PlatformHandle,
+    pub session_id: PlatformHandle,
+    pub nonce: PlatformHandle,
+    pub generation: PlatformHandle,
+    pub fence: PlatformHandle,
+    pub mutation_digest: PlatformHandle,
+    pub request_digest: PlatformHandle,
+}
+
+impl BackupRuntimeControlRequest {
+    /// Construct an authenticated backup envelope. The role/capability gate
+    /// runs before any digest is minted, so an unsupported method or a role
+    /// without the operation errors before effects.
+    pub fn new_backup(
+        operation: eliot_protocol::backup::BackupOperationKind,
+        role: eliot_protocol::backup::BackupRole,
+        source: PlatformHandle,
+        destination: PlatformHandle,
+        owner: PlatformHandle,
+        request_id: PlatformHandle,
+        session_id: PlatformHandle,
+        nonce: PlatformHandle,
+        generation: PlatformHandle,
+        fence: PlatformHandle,
+    ) -> Result<Self, String> {
+        if !role.permits(operation) {
+            return Err("backup role does not permit operation".to_owned());
+        }
+        let wire = PlatformHandle::new(BACKUP_WIRE.to_owned()).map_err(|e| e.to_string())?;
+        let mutation_digest = PlatformHandle::new(backup_mutation_digest_for(
+            &wire,
+            &operation,
+            &request_id,
+            &session_id,
+            &nonce,
+            &generation,
+            &fence,
+            &source,
+            &destination,
+            &owner,
+        ))
+        .map_err(|e| e.to_string())?;
+        let request_digest = PlatformHandle::new(backup_request_digest_for(
+            &wire,
+            &operation,
+            &request_id,
+            &mutation_digest,
+        ))
+        .map_err(|e| e.to_string())?;
+        let value = Self {
+            wire,
+            capability: backup_capability_for_operation(&operation),
+            operation,
+            role,
+            source,
+            destination,
+            owner,
+            request_id,
+            session_id,
+            nonce,
+            generation,
+            fence,
+            mutation_digest,
+            request_digest,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.wire.as_str() != BACKUP_WIRE {
+            return Err("unsupported backup wire".to_owned());
+        }
+        if !self.role.permits(self.operation) {
+            return Err("backup role does not permit operation".to_owned());
+        }
+        if self.capability != backup_capability_for_operation(&self.operation) {
+            return Err("backup capability mismatch".to_owned());
+        }
+        for (value, name) in [
+            (&self.source, "source"),
+            (&self.destination, "destination"),
+            (&self.owner, "owner"),
+            (&self.request_id, "request_id"),
+            (&self.session_id, "session_id"),
+            (&self.nonce, "nonce"),
+        ] {
+            backup_bounded_text(value, name)?;
+        }
+        if self.source == self.destination {
+            return Err("backup source and destination must remain distinct".to_owned());
+        }
+        // Generation and fence travel digest-bound: stale free-text values
+        // fail closed at the envelope. Exact-equality against live owner
+        // state stays with admission at the dispatch owner.
+        for (value, name) in [(&self.generation, "generation"), (&self.fence, "fence")] {
+            if !is_sha256_digest(value) {
+                return Err(format!("backup {name} must be lowercase sha256"));
+            }
+        }
+        if !is_sha256_digest(&self.mutation_digest) {
+            return Err("backup mutation_digest must be lowercase sha256".to_owned());
+        }
+        if !is_sha256_digest(&self.request_digest) {
+            return Err("backup request_digest must be lowercase sha256".to_owned());
+        }
+        let expected_mutation = backup_mutation_digest_for(
+            &self.wire,
+            &self.operation,
+            &self.request_id,
+            &self.session_id,
+            &self.nonce,
+            &self.generation,
+            &self.fence,
+            &self.source,
+            &self.destination,
+            &self.owner,
+        );
+        if expected_mutation != self.mutation_digest.as_str() {
+            return Err("backup mutation_digest mismatch".to_owned());
+        }
+        let expected = backup_request_digest_for(
+            &self.wire,
+            &self.operation,
+            &self.request_id,
+            &self.mutation_digest,
+        );
+        if expected != self.request_digest.as_str() {
+            return Err("backup request_digest mismatch".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated backup answer bound to one [`BackupRuntimeControlRequest`].
+/// The operation, source, destination, owner, and digest identities must
+/// match the request exactly; see [`backup_response_matches_request`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupRuntimeControlResponse {
+    pub wire: PlatformHandle,
+    pub operation: eliot_protocol::backup::BackupOperationKind,
+    pub source: PlatformHandle,
+    pub destination: PlatformHandle,
+    pub owner: PlatformHandle,
+    pub mutation_digest: PlatformHandle,
+    pub request_digest: PlatformHandle,
+}
+
+impl BackupRuntimeControlResponse {
+    /// Bind a backup answer to its exact request identity.
+    pub fn backup_response_for(request: &BackupRuntimeControlRequest) -> Self {
+        Self {
+            wire: request.wire.clone(),
+            operation: request.operation,
+            source: request.source.clone(),
+            destination: request.destination.clone(),
+            owner: request.owner.clone(),
+            mutation_digest: request.mutation_digest.clone(),
+            request_digest: request.request_digest.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.wire.as_str() != BACKUP_WIRE {
+            return Err("unsupported backup wire".to_owned());
+        }
+        for (value, name) in [
+            (&self.source, "source"),
+            (&self.destination, "destination"),
+            (&self.owner, "owner"),
+        ] {
+            backup_bounded_text(value, name)?;
+        }
+        if self.source == self.destination {
+            return Err("backup source and destination must remain distinct".to_owned());
+        }
+        if !is_sha256_digest(&self.mutation_digest) {
+            return Err("backup mutation_digest must be lowercase sha256".to_owned());
+        }
+        if !is_sha256_digest(&self.request_digest) {
+            return Err("backup request_digest must be lowercase sha256".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Check the backup answer against the exact request identity. The
+/// operation, source, destination, owner, and both digests must match; any
+/// substitution fails closed.
+pub fn backup_response_matches_request(
+    request: &BackupRuntimeControlRequest,
+    response: &BackupRuntimeControlResponse,
+) -> bool {
+    if response.validate().is_err() {
+        return false;
+    }
+    response.operation == request.operation
+        && response.source == request.source
+        && response.destination == request.destination
+        && response.owner == request.owner
+        && response.mutation_digest == request.mutation_digest
+        && response.request_digest == request.request_digest
+}
+
+fn backup_frame_payload_len(payload: &serde_json::Value) -> Result<usize, String> {
+    serde_json::to_vec(payload)
+        .map(|bytes| bytes.len())
+        .map_err(|_| "SessionFenced".to_owned())
+}
+
+pub fn backup_request_frame(
+    connection_id: impl Into<String>,
+    request: &BackupRuntimeControlRequest,
+) -> Result<Frame, String> {
+    request.validate().map_err(|_| "SessionFenced".to_owned())?;
+    let payload = serde_json::to_value(request).map_err(|_| "SessionFenced".to_owned())?;
+    if backup_frame_payload_len(&payload)? > MAX_BACKUP_RUNTIME_CONTROL_PAYLOAD_BYTES {
+        return Err("SessionFenced".to_owned());
+    }
+    let (request_id, request_identity) = durable_frame_identity(request.request_digest.as_str())
+        .map_err(|_| "SessionFenced".to_owned())?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: connection_id.into(),
+        request_id: Some(request_id),
+        kind: FrameKind::Control,
+        message_type: MessageType::Start,
+        request_identity: Some(request_identity),
+        payload: ProtocolPayload::Json(payload),
+        trace_context: production_trace_context(),
+    };
+    frame.validate().map_err(|_| "SessionFenced".to_owned())?;
+    Ok(frame)
+}
+
+pub fn decode_backup_request_frame(frame: &Frame) -> Result<BackupRuntimeControlRequest, String> {
+    frame.validate().map_err(|_| "SessionFenced".to_owned())?;
+    validate_production_trace_context(frame)?;
+    if frame.kind != FrameKind::Control || frame.message_type != MessageType::Start {
+        return Err("SessionFenced".to_owned());
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err("SessionFenced".to_owned());
+    };
+    if backup_frame_payload_len(payload)? > MAX_BACKUP_RUNTIME_CONTROL_PAYLOAD_BYTES {
+        return Err("SessionFenced".to_owned());
+    }
+    // Closed vocabulary with `deny_unknown_fields`: payload overrides,
+    // oversize text, malformed shapes, and duplicate fields fail here,
+    // before any effect. Unsupported methods (role without the operation),
+    // stale generation/fence digests, and capability divergence fail in the
+    // envelope validation below, also before effects.
+    let request: BackupRuntimeControlRequest =
+        serde_json::from_value(payload.clone()).map_err(|_| "SessionFenced".to_owned())?;
+    request.validate().map_err(|_| "SessionFenced".to_owned())?;
+    let frame_request_id = frame
+        .request_id
+        .as_ref()
+        .ok_or_else(|| "SessionFenced".to_owned())?;
+    if frame_request_id.as_str() != request.request_digest.as_str() {
+        return Err("SessionFenced".to_owned());
+    }
+    let identity = frame
+        .request_identity
+        .as_ref()
+        .ok_or_else(|| "SessionFenced".to_owned())?;
+    if identity.request.metadata.request_id.as_str() != request.request_digest.as_str()
+        || identity.idempotency_key != request.request_digest.as_str()
+        || identity.cancellation_id != request.request_digest.as_str()
+    {
+        return Err("SessionFenced".to_owned());
+    }
+    if identity.request.metadata.request_id != *frame_request_id {
+        return Err("SessionFenced".to_owned());
+    }
+    Ok(request)
+}
+
+pub fn backup_response_frame(
+    connection_id: impl Into<String>,
+    response: &BackupRuntimeControlResponse,
+) -> Result<Frame, String> {
+    response
+        .validate()
+        .map_err(|_| "SessionFenced".to_owned())?;
+    let payload = serde_json::to_value(response).map_err(|_| "SessionFenced".to_owned())?;
+    if backup_frame_payload_len(&payload)? > MAX_BACKUP_RUNTIME_CONTROL_PAYLOAD_BYTES {
+        return Err("SessionFenced".to_owned());
+    }
+    let (request_id, request_identity) = durable_frame_identity(response.request_digest.as_str())
+        .map_err(|_| "SessionFenced".to_owned())?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: connection_id.into(),
+        request_id: Some(request_id),
+        kind: FrameKind::Control,
+        message_type: MessageType::Ready,
+        request_identity: Some(request_identity),
+        payload: ProtocolPayload::Json(payload),
+        trace_context: production_trace_context(),
+    };
+    frame.validate().map_err(|_| "SessionFenced".to_owned())?;
+    Ok(frame)
+}
+
+pub fn decode_backup_response_frame(frame: &Frame) -> Result<BackupRuntimeControlResponse, String> {
+    frame.validate().map_err(|_| "SessionFenced".to_owned())?;
+    validate_production_trace_context(frame)?;
+    if frame.kind != FrameKind::Control || frame.message_type != MessageType::Ready {
+        return Err("SessionFenced".to_owned());
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err("SessionFenced".to_owned());
+    };
+    if backup_frame_payload_len(payload)? > MAX_BACKUP_RUNTIME_CONTROL_PAYLOAD_BYTES {
+        return Err("SessionFenced".to_owned());
+    }
+    let response: BackupRuntimeControlResponse =
+        serde_json::from_value(payload.clone()).map_err(|_| "SessionFenced".to_owned())?;
+    response
+        .validate()
+        .map_err(|_| "SessionFenced".to_owned())?;
+    let frame_request_id = frame
+        .request_id
+        .as_ref()
+        .ok_or_else(|| "SessionFenced".to_owned())?;
+    if frame_request_id.as_str() != response.request_digest.as_str() {
+        return Err("SessionFenced".to_owned());
+    }
+    let identity = frame
+        .request_identity
+        .as_ref()
+        .ok_or_else(|| "SessionFenced".to_owned())?;
+    if identity.request.metadata.request_id != *frame_request_id
+        || identity.idempotency_key != frame_request_id.as_str()
+        || identity.cancellation_id != frame_request_id.as_str()
+    {
+        return Err("SessionFenced".to_owned());
+    }
+    Ok(response)
+}
+
 fn production_trace_context() -> std::collections::BTreeMap<String, String> {
     std::collections::BTreeMap::from([(
         HOST_RUNTIME_CONTROL_PRODUCTION_TRACE_CONTEXT_KEY.to_owned(),

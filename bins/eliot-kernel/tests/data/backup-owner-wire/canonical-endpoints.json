@@ -1,0 +1,11 @@
+{
+  "description": "Canonical backup owner endpoints (issue #962). Exact pipe names plus exact peer expectations; no new pipe family is introduced.",
+  "host_owner": {
+    "pipe": "\\\\.\\pipe\\eliot\\host\\runtime-control-v1",
+    "peer": "host-backup-owner"
+  },
+  "watchdog_owner": {
+    "pipe": "\\\\.\\pipe\\eliot\\watchdog\\signals",
+    "peer": "watchdog-backup-owner"
+  }
+}

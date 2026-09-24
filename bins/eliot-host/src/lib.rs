@@ -4041,6 +4041,138 @@ impl HostComposition {
         Ok((sink, prepared))
     }
 
+    /// Accepted backup dispatch table (#954 envelope/method bridge, #962).
+    ///
+    /// Each entry is `(operation, owner path marker, needs_cutover_admission)`:
+    /// `PREPARE_ISOLATED_RESTORE` resolves through the #958 owner preparation
+    /// chain (see [`HostComposition::backup_dispatch_prepare`], which calls
+    /// [`DelegatedPreparation::prepare`](crate::backup_preparation::DelegatedPreparation::prepare));
+    /// `ADMIT_CUTOVER` resolves through the #961 owner cutover chain
+    /// (`crate::backup_cutover::execute_cutover`) exclusively under a separate
+    /// cutover admission. No algorithm is reimplemented here. Registration
+    /// runs [`HostComposition::validate_backup_dispatch_prepare_routing`]
+    /// over the table so the routing cannot rot unwired.
+    pub fn register_backup_dispatch() -> [(
+        eliot_protocol::backup::BackupOperationKind,
+        &'static str,
+        bool,
+    ); 2] {
+        use eliot_protocol::backup::BackupOperationKind as BackupOp;
+        let dispatch = [
+            (
+                BackupOp::PrepareIsolatedRestore,
+                "crate::backup_preparation::DelegatedPreparation::prepare",
+                false,
+            ),
+            (
+                BackupOp::AdmitCutover,
+                "crate::backup_cutover::execute_cutover",
+                true,
+            ),
+        ];
+        // Pin the preparation routing validation into registration;
+        // wiring-only, no backup operation runs here.
+        Self::validate_backup_dispatch_prepare_routing(dispatch);
+        dispatch
+    }
+
+    /// Validates the accepted backup dispatch routing shared by
+    /// registration and preparation (#962).
+    ///
+    /// Wiring-only pin: the closed two-entry table carries the preparation
+    /// path without cutover admission and the cutover path with it, while
+    /// rehearsal completion resolves to no entry so rehearsal can never
+    /// route to cutover. [`HostComposition::register_backup_dispatch`]
+    /// invokes this validation, and so does
+    /// [`HostComposition::backup_dispatch_prepare`] before delegating to
+    /// [`HostComposition::prepare_backup_destination`]; no backup operation
+    /// runs here.
+    fn validate_backup_dispatch_prepare_routing(
+        dispatch: [(
+            eliot_protocol::backup::BackupOperationKind,
+            &'static str,
+            bool,
+        ); 2],
+    ) {
+        use eliot_protocol::backup::BackupOperationKind as BackupOp;
+        // Length is pinned by the `[T; 2]` type; pin the routing contents.
+        let [
+            (prepare_op, prepare_marker, prepare_admission),
+            (cutover_op, cutover_marker, cutover_admission),
+        ] = dispatch;
+        debug_assert_eq!(prepare_op, BackupOp::PrepareIsolatedRestore);
+        debug_assert!(!prepare_marker.is_empty());
+        debug_assert!(!prepare_admission);
+        debug_assert_eq!(cutover_op, BackupOp::AdmitCutover);
+        debug_assert!(!cutover_marker.is_empty());
+        debug_assert!(cutover_admission);
+        debug_assert_eq!(
+            Self::backup_dispatch_needs_cutover_admission(BackupOp::PrepareIsolatedRestore),
+            Some(false)
+        );
+        debug_assert_eq!(
+            Self::backup_dispatch_needs_cutover_admission(BackupOp::AdmitCutover),
+            Some(true)
+        );
+        debug_assert_eq!(
+            Self::backup_dispatch_needs_cutover_admission(BackupOp::CompleteRehearsal),
+            None
+        );
+    }
+
+    /// Reports whether one backup operation needs a separate cutover
+    /// admission on the dispatch table (#962).
+    ///
+    /// Returns `Some(false)` for the preparation path, `Some(true)` for the
+    /// cutover path, and `None` for operations with no dispatch entry.
+    /// Rehearsal guard: `COMPLETE_REHEARSAL` returns `None`, so a rehearsal
+    /// completion can never resolve cutover.
+    pub fn backup_dispatch_needs_cutover_admission(
+        operation: eliot_protocol::backup::BackupOperationKind,
+    ) -> Option<bool> {
+        use eliot_protocol::backup::BackupOperationKind as BackupOp;
+        match operation {
+            BackupOp::PrepareIsolatedRestore => Some(false),
+            BackupOp::AdmitCutover => Some(true),
+            // `CompleteRehearsal` and every other operation share this arm:
+            // rehearsal completion has no dispatch entry, so it can never
+            // resolve cutover.
+            _ => None,
+        }
+    }
+
+    /// Dispatches one accepted preparation through the existing owner chain
+    /// (#962). This delegates to
+    /// [`HostComposition::prepare_backup_destination`], which authenticates
+    /// the caller, inspects owner evidence, and runs
+    /// [`DelegatedPreparation::prepare`](crate::backup_preparation::DelegatedPreparation::prepare);
+    /// the production caller chain is preserved and no algorithm is
+    /// reimplemented here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
+    /// when the caller gate, lease/installation binding, owner evidence,
+    /// admission, or journal persistence fails closed.
+    pub fn backup_dispatch_prepare<J: crate::backup_preparation::PreparationJournal>(
+        &self,
+        journal: J,
+        caller: &crate::backup_preparation::BackupCallerAuth,
+        request: &crate::backup_preparation::PresentedPreparationRequest,
+    ) -> Result<
+        (
+            crate::backup_preparation::DelegatedPreparation<J>,
+            crate::backup_preparation::PreparedDestination,
+        ),
+        crate::backup_preparation::PreparationError,
+    > {
+        // Route through the shared dispatch validation before delegating:
+        // preparation must resolve without cutover admission, cutover with
+        // it, and rehearsal completion to no entry.
+        Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
+        self.prepare_backup_destination(journal, caller, request)
+    }
+
     /// Opens the durable Host contour for one installation identity and
     /// advances its persisted epoch before any process admission.
     ///
@@ -4057,6 +4189,10 @@ impl HostComposition {
         // guard. Missing evidence suppresses `admitted`, never a new branch.
         host_lifecycle_observe_requested("host.open requested");
         let mut host_terminal = HostTerminalGuard::armed("host-open-failed");
+        // Backup dispatch wiring (#962): pin the accepted preparation /
+        // cutover routing into the production startup path so it cannot rot
+        // unwired. Wiring-only: no backup operation runs here.
+        Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
         if launch_options.installation().as_str().trim().is_empty() {
             return Err(HostError::MissingInstallation);
         }

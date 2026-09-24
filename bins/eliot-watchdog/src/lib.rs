@@ -56,6 +56,7 @@ const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
 const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
+mod backup_control;
 mod diagnostics;
 mod heartbeat_transport;
 mod host_identity_observation;
@@ -131,6 +132,10 @@ pub(crate) use service_registration_projection::{
     read_approved_service_registration, validate_bound_service_registrations,
 };
 
+pub use backup_control::{
+    AcceptedWatchdogBackupMethod, BackupControlHandle, accepted_watchdog_backup_methods,
+    register_backup_control, start_backup_control, stop_backup_control,
+};
 pub use heartbeat_transport::{
     FENCE_SEQUENCE, HeartbeatTransport, HeartbeatTransportDescriptor, HeartbeatTransportError,
 };
