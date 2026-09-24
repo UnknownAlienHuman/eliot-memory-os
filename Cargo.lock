@@ -2524,6 +2524,7 @@ dependencies = [
  "eliot-research-exchange",
  "eliot-research-exchange-api",
  "eliot-researcher",
+ "eliot-task",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2868,8 +2869,11 @@ name = "eliot-researcher"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-epistemic-contracts",
  "eliot-research-exchange",
  "eliot-research-exchange-api",
+ "eliot-task",
+ "serde",
 ]
 
 [[package]]

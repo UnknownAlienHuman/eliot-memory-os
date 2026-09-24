@@ -10,6 +10,9 @@ description = "ELIOT Researcher composition over governed acquisition and exchan
 eliot-research-exchange-api.workspace = true
 eliot-research-exchange.workspace = true
 eliot-contracts.workspace = true
+eliot-task.workspace = true
+eliot-epistemic-contracts.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true

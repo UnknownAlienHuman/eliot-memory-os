@@ -10,27 +10,34 @@ pub mod inquiry_governance;
 pub mod inquiry_obligations;
 pub mod source_admissibility;
 
+pub use evidence_portfolio::{CanonicalCoverageProjection, UnsupportedPrecisionItem};
+
 use eliot_contracts::StateFence;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, GovernedExchange, ResearchBridge};
 use eliot_research_exchange_api::{
-    AllowedReferenceManifest, AnchorPrecision, DisclosureClass, ResearchQueryRequest, SourceClass,
+    AllowedReferenceManifest, AnchorPrecision, ResearchQueryRequest,
 };
 
+pub use eliot_task::{
+    TaskGraphCompilationReceipt, TaskGraphCompilationRequest, TaskLifecycleOwner,
+};
 pub use inquiry_governance::{
-    BudgetDeadlineStopRule, CoverageGoal, EvidenceGrade, GovernorProfileAdmissionRequest,
-    HypothesisPolicy, IndependenceBlindingPolicy, InquiryGovernance, InquiryGovernanceError,
+    BudgetDeadlineStopRule, ClaimAudit, CoverageGoal, EvidenceFreeze, EvidenceGrade,
+    GovernorProfileAdmissionRequest, HypothesisPolicy, IndependenceBlindingPolicy,
+    InquiryDisposition, InquiryDispositionRecord, InquiryGovernance, InquiryGovernanceError,
     InquiryHorizon, InquiryLane, InquiryProtocol, InquiryProtocolProfile,
     InquiryProtocolProfileParams, InquiryRisk, InquirySelectionFeatures, InquiryUncertainty,
-    OutputContractAndReopenConditions, SpecialistDiscoverability, VerifierStrength,
-    select_protocol,
+    OutputContractAndReopenConditions, ResearchDebt, ResearchDebtKind, SpecialistDiscoverability,
+    VerifierStrength, select_protocol,
 };
 pub use inquiry_obligations::{
     AcceptanceCertificate, AcceptanceCertificateKind, InquiryObligation, InquiryObligationInput,
-    InquiryObligationStatus, TaskGraphCompilationReceipt, TaskGraphCompiler,
+    InquiryObligationStatus,
 };
 pub use source_admissibility::{
     GovernorSourceAdmissionRequest, SourceAdmissibilityReason, SourceAdmissibilityRecord,
-    SourceEligibility, SourceLimits, SourceProposal, SourceProvenance, SourceTaint,
+    SourceEligibility, SourceIndependence, SourceLimits, SourceProposal, SourceProvenance,
+    SourceTaint,
 };
 
 /// Error returned when governance compilation precedes an exchange submit.
@@ -85,20 +92,15 @@ impl<B> Researcher<B> {
     pub fn exchange(&self) -> &GovernedExchange<B> {
         &self.exchange
     }
-    pub fn exchange_mut(&mut self) -> &mut GovernedExchange<B> {
-        &mut self.exchange
+    /// Read-only view of the composed exchange bridge.
+    #[must_use]
+    pub fn bridge(&self) -> &B {
+        self.exchange.bridge()
     }
     /// Read-only view of the runtime-local R6 governance registry.
     #[must_use]
     pub fn governance(&self) -> &InquiryGovernance {
         &self.governance
-    }
-    /// Mutable view for the Researcher-owned governance registry.
-    pub fn governance_mut(&mut self) -> &mut InquiryGovernance {
-        &mut self.governance
-    }
-    pub fn into_exchange(self) -> GovernedExchange<B> {
-        self.exchange
     }
 }
 
@@ -121,21 +123,15 @@ impl<B: ResearchBridge> Researcher<B> {
     }
 
     /// Compiles profile-bound obligations through the existing work-graph port.
-    pub fn compile_obligations<C: TaskGraphCompiler>(
+    pub fn compile_obligations(
         &mut self,
         profile_id: &str,
         profile_revision: u64,
         inputs: &[InquiryObligationInput],
-        compiler_id: impl Into<String>,
-        compiler: &mut C,
+        task_owner: &TaskLifecycleOwner,
     ) -> Result<TaskGraphCompilationReceipt, InquiryGovernanceError> {
-        self.governance.compile_obligations(
-            profile_id,
-            profile_revision,
-            inputs,
-            compiler_id,
-            compiler,
-        )
+        self.governance
+            .compile_obligations(profile_id, profile_revision, inputs, task_owner)
     }
 
     /// Evaluates a provider source as candidate-only for an exact profile.
@@ -164,13 +160,12 @@ impl<B: ResearchBridge> Researcher<B> {
 
     /// Compiles obligations first, then submits through the existing governed
     /// exchange. This is acquisition composition, not self-enqueue or Finish.
-    pub fn submit_governed_query<C: TaskGraphCompiler>(
+    pub fn submit_governed_query(
         &mut self,
         profile_id: &str,
         profile_revision: u64,
         obligations: &[InquiryObligationInput],
-        compiler_id: impl Into<String>,
-        compiler: &mut C,
+        task_owner: &TaskLifecycleOwner,
         query: ResearchQueryRequest,
     ) -> Result<(ExchangeJob, TaskGraphCompilationReceipt), GovernedInquiryError> {
         let profile = self
@@ -180,9 +175,12 @@ impl<B: ResearchBridge> Researcher<B> {
                 profile_id: profile_id.to_owned(),
                 revision: profile_revision,
             })?;
-        if query.state_fence != profile.state_fence
+        if !profile.matches_binding(&profile.task_definition_digest, &query.state_fence)
+            || query.state_fence != profile.state_fence
             || query.question != profile.question
             || query.question_scope != profile.scope
+            || query.allowed_references.state_fence != profile.state_fence
+            || query.allowed_references.digest != profile.reference_manifest_digest
         {
             return Err(InquiryGovernanceError::InvalidField {
                 field: "query.profile_binding",
@@ -193,58 +191,19 @@ impl<B: ResearchBridge> Researcher<B> {
             profile_id,
             profile_revision,
             obligations,
-            compiler_id,
-            compiler,
+            task_owner,
         )?;
         let job = self.exchange.submit(query)?;
         Ok((job, receipt))
     }
 
-    pub fn submit_query(
+    /// Cancels only a job accepted through the governed composition path.
+    pub fn cancel_governed_query(
         &mut self,
-        query: ResearchQueryRequest,
+        job_id: &str,
+        fence: &StateFence,
     ) -> Result<ExchangeJob, ExchangeError> {
-        self.exchange.submit(query)
-    }
-
-    // Keep the protocol façade's explicit request fields stable; grouping them
-    // would broaden the public call-surface change beyond this lint fix.
-    #[allow(clippy::too_many_arguments)]
-    pub fn request(
-        &mut self,
-        exchange_id: impl Into<String>,
-        bridge_generation: impl Into<String>,
-        idempotency_key: impl Into<String>,
-        requester_principal: impl Into<String>,
-        fence: StateFence,
-        question: impl Into<String>,
-        scope: impl Into<String>,
-        expected_decision: impl Into<String>,
-        source_classes: Vec<SourceClass>,
-        allowed_references: AllowedReferenceManifest,
-        budget_units: u64,
-        deadline_ms: i64,
-    ) -> Result<ExchangeJob, ExchangeError> {
-        self.submit_query(ResearchQueryRequest {
-            exchange_id: exchange_id.into(),
-            protocol_revision: eliot_research_exchange_api::CONTRACT_VERSION,
-            bridge_generation: bridge_generation.into(),
-            idempotency_key: idempotency_key.into(),
-            requester_principal: requester_principal.into(),
-            state_fence: fence,
-            question: question.into(),
-            question_scope: scope.into(),
-            expected_decision: expected_decision.into(),
-            source_classes,
-            coverage_goal: "bounded exact sources with explicit unknowns".into(),
-            allowed_references,
-            disclosure: DisclosureClass::ProjectBound,
-            retention: "governed-by-caller".into(),
-            license_policy: "caller-policy".into(),
-            budget_units,
-            deadline_ms,
-            required_schema: "research-evidence-bundle/v1".into(),
-        })
+        self.exchange.cancel(job_id, fence)
     }
 }
 

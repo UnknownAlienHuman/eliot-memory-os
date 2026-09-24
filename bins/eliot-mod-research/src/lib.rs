@@ -17,10 +17,20 @@ pub mod evidence;
 pub mod execution;
 pub mod protocol;
 
-use eliot_contracts::StateFence;
+use serde::{Deserialize, Serialize};
+
+use eliot_contracts::{StateFence, TaskId};
 use eliot_research_exchange::{ExchangeError, ExchangeJob, ResearchBridge};
 use eliot_research_exchange_api::{CoverageGapKind, ResearchQueryRequest};
-use eliot_researcher::Researcher;
+use eliot_researcher::{
+    CanonicalCoverageProjection, ClaimAudit, EvidenceFreeze, GovernedInquiryError,
+    GovernorProfileAdmissionRequest, GovernorSourceAdmissionRequest, InquiryDisposition,
+    InquiryDispositionRecord, InquiryGovernanceError, InquiryObligationInput,
+    InquiryProtocolProfile, InquiryProtocolProfileParams, ResearchDebt, Researcher,
+    SourceAdmissibilityRecord, SourceEligibility, SourceProposal, TaskGraphCompilationReceipt,
+    UnsupportedPrecisionItem,
+};
+use eliot_task::{TaskCommandContext, TaskError, TaskLifecycleOwner, TaskLifecycleSnapshot};
 use thiserror::Error;
 
 pub use admission::{AdmissionRefusal, ProviderAdmission};
@@ -109,7 +119,7 @@ impl BridgeError {
 /// from ambient environment, and identity alone grants no execution: the
 /// Kernel-issued research admission that binds this identity to one exact
 /// operation lands in [`ProviderAdmission`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BridgeIdentity {
     executable: String,
     executable_sha256: String,
@@ -198,6 +208,10 @@ impl ResearchBridge for GovernedResearchBridge {
 
     fn cancel(&mut self, _job_id: &str) -> Result<(), Self::Error> {
         Err(BridgeError::ProviderUnavailable)
+    }
+
+    fn provider_unavailable(&self) -> bool {
+        true
     }
 }
 
@@ -429,11 +443,307 @@ pub fn compose_admitted(
     Researcher::new(AdmittedResearchBridge::new(runner, admission))
 }
 
-pub fn submit<B: ResearchBridge>(
+/// Non-test production request accepted by the R6 composition path. The
+/// request is data, not authority: the Task Controller owner and the normal
+/// provider admission boundary remain authoritative.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct R6ResearchRequest {
+    pub inquiry_id: String,
+    pub bridge_identity: BridgeIdentity,
+    pub task_id: TaskId,
+    pub task_project: String,
+    pub task_goal: String,
+    pub task_context: TaskCommandContext,
+    pub task_snapshot: Option<TaskLifecycleSnapshot>,
+    pub profile: InquiryProtocolProfileParams,
+    pub profile_revision: Option<InquiryProtocolProfileParams>,
+    pub obligations: Vec<InquiryObligationInput>,
+    pub source_proposals: Vec<SourceProposal>,
+    pub query: ResearchQueryRequest,
+    pub portfolio_digest: Option<String>,
+    pub manifest_digest: Option<String>,
+    pub coverage_receipt_digest: Option<String>,
+    pub canonical_coverage: Option<CanonicalCoverageProjection>,
+    pub evidence_freeze: Option<EvidenceFreeze>,
+    pub claim_audits: Vec<ClaimAudit>,
+    pub research_debts: Vec<ResearchDebt>,
+    pub unsupported_precision: Vec<UnsupportedPrecisionItem>,
+    pub disposition: InquiryDisposition,
+    pub next_probe: Option<String>,
+    pub narrower_claim: Option<String>,
+    pub explicit_unknown: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct R6CompositionOutput {
+    pub inquiry_id: String,
+    pub profile: InquiryProtocolProfile,
+    pub task_compilation: TaskGraphCompilationReceipt,
+    pub source_records: Vec<SourceAdmissibilityRecord>,
+    pub governor_profile_request: GovernorProfileAdmissionRequest,
+    pub governor_source_requests: Vec<GovernorSourceAdmissionRequest>,
+    pub exchange_job: Option<ExchangeJob>,
+    pub canonical_coverage: Option<CanonicalCoverageProjection>,
+    pub evidence_freeze: Option<EvidenceFreeze>,
+    pub claim_audits: Vec<ClaimAudit>,
+    pub research_debts: Vec<ResearchDebt>,
+    pub unsupported_precision: Vec<UnsupportedPrecisionItem>,
+    pub disposition: InquiryDispositionRecord,
+    pub candidate_only: bool,
+    pub canonical_write_authorized: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum R6CompositionError {
+    #[error("R6 request binding is invalid: {0}")]
+    InvalidBinding(String),
+    #[error("R6 governance rejected the request: {0}")]
+    Governance(#[from] InquiryGovernanceError),
+    #[error("R6 Task Controller rejected the request: {0}")]
+    TaskOwner(#[from] TaskError),
+    #[error("R6 exchange rejected the request: {0}")]
+    Exchange(#[from] GovernedInquiryError),
+}
+
+/// Reconstructs the existing Task Controller owner from an explicitly supplied
+/// lifecycle snapshot. The snapshot is a candidate input; this helper does not
+/// persist it or grant canonical authority.
+pub fn task_owner_from_snapshot(
+    snapshot: TaskLifecycleSnapshot,
+    context: &TaskCommandContext,
+) -> Result<TaskLifecycleOwner, R6CompositionError> {
+    Ok(TaskLifecycleOwner::from_snapshot(
+        context.authority_epoch.clone(),
+        context.state_fence.clone(),
+        snapshot,
+    )?)
+}
+
+#[allow(clippy::too_many_lines)]
+/// Real non-test R6 request/composition consumer.
+///
+/// It resolves/revises the profile, asks the existing Task Controller owner
+/// for the typed compilation receipt, assesses every source candidate, emits
+/// Governor-facing requests, and only then submits the exact query through the
+/// governed exchange. A provider-unavailable result is returned as a typed
+/// terminal gap; it is never converted into an answer.
+pub fn compose_r6_request<B: ResearchBridge>(
+    researcher: &mut Researcher<B>,
+    task_owner: &TaskLifecycleOwner,
+    request: R6ResearchRequest,
+) -> Result<R6CompositionOutput, R6CompositionError> {
+    if request.inquiry_id.trim().is_empty()
+        || request.task_id != request.profile.task_id
+        || request.task_context.state_fence != request.query.state_fence
+        || request.task_context.state_fence != request.profile.state_fence
+    {
+        return Err(R6CompositionError::InvalidBinding(
+            "task/profile/query identity or fence does not match".to_owned(),
+        ));
+    }
+    let task = task_owner.task(&request.task_id).ok_or_else(|| {
+        R6CompositionError::InvalidBinding("task is absent from owner".to_owned())
+    })?;
+    if task.project_ref != request.task_project || task.goal != request.task_goal {
+        return Err(R6CompositionError::InvalidBinding(
+            "request task project/goal does not match the live task record".to_owned(),
+        ));
+    }
+    let derived_task_definition = task_owner.task_definition_digest(&request.task_id)?;
+    if request.profile.task_definition_digest != derived_task_definition {
+        return Err(R6CompositionError::InvalidBinding(
+            "profile task-definition digest is not the live Task Controller digest".to_owned(),
+        ));
+    }
+    if let Some(revision) = &request.profile_revision
+        && (revision.task_id != request.task_id
+            || revision.task_definition_digest != derived_task_definition)
+    {
+        return Err(R6CompositionError::InvalidBinding(
+            "profile revision is not bound to the live task definition".to_owned(),
+        ));
+    }
+
+    let profile = researcher.resolve_inquiry_profile(request.profile)?;
+    let profile = if let Some(revision) = request.profile_revision {
+        researcher.revise_inquiry_profile(&profile.profile_id, revision)?
+    } else {
+        profile
+    };
+    let mut source_records = Vec::with_capacity(request.source_proposals.len());
+    for proposal in &request.source_proposals {
+        source_records.push(researcher.assess_source_candidate(
+            &profile.profile_id,
+            profile.revision,
+            &proposal.evidence_set_id,
+            proposal,
+        )?);
+    }
+    if !source_records.is_empty()
+        && !source_records
+            .iter()
+            .any(|record| record.eligibility == SourceEligibility::Eligible)
+    {
+        return Err(R6CompositionError::InvalidBinding(
+            "all proposed sources are pending or ineligible".to_owned(),
+        ));
+    }
+
+    let (job, task_compilation) = match researcher.submit_governed_query(
+        &profile.profile_id,
+        profile.revision,
+        &request.obligations,
+        task_owner,
+        request.query.clone(),
+    ) {
+        Ok(value) => (Some(value.0), value.1),
+        Err(GovernedInquiryError::Exchange(ExchangeError::InvalidTransition))
+            if researcher.bridge().provider_unavailable() =>
+        {
+            // Compile again through the same owner to retain the receipt while
+            // preserving the provider-unavailable disposition. This second
+            // call is idempotent at the Task Controller boundary and never
+            // retries the provider.
+            (
+                None,
+                researcher.compile_obligations(
+                    &profile.profile_id,
+                    profile.revision,
+                    &request.obligations,
+                    task_owner,
+                )?,
+            )
+        }
+        Err(error) => return Err(R6CompositionError::Exchange(error)),
+    };
+    if let Some(coverage) = &request.canonical_coverage {
+        coverage
+            .denominator
+            .validate()
+            .map_err(|error| R6CompositionError::InvalidBinding(error.to_string()))?;
+        coverage
+            .receipt
+            .validate()
+            .map_err(|error| R6CompositionError::InvalidBinding(error.to_string()))?;
+        if coverage.denominator.scope != profile.scope
+            || coverage.receipt.scope != profile.scope
+            || coverage.receipt.fence != profile.state_fence
+            || coverage.receipt.task_id != request.task_id
+            || coverage.receipt.denominator != coverage.denominator.digest
+        {
+            return Err(R6CompositionError::InvalidBinding(
+                "canonical coverage projection is not bound to the exact task/profile/scope/fence"
+                    .to_owned(),
+            ));
+        }
+    }
+    let portfolio_digest = request
+        .canonical_coverage
+        .as_ref()
+        .map(|coverage| coverage.portfolio_digest.clone())
+        .or(request.portfolio_digest.clone());
+    if request
+        .portfolio_digest
+        .as_ref()
+        .is_some_and(|digest| Some(digest) != portfolio_digest.as_ref())
+    {
+        return Err(R6CompositionError::InvalidBinding(
+            "caller portfolio digest does not match the canonical projection".to_owned(),
+        ));
+    }
+    let coverage_receipt_digest = request
+        .canonical_coverage
+        .as_ref()
+        .map(|coverage| coverage.receipt.digest.clone())
+        .or(request.coverage_receipt_digest.clone());
+    if request
+        .canonical_coverage
+        .as_ref()
+        .is_some_and(|coverage| coverage.receipt.fence != profile.state_fence)
+    {
+        return Err(R6CompositionError::InvalidBinding(
+            "canonical coverage receipt is not bound to the profile fence".to_owned(),
+        ));
+    }
+    if request
+        .coverage_receipt_digest
+        .as_ref()
+        .is_some_and(|digest| Some(digest) != coverage_receipt_digest.as_ref())
+    {
+        return Err(R6CompositionError::InvalidBinding(
+            "caller coverage digest does not match the canonical receipt".to_owned(),
+        ));
+    }
+    if let Some(freeze) = &request.evidence_freeze
+        && (freeze.profile_id != profile.profile_id
+            || freeze.profile_revision != profile.revision
+            || freeze.profile_digest != profile.digest
+            || freeze.state_fence != profile.state_fence
+            || coverage_receipt_digest
+                .as_ref()
+                .is_some_and(|digest| &freeze.coverage_receipt_digest != digest))
+    {
+        return Err(R6CompositionError::InvalidBinding(
+            "evidence freeze is not bound to the exact profile/fence/coverage receipt".to_owned(),
+        ));
+    }
+    if request.disposition.may_close()
+        && (!request.research_debts.is_empty() || !request.unsupported_precision.is_empty())
+    {
+        return Err(R6CompositionError::InvalidBinding(
+            "open research debts or unsupported precision cannot close an inquiry".to_owned(),
+        ));
+    }
+    let disposition = if job.is_none() {
+        InquiryDisposition::SourceUnavailable
+    } else {
+        request.disposition
+    };
+    let disposition = InquiryDispositionRecord::new(
+        &request.inquiry_id,
+        &profile,
+        source_records
+            .first()
+            .map_or_else(String::new, |record| record.evidence_set_id.clone()),
+        portfolio_digest,
+        request.manifest_digest,
+        coverage_receipt_digest,
+        disposition,
+        request.next_probe,
+        request.narrower_claim,
+        request.explicit_unknown,
+    )?;
+    let governor_profile_request = profile.governor_admission_request();
+    let governor_source_requests = source_records
+        .iter()
+        .map(SourceAdmissibilityRecord::governor_admission_request)
+        .collect();
+    Ok(R6CompositionOutput {
+        inquiry_id: request.inquiry_id,
+        profile,
+        task_compilation,
+        source_records,
+        governor_profile_request,
+        governor_source_requests,
+        exchange_job: job,
+        canonical_coverage: request.canonical_coverage,
+        evidence_freeze: request.evidence_freeze,
+        claim_audits: request.claim_audits,
+        research_debts: request.research_debts,
+        unsupported_precision: request.unsupported_precision,
+        disposition,
+        candidate_only: true,
+        canonical_write_authorized: false,
+    })
+}
+
+#[cfg(test)]
+fn submit<B: ResearchBridge>(
     researcher: &mut Researcher<B>,
     request: ResearchQueryRequest,
 ) -> Result<ExchangeJob, ExchangeError> {
-    researcher.submit_query(request)
+    let _ = (researcher, request);
+    Err(ExchangeError::InvalidTransition)
 }
 
 pub fn cancel<B: ResearchBridge>(
@@ -441,7 +751,7 @@ pub fn cancel<B: ResearchBridge>(
     job_id: &str,
     fence: &StateFence,
 ) -> Result<ExchangeJob, ExchangeError> {
-    researcher.exchange_mut().cancel(job_id, fence)
+    researcher.cancel_governed_query(job_id, fence)
 }
 
 #[must_use]
@@ -732,8 +1042,7 @@ mod tests {
     #[test]
     fn carried_identity_is_exact_end_to_end() {
         let researcher = compose_with_bridge(test_identity());
-        let (bridge, _) = researcher.into_exchange().into_parts();
-        assert_eq!(bridge.identity(), &test_identity());
+        assert_eq!(researcher.bridge().identity(), &test_identity());
     }
 
     #[test]
@@ -834,18 +1143,17 @@ mod tests {
             exchange_snapshot(&researcher).jobs.is_empty(),
             "no exchange job may be recorded for an unexecuted provider call"
         );
-        let (bridge, _) = researcher.into_exchange().into_parts();
         assert!(
-            !bridge.has_submitted(),
+            !researcher.bridge().has_submitted(),
             "a gap before executor contact must keep the operation retryable, not submitted"
         );
         assert_eq!(
-            bridge.admission().operation_id().as_str(),
+            researcher.bridge().admission().operation_id().as_str(),
             "op-24-slice-a",
             "the bound admission stays exact after a gap"
         );
-        assert_eq!(bridge.last_evidence(), None);
-        assert_eq!(bridge.last_provider_job_ref(), None);
+        assert_eq!(researcher.bridge().last_evidence(), None);
+        assert_eq!(researcher.bridge().last_provider_job_ref(), None);
     }
 
     /// Test-only request port: always refuses, so no executor contact happens.
