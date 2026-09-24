@@ -9,7 +9,10 @@ use std::collections::BTreeSet;
 use crate::SurrealStoreAdapter;
 use crate::config::{SchemaGeneration, SurrealAdapterConfig};
 use crate::error::AdapterError;
-use crate::plan::{self, build_receipt, validate_receipt_identity, validate_revision_heads};
+use crate::plan::{
+    self, build_receipt_with_expected_heads, validate_receipt_identity_with_expected_heads,
+    validate_revision_heads,
+};
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 use crate::write_execution::{
     AttemptOutcome, ExclusiveOpKind, ExecutableAttempt, OpExecution, ProviderGate,
@@ -1014,9 +1017,24 @@ async fn apply_with_retry(
     // duplicate or drift from semantic logic by construction.
     let mut semantic_plan: Option<plan::ApplyPlan> = None;
     loop {
-        match read_idempotency(db, &adapter.config, ctx, &transition).await? {
+        match read_idempotency(
+            db,
+            &adapter.config,
+            ctx,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )
+        .await?
+        {
             Idempotency::Replay(receipt) => {
-                validate_receipt_identity(&receipt, ctx, &transition)?;
+                validate_receipt_identity_with_expected_heads(
+                    &receipt,
+                    ctx,
+                    &transition,
+                    &expected_revision_heads,
+                    &expected_ordering_heads,
+                )?;
                 return Ok(receipt);
             }
             Idempotency::Conflict => {
@@ -1108,7 +1126,17 @@ async fn apply_with_retry(
             semantic_plan = Some(full.clone());
             full
         };
-        let receipt = build_receipt(ctx, &transition, &plan)?;
+        // Issue #63: the receipt binds the recomputed canonical request
+        // hash (verified against the supplied claim), never a blind copy,
+        // so Governor output, Kernel staging, store commit and WriteReceipt
+        // carry the identical digest.
+        let receipt = build_receipt_with_expected_heads(
+            ctx,
+            &transition,
+            &plan,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )?;
 
         // S-CONC-TX production-path rendezvous (issue #989): first attempt
         // only, after every pre-transaction read and the plan build, before
@@ -1138,7 +1166,13 @@ async fn apply_with_retry(
         .await
         {
             Ok(()) => {
-                validate_receipt_identity(&receipt, ctx, &transition)?;
+                validate_receipt_identity_with_expected_heads(
+                    &receipt,
+                    ctx,
+                    &transition,
+                    &expected_revision_heads,
+                    &expected_ordering_heads,
+                )?;
                 return Ok(receipt);
             }
             Err(AdapterError::AllocationContention { .. }) if retries < MAX_ALLOCATION_RETRIES => {
@@ -2241,13 +2275,13 @@ mod concurrent_allocation_tests {
 
         use super::super::{
             apply_prepared_with_authority, apply_prepared_without_write_guard, atomic_write,
-            build_receipt, client, read_fence, surreal_automation, surreal_experience,
-            surreal_reactive, validate_receipt_identity,
+            client, read_fence, surreal_automation, surreal_experience, surreal_reactive,
         };
         use crate::client::session_pool::SessionRole;
         use crate::config::{ClientSetLimits, SurrealAdapterConfig};
         use crate::error::AdapterError;
         use crate::plan;
+        use crate::plan::{build_receipt, validate_receipt_identity};
         use crate::{SchemaGeneration, SurrealStoreAdapter};
         use eliot_platform_windows::WindowsPlatform;
         use eliot_store_api::{
