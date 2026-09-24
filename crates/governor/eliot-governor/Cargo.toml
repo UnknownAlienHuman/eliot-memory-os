@@ -45,6 +45,8 @@ eliot-store-api.workspace = true
 eliot-task.workspace = true
 eliot-testd-core.workspace = true
 eliot-instrument-api.workspace = true
+eliot-learning-contracts.workspace = true
+eliot-learning-delta.workspace = true
 eliot-verifier = { path = "../../instrument/eliot-verifier", version = "0.1.0" }
 eliot-workscope.workspace = true
 eliot-runtime-contracts.workspace = true
