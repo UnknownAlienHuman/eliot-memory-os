@@ -639,6 +639,65 @@ impl DaemonComposition {
         }
         Ok(receipt)
     }
+
+    /// Commits one prebuilt named learning-record request through the
+    /// Governor learning-record commit caller, then publishes the resulting
+    /// owner change.
+    ///
+    /// Outbound-only: this method owns no Store client and opens no second
+    /// durability path. The only write path is the retained neutral Kernel
+    /// port, reached through
+    /// [`eliot_governor::commit_learning_record`](eliot_governor::commit_learning_record).
+    /// Same refresh/stale discipline as
+    /// [`Self::commit_experience_bank_record`]: the receipt is returned
+    /// unmodified and a failed refresh marks the dependent view
+    /// stale/pending instead of hiding divergence. Durability never implies
+    /// effectiveness: the returned flag comes only from
+    /// [`eliot_governor::learning_effective_under_admission`](eliot_governor::learning_effective_under_admission)
+    /// against the live fence, and a durable-but-unadmitted record stays
+    /// non-effective.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_learning_record(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        request: eliot_store_api::NamedMutationRequest,
+        scope_id: eliot_store_api::ScopeId,
+        proof_refs: Vec<String>,
+        permit: Option<&eliot_governor::LearningAdmissionPermit>,
+        admitted: bool,
+        admission_receipt_present: bool,
+        expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    ) -> Result<(eliot_store_api::WriteReceipt, bool), DaemonError> {
+        eliot_store_api::reject_direct_learning_write(&request).map_err(|error| {
+            DaemonError::Composition(CompositionError::Owner(format!(
+                "learning commit guard: {error}"
+            )))
+        })?;
+        let receipt = eliot_governor::commit_learning_record(
+            &self.governor,
+            identity,
+            request,
+            scope_id,
+            proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+        .map_err(DaemonError::Composition)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        let effective = eliot_governor::learning_effective_under_admission(
+            self.governor.governor(),
+            permit,
+            &live_fence,
+            admitted,
+            admission_receipt_present,
+        );
+        Ok((receipt, effective))
+    }
     /// Returns the retained owner receipt for an already-committed
     /// experience record, if this composition committed its idempotency
     /// key (P1-1, issue #1942).
