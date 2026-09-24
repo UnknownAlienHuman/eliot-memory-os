@@ -323,8 +323,8 @@ extern "system" fn watchdog_service_main(
     // `ApprovalUnavailable` before the runtime transient loop can run.
     let stop_signal = Arc::new(AtomicBool::new(false));
     let _ = SERVICE_STOP_REQUESTED.set(stop_signal.clone());
-    let validated_launch = match validate_bootstrap_with_transient_retry(&handle, &stop_signal) {
-        BootstrapValidationOutcome::Validated(launch) => launch,
+    let validated_launch = match validate_bootstrap_with_transient_retry(handle, &stop_signal) {
+        BootstrapValidationOutcome::Validated(launch) => *launch,
         BootstrapValidationOutcome::StopRequested => {
             set_service_status_stopped();
             return;
@@ -413,7 +413,7 @@ const BOOTSTRAP_RETRY_STOP_POLL_MS: u64 = 50;
 /// Outcome of the stop-aware SCM-bootstrap validation.
 #[cfg(windows)]
 enum BootstrapValidationOutcome {
-    Validated(eliot_watchdog::ValidatedWatchdogScmLaunch),
+    Validated(Box<eliot_watchdog::ValidatedWatchdogScmLaunch>),
     StopRequested,
     Failed(eliot_watchdog::WatchdogScmLaunchError),
 }
@@ -428,7 +428,7 @@ enum BootstrapValidationOutcome {
 /// registration nonce never enters the compared strings.
 #[cfg(windows)]
 fn validate_bootstrap_with_transient_retry(
-    handle: &ServiceStatusHandle,
+    handle: ServiceStatusHandle,
     stop_signal: &AtomicBool,
 ) -> BootstrapValidationOutcome {
     let mut attempt = 0_u32;
@@ -437,7 +437,7 @@ fn validate_bootstrap_with_transient_retry(
             return BootstrapValidationOutcome::StopRequested;
         }
         match validate_registered_process_bootstrap() {
-            Ok(launch) => return BootstrapValidationOutcome::Validated(launch),
+            Ok(launch) => return BootstrapValidationOutcome::Validated(Box::new(launch)),
             Err(error) => {
                 let transient = eliot_watchdog::FileWatchdogAdmission::is_transient_registry_lock(
                     &error.to_string(),
@@ -453,7 +453,7 @@ fn validate_bootstrap_with_transient_retry(
                     "transient installation-registry lock during SCM bootstrap, retrying"
                 );
                 publish_service_status(
-                    handle,
+                    &handle,
                     SERVICE_START_PENDING,
                     0,
                     0,
