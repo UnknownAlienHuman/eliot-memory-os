@@ -2584,6 +2584,8 @@ pub fn restore_controller(
     Ok(snapshot.clone())
 }
 
+pub mod adapter_launch;
+pub mod coverage_surface;
 /// Durable staged work and the no-lost-child state machine (issue #698).
 ///
 /// Caller: an [`durable_work::AdmittedWorkDefinition`] (admitted definition

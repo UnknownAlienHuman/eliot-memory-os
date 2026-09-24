@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -16,6 +17,8 @@ SCENARIO_PATH = Path("integrations/agent-runtimes/swarm-product-pulse.scenario.j
 CONTRACT_VERSION = "eliot.swarm-product-pulse-contract.v1"
 SCENARIO_VERSION = "eliot.swarm-product-pulse-scenario.v1"
 RECEIPT_VERSION = "eliot.swarm-product-pulse-receipt.v1"
+VERIFIER_VERSION = "eliot.swarm-product-pulse-verifier.v1"
+_SOURCE_UNRESOLVED = "unresolved:fixture-only"
 
 
 class SwarmPulseError(RuntimeError):
@@ -114,6 +117,46 @@ def validate_contract(contract: dict[str, Any]) -> None:
         value = contract.get(field)
         if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
             raise SwarmPulseError(f"swarm contract list is invalid: {field}")
+    if contract.get("cancellation_fixture_closure_fields") != [
+        "expected_process_tree_closed",
+        "expected_descendants_closed",
+    ]:
+        raise SwarmPulseError("swarm contract fixture closure drifted")
+    if contract.get("cancellation_fixture_outcome") != "expected_cancelled_confirmed":
+        raise SwarmPulseError("swarm contract fixture outcome drifted")
+
+
+def _git_source_identity(root: Path) -> tuple[str, str]:
+    """Best-effort git provenance for the fixture checkout.
+
+    Reads ``HEAD``/``HEAD^{tree}`` only; never executes a provider, process, or
+    runtime probe. Falls back to an explicit unresolved marker so the receipt
+    never fabricates source identity.
+    """
+    commit = _SOURCE_UNRESOLVED
+    tree = _SOURCE_UNRESOLVED
+    try:
+        for arguments, slot in ((["rev-parse", "HEAD"], 0), (["rev-parse", "HEAD^{tree}"], 1)):
+            completed = subprocess.run(
+                ["git", "-C", str(root), *arguments],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            value = completed.stdout.strip()
+            if (
+                completed.returncode == 0
+                and len(value) == 40
+                and all(character in "0123456789abcdefABCDEF" for character in value)
+            ):
+                if slot == 0:
+                    commit = value
+                else:
+                    tree = value
+    except Exception:
+        pass
+    return commit, tree
 
 
 def _validate_route_profile(profile: dict[str, Any], host: str) -> dict[str, Any]:
@@ -282,10 +325,13 @@ def run_swarm_pulse(root: Path, contract: dict[str, Any], scenario: dict[str, An
         if reference in seen_cancellations or expected_cancellations.get(reference) != attempt_id:
             raise SwarmPulseError("cancellation identity mismatch")
         seen_cancellations.add(reference)
-        if receipt.get("outcome") != "cancelled_confirmed":
-            raise SwarmPulseError("cancellation outcome is not reconciled")
-        if receipt.get("process_tree_closed") is not True or receipt.get("descendants_closed") is not True:
-            raise SwarmPulseError("cancellation lacks process/descendant closure")
+        if receipt.get("outcome") != contract["cancellation_fixture_outcome"]:
+            raise SwarmPulseError("cancellation outcome is not the expected fixture outcome")
+        for field in contract["cancellation_fixture_closure_fields"]:
+            if receipt.get(field) is not True:
+                raise SwarmPulseError("cancellation lacks expected fixture closure")
+        if "process_tree_closed" in receipt or "descendants_closed" in receipt:
+            raise SwarmPulseError("cancellation presents observed process receipt fields")
         if receipt.get("unknown_live_descendants") is not False:
             raise SwarmPulseError("cancellation retains unknown live descendants")
         _nonblank(receipt.get("terminal_readback"), "terminal_readback")
@@ -367,10 +413,19 @@ def run_swarm_pulse(root: Path, contract: dict[str, Any], scenario: dict[str, An
         "result_sha256": dict(sorted(result_hashes.items())),
         "cancellation_sha256": dict(sorted(cancellation_hashes.items())),
     }
+    # Fixture closure stays inside the hashed scenario denominator only; the
+    # emitted receipt never repeats expected_* closure as observed process fact.
+    source_commit, source_tree = _git_source_identity(root)
     return {
         "schema_version": RECEIPT_VERSION,
         "pulse_id": f"sha256:{sha256_json(basis)}",
         **basis,
+        "source_commit": source_commit,
+        "source_tree": source_tree,
+        "verifier_version": VERIFIER_VERSION,
+        "route_profile_digests": [
+            {"host": host, "sha256": route_hashes[host]} for host in sorted(route_hashes)
+        ],
         "hosts": sorted(hosts),
         "work_items": len(work_items),
         "agent_attempts": len(attempt_ids),
@@ -378,6 +433,9 @@ def run_swarm_pulse(root: Path, contract: dict[str, Any], scenario: dict[str, An
         "cancellations": len(cancellations),
         "mailbox_messages": len(mailbox),
         "provider_executions": 0,
+        "provider_execution_status": "NOT_EXECUTED",
+        "process_observation_status": "NOT_EXECUTED",
+        "runtime_execution_status": "NOT_EXECUTED",
         "selected_model_ids": 0,
         "native_subagents": False,
         "direct_group_chat": False,

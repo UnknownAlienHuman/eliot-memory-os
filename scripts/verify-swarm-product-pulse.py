@@ -19,10 +19,12 @@ from typing import Callable
 from swarm_product_pulse import (
     CONTRACT_PATH,
     SCENARIO_PATH,
+    VERIFIER_VERSION,
     SwarmPulseError,
     canonical_json_bytes,
     load_json,
     run_swarm_pulse,
+    sha256_json,
 )
 
 
@@ -83,9 +85,17 @@ def self_test(root: Path) -> None:
     _expect_failure("worker result authority", lambda: _execute(root, contract, result_authority))
 
     unknown_descendant = copy.deepcopy(scenario)
-    unknown_descendant["cancellation_receipts"][0]["descendants_closed"] = False
+    unknown_descendant["cancellation_receipts"][0]["expected_descendants_closed"] = False
     unknown_descendant["cancellation_receipts"][0]["unknown_live_descendants"] = True
     _expect_failure("unknown live descendant", lambda: _execute(root, contract, unknown_descendant))
+
+    observed_closure = copy.deepcopy(scenario)
+    observed_closure["cancellation_receipts"][0]["process_tree_closed"] = True
+    _expect_failure("observed process closure smuggling", lambda: _execute(root, contract, observed_closure))
+
+    observed_outcome = copy.deepcopy(scenario)
+    observed_outcome["cancellation_receipts"][0]["outcome"] = "cancelled_confirmed"
+    _expect_failure("observed cancellation outcome", lambda: _execute(root, contract, observed_outcome))
 
     no_dissent = copy.deepcopy(scenario)
     no_dissent["concilium"]["preserved_dissent"] = []
@@ -96,6 +106,20 @@ def self_test(root: Path) -> None:
     worker_decision["decision"]["disposition"] = "promote"
     worker_decision["decision"]["eligible_for_route_promotion"] = True
     _expect_failure("worker vote/promotion", lambda: _execute(root, contract, worker_decision))
+
+
+def _assert_no_observed_closure(value: object) -> None:
+    """Fail if the emitted receipt presents fixture closure as observed process receipt."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in ("process_tree_closed", "descendants_closed"):
+                raise AssertionError(f"receipt presents observed closure field: {key}")
+            _assert_no_observed_closure(child)
+    elif isinstance(value, list):
+        for child in value:
+            _assert_no_observed_closure(child)
+    elif value == "cancelled_confirmed":
+        raise AssertionError("receipt presents observed cancellation outcome")
 
 
 def verify_current(root: Path) -> dict:
@@ -121,6 +145,34 @@ def verify_current(root: Path) -> dict:
     for key, value in expected.items():
         if receipt.get(key) != value:
             raise AssertionError(f"receipt field drifted: {key}")
+    for key in (
+        "source_commit",
+        "source_tree",
+        "contract_sha256",
+        "scenario_sha256",
+        "verifier_version",
+        "route_profile_digests",
+        "provider_execution_status",
+        "process_observation_status",
+        "runtime_execution_status",
+    ):
+        if key not in receipt:
+            raise AssertionError(f"receipt provenance drifted: {key}")
+    if receipt.get("verifier_version") != VERIFIER_VERSION:
+        raise AssertionError("receipt verifier version drifted")
+    if receipt.get("contract_sha256") != sha256_json(contract):
+        raise AssertionError("receipt contract digest drifted")
+    if receipt.get("scenario_sha256") != sha256_json(scenario):
+        raise AssertionError("receipt scenario digest drifted")
+    digests = receipt.get("route_profile_digests")
+    if not isinstance(digests, list) or [
+        (entry.get("host"), entry.get("sha256")) for entry in digests if isinstance(entry, dict)
+    ] != sorted((host, receipt["route_profile_sha256"][host]) for host in receipt["hosts"]):
+        raise AssertionError("receipt route profile digests drifted")
+    for key in ("provider_execution_status", "process_observation_status", "runtime_execution_status"):
+        if receipt.get(key) != "NOT_EXECUTED":
+            raise AssertionError(f"receipt execution status drifted: {key}")
+    _assert_no_observed_closure(receipt)
     return receipt
 
 
@@ -176,7 +228,7 @@ def main() -> int:
 
     if arguments.self_test:
         self_test(root)
-        print("SWARM_PRODUCT_PULSE_SELF_TEST: PASS cases=9")
+        print("SWARM_PRODUCT_PULSE_SELF_TEST: PASS cases=11")
         return 0
 
     receipt = verify_current(root)
