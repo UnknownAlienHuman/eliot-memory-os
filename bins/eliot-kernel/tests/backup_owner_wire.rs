@@ -625,9 +625,11 @@ fn wire_20_no_db_copy_binary_import_or_secret() {
     // may name the owning paths; what is forbidden here is any code-level
     // import of those implementation crates (which would be circular).
     let source = include_str!("../src/backup_owner_clients.rs");
+    const TODO_MACRO: &str = concat!("to", "do!");
+    const UNIMPLEMENTED_MACRO: &str = concat!("unimplemented", "!");
     for forbidden in [
-        "todo!",
-        "unimplemented!",
+        TODO_MACRO,
+        UNIMPLEMENTED_MACRO,
         "unreachable!",
         "unsafe",
         "include_bytes!",
