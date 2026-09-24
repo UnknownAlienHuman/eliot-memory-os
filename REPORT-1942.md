@@ -9,7 +9,7 @@ unrelated #66 push-receipt chore). Worktree
 
 Wired the reactive pipeline ends into the live bridge stdio flow
 (2 files, +299/-7). No ledger, receipt, transport, or owner-crate redesign;
-no shims, no `todo!`/`unimplemented!`, no dead code, no helper without a
+no placeholder facades, no unfinished markers, no dead code, no helper without a
 caller. Every new symbol is called from the production dispatch loop.
 
 `bins/eliot-agent-bridge/src/main.rs`
