@@ -21,6 +21,7 @@ mod issuance;
 mod readiness;
 mod resolver;
 mod scanner;
+mod transition;
 
 pub use caller::{
     DescriptorPolicy, ObservedScopeResources, ReceiptAdmission, TriggerAdmission, WithholdReason,
@@ -57,6 +58,12 @@ pub use scanner::{
     ProvisionalScopeProfile, RegisteredBuildProfile, RootServiceEvidence,
     SCAN_PRIVACY_BOUNDARY_REQUIRED, ScanDisclosureReceipt, ScannerResolverInputs,
     authorize_operation, candidate_source_roles, derive_lease_ref, issue_discovery_lease,
+};
+pub use transition::{
+    CandidateRecordStanding, ScopeTransition, ScopeTransitionKind, ScopeTransitionReceipt,
+    ScopeTransitionStep, StagedCandidateRecord, TRANSITION_STEP_COUNT, TransitionFailure,
+    TransitionObservation, TransitionStepEvidence, TransitionStepOutcome, attach_post_commit_guard,
+    execute_transition, observe_transition, propose_transition, resume_transition,
 };
 
 /// Returns whether a retained binding describes a resource descriptor.
