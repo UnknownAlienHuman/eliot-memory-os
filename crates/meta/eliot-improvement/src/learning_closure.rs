@@ -1568,3 +1568,221 @@ fn closure_digest(
     field(&mut hasher, &policy.operation_ref);
     hasher.finalize().to_hex().to_string()
 }
+
+/// Explicit disposition closing a consequential campaign episode.
+///
+/// Records, but never performs, a promotion: `SCOPED_UPDATE_PROMOTED` is
+/// valid only with the separate authorized owner receipt it references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ClosureDisposition {
+    LocalLearningRetained,
+    ReusableCandidateOpened,
+    ScopedUpdatePromoted,
+    NoReusableDelta,
+    Inconclusive,
+    DeferredOutcome,
+    RejectedTransfer,
+    RolledBack,
+}
+
+impl ClosureDisposition {
+    /// Canonical issue name for this disposition.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LocalLearningRetained => "LOCAL_LEARNING_RETAINED",
+            Self::ReusableCandidateOpened => "REUSABLE_CANDIDATE_OPENED",
+            Self::ScopedUpdatePromoted => "SCOPED_UPDATE_PROMOTED",
+            Self::NoReusableDelta => "NO_REUSABLE_DELTA",
+            Self::Inconclusive => "INCONCLUSIVE",
+            Self::DeferredOutcome => "DEFERRED_OUTCOME",
+            Self::RejectedTransfer => "REJECTED_TRANSFER",
+            Self::RolledBack => "ROLLED_BACK",
+        }
+    }
+
+    /// Parse a canonical name or legacy alias into a disposition.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "LOCAL_LEARNING_RETAINED" | "task-local-retain" => Some(Self::LocalLearningRetained),
+            "REUSABLE_CANDIDATE_OPENED" => Some(Self::ReusableCandidateOpened),
+            "SCOPED_UPDATE_PROMOTED" => Some(Self::ScopedUpdatePromoted),
+            "NO_REUSABLE_DELTA" => Some(Self::NoReusableDelta),
+            "INCONCLUSIVE" | "inconclusive" | "continue-collect" => Some(Self::Inconclusive),
+            "DEFERRED_OUTCOME" | "repeat-review" => Some(Self::DeferredOutcome),
+            "REJECTED_TRANSFER" | "retire-review" => Some(Self::RejectedTransfer),
+            "ROLLED_BACK" => Some(Self::RolledBack),
+            _ => None,
+        }
+    }
+}
+
+/// Lifecycle event that may make closure due. Pure classifier input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ClosureLifecycleEvent {
+    Terminalization,
+    MajorCheckpoint,
+    DelayedOutcomeWindow,
+    ReworkWindow,
+    MaintenanceWindow,
+}
+
+/// Pure trigger outcome: which closure work is due for one event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureDue {
+    pub terminal: bool,
+    pub checkpoint: bool,
+    pub delayed_window: bool,
+}
+
+/// Pure trigger classifier: terminalization always closes, major checkpoints
+/// close only when the policy admits them, and delayed/rework/maintenance
+/// windows open delayed-outcome work.
+pub fn trigger_closure_due(event: ClosureLifecycleEvent, policy: &ClosurePolicy) -> ClosureDue {
+    match event {
+        ClosureLifecycleEvent::Terminalization => ClosureDue {
+            terminal: true,
+            checkpoint: false,
+            delayed_window: false,
+        },
+        ClosureLifecycleEvent::MajorCheckpoint => ClosureDue {
+            terminal: false,
+            checkpoint: policy.allow_checkpoint,
+            delayed_window: false,
+        },
+        ClosureLifecycleEvent::DelayedOutcomeWindow
+        | ClosureLifecycleEvent::ReworkWindow
+        | ClosureLifecycleEvent::MaintenanceWindow => ClosureDue {
+            terminal: false,
+            checkpoint: false,
+            delayed_window: true,
+        },
+    }
+}
+
+/// Visible learning debt while closure completes asynchronously.
+///
+/// Raw evidence must already be durable; the next task cannot silently use
+/// an unclosed candidate until this debt resolves to a disposition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearningDebt {
+    pub campaign_id: String,
+    pub closure_owner: String,
+    pub review_condition: String,
+    pub missing_evidence: Vec<String>,
+    pub created_at_finish_id: String,
+}
+
+impl LearningDebt {
+    /// Require an identifiable campaign, owner, and review condition.
+    pub fn validate(&self) -> Result<(), LearningClosureError> {
+        non_empty(&self.campaign_id, "campaign_id")?;
+        non_empty(&self.closure_owner, "closure_owner")?;
+        non_empty(&self.review_condition, "review_condition")?;
+        Ok(())
+    }
+}
+
+/// Canonical evidence reference groups assembled through existing Meta,
+/// Memory OS and Governor paths. Every group is a list of refs; an empty
+/// group names missing evidence via [`evidence_refs_complete`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureEvidenceRefs {
+    pub starting_harness_stack: Vec<String>,
+    pub final_harness_stack: Vec<String>,
+    pub outcome_refs: Vec<String>,
+    pub economics_refs: Vec<String>,
+    pub validated_updates: Vec<String>,
+    pub rejected_updates: Vec<String>,
+    pub failure_mechanisms: Vec<String>,
+    pub preserved_success: Vec<String>,
+    pub regression_results: Vec<String>,
+    pub activation_findings: Vec<String>,
+    pub adherence_findings: Vec<String>,
+    pub confounders: Vec<String>,
+    pub inheritance_actions: Vec<String>,
+    pub future_scope: Vec<String>,
+    pub retention_refs: Vec<String>,
+    pub revalidation_refs: Vec<String>,
+    pub owner_receipts: Vec<String>,
+    pub expiry_ref: Vec<String>,
+}
+
+/// List every empty evidence group by field name.
+pub fn evidence_refs_complete(refs: &ClosureEvidenceRefs) -> Vec<String> {
+    let mut missing = Vec::new();
+    if refs.starting_harness_stack.is_empty() {
+        missing.push("starting_harness_stack".to_string());
+    }
+    if refs.final_harness_stack.is_empty() {
+        missing.push("final_harness_stack".to_string());
+    }
+    if refs.outcome_refs.is_empty() {
+        missing.push("outcome_refs".to_string());
+    }
+    if refs.economics_refs.is_empty() {
+        missing.push("economics_refs".to_string());
+    }
+    if refs.validated_updates.is_empty() {
+        missing.push("validated_updates".to_string());
+    }
+    if refs.rejected_updates.is_empty() {
+        missing.push("rejected_updates".to_string());
+    }
+    if refs.failure_mechanisms.is_empty() {
+        missing.push("failure_mechanisms".to_string());
+    }
+    if refs.preserved_success.is_empty() {
+        missing.push("preserved_success".to_string());
+    }
+    if refs.regression_results.is_empty() {
+        missing.push("regression_results".to_string());
+    }
+    if refs.activation_findings.is_empty() {
+        missing.push("activation_findings".to_string());
+    }
+    if refs.adherence_findings.is_empty() {
+        missing.push("adherence_findings".to_string());
+    }
+    if refs.confounders.is_empty() {
+        missing.push("confounders".to_string());
+    }
+    if refs.inheritance_actions.is_empty() {
+        missing.push("inheritance_actions".to_string());
+    }
+    if refs.future_scope.is_empty() {
+        missing.push("future_scope".to_string());
+    }
+    if refs.retention_refs.is_empty() {
+        missing.push("retention_refs".to_string());
+    }
+    if refs.revalidation_refs.is_empty() {
+        missing.push("revalidation_refs".to_string());
+    }
+    if refs.owner_receipts.is_empty() {
+        missing.push("owner_receipts".to_string());
+    }
+    if refs.expiry_ref.is_empty() {
+        missing.push("expiry_ref".to_string());
+    }
+    missing
+}
+
+/// Build an explicit [`LearningClosureDisposition`] from an allowed
+/// disposition enum value. Silence is never a disposition: the caller must
+/// name one of the eight canonical dispositions.
+pub fn allowed_disposition(
+    disposition: ClosureDisposition,
+    missing_evidence: Vec<String>,
+    missing_owner: Option<String>,
+    open_debt: Vec<String>,
+    retain_ref: Option<String>,
+) -> LearningClosureDisposition {
+    LearningClosureDisposition {
+        disposition: disposition.as_str().to_string(),
+        missing_evidence,
+        missing_owner,
+        open_debt,
+        retain_ref: retain_ref.unwrap_or_default(),
+    }
+}

@@ -399,6 +399,75 @@ pub enum PromotionInputError {
     WideningRejected { detail: String },
     #[error("non-finite metric is not admissible")]
     NonFiniteMetric,
+    #[error("promotion receipt required: {detail}")]
+    PromotionReceiptRequired { detail: String },
+}
+
+/// Separately authorized owner receipt for a performed scoped promotion.
+///
+/// Records-only cell never issues this; the external owner does. A
+/// `SCOPED_UPDATE_PROMOTED` disposition is valid only with `Some` receipt
+/// whose [`ScopedPromotionReceipt::validate`] passes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedPromotionReceipt {
+    pub closure_id: String,
+    pub authorizing_owner: String,
+    pub owner_signature_ref: String,
+}
+
+impl ScopedPromotionReceipt {
+    /// Requires all three fields non-empty (after trimming).
+    pub fn validate(&self) -> Result<(), PromotionInputError> {
+        if self.closure_id.trim().is_empty() {
+            return Err(PromotionInputError::PromotionReceiptRequired {
+                detail: "closure_id is empty".to_string(),
+            });
+        }
+        if self.authorizing_owner.trim().is_empty() {
+            return Err(PromotionInputError::PromotionReceiptRequired {
+                detail: "authorizing_owner is empty".to_string(),
+            });
+        }
+        if self.owner_signature_ref.trim().is_empty() {
+            return Err(PromotionInputError::PromotionReceiptRequired {
+                detail: "owner_signature_ref is empty".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Gate for dispositions that claim a performed promotion.
+///
+/// Returns `Ok(())` for any `disposition != "SCOPED_UPDATE_PROMOTED"`.
+/// For `"SCOPED_UPDATE_PROMOTED"` requires `Some(receipt)` with passing
+/// [`ScopedPromotionReceipt::validate`], else `Err` with
+/// [`PromotionInputError::PromotionReceiptRequired`].
+///
+/// Intended call site (no-signature-change wiring note): call at the top of
+/// `check_closure_gate` / `prepare_promotion_input` once those functions gain
+/// an `Option<&ScopedPromotionReceipt>` parameter carrying the separate
+/// authorized owner receipt referenced by the disposition. The `disposition`
+/// argument maps to [`PromotionDisposition::disposition`]; the `receipt`
+/// argument maps to the external owner receipt (not
+/// [`PromotionInputPolicy::claimed_promotion_receipt`], which remains rejected
+/// by `validate_policy`, and not [`PromotionHandoff::promotion_receipt`],
+/// which this cell always leaves as `None`). Signatures were left unchanged
+/// here so existing behavior is preserved until that parameter is added.
+pub fn require_promotion_receipt(
+    disposition: &str,
+    receipt: Option<&ScopedPromotionReceipt>,
+) -> Result<(), PromotionInputError> {
+    if disposition != "SCOPED_UPDATE_PROMOTED" {
+        return Ok(());
+    }
+    match receipt {
+        Some(r) => r.validate(),
+        None => Err(PromotionInputError::PromotionReceiptRequired {
+            detail: "SCOPED_UPDATE_PROMOTED requires a separate authorized owner receipt"
+                .to_string(),
+        }),
+    }
 }
 
 /// Prepare one advisory promotion input from exact evidence.

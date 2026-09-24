@@ -35,9 +35,10 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::learning_closure::{
-    AdmissionState, AttemptOutcomesAndDeltas, CampaignAndTarget, ClosureAssembly, ClosurePolicy,
-    LearningClosureError, OutcomeHarmAndEconomicsEvidence, OverlayAndActivationAssessments,
-    PriorClosureHistory, assemble_campaign_learning_closure,
+    AdmissionState, AttemptOutcomesAndDeltas, CampaignAndTarget, ClosureAssembly,
+    ClosureDisposition, ClosureDue, ClosureLifecycleEvent, ClosurePolicy, LearningClosureError,
+    OutcomeHarmAndEconomicsEvidence, OverlayAndActivationAssessments, PriorClosureHistory,
+    assemble_campaign_learning_closure, trigger_closure_due,
 };
 use crate::{CandidateState, ImprovementCandidate, ImprovementSurface};
 
@@ -940,6 +941,16 @@ pub fn governed_assemble_campaign_learning_closure(
     closure_policy: ClosurePolicy,
     gate: GovernedRetrieval<'_>,
 ) -> Result<ClosureAssembly, GovernedClosureError> {
+    if let Some(reusable) = gate.reusable {
+        closure_candidate_usable_by_task(
+            reusable.origin_campaign_id.as_str(),
+            reusable.closure_ref.as_deref(),
+            gate.requesting_task_id,
+            gate.requesting_campaign_id,
+            gate.cross_task_admission.map(|a| a.admission_id.as_str()),
+        )
+        .map_err(GovernedClosureError::Bounds)?;
+    }
     if gate.requesting_campaign_id != exact_campaign_and_target.campaign_id {
         return Err(GovernedClosureError::Bounds(
             BoundsError::ClosureCampaignMismatch,
@@ -971,4 +982,173 @@ pub fn governed_assemble_campaign_learning_closure(
         prior_closure_history,
         closure_policy,
     )?)
+}
+
+/// Lifecycle-event entry to governed closure assembly (#1866 W1, I12.24).
+///
+/// Classifies `event` through [`trigger_closure_due`] against the closure
+/// policy, then delegates to
+/// [`governed_assemble_campaign_learning_closure`]. Terminalization and
+/// delayed-outcome/rework/maintenance windows always open closure work; a
+/// major checkpoint opens it only when the policy admits checkpoints, else
+/// [`BoundsError::InvalidPolicy`] is returned and nothing is assembled.
+/// Returns the assembly together with the trigger assessment so the caller
+/// (finish job / checkpoint owner) can record debt when closure stays open.
+#[allow(clippy::too_many_arguments)]
+pub fn governed_assemble_at_lifecycle_event(
+    event: ClosureLifecycleEvent,
+    exact_campaign_and_target: CampaignAndTarget,
+    exact_attempt_outcomes_and_deltas: AttemptOutcomesAndDeltas,
+    exact_overlay_and_activation_assessments: OverlayAndActivationAssessments,
+    exact_outcome_harm_and_economics_evidence: OutcomeHarmAndEconomicsEvidence,
+    prior_closure_history: PriorClosureHistory,
+    closure_policy: ClosurePolicy,
+    gate: GovernedRetrieval<'_>,
+) -> Result<(ClosureAssembly, ClosureDue), GovernedClosureError> {
+    let due = trigger_closure_due(event, &closure_policy);
+    if event == ClosureLifecycleEvent::MajorCheckpoint && !due.checkpoint {
+        return Err(GovernedClosureError::Bounds(BoundsError::InvalidPolicy(
+            "checkpoint closure not admitted by closure policy",
+        )));
+    }
+    let assembly = governed_assemble_campaign_learning_closure(
+        exact_campaign_and_target,
+        exact_attempt_outcomes_and_deltas,
+        exact_overlay_and_activation_assessments,
+        exact_outcome_harm_and_economics_evidence,
+        prior_closure_history,
+        closure_policy,
+        gate,
+    )?;
+    Ok((assembly, due))
+}
+
+// ---------------------------------------------------------------------------
+// Closure-assembly admission (#1866 W5/A4, I12.24 cross-task refusal).
+//
+// Draft deltas, unclosed reusable candidates, expired overlays, and ownerless
+// records must never affect another task: an unclosed reusable from a
+// finished campaign cannot be retrieved/applied by a different task. Before
+// closure, only the exact non-expired LOCAL_ADMITTED overlay of the active
+// campaign may influence a compatible attempt. Cross-task carryover requires
+// a new governed admission.
+// ---------------------------------------------------------------------------
+
+/// Admission request to assemble (close over) a campaign's learning closure
+/// on behalf of a task.
+///
+/// `campaign_id` identifies the closure campaign whose scope owns the
+/// assembly; `requesting_task_id` is the task asking for the assembly.
+/// `closure_ref` is the closure disposition that closed the candidate
+/// (None/blank = unclosed, ineligible). `cross_task_admission_ref` names the
+/// distinct, newly governed admission permitting cross-task carryover, when
+/// the requesting task operates outside the closure campaign's scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureAssemblyRequest {
+    pub campaign_id: String,
+    pub requesting_task_id: String,
+    pub closure_ref: Option<String>,
+    pub cross_task_admission_ref: Option<String>,
+}
+
+impl ClosureAssemblyRequest {
+    pub fn validate(&self) -> Result<(), BoundsError> {
+        if self.campaign_id.trim().is_empty() {
+            return Err(BoundsError::MissingField("campaign_id"));
+        }
+        if self.requesting_task_id.trim().is_empty() {
+            return Err(BoundsError::MissingField("requesting_task_id"));
+        }
+        Ok(())
+    }
+}
+
+/// Governed admission gate for closure assembly.
+///
+/// Reuses [`BoundsError`]: missing closure returns
+/// [`BoundsError::UnclosedReusable`]; a requesting task outside the closure
+/// campaign's scope without a distinct governed admission returns
+/// [`BoundsError::CrossTaskAdmissionMissing`].
+///
+/// Scope note: the request carries only the closure `campaign_id` and the
+/// requesting task id, so the campaign's task scope is identified by the
+/// `campaign_id` string itself. A requesting task whose id equals the
+/// campaign scope string is treated as local; any other task must present a
+/// non-blank `cross_task_admission_ref`. This is fail-closed: ordinary task
+/// ids never equal a campaign id, so cross-task assembly always requires
+/// the new governed admission.
+pub fn governed_closure_assembly_admission(
+    request: &ClosureAssemblyRequest,
+) -> Result<(), BoundsError> {
+    request.validate()?;
+    let closure_ref = request
+        .closure_ref
+        .as_ref()
+        .map(|r| r.trim())
+        .filter(|r| !r.is_empty());
+    let Some(closure_ref) = closure_ref else {
+        return Err(BoundsError::UnclosedReusable);
+    };
+    // Exactly one allowed disposition (I12.24): the closing ref must name one
+    // of the eight canonical dispositions (legacy aliases accepted).
+    if ClosureDisposition::parse(closure_ref).is_none() {
+        return Err(BoundsError::InvalidPolicy(
+            "closure_ref is not an allowed closure disposition",
+        ));
+    }
+    if request.requesting_task_id != request.campaign_id
+        && request
+            .cross_task_admission_ref
+            .as_ref()
+            .is_none_or(|r| r.trim().is_empty())
+    {
+        return Err(BoundsError::CrossTaskAdmissionMissing);
+    }
+    Ok(())
+}
+
+/// Pure per-candidate usability check for closure assembly by a task.
+///
+/// Returns `Ok(())` only when `candidate_closure_ref` is `Some(non-blank)`
+/// AND (`requesting_campaign_id == candidate_campaign_id` OR
+/// `cross_task_admission_ref` is `Some(non-blank)`). Otherwise returns the
+/// existing [`BoundsError`] variant for the failure: [`BoundsError::UnclosedReusable`]
+/// for a missing/blank closure ref, [`BoundsError::MissingField`] for blank
+/// identity inputs, or [`BoundsError::CrossTaskAdmissionMissing`] for a
+/// foreign-campaign candidate without a distinct governed admission.
+///
+/// Intended call site: the top of [`governed_assemble_campaign_learning_closure`],
+/// mapping its existing `gate` parameters (`gate.reusable.map(|r|
+/// r.origin_campaign_id)`, `gate.reusable.map(|r| r.closure_ref)`,
+/// `gate.requesting_task_id`, `gate.requesting_campaign_id`,
+/// `gate.cross_task_admission.map(|a| a.admission_id)`) into this helper and
+/// converting `BoundsError` into `GovernedClosureError::Bounds`. The wired
+/// call below follows exactly that mapping when a reusable is presented; a
+/// `None` reusable carries no closure candidate, so the helper is skipped.
+pub fn closure_candidate_usable_by_task(
+    candidate_campaign_id: &str,
+    candidate_closure_ref: Option<&str>,
+    requesting_task_id: &str,
+    requesting_campaign_id: &str,
+    cross_task_admission_ref: Option<&str>,
+) -> Result<(), BoundsError> {
+    if candidate_closure_ref.is_none_or(|r| r.trim().is_empty()) {
+        return Err(BoundsError::UnclosedReusable);
+    }
+    if candidate_campaign_id.trim().is_empty() {
+        return Err(BoundsError::MissingField("candidate_campaign_id"));
+    }
+    if requesting_task_id.trim().is_empty() {
+        return Err(BoundsError::MissingField("requesting_task_id"));
+    }
+    if requesting_campaign_id.trim().is_empty() {
+        return Err(BoundsError::MissingField("requesting_campaign_id"));
+    }
+    if requesting_campaign_id == candidate_campaign_id {
+        return Ok(());
+    }
+    if cross_task_admission_ref.is_none_or(|r| r.trim().is_empty()) {
+        return Err(BoundsError::CrossTaskAdmissionMissing);
+    }
+    Ok(())
 }
