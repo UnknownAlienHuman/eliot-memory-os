@@ -8,8 +8,9 @@ use eliot_agent_bridge::{
     kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
-    AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
-    ReconnectRequest, SessionId,
+    ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
+    ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
+    FencingToken, Generation, HostEventEnvelope, ReconnectRequest, SessionId,
 };
 use eliot_contracts::EpochId;
 #[cfg(test)]
@@ -1462,11 +1463,50 @@ fn bridge_error(error: &BridgeError) -> Response {
             code: "KERNEL_ACTIVATION_PORT_REJECTED",
             detail: "Kernel-owned HostActivationPort rejected or fenced the request".to_owned(),
         }
+    } else if let BridgeError::ActivationDenied(report) = error {
+        Response::Error {
+            code: activation_denial_host_code(report.disposition()),
+            detail: report.agent_detail(),
+        }
+    } else if let BridgeError::ActivationDeadlineExceeded {
+        operation,
+        deadline_unix_ms,
+    } = error
+    {
+        Response::Error {
+            code: "ACTIVATION_DEADLINE_EXCEEDED",
+            detail: format!(
+                "activation observed no terminal result before deadline {deadline_unix_ms} for operation {operation}; never a typed denial"
+            ),
+        }
+    } else if let BridgeError::ActivationUnknownOutcome { operation } = error {
+        Response::Error {
+            code: "ACTIVATION_UNKNOWN_OUTCOME",
+            detail: format!(
+                "activation outcome unknown for operation {operation}: transport ended with no terminal result before the deadline; never a typed denial, never authority"
+            ),
+        }
     } else {
         Response::Error {
             code: "BRIDGE_REQUEST_REJECTED",
             detail: error.to_string(),
         }
+    }
+}
+
+/// Maps an I7.20 activation denial disposition to its stable host-facing
+/// error code. The producer (`agent_disposition_for_denial`) is exhaustive
+/// over the four catalogue dispositions, so the fallback is unreachable by
+/// construction and exists only to keep the host code total.
+fn activation_denial_host_code(disposition: &str) -> &'static str {
+    if disposition == ACTIVATION_DISPOSITION_INVALID_REQUEST {
+        "ACTIVATION_INVALID_REQUEST"
+    } else if disposition == ACTIVATION_DISPOSITION_STALE_OR_CONFLICT {
+        "ACTIVATION_STALE_OR_CONFLICT"
+    } else if disposition == ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY {
+        "ACTIVATION_UNAVAILABLE_OR_CAPACITY"
+    } else {
+        "ACTIVATION_FAILED"
     }
 }
 

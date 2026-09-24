@@ -1094,7 +1094,8 @@ async fn external_agent_bridge_os_process_receives_typed_semantic_resolution_den
     assert!(matches!(
         denial.disposition,
         AgentBridgeActivationDisposition::Denied {
-            reason_code: AgentBridgeActivationDenialCode::SemanticResolutionUnavailable
+            reason_code: AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+            detail: None,
         }
     ));
     assert!(
@@ -1123,7 +1124,7 @@ async fn external_agent_bridge_os_process_receives_typed_semantic_resolution_den
     assert_eq!(
         stdout,
         concat!(
-            r#"{"status":"error","code":"BRIDGE_REQUEST_REJECTED","detail":"activation denied by the trusted host provider: SEMANTIC_RESOLUTION_UNAVAILABLE"}"#,
+            r#"{"status":"error","code":"ACTIVATION_FAILED","detail":"activation denied: disposition=FAILED reason=UNKNOWN_OUTCOME directive=retry-requires-new-ticket operation=r13-denied-os-demand no-typed-result"}"#,
             "\n"
         )
     );

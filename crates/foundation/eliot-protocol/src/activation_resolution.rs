@@ -265,7 +265,7 @@ pub enum AgentActivationResolutionDisposition {
 }
 
 impl AgentActivationResolutionDisposition {
-    fn validate(&self) -> Result<(), ProtocolError> {
+    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Resolved { binding } => binding.validate(),
             Self::TaskSelectionRequired { selection } => selection.validate_task_selection(),
