@@ -56,6 +56,7 @@ pub use finish_attempt::{FinishAttemptError, GovernorFinishAttempt};
 mod controlboard_projection;
 mod learning_admission;
 mod learning_delta_integration;
+mod learning_record_commit;
 mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_closure_feed;
@@ -104,6 +105,10 @@ pub use learning_delta_integration::{
     AttemptCloseError, admission_claim_for_delta, close_attempt_with_activation_receipt,
     delta_delivery_allowed, derive_delta_at_boundary, emit_activation_receipt_at_attempt_close,
     issue_delta_admission, retry_lineage_for_delta, store_derived_delta, verify_delta_delivery,
+};
+pub use learning_record_commit::{
+    commit_learning_record, learning_effective_under_admission,
+    learning_record_mutation_request_for_delta,
 };
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
