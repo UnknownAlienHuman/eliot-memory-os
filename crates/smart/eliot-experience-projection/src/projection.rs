@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 /// Freeze identity this package builds against.
 ///
 /// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
-pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r5";
+pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7";
 
 /// Immutable read-aid view: opaque refs plus the owner coverage binding.
 ///

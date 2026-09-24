@@ -674,6 +674,7 @@ pub fn produce_feedback_from_journal(
 /// owner-issued fixtures until then) together with the exact revision
 /// marker read at, the owner coverage binding, and owner omissions. This
 /// type carries read evidence; it performs no I/O and owns no table.
+#[derive(Clone)]
 pub struct BankStoreSnapshot<'a> {
     /// Records the durable read returned, in read order.
     pub records: &'a [ExperienceBankRecord],
@@ -687,6 +688,7 @@ pub struct BankStoreSnapshot<'a> {
 
 /// Store-issued snapshot of feedback records for one read. Same
 /// read-evidence rule as [`BankStoreSnapshot`].
+#[derive(Clone)]
 pub struct FeedbackStoreSnapshot<'a> {
     /// Records the durable read returned, in read order.
     pub records: &'a [AgentFeedbackRecord],
@@ -1028,6 +1030,7 @@ pub struct PagedExperienceConsumerBundle {
     pub bank_next_cursor: Option<String>,
     /// Opaque owner cursor for the next feedback page (`None` ends it).
     pub feedback_next_cursor: Option<String>,
+    generation: ConsumerPagedReadGeneration,
 }
 
 /// Assemble and edge-consume one page of both experience envelopes.
@@ -1078,95 +1081,175 @@ pub fn assemble_experience_for_consumer_paged(
         feedback: feedback.projection,
         bank_next_cursor: bank.next_cursor,
         feedback_next_cursor: feedback.next_cursor,
+        generation: ConsumerPagedReadGeneration::initial(),
     })
+}
+
+/// Per-family state for one current paged enumeration.
+///
+/// `None` is never overloaded: `NeedsFirstPage` is the only state that
+/// selects the headless page, `Continuing` carries the exact owner cursor,
+/// and `Complete` is reached only after a validated page reports no next
+/// cursor. A restart returns the family to `NeedsFirstPage` and advances
+/// its generation, invalidating every page from the prior enumeration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsumerPagedFamilyState {
+    /// The next owner read must use the headless first-page selector.
+    NeedsFirstPage,
+    /// The next owner read must use this exact opaque owner cursor.
+    Continuing(String),
+    /// The current enumeration ended on a validated page.
+    Complete,
+}
+
+/// Generation token carried by a page bundle so a restart can invalidate
+/// one family's partial result without invalidating the other family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsumerPagedReadGeneration {
+    /// Bank enumeration generation.
+    pub bank: u64,
+    /// Feedback enumeration generation.
+    pub feedback: u64,
+}
+
+impl ConsumerPagedReadGeneration {
+    const fn initial() -> Self {
+        Self {
+            bank: 0,
+            feedback: 0,
+        }
+    }
 }
 
 /// Echo-next-cursor driver for the multi-page consumer read.
 ///
-/// Production loop driver over [`assemble_experience_for_consumer_paged`]:
-/// the caller performs each owner-store read with the cursors this driver
-/// exposes ([`ConsumerPagedReadDriver::bank_cursor`] /
-/// [`ConsumerPagedReadDriver::feedback_cursor`]), then hands the fresh
-/// caller-supplied snapshots plus the owner-issued next cursors from that
-/// read to [`ConsumerPagedReadDriver::assemble_next_page`], which runs the
-/// same per-family supply join plus consumer-edge re-resolution and stores
-/// the echoed cursors as the next iteration's selectors. The loop ends when
-/// [`ConsumerPagedReadDriver::is_complete`] reports `None` on both
-/// families; anything else is a partial read, never a complete one.
+/// Production loop driver over the owner page suppliers. The caller performs
+/// each owner-store read with the selectors exposed by this driver, then
+/// hands fresh snapshots and the owner-issued next cursors to
+/// [`ConsumerPagedReadDriver::assemble_next_page`]. Each family has an
+/// explicit first-page/continuation/completed state, so `None` cannot make a
+/// restart look complete. The loop ends only when both families have reached
+/// a validated end page in the same current enumeration generation.
 ///
 /// Boundary: this lane never performs the store read and never parses or
-/// mints cursors. Snapshots stay caller-supplied inputs on every iteration;
-/// the driver only echoes the opaque owner cursors and revalidates through
-/// [`assemble_experience_for_consumer_paged`]. A fence/heads mismatch is
-/// reported by the owner store failing the echoed cursor closed (a commit
-/// advanced a revision head or the fence moved): the caller restarts that
-/// family's enumeration from the headless first page with
-/// [`ConsumerPagedReadDriver::restart_bank_from_head`] /
-/// [`ConsumerPagedReadDriver::restart_feedback_from_head`] — never skip
-/// ahead, never replay rows into a duplicate, never treat a rejected
-/// cursor as truncation. Families paginate independently: restarting one
-/// never touches the other's cursor.
+/// mints cursors. A fence/heads mismatch is reported by the owner store
+/// failing the echoed cursor closed. The caller must then use the matching
+/// restart method; that method invalidates only that family's retained page
+/// and generation while leaving the other family untouched.
 pub struct ConsumerPagedReadDriver {
-    /// Opaque owner cursor to supply as the next bank read's selector
-    /// (`None` selects the headless first page, or — once pages have been
-    /// assembled — ends that family's enumeration).
-    bank_cursor: Option<String>,
-    /// Opaque owner cursor to supply as the next feedback read's selector.
-    feedback_cursor: Option<String>,
-    /// Pages successfully assembled; keeps the headless `None`/`None`
-    /// start state from reading as complete before the first page.
-    pages_assembled: u64,
+    bank_state: ConsumerPagedFamilyState,
+    feedback_state: ConsumerPagedFamilyState,
+    bank_projection: Option<BankProjection>,
+    feedback_projection: Option<FeedbackProjection>,
+    bank_generation: u64,
+    feedback_generation: u64,
 }
 
 impl ConsumerPagedReadDriver {
-    /// Start a headless read: both families enumerate from their first
-    /// page with `None` as the cursor selector.
+    /// Start a headless read: both families explicitly need their first page.
     pub fn headless() -> Self {
         Self {
-            bank_cursor: None,
-            feedback_cursor: None,
-            pages_assembled: 0,
+            bank_state: ConsumerPagedFamilyState::NeedsFirstPage,
+            feedback_state: ConsumerPagedFamilyState::NeedsFirstPage,
+            bank_projection: None,
+            feedback_projection: None,
+            bank_generation: 0,
+            feedback_generation: 0,
         }
     }
 
     /// Opaque bank cursor for the next owner-store read.
+    ///
+    /// `None` is returned for both `NeedsFirstPage` and `Complete`; callers
+    /// that need to distinguish those cases must inspect [`Self::bank_state`].
     pub fn bank_cursor(&self) -> Option<&str> {
-        self.bank_cursor.as_deref()
+        match &self.bank_state {
+            ConsumerPagedFamilyState::Continuing(cursor) => Some(cursor.as_str()),
+            ConsumerPagedFamilyState::NeedsFirstPage | ConsumerPagedFamilyState::Complete => None,
+        }
     }
 
-    /// Opaque feedback cursor for the next owner-store read. Same
-    /// headless/end rule as [`ConsumerPagedReadDriver::bank_cursor`].
+    /// Opaque feedback cursor for the next owner-store read. The selector
+    /// follows the same explicit-state rule as [`Self::bank_cursor`].
     pub fn feedback_cursor(&self) -> Option<&str> {
-        self.feedback_cursor.as_deref()
+        match &self.feedback_state {
+            ConsumerPagedFamilyState::Continuing(cursor) => Some(cursor.as_str()),
+            ConsumerPagedFamilyState::NeedsFirstPage | ConsumerPagedFamilyState::Complete => None,
+        }
     }
 
-    /// `true` once at least one page is assembled and both family cursors
-    /// are `None`: `None` on both ends the read.
+    /// Current explicit bank state.
+    pub fn bank_state(&self) -> &ConsumerPagedFamilyState {
+        &self.bank_state
+    }
+
+    /// Current explicit feedback state.
+    pub fn feedback_state(&self) -> &ConsumerPagedFamilyState {
+        &self.feedback_state
+    }
+
+    /// Generation token for the current per-family enumerations.
+    pub fn generation(&self) -> ConsumerPagedReadGeneration {
+        ConsumerPagedReadGeneration {
+            bank: self.bank_generation,
+            feedback: self.feedback_generation,
+        }
+    }
+
+    /// `true` only after both families have reached `Complete` in their
+    /// current generations. A headless driver is therefore never complete.
     pub fn is_complete(&self) -> bool {
-        self.pages_assembled > 0 && self.bank_cursor.is_none() && self.feedback_cursor.is_none()
+        matches!(self.bank_state, ConsumerPagedFamilyState::Complete)
+            && matches!(self.feedback_state, ConsumerPagedFamilyState::Complete)
+    }
+
+    /// Return whether a returned page still belongs to both current family
+    /// generations. Use the family-specific methods when preserving the
+    /// unrelated family after a restart.
+    pub fn bundle_is_current(&self, bundle: &PagedExperienceConsumerBundle) -> bool {
+        self.bank_page_is_current(bundle) && self.feedback_page_is_current(bundle)
+    }
+
+    /// Return whether the bank projection in `bundle` belongs to the
+    /// current bank enumeration.
+    pub fn bank_page_is_current(&self, bundle: &PagedExperienceConsumerBundle) -> bool {
+        bundle.generation.bank == self.bank_generation
+    }
+
+    /// Return whether the feedback projection in `bundle` belongs to the
+    /// current feedback enumeration.
+    pub fn feedback_page_is_current(&self, bundle: &PagedExperienceConsumerBundle) -> bool {
+        bundle.generation.feedback == self.feedback_generation
     }
 
     /// Restart bank enumeration from the headless first page after the
-    /// owner store rejects the echoed bank cursor (fence/heads mismatch).
-    /// Feedback enumeration is untouched: families paginate independently.
+    /// owner store rejects the echoed bank cursor. The bank projection and
+    /// all of its old-generation pages are invalidated; feedback state,
+    /// projection, and generation are untouched.
     pub fn restart_bank_from_head(&mut self) {
-        self.bank_cursor = None;
+        self.bank_state = ConsumerPagedFamilyState::NeedsFirstPage;
+        self.bank_projection = None;
+        self.bank_generation = self.bank_generation.wrapping_add(1);
     }
 
-    /// Restart feedback enumeration from the headless first page. Same
-    /// independence rule as
-    /// [`ConsumerPagedReadDriver::restart_bank_from_head`].
+    /// Restart feedback enumeration from the headless first page. The
+    /// independence and invalidation rules mirror [`Self::restart_bank_from_head`].
     pub fn restart_feedback_from_head(&mut self) {
-        self.feedback_cursor = None;
+        self.feedback_state = ConsumerPagedFamilyState::NeedsFirstPage;
+        self.feedback_projection = None;
+        self.feedback_generation = self.feedback_generation.wrapping_add(1);
     }
 
-    /// Assemble the next consumer page from fresh caller-supplied
-    /// snapshots and the owner-issued next cursors of this read, then
-    /// store those cursors as the next iteration's selectors.
+    /// Assemble the next consumer page from fresh caller-supplied snapshots
+    /// and owner-issued next cursors.
     ///
-    /// Fail-closed once the read has ended (`None` on both families after
-    /// pages were assembled): re-calling would replay the last page into
-    /// a duplicate, so it errors instead of assembling.
+    /// This compatibility entry cannot observe which selector the caller used
+    /// for the store read, so it refuses a continuation state rather than
+    /// accepting an unproven selector. New production paths use
+    /// [`Self::assemble_next_page_with_selectors`], which validates both the
+    /// selector and the owner-issued next cursor before state advances. A
+    /// completed family is retained while the other family continues from its
+    /// headless first page.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_next_page(
         &mut self,
@@ -1181,13 +1264,15 @@ impl ConsumerPagedReadDriver {
         bank_next_cursor: Option<String>,
         feedback_next_cursor: Option<String>,
     ) -> Result<PagedExperienceConsumerBundle, GovernorObservationError> {
-        if self.is_complete() {
+        if matches!(self.bank_state, ConsumerPagedFamilyState::Continuing(_))
+            || matches!(self.feedback_state, ConsumerPagedFamilyState::Continuing(_))
+        {
             return Err(GovernorObservationError::InvalidField {
-                field: "consumer_page.read",
-                reason: "paged consumer read already ended; None on both families ends the read, never replay the last page",
+                field: "consumer_page.selector",
+                reason: "compatibility page entry cannot prove a continuation selector; use the selector-aware entry",
             });
         }
-        let page = assemble_experience_for_consumer_paged(
+        self.assemble_next_page_inner(
             ledger,
             projection_id,
             scope,
@@ -1196,14 +1281,233 @@ impl ConsumerPagedReadDriver {
             feedback,
             schedule,
             holds,
+            false,
+            None,
+            None,
             bank_next_cursor,
             feedback_next_cursor,
-        )?;
-        self.bank_cursor.clone_from(&page.bank_next_cursor);
-        self.feedback_cursor.clone_from(&page.feedback_next_cursor);
-        self.pages_assembled = self.pages_assembled.saturating_add(1);
-        Ok(page)
+        )
     }
+
+    /// Assemble one page while proving the exact selector used for each
+    /// current family read.
+    ///
+    /// `bank_selector` and `feedback_selector` are the selectors echoed to
+    /// the owner store: `None` for `NeedsFirstPage`/`Complete`, or exactly the
+    /// current `Continuing` cursor. `bank_next_cursor` and
+    /// `feedback_next_cursor` are the explicit owner results of this read and
+    /// become the next family state. A completed family must remain selector-
+    /// free and next-cursor-free; the other family can continue independently.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_next_page_with_selectors(
+        &mut self,
+        ledger: &mut ExperienceRevisionLedger,
+        projection_id: ArtifactId,
+        scope: &ObservationScope,
+        fence: &StateFence,
+        bank: BankStoreSnapshot<'_>,
+        feedback: FeedbackStoreSnapshot<'_>,
+        schedule: &RetentionSchedule,
+        holds: &BTreeMap<String, RetentionHold>,
+        bank_selector: Option<&str>,
+        feedback_selector: Option<&str>,
+        bank_next_cursor: Option<String>,
+        feedback_next_cursor: Option<String>,
+    ) -> Result<PagedExperienceConsumerBundle, GovernorObservationError> {
+        self.assemble_next_page_inner(
+            ledger,
+            projection_id,
+            scope,
+            fence,
+            bank,
+            feedback,
+            schedule,
+            holds,
+            true,
+            bank_selector,
+            feedback_selector,
+            bank_next_cursor,
+            feedback_next_cursor,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn assemble_next_page_inner(
+        &mut self,
+        ledger: &mut ExperienceRevisionLedger,
+        projection_id: ArtifactId,
+        scope: &ObservationScope,
+        fence: &StateFence,
+        bank: BankStoreSnapshot<'_>,
+        feedback: FeedbackStoreSnapshot<'_>,
+        schedule: &RetentionSchedule,
+        holds: &BTreeMap<String, RetentionHold>,
+        validate_selectors: bool,
+        bank_selector: Option<&str>,
+        feedback_selector: Option<&str>,
+        bank_next_cursor: Option<String>,
+        feedback_next_cursor: Option<String>,
+    ) -> Result<PagedExperienceConsumerBundle, GovernorObservationError> {
+        if self.is_complete() {
+            return Err(GovernorObservationError::InvalidField {
+                field: "consumer_page.read",
+                reason: "paged consumer read already ended; both families must be restarted explicitly",
+            });
+        }
+        if validate_selectors {
+            validate_family_selector(
+                &self.bank_state,
+                bank_selector,
+                "consumer_page.bank_selector",
+            )?;
+            validate_family_selector(
+                &self.feedback_state,
+                feedback_selector,
+                "consumer_page.feedback_selector",
+            )?;
+        }
+        validate_completed_family_cursor(
+            &self.bank_state,
+            bank_next_cursor.as_deref(),
+            "consumer_page.bank_next_cursor",
+        )?;
+        validate_completed_family_cursor(
+            &self.feedback_state,
+            feedback_next_cursor.as_deref(),
+            "consumer_page.feedback_next_cursor",
+        )?;
+
+        let bank_page = if matches!(self.bank_state, ConsumerPagedFamilyState::Complete) {
+            None
+        } else {
+            Some(supply_bank_projection_from_store_paged(
+                ledger,
+                bank,
+                projection_id.clone(),
+                scope.clone(),
+                fence.clone(),
+                schedule,
+                holds,
+                bank_next_cursor,
+            )?)
+        };
+        let feedback_page = if matches!(self.feedback_state, ConsumerPagedFamilyState::Complete) {
+            None
+        } else {
+            Some(supply_feedback_projection_from_store_paged(
+                ledger,
+                feedback,
+                projection_id,
+                scope.clone(),
+                fence.clone(),
+                schedule,
+                holds,
+                feedback_next_cursor,
+            )?)
+        };
+
+        let bank_result = match bank_page {
+            Some(page) => {
+                let next = page.next_cursor;
+                let projection = page.projection;
+                revalidate_bank_projection_for_consumer(&projection, scope, fence)?;
+                Some((projection, next))
+            }
+            None => None,
+        };
+        let feedback_result = match feedback_page {
+            Some(page) => {
+                let next = page.next_cursor;
+                let projection = page.projection;
+                revalidate_feedback_projection_for_consumer(&projection, scope, fence)?;
+                Some((projection, next))
+            }
+            None => None,
+        };
+
+        let (bank_projection, bank_next) = match bank_result {
+            Some((projection, next)) => {
+                self.bank_state = state_after_page(next.clone());
+                self.bank_projection = Some(projection.clone());
+                (projection, next)
+            }
+            None => (
+                self.bank_projection
+                    .clone()
+                    .ok_or(GovernorObservationError::InvalidField {
+                        field: "consumer_page.bank_projection",
+                        reason: "completed bank enumeration has no retained page",
+                    })?,
+                None,
+            ),
+        };
+        let (feedback_projection, feedback_next) = match feedback_result {
+            Some((projection, next)) => {
+                self.feedback_state = state_after_page(next.clone());
+                self.feedback_projection = Some(projection.clone());
+                (projection, next)
+            }
+            None => (
+                self.feedback_projection
+                    .clone()
+                    .ok_or(GovernorObservationError::InvalidField {
+                        field: "consumer_page.feedback_projection",
+                        reason: "completed feedback enumeration has no retained page",
+                    })?,
+                None,
+            ),
+        };
+
+        Ok(PagedExperienceConsumerBundle {
+            bank: bank_projection,
+            feedback: feedback_projection,
+            bank_next_cursor: bank_next,
+            feedback_next_cursor: feedback_next,
+            generation: self.generation(),
+        })
+    }
+}
+
+fn state_after_page(next_cursor: Option<String>) -> ConsumerPagedFamilyState {
+    next_cursor.map_or(
+        ConsumerPagedFamilyState::Complete,
+        ConsumerPagedFamilyState::Continuing,
+    )
+}
+
+fn validate_family_selector(
+    state: &ConsumerPagedFamilyState,
+    supplied: Option<&str>,
+    field: &'static str,
+) -> Result<(), GovernorObservationError> {
+    let valid = match state {
+        ConsumerPagedFamilyState::NeedsFirstPage | ConsumerPagedFamilyState::Complete => {
+            supplied.is_none()
+        }
+        ConsumerPagedFamilyState::Continuing(expected) => supplied == Some(expected.as_str()),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(GovernorObservationError::InvalidField {
+            field,
+            reason: "supplied selector does not match the family's explicit first-page/continuation/completed state",
+        })
+    }
+}
+
+fn validate_completed_family_cursor(
+    state: &ConsumerPagedFamilyState,
+    next_cursor: Option<&str>,
+    field: &'static str,
+) -> Result<(), GovernorObservationError> {
+    if matches!(state, ConsumerPagedFamilyState::Complete) && next_cursor.is_some() {
+        return Err(GovernorObservationError::InvalidField {
+            field,
+            reason: "completed family cannot be reopened with another owner next cursor",
+        });
+    }
+    Ok(())
 }
 
 /// Produce the durable commit payload for one admitted bank record.
@@ -1474,14 +1778,20 @@ pub fn consume_feedback_range_payload(
 fn owner_cursor_from_range_payload(
     payload: &Value,
 ) -> Result<Option<String>, GovernorObservationError> {
-    match payload.get("next_cursor") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(cursor)) => {
+    let cursor = payload
+        .get("next_cursor")
+        .ok_or(GovernorObservationError::InvalidField {
+            field: "audit_range.next_cursor",
+            reason: "owner page envelope omitted the required continuation cursor member",
+        })?;
+    match cursor {
+        Value::Null => Ok(None),
+        Value::String(cursor) => {
             check_owner_cursor(Some(cursor.clone()), "audit_range.next_cursor")
         }
-        Some(_) => Err(GovernorObservationError::InvalidField {
+        _ => Err(GovernorObservationError::InvalidField {
             field: "audit_range.next_cursor",
-            reason: "owner continuation cursor must be text or null",
+            reason: "owner continuation cursor must be text or explicit null",
         }),
     }
 }

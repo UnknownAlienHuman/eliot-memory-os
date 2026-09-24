@@ -248,6 +248,7 @@ eliot-contracts = { path = "crates/foundation/eliot-contracts", version = "0.1.0
 eliot-evaluation-contracts = { path = "crates/foundation/eliot-evaluation-contracts", version = "0.1.0" }
 eliot-evidence = { path = "crates/foundation/eliot-evidence", version = "0.1.0" }
 eliot-observation-contracts = { path = "crates/foundation/eliot-observation-contracts", version = "0.1.0" }
+eliot-memory-projection-contracts = { path = "crates/foundation/eliot-memory-projection-contracts", version = "0.1.0" }
 eliot-protocol = { path = "crates/foundation/eliot-protocol", version = "0.1.0" }
 eliot-receipts = { path = "crates/foundation/eliot-receipts", version = "0.1.0" }
 eliot-rules = { path = "crates/foundation/eliot-rules", version = "0.1.0" }

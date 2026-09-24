@@ -78,11 +78,11 @@ pub const QUALITY_CONTRACT_VERSION: ContractVersion = ContractVersion::new(0, 1,
 /// Freeze identity this consumer package builds against.
 ///
 /// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
-pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6";
+pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7";
 
-/// Fail closed unless this package builds against the delivered r6 freeze.
+/// Fail closed unless this package builds against the delivered r7 freeze.
 fn check_consumed_freeze() -> Result<(), QualityError> {
-    if CONSUMED_FREEZE_ID != "cognitive-rev12-contract-schema-freeze-2026-09-22-r6" {
+    if CONSUMED_FREEZE_ID != "cognitive-rev12-contract-schema-freeze-2026-09-22-r7" {
         return Err(QualityError::VersionMismatch);
     }
     Ok(())

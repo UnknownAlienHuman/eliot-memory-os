@@ -54,7 +54,7 @@ disposition = "Smart consumer surface reused: ExperienceView assembly plus journ
 
 [[donor]]
 path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
-disposition = "wave authority: freeze r5 denominator doctrine; V1 envelope kept as declared, no r6 requested"
+disposition = "wave authority: freeze r7 denominator doctrine and exact current readback; V1 envelope kept as declared"
 
 [agent_task]
 objective = "Project one scoped bridge audit read into a frozen V1 journal envelope plus a revalidated Smart view."

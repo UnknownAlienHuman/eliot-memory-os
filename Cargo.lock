@@ -3433,6 +3433,8 @@ dependencies = [
  "eliot-kernel-service",
  "eliot-learning-contracts",
  "eliot-maintenance",
+ "eliot-memory-projection-contracts",
+ "eliot-memory-projection-provider",
  "eliot-memory-quality",
  "eliot-observability",
  "eliot-observation",

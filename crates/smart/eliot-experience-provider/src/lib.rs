@@ -59,7 +59,7 @@
 //!
 //! ## V1 freeze discipline
 //!
-//! This cell carries the freeze-r5 V1 envelope as declared. Only V1
+//! This cell carries the freeze-r7 V1 envelope as declared. Only V1
 //! [`ObservationRecordEnvelope`] members project; an additive V2 record
 //! twin (`record_v2`) is never collapsed into V1. The consumed
 //! [`AuditRangeV1Payload`] shape rejects unknown fields, so a store-side
@@ -85,30 +85,15 @@
 //! (`assess_self_quality` requires at least one family, not all three).
 //! Durable bank/feedback bridge execution remains the #19 join.
 //!
-//! ## Seam: dreamer-memory-revision consumer (sibling lane, not duplicated)
+//! ## Seam: dreamer-memory-revision consumer (current owner, not duplicated)
 //!
 //! The `propose` consumer (`Result<NegativeMemoryExtinctionCandidate,
-//! RevisionError>`) lives ONLY on sibling branch
-//! `work/223-dreamer-memory-revision-scope @
-//! cdd6305ff0ab838e9e2855d5f6f0ac8b940012a79fe0`:
-//! `crates/smart/eliot-dreamer-memory-revision/src/lib.rs` (`propose` at
-//! line 290 over `RevisionIntake` at line 253). Its `RevisionIntake`
-//! input shapes `FailureObservation` (observation-contracts role) and
-//! `MemoryRevisionEvidence` exist nowhere on main (main carries only
-//! that crate's `module.toml`): similarly-named main types do not
-//! satisfy the intake — `FailureObservationState` (dreamer-contracts
-//! failure-curation state enum) is a different type and role, and the
-//! MCP surface `FailureObservation` DTO is explicitly rejected as
-//! owner-neutral contract material by the freeze readback rule. The
-//! sibling crate is not a workspace member, so no path dependency may
-//! target it and vendoring its core would fork sibling-owned source. A caller here
-//! becomes compilable when the sibling crate lands on main as a member:
-//! `RevisionIntake` over owner-held observation, evidence,
-//! `TaskProjection`/`SafetyProjection` (context contracts, on main),
-//! `SelfQueryInput` (dreamer contracts, on main), `AcceptedSourceProjection`
-//! (dreamer contracts, on main), pose digest, and candidate id — then a
-//! `produce_dreamer_revision` caller mirrors the understanding legs
-//! above. Until then this seam is recorded, not fabricated.
+//! RevisionError>`) is owned by
+//! `crates/smart/eliot-dreamer-memory-revision/src/lib.rs` over its exact
+//! `RevisionIntake`. The intake now requires an explicit current
+//! `SchemaFreezeBinding` and the daemon event path calls the owner only when
+//! that binding and every other owner-issued member are supplied. This crate
+//! does not define a second observation, evidence, query, or candidate type.
 //!
 //! ## Seam: durable commit transition (canonical transition owner)
 //!
@@ -166,8 +151,8 @@ use thiserror::Error;
 
 /// Freeze identity this package builds against.
 ///
-/// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml` (r5).
-pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r5";
+/// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml` (r7).
+pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7";
 
 /// Coordination kind of the consumed audit payload.
 ///

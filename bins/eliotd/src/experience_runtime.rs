@@ -47,14 +47,18 @@ use eliot_experience_provider::{
     produce_memory_quality, produce_understanding_assessment,
 };
 use eliot_learning_contracts::HarnessActivationReceiptCandidate;
+use eliot_memory_projection_contracts::{
+    MemoryProjectionBatch, MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace, select,
+};
+use eliot_memory_projection_provider::{ProjectionRequest, project_batch};
 use eliot_memory_quality::{MemoryEcologyAssessment, QualityRequest};
 use eliot_observation::{
     GovernorObservationError,
     bank_admission::{
-        BankStoreSnapshot, ExperienceRevisionLedger, FeedbackStoreSnapshot,
-        bank_records_from_range_payload, feedback_records_from_range_payload, produce_bank_commit,
-        produce_feedback_commit, supply_bank_projection_from_store,
-        supply_feedback_projection_from_store,
+        BankStoreSnapshot, ConsumerPagedReadDriver, ExperienceRevisionLedger,
+        FeedbackStoreSnapshot, PagedExperienceConsumerBundle, bank_records_from_range_payload,
+        feedback_records_from_range_payload, produce_bank_commit, produce_feedback_commit,
+        supply_bank_projection_from_store, supply_feedback_projection_from_store,
     },
 };
 use eliot_observation_contracts::{
@@ -106,6 +110,20 @@ pub enum ExperienceDriverError {
     /// The Governor-backed experience commit failed.
     #[error("experience commit failed: {0}")]
     Commit(String),
+    /// A continuation cursor envelope is missing or malformed.
+    #[error("experience cursor {field}: {reason}")]
+    Cursor {
+        /// Cursor field at fault.
+        field: &'static str,
+        /// Exact fail-closed reason.
+        reason: &'static str,
+    },
+    /// The admitted memory projection provider rejected its exact request.
+    #[error("memory projection provider: {0}")]
+    MemoryProjection(#[from] eliot_memory_projection_provider::ProjectionError),
+    /// The shared memory selection consumer rejected the projected batch.
+    #[error("memory projection selection: {0}")]
+    MemorySelection(#[from] eliot_memory_projection_contracts::SelectionError),
 }
 
 /// Maps a Dreamer memory-revision owner rejection into the Governor
@@ -126,6 +144,16 @@ impl From<RevisionError> for ExperienceDriverError {
     fn from(error: RevisionError) -> Self {
         ExperienceDriverError::Governor(match error {
             RevisionError::Observation(inner) => GovernorObservationError::Observation(inner),
+            RevisionError::MissingSchemaFreeze => GovernorObservationError::InvalidField {
+                field: "dmr.intake.schema_freeze",
+                reason: "current schema-freeze readback is required",
+            },
+            RevisionError::SchemaFreezeMismatch { field } => {
+                GovernorObservationError::InvalidField {
+                    field,
+                    reason: "schema-freeze identity or readback is not current",
+                }
+            }
             RevisionError::Context(_) => GovernorObservationError::InvalidField {
                 field: "dmr.intake.projection",
                 reason: "admitted task/safety projection rejected its shape",
@@ -160,6 +188,66 @@ impl From<RevisionError> for ExperienceDriverError {
             },
         })
     }
+}
+
+/// One admitted provider-to-consumer edge for the memory projection family.
+///
+/// The Governor-owned provider receives the exact shared `ProjectionRequest`
+/// and emits `MemoryProjectionBatch`; the shared selection consumer then
+/// receives that same batch with the exact `MemoryQueryIntent` and
+/// `MemorySelectionPolicy`. No provider-specific request, batch, or selection
+/// type is introduced here, and this pure edge performs no store read, model
+/// call, admission, delivery, or effect.
+///
+/// The relation-level product proof remains
+/// `D3B_CANONICAL_PROJECTION_PULSE_01` and is not executed by this helper.
+pub fn project_memory_and_select(
+    request: &ProjectionRequest,
+    intent: &MemoryQueryIntent,
+    policy: &MemorySelectionPolicy,
+) -> Result<(MemoryProjectionBatch, MemorySelectionTrace), ExperienceDriverError> {
+    let batch = project_batch(request)?;
+    let trace = select(intent, policy, &batch)?;
+    Ok((batch, trace))
+}
+
+/// Production entry for one explicitly driven experience consumer page.
+///
+/// The caller owns the store reads and passes the exact selectors used for
+/// those reads plus the owner-issued next cursors returned by them. The
+/// repaired [`ConsumerPagedReadDriver`] validates both sides, revalidates the
+/// owner projections, advances only unfinished families, and invalidates a
+/// restarted family's old generation. No loop or trigger is automatic.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_experience_consumer_page(
+    driver: &mut ConsumerPagedReadDriver,
+    ledger: &mut ExperienceRevisionLedger,
+    projection_id: ArtifactId,
+    scope: &ObservationScope,
+    fence: &StateFence,
+    bank: BankStoreSnapshot<'_>,
+    feedback: FeedbackStoreSnapshot<'_>,
+    schedule: &RetentionSchedule,
+    holds: &BTreeMap<String, RetentionHold>,
+    bank_selector: Option<&str>,
+    feedback_selector: Option<&str>,
+    bank_next_cursor: Option<String>,
+    feedback_next_cursor: Option<String>,
+) -> Result<PagedExperienceConsumerBundle, ExperienceDriverError> {
+    Ok(driver.assemble_next_page_with_selectors(
+        ledger,
+        projection_id,
+        scope,
+        fence,
+        bank,
+        feedback,
+        schedule,
+        holds,
+        bank_selector,
+        feedback_selector,
+        bank_next_cursor,
+        feedback_next_cursor,
+    )?)
 }
 
 /// Dreamer memory-revision consumer invocation: propose one advisory
@@ -348,6 +436,37 @@ pub struct ExperienceFeedbackEventInputs {
     pub source_id: String,
 }
 
+/// Explicit owner-page inputs for the repaired paged consumer edge.
+///
+/// This is an integration call bundle, not a new projection or provider
+/// schema: every member is an existing owner snapshot, binding, schedule,
+/// hold, or opaque cursor selector.
+pub struct PagedExperiencePageInput<'a> {
+    /// Caller-owned state machine; the event advances it only after both
+    /// family pages validate.
+    pub driver: &'a mut ConsumerPagedReadDriver,
+    /// Ledger rebuilt from the supplied owner snapshots.
+    pub ledger: &'a mut ExperienceRevisionLedger,
+    /// Projection identity for the page.
+    pub projection_id: ArtifactId,
+    /// Bank owner snapshot for this read.
+    pub bank: BankStoreSnapshot<'a>,
+    /// Feedback owner snapshot for this read.
+    pub feedback: FeedbackStoreSnapshot<'a>,
+    /// Owner-issued retention schedule.
+    pub schedule: &'a RetentionSchedule,
+    /// Owner-issued retention holds.
+    pub holds: &'a BTreeMap<String, RetentionHold>,
+    /// Exact selector used for the bank store read.
+    pub bank_selector: Option<&'a str>,
+    /// Exact selector used for the feedback store read.
+    pub feedback_selector: Option<&'a str>,
+    /// Owner-issued next cursor returned by the bank read.
+    pub bank_next_cursor: Option<String>,
+    /// Owner-issued next cursor returned by the feedback read.
+    pub feedback_next_cursor: Option<String>,
+}
+
 /// Governed trigger event for one terminal experience-quality run.
 ///
 /// Understanding leg inputs: everything except outcome-side experience.
@@ -457,6 +576,19 @@ pub struct ExperienceQualityEvent<'a> {
     /// Memory-quality request, when the memory family runs (edge-supplied
     /// owner batch, applicability verdict, projections, and receipts).
     pub memory: Option<QualityRequest>,
+    /// Exact shared provider/consumer edge inputs, when the admitted memory
+    /// projection edge runs. The tuple prevents a provider-specific request
+    /// duplicate: it is `(ProjectionRequest, MemoryQueryIntent,
+    /// MemorySelectionPolicy)` by reference.
+    pub memory_projection: Option<(
+        &'a ProjectionRequest,
+        &'a MemoryQueryIntent,
+        &'a MemorySelectionPolicy,
+    )>,
+    /// Exact owner-issued Dreamer revision intake, when the trigger edge has
+    /// admitted every member. A missing schema-freeze binding inside the
+    /// intake fails closed; this event never synthesizes one from prose.
+    pub revision: Option<&'a RevisionIntake<'a>>,
     /// Understanding leg inputs, when the understanding family runs
     /// (edge-supplied owner context minus outcome experience, which the
     /// entry binds from its own live envelopes).
@@ -482,6 +614,11 @@ pub struct ExperienceQualityEventOutput {
     pub feedback_withheld: Vec<WithheldMember>,
     /// Memory ecology assessment, when the memory family ran.
     pub memory_assessment: Option<MemoryEcologyAssessment>,
+    /// Exact shared provider/consumer edge result, when that edge ran.
+    pub memory_projection: Option<(MemoryProjectionBatch, MemorySelectionTrace)>,
+    /// Advisory extinction candidate, when an exact admitted revision intake
+    /// was supplied to the terminal event.
+    pub extinction_candidate: Option<NegativeMemoryExtinctionCandidate>,
     /// Owner-minted bank continuation cursor echoed verbatim from the
     /// consumed range payload (`next_cursor`), or `None` when the page
     /// ends the enumeration.
@@ -503,22 +640,34 @@ pub struct ExperienceQualityEventOutput {
     pub common_ground: Option<CommonGroundAssessment>,
 }
 
-/// Echoes the owner-minted range continuation cursor from a consumed
-/// bank/feedback range payload, if the page carries one.
+/// Echo the owner-minted range continuation cursor from a consumed
+/// bank/feedback range payload.
 ///
-/// Reads only the [`EXPERIENCE_PAGE_NEXT_CURSOR`] member minted by the
-/// owner page envelope
-/// ([`ExperienceRangePage`](eliot_store_api::ExperienceRangePage)): a
-/// missing member, a non-string member, or a blank cursor echoes as
-/// `None` (page ends the enumeration). The cursor is echoed verbatim,
-/// never parsed or advanced here; multi-page iteration belongs to the
-/// trigger edge per the output contract.
-fn range_next_cursor(payload: &serde_json::Value) -> Option<String> {
-    payload
-        .get(EXPERIENCE_PAGE_NEXT_CURSOR)
-        .and_then(serde_json::Value::as_str)
-        .filter(|cursor| !cursor.trim().is_empty())
-        .map(str::to_owned)
+/// The owner page envelope must explicitly carry either `null` (the current
+/// page is the validated end) or a nonblank string cursor. A missing member,
+/// a non-string member, or a blank cursor is malformed bridge evidence and
+/// fails closed; it is never silently converted into end-of-stream.
+fn range_next_cursor(payload: &serde_json::Value) -> Result<Option<String>, ExperienceDriverError> {
+    match payload.get(EXPERIENCE_PAGE_NEXT_CURSOR) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(cursor))
+            if !cursor.trim().is_empty() && !cursor.chars().any(char::is_control) =>
+        {
+            Ok(Some(cursor.clone()))
+        }
+        Some(serde_json::Value::String(_)) => Err(ExperienceDriverError::Cursor {
+            field: EXPERIENCE_PAGE_NEXT_CURSOR,
+            reason: "owner continuation cursor must be nonblank text or explicit null",
+        }),
+        Some(_) => Err(ExperienceDriverError::Cursor {
+            field: EXPERIENCE_PAGE_NEXT_CURSOR,
+            reason: "owner continuation cursor must be text or explicit null",
+        }),
+        None => Err(ExperienceDriverError::Cursor {
+            field: EXPERIENCE_PAGE_NEXT_CURSOR,
+            reason: "owner page envelope omitted the required continuation cursor member",
+        }),
+    }
 }
 
 /// Terminal event entry: trigger event to reviewed candidate.
@@ -644,6 +793,16 @@ pub async fn run_experience_quality_event(
         Some(request) => Some(produce_memory_quality(request)?),
         None => None,
     };
+    let memory_projection = match event.memory_projection {
+        Some((request, intent, policy)) => {
+            Some(project_memory_and_select(request, intent, policy)?)
+        }
+        None => None,
+    };
+    let extinction_candidate = event
+        .revision
+        .map(propose_memory_extinction_candidate)
+        .transpose()?;
     let mut experience = Vec::new();
     if let Some(journal) = journal_envelope.as_ref() {
         experience.push(ExperienceEvidence::Journal(journal));
@@ -705,26 +864,87 @@ pub async fn run_experience_quality_event(
         bank_withheld: bank_shaped.withheld,
         feedback_withheld: feedback_shaped.withheld,
         memory_assessment,
-        bank_next_cursor: range_next_cursor(&event.bank.payload),
-        feedback_next_cursor: range_next_cursor(&event.feedback.payload),
+        memory_projection,
+        extinction_candidate,
+        bank_next_cursor: range_next_cursor(&event.bank.payload)?,
+        feedback_next_cursor: range_next_cursor(&event.feedback.payload)?,
         understanding,
         common_ground,
     })
 }
 
+/// Production terminal entry for one explicit paged consumer page plus the
+/// existing quality event.
+///
+/// The page edge is invoked directly with caller-owned owner snapshots and
+/// selectors; the quality event remains a separate read/assessment path. This
+/// function does not create a loop, trigger, or owner input, and it returns
+/// the page generation alongside the quality output so a restart can be
+/// observed without treating a stale partial as complete.
+pub async fn run_experience_quality_event_with_paged_page(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    ctx: &RequestMetadata,
+    event: &ExperienceQualityEvent<'_>,
+    paged: &mut PagedExperiencePageInput<'_>,
+) -> Result<(ExperienceQualityEventOutput, PagedExperienceConsumerBundle), ExperienceDriverError> {
+    let output = run_experience_quality_event(composition, kernel, ctx, event).await?;
+    let page = assemble_experience_consumer_page(
+        &mut *paged.driver,
+        &mut *paged.ledger,
+        paged.projection_id.clone(),
+        &event.scope,
+        &ctx.state_fence,
+        paged.bank.clone(),
+        paged.feedback.clone(),
+        paged.schedule,
+        paged.holds,
+        paged.bank_selector,
+        paged.feedback_selector,
+        paged.bank_next_cursor.clone(),
+        paged.feedback_next_cursor.clone(),
+    )?;
+    Ok((output, page))
+}
+
+/// Terminal event entry requiring one already-admitted revision intake.
+///
+/// Unlike the compatibility helper below, this entry has no `Option` lane:
+/// the caller must provide the exact owner intake and its current
+/// schema-freeze binding. The quality event remains unchanged and no owner
+/// material is synthesized.
+pub async fn run_experience_quality_event_with_admitted_revision(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    ctx: &RequestMetadata,
+    event: &ExperienceQualityEvent<'_>,
+    revision: &RevisionIntake<'_>,
+) -> Result<
+    (
+        ExperienceQualityEventOutput,
+        NegativeMemoryExtinctionCandidate,
+    ),
+    ExperienceDriverError,
+> {
+    if event.revision.is_some() {
+        return Err(ExperienceDriverError::Position {
+            field: "event.revision",
+            reason: "revision intake is already bound on the event",
+        });
+    }
+    let output = run_experience_quality_event(composition, kernel, ctx, event).await?;
+    let candidate = propose_memory_extinction_candidate(revision)?;
+    Ok((output, candidate))
+}
+
 /// Terminal event entry with an optional admitted extinction intake.
 ///
-/// Runs [`run_experience_quality_event`] unchanged, then — only when
-/// `revision` is `Some` — proposes one advisory extinction candidate
-/// via [`propose_memory_extinction_candidate`] over that intake.
-/// `Some` must be an already-admitted [`RevisionIntake`] held by the
-/// trigger edge (the O1-owned daemon trigger assembles it from
-/// owner-issued members); this entry never synthesizes intake from
-/// the quality event's bank/feedback envelopes and owns no automatic
-/// trigger. `None` skips the revision lane entirely. This entry calls
-/// [`run_experience_quality_event`] and then the propose wrapper,
-/// so both symbols have a production caller in this file; the
-/// read-only base path is unaffected.
+/// Runs [`run_experience_quality_event`] and returns its exact event-bound
+/// extinction candidate. The legacy `revision` argument is an explicit
+/// compatibility path for callers that cannot yet place the intake on the
+/// event; it is mutually exclusive with `event.revision`, so the same owner
+/// intake is never proposed twice. Both paths require the intake's exact
+/// schema-freeze binding and never synthesize owner material.
 pub async fn run_experience_quality_event_with_revision(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
@@ -738,10 +958,17 @@ pub async fn run_experience_quality_event_with_revision(
     ),
     ExperienceDriverError,
 > {
+    if revision.is_some() && event.revision.is_some() {
+        return Err(ExperienceDriverError::Position {
+            field: "event.revision",
+            reason: "revision intake is supplied both on the event and compatibility argument",
+        });
+    }
     let output = run_experience_quality_event(composition, kernel, ctx, event).await?;
-    let extinction = revision
-        .map(propose_memory_extinction_candidate)
-        .transpose()?;
+    let extinction = match revision {
+        Some(intake) => Some(propose_memory_extinction_candidate(intake)?),
+        None => output.extinction_candidate.clone(),
+    };
     Ok((output, extinction))
 }
 

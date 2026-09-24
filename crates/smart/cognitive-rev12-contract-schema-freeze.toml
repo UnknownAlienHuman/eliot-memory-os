@@ -1,8 +1,8 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6"
-revision = 6
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r5"
-supersedes_freeze_digest = "sha256:b9f08ae6ad849e1c808703e711b9ef2acfd5715844f8bacba1aacc0bf2d176b9"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7"
+revision = 7
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6"
+supersedes_freeze_digest = "sha256:737571ecfba0a1731875a2d66f0dbc863d4a756e983244dacbd266d79738b50c"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
@@ -13,19 +13,83 @@ evidence_execution_status = "NOT_EXECUTED"
 integration_owner = "cognitive-wave-integrator"
 
 [readback]
-rule = "Reproducible digest is sha256 over these exact file bytes. Any byte change creates a new freeze candidate; verdicts bound to the prior digest are invalidated, not edited."
+rule = "The current digest is reproducible after replacing only the current_digest value with 64 ASCII zeroes, then hashing the exact UTF-8 file bytes with SHA-256. Any byte change creates a new freeze candidate; verdicts bound to the prior digest are invalidated, not edited."
+digest_algorithm = "SHA-256"
+digest_scope = "UTF-8 bytes of this file with the value of readback.current_digest replaced by exactly 64 ASCII zero characters; all other bytes and line endings unchanged"
+current_digest = "sha256:3412b906605d9711b57d54f1fd6fc4c0c6248cb79ac6e74ec11cd58239916e70"
+readback = "Recompute digest_scope over the delivered file and require an exact byte-for-byte match with current_digest; a mismatch is a failed freeze readback, not a permissive warning."
+readback_command = "python scripts/read_freeze_digest.py crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+predecessor_readback = "sha256:737571ecfba0a1731875a2d66f0dbc863d4a756e983244dacbd266d79738b50c"
 rejects = ["generic JSON treated as a projection contract", "prose-invented request/contribution types", "MCP surface DTOs treated as owner-neutral contracts"]
 
-# Historical cell numbers 69, 70, 72, 73, 75 (original #223 record) have no
-# referent in the current topology: cognitive-crate-decisions.toml assigns
-# orders 1-43 and cognitive-wave-09.toml assigns orders 76-86. This freeze
-# binds the current orders below and does not invent mappings for the stale
-# numbers. Code and document disagree here; the disagreement is reported,
-# not resolved by invention.
+# The historical rev12 cell catalogue is authoritative for the original
+# #223 cell numbers. These entries reconcile those names to the current
+# owner contracts/cells; they do not recreate the removed
+# eliot-memory-projection package or freeze an unowned request shape.
+[[historical_cell_mapping]]
+cell_order = 69
+historical_cell = "smart.memory.candidate_query"
+source_catalog = "crates/smart/cells-v12/069-smart-memory-candidate_query.toml"
+source_commit = "27d71619b6b777bd36b18502e8ac749e4a113cad"
+historical_physical_crate = "eliot-memory-projection"
+current_cell = "foundation.memory.projection-contracts"
+current_owner = "eliot-memory-projection-contracts"
+current_contract = ["MemoryQueryIntent", "MemorySelectionPolicy", "MemorySelectionTrace", "select"]
+disposition = "RECONCILED_TO_OWNER_CONTRACT"
+note = "The removed package is not recreated; the exact surviving owner selection surface is used instead."
+
+[[historical_cell_mapping]]
+cell_order = 70
+historical_cell = "smart.memory.context_projection"
+source_catalog = "crates/smart/cells-v12/070-smart-memory-context_projection.toml"
+source_commit = "27d71619b6b777bd36b18502e8ac749e4a113cad"
+historical_physical_crate = "eliot-memory-projection"
+current_cell = "smart.context.candidates"
+current_owner = "eliot-context-candidates"
+current_contract = ["MemoryInput", "CanonicalProjectionSet", "ContextCandidateSet"]
+disposition = "RECONCILED_TO_CONTEXT_SLOT_WITHOUT_NEW_REQUEST"
+note = "MemoryInput is the current structural memory slot; MemoryContextProjectionRequest remains NOT_FROZEN and is not invented here."
+
+[[historical_cell_mapping]]
+cell_order = 72
+historical_cell = "smart.experience.projection"
+source_catalog = "crates/smart/cells-v12/072-smart-experience-projection.toml"
+source_commit = "27d71619b6b777bd36b18502e8ac749e4a113cad"
+historical_physical_crate = "eliot-experience-projection"
+current_cell = "smart.experience.projection"
+current_owner = "eliot-experience-projection"
+current_contract = ["ExperienceView", "revalidate_bank_refs", "revalidate_feedback_refs"]
+disposition = "RECONCILED_TO_OWNER_PACKAGE"
+note = "The package remains a read-aid over owner projections and never owns experience state."
+
+[[historical_cell_mapping]]
+cell_order = 73
+historical_cell = "smart.self_model.context_projection"
+source_catalog = "crates/smart/cells-v12/073-smart-self_model-context_projection.toml"
+source_commit = "27d71619b6b777bd36b18502e8ac749e4a113cad"
+historical_physical_crate = "eliot-dreamer-self-query"
+current_cell = "smart.dreamer.self_query"
+current_owner = "eliot-dreamer-self-query"
+current_contract = ["SelfQueryPoseReceipt", "AcceptedSourceProjection", "SelfQueryInput"]
+disposition = "RECONCILED_TO_OWNER_ADAPTER"
+note = "The current adapter poses the existing Dreamer owner input; it does not create a parallel self-model request or context contribution."
+
+[[historical_cell_mapping]]
+cell_order = 75
+historical_cell = "smart.epistemic.context_projection"
+source_catalog = "crates/smart/cells-v12/075-smart-epistemic-context_projection.toml"
+source_commit = "27d71619b6b777bd36b18502e8ac749e4a113cad"
+historical_physical_crate = "eliot-epistemic"
+current_cell = "smart.epistemic.context_provider"
+current_owner = "eliot-epistemic-context-provider"
+current_contract = ["ProviderContribution", "ContextCandidateSet"]
+disposition = "RECONCILED_TO_SHARED_CONTRIBUTION"
+note = "The Smart package is a thin adapter over the owner-neutral contribution; no provider-specific contribution schema is introduced."
+
 [cell_number_note]
 historical_numbers = [69, 70, 72, 73, 75]
 current_topology = "cognitive-crate-decisions.toml orders 1-43 plus cognitive-wave-09.toml orders 76-86"
-disposition = "REPORTED_NOT_INVENTED"
+disposition = "RECONCILED_TO_CURRENT_OWNER_CONTRACTS"
 
 [[upstream_crate]]
 crate = "eliot-memory-projection-contracts"
@@ -604,6 +668,33 @@ functional_cell = "smart.understanding.common_ground"
 frozen_inputs = ["ActiveUnderstandingView by handle"]
 blocked_inputs = ["accepted-source projection (contract exists per unit #3; provider edge and pulse pending)"]
 consumer_of_freeze = true
+
+[[admitted_shared_type_edge]]
+id = "E-223-MEMORY-PROJECTION-SELECTION"
+provider = "eliot-memory-projection-provider::project_batch"
+consumer = "eliot-memory-projection-contracts::select"
+shared_contract = "eliot_memory_projection_contracts::MemoryProjectionBatch"
+provider_request = "eliot_memory_projection_provider::ProjectionRequest"
+consumer_inputs = ["MemoryQueryIntent", "MemorySelectionPolicy"]
+production_caller = "bins/eliotd/src/experience_runtime.rs::run_experience_quality_event"
+product_pulse = "D3B_CANONICAL_PROJECTION_PULSE_01"
+proof_ceiling = "PACKAGE_PROOF_ONLY"
+execution_status = "NOT_EXECUTED"
+trigger = "MANUAL_EXPLICIT_INPUT_ONLY"
+note = "The edge passes the exact shared batch from provider to selection consumer; no duplicate request, contribution, storage, model, admission, delivery, or effect surface is admitted."
+
+[[schema_freeze_gate]]
+consumer = "eliot-dreamer-memory-revision::propose"
+input = "SchemaFreezeBinding { freeze_id, readback_digest }"
+missing_behavior = "FAIL_CLOSED_WITH_MISSING_SCHEMA_FREEZE"
+stale_behavior = "FAIL_CLOSED_WITH_SCHEMA_FREEZE_MISMATCH"
+current_freeze = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7"
+
+[[frozen_type]]
+crate = "eliot-dreamer-memory-revision"
+rust_path = "eliot_dreamer_memory_revision::SchemaFreezeBinding"
+fields = ["freeze_id", "readback_digest"]
+denominator_note = "Both exact identity and normalized readback are mandatory; no owner input is interpreted before the gate passes."
 
 [[frozen_type]]
 crate = "eliot-memory-projection-contracts"

@@ -90,7 +90,7 @@ use thiserror::Error;
 /// Freeze identity this package builds against.
 ///
 /// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
-pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6";
+pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7";
 /// Exact contract version every assessment candidate in this crate is written
 /// against (`VR-EXACT-CONTRACT-VERSION` applied to the own wire shape).
 ///

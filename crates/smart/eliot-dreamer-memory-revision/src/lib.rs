@@ -13,10 +13,11 @@
 //! There are no parallel observation, evidence, query, or projection types
 //! here: failure/revision shapes stay with `eliot-observation-contracts`,
 //! self-query/accepted-source shapes stay with `eliot-dreamer-contracts`,
-//! and task/safety projections stay with `eliot-context-contracts`. This
-//! crate performs no compilation, admission, briefing, or model work, owns
-//! no reactive path, and promotes nothing: output is candidate-only for the
-//! Governor transition path.
+//! and task/safety projections stay with `eliot-context-contracts`. The
+//! required `SchemaFreezeBinding` is an identity/readback gate, not another
+//! domain schema. This crate performs no compilation, admission, briefing,
+//! or model work, owns no reactive path, and promotes nothing: output is
+//! candidate-only for the Governor transition path.
 
 #![forbid(unsafe_code)]
 
@@ -39,7 +40,13 @@ use thiserror::Error;
 /// Freeze identity this consumer builds against.
 ///
 /// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
-pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6";
+pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7";
+/// Normalized SHA-256 readback identity required at the revision boundary.
+///
+/// The value is the digest recorded in the freeze artifact's `readback`
+/// table. It is checked at runtime, not inferred from the package source.
+pub const FREEZE_READBACK_DIGEST: &str =
+    "sha256:3412b906605d9711b57d54f1fd6fc4c0c6248cb79ac6e74ec11cd58239916e70";
 /// Contract version carried by every candidate emitted here.
 pub const CANDIDATE_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 /// Maximum revision-evidence refs carried by one intake.
@@ -66,6 +73,12 @@ pub enum RevisionError {
     /// The self-query input or accepted-source projection rejected its shape.
     #[error("dreamer memory revision: self-query contract: {0}")]
     SelfQuery(#[from] SelfQueryContractError),
+    /// The required schema-freeze readback was not supplied.
+    #[error("dreamer memory revision: schema-freeze readback is required")]
+    MissingSchemaFreeze,
+    /// The supplied schema-freeze identity or digest is not current.
+    #[error("dreamer memory revision: schema-freeze mismatch at {field}")]
+    SchemaFreezeMismatch { field: &'static str },
     /// A scope identity does not match its governing scope.
     #[error("dreamer memory revision: scope mismatch at {field}")]
     ScopeMismatch { field: &'static str },
@@ -249,8 +262,42 @@ impl NegativeMemoryExtinctionCandidate {
     }
 }
 
+/// Exact schema-freeze identity supplied by the integration edge.
+///
+/// This is evidence binding, not a second schema. Both values are required
+/// and compared with the package's current freeze constants before any
+/// owner material is interpreted. A caller cannot omit the binding and rely
+/// on a source-file scan or an issue-body reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaFreezeBinding {
+    /// Exact freeze identity, including revision.
+    pub freeze_id: String,
+    /// Normalized readback digest recorded by the freeze artifact.
+    pub readback_digest: String,
+}
+
+impl SchemaFreezeBinding {
+    /// Validate this binding against the current package freeze.
+    pub fn validate_current(&self) -> Result<(), RevisionError> {
+        if self.freeze_id != FREEZE_ID {
+            return Err(RevisionError::SchemaFreezeMismatch {
+                field: "intake.schema_freeze.freeze_id",
+            });
+        }
+        if self.readback_digest != FREEZE_READBACK_DIGEST {
+            return Err(RevisionError::SchemaFreezeMismatch {
+                field: "intake.schema_freeze.readback_digest",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Complete validated intake for one extinction assessment.
 pub struct RevisionIntake<'a> {
+    /// Exact current schema-freeze identity and readback. Missing evidence
+    /// fails closed before any failure/evidence owner is consulted.
+    pub schema_freeze: Option<&'a SchemaFreezeBinding>,
     /// Owner-neutral failure observation, by value.
     pub observation: &'a FailureObservation,
     /// Revision evidence refs bearing on the observation.
@@ -287,9 +334,14 @@ fn check_candidate_id(value: &ArtifactId) -> Result<(), RevisionError> {
 /// citations, digest drift) fail closed as [`RevisionError`]. Valid intake
 /// with insufficient evidence yields `Ok` with state `Inconclusive` or
 /// `Unsupported` and the exact missing evidence named.
+#[allow(clippy::too_many_lines)]
 pub fn propose(
     intake: &RevisionIntake<'_>,
 ) -> Result<NegativeMemoryExtinctionCandidate, RevisionError> {
+    let schema_freeze = intake
+        .schema_freeze
+        .ok_or(RevisionError::MissingSchemaFreeze)?;
+    schema_freeze.validate_current()?;
     intake.observation.validate()?;
     if intake.evidence.len() > MAX_REVISION_EVIDENCE {
         return Err(RevisionError::Bounds {

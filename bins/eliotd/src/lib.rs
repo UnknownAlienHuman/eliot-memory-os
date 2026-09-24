@@ -143,9 +143,11 @@ pub use dreamer_model_adapter::{
 pub use experience_runtime::{
     CommonGroundEventInputs, ExperienceCommitOutput, ExperienceDriverError,
     ExperienceJournalDriverInputs, ExperienceQualityEvent, ExperienceQualityEventOutput,
-    UnderstandingEventInputs, commit_experience_event_records, derive_commit_ingress,
-    produce_journal_projection, propose_memory_extinction_candidate, read_current_position,
-    run_experience_quality_event, run_experience_quality_event_with_revision,
+    PagedExperiencePageInput, UnderstandingEventInputs, assemble_experience_consumer_page,
+    commit_experience_event_records, derive_commit_ingress, produce_journal_projection,
+    project_memory_and_select, propose_memory_extinction_candidate, read_current_position,
+    run_experience_quality_event, run_experience_quality_event_with_admitted_revision,
+    run_experience_quality_event_with_paged_page, run_experience_quality_event_with_revision,
 };
 pub use first_run_wiring::{
     DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
