@@ -1,0 +1,149 @@
+{
+  "issue": 864,
+  "contract": "eliot.storage.blob",
+  "contract_version": "s-04-v2",
+  "denominator": 14,
+  "note": "Finite deterministic port-failure descriptions for R-DISKFULL-BLOB. Each row names the exact durable port method whose capacity fault the service classifies, the resulting BlobCapacityStage, the effect certainty, the recovery disposition and the identity form. Cause namespace codes are fixed: posix ENOSPC=28, windows ERROR_DISK_FULL=112, windows ERROR_HANDLE_DISK_FULL=39. Wrong-namespace codes never classify.",
+  "cases": [
+    {
+      "id": "root-create",
+      "port": "native-fs",
+      "method": "create_dir_all/canonicalize",
+      "fault": "capacity",
+      "stage": "RootLeaseCreate",
+      "effect": "PartialWriteUnknown",
+      "recovery": "CapacityRevalidationRequired",
+      "identity": "RootLease"
+    },
+    {
+      "id": "lease-heartbeat",
+      "port": "native-fs",
+      "method": "lease-record-write",
+      "fault": "capacity",
+      "stage": "RootLeaseHeartbeat",
+      "effect": "PartialWriteUnknown",
+      "recovery": "CapacityRevalidationRequired",
+      "identity": "RootLease"
+    },
+    {
+      "id": "journal-create",
+      "port": "BlobPlatformPort",
+      "method": "write_new_durable",
+      "fault": "capacity",
+      "stage": "JournalWrite",
+      "effect": "PartialWriteUnknown",
+      "recovery": "CapacityRevalidationRequired",
+      "identity": "Journal"
+    },
+    {
+      "id": "payload-write",
+      "port": "BlobPlatformPort",
+      "method": "write_new_durable",
+      "fault": "capacity",
+      "stage": "PayloadWrite",
+      "effect": "PartialWriteUnknown",
+      "recovery": "CapacityRevalidationRequired",
+      "identity": "Operation"
+    },
+    {
+      "id": "metadata-write",
+      "port": "BlobPlatformPort",
+      "method": "write_new_durable",
+      "fault": "capacity",
+      "stage": "MetadataWrite",
+      "effect": "PartialWriteUnknown",
+      "recovery": "CapacityRevalidationRequired",
+      "identity": "Operation"
+    },
+    {
+      "id": "journal-sync",
+      "port": "BlobPlatformPort",
+      "method": "replace_durable",
+      "fault": "capacity",
+      "stage": "JournalWrite",
+      "effect": "PossiblePublication",
+      "recovery": "ReconcileSameOperationThenRevalidate",
+      "identity": "Journal"
+    },
+    {
+      "id": "payload-publication",
+      "port": "BlobPlatformPort",
+      "method": "rename_no_replace_durable",
+      "fault": "capacity",
+      "stage": "PayloadPublication",
+      "effect": "PossiblePublication",
+      "recovery": "ReconcileSameOperationThenRevalidate",
+      "identity": "Journal"
+    },
+    {
+      "id": "metadata-publication",
+      "port": "BlobPlatformPort",
+      "method": "rename_no_replace_durable",
+      "fault": "capacity",
+      "stage": "MetadataPublication",
+      "effect": "PossiblePublication",
+      "recovery": "ReconcileSameOperationThenRevalidate",
+      "identity": "Journal"
+    },
+    {
+      "id": "commit-write",
+      "port": "BlobPlatformPort",
+      "method": "write_new_durable",
+      "fault": "capacity",
+      "stage": "CommitWrite",
+      "effect": "PossiblePublication",
+      "recovery": "ReconcileSameOperationThenRevalidate",
+      "identity": "Journal"
+    },
+    {
+      "id": "stage-cleanup",
+      "port": "BlobPlatformPort",
+      "method": "remove_durable",
+      "fault": "capacity",
+      "stage": "Cleanup",
+      "effect": "PossiblePublication",
+      "recovery": "ReconcileSameOperationThenRevalidate",
+      "identity": "Journal"
+    },
+    {
+      "id": "gc-delete",
+      "port": "BlobPlatformPort",
+      "method": "remove_durable",
+      "fault": "capacity",
+      "stage": "GcCleanup",
+      "effect": "PossibleMutation",
+      "recovery": "ReconcileSameOperationThenRevalidate",
+      "identity": "Journal"
+    },
+    {
+      "id": "cas-journal",
+      "port": "BlobPlatformPort",
+      "method": "compare_and_replace_durable",
+      "fault": "capacity",
+      "stage": "CasJournal",
+      "effect": "PossibleMutation",
+      "recovery": "ReconcileSameOperationThenRevalidate",
+      "identity": "Operation"
+    },
+    {
+      "id": "lease-claim",
+      "port": "BlobPlatformPort",
+      "method": "claim_root",
+      "fault": "capacity",
+      "stage": "RootLeaseCreate",
+      "effect": "NotAttempted",
+      "recovery": "CapacityRevalidationRequired",
+      "identity": "RootLease"
+    },
+    {
+      "id": "commit-durability-unknown",
+      "port": "BlobPlatformPort",
+      "method": "write_new_durable",
+      "fault": "capacity",
+      "stage": "CommitWrite",
+      "effect": "DurabilityUnconfirmed",
+      "recovery": "ReconcileSameOperationThenRevalidate",
+      "identity": "Journal"
+    }
+  ]
+}
