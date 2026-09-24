@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod apply;
+mod backup_snapshot;
 mod client;
 mod config;
 mod dreamer_job;
@@ -30,6 +31,7 @@ mod write_scheduler;
 use std::fmt;
 use std::num::NonZeroUsize;
 
+pub use crate::client::session_pool::{PoolAdmission, PoolOccupancy, SessionRole};
 pub use config::{
     ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
     PINNED_SURREALDB_MAJOR, SchemaGeneration, SchemaGenerationError, SurrealAdapterConfig,
@@ -37,17 +39,17 @@ pub use config::{
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::RetainedProcessPathLease;
 use eliot_store_api::{
-    CAPABILITY_RESERVED_WRITE, CanonicalStoreClient, CanonicalValidationSnapshot, ExactJsonBytes,
-    GENESIS_MANIFEST_NAME, NamedOperationManifest, NamedReadRequest, NamedReadResponse,
-    OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
-    RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
-    operation_manifest_set_digest,
+    CAPABILITY_RESERVED_WRITE, CanonicalSnapshotPort, CanonicalStoreClient,
+    CanonicalValidationSnapshot, ExactJsonBytes, GENESIS_MANIFEST_NAME, NamedOperationManifest,
+    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest,
+    SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StateFence, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
-pub use crate::client::session_pool::{PoolAdmission, PoolOccupancy, SessionRole};
 
 /// Server identity proved by the last ownership-verified authentication on
 /// the live provider transport (issue #1932).
@@ -308,7 +310,10 @@ impl SurrealStoreAdapter {
     #[must_use]
     pub fn reserved_write_capability(&self) -> Option<&'static str> {
         let slot = self.execution.lock().ok()?;
-        if slot.as_ref().is_some_and(|execution| execution.is_concurrent()) {
+        if slot
+            .as_ref()
+            .is_some_and(|execution| execution.is_concurrent())
+        {
             Some(CAPABILITY_RESERVED_WRITE)
         } else {
             None
@@ -688,6 +693,38 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         Box::pin(dreamer_job::dreamer_job(self, ctx, request))
             .await
             .map_err(AdapterError::into_store_error)
+    }
+}
+
+/// Coherent bounded snapshot capture over the `SurrealDB` bridge (issue #951).
+///
+/// Read-only delegation to [`crate::backup_snapshot`]: each method binds,
+/// pages, or closes one owner-issued consistency point without acquiring
+/// `write_lock`, issuing DDL, or performing restore.
+impl CanonicalSnapshotPort for SurrealStoreAdapter {
+    async fn begin_snapshot(
+        &self,
+        ctx: &RequestMeta,
+        request: SnapshotBeginRequest,
+    ) -> Result<SnapshotHandle, StoreError> {
+        crate::backup_snapshot::begin_snapshot(self, ctx, request).await
+    }
+
+    async fn read_snapshot_page(
+        &self,
+        ctx: &RequestMeta,
+        handle: SnapshotHandle,
+        cursor: SnapshotCursor,
+    ) -> Result<SnapshotPage, StoreError> {
+        crate::backup_snapshot::read_snapshot_page(self, ctx, handle, cursor).await
+    }
+
+    async fn end_snapshot(
+        &self,
+        ctx: &RequestMeta,
+        handle: SnapshotHandle,
+    ) -> Result<SnapshotEndReceipt, StoreError> {
+        crate::backup_snapshot::end_snapshot(self, ctx, handle).await
     }
 }
 
