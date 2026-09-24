@@ -77,7 +77,7 @@ fn replay_plan() -> ReplayPlan {
 }
 
 fn candidate(evidence: &[&str]) -> ImprovementCandidate {
-    ImprovementCandidate::new(
+    let mut candidate = ImprovementCandidate::new(
         "project-1869",
         ImprovementSurface::Memory,
         "tighten context budget",
@@ -88,7 +88,19 @@ fn candidate(evidence: &[&str]) -> ImprovementCandidate {
         replay_plan(),
         BTreeMap::new(),
     )
-    .expect("fixture candidate validates")
+    .expect("fixture candidate validates");
+    candidate.set_details(
+        "retrieval regret above threshold",
+        vec!["oversized context window".to_string()],
+        BTreeMap::from([("cost-1869".to_string(), 1.0)]),
+        "memory retrieval",
+        "governor-1869",
+        "work-item-1869",
+        "canary-1869",
+        "rollback-1869",
+        "stop on cost regression",
+    );
+    candidate
 }
 
 fn policy(max_active: usize) -> CandidateBoundPolicy {

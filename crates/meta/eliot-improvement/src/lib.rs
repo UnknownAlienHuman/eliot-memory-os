@@ -11,8 +11,13 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod application_class;
+pub mod brief;
+pub mod budget_proof;
 pub mod candidate_bounds;
+pub mod evidence_sources;
 pub mod governed_screen;
+pub mod intake;
 pub mod learning_closure;
 pub mod overlay_policy_routing;
 pub mod producer;
@@ -27,6 +32,23 @@ pub use producer::{
 };
 
 pub mod promotion_input;
+
+pub use application_class::{
+    ApplicationClass, ChangeDescriptor, check_class_gate, classify, is_prohibited_tuning_surface,
+};
+pub use brief::{
+    ImprovementBrief, OwnerDecision, OwnerDecisionKind, SafeBoundary, brief_at_safe_boundary,
+    record_owner_decision,
+};
+pub use budget_proof::{
+    BudgetProof, ComplexityEconomicsDelta, require_matched_budget_for_promotion,
+    stamp_outcome_budget,
+};
+pub use evidence_sources::{
+    EvidenceSource, SourcedEvidence, candidate_from_evidence, sourced_evidence,
+    sourced_evidence_from_repeated_verifier_failure,
+};
+pub use intake::{IntakeOutcome, IntakeRequest, intake_from_evidence};
 
 pub use promotion_input::{
     AGENT_ORDER, CAUSAL_PROPERTY, ClosureBinding, MODULE_ID, PriorPromotionHistory,
@@ -66,6 +88,41 @@ impl CandidateState {
     }
 }
 
+/// Owner-decision lifecycle of an improvement candidate (I12.24:36-37).
+///
+/// `CandidateState` above tracks the advisory pipeline position (candidate,
+/// replay, evaluation); this enum tracks the named owner decision lifecycle
+/// from proposal to terminal disposition. Both are stored on the candidate so
+/// deduplication, briefs, and promotion gates observe the full lineage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementLifecycle {
+    Proposed,
+    Triaged,
+    AcceptedForExperiment,
+    Running,
+    Supported,
+    Narrowed,
+    Rejected,
+    RolledBack,
+    Stale,
+    Archived,
+}
+
+impl ImprovementLifecycle {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Supported
+                | Self::Narrowed
+                | Self::Rejected
+                | Self::RolledBack
+                | Self::Stale
+                | Self::Archived
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReplayPlan {
     pub fixed_replay_refs: Vec<String>,
@@ -101,6 +158,26 @@ pub struct ImprovementCandidate {
     pub replay_plan: ReplayPlan,
     pub baseline_metrics: BTreeMap<String, f64>,
     pub state: CandidateState,
+    /// I12.24 trigger: problem statement or metric that raised the candidate.
+    pub trigger_problem_or_metric: String,
+    /// I12.24 root-cause hypotheses carried with the candidate.
+    pub root_cause_hypotheses: Vec<String>,
+    /// I12.24 counter-metrics that must not regress.
+    pub counter_metrics: BTreeMap<String, f64>,
+    /// I12.24 validity scope of the proposed change.
+    pub validity_scope: String,
+    /// I12.24 owner and decision authority for this candidate.
+    pub owner_and_decision_authority: String,
+    /// I12.24 delivery target (work item / module / config path).
+    pub delivery_target: String,
+    /// I12.24 canary plan reference.
+    pub canary_plan: String,
+    /// I12.24 rollback reference.
+    pub rollback: String,
+    /// I12.24 stop condition for the experiment.
+    pub stop_condition: String,
+    /// I12.24 owner-decision lifecycle (proposed .. archived).
+    pub lifecycle: ImprovementLifecycle,
     pub revision: u64,
     pub advisory_only: bool,
     pub created_at: OffsetDateTime,
@@ -136,16 +213,82 @@ impl ImprovementCandidate {
             replay_plan,
             baseline_metrics,
             state: CandidateState::Candidate,
+            trigger_problem_or_metric: String::new(),
+            root_cause_hypotheses: Vec::new(),
+            counter_metrics: BTreeMap::new(),
+            validity_scope: String::new(),
+            owner_and_decision_authority: String::new(),
+            delivery_target: String::new(),
+            canary_plan: String::new(),
+            rollback: String::new(),
+            stop_condition: String::new(),
+            lifecycle: ImprovementLifecycle::Proposed,
             revision: 0,
             advisory_only: true,
             created_at: now,
             updated_at: now,
         };
-        candidate.validate()?;
+        candidate.validate_base()?;
         Ok(candidate)
     }
 
+    /// Attach the I12.24 decision fields after construction.
+    ///
+    /// All fields are public, so evidence adapters (see
+    /// [`crate::evidence_sources::candidate_from_evidence`]) may also assign
+    /// them directly; this helper keeps the assignment in one place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_details(
+        &mut self,
+        trigger_problem_or_metric: impl Into<String>,
+        root_cause_hypotheses: Vec<String>,
+        counter_metrics: BTreeMap<String, f64>,
+        validity_scope: impl Into<String>,
+        owner_and_decision_authority: impl Into<String>,
+        delivery_target: impl Into<String>,
+        canary_plan: impl Into<String>,
+        rollback: impl Into<String>,
+        stop_condition: impl Into<String>,
+    ) {
+        self.trigger_problem_or_metric = trigger_problem_or_metric.into();
+        self.root_cause_hypotheses = root_cause_hypotheses;
+        self.counter_metrics = counter_metrics;
+        self.validity_scope = validity_scope.into();
+        self.owner_and_decision_authority = owner_and_decision_authority.into();
+        self.delivery_target = delivery_target.into();
+        self.canary_plan = canary_plan.into();
+        self.rollback = rollback.into();
+        self.stop_condition = stop_condition.into();
+        self.updated_at = OffsetDateTime::now_utc();
+    }
+
     pub fn validate(&self) -> Result<(), ImprovementError> {
+        self.validate_base()?;
+        non_empty(&self.trigger_problem_or_metric, "trigger_problem_or_metric")?;
+        require_names(&self.root_cause_hypotheses, "root_cause_hypotheses")?;
+        if self
+            .counter_metrics
+            .values()
+            .any(|value| !value.is_finite())
+        {
+            return Err(ImprovementError::NonFiniteMetric);
+        }
+        non_empty(&self.validity_scope, "validity_scope")?;
+        non_empty(
+            &self.owner_and_decision_authority,
+            "owner_and_decision_authority",
+        )?;
+        non_empty(&self.delivery_target, "delivery_target")?;
+        non_empty(&self.canary_plan, "canary_plan")?;
+        non_empty(&self.rollback, "rollback")?;
+        non_empty(&self.stop_condition, "stop_condition")?;
+        Ok(())
+    }
+
+    /// Base structural checks that hold for every candidate, including
+    /// freshly constructed ones whose I12.24 decision details are attached
+    /// later via [`Self::set_details`].
+    fn validate_base(&self) -> Result<(), ImprovementError> {
         non_empty(&self.project_id, "project_id")?;
         non_empty(&self.proposed_change, "proposed_change")?;
         require_refs(&self.source_trace_refs, "source_trace_refs")?;
@@ -207,6 +350,76 @@ impl ImprovementCandidate {
         Ok(())
     }
 
+    /// Move the owner-decision lifecycle forward (I12.24:36-37).
+    ///
+    /// Terminal lifecycles admit no outgoing transition. The advisory
+    /// `CandidateState` machine is untouched; lifecycle transitions only
+    /// refresh `updated_at` and never touch `revision`, so pipeline guards
+    /// keep their exact semantics.
+    pub fn transition_lifecycle(
+        &mut self,
+        next: ImprovementLifecycle,
+    ) -> Result<(), ImprovementError> {
+        let allowed = matches!(
+            (self.lifecycle, next),
+            (
+                ImprovementLifecycle::Proposed,
+                ImprovementLifecycle::Triaged
+            ) | (
+                ImprovementLifecycle::Triaged,
+                ImprovementLifecycle::AcceptedForExperiment
+            ) | (
+                ImprovementLifecycle::AcceptedForExperiment,
+                ImprovementLifecycle::Running
+            ) | (
+                ImprovementLifecycle::Running,
+                ImprovementLifecycle::Supported
+            ) | (
+                ImprovementLifecycle::Running,
+                ImprovementLifecycle::Narrowed
+            ) | (
+                ImprovementLifecycle::Running,
+                ImprovementLifecycle::Rejected
+            ) | (
+                ImprovementLifecycle::Running,
+                ImprovementLifecycle::RolledBack
+            ) | (
+                ImprovementLifecycle::Triaged,
+                ImprovementLifecycle::Rejected
+            ) | (
+                ImprovementLifecycle::Proposed,
+                ImprovementLifecycle::Rejected
+            ) | (ImprovementLifecycle::Proposed, ImprovementLifecycle::Stale)
+                | (ImprovementLifecycle::Triaged, ImprovementLifecycle::Stale)
+                | (
+                    ImprovementLifecycle::Narrowed,
+                    ImprovementLifecycle::Archived
+                )
+                | (
+                    ImprovementLifecycle::Supported,
+                    ImprovementLifecycle::Archived
+                )
+                | (
+                    ImprovementLifecycle::Rejected,
+                    ImprovementLifecycle::Archived
+                )
+                | (
+                    ImprovementLifecycle::RolledBack,
+                    ImprovementLifecycle::Archived
+                )
+                | (ImprovementLifecycle::Stale, ImprovementLifecycle::Archived)
+        );
+        if !allowed {
+            return Err(ImprovementError::InvalidLifecycleTransition {
+                from: self.lifecycle,
+                to: next,
+            });
+        }
+        self.lifecycle = next;
+        self.updated_at = OffsetDateTime::now_utc();
+        Ok(())
+    }
+
     pub fn promotion_input(
         &self,
         outcome: OutcomeEvidence,
@@ -243,6 +456,25 @@ pub struct OutcomeEvidence {
     pub evidence_refs: Vec<String>,
     pub observed_metrics: BTreeMap<String, f64>,
     pub counter_metrics: BTreeMap<String, f64>,
+    /// Canonical budget-equivalence ledger binding (I12.24:76, I18.47).
+    ///
+    /// Names the single `BudgetEquivalenceLedger` record this outcome is
+    /// compared under. Replay-only outcomes leave it empty and are refused
+    /// promotion by [`OutcomeEvidence::validate_for`].
+    pub budget_ledger_ref: String,
+    /// Complexity-economics delta record (I12.24:76, I18.47).
+    pub complexity_delta_ref: String,
+    /// Whether the bound complexity-economics delta is conclusive.
+    /// An inconclusive delta never promotes, however good replay looks.
+    pub economics_conclusive: bool,
+    /// Affected checks evaluated under the matched budget.
+    pub affected_check_refs: Vec<String>,
+    /// Matched-budget live shadow evidence refs.
+    pub live_shadow_refs: Vec<String>,
+    /// Matched-budget live canary evidence refs.
+    pub live_canary_refs: Vec<String>,
+    /// Delayed-harm visibility window reference.
+    pub delayed_harm_window_ref: String,
 }
 
 impl OutcomeEvidence {
@@ -290,6 +522,42 @@ impl OutcomeEvidence {
             .any(|value| !value.is_finite())
         {
             return Err(ImprovementError::NonFiniteMetric);
+        }
+        // I12.24:76 promotion gate: replay-only evidence never promotes.
+        // A promotion-bound outcome must bind the single canonical
+        // budget-equivalence ledger and a conclusive complexity-economics
+        // delta, name the affected checks, carry matched-budget live
+        // shadow/canary evidence, and expose delayed-harm visibility.
+        if self.budget_ledger_ref.trim().is_empty() {
+            return Err(ImprovementError::MissingBudgetProof);
+        }
+        if self.complexity_delta_ref.trim().is_empty() {
+            return Err(ImprovementError::MissingBudgetProof);
+        }
+        if !self.economics_conclusive {
+            return Err(ImprovementError::BudgetGateViolation(
+                "inconclusive complexity-economics delta cannot promote",
+            ));
+        }
+        if self.affected_check_refs.is_empty()
+            || self
+                .affected_check_refs
+                .iter()
+                .any(|value| value.trim().is_empty())
+        {
+            return Err(ImprovementError::BudgetGateViolation(
+                "promotion requires affected checks under the matched budget",
+            ));
+        }
+        if self.live_shadow_refs.is_empty() && self.live_canary_refs.is_empty() {
+            return Err(ImprovementError::BudgetGateViolation(
+                "promotion requires matched-budget live shadow or canary evidence",
+            ));
+        }
+        if self.delayed_harm_window_ref.trim().is_empty() {
+            return Err(ImprovementError::BudgetGateViolation(
+                "promotion requires delayed-harm visibility",
+            ));
         }
         Ok(())
     }
@@ -375,4 +643,19 @@ pub enum ImprovementError {
     OutcomeOutsidePlan,
     #[error("outcome contains an undeclared counter metric")]
     UnknownCounterMetric,
+    #[error("invalid owner lifecycle transition from {from:?} to {to:?}")]
+    InvalidLifecycleTransition {
+        from: ImprovementLifecycle,
+        to: ImprovementLifecycle,
+    },
+    #[error("brief requires an active Main Agent or Human at a safe boundary")]
+    UnsafeBoundary,
+    #[error("application-class boundary refused the change")]
+    ApplicationClassViolation,
+    #[error("promotion requires a bound budget-equivalence and economics record")]
+    MissingBudgetProof,
+    #[error("budget gate refused promotion: {0}")]
+    BudgetGateViolation(&'static str),
+    #[error("backlog refused intake: {0}")]
+    BacklogRefused(String),
 }
