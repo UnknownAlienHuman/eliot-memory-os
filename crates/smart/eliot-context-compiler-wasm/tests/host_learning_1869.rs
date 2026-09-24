@@ -25,7 +25,7 @@ use eliot_contracts::{
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_governor::{
     Governor, GovernorConfig, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
-    QueueLimits, issue_learning_admission,
+    QueueLimits, issue_learning_admission, verify_learning_admission,
 };
 use eliot_improvement::candidate_bounds::{AdmitOutcome, BoundedBacklog, CandidateBoundPolicy};
 use eliot_improvement::{
@@ -373,8 +373,26 @@ fn live_chain() -> Chain {
     )
     .expect("fixture candidate validates");
     let candidate_id = candidate.candidate_id.clone();
+    let permit = issue_learning_admission(
+        &governor,
+        &LearningAdmissionClaim {
+            schema_version: LEARNING_ADMISSION_SCHEMA_VERSION,
+            source_campaign_id: CAMPAIGN_1869.to_string(),
+            target_task_id: TASK_1869.to_string(),
+            fence: fence.clone(),
+            overlay_id: Some(OVERLAY_1869.to_string()),
+            candidate_id: Some(candidate_id.clone()),
+            scope_ref: "scope-1869".to_string(),
+            authority_ref: "governor-1869".to_string(),
+            retention_ref: "retention-1869".to_string(),
+            evaluator_ref: "evaluator-1869-a".to_string(),
+            rollback_ref: "rollback-1869".to_string(),
+        },
+    )
+    .expect("owner issues");
+    let verified = verify_learning_admission(&governor, &permit, &fence).expect("owner verifies");
     assert!(matches!(
-        backlog.admit(candidate, 3.0, Some("governor-1869".to_string())),
+        backlog.admit_governed(candidate, 3.0, Some("governor-1869".to_string()), &verified,),
         Ok(AdmitOutcome::Admitted { .. })
     ));
     Chain {

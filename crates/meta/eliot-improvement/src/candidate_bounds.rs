@@ -170,6 +170,12 @@ pub enum ArchiveCause {
 pub struct BoundedBacklog {
     policies: Vec<CandidateBoundPolicy>,
     entries: Vec<TrackedCandidate>,
+    /// Append-only archive history. Archived entries remain in `entries` as
+    /// terminal lifecycle records, while this projection makes the archival
+    /// decision independently observable and prevents a later capacity pass
+    /// from looking like a silent eviction.
+    #[serde(default)]
+    archives: Vec<ArchivedCandidate>,
 }
 
 impl BoundedBacklog {
@@ -180,6 +186,7 @@ impl BoundedBacklog {
         Ok(Self {
             policies,
             entries: Vec::new(),
+            archives: Vec::new(),
         })
     }
 
@@ -208,6 +215,119 @@ impl BoundedBacklog {
         self.entries.iter().find(|entry| {
             entry.candidate.candidate_id == candidate_id && entry.candidate.state.is_experimental()
         })
+    }
+
+    /// Returns the retained terminal/active row for readback, including an
+    /// archived row. Unlike [`Self::entry_for`], this never filters by
+    /// advisory state; it is the history inspection surface.
+    #[must_use]
+    pub fn retained_entry_for(&self, candidate_id: &str) -> Option<&TrackedCandidate> {
+        self.entries
+            .iter()
+            .find(|entry| entry.candidate.candidate_id == candidate_id)
+    }
+
+    /// Returns the append-only archive projection in transition order.
+    ///
+    /// An archive record is retained even though the corresponding candidate
+    /// is no longer active. This is the readback surface for operators and
+    /// later policy evaluation; it is not a second candidate registry.
+    #[must_use]
+    pub fn archives(&self) -> &[ArchivedCandidate] {
+        &self.archives
+    }
+
+    /// Installs the owner-derived policy for a surface, or verifies that the
+    /// already-installed policy is byte-for-byte equivalent.
+    ///
+    /// A daemon may discover a policy lazily when its first owner-bound
+    /// request arrives. It may not silently replace a policy after active
+    /// entries exist: a changed authority or revision is a fail-closed owner
+    /// transition, not a caller-controlled mutation.
+    pub fn install_policy(&mut self, policy: CandidateBoundPolicy) -> Result<(), BoundsError> {
+        policy.validate()?;
+        if let Some(existing) = self
+            .policies
+            .iter()
+            .find(|existing| existing.target_surface == policy.target_surface)
+        {
+            if existing != &policy {
+                return Err(BoundsError::InvalidPolicy(
+                    "an installed surface policy cannot be replaced by a different owner revision",
+                ));
+            }
+            return Ok(());
+        }
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.candidate.target_surface == policy.target_surface)
+        {
+            return Err(BoundsError::InvalidPolicy(
+                "a policy cannot be introduced after entries exist for its surface",
+            ));
+        }
+        self.policies.push(policy);
+        Ok(())
+    }
+
+    /// Sweeps every currently ineligible entry on one surface and returns
+    /// the explicit archive records. The selection is deliberately narrow:
+    /// stale lifecycle, absent owner, or value below the installed floor;
+    /// owned/high-value rows are never selected.
+    pub fn archive_ineligible(
+        &mut self,
+        surface: ImprovementSurface,
+    ) -> Result<Vec<ArchivedCandidate>, BoundsError> {
+        let floor = self.policy_for(surface)?.min_value;
+        let selected = self
+            .active_for(surface)
+            .into_iter()
+            .filter_map(|entry| {
+                let cause = if entry.candidate.lifecycle == crate::ImprovementLifecycle::Stale {
+                    Some(ArchiveCause::Stale)
+                } else if entry.owner.is_none() {
+                    Some(ArchiveCause::Ownerless)
+                } else if entry.value < floor {
+                    Some(ArchiveCause::LowValue)
+                } else {
+                    None
+                };
+                cause.map(|cause| (entry.candidate.candidate_id.clone(), cause))
+            })
+            .collect::<Vec<_>>();
+        let mut archived = Vec::with_capacity(selected.len());
+        for (candidate_id, cause) in selected {
+            let summary = format!(
+                "bounded backlog sweep archived {cause:?} candidate {candidate_id} with explicit lifecycle transition"
+            );
+            archived.push(self.archive(&candidate_id, cause, summary)?);
+        }
+        Ok(archived)
+    }
+
+    /// Mark an active candidate stale through the explicit owner lifecycle.
+    ///
+    /// This is a lifecycle transition, not an eviction. The candidate remains
+    /// in the bounded registry until an owner-authorized archive sweep records
+    /// its summary, so stale history cannot disappear as a side effect of the
+    /// capacity check.
+    pub fn mark_stale(&mut self, candidate_id: &str) -> Result<(), BoundsError> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.candidate.candidate_id == candidate_id)
+            .ok_or(BoundsError::UnknownCandidate)?;
+        if !entry.candidate.state.is_experimental() {
+            return Err(BoundsError::NotActive);
+        }
+        if entry.candidate.lifecycle == crate::ImprovementLifecycle::Stale {
+            return Ok(());
+        }
+        entry
+            .candidate
+            .transition_lifecycle(crate::ImprovementLifecycle::Stale)
+            .map_err(BoundsError::Candidate)
     }
 
     /// Admit a candidate: dedup-merge on overlapping canonical evidence
@@ -388,6 +508,11 @@ impl BoundedBacklog {
                 return Err(BoundsError::NotActive);
             }
             match cause {
+                ArchiveCause::Stale
+                    if entry.candidate.lifecycle != crate::ImprovementLifecycle::Stale =>
+                {
+                    return Err(BoundsError::ArchiveCauseMismatch);
+                }
                 ArchiveCause::Ownerless if entry.owner.is_some() => {
                     return Err(BoundsError::ArchiveCauseMismatch);
                 }
@@ -402,7 +527,8 @@ impl BoundedBacklog {
         }
         let entry = &mut self.entries[index];
         retire_candidate(&mut entry.candidate).map_err(BoundsError::Candidate)?;
-        Ok(ArchivedCandidate {
+        archive_candidate_lifecycle(&mut entry.candidate).map_err(BoundsError::Candidate)?;
+        let archived = ArchivedCandidate {
             candidate_id: entry.candidate.candidate_id.clone(),
             target_surface: entry.candidate.target_surface,
             cause,
@@ -410,7 +536,9 @@ impl BoundedBacklog {
             merged_from: entry.merged_from.clone(),
             evidence_lineage: canonical_evidence_lineage(&entry.candidate.evidence_refs),
             archived_revision: entry.candidate.revision,
-        })
+        };
+        self.archives.push(archived.clone());
+        Ok(archived)
     }
 }
 
@@ -434,6 +562,33 @@ fn retire_candidate(candidate: &mut ImprovementCandidate) -> Result<(), crate::I
         CandidateState::Retired => {}
     }
     Ok(())
+}
+
+/// Complete the owner-decision lifecycle with an explicit archive state.
+///
+/// The advisory state machine and the owner lifecycle are deliberately
+/// separate. Archiving therefore retires the advisory state first, then uses
+/// only legal owner-lifecycle edges to reach `Archived`; it never invents a
+/// new lifecycle or leaves a terminal record looking merely rejected.
+fn archive_candidate_lifecycle(
+    candidate: &mut ImprovementCandidate,
+) -> Result<(), crate::ImprovementError> {
+    use crate::ImprovementLifecycle;
+    match candidate.lifecycle {
+        ImprovementLifecycle::Proposed
+        | ImprovementLifecycle::Triaged
+        | ImprovementLifecycle::AcceptedForExperiment
+        | ImprovementLifecycle::Running => {
+            candidate.transition_lifecycle(ImprovementLifecycle::Rejected)?;
+        }
+        ImprovementLifecycle::Rejected
+        | ImprovementLifecycle::Supported
+        | ImprovementLifecycle::Narrowed
+        | ImprovementLifecycle::RolledBack
+        | ImprovementLifecycle::Stale => {}
+        ImprovementLifecycle::Archived => return Ok(()),
+    }
+    candidate.transition_lifecycle(ImprovementLifecycle::Archived)
 }
 
 // ---------------------------------------------------------------------------
@@ -856,8 +1011,15 @@ pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDeci
         if Some(candidate.candidate_id.as_str()) != permit.candidate_id() {
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }
-        if request.backlog.entry_for(&candidate.candidate_id).is_none() {
-            return Err(BoundsError::NotBacklogAdmitted);
+        let retained = request
+            .backlog
+            .entry_for(&candidate.candidate_id)
+            .ok_or(BoundsError::NotBacklogAdmitted)?;
+        if retained.admitted_under_authority.as_deref() != Some(permit.authority_ref()) {
+            return Err(BoundsError::GovernorAuthorityUnconfirmed);
+        }
+        if retained.owner.as_deref() != candidate.owner.as_deref() {
+            return Err(BoundsError::GovernorAuthorityUnconfirmed);
         }
         reusable_candidate_id = Some(candidate.candidate_id.clone());
         reusable_origin = Some(candidate.origin_campaign_id.as_str());

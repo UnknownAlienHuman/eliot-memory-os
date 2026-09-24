@@ -50,7 +50,12 @@ fn admission_error_to_guest(error: &LearningAdmissionError) -> GuestError {
         }
         LearningAdmissionError::StaleAuthorityEpoch
         | LearningAdmissionError::GenerationMismatch
-        | LearningAdmissionError::DigestMismatch => GuestError::IdentityConflict,
+        | LearningAdmissionError::DigestMismatch
+        | LearningAdmissionError::OwnerEvidenceMismatch(_)
+        | LearningAdmissionError::InvalidTargetTask => GuestError::IdentityConflict,
+        LearningAdmissionError::OwnerEvidenceUnavailable(_) => {
+            GuestError::RejectedEnvelope("learning.owner-evidence-unavailable".to_owned())
+        }
     }
 }
 
@@ -86,6 +91,14 @@ pub fn compile_learning_context(
     }
     if !fences_match_exact(&request.input.binding.state_fence, permit.fence()) {
         return refused(request, GuestError::InvalidFence);
+    }
+    for ticket in &request.input.learning_tickets {
+        if let Err(error) = ticket.validate() {
+            return refused(request, GuestError::from(&error));
+        }
+        if ticket.digest.as_str() != permit.digest() {
+            return refused(request, GuestError::IdentityConflict);
+        }
     }
     let verified =
         match verify_learning_admission(governor, permit, &request.input.binding.state_fence) {

@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,12 +15,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentResult, EffectCeiling, ProviderExecutionBinding, ResultDisposition,
 };
+use eliot_context_assembly::AssemblyPolicy;
+use eliot_context_contracts::{AdmissionInput, ContextRecipe, QualityScorecard};
 use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
 use eliot_governor::{
     CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
     FinishDecisionReceipt, GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig,
     KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
 };
+use eliot_improvement::{LearningProduction, PresentedLearning};
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{AgentActivationResolutionResult, AgentActivationResolutionTicket};
@@ -53,6 +56,7 @@ mod dreamer_model_adapter;
 mod experience_runtime;
 mod first_run_wiring;
 mod freshness_admission;
+mod governed_context;
 mod governor_local_read;
 pub mod improvement_intake;
 mod kernel_authority_client;
@@ -158,6 +162,7 @@ pub use freshness_admission::{
     RequestedEffect, ReusableCandidateView, RevisionHead, TaskCompatibility,
     evaluate_freshness_admission, fetch_committed_candidate, normalize_heads,
 };
+pub use governed_context::{NativeComposeError, NativeGovernedCompilation};
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
     serve_admitted_local_read,
@@ -410,6 +415,12 @@ pub struct DaemonComposition {
     /// execute. Semantics stay in the Governor registry; this is the
     /// composition root's handle on that view.
     capability_admission: GovernorCapabilityAdmission,
+    /// The single daemon-owned bounded learning backlog. Meta intake and
+    /// archive history live here; no caller retains a second mutable copy.
+    improvement_backlog: eliot_improvement::candidate_bounds::BoundedBacklog,
+    /// Bounded owner-bound intake events drained by the existing daemon loop.
+    pending_governed_improvement_intakes:
+        VecDeque<improvement_intake::GovernedImprovementIntakeEvent>,
 }
 
 impl DaemonComposition {
@@ -473,7 +484,67 @@ impl DaemonComposition {
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
+            improvement_backlog: eliot_improvement::candidate_bounds::BoundedBacklog::default(),
+            pending_governed_improvement_intakes: VecDeque::new(),
         })
+    }
+
+    /// Run the native governed Context Compiler path over the retained
+    /// daemon backlog.
+    ///
+    /// The composition checks three owner boundaries before the pure native
+    /// composer runs: the presented Governor handle is this composition's
+    /// live handle, both presented/production backlog references are the one
+    /// retained daemon backlog, and the permit still matches the current
+    /// canonical/task/policy/evaluator owner projection. A generic caller
+    /// string can therefore never substitute a different registry or
+    /// authority channel.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "native context delivery preserves the complete owner-bound retrieval/admission/assembly closure"
+    )]
+    pub fn compose_governed_context<F>(
+        &self,
+        production: LearningProduction<'_>,
+        presented: PresentedLearning<'_>,
+        input: AdmissionInput,
+        recipe: &ContextRecipe,
+        quality: QualityScorecard,
+        policy: &AssemblyPolicy,
+        measure: F,
+    ) -> Result<governed_context::NativeGovernedCompilation, governed_context::NativeComposeError>
+    where
+        F: FnOnce(
+            &[u8],
+        ) -> Result<
+            eliot_context_contracts::SerializedContextMeasurement,
+            eliot_context_contracts::ContextError,
+        >,
+    {
+        if !std::ptr::eq(presented.governor, self.governor.governor()) {
+            return Err(governed_context::NativeComposeError::Owner(
+                eliot_governor::LearningAdmissionError::OwnerEvidenceMismatch("governor_handle"),
+            ));
+        }
+        if !std::ptr::eq(
+            production.backlog,
+            std::ptr::from_ref(&self.improvement_backlog),
+        ) || !std::ptr::eq(
+            presented.backlog,
+            std::ptr::from_ref(&self.improvement_backlog),
+        ) {
+            return Err(governed_context::NativeComposeError::Owner(
+                eliot_governor::LearningAdmissionError::OwnerEvidenceMismatch("retained_backlog"),
+            ));
+        }
+        let permit = presented.verified.permit();
+        let fence = self.governor.kernel_snapshot().state_fence();
+        self.governor
+            .verify_learning_admission_for_owner(permit, &fence)
+            .map_err(governed_context::NativeComposeError::Owner)?;
+        governed_context::compose_governed_native_context(
+            production, presented, input, recipe, quality, policy, measure,
+        )
     }
 
     /// Commits one Canonical-admitted transition under the exact admitted

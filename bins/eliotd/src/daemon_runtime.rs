@@ -646,6 +646,30 @@ impl LoopCadence {
     }
 }
 
+async fn drive_governed_improvement_intake(composition: &SharedComposition) {
+    let mut guard = composition.lock().await;
+    match guard.drive_governed_improvement_intake_once() {
+        Ok(Some(outcome)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.governed_improvement_intake_admitted",
+                candidate_id = %outcome.candidate_id,
+                merged = outcome.merged_into.is_some(),
+                archived = outcome.archived_candidate.is_some(),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "governed-improvement-intake",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
+}
+
 async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -686,6 +710,11 @@ async fn run_loop(
                 return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
+                // The owner-bound Meta intake queue rides the existing
+                // activation tick. It is a bounded drain, not a second
+                // scheduler: the daemon composition remains the sole owner
+                // of the backlog and pending events.
+                drive_governed_improvement_intake(&composition).await;
                 // The local-read poller rides the same tick under its own
                 // gate: it must start even while an activation is in flight,
                 // so its gate is checked before the activation early-continue.

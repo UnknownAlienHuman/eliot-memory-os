@@ -48,7 +48,10 @@ pub use evidence_sources::{
     EvidenceSource, SourcedEvidence, candidate_from_evidence, sourced_evidence,
     sourced_evidence_from_repeated_verifier_failure,
 };
-pub use intake::{IntakeOutcome, IntakeRequest, intake_from_evidence};
+pub use intake::{
+    IntakeOutcome, IntakeRequest, PreparedIntake, admit_prepared_intake, intake_from_evidence,
+    intake_from_evidence_governed, prepare_intake, prepare_intake_for_owner,
+};
 
 pub use promotion_input::{
     AGENT_ORDER, CAUSAL_PROPERTY, ClosureBinding, MODULE_ID, PriorPromotionHistory,
@@ -385,6 +388,9 @@ impl ImprovementCandidate {
                 ImprovementLifecycle::RolledBack
             ) | (
                 ImprovementLifecycle::Triaged,
+                ImprovementLifecycle::Rejected
+            ) | (
+                ImprovementLifecycle::AcceptedForExperiment,
                 ImprovementLifecycle::Rejected
             ) | (
                 ImprovementLifecycle::Proposed,

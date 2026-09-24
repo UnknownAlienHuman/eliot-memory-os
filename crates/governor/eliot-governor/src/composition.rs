@@ -25,7 +25,9 @@ use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
     FinishAttemptError, Governor, GovernorConfig, GovernorFinishAttempt, GovernorState,
-    QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
+    LearningAdmissionError, LearningAdmissionOwnerRecord, LearningAdmissionPermit,
+    LearningAdmissionRequest, QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
+    VerifiedLearningAdmission, issue_learning_admission, verify_learning_admission,
 };
 use eliot_authority::{
     GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
@@ -40,7 +42,8 @@ use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
-    ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+    ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, fences_match_exact,
+    sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
 use eliot_diagnostic::{
@@ -71,7 +74,7 @@ use eliot_store_api::{
     CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
     ScopeRevisionView, StoreHealth, WriteReceipt,
 };
-use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
+use eliot_task::{TaskCommand, TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
 use eliot_testd_core::{
     JobState, RawArtifactStream, ReceiptBinding, TestJob, TestdSourceObservation,
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
@@ -3628,6 +3631,143 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub fn governor(&self) -> &Governor {
         &self.governor
+    }
+
+    /// Projects the owner evidence required for a learning permit for one
+    /// current task. Missing task, plan, policy, evaluator, or action
+    /// authorization is deliberately unavailable rather than synthesized.
+    fn learning_admission_owner_record_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<LearningAdmissionOwnerRecord, LearningAdmissionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(LearningAdmissionError::OwnerEvidenceUnavailable(
+                "composition_readiness",
+            ));
+        }
+        let fence = self.snapshot.state_fence();
+        let task = self
+            .owners
+            .task
+            .task(task_id)
+            .ok_or(LearningAdmissionError::OwnerEvidenceUnavailable("task"))?;
+        if task.task_id != *task_id
+            || task.state_fence != fence
+            || !matches!(
+                task.state,
+                TaskState::ActionAuthorized | TaskState::Executing | TaskState::Verifying
+            )
+        {
+            return Err(LearningAdmissionError::OwnerEvidenceMismatch("task_owner"));
+        }
+        let plan = self
+            .owners
+            .canonical
+            .read_current_plan(&fence)
+            .map_err(|_| LearningAdmissionError::OwnerEvidenceUnavailable("canonical_plan"))?;
+        if plan.task_id != *task_id {
+            return Err(LearningAdmissionError::OwnerEvidenceMismatch(
+                "canonical_plan_task",
+            ));
+        }
+        let verifier =
+            plan.verifier
+                .as_ref()
+                .ok_or(LearningAdmissionError::OwnerEvidenceUnavailable(
+                    "canonical_plan_verifier",
+                ))?;
+        let policy = self
+            .owners
+            .policy
+            .as_ref()
+            .ok_or(LearningAdmissionError::OwnerEvidenceUnavailable("policy"))?;
+        if policy.snapshot().scope_id != plan.work_scope_id {
+            return Err(LearningAdmissionError::OwnerEvidenceMismatch(
+                "policy_scope",
+            ));
+        }
+        let rollback_ref = self
+            .owners
+            .task
+            .events()
+            .iter()
+            .rev()
+            .find_map(|event| {
+                if event.task_id != *task_id || event.state_fence != fence {
+                    return None;
+                }
+                match &event.command {
+                    Some(TaskCommand::AuthorizeAction { authority_ref, .. }) => {
+                        Some(authority_ref.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .ok_or(LearningAdmissionError::OwnerEvidenceUnavailable(
+                "task_action_authority",
+            ))?;
+        LearningAdmissionOwnerRecord::from_owner_projection(
+            fence,
+            plan.work_scope_id,
+            policy.snapshot().policy_owner.owner_ref.clone(),
+            policy.snapshot().snapshot_id.clone(),
+            verifier.evaluator.as_str().to_owned(),
+            rollback_ref,
+            policy.revision(),
+        )
+    }
+
+    /// Returns the current owner projection used by strict learning admission.
+    ///
+    /// The returned record is evidence, not an authority token. Callers must
+    /// use the issuance/verification methods below so all five revalidation
+    /// refs are re-read from this composition at the live fence.
+    pub fn learning_admission_owner_record(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<LearningAdmissionOwnerRecord, CompositionError> {
+        self.learning_admission_owner_record_for_task(task_id)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Issues a learning permit only after projecting all authority-bearing
+    /// fields from the current task, canonical plan, policy, and evaluator
+    /// owners. Requester strings are identities to match, never authorization.
+    pub fn issue_learning_admission_for_owner(
+        &self,
+        request: &LearningAdmissionRequest,
+    ) -> Result<LearningAdmissionPermit, LearningAdmissionError> {
+        request.validate()?;
+        let task_id = TaskId::new(request.target_task_id.clone())
+            .map_err(|_| LearningAdmissionError::InvalidTargetTask)?;
+        let owner = self.learning_admission_owner_record_for_task(&task_id)?;
+        let fence = self.snapshot.state_fence();
+        let claim = owner.claim_for(request, &fence)?;
+        issue_learning_admission(&self.governor, &claim)
+    }
+
+    /// Revalidates a permit against both live Governor state and the current
+    /// owner projection before a learning-derived value can be delivered.
+    pub fn verify_learning_admission_for_owner<'a>(
+        &self,
+        permit: &'a LearningAdmissionPermit,
+        current_fence: &StateFence,
+    ) -> Result<VerifiedLearningAdmission<'a>, LearningAdmissionError> {
+        let task_id = TaskId::new(permit.target_task_id().to_owned())
+            .map_err(|_| LearningAdmissionError::InvalidTargetTask)?;
+        let owner = self.learning_admission_owner_record_for_task(&task_id)?;
+        if !fences_match_exact(current_fence, owner.state_fence())
+            || permit.scope_ref() != owner.scope_ref()
+            || permit.authority_ref() != owner.authority_ref()
+            || permit.retention_ref() != owner.retention_ref()
+            || permit.evaluator_ref() != owner.evaluator_ref()
+            || permit.rollback_ref() != owner.rollback_ref()
+        {
+            return Err(LearningAdmissionError::OwnerEvidenceMismatch(
+                "current_owner_projection",
+            ));
+        }
+        verify_learning_admission(&self.governor, permit, current_fence)
     }
 
     /// Compiles the `ControlBoard` read projection over the current owners.

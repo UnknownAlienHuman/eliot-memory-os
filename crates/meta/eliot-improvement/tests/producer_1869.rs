@@ -277,6 +277,10 @@ fn archived_candidate_cannot_be_produced() {
         .expect("live owner verifies");
     setup
         .backlog
+        .mark_stale(&setup.candidate_id)
+        .expect("candidate enters the stale lifecycle before archival");
+    setup
+        .backlog
         .archive(
             &setup.candidate_id.clone(),
             ArchiveCause::Stale,

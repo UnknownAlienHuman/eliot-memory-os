@@ -110,6 +110,172 @@ impl LearningAdmissionClaim {
     }
 }
 
+/// Request for an owner-bound learning permit. Unlike
+/// [`LearningAdmissionClaim`], this request carries no authority-bearing
+/// strings. The Governor composition fills scope, authority, retention,
+/// evaluator, and rollback from its retained owner projections before minting.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningAdmissionRequest {
+    /// Source campaign subject identity; issuance derives its authority from
+    /// the current owner projection rather than trusting this string.
+    pub source_campaign_id: String,
+    /// Target task subject identity; the Governor resolves its current owner
+    /// record before issuing.
+    pub target_task_id: String,
+    /// Optional overlay subject identity.
+    pub overlay_id: Option<String>,
+    /// Optional reusable-candidate subject identity.
+    pub candidate_id: Option<String>,
+}
+
+impl LearningAdmissionRequest {
+    pub fn validate(&self) -> Result<(), LearningAdmissionError> {
+        if self.source_campaign_id.trim().is_empty() {
+            return Err(LearningAdmissionError::MissingField("source_campaign_id"));
+        }
+        if self.target_task_id.trim().is_empty() {
+            return Err(LearningAdmissionError::MissingField("target_task_id"));
+        }
+        if self
+            .overlay_id
+            .as_ref()
+            .is_none_or(|value| value.trim().is_empty())
+            && self
+                .candidate_id
+                .as_ref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(LearningAdmissionError::NoInfluenceSubject);
+        }
+        Ok(())
+    }
+}
+
+/// Owner projection used to bind a learning permit to the current canonical
+/// task, plan, policy, and evaluator records.
+///
+/// The fields are private so a requester cannot construct or replace them.
+/// The Governor composition is the only constructor and refreshes the
+/// projection from its single retained owner set on every issuance or
+/// verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LearningAdmissionOwnerRecord {
+    state_fence: StateFence,
+    scope_ref: String,
+    authority_ref: String,
+    retention_ref: String,
+    evaluator_ref: String,
+    rollback_ref: String,
+    policy_revision: u64,
+}
+
+impl LearningAdmissionOwnerRecord {
+    pub(crate) fn from_owner_projection(
+        state_fence: StateFence,
+        scope_ref: String,
+        authority_ref: String,
+        retention_ref: String,
+        evaluator_ref: String,
+        rollback_ref: String,
+        policy_revision: u64,
+    ) -> Result<Self, LearningAdmissionError> {
+        let record = Self {
+            state_fence,
+            scope_ref,
+            authority_ref,
+            retention_ref,
+            evaluator_ref,
+            rollback_ref,
+            policy_revision,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<(), LearningAdmissionError> {
+        self.state_fence
+            .validate()
+            .map_err(|_| LearningAdmissionError::InvalidFence)?;
+        for (field, value) in [
+            ("scope_ref", &self.scope_ref),
+            ("authority_ref", &self.authority_ref),
+            ("retention_ref", &self.retention_ref),
+            ("evaluator_ref", &self.evaluator_ref),
+            ("rollback_ref", &self.rollback_ref),
+        ] {
+            if value.trim().is_empty() {
+                return Err(LearningAdmissionError::OwnerEvidenceUnavailable(field));
+            }
+        }
+        if self.policy_revision == 0 {
+            return Err(LearningAdmissionError::OwnerEvidenceUnavailable(
+                "policy_revision",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    #[must_use]
+    pub fn scope_ref(&self) -> &str {
+        &self.scope_ref
+    }
+
+    #[must_use]
+    pub fn authority_ref(&self) -> &str {
+        &self.authority_ref
+    }
+
+    #[must_use]
+    pub fn retention_ref(&self) -> &str {
+        &self.retention_ref
+    }
+
+    #[must_use]
+    pub fn evaluator_ref(&self) -> &str {
+        &self.evaluator_ref
+    }
+
+    #[must_use]
+    pub fn rollback_ref(&self) -> &str {
+        &self.rollback_ref
+    }
+
+    #[must_use]
+    pub const fn policy_revision(&self) -> u64 {
+        self.policy_revision
+    }
+
+    pub(crate) fn claim_for(
+        &self,
+        request: &LearningAdmissionRequest,
+        fence: &StateFence,
+    ) -> Result<LearningAdmissionClaim, LearningAdmissionError> {
+        request.validate()?;
+        if !fences_match_exact(fence, &self.state_fence) {
+            return Err(LearningAdmissionError::StaleStateFence);
+        }
+        Ok(LearningAdmissionClaim {
+            schema_version: LEARNING_ADMISSION_SCHEMA_VERSION,
+            source_campaign_id: request.source_campaign_id.clone(),
+            target_task_id: request.target_task_id.clone(),
+            fence: self.state_fence.clone(),
+            overlay_id: request.overlay_id.clone(),
+            candidate_id: request.candidate_id.clone(),
+            scope_ref: self.scope_ref.clone(),
+            authority_ref: self.authority_ref.clone(),
+            retention_ref: self.retention_ref.clone(),
+            evaluator_ref: self.evaluator_ref.clone(),
+            rollback_ref: self.rollback_ref.clone(),
+        })
+    }
+}
+
 /// Fail-closed learning admission errors. Stale epoch, stale fence, and
 /// digest mismatch are distinct refusals; none refreshes silently.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -132,6 +298,12 @@ pub enum LearningAdmissionError {
     DigestMismatch,
     #[error("presented fence does not exactly match the admitted fence")]
     StaleStateFence,
+    #[error("owner evidence required for learning admission is unavailable: {0}")]
+    OwnerEvidenceUnavailable(&'static str),
+    #[error("owner evidence does not match the learning admission binding: {0}")]
+    OwnerEvidenceMismatch(&'static str),
+    #[error("learning admission target task identity is invalid")]
+    InvalidTargetTask,
 }
 
 /// Owner-issued learning admission permit (opaque in-process handle).

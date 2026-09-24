@@ -3411,6 +3411,8 @@ dependencies = [
  "eliot-cognitive-quality",
  "eliot-config",
  "eliot-conformance-contracts",
+ "eliot-context-admission",
+ "eliot-context-assembly",
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-controlboard",

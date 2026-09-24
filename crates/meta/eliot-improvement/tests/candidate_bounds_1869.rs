@@ -29,7 +29,9 @@ use eliot_improvement::learning_closure::{
     OutcomeKind, OutcomeRecord, OverlayAndActivationAssessments, OverlayRecord,
     PriorClosureHistory, StageAssessment,
 };
-use eliot_improvement::{ImprovementCandidate, ImprovementSurface, ReplayPlan};
+use eliot_improvement::{
+    ImprovementCandidate, ImprovementLifecycle, ImprovementSurface, ReplayPlan,
+};
 use time::{Duration, OffsetDateTime};
 
 // ---------------------------------------------------------------------------
@@ -141,18 +143,44 @@ fn closed_reusable(origin_campaign: &str) -> ReusableCandidateRef {
 
 #[test]
 fn duplicate_lineage_merges_with_provenance() {
+    let governor = governor_1869(3);
+    let fence = fence_1869(3);
     let mut backlog = BoundedBacklog::new(vec![policy(8)]).expect("policy validates");
     let first = candidate(&["ev-1869-a", "ev-1869-b"]);
     let first_id = first.candidate_id.clone();
+    let first_permit = issue_learning_admission(
+        &governor,
+        &claim_1869(&fence, OVERLAY_1869, Some(&first_id)),
+    )
+    .expect("owner issues first admission");
+    let first_verified =
+        verify_learning_admission(&governor, &first_permit, &fence).expect("owner verifies first");
     assert!(matches!(
-        backlog.admit(first, 3.0, Some("governor-1869".to_string())),
+        backlog.admit_governed(
+            first,
+            3.0,
+            Some(AUTHORITY_1869.to_string()),
+            &first_verified,
+        ),
         Ok(AdmitOutcome::Admitted { .. })
     ));
 
     let second = candidate(&["ev-1869-b", "ev-1869-c"]);
     let second_id = second.candidate_id.clone();
+    let second_permit = issue_learning_admission(
+        &governor,
+        &claim_1869(&fence, OVERLAY_1869, Some(&second_id)),
+    )
+    .expect("owner issues second admission");
+    let second_verified = verify_learning_admission(&governor, &second_permit, &fence)
+        .expect("owner verifies second");
     let outcome = backlog
-        .admit(second, 4.0, Some("governor-1869".to_string()))
+        .admit_governed(
+            second,
+            4.0,
+            Some(AUTHORITY_1869.to_string()),
+            &second_verified,
+        )
         .expect("duplicate admits merge");
     assert_eq!(
         outcome,
@@ -277,7 +305,10 @@ fn cross_task_use_requires_governed_admission() {
 #[test]
 fn bound_refuses_until_explicit_archive() {
     let mut backlog = BoundedBacklog::new(vec![policy(1)]).expect("policy validates");
-    let first = candidate(&["ev-1869-bound-a"]);
+    let mut first = candidate(&["ev-1869-bound-a"]);
+    first
+        .transition_lifecycle(ImprovementLifecycle::Stale)
+        .expect("test candidate is explicitly stale");
     let first_id = first.candidate_id.clone();
     assert!(matches!(
         backlog.admit(first, 2.0, Some("governor-1869".to_string())),
@@ -301,6 +332,15 @@ fn bound_refuses_until_explicit_archive() {
         .expect("explicit archive transitions");
     assert_eq!(archived.candidate_id, first_id);
     assert!(backlog.active_for(ImprovementSurface::Memory).is_empty());
+    assert_eq!(backlog.archives().len(), 1);
+    let retained = backlog
+        .retained_entry_for(&archived.candidate_id)
+        .expect("archived row remains retained");
+    assert_eq!(
+        retained.candidate.lifecycle,
+        eliot_improvement::ImprovementLifecycle::Archived
+    );
+    assert_eq!(archived.archived_revision, 2);
     assert!(matches!(
         backlog.admit(
             candidate(&["ev-1869-bound-b"]),
@@ -733,18 +773,21 @@ fn archived_reusable_loses_retrieval() {
     let governor = governor_1869(3);
     let fence = fence_1869(3);
     let mut backlog = BoundedBacklog::new(vec![policy(8)]).expect("policy validates");
-    let admitted = candidate(&["ev-1869-archive-a"]);
+    let mut admitted = candidate(&["ev-1869-archive-a"]);
+    admitted
+        .transition_lifecycle(ImprovementLifecycle::Stale)
+        .expect("test candidate is explicitly stale");
     let admitted_id = admitted.candidate_id.clone();
-    assert!(matches!(
-        backlog.admit(admitted, 2.0, Some(AUTHORITY_1869.to_string())),
-        Ok(AdmitOutcome::Admitted { .. })
-    ));
     let permit = issue_learning_admission(
         &governor,
         &claim_1869(&fence, OVERLAY_1869, Some(&admitted_id)),
     )
     .expect("owner issues");
     let verified = verify_learning_admission(&governor, &permit, &fence).expect("owner verifies");
+    assert!(matches!(
+        backlog.admit_governed(admitted, 2.0, Some(AUTHORITY_1869.to_string()), &verified),
+        Ok(AdmitOutcome::Admitted { .. })
+    ));
     let reusable = ReusableCandidateRef {
         candidate_id: admitted_id.clone(),
         closure_ref: Some("closure-1869-a".to_string()),
