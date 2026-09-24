@@ -12,7 +12,10 @@
 //! `GetReactiveInjectionState` and `GetResourceSnapshot`, plus issue #1779
 //! `GetUserAutomationState`), plus issue #223 the two experience range
 //! reads (`GetExperienceBankRange`, `GetAgentFeedbackRange`, scope-addressed
-//! with proven adapter handlers in this slice) and the activated audit
+//! with proven adapter handlers in this slice), plus issue #1868 the
+//! learning-record range read (`GetLearningRecordRange`, scope-addressed
+//! with the closed record-kind filter and proven adapter handlers in this
+//! slice), and the activated audit
 //! range read (`GetAuditRange`: fence-gated envelope-candidate range over
 //! durable capture evidence with proven adapter handlers in this slice), the four `CaptureObservation` /
 //! `AppendAuditEvent` / `ApplyLifecyclePolicy` mutations (AUD-C01:
@@ -271,8 +274,11 @@ struct ActivatedReadDescriptor {
 /// (issue #223: fence-gated journal-global scan; scope filtering lives
 /// consumer-side per I12-26, mirroring the `GetMailbox` split where the
 /// Governor facade requires a caller scope while catalogue rows stay
-/// scope-free).
-const ACTIVATED_READS: [ActivatedReadDescriptor; 17] = [
+/// scope-free); `GetLearningRecordRange` addresses its scope through the
+/// typed `scope_id` request field (issue #1868: proven by both adapter
+/// handlers) and filters through the declared optional closed
+/// `record_kind` selector plus the `max_records` bound.
+const ACTIVATED_READS: [ActivatedReadDescriptor; 18] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -358,11 +364,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 17] = [
         requires_scope_id: false,
         scope_kind: SCOPE_KIND_NONE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetLearningRecordRange,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 17] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 18] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -381,6 +392,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 17] {
         ACTIVATED_READS[14].operation,
         ACTIVATED_READS[15].operation,
         ACTIVATED_READS[16].operation,
+        ACTIVATED_READS[17].operation,
     ]
 }
 
@@ -415,10 +427,15 @@ struct ActivatedMutationDescriptor {
 /// `CommitExperienceBank` and `CommitAgentFeedback` persist `Candidate`
 /// through the `CaptureCandidate` family (issue #223: Store-owned durable
 /// experience-bank/feedback rows with the closed experience typed
-/// contract). All fifteen address no scope, mirroring the scope-free read
+/// contract); `RecordLearningRecord` persists `Candidate` through the
+/// `CaptureCandidate` family (issue #1868, I12.24: Store-owned durable
+/// learning rows keyed `(record_kind, handle, record_digest)` with the
+/// closed learning typed contract; the only Kernel-owned learning
+/// surface, so learning crates can never become autonomous persistence
+/// systems). All sixteen address no scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 15] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 16] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -509,6 +526,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 15] = [
         maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordLearningRecord,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
 ];
 
 fn read_entry_spec(descriptor: &ActivatedReadDescriptor) -> OperationManifestSpec {
@@ -572,8 +595,8 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the seventeen activated reads, the
-/// fifteen activated mutations, then the genesis bootstrap entry. Generation is
+/// Declaration order is the canonical order: the eighteen activated reads, the
+/// sixteen activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -733,7 +756,9 @@ pub fn validate_read_against_catalogue(
 /// the entry input bound. Only `CaptureObservation`, `AppendAuditEvent`,
 /// `ApplyLifecyclePolicy`, `ReconcileRecovery`, `UpdateTaskState`,
 /// `ApplyEpistemicRevision`, `ApplyErasure`, `ApplyNotificationState`,
-/// `ApplyReactiveInjectionState`, and `ApplyResourceSnapshot` have activated
+/// `ApplyReactiveInjectionState`, `ApplyResourceSnapshot`,
+/// `CommitExperienceBank`, `CommitAgentFeedback`, and
+/// `RecordLearningRecord` have activated
 /// mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
 /// and consumer triple. An `Erasure`-class plan additionally admits only the
@@ -829,6 +854,11 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::CommitAgentFeedback => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::validate_experience_mutation_params(command.operation, &command.parameters)?;
+            }
+            NamedMutationOperation::RecordLearningRecord => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::decode_learning_mutation(command.operation, &command.parameters)
+                    .map(|_| ())?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
