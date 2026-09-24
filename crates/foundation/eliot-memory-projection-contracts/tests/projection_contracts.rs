@@ -165,6 +165,127 @@ fn duplicate_handles_are_rejected() {
 }
 
 #[test]
+fn known_positive_unaccounted_remainder_is_rejected() {
+    let mut candidate = batch();
+    candidate.records.clear();
+    candidate.coverage.denominator = DenominatorState::Known { total: 1 };
+    let error = candidate
+        .validate()
+        .expect_err("a positive remainder must not become a complete batch");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+    ));
+}
+
+#[test]
+fn duplicate_omission_identities_are_rejected() {
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Known { total: 4 };
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.omissions = vec![
+        CoverageOmission {
+            handle: aid("mem-3"),
+            reason: "scope-mismatch".to_owned(),
+        },
+        CoverageOmission {
+            handle: aid("mem-3"),
+            reason: "scope-mismatch".to_owned(),
+        },
+    ];
+    let error = candidate
+        .validate()
+        .expect_err("duplicate omission identities must fail");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::Duplicate { .. }
+    ));
+}
+
+#[test]
+fn omission_cannot_overlap_a_projected_record() {
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Known { total: 3 };
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.omissions.push(CoverageOmission {
+        handle: aid("mem-1"),
+        reason: "scope-mismatch".to_owned(),
+    });
+    let error = candidate
+        .validate()
+        .expect_err("projected and omitted identities must be disjoint");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+    ));
+}
+
+#[test]
+fn deferred_frontier_cannot_overlap_projected_volume() {
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Known { total: 3 };
+    candidate.coverage.truncated = true;
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.frontier = vec!["mem-1".to_owned(), "mem-3".to_owned()];
+    let error = candidate
+        .validate()
+        .expect_err("deferred identities must be disjoint from projected volume");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+    ));
+}
+
+#[test]
+fn duplicate_deferred_frontier_identities_are_rejected() {
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Known { total: 4 };
+    candidate.coverage.truncated = true;
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.frontier = vec!["mem-3".to_owned(), "mem-3".to_owned()];
+    let error = candidate
+        .validate()
+        .expect_err("duplicate deferred identities must fail");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::Duplicate { .. }
+    ));
+}
+
+#[test]
+fn omitted_volume_is_explicitly_accounted() {
+    let mut candidate = batch();
+    candidate.records.pop();
+    candidate.coverage.denominator = DenominatorState::Known { total: 2 };
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.omissions.push(CoverageOmission {
+        handle: aid("mem-2"),
+        reason: "fence-mismatch".to_owned(),
+    });
+    candidate
+        .validate()
+        .expect("omitted volume is an explicit partition member");
+}
+
+#[test]
+fn truncated_batch_accounts_for_exact_deferred_remainder() {
+    let candidate = MemoryProjectionBatch {
+        contract_version: CONTRACT_VERSION,
+        binding: binding(),
+        records: vec![record("mem-1")],
+        coverage: ProjectionCoverage {
+            denominator: DenominatorState::Known { total: 3 },
+            truncated: true,
+            frontier: vec!["mem-2".to_owned(), "mem-3".to_owned()],
+            omissions: vec![],
+            revalidation_required: true,
+        },
+    };
+    candidate.validate().expect("truncated remainder is exact");
+    assert_eq!(candidate.coverage.frontier, vec!["mem-2", "mem-3"]);
+}
+
+#[test]
 fn truncated_coverage_without_frontier_is_rejected() {
     let mut candidate = batch();
     candidate.coverage.truncated = true;

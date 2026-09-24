@@ -260,8 +260,51 @@ fn missing_denominator_fails_closed() {
 }
 
 #[test]
+fn known_positive_unaccounted_remainder_fails_before_evaluation() {
+    let mut candidate = request(vec![]);
+    candidate.batch.coverage.denominator = DenominatorState::Known { total: 1 };
+    let error = evaluate_applicability(&candidate)
+        .expect_err("an unaccounted known remainder must fail closed");
+    assert!(matches!(
+        error,
+        eliot_memory_applicability::ApplicabilityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+        )
+    ));
+}
+
+#[test]
+fn independently_deserialized_set_cannot_claim_a_short_complete_denominator() {
+    let mut set = evaluate(vec![record("mem-1")]);
+    set.denominator = DenominatorState::Known { total: 2 };
+    let error = set
+        .validate()
+        .expect_err("a short set without revalidation must fail closed");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+    ));
+}
+
+#[test]
+fn truncated_batch_preserves_exact_recovery_state() {
+    let mut candidate = request(vec![record("mem-1")]);
+    candidate.batch.coverage.denominator = DenominatorState::Known { total: 3 };
+    candidate.batch.coverage.truncated = true;
+    candidate.batch.coverage.frontier = vec!["mem-2".to_owned(), "mem-3".to_owned()];
+    candidate.batch.coverage.revalidation_required = true;
+    let set = evaluate_applicability(&candidate).expect("truncated evaluation");
+    assert!(set.truncated);
+    assert!(set.revalidation_required);
+    assert_eq!(set.applicable.len(), 1);
+    set.validate()
+        .expect("set preserves the incomplete proof ceiling");
+}
+
+#[test]
 fn truncation_and_revalidation_echo_to_the_set() {
     let mut candidate = request(vec![record("mem-1")]);
+    candidate.batch.coverage.denominator = DenominatorState::Known { total: 2 };
     candidate.batch.coverage.truncated = true;
     candidate.batch.coverage.frontier = vec!["resume-after-mem-1".to_owned()];
     candidate.batch.coverage.revalidation_required = true;

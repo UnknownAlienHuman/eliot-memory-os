@@ -53,13 +53,13 @@ crate = "eliot-memory-projection-contracts"
 rust_path = "eliot_memory_projection_contracts::MemoryProjectionBatch"
 fields = ["contract_version", "binding", "records", "coverage"]
 scope_fence_fields = ["binding"]
-denominator_note = "Every record binding must equal the batch binding; every record fence must satisfy is_compatible_with against the batch fence; handles are unique."
+denominator_note = "Every record binding must equal the batch binding; every record fence must satisfy is_compatible_with against the batch fence; projected, omitted, and frontier-deferred handles form one exact disjoint partition."
 
 [[frozen_type]]
 crate = "eliot-memory-projection-contracts"
 rust_path = "eliot_memory_projection_contracts::ProjectionCoverage"
 fields = ["denominator", "truncated", "frontier", "omissions", "revalidation_required"]
-denominator_note = "Known{total} must cover projected plus omitted volume; truncation requires a nonempty resume frontier; truncation or omission requires revalidation."
+denominator_note = "Known{total} must exactly partition the disjoint projected, omitted, and frontier-deferred identity sets; truncation requires a nonempty resume frontier; truncation or omission requires revalidation."
 
 [[frozen_type]]
 crate = "eliot-memory-projection-contracts"
@@ -517,7 +517,7 @@ applies_to = ["eliot-observation-contracts"]
 
 [[denominator]]
 id = "DEN-MEMORY-BATCH"
-definition = "DenominatorState::Known{total} over the read-side observed volume at the named batch fence, with explicit truncation frontier, named omissions, and revalidation flag. Every Complete state requires this exact independently recheckable denominator."
+definition = "DenominatorState::Known{total} is the exact disjoint partition of projected, omitted, and frontier-deferred identities at the named batch fence, with an explicit truncation frontier, named omissions, and revalidation flag. Every Complete state requires this exact independently recheckable denominator; Unknown remains explicitly incomplete and fails closed."
 owner = "eliot-memory-projection-contracts"
 
 [[denominator]]

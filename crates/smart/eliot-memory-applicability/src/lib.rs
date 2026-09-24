@@ -203,6 +203,10 @@ fn classify_preconditions(record: &MemoryProjectionRecord) -> Option<ExclusionRe
 pub fn evaluate_applicability(
     request: &ApplicabilityRequest,
 ) -> Result<ApplicableMemorySet, ApplicabilityError> {
+    // The owner validator closes the exact projected/omitted/deferred
+    // partition before classification. The set validator below independently
+    // checks the denominator so a deserialized verdict cannot recover the
+    // false-completeness path by bypassing this evaluator.
     request.validate()?;
     if matches!(
         request.batch.coverage.denominator,

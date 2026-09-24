@@ -48,7 +48,8 @@ pub enum DenominatorState {
     /// Exact canonical records observed by the read side.
     #[serde(rename = "KNOWN")]
     Known {
-        /// Total observed records, projected or omitted.
+        /// Total observed records, partitioned into projected, omitted, and
+        /// frontier-deferred identities.
         total: usize,
     },
     /// The read side could not establish the denominator, with a reason.
@@ -72,7 +73,8 @@ impl DenominatorState {
 /// One explicitly omitted record: handle plus the rule that omitted it.
 ///
 /// Omissions are never silent loss: fence-incompatible, scope-mismatched, or
-/// bound-truncated volume is named here with its exact reason.
+/// otherwise withheld volume is named here with its exact reason. Deferred
+/// truncation identities travel separately in [`ProjectionCoverage::frontier`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageOmission {
@@ -106,8 +108,9 @@ pub struct ProjectionCoverage {
 }
 
 impl ProjectionCoverage {
-    /// Validate coverage shape (member accounting is checked by the batch,
-    /// which sees the carried records).
+    /// Validate coverage shape. The batch owner performs the exact
+    /// projected/omitted/deferred partition because only it sees all three
+    /// identity collections together.
     pub fn validate(&self) -> Result<(), MemoryProjectionError> {
         self.denominator.validate()?;
         if self.frontier.len() > MAX_BATCH_FRONTIER {
@@ -158,10 +161,10 @@ impl MemoryProjectionBatch {
                 field: "batch.records",
             });
         }
-        let mut seen = BTreeSet::new();
+        let mut projected = BTreeSet::new();
         for record in &self.records {
             record.validate()?;
-            if !seen.insert(record.handle.as_str().to_owned()) {
+            if !projected.insert(record.handle.as_str().to_owned()) {
                 return Err(MemoryProjectionError::Duplicate {
                     field: "batch.records",
                     value: record.handle.as_str().to_owned(),
@@ -185,13 +188,55 @@ impl MemoryProjectionBatch {
                 });
             }
         }
-        // Every observed record is either projected or omitted: a known
-        // denominator below the accounted volume contradicts the read side.
+
+        let mut omitted = BTreeSet::new();
+        for omission in &self.coverage.omissions {
+            let handle = omission.handle.as_str();
+            if !omitted.insert(handle.to_owned()) {
+                return Err(MemoryProjectionError::Duplicate {
+                    field: "coverage.omissions",
+                    value: handle.to_owned(),
+                });
+            }
+            if projected.contains(handle) {
+                return Err(MemoryProjectionError::CoverageMismatch {
+                    reason: "an omitted identity cannot also be projected",
+                });
+            }
+        }
+
+        let mut deferred = BTreeSet::new();
+        for handle in &self.coverage.frontier {
+            if !deferred.insert(handle.clone()) {
+                return Err(MemoryProjectionError::Duplicate {
+                    field: "coverage.frontier",
+                    value: handle.clone(),
+                });
+            }
+            if projected.contains(handle) || omitted.contains(handle) {
+                return Err(MemoryProjectionError::CoverageMismatch {
+                    reason: "a deferred identity cannot overlap projected or omitted volume",
+                });
+            }
+        }
+
+        // A known denominator is an exact partition, not a lower bound. Every
+        // observed identity must be projected, explicitly omitted, or named
+        // in the truncation frontier; a positive unexplained remainder is a
+        // coverage contradiction even when the batch is otherwise bounded.
+        let accounted = self
+            .records
+            .len()
+            .checked_add(self.coverage.omissions.len())
+            .and_then(|volume| volume.checked_add(self.coverage.frontier.len()))
+            .ok_or(MemoryProjectionError::CoverageMismatch {
+                reason: "accounted denominator volume overflows",
+            })?;
         if let DenominatorState::Known { total } = &self.coverage.denominator
-            && *total < self.records.len() + self.coverage.omissions.len()
+            && *total != accounted
         {
             return Err(MemoryProjectionError::CoverageMismatch {
-                reason: "denominator is below projected plus omitted volume",
+                reason: "known denominator must exactly equal projected, omitted, and deferred volume",
             });
         }
         // Volume truncation must name where to resume; a frontier without

@@ -160,8 +160,8 @@ pub struct ApplicableMemorySet {
 }
 
 impl ApplicableMemorySet {
-    /// Validate set shape: binding, handle uniqueness across both lists, and
-    /// exclusion reasons.
+    /// Validate set shape: binding, handle uniqueness across both lists,
+    /// exclusion reasons, and denominator accounting.
     pub fn validate(&self) -> Result<(), MemoryProjectionError> {
         if self.contract_version != crate::CONTRACT_VERSION {
             return Err(MemoryProjectionError::VersionMismatch);
@@ -183,6 +183,37 @@ impl ApplicableMemorySet {
                 return Err(MemoryProjectionError::Duplicate {
                     field: "set.excluded",
                     value: record.handle.as_str().to_owned(),
+                });
+            }
+        }
+
+        // The set can be deserialized independently of its batch, so it must
+        // not over-account the known denominator or call an incomplete result
+        // complete merely because the projected list happens to be short.
+        // Omissions and deferred frontier members are intentionally absent
+        // from this verdict; their explicit revalidation flag is the proof
+        // ceiling that permits a short result.
+        let accounted = self
+            .applicable
+            .len()
+            .checked_add(self.excluded.len())
+            .ok_or(MemoryProjectionError::CoverageMismatch {
+                reason: "set disposition volume overflows",
+            })?;
+        if self.truncated && !self.revalidation_required {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "truncated set requires revalidation",
+            });
+        }
+        if let DenominatorState::Known { total } = &self.denominator {
+            if accounted > *total {
+                return Err(MemoryProjectionError::CoverageMismatch {
+                    reason: "set dispositions exceed the known denominator",
+                });
+            }
+            if !self.revalidation_required && accounted != *total {
+                return Err(MemoryProjectionError::CoverageMismatch {
+                    reason: "non-revalidation set must account for the exact known denominator",
                 });
             }
         }
