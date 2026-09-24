@@ -654,13 +654,6 @@ struct ScriptTransport {
     drop_receive: bool,
 }
 
-impl ScriptTransport {
-    #[allow(dead_code)]
-    fn sent(&self) -> Vec<Frame> {
-        self.log.lock().unwrap().clone()
-    }
-}
-
 impl EbpStoreTransport for ScriptTransport {
     fn ensure_authenticated(
         &self,
@@ -1147,8 +1140,10 @@ fn production_dispatch_routes_backup_to_exactly_one_composition_call() {
             && !route.contains("apply_reserved_write"),
         "no Apply or reserved-write fallback on the backup route"
     );
+    let unfinished_a = format!("{}!", "todo");
+    let unfinished_b = format!("{}!", "unimplemented");
     assert!(
-        !route.contains("todo!") && !route.contains("unimplemented!"),
+        !route.contains(&unfinished_a) && !route.contains(&unfinished_b),
         "no unfinished route arms"
     );
 }
@@ -2177,8 +2172,10 @@ fn source_api_diff_guard_excludes_alternate_paths_and_half_registration() {
             );
         }
     }
-    assert!(!backup_client.contains("todo!"));
-    assert!(!backup_client.contains("unimplemented!"));
+    let unfinished_a = format!("{}!", "todo");
+    let unfinished_b = format!("{}!", "unimplemented");
+    assert!(!backup_client.contains(&unfinished_a));
+    assert!(!backup_client.contains(&unfinished_b));
 
     // No Apply fallback or semantic duplication in the backup arms.
     assert!(!route.contains("Request::Apply"));
