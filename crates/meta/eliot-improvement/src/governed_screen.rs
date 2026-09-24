@@ -88,7 +88,10 @@ fn map_admission_error(error: LearningAdmissionError) -> BoundsError {
         | LearningAdmissionError::GovernorNotAdmitting
         | LearningAdmissionError::StaleAuthorityEpoch
         | LearningAdmissionError::GenerationMismatch
-        | LearningAdmissionError::DigestMismatch => BoundsError::GovernorAuthorityUnconfirmed,
+        | LearningAdmissionError::DigestMismatch
+        | LearningAdmissionError::OwnerEvidenceUnavailable(_)
+        | LearningAdmissionError::OwnerEvidenceMismatch(_)
+        | LearningAdmissionError::InvalidTargetTask => BoundsError::GovernorAuthorityUnconfirmed,
     }
 }
 
@@ -166,6 +169,9 @@ pub fn check_governed_carriage(
             {
                 return Err(BoundsError::OwnerlessRecord);
             }
+            if mark.owner != Some(permit.authority_ref()) {
+                return Err(BoundsError::GovernorAuthorityUnconfirmed);
+            }
         }
     }
 
@@ -206,6 +212,9 @@ pub fn check_governed_carriage(
                 .entry_for(candidate_id)
                 .ok_or(BoundsError::NotBacklogAdmitted)?;
             if retained.admitted_under_authority.as_deref() != Some(permit.authority_ref()) {
+                return Err(BoundsError::GovernorAuthorityUnconfirmed);
+            }
+            if mark.owner != retained.owner.as_deref() {
                 return Err(BoundsError::GovernorAuthorityUnconfirmed);
             }
         }

@@ -121,6 +121,9 @@ pub fn screen_learning_subjects(
             {
                 return Err(ContextError::InvalidField("learning.owner"));
             }
+            if mark.owner.as_deref() != Some(permit.authority_ref()) {
+                return Err(ContextError::IdentityConflict);
+            }
         }
     }
     Ok(())
@@ -171,6 +174,15 @@ pub fn admit_context_with_learning(
         .iter()
         .any(|candidate| candidate.learning.is_some());
     if marked || !input.learning_tickets.is_empty() {
+        let permit = presented.verified.permit();
+        for ticket in &input.learning_tickets {
+            ticket
+                .validate()
+                .map_err(|_| ContextError::InvalidField("learning.ticket"))?;
+            if ticket.digest.as_str() != permit.digest() {
+                return Err(ContextError::IdentityConflict);
+            }
+        }
         let mut marks = Vec::new();
         for candidate in &input.candidates.candidates {
             if let Some(provenance) = &candidate.learning {
