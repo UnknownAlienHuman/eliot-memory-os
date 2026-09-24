@@ -6,13 +6,12 @@ use eliot_contracts::{
 use eliot_evidence::EvidenceFreshness;
 use eliot_learning_contracts::{
     AssessmentDimension, AssignmentKind, AttemptFailure, AttemptLearningDeltaCandidate,
-    AttemptLearningOutcome, AttemptLearningResult, AttributedSubject,
-    CampaignActiveOverlayPolicy, CampaignHarnessOverlayCandidate, CampaignHistoryPlanReference,
-    CampaignId, CampaignLearningStateProvenance, CampaignLearningStateView,
-    CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind, CampaignPositionRef,
-    CampaignSlotProjectionDigest, CampaignSourceBinding, CampaignSourceRequirement,
-    CampaignSourceResolution, CampaignSourceResolutionStatus, CampaignSourceRevisionRef,
-    CampaignSourceRole, CausalCeiling,
+    AttemptLearningOutcome, AttemptLearningResult, AttributedSubject, CampaignActiveOverlayPolicy,
+    CampaignHarnessOverlayCandidate, CampaignHistoryPlanReference, CampaignId,
+    CampaignLearningStateProvenance, CampaignLearningStateView, CampaignOwnerRecordId,
+    CampaignOwnerRevision, CampaignPositionKind, CampaignPositionRef, CampaignSlotProjectionDigest,
+    CampaignSourceBinding, CampaignSourceRequirement, CampaignSourceResolution,
+    CampaignSourceResolutionStatus, CampaignSourceRevisionRef, CampaignSourceRole, CausalCeiling,
     ChangeOperation, ChangeSurface, ClosureHandoff, Completeness, ContractBinding,
     DimensionAssessment, DimensionStatus, ExternalDecisionClass, HarnessActivationReceiptCandidate,
     HistoryRetention, ImprovementExperimentCandidate, InverseChange, LearningAssessmentCandidate,
@@ -21,8 +20,8 @@ use eliot_learning_contracts::{
     OverlayChange, OverlayId, OverlayOrigin, OwnerDisagreement, OwnerId, OwnerProof,
     PromotionBoundaryCandidate, PromotionMutationTarget, RolloutBoundary, SlotDisposition, SlotId,
     SlotProjection, SlotRequirement, SlotSpec, SourceDenominator, StageDisposition,
-    StageObservation, SubjectKind, UseAttributionCandidate, UseBasis, UseDisposition, ValueState,
-    TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+    StageObservation, SubjectKind, TASK_CONTROLLER_CAMPAIGN_OWNER_ID, UseAttributionCandidate,
+    UseBasis, UseDisposition, ValueState,
 };
 use eliot_receipts::{ProofCeiling, WorkScopeId};
 
@@ -86,7 +85,13 @@ fn slot_spec(tag: &str, target: &TargetId, requirement: SlotRequirement) -> Slot
     }
 }
 
-fn campaign_source_contract(binding: &ContractBinding, tag: &str) -> (Vec<CampaignSourceRequirement>, CampaignLearningStateProvenance) {
+fn campaign_source_contract(
+    binding: &ContractBinding,
+    tag: &str,
+) -> (
+    Vec<CampaignSourceRequirement>,
+    CampaignLearningStateProvenance,
+) {
     let mut requirements = Vec::with_capacity(CampaignSourceRole::all().len());
     let mut resolutions = Vec::with_capacity(CampaignSourceRole::all().len());
     for (index, role) in CampaignSourceRole::all().into_iter().enumerate() {
@@ -105,7 +110,9 @@ fn campaign_source_contract(binding: &ContractBinding, tag: &str) -> (Vec<Campai
                 | CampaignSourceRole::TaskOpenItems => {
                     CampaignOwnerRecordId::Task(binding.task_id.clone())
                 }
-                _ => CampaignOwnerRecordId::Artifact(aid(&format!("source-record-590-{tag}-{index}"))),
+                _ => CampaignOwnerRecordId::Artifact(aid(&format!(
+                    "source-record-590-{tag}-{index}"
+                ))),
             };
             Some(CampaignSourceRevisionRef {
                 role,
@@ -162,11 +169,31 @@ fn campaign_source_contract(binding: &ContractBinding, tag: &str) -> (Vec<Campai
         });
     }
     let position_specs = [
-        (CampaignPositionKind::Current, CampaignSourceRole::CurrentPosition, "current"),
-        (CampaignPositionKind::Experience, CampaignSourceRole::ExperiencePosition, "experience"),
-        (CampaignPositionKind::Adaptation, CampaignSourceRole::AdaptationPosition, "adaptation"),
-        (CampaignPositionKind::Evaluation, CampaignSourceRole::EvaluationPosition, "evaluation"),
-        (CampaignPositionKind::EconomicsProgress, CampaignSourceRole::EconomicsProgress, "economics"),
+        (
+            CampaignPositionKind::Current,
+            CampaignSourceRole::CurrentPosition,
+            "current",
+        ),
+        (
+            CampaignPositionKind::Experience,
+            CampaignSourceRole::ExperiencePosition,
+            "experience",
+        ),
+        (
+            CampaignPositionKind::Adaptation,
+            CampaignSourceRole::AdaptationPosition,
+            "adaptation",
+        ),
+        (
+            CampaignPositionKind::Evaluation,
+            CampaignSourceRole::EvaluationPosition,
+            "evaluation",
+        ),
+        (
+            CampaignPositionKind::EconomicsProgress,
+            CampaignSourceRole::EconomicsProgress,
+            "economics",
+        ),
     ];
     let positions = position_specs
         .into_iter()
@@ -224,13 +251,21 @@ fn bind_slot_source_contract(
             .find(|requirement| requirement.role == spec.source_role)
             .expect("slot source role is declared");
         requirement.owner = spec.owner.clone();
-        requirement.expected_reference.as_mut().expect("slot source is declared").owner = spec.owner.clone();
+        requirement
+            .expected_reference
+            .as_mut()
+            .expect("slot source is declared")
+            .owner = spec.owner.clone();
         let resolution = provenance
             .source_resolutions
             .iter_mut()
             .find(|resolution| resolution.role == spec.source_role)
             .expect("slot source role is resolved");
-        resolution.reference.as_mut().expect("slot source is current").owner = spec.owner.clone();
+        resolution
+            .reference
+            .as_mut()
+            .expect("slot source is current")
+            .owner = spec.owner.clone();
     }
     for projection in projections {
         let spec = recipe

@@ -13,8 +13,7 @@ use serde_json::Value;
 use crate::{HARD_STRUCTURED_RESPONSE_BYTES, MAX_FRAME_BYTES, ProtocolError};
 
 /// Stable wire identity for one admitted Task Controller invocation.
-pub const TASK_CONTROLLER_INVOCATION_WIRE_ID: &str =
-    "eliot.protocol.task-controller-invocation";
+pub const TASK_CONTROLLER_INVOCATION_WIRE_ID: &str = "eliot.protocol.task-controller-invocation";
 /// Current Task Controller invocation wire version.
 pub const TASK_CONTROLLER_INVOCATION_WIRE_VERSION: u16 = 1;
 /// Stable wire identity for the Kernel-issued Task Controller attempt.
@@ -22,8 +21,7 @@ pub const TASK_CONTROLLER_ATTEMPT_WIRE_ID: &str = "eliot.protocol.task-controlle
 /// Current Task Controller attempt wire version.
 pub const TASK_CONTROLLER_ATTEMPT_WIRE_VERSION: u16 = 1;
 /// Stable wire identity for the Task Controller result body.
-pub const TASK_CONTROLLER_RESULT_BODY_WIRE_ID: &str =
-    "eliot.protocol.task-controller-result-body";
+pub const TASK_CONTROLLER_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.task-controller-result-body";
 /// Current Task Controller result-body wire version.
 pub const TASK_CONTROLLER_RESULT_BODY_WIRE_VERSION: u16 = 1;
 
@@ -73,7 +71,8 @@ fn structured_object(value: &Value, field: &'static str) -> Result<(), ProtocolE
             reason: "must be a JSON object",
         });
     }
-    let bytes = canonical_json_bytes(value).map_err(|error| ProtocolError::Json(error.to_string()))?;
+    let bytes =
+        canonical_json_bytes(value).map_err(|error| ProtocolError::Json(error.to_string()))?;
     if bytes.len() > MAX_TASK_CONTROLLER_VALUE_BYTES {
         return Err(ProtocolError::InvalidField {
             field,
@@ -140,10 +139,7 @@ impl TaskControllerInvocation {
                 reason: "unsupported Task Controller invocation",
             });
         }
-        bounded_text(
-            self.task_id.as_str(),
-            "task_controller_invocation.task_id",
-        )?;
+        bounded_text(self.task_id.as_str(), "task_controller_invocation.task_id")?;
         bounded_text(
             &self.work_scope_id,
             "task_controller_invocation.work_scope_id",
@@ -166,7 +162,10 @@ impl TaskControllerInvocation {
             structured_object(value, field)?;
         }
         if let Some(selector) = &self.prior_delivery_selector {
-            structured_object(selector, "task_controller_invocation.prior_delivery_selector")?;
+            structured_object(
+                selector,
+                "task_controller_invocation.prior_delivery_selector",
+            )?;
         }
         Ok(())
     }
@@ -292,18 +291,21 @@ impl TaskControllerResultBody {
                 reason: "unsupported Task Controller result body",
             });
         }
-        validate_operation_id(&self.operation_id, "task_controller_result_body.operation_id")?;
+        validate_operation_id(
+            &self.operation_id,
+            "task_controller_result_body.operation_id",
+        )?;
         lowercase_sha256(
             &self.request_sha256,
             "task_controller_result_body.request_sha256",
         )?;
-        let operation_digest = self
-            .operation_id
-            .strip_prefix("hostreq:")
-            .ok_or(ProtocolError::InvalidField {
-                field: "task_controller_result_body.operation_id",
-                reason: "must be the deterministic handle for its request digest",
-            })?;
+        let operation_digest =
+            self.operation_id
+                .strip_prefix("hostreq:")
+                .ok_or(ProtocolError::InvalidField {
+                    field: "task_controller_result_body.operation_id",
+                    reason: "must be the deterministic handle for its request digest",
+                })?;
         if operation_digest != self.request_sha256 {
             return Err(ProtocolError::InvalidField {
                 field: "task_controller_result_body.request_sha256",

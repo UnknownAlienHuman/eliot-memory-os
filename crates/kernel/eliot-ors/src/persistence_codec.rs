@@ -35,6 +35,11 @@ use crate::SupervisionLeaseStageResolution;
 use crate::UnknownCommitRecord;
 use crate::cutover_ownership::StoredCutoverOwnership;
 use eliot_runtime_contracts::GenerationCutoverState;
+use eliot_store_api::{
+    CampaignLearningStateViewPublication, CampaignSourceHead, CampaignSourceRecord,
+};
+
+use super::CampaignSourceReservation;
 
 pub(super) fn encode<T: Serialize>(value: &T) -> Result<String, OrsError> {
     serde_json::to_string(value).map_err(|error| OrsError::Encoding(error.to_string()))
@@ -44,6 +49,48 @@ pub(super) trait PersistedValue: DeserializeOwned {
     const RECORD_TYPE: &'static str;
 
     fn validate_persisted(&self) -> Result<(), OrsError>;
+}
+
+impl PersistedValue for CampaignLearningStateViewPublication {
+    const RECORD_TYPE: &'static str = "campaign_learning_state_view";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))
+    }
+}
+
+impl PersistedValue for CampaignSourceHead {
+    const RECORD_TYPE: &'static str = "campaign_source_head";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))
+    }
+}
+
+impl PersistedValue for CampaignSourceRecord {
+    const RECORD_TYPE: &'static str = "campaign_source_record";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))
+    }
+}
+
+impl PersistedValue for CampaignSourceReservation {
+    const RECORD_TYPE: &'static str = "campaign_source_reservation";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        eliot_store_api::validate_sha256_hex(
+            &self.request_digest,
+            "campaign_source.request_digest",
+        )
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        self.publication
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))
+    }
 }
 
 impl PersistedValue for RecoveryPayloadEnvelope {

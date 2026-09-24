@@ -8,35 +8,35 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{ArtifactId, StateFence, TaskId, canonical_json_bytes, sha256_hex};
 use eliot_context::campaign_publication::{
     ContextCampaignRecipeBody, context_delivery_body_digest, context_recipe_body_digest,
 };
 use eliot_context_contracts::SessionDeliverySnapshot;
+use eliot_contracts::{ArtifactId, StateFence, TaskId, canonical_json_bytes, sha256_hex};
+use eliot_learning_contracts::{
+    CampaignLearningStateView, CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind,
+    CampaignPositionRef, CampaignSourceBinding, CampaignSourceRequirement,
+    CampaignSourceResolution, CampaignSourceResolutionStatus, CampaignSourceRevisionRef,
+    CampaignSourceRole, CampaignViewRebuildReason, Completeness, LearningStateViewRecipe,
+    OwnerDisagreement, OwnerId, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+};
 use eliot_learning_state_view::{
     CampaignHistoryPlanInput, CampaignLearningStateCompilationInput,
     compile_campaign_learning_state_view, validate_campaign_learning_state_view_current,
-};
-use eliot_learning_contracts::{
-    CampaignLearningStateView, CampaignOwnerRecordId, CampaignOwnerRevision,
-    CampaignPositionKind, CampaignPositionRef, CampaignViewRebuildReason, OwnerDisagreement,
-    CampaignSourceBinding, CampaignSourceRequirement, CampaignSourceResolution,
-    CampaignSourceResolutionStatus, CampaignSourceRevisionRef, CampaignSourceRole,
-    Completeness, LearningStateViewRecipe, OwnerId, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
 };
 use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestResultBody, LocalReadAttempt,
     host_request_operation_id,
 };
-use eliot_store_api::{
-    CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
-    CampaignLearningStateViewPublication, CampaignLearningStateViewReadStatus,
-    CampaignHistoryPlanRecord, CampaignSourceRevisionLookup,
-    CampaignSourceHead, CampaignSourceReadStatus, CampaignSourceRevisionRead,
-    CampaignSourceRecord, NamedReadOperation, NamedReadRequest, ReadConsistency, ScopeId,
-};
 use eliot_reactive_context_plan::RetrievalPlan;
+use eliot_store_api::{
+    CampaignHistoryPlanRecord, CampaignLearningStateViewLookup,
+    CampaignLearningStateViewPublication, CampaignLearningStateViewRead,
+    CampaignLearningStateViewReadStatus, CampaignSourceHead, CampaignSourceReadStatus,
+    CampaignSourceRecord, CampaignSourceRevisionLookup, CampaignSourceRevisionRead,
+    NamedReadOperation, NamedReadRequest, ReadConsistency, ScopeId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -144,6 +144,7 @@ struct CampaignPacketGap {
 struct CampaignPacketResponse {
     outcome: CampaignPacketOutcome,
     completeness: Completeness,
+    #[serde(rename = "campaign_learning_state_view")]
     view: Option<CampaignLearningStateViewPublication>,
     compiled_context: Option<eliot_context::CampaignCompiledContext>,
     gaps: Vec<CampaignPacketGap>,
@@ -231,8 +232,8 @@ pub fn validate_campaign_packet_pair(
         .and_then(|object| object.get("arguments"))
         .cloned()
         .ok_or(CampaignPacketError::InvalidSelectors)?;
-    let arguments: PacketArguments = serde_json::from_value(arguments)
-        .map_err(|_| CampaignPacketError::InvalidSelectors)?;
+    let arguments: PacketArguments =
+        serde_json::from_value(arguments).map_err(|_| CampaignPacketError::InvalidSelectors)?;
     if arguments
         .packet_ref
         .as_deref()
@@ -290,6 +291,11 @@ pub async fn serve_campaign_packet_pair(
     resolve_compile_and_bind_result(kernel, envelope, attempt, binding, selectors).await
 }
 
+#[allow(
+    clippy::manual_let_else,
+    clippy::too_many_lines,
+    reason = "the production compiler keeps read admission, source binding, and view publication in one branch"
+)]
 async fn resolve_compile_and_bind_result(
     kernel: &DaemonKernelClient,
     envelope: &HostRequestEnvelope,
@@ -357,7 +363,7 @@ async fn resolve_compile_and_bind_result(
         task_plan_resolution,
         task_plan_record,
     )
-        .await
+    .await
     {
         Ok(resolved) => resolved,
         Err(_) => {
@@ -413,22 +419,22 @@ async fn resolve_compile_and_bind_result(
     }
     let prior_covers_materials = prior.as_ref().is_some_and(|publication| {
         selectors.material_refs.iter().all(|selector| {
-            ArtifactId::new(selector.clone()).is_ok_and(|handle| {
-                publication.view.required_references.contains(&handle)
-            })
+            ArtifactId::new(selector.clone())
+                .is_ok_and(|handle| publication.view.required_references.contains(&handle))
         })
     });
-    let prior_is_current = prior_covers_materials && prior.as_ref().is_some_and(|publication| {
-        validate_campaign_learning_state_view_current(
-            &publication.view,
-            &recipe,
-            &binding.state_fence,
-            &resolved.resolutions,
-            &current_history_plans,
-            observed_at_ms,
-        )
-        .is_ok()
-    });
+    let prior_is_current = prior_covers_materials
+        && prior.as_ref().is_some_and(|publication| {
+            validate_campaign_learning_state_view_current(
+                &publication.view,
+                &recipe,
+                &binding.state_fence,
+                &resolved.resolutions,
+                &current_history_plans,
+                observed_at_ms,
+            )
+            .is_ok()
+        });
 
     let view = if prior_is_current {
         prior
@@ -536,7 +542,14 @@ async fn resolve_compile_and_bind_result(
                 &publication.view.provenance.source_resolutions,
                 &resolved.resolutions,
             ) {
-                CampaignViewRebuildReason::OwnerRevisionChanged
+                if policy_source_revision_changed(
+                    &publication.view.provenance.source_resolutions,
+                    &resolved.resolutions,
+                ) {
+                    CampaignViewRebuildReason::PolicyChanged
+                } else {
+                    CampaignViewRebuildReason::OwnerRevisionChanged
+                }
             } else {
                 CampaignViewRebuildReason::ExplicitRefresh
             }
@@ -577,7 +590,10 @@ async fn resolve_compile_and_bind_result(
         }
     };
 
-    let is_nonusable = matches!(view.completeness, Completeness::Stale | Completeness::Blocked);
+    let is_nonusable = matches!(
+        view.completeness,
+        Completeness::Stale | Completeness::Blocked
+    );
     if is_nonusable {
         let publication = match make_view_publication(&binding, view) {
             Ok(publication) => publication,
@@ -640,65 +656,64 @@ async fn resolve_compile_and_bind_result(
                 context_blocked_response(
                     publication,
                     CampaignPacketGapCode::ContextRecipeUnavailable,
-                    CampaignSourceRole::ContextRecipe,
+                    Some(CampaignSourceRole::ContextRecipe),
                     &resolved.resolutions,
                     prior.is_some() && !prior_is_current,
                 ),
             );
         }
     };
-    let context_delivery_record = match current_record(&resolved, CampaignSourceRole::ContextDelivery) {
-        Ok(record) => record,
-        Err(_) => {
-            return campaign_packet_result_body(
-                envelope,
-                attempt,
-                context_blocked_response(
-                    publication,
-                    CampaignPacketGapCode::ContextDeliveryUnavailable,
-                    CampaignSourceRole::ContextDelivery,
-                    &resolved.resolutions,
-                    prior.is_some() && !prior_is_current,
-                ),
-            );
-        }
-    };
-    let context_recipe_body: ContextCampaignRecipeBody = match serde_json::from_value(
-        context_recipe_record.document.body.clone(),
-    ) {
-        Ok(body) => body,
-        Err(_) => {
-            return campaign_packet_result_body(
-                envelope,
-                attempt,
-                context_blocked_response(
-                    publication,
-                    CampaignPacketGapCode::ContextRecipeUnavailable,
-                    CampaignSourceRole::ContextRecipe,
-                    &resolved.resolutions,
-                    prior.is_some() && !prior_is_current,
-                ),
-            );
-        }
-    };
-    let prior_delivery: SessionDeliverySnapshot = match serde_json::from_value(
-        context_delivery_record.document.body.clone(),
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(_) => {
-            return campaign_packet_result_body(
-                envelope,
-                attempt,
-                context_blocked_response(
-                    publication,
-                    CampaignPacketGapCode::ContextDeliveryUnavailable,
-                    CampaignSourceRole::ContextDelivery,
-                    &resolved.resolutions,
-                    prior.is_some() && !prior_is_current,
-                ),
-            );
-        }
-    };
+    let context_delivery_record =
+        match current_record(&resolved, CampaignSourceRole::ContextDelivery) {
+            Ok(record) => record,
+            Err(_) => {
+                return campaign_packet_result_body(
+                    envelope,
+                    attempt,
+                    context_blocked_response(
+                        publication,
+                        CampaignPacketGapCode::ContextDeliveryUnavailable,
+                        Some(CampaignSourceRole::ContextDelivery),
+                        &resolved.resolutions,
+                        prior.is_some() && !prior_is_current,
+                    ),
+                );
+            }
+        };
+    let context_recipe_body: ContextCampaignRecipeBody =
+        match serde_json::from_value(context_recipe_record.document.body.clone()) {
+            Ok(body) => body,
+            Err(_) => {
+                return campaign_packet_result_body(
+                    envelope,
+                    attempt,
+                    context_blocked_response(
+                        publication,
+                        CampaignPacketGapCode::ContextRecipeUnavailable,
+                        Some(CampaignSourceRole::ContextRecipe),
+                        &resolved.resolutions,
+                        prior.is_some() && !prior_is_current,
+                    ),
+                );
+            }
+        };
+    let prior_delivery: SessionDeliverySnapshot =
+        match serde_json::from_value(context_delivery_record.document.body.clone()) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return campaign_packet_result_body(
+                    envelope,
+                    attempt,
+                    context_blocked_response(
+                        publication,
+                        CampaignPacketGapCode::ContextDeliveryUnavailable,
+                        Some(CampaignSourceRole::ContextDelivery),
+                        &resolved.resolutions,
+                        prior.is_some() && !prior_is_current,
+                    ),
+                );
+            }
+        };
     let context_source_schema_invalid = context_recipe_record.document.schema
         != eliot_store_api::CampaignSourceDocumentSchema::ContextRecipe
         || context_delivery_record.document.schema
@@ -718,7 +733,7 @@ async fn resolve_compile_and_bind_result(
             context_blocked_response(
                 publication,
                 CampaignPacketGapCode::ContextRecipeUnavailable,
-                CampaignSourceRole::ContextRecipe,
+                Some(CampaignSourceRole::ContextRecipe),
                 &resolved.resolutions,
                 prior.is_some() && !prior_is_current,
             ),
@@ -802,24 +817,19 @@ async fn resolve_manifest_sources(
                 });
             }
             CampaignSourceBinding::ExactReference => {
-                let (resolution, source) = match resolve_exact_source_requirement(
-                    kernel,
-                    binding,
-                    requirement,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => (
-                        CampaignSourceResolution {
-                            role: requirement.role,
-                            status: CampaignSourceResolutionStatus::Blocked,
-                            reference: None,
-                            read_state_fence: binding.state_fence.clone(),
-                        },
-                        None,
-                    ),
-                };
+                let (resolution, source) =
+                    match resolve_exact_source_requirement(kernel, binding, requirement).await {
+                        Ok(result) => result,
+                        Err(_) => (
+                            CampaignSourceResolution {
+                                role: requirement.role,
+                                status: CampaignSourceResolutionStatus::Blocked,
+                                reference: None,
+                                read_state_fence: binding.state_fence.clone(),
+                            },
+                            None,
+                        ),
+                    };
                 resolutions.push(resolution);
                 if let Some(source) = source {
                     current_records.push(source);
@@ -868,10 +878,9 @@ async fn resolve_exact_source_requirement(
             current_source = Some(source.clone());
             Some(reference)
         }
-        CampaignSourceReadStatus::Stale => read
-            .current_head
-            .as_ref()
-            .map(source_reference_from_head),
+        CampaignSourceReadStatus::Stale => {
+            read.current_head.as_ref().map(source_reference_from_head)
+        }
         CampaignSourceReadStatus::Blocked | CampaignSourceReadStatus::Missing => None,
     };
     let status = match read.status {
@@ -930,6 +939,22 @@ fn source_resolutions_differ(
     previous != current
 }
 
+fn policy_source_revision_changed(
+    previous: &[CampaignSourceResolution],
+    current: &[CampaignSourceResolution],
+) -> bool {
+    let policy_roles = [
+        CampaignSourceRole::GovernorPolicy,
+        CampaignSourceRole::ContextToolPolicy,
+        CampaignSourceRole::ActiveOverlay,
+    ];
+    policy_roles.iter().any(|role| {
+        let before = previous.iter().find(|resolution| resolution.role == *role);
+        let after = current.iter().find(|resolution| resolution.role == *role);
+        before != after
+    })
+}
+
 fn collect_slot_projections(
     recipe: &LearningStateViewRecipe,
     resolved: &ResolvedCampaignSources,
@@ -956,11 +981,13 @@ fn collect_slot_projections(
             let observed = projection
                 .canonical_digest()
                 .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
-            if !source.slot_projection_digests.iter().any(|digest| {
-                digest.slot_id == projection.slot_id && digest.digest == observed
-            }) || projections
-                .insert(projection.slot_id.as_str().to_owned(), projection.clone())
-                .is_some()
+            if !source
+                .slot_projection_digests
+                .iter()
+                .any(|digest| digest.slot_id == projection.slot_id && digest.digest == observed)
+                || projections
+                    .insert(projection.slot_id.as_str().to_owned(), projection.clone())
+                    .is_some()
             {
                 return Err(CampaignPacketError::OwnerReadUnavailable.to_string());
             }
@@ -1014,7 +1041,10 @@ fn collect_disagreements(current_records: &[CampaignSourceRecord]) -> Vec<OwnerD
 fn collect_positions(resolved: &ResolvedCampaignSources) -> Vec<CampaignPositionRef> {
     let mut positions = Vec::new();
     for (role, kind) in [
-        (CampaignSourceRole::CurrentPosition, CampaignPositionKind::Current),
+        (
+            CampaignSourceRole::CurrentPosition,
+            CampaignPositionKind::Current,
+        ),
         (
             CampaignSourceRole::ExperiencePosition,
             CampaignPositionKind::Experience,
@@ -1032,7 +1062,11 @@ fn collect_positions(resolved: &ResolvedCampaignSources) -> Vec<CampaignPosition
             CampaignPositionKind::EconomicsProgress,
         ),
     ] {
-        if let Some(source) = resolved.current_records.iter().find(|source| source.role == role) {
+        if let Some(source) = resolved
+            .current_records
+            .iter()
+            .find(|source| source.role == role)
+        {
             positions.push(CampaignPositionRef {
                 kind,
                 source_role: role,
@@ -1121,7 +1155,14 @@ fn source_reference_from_head(head: &CampaignSourceHead) -> CampaignSourceRevisi
 async fn read_task_plan_recipe(
     kernel: &DaemonKernelClient,
     binding: &CampaignPacketBinding,
-) -> Result<(LearningStateViewRecipe, CampaignSourceResolution, CampaignSourceRecord), String> {
+) -> Result<
+    (
+        LearningStateViewRecipe,
+        CampaignSourceResolution,
+        CampaignSourceRecord,
+    ),
+    String,
+> {
     let task_id = TaskId::new(binding.task_id.clone())
         .map_err(|_| CampaignPacketError::InvalidTaskPlan.to_string())?;
     let owner_artifact = ArtifactId::new(TASK_CONTROLLER_CAMPAIGN_OWNER_ID.to_owned())
@@ -1222,14 +1263,26 @@ async fn read_campaign_source(
             .named_parameters()
             .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?,
     )?;
-    let response = crate::kernel_context_read_client::KernelContextReadClient::execute_campaign_read(
-        kernel, request,
-    )
-    .await
-    .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
+    let response =
+        crate::kernel_context_read_client::KernelContextReadClient::execute_campaign_read(
+            kernel, request,
+        )
+        .await
+        .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
     let read = CampaignSourceRevisionRead::from_named_read_response(&response)
         .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
-    if read.read_state_fence != binding.state_fence {
+    if read.read_state_fence != binding.state_fence
+        || read.current_head.as_ref().is_some_and(|head| {
+            head.role != lookup.role
+                || head.owner_id != lookup.owner_id
+                || head.record_id != lookup.record_id
+        })
+        || read.source.as_ref().is_some_and(|source| {
+            source.role != lookup.role
+                || source.owner_id != lookup.owner_id
+                || source.record_id != lookup.record_id
+        })
+    {
         return Err(CampaignPacketError::OwnerReadUnavailable.to_string());
     }
     Ok(read)
@@ -1247,7 +1300,7 @@ async fn read_prior_campaign_view(
     let scope_id = ScopeId::new(binding.work_scope_id.clone())
         .map_err(|_| CampaignPacketError::PriorViewUnavailable.to_string())?;
     let lookup = CampaignLearningStateViewLookup {
-        view_id,
+        view_id: view_id.clone(),
         task_id,
         scope_id,
     };
@@ -1258,11 +1311,12 @@ async fn read_prior_campaign_view(
             .named_parameters()
             .map_err(|_| CampaignPacketError::PriorViewUnavailable.to_string())?,
     )?;
-    let response = crate::kernel_context_read_client::KernelContextReadClient::execute_campaign_read(
-        kernel, request,
-    )
-    .await
-    .map_err(|_| CampaignPacketError::PriorViewUnavailable.to_string())?;
+    let response =
+        crate::kernel_context_read_client::KernelContextReadClient::execute_campaign_read(
+            kernel, request,
+        )
+        .await
+        .map_err(|_| CampaignPacketError::PriorViewUnavailable.to_string())?;
     let read = CampaignLearningStateViewRead::from_named_read_response(&response)
         .map_err(|_| CampaignPacketError::PriorViewUnavailable.to_string())?;
     if read.read_state_fence != binding.state_fence
@@ -1273,7 +1327,7 @@ async fn read_prior_campaign_view(
     let publication = read
         .publication
         .ok_or_else(|| CampaignPacketError::PriorViewUnavailable.to_string())?;
-    if publication.view_id.as_str() != view_id
+    if publication.view_id != view_id
         || publication.task_id.as_str() != binding.task_id
         || publication.scope_id.as_str() != binding.work_scope_id
         || publication.view.view_id != publication.view_id

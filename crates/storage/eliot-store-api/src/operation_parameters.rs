@@ -942,9 +942,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetOrderingHeads" => Some(NamedReadOperation::GetOrderingHeads),
         b"GetTaskState" => Some(NamedReadOperation::GetTaskState),
         b"GetCampaignSourceRevision" => Some(NamedReadOperation::GetCampaignSourceRevision),
-        b"GetCampaignLearningStateView" => {
-            Some(NamedReadOperation::GetCampaignLearningStateView)
-        }
+        b"GetCampaignLearningStateView" => Some(NamedReadOperation::GetCampaignLearningStateView),
         b"GetCurrentEpistemicPosition" => Some(NamedReadOperation::GetCurrentEpistemicPosition),
         b"GetEvidencePack" => Some(NamedReadOperation::GetEvidencePack),
         b"GetUnderstandingProjectionInputs" => {
@@ -1057,9 +1055,7 @@ pub const fn declared_read_parameters(
         }
         NamedReadOperation::GetCurrentEpistemicPosition => &CURRENT_POSITION_PARAMETERS,
         NamedReadOperation::GetTaskState => &GET_TASK_STATE_PARAMETERS,
-        NamedReadOperation::GetCampaignSourceRevision => {
-            &GET_CAMPAIGN_SOURCE_REVISION_PARAMETERS
-        }
+        NamedReadOperation::GetCampaignSourceRevision => &GET_CAMPAIGN_SOURCE_REVISION_PARAMETERS,
         NamedReadOperation::GetCampaignLearningStateView => {
             &GET_CAMPAIGN_LEARNING_STATE_VIEW_PARAMETERS
         }
@@ -1366,9 +1362,8 @@ fn check_declared_shape(
             Ok(())
         }
         ParameterShape::CampaignSourceLookup => {
-            let lookup: crate::CampaignSourceRevisionLookup =
-                serde_json::from_value(value.clone())
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            let lookup: crate::CampaignSourceRevisionLookup = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
             lookup.validate()
         }
         ParameterShape::CampaignSourcePublications => {

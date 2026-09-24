@@ -7,9 +7,9 @@
 use eliot_contracts::{ArtifactId, SourceId, TaskRevision, canonical_json_bytes, sha256_hex};
 use eliot_learning_contracts::{
     CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSlotProjectionDigest,
-    CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole,
-    LearningStateViewRecipe, MemberProjection, OwnerId, SlotDisposition, SlotProjection,
-    SlotRequirement, SourceLineage, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+    CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
+    MemberProjection, OwnerId, SlotDisposition, SlotProjection, SlotRequirement,
+    TASK_CONTROLLER_CAMPAIGN_OWNER_ID, identity::SourceLineage,
 };
 use eliot_store_api::{
     CampaignSourceDocument, CampaignSourceDocumentSchema, CampaignSourceHead,
@@ -22,7 +22,7 @@ use crate::task_lifecycle::TaskLifecycleError;
 
 /// Exact heads returned by the two named Task Controller source reads.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct TaskControllerCampaignSourceHeads {
+pub struct TaskControllerCampaignSourceHeads {
     /// Current head for the task objective, if one exists.
     pub objective: Option<CampaignSourceHead>,
     /// Current head for the task plan, if one exists.
@@ -36,7 +36,7 @@ pub(crate) struct TaskControllerCampaignSources {
     pub objective: CampaignSourcePublication,
     /// Recipe projection anchored to the admitted task fence.
     pub plan: CampaignSourcePublication,
-    /// Recipe with the exact newly built TaskObjective reference installed.
+    /// Recipe with the exact newly built `TaskObjective` reference installed.
     pub recipe: LearningStateViewRecipe,
 }
 
@@ -56,13 +56,21 @@ struct TaskObjectiveSnapshotIdentity<'a> {
     goal_digest: &'a str,
 }
 
-/// Build TaskObjective and TaskPlan publications from an accepted task event.
+/// Build `TaskObjective` and `TaskPlan` publications from an accepted task event.
 ///
 /// The caller supplies the exact owner heads it read for both CAS inputs. The
-/// TaskObjective snapshot handle is a source-owner-minted projection ArtifactId
+/// `TaskObjective` snapshot handle is a source-owner-minted projection `ArtifactId`
 /// deterministic from task ID, revision, and goal digest; it is never a typed
-/// alias for the task ID. The TaskPlan source revision follows the admitted
-/// task fence, while the TaskObjective revision follows the resulting record.
+/// alias for the task ID. The `TaskPlan` source revision follows the admitted
+/// task fence, while the `TaskObjective` revision follows the resulting record.
+#[allow(
+    clippy::result_large_err,
+    reason = "TaskLifecycleError is the shared typed task-owner failure contract"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the two owner publications and recipe CAS binding remain one auditable transaction builder"
+)]
 pub(crate) fn build_task_controller_campaign_sources(
     event: &TaskLifecycleEvent,
     record: &TaskRecord,
@@ -74,8 +82,10 @@ pub(crate) fn build_task_controller_campaign_sources(
         .validate()
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
 
-    let owner_id = OwnerId::new(TASK_CONTROLLER_CAMPAIGN_OWNER_ID)
-        .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    let owner_id = OwnerId::from_artifact(
+        ArtifactId::new(TASK_CONTROLLER_CAMPAIGN_OWNER_ID)
+            .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+    );
     let task_revision = TaskRevision::new(record.revision)
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
     let objective_slot = task_objective_slot(&recipe, &owner_id)?;
@@ -119,10 +129,10 @@ pub(crate) fn build_task_controller_campaign_sources(
             source: SourceLineage {
                 owner: source_id,
                 snapshot: source_snapshot.clone(),
-                revision: task_revision.clone(),
+                revision: task_revision,
                 digest: goal_digest.clone(),
             },
-            projection_revision: task_revision.clone(),
+            projection_revision: task_revision,
             disposition: SlotDisposition::Current,
             value_digest: Some(goal_digest.clone()),
             evidence: vec![source_snapshot.clone()],
@@ -134,7 +144,7 @@ pub(crate) fn build_task_controller_campaign_sources(
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
     let objective_body = TaskObjectiveDocument {
         task_id: record.task_id.clone(),
-        revision: task_revision.clone(),
+        revision: task_revision,
         goal: record.goal.clone(),
         goal_digest,
         source_snapshot,
@@ -149,7 +159,7 @@ pub(crate) fn build_task_controller_campaign_sources(
         CampaignSourceRole::TaskObjective,
         owner_id.clone(),
         CampaignOwnerRecordId::Task(record.task_id.clone()),
-        CampaignOwnerRevision::Task(task_revision.clone()),
+        CampaignOwnerRevision::Task(task_revision),
         record.state_fence.clone(),
         vec![CampaignSlotProjectionDigest {
             slot_id: objective_slot.slot_id.clone(),
@@ -170,7 +180,7 @@ pub(crate) fn build_task_controller_campaign_sources(
         revision: CampaignOwnerRevision::Task(task_revision),
         content_digest: objective_record.content_digest.clone(),
         slot_projection_digests: vec![CampaignSlotProjectionDigest {
-            slot_id: objective_slot.slot_id,
+            slot_id: objective_slot.slot_id.clone(),
             digest: slot_projection_digest,
         }],
         recorded_state_fence: record.state_fence.clone(),
@@ -201,7 +211,6 @@ pub(crate) fn build_task_controller_campaign_sources(
         .binding
         .state_fence
         .task_revision
-        .clone()
         .ok_or_else(|| source_error("TaskPlan requires the admitted task revision"))?;
     let task_plan = recipe
         .source_requirements
@@ -252,6 +261,10 @@ pub(crate) fn build_task_controller_campaign_sources(
     })
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "TaskLifecycleError is the shared typed task-owner failure contract"
+)]
 fn task_objective_slot<'a>(
     recipe: &'a LearningStateViewRecipe,
     expected_owner: &OwnerId,
@@ -276,6 +289,10 @@ fn task_objective_slot<'a>(
     Ok(slot)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "TaskLifecycleError is the shared typed task-owner failure contract"
+)]
 fn validate_admitted_task_binding(
     event: &TaskLifecycleEvent,
     record: &TaskRecord,

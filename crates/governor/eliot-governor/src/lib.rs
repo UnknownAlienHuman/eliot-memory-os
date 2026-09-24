@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 mod activation_outcome;
+mod campaign_task_sources;
 mod canonical_projections;
 mod capability_evidence;
 mod composition;
@@ -70,6 +71,7 @@ mod task_lifecycle;
 mod wasm_resolution;
 
 pub use activation_outcome::*;
+pub use campaign_task_sources::TaskControllerCampaignSourceHeads;
 pub use canonical_projections::{
     GOVERNOR_PROJECTIONS_SCHEMA_VERSION, GovernorAffordanceProjection,
     GovernorContinuityProjection, GovernorProjectionError, GovernorProjectionSet,

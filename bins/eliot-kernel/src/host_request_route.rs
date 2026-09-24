@@ -1491,6 +1491,9 @@ fn validate_campaign_view_result(
     let Some(value) = response.get("campaign_learning_state_view") else {
         return Ok(());
     };
+    if value.is_null() {
+        return Ok(());
+    }
     if stored.capability_ref.as_str() != "eliot.packet" {
         return Err(TransportError::SessionFenced);
     }
@@ -1503,11 +1506,10 @@ fn validate_campaign_view_result(
     if envelope.identity.task_id.as_deref() != Some(publication.task_id.as_str())
         || envelope.identity.work_scope_id.as_deref() != Some(publication.scope_id.as_str())
         || envelope.state_fence != publication.state_fence
-        || stored.task_ref.as_ref().map(OpaqueLabel::as_str)
-            != Some(publication.task_id.as_str())
-        || stored.scope_ref.as_ref().map(OpaqueLabel::as_str)
-            != Some(publication.scope_id.as_str())
-        || stored.fence_digest != sha256_json(&publication.state_fence)
+        || stored.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(publication.task_id.as_str())
+        || stored.scope_ref.as_ref().map(OpaqueLabel::as_str) != Some(publication.scope_id.as_str())
+        || sha256_json(&publication.state_fence).map_err(|_| TransportError::SessionFenced)?
+            != stored.fence_digest
     {
         return Err(TransportError::SessionFenced);
     }

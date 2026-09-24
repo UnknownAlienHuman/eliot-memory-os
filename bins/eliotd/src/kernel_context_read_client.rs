@@ -60,9 +60,9 @@ use eliot_protocol::{
 use eliot_read::{LocalReadPort, QueryResult, ReadError};
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignSourceRevisionLookup, CanonicalReadClient,
-    EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    REVOCATION_HISTORY_MAX_RECORDS, ReadConsistency, RevisionHead, RevisionKey, ScopeId,
-    StoreError, MAX_EXPERIENCE_PAGE_RECORDS, validate_experience_read_params,
+    EVIDENCE_PACK_MAX_RECORDS, MAX_EXPERIENCE_PAGE_RECORDS, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, REVOCATION_HISTORY_MAX_RECORDS, ReadConsistency, RevisionHead, RevisionKey,
+    ScopeId, StoreError, validate_experience_read_params,
 };
 
 use super::{DaemonKernelClient, SERVICE_NAME};
@@ -232,10 +232,13 @@ impl KernelContextReadClient {
             });
         }
         request.validate()?;
-        let lookup = request.parameters.get("lookup").ok_or(StoreError::InvalidField {
-            field: "operation.parameter",
-            reason: "campaign learning lookup is required",
-        })?;
+        let lookup = request
+            .parameters
+            .get("lookup")
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "campaign learning lookup is required",
+            })?;
         if request.parameters.len() != 1 {
             return Err(StoreError::InvalidField {
                 field: "operation.parameters",
@@ -244,8 +247,9 @@ impl KernelContextReadClient {
         }
         match request.operation {
             NamedReadOperation::GetCampaignSourceRevision => {
-                let lookup: CampaignSourceRevisionLookup = serde_json::from_value(lookup.clone())
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+                let lookup: CampaignSourceRevisionLookup =
+                    serde_json::from_value(lookup.clone())
+                        .map_err(|error| StoreError::Serialization(error.to_string()))?;
                 if lookup.named_parameters()? != request.parameters {
                     return Err(StoreError::InvalidField {
                         field: "operation.parameter",
@@ -623,9 +627,7 @@ impl KernelContextReadClient {
     /// transport. Range size is bounded by the canonical owner contract;
     /// the packet compiler supplies the authenticated envelope's scope and
     /// fence, never a scope or revision claimed by tool arguments.
-    fn check_experience_range_capability(
-        request: &NamedReadRequest,
-    ) -> Result<(), StoreError> {
+    fn check_experience_range_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
         if request.scope_id.is_none() {
             return Err(StoreError::InvalidField {
                 field: "scope_id",

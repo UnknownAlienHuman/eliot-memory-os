@@ -130,6 +130,23 @@ pub trait KernelTransitionPort: Send + Sync {
 
     /// Returns a bounded Kernel-owned health observation.
     fn health(&self) -> KernelPortFuture<'_, StoreHealth>;
+
+    /// Reads the exact current Task Controller source heads used as CAS
+    /// expectations for one recipe-bearing task transition. Implementations
+    /// that do not expose the campaign source read route fail closed; no
+    /// transition may guess `None` for an existing head.
+    fn campaign_source_heads(
+        &self,
+        _task_id: &TaskId,
+        _scope_id: &str,
+        _state_fence: &StateFence,
+    ) -> KernelPortFuture<'_, crate::campaign_task_sources::TaskControllerCampaignSourceHeads> {
+        Box::pin(async {
+            Err(KernelPortError::NotAdmitted(
+                "Task Controller campaign source-head read is not admitted".to_owned(),
+            ))
+        })
+    }
 }
 
 /// Object-safe future returned by a neutral Kernel transition port.

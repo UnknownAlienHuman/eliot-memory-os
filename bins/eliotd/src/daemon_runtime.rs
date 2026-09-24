@@ -1006,11 +1006,10 @@ async fn run_local_read_poll(
     // authenticated named owner reads. It runs on the reachable poll path and
     // settles through the same attempt-bound result leg as local Skill work.
     if eliotd::campaign_packet::is_campaign_packet_tool(&tool) {
-        let body = eliotd::campaign_packet::serve_campaign_packet_pair(
-            kernel, &envelope, &tool, &attempt,
-        )
-        .await
-        .map_err(|error| format!("daemon campaign packet compilation: {error}"))?;
+        let body =
+            eliotd::campaign_packet::serve_campaign_packet_pair(kernel, &envelope, &tool, &attempt)
+                .await
+                .map_err(|error| format!("daemon campaign packet compilation: {error}"))?;
         return match submit_local_read_result_idempotent(kernel, &body).await? {
             LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
             LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),

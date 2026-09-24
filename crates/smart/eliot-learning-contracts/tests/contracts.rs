@@ -1,7 +1,7 @@
 use eliot_agent_contracts::{AgentAttemptId, TargetId};
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId, RequestId,
-    ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
+    ArtifactId, AuthorityEpoch, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId,
+    RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_evidence::EvidenceFreshness;
 use eliot_learning_contracts::*;
@@ -85,9 +85,9 @@ fn source_revision(
         }
         CampaignSourceRole::MemoryProjection
         | CampaignSourceRole::StableHarness
-        | CampaignSourceRole::TaskFamilyHarness => CampaignOwnerRevision::ResourceGeneration(
-            binding.state_fence.resource_generation,
-        ),
+        | CampaignSourceRole::TaskFamilyHarness => {
+            CampaignOwnerRevision::ResourceGeneration(binding.state_fence.resource_generation)
+        }
         CampaignSourceRole::FrozenAnchor | CampaignSourceRole::ArtifactProjection => {
             CampaignOwnerRevision::ResourceSnapshot(content_digest.to_owned())
         }
@@ -97,7 +97,13 @@ fn source_revision(
 
 fn campaign_source_contract(
     binding: &ContractBinding,
-) -> Result<(Vec<CampaignSourceRequirement>, CampaignLearningStateProvenance), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Vec<CampaignSourceRequirement>,
+        CampaignLearningStateProvenance,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let mut requirements = Vec::with_capacity(CampaignSourceRole::all().len());
     let mut resolutions = Vec::with_capacity(CampaignSourceRole::all().len());
     for (index, role) in CampaignSourceRole::all().into_iter().enumerate() {
@@ -174,11 +180,26 @@ fn campaign_source_contract(
         });
     }
     let position_specs = [
-        (CampaignPositionKind::Current, CampaignSourceRole::CurrentPosition),
-        (CampaignPositionKind::Experience, CampaignSourceRole::ExperiencePosition),
-        (CampaignPositionKind::Adaptation, CampaignSourceRole::AdaptationPosition),
-        (CampaignPositionKind::Evaluation, CampaignSourceRole::EvaluationPosition),
-        (CampaignPositionKind::EconomicsProgress, CampaignSourceRole::EconomicsProgress),
+        (
+            CampaignPositionKind::Current,
+            CampaignSourceRole::CurrentPosition,
+        ),
+        (
+            CampaignPositionKind::Experience,
+            CampaignSourceRole::ExperiencePosition,
+        ),
+        (
+            CampaignPositionKind::Adaptation,
+            CampaignSourceRole::AdaptationPosition,
+        ),
+        (
+            CampaignPositionKind::Evaluation,
+            CampaignSourceRole::EvaluationPosition,
+        ),
+        (
+            CampaignPositionKind::EconomicsProgress,
+            CampaignSourceRole::EconomicsProgress,
+        ),
     ];
     let positions = position_specs
         .into_iter()
@@ -236,13 +257,21 @@ fn bind_slot_source_contract(
             .find(|requirement| requirement.role == spec.source_role)
             .expect("slot source role is declared");
         requirement.owner = spec.owner.clone();
-        requirement.expected_reference.as_mut().expect("slot source is declared").owner = spec.owner.clone();
+        requirement
+            .expected_reference
+            .as_mut()
+            .expect("slot source is declared")
+            .owner = spec.owner.clone();
         let resolution = provenance
             .source_resolutions
             .iter_mut()
             .find(|resolution| resolution.role == spec.source_role)
             .expect("slot source role is resolved");
-        resolution.reference.as_mut().expect("slot source is current").owner = spec.owner.clone();
+        resolution
+            .reference
+            .as_mut()
+            .expect("slot source is current")
+            .owner = spec.owner.clone();
     }
     for projection in projections {
         let spec = recipe
@@ -260,7 +289,10 @@ fn bind_slot_source_contract(
             .as_mut()
             .expect("slot source is declared")
             .slot_projection_digests
-            .push(CampaignSlotProjectionDigest { slot_id: projection.slot_id.clone(), digest: projection_digest.clone() });
+            .push(CampaignSlotProjectionDigest {
+                slot_id: projection.slot_id.clone(),
+                digest: projection_digest.clone(),
+            });
         provenance
             .source_resolutions
             .iter_mut()
@@ -270,7 +302,10 @@ fn bind_slot_source_contract(
             .as_mut()
             .expect("slot source is current")
             .slot_projection_digests
-            .push(CampaignSlotProjectionDigest { slot_id: projection.slot_id.clone(), digest: projection_digest });
+            .push(CampaignSlotProjectionDigest {
+                slot_id: projection.slot_id.clone(),
+                digest: projection_digest,
+            });
     }
     recipe.seal()?;
     Ok(())

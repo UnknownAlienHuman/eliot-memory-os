@@ -198,9 +198,7 @@ pub fn parse_task_controller_claimed_pair(
         .validate()
         .map_err(|error| format!("Kernel Task Controller attempt is invalid: {error}"))?;
 
-    let tool_name = tool
-        .get("name")
-        .and_then(serde_json::Value::as_str);
+    let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
     let tool_invocation = tool
         .get("arguments")
         .cloned()
@@ -213,7 +211,11 @@ pub fn parse_task_controller_claimed_pair(
         || tool_invocation.as_ref() != Some(&invocation)
         || invocation.task_id.as_str() != envelope.identity.task_id.as_deref().unwrap_or_default()
         || invocation.work_scope_id
-            != envelope.identity.work_scope_id.as_deref().unwrap_or_default()
+            != envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .unwrap_or_default()
         || request_identity.request.state_fence != envelope.state_fence
         || request_identity.request.metadata.state_fence != envelope.state_fence
         || request_identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id)
@@ -244,9 +246,7 @@ pub fn parse_task_controller_submit_outcome(
     let accepted = value
         .get("accepted")
         .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| {
-            "Kernel task_controller_result answer omits accepted outcome".to_owned()
-        })?;
+        .ok_or_else(|| "Kernel task_controller_result answer omits accepted outcome".to_owned())?;
     if accepted {
         return Ok(TaskControllerSubmitOutcome::Accepted);
     }

@@ -38,10 +38,10 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod campaign_packet;
 pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
-mod campaign_packet;
 pub mod capability_outcome;
 mod controlboard_adapters;
 mod daemon_config;
