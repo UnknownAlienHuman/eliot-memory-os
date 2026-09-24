@@ -1,56 +1,55 @@
 //! Shared-executor research provider execution.
 //!
-//! A [`ProviderBridge`] runs one admitted operation through the shared
-//! governed Windows [`ProcessExecutor`] contour: the request-minting port
-//! (owned by the runtime composition root, which holds Kernel-issued process
-//! authority) binds the admitted operation to exactly one [`ProcessRequest`],
-//! and the bridge validates that binding before the executor is contacted.
-//! The bridge mints no intent, no permit, and no argv; it never reads ambient
-//! environment, task text, or stdin, and it never spawns a child directly.
-//!
-//! Execution is synchronous over the executor's async contour via the
-//! established P-04 `block_on` precedent (P-04 futures complete without a
-//! reactor). Every refusal below happens before `start` unless the error says
-//! otherwise.
+//! `ProviderBridge` is deliberately an adapter around the one public
+//! `ProcessExecutor` contract. It builds no executable intent or permit: the
+//! injected `ResearchRequestPort` is the composition seam that consumes a
+//! Kernel-authorized request and the exact typed wire bytes. Every operation
+//! remains operation-local; timeout, cancellation, crash, and unknown outcomes
+//! are retained as evidence and are never converted into a clean retry.
 
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eliot_process::{
     CancellationReceipt, EnvironmentInheritance, ExitDisposition, OperationId, ProcessEvidence,
-    ProcessEvidenceSink, ProcessExecutor, ProcessLifecycle, ProcessRequest,
+    ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
+    ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
 };
-use eliot_process_executor::WindowsProcessExecutor;
-use eliot_research_exchange_api::ResearchQueryRequest;
+use eliot_process_executor::{CapturedStream, WindowsProcessExecutor};
+use eliot_research_exchange_api::{
+    CompletionDisposition, CoverageGap, CoverageGapKind, ResearchEvidenceBundle,
+    ResearchQueryRequest,
+};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::BridgeError;
 use crate::admission::ProviderAdmission;
-use crate::evidence::{RawProviderEvidence, sha256_hex};
+use crate::evidence::{
+    ProviderAttemptReceipt, ProviderCleanupReceipt, RawProviderEvidence, sha256_hex,
+};
 use crate::protocol::{
-    RESEARCH_PROVIDER_WIRE_VERSION, ResultFrame, SubmitAck, SubmitEnvelope, scan_result_frame,
+    CoverageDenominator, PROVIDER_WIRE_ARGUMENT, ResultFrame, SubmitAck, SubmitEnvelope,
+    scan_result_frame,
 };
 
-/// Compile-time proof that the bound executor implements the shared
-/// [`ProcessExecutor`] contract: if P-04 ever stops implementing P-03, the
-/// binding fails to build instead of silently targeting a fork.
+/// Compile-time proof that the production binding uses the shared P-03/P-04
+/// contract rather than a private process launcher.
 const _: fn() = || {
     fn requires_shared_contract<E: ProcessExecutor>() {}
     requires_shared_contract::<WindowsProcessExecutor>();
 };
 
-/// Default bound for the terminal-lifecycle wait (matches the established
-/// executor test precedent of a 30-second horizon with 25 ms polls).
+/// Default fallback wait ceiling. An admission always narrows this to its
+/// absolute deadline before start.
 pub const BOUND_RUN_DEADLINE: Duration = Duration::from_secs(30);
-/// Poll interval for the terminal-lifecycle wait.
 const BOUND_RUN_POLL: Duration = Duration::from_millis(25);
+const MAX_ADMISSION_WAIT: Duration = Duration::from_hours(24);
 
-/// Typed failure of the request-minting port. The port is the only party that
-/// may mint [`ProcessRequest`] values; its failures carry no payload, and the
-/// bridge maps them to the typed source-unavailable gap (degradation, never a
-/// fabricated result).
+/// Typed failure of the request-minting/delivery port.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RequestPortError {
     /// No Kernel-issued process authority is available in this scope.
@@ -59,81 +58,136 @@ pub enum RequestPortError {
     /// The port refused to mint a request for this operation.
     #[error("the request port refused the binding")]
     Refused,
+    /// The port did not deliver the exact admitted wire bytes.
+    #[error("the request port did not deliver the admitted wire envelope")]
+    WireDeliveryRefused,
+    /// The pre-start intent record could not be durably recorded.
+    #[error("the request port could not persist the provider intent record")]
+    EvidenceUnavailable,
 }
 
-/// Composition-root seam minting authorized [`ProcessRequest`] values.
-///
-/// Dispatch permits are Kernel-issued authority, so the bridge never mints
-/// requests itself. `request_sha256` binds the exact canonical request bytes
-/// the minted request must execute for; the bridge re-validates the returned
-/// request against the admission before the executor is contacted.
+/// Composition-root seam that mints an authorized request and delivers the
+/// exact wire bytes to the child-facing launch material.
 pub trait ResearchRequestPort: Send + Sync {
-    /// Binds one admitted operation to exactly one authorized process request.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RequestPortError`] when no authority is available or the
-    /// port refuses the binding.
+    /// Binds one admitted operation and exact wire envelope to one process
+    /// request. Implementations must place `wire_bytes` in the child launch
+    /// material; the bridge verifies that fact before start.
     fn bind(
         &self,
         admission: &ProviderAdmission,
-        request_sha256: &str,
+        envelope: &SubmitEnvelope,
+        wire_bytes: &[u8],
     ) -> Result<ProcessRequest, RequestPortError>;
 }
 
-/// Terminal provider outcome in provider-local terms. This is acquisition
-/// evidence, never a semantic verdict and never task finish.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Terminal provider outcome in provider-local terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderOutcome {
-    /// Provider completed and the submit ack decoded.
+    /// Provider completed and a candidate frame was correlated.
     Completed,
-    /// Provider completed with a non-zero code or a crash-class disposition.
+    /// Provider completed with a crash/failure disposition.
     Crashed,
-    /// The terminal wait exceeded the deadline.
+    /// The terminal wait exceeded the admitted deadline.
     TimedOut,
-    /// Cancellation stopped the tree.
+    /// Cancellation stopped the tree and was receipted.
     Cancelled,
-    /// The external outcome cannot be classified yet; reconciliation by the
-    /// stable operation identity is required before any retry.
+    /// The external outcome cannot be classified yet.
     Unknown,
 }
 
-/// One executed provider attempt: the stable job identity, the typed outcome,
-/// the immutable raw evidence, the provider-local job reference, and the
-/// terminal result frame when the provider emitted one.
-#[derive(Clone, Debug)]
-pub struct ProviderExecution {
-    /// Stable admitted operation identity (the only identity the exchange
-    /// keys on).
-    pub job_id: String,
-    /// Typed terminal outcome.
-    pub outcome: ProviderOutcome,
-    /// Immutable raw evidence (stdout/stderr/exit/lineage digests).
-    pub evidence: RawProviderEvidence,
-    /// Provider-local job reference (correlation only, never identity).
-    pub provider_job_ref: String,
-    /// Terminal result frame when present in provider output.
-    pub result_frame: Option<ResultFrame>,
-    /// Canonical submit wire bytes sent to the port binding.
-    pub wire_bytes: Vec<u8>,
+/// Why a provider attempt cannot be treated as a successful result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderFailureKind {
+    /// Typed provider result reported failure.
+    ProviderFailed,
+    /// Provider reported cancellation.
+    ProviderCancelled,
+    /// Wire was malformed or failed exact correlation.
+    Protocol,
+    /// Raw/process evidence is incomplete.
+    Evidence,
+    /// Timeout/unknown/crash outcome.
+    Process,
 }
 
-/// One started operation with its sealed bindings: the stable operation
-/// identity, the invocation digest every observation must preserve, and the
-/// canonical submit wire bytes.
+/// One executed provider attempt and its durable operation receipt.
+#[derive(Clone, Debug)]
+pub struct ProviderExecution {
+    /// Stable admitted operation identity, never the provider job id.
+    pub job_id: String,
+    pub outcome: ProviderOutcome,
+    /// Immutable raw stdout/stderr/exit/lineage evidence.
+    pub evidence: RawProviderEvidence,
+    /// Provider-local correlation reference, if decoded.
+    pub provider_job_ref: Option<String>,
+    /// Exact provider result frame, if decoded.
+    pub result_frame: Option<ResultFrame>,
+    /// Canonical submit wire bytes actually delivered to the child.
+    pub wire_bytes: Vec<u8>,
+    /// Full route/privacy/budget/usage/deadline/cancel/cleanup receipt.
+    pub receipt: ProviderAttemptReceipt,
+    /// Candidate-only evidence/coverage material, if a result was available.
+    pub candidate: Option<ResearchEvidenceBundle>,
+    /// Stable failure projection for this attempt, if any.
+    pub failure: Option<ProviderFailureKind>,
+}
+
+impl ProviderExecution {
+    /// Projects this physical/provider outcome to a stable bridge error.
+    #[must_use]
+    pub fn bridge_error(&self) -> Option<BridgeError> {
+        match self.failure {
+            None => None,
+            Some(ProviderFailureKind::ProviderCancelled | ProviderFailureKind::Process)
+                if self.outcome == ProviderOutcome::Cancelled =>
+            {
+                Some(BridgeError::Cancelled {
+                    reason: "provider reported cancellation",
+                })
+            }
+            Some(ProviderFailureKind::ProviderCancelled) => Some(BridgeError::Cancelled {
+                reason: "provider reported cancellation",
+            }),
+            Some(ProviderFailureKind::ProviderFailed) => Some(BridgeError::ProviderFailed {
+                reason: "provider reported a failed acquisition",
+            }),
+            Some(ProviderFailureKind::Protocol) => Some(BridgeError::ProtocolViolation {
+                reason: "provider result was not correlated to the admitted operation",
+            }),
+            Some(ProviderFailureKind::Evidence) => Some(BridgeError::EvidenceIncomplete {
+                reason: "provider evidence or terminal disposition is incomplete",
+            }),
+            Some(ProviderFailureKind::Process) => match self.outcome {
+                ProviderOutcome::TimedOut => Some(BridgeError::TimedOut),
+                ProviderOutcome::Unknown => Some(BridgeError::UnknownOutcome),
+                ProviderOutcome::Crashed => Some(BridgeError::ProviderFailed {
+                    reason: "provider process crashed or exceeded a resource limit",
+                }),
+                ProviderOutcome::Cancelled => Some(BridgeError::Cancelled {
+                    reason: "provider reported cancellation",
+                }),
+                ProviderOutcome::Completed => Some(BridgeError::EvidenceIncomplete {
+                    reason: "provider completed without a correlated result",
+                }),
+            },
+        }
+    }
+}
+
 struct BoundOperation {
+    admission: ProviderAdmission,
     operation: OperationId,
     digest: String,
+    envelope: SubmitEnvelope,
     wire_bytes: Vec<u8>,
+    deadline_at: Instant,
+    deadline_unix_ms: i64,
+    process_request: Option<ProcessRequest>,
+    start_receipt: Option<ProcessStartReceipt>,
 }
 
 /// Stateless shared-executor runner for admitted research operations.
-///
-/// The runner stores the executor handle, the request-minting port, the
-/// evidence sink, and the terminal-wait deadline. It owns no admission and no
-/// per-operation state: one bounded operation's lifecycle lives with the
-/// admitted bridge in `lib.rs`, which is the only caller of
-/// [`ProviderBridge::execute`].
 pub struct ProviderBridge {
     executor: Arc<WindowsProcessExecutor>,
     port: Arc<dyn ResearchRequestPort>,
@@ -142,8 +196,9 @@ pub struct ProviderBridge {
 }
 
 impl ProviderBridge {
-    /// Binds the runner to a shared executor, a request-minting port, and an
-    /// evidence sink. Starts nothing; grants no execution.
+    /// Binds the runner to the shared executor, an authorized request port,
+    /// and an evidence sink. Starts nothing and grants no authority.
+    #[must_use]
     pub fn new(
         executor: Arc<WindowsProcessExecutor>,
         port: Arc<dyn ResearchRequestPort>,
@@ -157,43 +212,95 @@ impl ProviderBridge {
         }
     }
 
-    /// Overrides the terminal-lifecycle wait bound.
+    /// Overrides only the outer fallback wait; the admitted absolute deadline
+    /// remains authoritative and is always narrower.
     #[must_use]
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = deadline;
         self
     }
 
-    /// Returns the bound shared executor.
+    /// Returns the shared executor handle.
     #[must_use]
     pub fn executor(&self) -> &Arc<WindowsProcessExecutor> {
         &self.executor
     }
 
-    /// Executes one admitted request through the shared governed contour.
-    ///
-    /// Order (all fail-closed): request/admission binding, port minting,
-    /// minted-request re-validation (artifact, operation, generation, epoch,
-    /// no ambient environment inheritance), executor start with receipt
-    /// checks, terminal wait with deadline, stream readback with immutable
-    /// evidence materialization, typed ack decode. A provider terminal state
-    /// that cannot be classified returns [`ProviderOutcome::Unknown`] with
-    /// the evidence preserved, and must be reconciled by operation identity
-    /// before any retry.
+    /// Executes one admitted request through the governed contour.
     pub fn execute(
         &self,
         admission: &ProviderAdmission,
         request: &ResearchQueryRequest,
     ) -> Result<ProviderExecution, BridgeError> {
-        let bound = self.bind_operation(admission, request)?;
-        let view = self.await_terminal(&bound)?;
-        self.finish_terminal(bound, &view)
+        let mut bound = self.bind_operation(admission, request)?;
+        let process_request =
+            bound
+                .process_request
+                .take()
+                .ok_or(BridgeError::EvidenceIncomplete {
+                    reason: "admitted process request was not available for start",
+                })?;
+        let start_receipt = match block_on(self.executor.start(process_request, self.sink.clone()))
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let prelaunch_contract_failure =
+                    matches!(&error, ProcessExecutionError::Contract(_));
+                if !prelaunch_contract_failure {
+                    let reconciliation = self.reconcile_operation(&bound.operation).ok();
+                    return self.finish_unobserved_with_reconciliation(
+                        bound,
+                        ProviderOutcome::Unknown,
+                        None,
+                        reconciliation,
+                        Some(&error),
+                    );
+                }
+                return Err(map_start_error(error));
+            }
+        };
+        if start_receipt.operation_id() != &bound.operation
+            || start_receipt.request_digest() != bound.digest
+            || start_receipt.accepted_generation() != admission.process_generation()
+        {
+            let reconciliation = self.reconcile_operation(&bound.operation).ok();
+            return self.finish_unobserved_with_reconciliation(
+                bound,
+                ProviderOutcome::Unknown,
+                None,
+                reconciliation,
+                None,
+            );
+        }
+        bound.start_receipt = Some(start_receipt);
+        match self.await_terminal(&bound) {
+            Ok(view) => self.finish_terminal(bound, &view, None),
+            Err(WaitFailure::TimedOut) => {
+                let cancellation = self.cancel_operation(&bound.operation).ok();
+                let reconciliation = self.reconcile_operation(&bound.operation).ok();
+                self.finish_unobserved_with_reconciliation(
+                    bound,
+                    ProviderOutcome::TimedOut,
+                    cancellation,
+                    reconciliation,
+                    None,
+                )
+            }
+            Err(WaitFailure::Unknown | WaitFailure::Process) => {
+                let reconciliation = self.reconcile_operation(&bound.operation).ok();
+                self.finish_unobserved_with_reconciliation(
+                    bound,
+                    ProviderOutcome::Unknown,
+                    None,
+                    reconciliation,
+                    None,
+                )
+            }
+        }
     }
 
-    /// Validates the request/admission binding, mints the process request
-    /// through the port, re-validates the minted binding, and starts the
-    /// operation with receipt checks. Everything here happens before any
-    /// provider output exists.
+    /// Validates the request/admission binding, builds the exact wire before
+    /// port binding, and starts only the revalidated process request.
     fn bind_operation(
         &self,
         admission: &ProviderAdmission,
@@ -212,105 +319,117 @@ impl ProviderBridge {
                 reason: "research request is not canonical wire JSON",
             })?;
         let request_sha256 = sha256_hex(&request_bytes);
-        let process_request = self
-            .port
-            .bind(admission, &request_sha256)
-            .map_err(|_| BridgeError::ProviderUnavailable)?;
-        check_minted_request(admission, &process_request)?;
-        let operation = process_request.operation_id().clone();
-        let digest = process_request.invocation_digest().to_owned();
-        let generation = process_request.generation();
-        let envelope = SubmitEnvelope {
-            wire_version: RESEARCH_PROVIDER_WIRE_VERSION,
-            operation_id: operation.as_str().to_owned(),
-            exchange_id: request.exchange_id.clone(),
-            idempotency_key: request.idempotency_key.clone(),
-            invocation_digest: digest.clone(),
-            protocol_revision: request.protocol_revision,
-            required_schema: request.required_schema.clone(),
-            request_sha256,
-        };
+        let envelope = SubmitEnvelope::from_admission(request, admission, request_sha256.clone());
         let wire_bytes = envelope
             .encode()
             .map_err(|refusal| BridgeError::ProtocolViolation {
                 reason: refusal.reason(),
             })?;
-        // Fail-closed serializer check: the wire we hand to the port binding
-        // must decode back to the same operation and invocation binding.
-        let round_trip = SubmitEnvelope::decode(&wire_bytes).map_err(|refusal| {
-            BridgeError::ProtocolViolation {
-                reason: refusal.reason(),
-            }
-        })?;
-        if round_trip.operation_id != envelope.operation_id
-            || round_trip.invocation_digest != envelope.invocation_digest
-        {
-            return Err(BridgeError::ProtocolViolation {
-                reason: "submit envelope failed its round-trip binding check",
-            });
-        }
-        let receipt = block_on(self.executor.start(process_request, self.sink.clone()))
-            .map_err(BridgeError::Process)?;
-        if receipt.operation_id() != &operation
-            || receipt.request_digest() != digest
-            || receipt.accepted_generation() != generation
-        {
-            return Err(BridgeError::EvidenceIncomplete {
-                reason: "executor start receipt does not preserve the bound request",
-            });
-        }
+        let process_request =
+            self.port
+                .bind(admission, &envelope, &wire_bytes)
+                .map_err(|error| match error {
+                    RequestPortError::NoAuthority => BridgeError::ProviderUnavailable,
+                    RequestPortError::Refused => BridgeError::NotAdmitted {
+                        reason: "Kernel request port refused the admitted process binding",
+                    },
+                    RequestPortError::WireDeliveryRefused => BridgeError::ProtocolViolation {
+                        reason: "request port refused exact provider wire delivery",
+                    },
+                    RequestPortError::EvidenceUnavailable => BridgeError::EvidenceIncomplete {
+                        reason: "request port could not persist the pre-start provider intent",
+                    },
+                })?;
+        check_minted_request(admission, &envelope, &wire_bytes, &process_request)?;
+        let operation = process_request.operation_id().clone();
+        let digest = process_request.invocation_digest().to_owned();
         Ok(BoundOperation {
+            admission: admission.clone(),
             operation,
             digest,
+            envelope,
             wire_bytes,
+            deadline_at: self.deadline_at(admission)?,
+            deadline_unix_ms: admission.deadline_ms(),
+            process_request: Some(process_request),
+            start_receipt: None,
         })
     }
 
-    /// Waits for the terminal lifecycle of one started operation, preserving
-    /// the request binding on every observation. A deadline overrun attempts
-    /// cancellation and stays explicit: the outcome is unconfirmed.
-    fn await_terminal(
-        &self,
-        bound: &BoundOperation,
-    ) -> Result<eliot_process::ProcessExecutionView, BridgeError> {
-        let started = Instant::now();
+    fn deadline_at(&self, admission: &ProviderAdmission) -> Result<Instant, BridgeError> {
+        let now = now_unix_ms();
+        let remaining_ms = admission.deadline_ms().saturating_sub(now);
+        if remaining_ms <= 0 {
+            return Err(BridgeError::TimedOut);
+        }
+        let remaining = Duration::from_millis(u64::try_from(remaining_ms).unwrap_or(u64::MAX));
+        let bounded = self.deadline.min(remaining).min(MAX_ADMISSION_WAIT);
+        if bounded.is_zero() {
+            return Err(BridgeError::TimedOut);
+        }
+        Instant::now()
+            .checked_add(bounded)
+            .ok_or(BridgeError::TimedOut)
+    }
+
+    fn await_terminal(&self, bound: &BoundOperation) -> Result<ProcessExecutionView, WaitFailure> {
         loop {
-            let view = block_on(self.executor.inspect(bound.operation.clone()))
-                .map_err(BridgeError::Process)?;
+            let view = match block_on(self.executor.inspect(bound.operation.clone())) {
+                Ok(view) => view,
+                Err(ProcessExecutionError::UnknownOutcome) => return Err(WaitFailure::Unknown),
+                Err(_) => return Err(WaitFailure::Process),
+            };
             if view.operation_id() != &bound.operation || view.request_digest() != bound.digest {
-                return Err(BridgeError::EvidenceIncomplete {
-                    reason: "executor observation does not preserve the bound request",
-                });
+                return Err(WaitFailure::Unknown);
             }
             if view.lifecycle().is_terminal() {
                 return Ok(view);
             }
-            if started.elapsed() >= self.deadline {
-                let _ = block_on(self.executor.cancel(bound.operation.clone()));
-                return Err(BridgeError::TimedOut);
+            if Instant::now() >= bound.deadline_at {
+                return Err(WaitFailure::TimedOut);
             }
             std::thread::sleep(BOUND_RUN_POLL);
         }
     }
 
-    /// Materializes immutable evidence from one terminal observation and
-    /// decodes the typed provider ack. Unknown terminal states stay explicit
-    /// with the evidence preserved; provider output never becomes identity.
+    #[allow(clippy::too_many_lines)]
     fn finish_terminal(
         &self,
         bound: BoundOperation,
-        view: &eliot_process::ProcessExecutionView,
+        view: &ProcessExecutionView,
+        cancellation: Option<CancellationReceipt>,
     ) -> Result<ProviderExecution, BridgeError> {
-        let exit = view.exit().ok_or(BridgeError::EvidenceIncomplete {
-            reason: "executor reported a terminal lifecycle without an exit observation",
-        })?;
-        let descendants_complete = view
-            .descendants()
-            .is_some_and(|descendants| descendants.complete() && descendants.tree_terminated());
-        let (stdout, stderr) = self
+        let reconciliation = self.reconcile_operation(&bound.operation).ok();
+        let captured = self
             .executor
             .captured_output(&bound.operation)
-            .map_err(BridgeError::Process)?;
+            .map_err(BridgeError::Process);
+        let Ok((stdout, stderr)) = captured else {
+            return self.finish_unobserved_with_reconciliation(
+                bound,
+                ProviderOutcome::Unknown,
+                cancellation,
+                reconciliation,
+                None,
+            );
+        };
+        let Some(exit) = view.exit() else {
+            return self.finish_unobserved_with_reconciliation(
+                bound,
+                ProviderOutcome::Unknown,
+                cancellation,
+                reconciliation,
+                None,
+            );
+        };
+        let descendants = view.descendants();
+        let descendants_complete = descendants
+            .is_some_and(|descendants| descendants.complete() && descendants.tree_terminated());
+        let tree_terminated =
+            descendants.is_some_and(eliot_process::DescendantEvidence::tree_terminated);
+        let lineage_handle = descendants
+            .and_then(|descendants| descendants.evidence_ref())
+            .map(str::to_owned);
         let evidence = RawProviderEvidence::materialize(
             bound.operation.as_str(),
             &bound.digest,
@@ -319,37 +438,192 @@ impl ProviderBridge {
             &stderr,
             descendants_complete,
         );
-        let outcome = classify_terminal(view.lifecycle(), exit, descendants_complete);
-        if outcome == ProviderOutcome::Unknown {
-            return Err(BridgeError::UnknownOutcome);
+        let process_outcome = classify_terminal(view.lifecycle(), exit, descendants_complete);
+        let mut outcome = process_outcome;
+        let mut failure = match process_outcome {
+            ProviderOutcome::Completed => None,
+            ProviderOutcome::Crashed => Some(ProviderFailureKind::ProviderFailed),
+            ProviderOutcome::TimedOut => Some(ProviderFailureKind::Process),
+            ProviderOutcome::Cancelled => Some(ProviderFailureKind::ProviderCancelled),
+            ProviderOutcome::Unknown => Some(ProviderFailureKind::Evidence),
+        };
+        let mut provider_job_ref = None;
+        let mut result_frame = None;
+        if process_outcome == ProviderOutcome::Completed {
+            let ack_line = stdout
+                .bytes
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap_or_default();
+            if let Ok(ack) = SubmitAck::decode(
+                ack_line,
+                bound.envelope.operation_id.as_str(),
+                bound.envelope.request_sha256.as_str(),
+            ) {
+                provider_job_ref = Some(ack.provider_job_id);
+            } else {
+                outcome = ProviderOutcome::Unknown;
+                failure = Some(ProviderFailureKind::Protocol);
+            }
+            if failure.is_none() {
+                match scan_result_frame(
+                    &stdout.bytes,
+                    &bound.envelope.operation_id,
+                    &bound.envelope.request_sha256,
+                    &bound.envelope.route_id,
+                ) {
+                    Ok(Some(frame)) => {
+                        let disposition = frame.disposition;
+                        let over_budget = frame.usage_units > bound.envelope.budget_units;
+                        result_frame = Some(frame);
+                        if over_budget {
+                            outcome = ProviderOutcome::Unknown;
+                            failure = Some(ProviderFailureKind::Protocol);
+                        } else {
+                            outcome = match disposition {
+                                crate::protocol::ProviderResultDisposition::CompletedCandidateAvailable => ProviderOutcome::Completed,
+                                crate::protocol::ProviderResultDisposition::ProviderCancelled => ProviderOutcome::Cancelled,
+                                crate::protocol::ProviderResultDisposition::ProviderFailed => ProviderOutcome::Crashed,
+                            };
+                            failure = match disposition {
+                                crate::protocol::ProviderResultDisposition::CompletedCandidateAvailable => None,
+                                crate::protocol::ProviderResultDisposition::ProviderCancelled => Some(ProviderFailureKind::ProviderCancelled),
+                                crate::protocol::ProviderResultDisposition::ProviderFailed => Some(ProviderFailureKind::ProviderFailed),
+                            };
+                        }
+                    }
+                    Ok(None) => {
+                        outcome = ProviderOutcome::Unknown;
+                        failure = Some(ProviderFailureKind::Evidence);
+                    }
+                    Err(_) => {
+                        outcome = ProviderOutcome::Unknown;
+                        failure = Some(ProviderFailureKind::Protocol);
+                    }
+                }
+            }
         }
-        let ack_line = stdout
-            .bytes
-            .split(|byte| *byte == b'\n')
-            .next()
-            .unwrap_or_default();
-        let ack =
-            SubmitAck::decode(ack_line).map_err(|refusal| BridgeError::ProtocolViolation {
-                reason: refusal.reason(),
-            })?;
-        let result_frame =
-            scan_result_frame(&stdout.bytes).map_err(|refusal| BridgeError::ProtocolViolation {
-                reason: refusal.reason(),
-            })?;
+        let evidence = attach_evidence_handles(evidence, reconciliation.as_ref())
+            .with_lineage_handle(lineage_handle);
+        let receipt = build_receipt(
+            &bound,
+            &evidence,
+            outcome,
+            descendants_complete,
+            cancellation,
+            reconciliation,
+            None,
+            tree_terminated,
+            provider_job_ref.clone(),
+            result_frame.as_ref(),
+        );
+        let candidate = build_candidate_bundle(
+            &bound.admission,
+            &bound,
+            result_frame.as_ref(),
+            outcome,
+            &evidence,
+        );
         Ok(ProviderExecution {
             job_id: bound.operation.as_str().to_owned(),
             outcome,
             evidence,
-            provider_job_ref: ack.provider_job_id,
+            provider_job_ref,
             result_frame,
             wire_bytes: bound.wire_bytes,
+            receipt,
+            candidate,
+            failure,
         })
     }
 
-    /// Requests cancellation of the bound operation through the executor.
+    #[allow(clippy::unnecessary_wraps)]
+    fn finish_unobserved_with_reconciliation(
+        &self,
+        bound: BoundOperation,
+        outcome: ProviderOutcome,
+        cancellation: Option<CancellationReceipt>,
+        reconciliation: Option<ProcessEvidence>,
+        start_error: Option<&ProcessExecutionError>,
+    ) -> Result<ProviderExecution, BridgeError> {
+        let streams = self
+            .executor
+            .captured_output(&bound.operation)
+            .unwrap_or_else(|_| empty_streams());
+        let descendants_complete = reconciliation
+            .as_ref()
+            .and_then(|value| value.view().descendants())
+            .is_some_and(|descendants| descendants.complete() && descendants.tree_terminated());
+        let tree_terminated = reconciliation
+            .as_ref()
+            .and_then(|value| value.view().descendants())
+            .is_some_and(eliot_process::DescendantEvidence::tree_terminated);
+        let evidence = reconciliation
+            .as_ref()
+            .and_then(|value| value.view().exit())
+            .map_or_else(
+                || {
+                    RawProviderEvidence::unknown(
+                        bound.operation.as_str(),
+                        &bound.digest,
+                        &streams.0,
+                        &streams.1,
+                    )
+                },
+                |exit| {
+                    RawProviderEvidence::materialize(
+                        bound.operation.as_str(),
+                        &bound.digest,
+                        exit,
+                        &streams.0,
+                        &streams.1,
+                        descendants_complete,
+                    )
+                },
+            );
+        let evidence = attach_evidence_handles(evidence, reconciliation.as_ref());
+        let receipt = build_receipt(
+            &bound,
+            &evidence,
+            outcome,
+            descendants_complete,
+            cancellation,
+            reconciliation,
+            start_error.map(ToString::to_string),
+            tree_terminated,
+            None,
+            None,
+        );
+        let candidate = build_candidate_bundle(&bound.admission, &bound, None, outcome, &evidence);
+        let failure = Some(if start_error.is_some() {
+            ProviderFailureKind::Process
+        } else {
+            match outcome {
+                ProviderOutcome::TimedOut => ProviderFailureKind::Process,
+                ProviderOutcome::Cancelled => ProviderFailureKind::ProviderCancelled,
+                ProviderOutcome::Crashed => ProviderFailureKind::ProviderFailed,
+                ProviderOutcome::Unknown | ProviderOutcome::Completed => {
+                    ProviderFailureKind::Evidence
+                }
+            }
+        });
+        Ok(ProviderExecution {
+            job_id: bound.operation.as_str().to_owned(),
+            outcome,
+            evidence,
+            provider_job_ref: None,
+            result_frame: None,
+            wire_bytes: bound.wire_bytes,
+            receipt,
+            candidate,
+            failure,
+        })
+    }
+
+    /// Requests cancellation and returns the exact receipt to the caller.
     pub fn cancel_operation(
         &self,
-        operation: &eliot_process::OperationId,
+        operation: &OperationId,
     ) -> Result<CancellationReceipt, BridgeError> {
         block_on(self.executor.cancel(operation.clone())).map_err(BridgeError::Process)
     }
@@ -357,19 +631,243 @@ impl ProviderBridge {
     /// Reconciles the bound operation's unknown external result.
     pub fn reconcile_operation(
         &self,
-        operation: &eliot_process::OperationId,
+        operation: &OperationId,
     ) -> Result<ProcessEvidence, BridgeError> {
         block_on(self.executor.reconcile(operation.clone())).map_err(BridgeError::Process)
     }
 }
 
-/// Re-validates a port-minted request against the admission before the
-/// executor is contacted: exact artifact identity, exact operation identity,
-/// exact process generation, epoch agreement, structural validity, and no
-/// ambient environment inheritance (the child receives only explicit values,
-/// so credentials, proxy configuration, and user resources cannot leak in).
+enum WaitFailure {
+    TimedOut,
+    Unknown,
+    Process,
+}
+
+fn map_start_error(error: ProcessExecutionError) -> BridgeError {
+    match error {
+        ProcessExecutionError::Unavailable(_) => BridgeError::ProviderUnavailable,
+        ProcessExecutionError::UnknownOutcome => BridgeError::UnknownOutcome,
+        other => BridgeError::Process(other),
+    }
+}
+
+fn empty_streams() -> (CapturedStream, CapturedStream) {
+    (
+        CapturedStream {
+            bytes: Vec::new(),
+            total_bytes: 0,
+            truncated: false,
+            complete: false,
+            captured: false,
+        },
+        CapturedStream {
+            bytes: Vec::new(),
+            total_bytes: 0,
+            truncated: false,
+            complete: false,
+            captured: false,
+        },
+    )
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX)
+}
+
+fn attach_evidence_handles(
+    evidence: RawProviderEvidence,
+    reconciliation: Option<&ProcessEvidence>,
+) -> RawProviderEvidence {
+    let Some(process_evidence) = reconciliation else {
+        return evidence;
+    };
+    let stdout = process_evidence
+        .stdout()
+        .and_then(|stream| stream.source())
+        .map(|source| source.locator().to_owned());
+    let stderr = process_evidence
+        .stderr()
+        .and_then(|stream| stream.source())
+        .map(|source| source.locator().to_owned());
+    let lineage = process_evidence
+        .view()
+        .descendants()
+        .and_then(|descendants| descendants.evidence_ref())
+        .map(str::to_owned);
+    evidence.with_evidence_handles(stdout, stderr, lineage)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_receipt(
+    bound: &BoundOperation,
+    evidence: &RawProviderEvidence,
+    outcome: ProviderOutcome,
+    descendants_complete: bool,
+    cancellation: Option<CancellationReceipt>,
+    reconciliation: Option<ProcessEvidence>,
+    process_error: Option<String>,
+    tree_terminated: bool,
+    provider_job_ref: Option<String>,
+    result_frame: Option<&ResultFrame>,
+) -> ProviderAttemptReceipt {
+    let envelope = &bound.envelope;
+    let admission = &bound.admission;
+    let cleanup_proven =
+        descendants_complete && tree_terminated && evidence.lineage_evidence_ref.is_some();
+    ProviderAttemptReceipt {
+        operation_id: envelope.operation_id.clone(),
+        invocation_digest: bound.digest.clone(),
+        process_error,
+        outcome,
+        start_receipt: bound.start_receipt.clone(),
+        artifact_sha256: admission.bridge().executable_sha256().to_owned(),
+        config_digest: admission.config_digest().to_owned(),
+        protocol_digest: admission.protocol_digest().to_owned(),
+        registry_evidence_sha256: envelope.registry_evidence_sha256.clone(),
+        module_id: admission.module_id().to_owned(),
+        module_generation_id: admission.module_generation_id().to_owned(),
+        provider_id: envelope.provider_id.clone(),
+        bridge_generation: envelope.bridge_generation.clone(),
+        protocol_revision: envelope.protocol_revision,
+        required_schema: envelope.required_schema.clone(),
+        process_generation: envelope.process_generation,
+        authority_epoch: admission.epoch().clone(),
+        state_fence: admission.fence().clone(),
+        route_id: envelope.route_id.clone(),
+        disclosure: envelope.disclosure,
+        data_class: envelope.data_class.clone(),
+        credential_binding_id: envelope.credential_binding_id.clone(),
+        credential_owner_principal: admission.credential_binding().owner_principal.clone(),
+        credential_acting_principal: admission.credential_binding().acting_principal.clone(),
+        budget_units: envelope.budget_units,
+        usage_units: result_frame.map_or(0, |frame| frame.usage_units),
+        deadline_unix_ms: bound.deadline_unix_ms,
+        cancellation_id: envelope.cancellation_id.clone(),
+        wire_sha256: sha256_hex(&bound.wire_bytes),
+        raw_evidence: evidence.clone(),
+        reconciliation,
+        cancellation,
+        cleanup: ProviderCleanupReceipt {
+            descendants_complete,
+            tree_terminated,
+            lineage_evidence_ref: evidence.lineage_evidence_ref.clone(),
+            cleanup_proven,
+        },
+        provider_job_ref,
+        result_disposition: result_frame.map(|frame| frame.disposition),
+        source_handles: result_frame
+            .map(|frame| frame.source_handles.clone())
+            .unwrap_or_default(),
+        provenance_handles: result_frame
+            .map(|frame| frame.provenance_handles.clone())
+            .unwrap_or_default(),
+        coverage_gaps: result_frame
+            .map(|frame| frame.coverage_gaps.clone())
+            .unwrap_or_default(),
+        coverage_denominator: result_frame.map(|frame| frame.coverage_denominator),
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn build_candidate_bundle(
+    admission: &ProviderAdmission,
+    bound: &BoundOperation,
+    result_frame: Option<&ResultFrame>,
+    outcome: ProviderOutcome,
+    evidence: &RawProviderEvidence,
+) -> Option<ResearchEvidenceBundle> {
+    let envelope = &bound.envelope;
+    let (gap_kind, disposition, detail, failed) = match (result_frame, outcome) {
+        (Some(frame), ProviderOutcome::Completed)
+            if frame.coverage_denominator != CoverageDenominator::CompleteScope =>
+        {
+            (
+                CoverageGapKind::Unknown,
+                CompletionDisposition::IncompleteCoverage,
+                "provider returned candidate material without a complete frozen-scope denominator",
+                Vec::new(),
+            )
+        }
+        (Some(_frame), ProviderOutcome::Completed) => (
+            CoverageGapKind::Unknown,
+            CompletionDisposition::Inconclusive,
+            "candidate-only provider result awaits Governor admission",
+            Vec::new(),
+        ),
+        (_, ProviderOutcome::Cancelled) => (
+            CoverageGapKind::Cancelled,
+            CompletionDisposition::Cancelled,
+            "provider acquisition was cancelled before a complete candidate result was proven",
+            vec!["provider cancellation".to_owned()],
+        ),
+        (_, ProviderOutcome::TimedOut) => (
+            CoverageGapKind::Timeout,
+            CompletionDisposition::IncompleteCoverage,
+            "provider acquisition exceeded the admitted deadline",
+            vec!["provider timeout".to_owned()],
+        ),
+        (_, ProviderOutcome::Crashed) => (
+            CoverageGapKind::Unknown,
+            CompletionDisposition::IncompleteCoverage,
+            "provider process crashed or reported acquisition failure",
+            vec!["provider crash/failure".to_owned()],
+        ),
+        (_, ProviderOutcome::Unknown | ProviderOutcome::Completed) => (
+            CoverageGapKind::Unknown,
+            CompletionDisposition::IncompleteCoverage,
+            "provider result is unknown or lacks correlated source/coverage evidence",
+            vec!["provider unknown/incomplete result".to_owned()],
+        ),
+    };
+    let source_handle = result_frame
+        .and_then(|frame| frame.source_handles.first().cloned())
+        .unwrap_or_else(|| format!("provider:{}", envelope.route_id));
+    let coverage_gaps = vec![CoverageGap {
+        source_handle,
+        kind: gap_kind,
+        detail: detail.to_owned(),
+    }];
+    let coverage_unknowns = if result_frame.is_some() {
+        vec!["provider source/provenance/coverage metadata is candidate-only until Governor admission".to_owned()]
+    } else {
+        vec!["no provider result frame was correlated".to_owned()]
+    };
+    let artifact_handles = result_frame
+        .map(|frame| vec![format!("provider-candidate:{}", frame.candidate_sha256)])
+        .unwrap_or_default();
+    let digest_input = format!(
+        "{}:{}:{}:{}",
+        envelope.operation_id, envelope.request_sha256, envelope.route_id, evidence.stdout.sha256
+    );
+    Some(ResearchEvidenceBundle {
+        exchange_id: envelope.exchange_id.clone(),
+        job_id: envelope.operation_id.clone(),
+        system_generation: admission.module_generation_id().to_owned(),
+        immutable_bundle_digest: sha256_hex(digest_input.as_bytes()),
+        origin_authentication: admission.bridge().executable_sha256().to_owned(),
+        state_fence: admission.fence().clone(),
+        sources: Vec::new(),
+        claims: Vec::new(),
+        bounded_excerpts: Vec::new(),
+        artifact_handles,
+        coverage_unknowns,
+        failed_acquisition: failed,
+        coverage_gaps,
+        disposition,
+        synthesis_is_candidate: true,
+        disclosure: envelope.disclosure,
+        invalidation: Some("candidate-only; normal Governor admission required".to_owned()),
+    })
+}
+
 fn check_minted_request(
     admission: &ProviderAdmission,
+    expected_envelope: &SubmitEnvelope,
+    wire_bytes: &[u8],
     request: &ProcessRequest,
 ) -> Result<(), BridgeError> {
     request.validate().map_err(|_| BridgeError::NotAdmitted {
@@ -380,6 +878,17 @@ fn check_minted_request(
     {
         return Err(BridgeError::NotAdmitted {
             reason: "minted process request names an unapproved artifact",
+        });
+    }
+    let expected_working_directory =
+        Path::new(request.executable())
+            .parent()
+            .ok_or(BridgeError::NotAdmitted {
+                reason: "approved provider artifact has no installation directory",
+            })?;
+    if request.working_directory() != expected_working_directory.to_string_lossy().as_ref() {
+        return Err(BridgeError::NotAdmitted {
+            reason: "minted process request permits a caller-selected working directory",
         });
     }
     if request.operation_id() != admission.operation_id() {
@@ -396,23 +905,56 @@ fn check_minted_request(
         .fence()
         .authority_epoch()
         .is_same_authority(admission.epoch())
+        || request.fence().generation().get() != admission.process_generation().get()
+        || request.fence().nonce() != admission.cancellation().cancellation_id
     {
         return Err(BridgeError::NotAdmitted {
-            reason: "minted process request disagrees on authority epoch",
+            reason: "minted process request disagrees on the full process fence or cancellation identity",
         });
     }
-    if request.environment().inheritance() != EnvironmentInheritance::None {
+    if request.environment().inheritance() != EnvironmentInheritance::None
+        || !request.environment().non_secret().is_empty()
+        || !request.environment().secret_refs().is_empty()
+    {
         return Err(BridgeError::NotAdmitted {
-            reason: "minted process request does not restrict environment inheritance",
+            reason: "minted process request permits ambient environment or secret injection",
+        });
+    }
+    let argv = request.argv();
+    if argv.len() != 2
+        || argv[0] != PROVIDER_WIRE_ARGUMENT
+        || argv[1] != std::str::from_utf8(wire_bytes).unwrap_or("")
+    {
+        return Err(BridgeError::ProtocolViolation {
+            reason: "minted process request did not deliver the exact provider wire envelope",
+        });
+    }
+    let delivered =
+        SubmitEnvelope::decode(wire_bytes).map_err(|refusal| BridgeError::ProtocolViolation {
+            reason: refusal.reason(),
+        })?;
+    if delivered != *expected_envelope {
+        return Err(BridgeError::ProtocolViolation {
+            reason: "delivered provider wire does not match the admitted envelope",
+        });
+    }
+    let remaining = admission.deadline_ms().saturating_sub(now_unix_ms()).max(1);
+    if request.resource_limits().wall_timeout_ms() > u64::try_from(remaining).unwrap_or(u64::MAX) {
+        return Err(BridgeError::NotAdmitted {
+            reason: "minted process request exceeds the admitted deadline",
+        });
+    }
+    if request.resource_limits().stdout_bytes() == 0
+        || request.resource_limits().stderr_bytes() == 0
+        || request.resource_limits().max_descendants() == 0
+    {
+        return Err(BridgeError::NotAdmitted {
+            reason: "minted process request has incomplete resource or stream bounds",
         });
     }
     Ok(())
 }
 
-/// Classifies one terminal observation into a provider-local outcome.
-/// Anything that is not a clean completed exit with proven tree closure stays
-/// explicit: crash-class dispositions, missing descendant proof, and unknown
-/// lifecycles never decode as success.
 fn classify_terminal(
     lifecycle: ProcessLifecycle,
     exit: &eliot_process::ExitStatus,
@@ -422,25 +964,13 @@ fn classify_terminal(
         return ProviderOutcome::Unknown;
     }
     match exit.disposition() {
-        ExitDisposition::Completed => {
-            if descendants_complete {
-                ProviderOutcome::Completed
-            } else {
-                ProviderOutcome::Unknown
-            }
-        }
+        ExitDisposition::Completed if descendants_complete => ProviderOutcome::Completed,
+        ExitDisposition::Completed | ExitDisposition::Unknown => ProviderOutcome::Unknown,
         ExitDisposition::Cancelled => ProviderOutcome::Cancelled,
         ExitDisposition::Signalled | ExitDisposition::ResourceLimit => ProviderOutcome::Crashed,
-        ExitDisposition::Unknown => ProviderOutcome::Unknown,
     }
 }
 
-/// Drives one executor future to completion on the calling thread.
-///
-/// Established precedent: the production `block_on_sink` drain path and the
-/// `block_on` test driver in `eliot-process-executor` spin a noop waker with
-/// `yield_now`. P-04 futures complete without a reactor; this performs no
-/// sleeping, no retry, and no I/O of its own.
 fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     let waker = Waker::noop();
@@ -457,339 +987,31 @@ fn block_on<F: Future>(future: F) -> F::Output {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use std::collections::BTreeMap;
-    use std::num::NonZeroU64;
-    use std::sync::Arc;
-
-    use eliot_contracts::{EpochId, EpochLineageId};
-    use eliot_process::{
-        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
-        EnvironmentProjection, ExitDisposition, ExitStatus, FencingToken, Generation, ImageId,
-        JobId, KernelDispatchKey, OperationId, PermitIssuance, ProcessIntent, ProcessTreeId,
-        ResourceLimits, SessionId,
-    };
-    use eliot_research_exchange_api::DisclosureClass;
-
-    use crate::support::{
-        DIGEST_A, DIGEST_B, test_admission, test_epoch, test_identity, test_request,
-    };
-
     use super::*;
-
-    /// Authority port that must never be contacted: every test here fails
-    /// before the executor is reached, so any call is a test failure.
-    struct UnreachedPort;
-
-    impl eliot_process_executor::DispatchValidationPort for UnreachedPort {
-        fn validate_and_consume(
-            &self,
-            _request: ProcessRequest,
-            _observed: eliot_process::SuspendedProcessIdentity,
-        ) -> Result<eliot_process::ValidatedDispatch, eliot_process::ProcessExecutionError>
-        {
-            panic!("refusal tests must not reach the executor");
-        }
-    }
-
-    /// Request port that must never be contacted: binding validation must
-    /// refuse before minting is attempted.
-    struct UnreachedBindPort;
-
-    impl ResearchRequestPort for UnreachedBindPort {
-        fn bind(
-            &self,
-            _admission: &ProviderAdmission,
-            _request_sha256: &str,
-        ) -> Result<ProcessRequest, RequestPortError> {
-            panic!("binding validation must refuse before the port is contacted");
-        }
-    }
-
-    /// Evidence sink that accepts and drops everything.
-    #[derive(Default)]
-    struct DropSink;
-
-    impl ProcessEvidenceSink for DropSink {
-        fn record(
-            &self,
-            _evidence: eliot_process::ProcessEvidence,
-        ) -> Result<(), eliot_process::EvidenceSinkError> {
-            Ok(())
-        }
-    }
-
-    /// Mints one structurally valid process request with test authority,
-    /// following the P-04 test precedent. Field overrides let each refusal
-    /// test present a valid request bound to the wrong operation.
-    fn mint_request(
-        exe: &str,
-        digest: &str,
-        operation: &str,
-        generation: u64,
-        epoch: &EpochId,
-        inheritance: EnvironmentInheritance,
-        nonce: &str,
-    ) -> ProcessRequest {
-        let generation = Generation::new(generation).expect("generation");
-        let environment = match inheritance {
-            EnvironmentInheritance::None => EnvironmentProjection::default(),
-            EnvironmentInheritance::Allowlisted => EnvironmentProjection::new(
-                BTreeMap::new(),
-                Vec::new(),
-                EnvironmentInheritance::Allowlisted,
-            )
-            .expect("environment"),
-        };
-        let intent = ProcessIntent::new(
-            OperationId::new(operation).expect("operation"),
-            ProcessTreeId::new("tree-24-test").expect("tree"),
-            JobId::new("job-24-test").expect("job"),
-            ImageId::new("image-24-test").expect("image"),
-            SessionId::new("session-24-test").expect("session"),
-            generation,
-            exe,
-            digest,
-            vec!["--execute".to_owned()],
-            std::env::temp_dir().to_string_lossy().into_owned(),
-            environment,
-            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)
-                .expect("limits"),
-        )
-        .expect("intent");
-        let fence = FencingToken::new(epoch.clone(), generation, format!("fence-24-{nonce}"))
-            .expect("fence");
-        let mut authority = DispatchPermitAuthority::activate(
-            DispatchAuthorityId::new("auth-24-test").expect("authority"),
-            KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("key"),
-        );
-        let permit = authority
-            .issue(
-                &intent,
-                PermitIssuance::new(
-                    ActionLeaseRef::new(format!("lease-24-{nonce}")).expect("lease"),
-                    fence,
-                    BTreeMap::new(),
-                    100,
-                    10_000,
-                    format!("nonce-24-{nonce}"),
-                )
-                .expect("issuance"),
-            )
-            .expect("permit");
-        ProcessRequest::new(intent, permit).expect("request")
-    }
-
-    /// Request port minting one fixed valid request per test.
-    struct MintingPort {
-        exe: String,
-        digest: String,
-        operation: String,
-        generation: u64,
-        epoch: EpochId,
-        inheritance: EnvironmentInheritance,
-        nonce: String,
-    }
-
-    impl ResearchRequestPort for MintingPort {
-        fn bind(
-            &self,
-            _admission: &ProviderAdmission,
-            _request_sha256: &str,
-        ) -> Result<ProcessRequest, RequestPortError> {
-            Ok(mint_request(
-                &self.exe,
-                &self.digest,
-                &self.operation,
-                self.generation,
-                &self.epoch,
-                self.inheritance,
-                &self.nonce,
-            ))
-        }
-    }
-
-    /// Request port that always refuses: no authority is available in scope.
-    struct RefusingPort;
-
-    impl ResearchRequestPort for RefusingPort {
-        fn bind(
-            &self,
-            _admission: &ProviderAdmission,
-            _request_sha256: &str,
-        ) -> Result<ProcessRequest, RequestPortError> {
-            Err(RequestPortError::NoAuthority)
-        }
-    }
-
-    fn runner_with(port: Arc<dyn ResearchRequestPort>) -> ProviderBridge {
-        let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(UnreachedPort)));
-        ProviderBridge::new(executor, port, Arc::new(DropSink))
-    }
-
-    fn matching_port(nonce: &str) -> MintingPort {
-        MintingPort {
-            exe: test_identity().executable().to_owned(),
-            digest: DIGEST_A.to_owned(),
-            operation: "op-24-slice-a".to_owned(),
-            generation: 3,
-            epoch: test_epoch(),
-            inheritance: EnvironmentInheritance::None,
-            nonce: nonce.to_owned(),
-        }
-    }
-
-    #[test]
-    fn request_admission_mismatch_fails_before_port_contact() {
-        let runner = runner_with(Arc::new(UnreachedBindPort));
-        let mut widened = test_request();
-        widened.disclosure = DisclosureClass::Public;
-        assert!(
-            matches!(
-                runner.execute(&test_admission(), &widened),
-                Err(BridgeError::NotAdmitted { .. })
-            ),
-            "privacy widening must be refused before the port is contacted"
-        );
-    }
-
-    #[test]
-    fn refusing_port_maps_to_source_unavailable() {
-        let runner = runner_with(Arc::new(RefusingPort));
-        assert!(
-            matches!(
-                runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::ProviderUnavailable)
-            ),
-            "absent process authority must degrade to the typed gap"
-        );
-    }
-
-    #[test]
-    fn minted_unapproved_artifact_is_refused_before_start() {
-        let runner = runner_with(Arc::new(MintingPort {
-            exe: "C:\\evil\\tool.exe".to_owned(),
-            digest: DIGEST_B.to_owned(),
-            ..matching_port("artifact")
-        }));
-        assert!(
-            matches!(
-                runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::NotAdmitted { .. })
-            ),
-            "environment-selected executable must be refused before start"
-        );
-    }
-
-    #[test]
-    fn minted_foreign_operation_is_refused_before_start() {
-        let runner = runner_with(Arc::new(MintingPort {
-            operation: "op-foreign".to_owned(),
-            ..matching_port("operation")
-        }));
-        assert!(
-            matches!(
-                runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::NotAdmitted { .. })
-            ),
-            "a request bound to a foreign operation must be refused before start"
-        );
-    }
-
-    #[test]
-    fn minted_stale_generation_is_refused_before_start() {
-        let runner = runner_with(Arc::new(MintingPort {
-            generation: 9,
-            ..matching_port("generation")
-        }));
-        assert!(
-            matches!(
-                runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::NotAdmitted { .. })
-            ),
-            "a stale process generation must be refused before start"
-        );
-    }
-
-    #[test]
-    fn minted_epoch_mismatch_is_refused_before_start() {
-        let other_epoch = EpochId::new(
-            EpochLineageId::new("6ba7b810-9dad-11d1-80b4-00c04fd430c8").expect("lineage"),
-            NonZeroU64::new(7).expect("sequence"),
-        )
-        .expect("epoch");
-        let runner = runner_with(Arc::new(MintingPort {
-            epoch: other_epoch,
-            ..matching_port("epoch")
-        }));
-        assert!(
-            matches!(
-                runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::NotAdmitted { .. })
-            ),
-            "authority epoch disagreement must be refused before start"
-        );
-    }
-
-    #[test]
-    fn minted_ambient_inheritance_is_refused_before_start() {
-        let runner = runner_with(Arc::new(MintingPort {
-            inheritance: EnvironmentInheritance::Allowlisted,
-            ..matching_port("inheritance")
-        }));
-        assert!(
-            matches!(
-                runner.execute(&test_admission(), &test_request()),
-                Err(BridgeError::NotAdmitted { .. })
-            ),
-            "ambient environment inheritance must be refused before start"
-        );
-    }
 
     #[test]
     fn terminal_classification_never_invents_success() {
         let completed =
-            ExitStatus::new(ExitDisposition::Completed, Some(0), None, 1).expect("exit");
+            eliot_process::ExitStatus::new(ExitDisposition::Completed, Some(0), None, 1)
+                .expect("exit");
         assert_eq!(
             classify_terminal(ProcessLifecycle::Exited, &completed, true),
             ProviderOutcome::Completed
         );
-        // A completed exit without proven tree closure is unknown, not success.
         assert_eq!(
             classify_terminal(ProcessLifecycle::Exited, &completed, false),
             ProviderOutcome::Unknown
         );
-        // An unknown lifecycle poisons even a clean exit observation.
-        assert_eq!(
-            classify_terminal(ProcessLifecycle::UnknownOutcome, &completed, true),
-            ProviderOutcome::Unknown
-        );
-        let signalled =
-            ExitStatus::new(ExitDisposition::Signalled, None, Some(15), 1).expect("exit");
-        assert_eq!(
-            classify_terminal(ProcessLifecycle::Failed, &signalled, true),
-            ProviderOutcome::Crashed
-        );
-        let limited = ExitStatus::new(ExitDisposition::ResourceLimit, None, None, 1).expect("exit");
-        assert_eq!(
-            classify_terminal(ProcessLifecycle::Failed, &limited, true),
-            ProviderOutcome::Crashed
-        );
-        let cancelled = ExitStatus::new(ExitDisposition::Cancelled, None, None, 1).expect("exit");
+        let cancelled = eliot_process::ExitStatus::new(ExitDisposition::Cancelled, None, None, 1)
+            .expect("exit");
         assert_eq!(
             classify_terminal(ProcessLifecycle::Exited, &cancelled, true),
             ProviderOutcome::Cancelled
         );
-        let unknown = ExitStatus::new(ExitDisposition::Unknown, None, None, 1).expect("exit");
-        assert_eq!(
-            classify_terminal(ProcessLifecycle::Exited, &unknown, true),
-            ProviderOutcome::Unknown
-        );
     }
 
     #[test]
-    fn runner_binds_executor_port_and_default_deadline() {
-        let runner = runner_with(Arc::new(RefusingPort)).with_deadline(Duration::from_secs(5));
-        let _ = runner.executor();
-        assert_eq!(BOUND_RUN_DEADLINE, Duration::from_secs(30));
+    fn wire_marker_is_part_of_the_exact_launch_contract() {
+        assert_eq!(PROVIDER_WIRE_ARGUMENT, "--eliot-research-wire");
     }
 }

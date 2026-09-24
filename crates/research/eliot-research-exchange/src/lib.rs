@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::{ContractVersion, StateFence};
 use eliot_research_exchange_api::{
-    ResearchContractError, ResearchEvidenceBundle, ResearchExportBundle, ResearchQueryRequest,
+    CoverageGap, CoverageGapKind, ResearchContractError, ResearchEvidenceBundle,
+    ResearchExportBundle, ResearchProviderFailure, ResearchQueryRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -35,8 +36,12 @@ pub struct ExchangeJob {
     pub status: ExchangeStatus,
     pub state_fence: StateFence,
     pub progress_units: u64,
+    /// Candidate/evidence material returned by the provider. It remains
+    /// unadmitted until the normal Governor path accepts it.
     pub result: Option<ResearchEvidenceBundle>,
-    pub failure: Option<String>,
+    /// Typed acquisition failure, when the provider degraded coverage.
+    #[serde(default)]
+    pub failure: Option<ResearchProviderFailure>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -49,16 +54,71 @@ pub enum ExchangeError {
     NotFound,
     #[error("exchange job is not accepting this transition")]
     InvalidTransition,
+    #[error("research provider acquisition failed: {failure}")]
+    Provider {
+        /// Stable provider/acquisition failure projection.
+        failure: ResearchProviderFailure,
+        /// Candidate material retained even when the provider degraded.
+        candidate: Option<Box<ResearchEvidenceBundle>>,
+    },
     #[error("state fence is stale")]
     StaleFence,
     #[error("export is not permitted for this exchange")]
     ExportDenied,
 }
 
+impl ExchangeError {
+    /// Returns the typed coverage gap carried by a provider failure.
+    #[must_use]
+    pub fn coverage_gap(&self) -> Option<CoverageGap> {
+        match self {
+            Self::Provider { failure, .. } => Some(failure.coverage_gap()),
+            _ => None,
+        }
+    }
+
+    /// Returns the typed provider failure, when this error is acquisition-scoped.
+    #[must_use]
+    pub fn provider_failure(&self) -> Option<&ResearchProviderFailure> {
+        match self {
+            Self::Provider { failure, .. } => Some(failure),
+            _ => None,
+        }
+    }
+
+    /// Borrows candidate-only material retained alongside a provider failure.
+    #[must_use]
+    pub fn candidate_bundle(&self) -> Option<&ResearchEvidenceBundle> {
+        match self {
+            Self::Provider { candidate, .. } => candidate.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 pub trait ResearchBridge {
     type Error: std::error::Error + Send + Sync + 'static;
     fn submit(&mut self, request: &ResearchQueryRequest) -> Result<String, Self::Error>;
     fn cancel(&mut self, job_id: &str) -> Result<(), Self::Error>;
+
+    /// Returns the last typed provider failure without exposing raw provider
+    /// bytes. Existing non-provider bridges retain the default `None`.
+    fn last_failure(&self) -> Option<ResearchProviderFailure> {
+        None
+    }
+
+    /// Takes candidate/evidence material produced by the last provider call.
+    /// The exchange never promotes it; a later Governor admission is required.
+    fn take_candidate_bundle(&mut self) -> Option<ResearchEvidenceBundle> {
+        None
+    }
+
+    /// Returns the canonical operation identity when the bridge has contacted
+    /// an external provider. `None` means the refusal occurred before any
+    /// provider effect and therefore must not create a replayable job.
+    fn last_operation_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -141,21 +201,65 @@ impl<B: ResearchBridge> GovernedExchange<B> {
             }
             return Ok(existing.clone());
         }
-        let job_id = self
-            .bridge
-            .submit(&request)
-            .map_err(|_| ExchangeError::InvalidTransition)?;
+        let Ok(job_id) = self.bridge.submit(&request) else {
+            let failure = self.bridge.last_failure().unwrap_or_else(|| {
+                ResearchProviderFailure::new(
+                    "RESEARCH_SOURCE_UNAVAILABLE",
+                    CoverageGapKind::SourceUnavailable,
+                    "provider:unavailable",
+                    "the research provider returned no admitted acquisition result",
+                )
+            });
+            let candidate = self.bridge.take_candidate_bundle();
+            if let Some(operation_id) = self.bridge.last_operation_id() {
+                let degraded = ExchangeJob {
+                    exchange_id: request.exchange_id.clone(),
+                    job_id: operation_id.to_owned(),
+                    request: request.clone(),
+                    status: if candidate.is_some() {
+                        ExchangeStatus::Partial
+                    } else {
+                        ExchangeStatus::Failed
+                    },
+                    state_fence: request.state_fence.clone(),
+                    progress_units: 0,
+                    result: candidate.clone(),
+                    failure: Some(failure.clone()),
+                };
+                self.snapshot
+                    .idempotency
+                    .insert(request.idempotency_key.clone(), operation_id.to_owned());
+                self.snapshot.jobs.insert(operation_id.to_owned(), degraded);
+            }
+            return Err(ExchangeError::Provider {
+                failure,
+                candidate: candidate.map(Box::new),
+            });
+        };
         if job_id.trim().is_empty() {
-            return Err(ExchangeError::InvalidTransition);
+            return Err(ExchangeError::Provider {
+                failure: ResearchProviderFailure::new(
+                    "RESEARCH_SOURCE_UNAVAILABLE",
+                    CoverageGapKind::SourceUnavailable,
+                    "provider:unavailable",
+                    "the provider returned an empty operation identity",
+                ),
+                candidate: self.bridge.take_candidate_bundle().map(Box::new),
+            });
         }
+        let candidate = self.bridge.take_candidate_bundle();
         let job = ExchangeJob {
             exchange_id: request.exchange_id.clone(),
             job_id: job_id.clone(),
             state_fence: request.state_fence.clone(),
             request,
-            status: ExchangeStatus::Accepted,
+            status: if candidate.is_some() {
+                ExchangeStatus::Partial
+            } else {
+                ExchangeStatus::Accepted
+            },
             progress_units: 0,
-            result: None,
+            result: candidate,
             failure: None,
         };
         self.snapshot
@@ -247,9 +351,18 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         {
             return Err(ExchangeError::InvalidTransition);
         }
-        self.bridge
-            .cancel(job_id)
-            .map_err(|_| ExchangeError::InvalidTransition)?;
+        if self.bridge.cancel(job_id).is_err() {
+            let failure = self.bridge.last_failure().unwrap_or_else(|| {
+                ResearchProviderFailure::new(
+                    "RESEARCH_SOURCE_UNAVAILABLE",
+                    CoverageGapKind::Cancelled,
+                    "provider:cancel",
+                    "provider cancellation was not admitted or could not be receipted",
+                )
+            });
+            let candidate = self.bridge.take_candidate_bundle().map(Box::new);
+            return Err(ExchangeError::Provider { failure, candidate });
+        }
         let job = self
             .snapshot
             .jobs

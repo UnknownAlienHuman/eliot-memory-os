@@ -8,9 +8,17 @@
 //! this record carries exact digests so the Governor-owned Blob path can bind
 //! the raw artifacts without trusting a claim about them.
 
-use eliot_process::{ExitDisposition, ExitStatus};
+use eliot_contracts::{ContractVersion, EpochId, StateFence};
+use eliot_process::{
+    CancellationReceipt, ExitDisposition, ExitStatus, ProcessEvidence, ProcessStartReceipt,
+};
 use eliot_process_executor::CapturedStream;
+use eliot_research_exchange_api::DisclosureClass;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::execution::ProviderOutcome;
+use crate::protocol::{CoverageDenominator, ProviderResultDisposition};
 
 /// Length of a lowercase SHA-256 hex digest.
 pub const SHA256_HEX_LEN: usize = 64;
@@ -23,7 +31,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Why a captured stream is absent or incomplete. Omission is typed and
 /// reversible (the variant names what is missing); it never poses as data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StreamOmission {
     /// The executor supplied no stream handle.
     NoHandle,
@@ -34,7 +43,8 @@ pub enum StreamOmission {
 }
 
 /// Immutable record of one captured provider stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamRecord {
     /// SHA-256 of the retained prefix bytes.
     pub sha256: String,
@@ -71,7 +81,8 @@ impl StreamRecord {
 }
 
 /// Immutable raw evidence for one bounded provider execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawProviderEvidence {
     /// Stable admitted operation identity.
     pub operation_id: String,
@@ -83,11 +94,19 @@ pub struct RawProviderEvidence {
     pub stderr: StreamRecord,
     /// Physical exit disposition (never a semantic verdict).
     pub exit_disposition: ExitDisposition,
+    /// Whether an actual exit observation was received.
+    pub exit_observed: bool,
     /// Exact numeric exit code for completed exits; `None` otherwise (a
     /// non-completed exit has no meaningful code and none is fabricated).
     pub exit_code: Option<i32>,
     /// Whether exact descendant/tree-termination evidence was observed.
     pub descendants_complete: bool,
+    /// Durable stdout locator when the shared executor supplied one.
+    pub stdout_evidence_ref: Option<String>,
+    /// Durable stderr locator when the shared executor supplied one.
+    pub stderr_evidence_ref: Option<String>,
+    /// Durable process-lineage/cleanup handle when observed.
+    pub lineage_evidence_ref: Option<String>,
 }
 
 impl RawProviderEvidence {
@@ -117,9 +136,72 @@ impl RawProviderEvidence {
             stdout: StreamRecord::capture(stdout),
             stderr: StreamRecord::capture(stderr),
             exit_disposition: exit.disposition(),
+            exit_observed: true,
             exit_code,
             descendants_complete,
+            stdout_evidence_ref: None,
+            stderr_evidence_ref: None,
+            lineage_evidence_ref: None,
         }
+    }
+}
+
+impl RawProviderEvidence {
+    /// Materializes an honest pre-exit/unknown observation. No exit code or
+    /// completed exit is fabricated when the process outcome is unconfirmed.
+    #[must_use]
+    pub fn unknown(
+        operation_id: &str,
+        invocation_digest: &str,
+        stdout: &CapturedStream,
+        stderr: &CapturedStream,
+    ) -> Self {
+        Self {
+            operation_id: operation_id.to_owned(),
+            invocation_digest: invocation_digest.to_owned(),
+            stdout: StreamRecord::capture(stdout),
+            stderr: StreamRecord::capture(stderr),
+            exit_disposition: ExitDisposition::Unknown,
+            exit_observed: false,
+            exit_code: None,
+            descendants_complete: false,
+            stdout_evidence_ref: None,
+            stderr_evidence_ref: None,
+            lineage_evidence_ref: None,
+        }
+    }
+
+    /// Attaches durable executor handles/omission locators without changing
+    /// the raw digests or omission classifications.
+    #[must_use]
+    pub fn with_evidence_handles(
+        mut self,
+        stdout: Option<String>,
+        stderr: Option<String>,
+        lineage: Option<String>,
+    ) -> Self {
+        if stdout.is_none() && self.stdout.omission.is_none() {
+            self.stdout.complete = false;
+            self.stdout.omission = Some(StreamOmission::NoHandle);
+        }
+        if stderr.is_none() && self.stderr.omission.is_none() {
+            self.stderr.complete = false;
+            self.stderr.omission = Some(StreamOmission::NoHandle);
+        }
+        self.stdout_evidence_ref = stdout;
+        self.stderr_evidence_ref = stderr;
+        self.lineage_evidence_ref = lineage;
+        self
+    }
+
+    /// Attaches a lineage handle observed on a terminal view when no separate
+    /// reconciliation record was available.
+    #[must_use]
+    pub fn with_lineage_handle(mut self, lineage: Option<String>) -> Self {
+        if self.lineage_evidence_ref.is_none() {
+            self.lineage_evidence_ref = lineage;
+        }
+        self
     }
 }
 
@@ -132,6 +214,129 @@ fn exit_code_of(exit: &ExitStatus) -> Option<i32> {
         .ok()
         .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
         .and_then(|code| i32::try_from(code).ok())
+}
+
+/// Cleanup observation retained with every provider attempt receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCleanupReceipt {
+    /// Whether the executor observed every descendant.
+    pub descendants_complete: bool,
+    /// Whether every Job member was terminated/reaped.
+    pub tree_terminated: bool,
+    /// Durable executor lineage/evidence handle when available.
+    pub lineage_evidence_ref: Option<String>,
+    /// Whether cleanup is fully proven rather than merely requested.
+    pub cleanup_proven: bool,
+}
+
+/// Immutable pre-start intent record. It is written before a process request
+/// can be issued, so a disconnect during launch still has a durable binding
+/// for the later reconciliation attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIntentRecord {
+    /// Stable admitted operation identity.
+    pub operation_id: String,
+    /// SHA-256 of the exact provider wire envelope.
+    pub wire_sha256: String,
+    /// Exact registered artifact/config/protocol/registry identities.
+    pub artifact_sha256: String,
+    pub config_digest: String,
+    pub protocol_digest: String,
+    pub registry_evidence_sha256: String,
+    pub module_id: String,
+    pub module_generation_id: String,
+    /// Exact route, privacy, credential and process identity.
+    pub route_id: String,
+    pub provider_id: String,
+    pub bridge_generation: String,
+    pub protocol_revision: ContractVersion,
+    pub required_schema: String,
+    pub disclosure: DisclosureClass,
+    pub data_class: String,
+    pub credential_binding_id: String,
+    pub credential_owner_principal: String,
+    pub credential_acting_principal: String,
+    pub process_generation: u64,
+    pub state_fence: StateFence,
+    /// Budget/deadline/cancellation ceilings.
+    pub budget_units: u64,
+    pub deadline_unix_ms: i64,
+    pub cancellation_id: String,
+    /// Wall-clock recording time; it is evidence metadata, not authority.
+    pub recorded_at_unix_ms: u64,
+}
+
+/// Immutable operation-scoped receipt for one provider process attempt.
+///
+/// This is an evidence/coordination record, not a semantic result or authority
+/// grant. It keeps route, privacy, budget/usage, deadline, cancellation,
+/// cleanup, and reconciliation dimensions together so a caller cannot report
+/// a successful provider exit while losing the operation's effect identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderAttemptReceipt {
+    /// Stable admitted operation identity.
+    pub operation_id: String,
+    /// Process request invocation digest.
+    pub invocation_digest: String,
+    /// Sanitized executor error retained when a start/terminal observation
+    /// could not be completed; it is never replaced by a clean refusal.
+    pub process_error: Option<String>,
+    /// Terminal provider/process classification carried by this receipt.
+    pub outcome: ProviderOutcome,
+    /// Exact executor start receipt, retained when start was proven.
+    pub start_receipt: Option<ProcessStartReceipt>,
+    /// Exact artifact/config/protocol/registry identity.
+    pub artifact_sha256: String,
+    pub config_digest: String,
+    pub protocol_digest: String,
+    pub registry_evidence_sha256: String,
+    pub module_id: String,
+    pub module_generation_id: String,
+    pub provider_id: String,
+    pub bridge_generation: String,
+    pub protocol_revision: ContractVersion,
+    pub required_schema: String,
+    pub process_generation: u64,
+    pub authority_epoch: EpochId,
+    pub state_fence: StateFence,
+    /// Exact route and privacy/data binding.
+    pub route_id: String,
+    pub disclosure: DisclosureClass,
+    pub data_class: String,
+    pub credential_binding_id: String,
+    pub credential_owner_principal: String,
+    pub credential_acting_principal: String,
+    /// Budget/usage receipt.
+    pub budget_units: u64,
+    pub usage_units: u64,
+    /// Absolute operation deadline and cancellation identity.
+    pub deadline_unix_ms: i64,
+    pub cancellation_id: String,
+    /// SHA-256 of the exact request bytes delivered to the child.
+    pub wire_sha256: String,
+    /// Raw stream/exit/lineage evidence.
+    pub raw_evidence: RawProviderEvidence,
+    /// Optional durable typed stream/process evidence returned by reconcile.
+    pub reconciliation: Option<ProcessEvidence>,
+    /// Cancellation receipt, retained rather than discarded.
+    pub cancellation: Option<CancellationReceipt>,
+    /// Cleanup/descendant receipt.
+    pub cleanup: ProviderCleanupReceipt,
+    /// Provider-local correlation reference.
+    pub provider_job_ref: Option<String>,
+    /// Provider result disposition, if a typed frame was received.
+    pub result_disposition: Option<ProviderResultDisposition>,
+    /// Exact source handles echoed by the provider.
+    pub source_handles: Vec<String>,
+    /// Exact provenance/evidence handles echoed by the provider.
+    pub provenance_handles: Vec<String>,
+    /// Sanitized provider coverage-gap details.
+    pub coverage_gaps: Vec<String>,
+    /// Coverage denominator reported by the provider, if any.
+    pub coverage_denominator: Option<CoverageDenominator>,
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use eliot_contracts::{ClockReading, ContractVersion, StateFence};
 use schemars::JsonSchema;
@@ -149,6 +150,58 @@ pub struct CoverageGap {
     pub source_handle: String,
     pub kind: CoverageGapKind,
     pub detail: String,
+}
+
+/// Stable provider/acquisition failure projection carried by the exchange.
+///
+/// The provider bridge owns the physical failure and its evidence.  The
+/// exchange carries only this typed, coverage-scoped projection so an
+/// unavailable source cannot be collapsed into a generic transition error or
+/// presented as an empty-but-complete inquiry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchProviderFailure {
+    /// Stable machine-readable reason code.
+    pub code: String,
+    /// Coverage dimension affected by this provider failure.
+    pub kind: CoverageGapKind,
+    /// Opaque source/provider handle used for the gap record.
+    pub source_handle: String,
+    /// Sanitized detail; raw provider bytes remain in evidence custody.
+    pub detail: String,
+}
+
+impl fmt::Display for ResearchProviderFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl ResearchProviderFailure {
+    /// Builds a validated provider failure projection.
+    pub fn new(
+        code: impl Into<String>,
+        kind: CoverageGapKind,
+        source_handle: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            kind,
+            source_handle: source_handle.into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// Projects this failure into a typed coverage gap.
+    #[must_use]
+    pub fn coverage_gap(&self) -> CoverageGap {
+        CoverageGap {
+            source_handle: self.source_handle.clone(),
+            kind: self.kind,
+            detail: self.detail.clone(),
+        }
+    }
 }
 
 impl CoverageGap {

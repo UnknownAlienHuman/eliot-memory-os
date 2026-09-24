@@ -16,21 +16,34 @@ pub mod admission;
 pub mod evidence;
 pub mod execution;
 pub mod protocol;
+pub mod runtime;
+
+use std::path::{Component, Path};
 
 use eliot_contracts::StateFence;
+use eliot_process::CancellationStatus;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, ResearchBridge};
-use eliot_research_exchange_api::{CoverageGapKind, ResearchQueryRequest};
+use eliot_research_exchange_api::{
+    CoverageGapKind, ResearchEvidenceBundle, ResearchProviderFailure, ResearchQueryRequest,
+};
 use eliot_researcher::Researcher;
 use thiserror::Error;
 
-pub use admission::{AdmissionRefusal, ProviderAdmission};
-pub use evidence::{RawProviderEvidence, StreamOmission, StreamRecord, sha256_hex};
+pub use admission::{
+    AdmissionRefusal, BridgeContract, CancellationBinding, CredentialBinding,
+    ModuleGenerationEvidence, ProviderAdmission, ProviderRegistry, ProviderRoute,
+};
+pub use evidence::{
+    ProviderAttemptReceipt, ProviderCleanupReceipt, ProviderIntentRecord, RawProviderEvidence,
+    StreamOmission, StreamRecord, sha256_hex,
+};
 pub use execution::{
-    BOUND_RUN_DEADLINE, ProviderBridge, ProviderExecution, ProviderOutcome, RequestPortError,
-    ResearchRequestPort,
+    BOUND_RUN_DEADLINE, ProviderBridge, ProviderExecution, ProviderFailureKind, ProviderOutcome,
+    RequestPortError, ResearchRequestPort,
 };
 pub use protocol::{
-    MAX_WIRE_BYTES, MAX_WIRE_LINES, RESEARCH_PROVIDER_WIRE_VERSION, ResultFrame, SubmitEnvelope,
+    CoverageDenominator, MAX_WIRE_BYTES, MAX_WIRE_LINES, PROVIDER_WIRE_ARGUMENT,
+    RESEARCH_PROVIDER_WIRE_VERSION, ResultFrame, SubmitAck, SubmitEnvelope,
 };
 
 /// Stable gap code emitted when no governed provider execution is available.
@@ -74,6 +87,11 @@ pub enum BridgeError {
         "research provider execution exceeded the deadline; cancellation was attempted and the outcome is unconfirmed: reconcile by operation identity before any retry"
     )]
     TimedOut,
+    #[error("research provider acquisition was cancelled: {reason}")]
+    Cancelled {
+        /// Stable cancellation detail.
+        reason: &'static str,
+    },
     #[error(
         "research provider outcome is unknown: reconcile by operation identity before any retry"
     )]
@@ -95,21 +113,91 @@ impl BridgeError {
             Self::NotAdmitted { .. } => CoverageGapKind::PolicyOrDisclosureDenied,
             Self::ProtocolViolation { .. } => CoverageGapKind::StaleSourceOrIndex,
             Self::TimedOut => CoverageGapKind::Timeout,
-            Self::ProviderFailed { .. }
-            | Self::EvidenceIncomplete { .. }
-            | Self::UnknownOutcome
-            | Self::Process(_) => CoverageGapKind::Unknown,
+            Self::ProviderFailed { .. } => CoverageGapKind::Unknown,
+            Self::Cancelled { .. } => CoverageGapKind::Cancelled,
+            Self::EvidenceIncomplete { .. } | Self::UnknownOutcome | Self::Process(_) => {
+                CoverageGapKind::Unknown
+            }
         }
+    }
+
+    /// Projects this error into the typed exchange coverage failure.
+    #[must_use]
+    pub fn provider_failure(&self) -> ResearchProviderFailure {
+        let (code, kind, detail) = match self {
+            Self::ProviderUnavailable => (
+                RESEARCH_SOURCE_UNAVAILABLE,
+                CoverageGapKind::SourceUnavailable,
+                "no admitted provider execution was available",
+            ),
+            Self::NotAdmitted { .. } => (
+                "RESEARCH_PROVIDER_NOT_ADMITTED",
+                self.coverage_gap_kind(),
+                "provider execution was refused before effect",
+            ),
+            Self::ProtocolViolation { .. } => (
+                "RESEARCH_PROVIDER_PROTOCOL_INVALID",
+                CoverageGapKind::StaleSourceOrIndex,
+                "provider wire or correlation was not admitted",
+            ),
+            Self::ProviderFailed { .. } => (
+                "RESEARCH_PROVIDER_FAILED",
+                CoverageGapKind::Unknown,
+                "provider reported an acquisition failure",
+            ),
+            Self::Cancelled { .. } => (
+                "RESEARCH_PROVIDER_CANCELLED",
+                CoverageGapKind::Cancelled,
+                "provider acquisition was cancelled",
+            ),
+            Self::TimedOut => (
+                "RESEARCH_PROVIDER_TIMEOUT",
+                CoverageGapKind::Timeout,
+                "provider acquisition exceeded the admitted deadline",
+            ),
+            Self::UnknownOutcome => (
+                "RESEARCH_PROVIDER_UNKNOWN_OUTCOME",
+                CoverageGapKind::Unknown,
+                "provider outcome requires same-operation reconciliation",
+            ),
+            Self::EvidenceIncomplete { .. } | Self::Process(_) => (
+                "RESEARCH_PROVIDER_EVIDENCE_INCOMPLETE",
+                CoverageGapKind::Unknown,
+                "provider evidence or process receipt is incomplete",
+            ),
+            Self::InvalidBridgeIdentity { .. } => (
+                "RESEARCH_PROVIDER_IDENTITY_INVALID",
+                CoverageGapKind::SourceUnavailable,
+                "provider bridge identity is invalid",
+            ),
+        };
+        ResearchProviderFailure::new(
+            code,
+            kind,
+            format!("provider:{}", coverage_kind_label(self.coverage_gap_kind())),
+            detail,
+        )
     }
 }
 
-/// Explicit immutable identity of one registered research provider bridge.
+fn coverage_kind_label(kind: CoverageGapKind) -> &'static str {
+    match kind {
+        CoverageGapKind::SourceUnavailable => "source-unavailable",
+        CoverageGapKind::StaleSourceOrIndex => "stale-source-or-index",
+        CoverageGapKind::PolicyOrDisclosureDenied => "policy-or-disclosure-denied",
+        CoverageGapKind::BudgetExhausted => "budget-exhausted",
+        CoverageGapKind::Timeout => "timeout",
+        CoverageGapKind::Cancelled => "cancelled",
+        CoverageGapKind::Unknown => "unknown",
+    }
+}
 ///
 /// Both fields arrive from already-admitted material. Nothing here is read
 /// from ambient environment, and identity alone grants no execution: the
 /// Kernel-issued research admission that binds this identity to one exact
 /// operation lands in [`ProviderAdmission`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BridgeIdentity {
     executable: String,
     executable_sha256: String,
@@ -120,17 +208,23 @@ impl BridgeIdentity {
     ///
     /// # Errors
     ///
-    /// Returns [`BridgeError::InvalidBridgeIdentity`] when the path is blank
-    /// or the digest is not a lowercase SHA-256 hex string.
+    /// Returns [`BridgeError::InvalidBridgeIdentity`] when the path is not an
+    /// absolute canonical path or the digest is not a lowercase SHA-256 hex
+    /// string.
     pub fn new(
         executable: impl Into<String>,
         executable_sha256: impl Into<String>,
     ) -> Result<Self, BridgeError> {
         let executable = executable.into();
         let executable_sha256 = executable_sha256.into();
-        if executable.trim().is_empty() {
+        if executable.trim().is_empty()
+            || !Path::new(&executable).is_absolute()
+            || Path::new(&executable)
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
             return Err(BridgeError::InvalidBridgeIdentity {
-                reason: "executable path is empty",
+                reason: "executable path is not an absolute canonical path",
             });
         }
         if !is_lowercase_sha256(&executable_sha256) {
@@ -142,6 +236,27 @@ impl BridgeIdentity {
             executable,
             executable_sha256,
         })
+    }
+
+    /// Rechecks the immutable bridge identity after transport/deserialization.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        if self.executable.trim().is_empty()
+            || self.executable.chars().any(char::is_control)
+            || !Path::new(&self.executable).is_absolute()
+            || Path::new(&self.executable)
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(BridgeError::InvalidBridgeIdentity {
+                reason: "executable path is not an absolute canonical path",
+            });
+        }
+        if !is_lowercase_sha256(&self.executable_sha256) {
+            return Err(BridgeError::InvalidBridgeIdentity {
+                reason: "executable digest is not a lowercase SHA-256 hex digest",
+            });
+        }
+        Ok(())
     }
 
     /// Returns the registered bridge executable path.
@@ -199,6 +314,10 @@ impl ResearchBridge for GovernedResearchBridge {
     fn cancel(&mut self, _job_id: &str) -> Result<(), Self::Error> {
         Err(BridgeError::ProviderUnavailable)
     }
+
+    fn last_failure(&self) -> Option<ResearchProviderFailure> {
+        Some(BridgeError::ProviderUnavailable.provider_failure())
+    }
 }
 
 /// Lifecycle phase of one admitted operation. One bridge serves exactly one
@@ -206,53 +325,27 @@ impl ResearchBridge for GovernedResearchBridge {
 /// resubmitted blindly — unknown or timed-out outcomes must be reconciled by
 /// the stable operation identity first, and every other outcome requires a
 /// fresh admission for a fresh attempt.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 enum BridgePhase {
     /// Nothing was attempted through the executor yet.
     Awaiting,
     /// The executor was contacted; resubmission is refused.
     Submitted {
-        /// Typed terminal outcome (or the failure that ended the attempt).
-        outcome: SubmittedOutcome,
-        /// Immutable raw evidence when the attempt reached materialization.
+        outcome: ProviderOutcome,
         evidence: Option<RawProviderEvidence>,
-        /// Provider-local job reference when the ack decoded.
+        receipt: Option<ProviderAttemptReceipt>,
         provider_job_ref: Option<String>,
-        /// Whether an unknown outcome was reconciled since.
+        candidate: Option<ResearchEvidenceBundle>,
+        failure: Option<ResearchProviderFailure>,
+        cancellation: Option<eliot_process::CancellationReceipt>,
+        reconciliation: Option<eliot_process::ProcessEvidence>,
         reconciled: bool,
     },
 }
 
-/// Terminal record of one submitted attempt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SubmittedOutcome {
-    Completed,
-    Crashed,
-    TimedOut,
-    Cancelled,
-    Unknown,
-    Refused,
-}
-
-impl SubmittedOutcome {
-    /// Returns whether this outcome requires reconciliation before any retry.
-    /// A fresh admission is required regardless; this flag additionally opens
-    /// the `reconcile` path.
-    const fn requires_reconciliation(self) -> bool {
-        matches!(self, Self::TimedOut | Self::Unknown)
-    }
-}
-
 /// Admitted research provider bridge: one exact admission, one bounded
 /// operation, shared-executor execution.
-///
-/// The bridge is constructed from already-admitted material (identity,
-/// admission, executor handle, request-minting port, evidence sink) and mints
-/// no authority. `submit` returns the admitted operation identity — the only
-/// identity the exchange keys on; the provider-local job reference stays
-/// outcome evidence. Provider output remains candidate/evidence-set material:
-/// this bridge never builds a `ResearchEvidenceBundle`, never touches
-/// Cognitive Inheritance, policy, or finish.
 pub struct AdmittedResearchBridge {
     runner: ProviderBridge,
     admission: ProviderAdmission,
@@ -277,7 +370,7 @@ impl AdmittedResearchBridge {
         &self.admission
     }
 
-    /// Returns whether the executor has been contacted for this operation.
+    /// Returns whether the executor was contacted for this operation.
     #[must_use]
     pub const fn has_submitted(&self) -> bool {
         matches!(self.phase, BridgePhase::Submitted { .. })
@@ -292,8 +385,16 @@ impl AdmittedResearchBridge {
         }
     }
 
+    /// Returns the complete operation/process receipt.
+    #[must_use]
+    pub const fn last_receipt(&self) -> Option<&ProviderAttemptReceipt> {
+        match &self.phase {
+            BridgePhase::Awaiting => None,
+            BridgePhase::Submitted { receipt, .. } => receipt.as_ref(),
+        }
+    }
+
     /// Returns the provider-local job reference when the submit ack decoded.
-    /// Correlation only: this reference is never canonical identity.
     #[must_use]
     pub const fn last_provider_job_ref(&self) -> Option<&String> {
         match &self.phase {
@@ -304,13 +405,25 @@ impl AdmittedResearchBridge {
         }
     }
 
-    /// Reconciles an unknown or timed-out outcome by operation identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BridgeError::NotAdmitted`] when nothing was attempted, when
-    /// the outcome is already classified, or when it was already reconciled.
-    /// Transport failures surface as [`BridgeError::Process`].
+    /// Takes candidate-only provider material for the exchange.
+    #[must_use]
+    pub fn take_candidate_bundle(&mut self) -> Option<ResearchEvidenceBundle> {
+        match &mut self.phase {
+            BridgePhase::Submitted { candidate, .. } => candidate.take(),
+            BridgePhase::Awaiting => None,
+        }
+    }
+
+    /// Returns the typed failure retained after the last provider call.
+    #[must_use]
+    pub fn last_failure(&self) -> Option<ResearchProviderFailure> {
+        match &self.phase {
+            BridgePhase::Submitted { failure, .. } => failure.clone(),
+            BridgePhase::Awaiting => None,
+        }
+    }
+
+    /// Reconciles an unknown or timed-out outcome by the stable operation ID.
     pub fn reconcile(&mut self) -> Result<eliot_process::ProcessEvidence, BridgeError> {
         let BridgePhase::Submitted {
             outcome,
@@ -322,7 +435,11 @@ impl AdmittedResearchBridge {
                 reason: "nothing was attempted through the executor yet",
             });
         };
-        if !outcome.requires_reconciliation() || *reconciled {
+        if !matches!(
+            outcome,
+            ProviderOutcome::TimedOut | ProviderOutcome::Unknown
+        ) || *reconciled
+        {
             return Err(BridgeError::NotAdmitted {
                 reason: "outcome is classified or already reconciled",
             });
@@ -330,8 +447,18 @@ impl AdmittedResearchBridge {
         let evidence = self
             .runner
             .reconcile_operation(self.admission.operation_id())?;
-        if let BridgePhase::Submitted { reconciled, .. } = &mut self.phase {
+        if let BridgePhase::Submitted {
+            reconciliation,
+            receipt,
+            reconciled,
+            ..
+        } = &mut self.phase
+        {
             *reconciled = true;
+            *reconciliation = Some(evidence.clone());
+            if let Some(receipt) = receipt {
+                receipt.reconciliation = Some(evidence.clone());
+            }
         }
         Ok(evidence)
     }
@@ -348,43 +475,49 @@ impl ResearchBridge for AdmittedResearchBridge {
         }
         match self.runner.execute(&self.admission, request) {
             Ok(execution) => {
-                let outcome = match execution.outcome {
-                    ProviderOutcome::Completed => SubmittedOutcome::Completed,
-                    ProviderOutcome::Crashed => SubmittedOutcome::Crashed,
-                    ProviderOutcome::TimedOut => SubmittedOutcome::TimedOut,
-                    ProviderOutcome::Cancelled => SubmittedOutcome::Cancelled,
-                    ProviderOutcome::Unknown => SubmittedOutcome::Unknown,
-                };
+                let error = execution.bridge_error();
+                let failure = error.as_ref().map(BridgeError::provider_failure);
                 let job_id = execution.job_id.clone();
                 self.phase = BridgePhase::Submitted {
-                    outcome,
+                    outcome: execution.outcome,
                     evidence: Some(execution.evidence),
-                    provider_job_ref: Some(execution.provider_job_ref),
+                    receipt: Some(execution.receipt),
+                    provider_job_ref: execution.provider_job_ref,
+                    candidate: execution.candidate,
+                    failure,
+                    cancellation: None,
+                    reconciliation: None,
                     reconciled: false,
                 };
-                Ok(job_id)
+                match error {
+                    Some(error) => Err(error),
+                    None => Ok(job_id),
+                }
             }
             Err(error) => {
-                // Nothing reached the executor for binding refusals and absent
-                // authority: the same admission may be retried with corrected
-                // input. Every other failure means the operation may exist in
-                // the executor registry, so resubmission is refused and
-                // unknown outcomes stay reconcile-gated.
-                let terminal = match &error {
-                    BridgeError::TimedOut => SubmittedOutcome::TimedOut,
-                    BridgeError::UnknownOutcome => SubmittedOutcome::Unknown,
-                    BridgeError::ProviderFailed { .. }
-                    | BridgeError::EvidenceIncomplete { .. }
-                    | BridgeError::ProtocolViolation { .. }
-                    | BridgeError::Process(_) => SubmittedOutcome::Refused,
-                    BridgeError::NotAdmitted { .. }
-                    | BridgeError::ProviderUnavailable
-                    | BridgeError::InvalidBridgeIdentity { .. } => return Err(error),
-                };
+                // A port refusal before executor contact is retryable only with
+                // corrected input. Every other post-admission failure is held
+                // as an unknown operation and is never collapsed to Refused.
+                if matches!(
+                    error,
+                    BridgeError::ProviderUnavailable
+                        | BridgeError::InvalidBridgeIdentity { .. }
+                        | BridgeError::NotAdmitted { .. }
+                        | BridgeError::ProtocolViolation { .. }
+                        | BridgeError::EvidenceIncomplete { .. }
+                        | BridgeError::Process(_)
+                ) {
+                    return Err(error);
+                }
                 self.phase = BridgePhase::Submitted {
-                    outcome: terminal,
+                    outcome: ProviderOutcome::Unknown,
                     evidence: None,
+                    receipt: None,
                     provider_job_ref: None,
+                    candidate: None,
+                    failure: Some(error.provider_failure()),
+                    cancellation: None,
+                    reconciliation: None,
                     reconciled: false,
                 };
                 Err(error)
@@ -398,14 +531,74 @@ impl ResearchBridge for AdmittedResearchBridge {
                 reason: "cancel targets a foreign operation",
             });
         }
-        if !matches!(self.phase, BridgePhase::Awaiting) {
-            self.runner
-                .cancel_operation(self.admission.operation_id())?;
-            return Ok(());
+        if matches!(self.phase, BridgePhase::Awaiting) {
+            return Err(BridgeError::NotAdmitted {
+                reason: "nothing was attempted through the executor yet",
+            });
         }
-        Err(BridgeError::NotAdmitted {
-            reason: "nothing was attempted through the executor yet",
-        })
+        let receipt = self
+            .runner
+            .cancel_operation(self.admission.operation_id())?;
+        let status = receipt.status();
+        if let BridgePhase::Submitted {
+            outcome,
+            failure,
+            cancellation,
+            receipt: attempt_receipt,
+            ..
+        } = &mut self.phase
+        {
+            *cancellation = Some(receipt.clone());
+            if let Some(attempt_receipt) = attempt_receipt {
+                attempt_receipt.cancellation = Some(receipt.clone());
+                match status {
+                    CancellationStatus::Completed => {
+                        attempt_receipt.outcome = ProviderOutcome::Cancelled;
+                        *outcome = ProviderOutcome::Cancelled;
+                        *failure = Some(
+                            BridgeError::Cancelled {
+                                reason: "provider cancellation completed",
+                            }
+                            .provider_failure(),
+                        );
+                    }
+                    CancellationStatus::Requested
+                    | CancellationStatus::InProgress
+                    | CancellationStatus::UnknownOutcome => {
+                        attempt_receipt.outcome = ProviderOutcome::Unknown;
+                        *outcome = ProviderOutcome::Unknown;
+                        *failure = Some(BridgeError::UnknownOutcome.provider_failure());
+                    }
+                    CancellationStatus::NotRequested | CancellationStatus::RejectedStaleFence => {}
+                }
+            }
+        }
+        match status {
+            CancellationStatus::Completed => Ok(()),
+            CancellationStatus::Requested
+            | CancellationStatus::InProgress
+            | CancellationStatus::UnknownOutcome => Err(BridgeError::UnknownOutcome),
+            CancellationStatus::NotRequested | CancellationStatus::RejectedStaleFence => {
+                Err(BridgeError::NotAdmitted {
+                    reason: "provider cancellation had no admitted effect",
+                })
+            }
+        }
+    }
+
+    fn last_failure(&self) -> Option<ResearchProviderFailure> {
+        AdmittedResearchBridge::last_failure(self)
+    }
+
+    fn last_operation_id(&self) -> Option<&str> {
+        match &self.phase {
+            BridgePhase::Awaiting => None,
+            BridgePhase::Submitted { .. } => Some(self.admission.operation_id().as_str()),
+        }
+    }
+
+    fn take_candidate_bundle(&mut self) -> Option<ResearchEvidenceBundle> {
+        AdmittedResearchBridge::take_candidate_bundle(self)
     }
 }
 
@@ -471,7 +664,10 @@ pub(crate) mod support {
         SourceClass,
     };
 
-    use super::{BridgeIdentity, ProviderAdmission};
+    use super::{
+        BridgeContract, BridgeIdentity, CancellationBinding, CredentialBinding,
+        ModuleGenerationEvidence, ProviderAdmission, ProviderRegistry, ProviderRoute,
+    };
 
     pub(crate) const DIGEST_A: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -505,22 +701,64 @@ pub(crate) mod support {
     }
 
     pub(crate) fn test_admission() -> ProviderAdmission {
-        ProviderAdmission::new(
+        let route = ProviderRoute {
+            route_id: "route-research-private".to_owned(),
+            provider_id: "provider-research".to_owned(),
+            route_class: "service".to_owned(),
+            data_class: "project-bound".to_owned(),
+            paid_network: true,
+            credential_binding: CredentialBinding {
+                binding_id: "credential-binding-24".to_owned(),
+                owner_principal: "researcher-owner".to_owned(),
+                acting_principal: "requester-24-slice-a".to_owned(),
+                mode: "explicit_delegation".to_owned(),
+                data_classes: vec!["project-bound".to_owned()],
+                secret_ref_sha256: DIGEST_A.to_owned(),
+                revocation_ref: "revocation-24".to_owned(),
+            },
+        };
+        let contract = BridgeContract::new(
             test_identity(),
             DIGEST_B,
             DIGEST_C,
             "mod-research-provider",
             "gen-mod-24-a",
+            DIGEST_A,
             Generation::new(3).expect("generation"),
             test_epoch(),
             test_fence(),
+            route.clone(),
             DisclosureClass::ProjectBound,
+            "project-bound",
             10,
             1_800_000_000_000,
             ContractVersion::new(1, 0, 0),
             "research-evidence-bundle/v1",
             "gen-24-slice-a",
+            CancellationBinding {
+                operation_id: test_operation_id(),
+                cancellation_id: "cancel-op-24".to_owned(),
+                owner_principal: "researcher-owner".to_owned(),
+                deadline_unix_ms: 1_800_000_000_000,
+            },
+        )
+        .expect("test contract must construct");
+        let evidence = ModuleGenerationEvidence {
+            module_id: contract.module_id.clone(),
+            generation_id: contract.module_generation_id.clone(),
+            artifact_sha256: contract.bridge.executable_sha256().to_owned(),
+            config_sha256: contract.config_digest.clone(),
+            protocol_sha256: contract.protocol_digest.clone(),
+            protocol_revision: contract.protocol_revision,
+            route,
+            state_fence: contract.fence.clone(),
+            active: true,
+            evidence_sha256: contract.registry_evidence_sha256.clone(),
+        };
+        ProviderAdmission::from_contract(
+            contract,
             test_operation_id(),
+            &ProviderRegistry::new(vec![evidence]),
         )
         .expect("test admission must construct")
     }
@@ -629,8 +867,8 @@ mod tests {
         let mut researcher = compose_with_bridge(test_identity());
         let result = submit(&mut researcher, test_request());
         assert!(
-            matches!(result, Err(ExchangeError::InvalidTransition)),
-            "bridge gap must surface without fabricating a job"
+            matches!(result, Err(ExchangeError::Provider { .. })),
+            "bridge gap must surface as a typed coverage failure without fabricating a job"
         );
         assert!(
             exchange_snapshot(&researcher).jobs.is_empty(),
@@ -710,13 +948,14 @@ mod tests {
             ("from_", "environment"),
             ("compose_from_", "environment"),
         ];
-        const SOURCES: [&str; 6] = [
+        const SOURCES: [&str; 7] = [
             include_str!("lib.rs"),
             include_str!("main.rs"),
             include_str!("admission.rs"),
             include_str!("evidence.rs"),
             include_str!("execution.rs"),
             include_str!("protocol.rs"),
+            include_str!("runtime.rs"),
         ];
         for (head, tail) in FORBIDDEN_FRAGMENTS {
             let symbol = format!("{head}{tail}");
@@ -827,8 +1066,8 @@ mod tests {
         );
         let result = submit(&mut researcher, test_request());
         assert!(
-            matches!(result, Err(ExchangeError::InvalidTransition)),
-            "absent process authority must surface as a gap, never a job"
+            matches!(result, Err(ExchangeError::Provider { .. })),
+            "absent process authority must surface as a typed gap, never a job"
         );
         assert!(
             exchange_snapshot(&researcher).jobs.is_empty(),
@@ -855,7 +1094,8 @@ mod tests {
         fn bind(
             &self,
             _admission: &super::admission::ProviderAdmission,
-            _request_sha256: &str,
+            _envelope: &super::protocol::SubmitEnvelope,
+            _wire_bytes: &[u8],
         ) -> Result<eliot_process::ProcessRequest, super::execution::RequestPortError> {
             Err(self.0)
         }

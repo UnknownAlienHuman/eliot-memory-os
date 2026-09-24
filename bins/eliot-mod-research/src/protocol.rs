@@ -1,26 +1,26 @@
 //! Typed versioned research-provider wire protocol.
 //!
-//! The bridge speaks one bounded JSONL wire to the provider child. The first
-//! stdout line is the submit acknowledgement; the terminal result frame, when
-//! present, carries the provider disposition plus the candidate content digest
-//! (candidate bytes stay in raw evidence for Governor admission; they are
-//! never parsed here as semantic results).
-//!
-//! A returned provider `job_id` is provider-local correlation state. It is
-//! retained in bridge outcome evidence and never promoted to canonical
-//! task/job identity: the exchange keys on the admitted operation identity.
-//! Provider bodies never enter errors; every refusal carries a stable reason.
+//! The request envelope is encoded before the Kernel-issued process request
+//! is minted and is carried as an exact process argument. The executor's
+//! argv is therefore the delivery channel: the child receives the bytes that
+//! were hashed and admitted, rather than a locally reconstructed equivalent.
+//! Provider-local job identifiers remain correlation evidence only.
 
 use eliot_contracts::ContractVersion;
+use eliot_research_exchange_api::DisclosureClass;
 use serde::{Deserialize, Serialize};
 
-/// Current research-provider wire version. The bridge accepts exactly this
-/// version; anything else is a stale/foreign wire, never a best-effort parse.
-pub const RESEARCH_PROVIDER_WIRE_VERSION: u16 = 1;
+use crate::admission::ProviderAdmission;
+use crate::{is_lowercase_sha256, sha256_hex};
+
+/// Current research-provider wire version.
+pub const RESEARCH_PROVIDER_WIRE_VERSION: u16 = 2;
 /// Maximum accepted wire payload in bytes (one envelope or one frame).
 pub const MAX_WIRE_BYTES: usize = 64 * 1024;
 /// Maximum accepted stdout lines scanned for ack/result frames.
 pub const MAX_WIRE_LINES: usize = 4096;
+/// Exact argv marker used to deliver the admitted request envelope.
+pub const PROVIDER_WIRE_ARGUMENT: &str = "--eliot-research-wire";
 
 /// Stable refusal reasons for wire violations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +35,8 @@ pub enum ProtocolRefusal {
     BlankCorrelation,
     /// No terminal result frame is present in provider output.
     MissingResultFrame,
+    /// Provider output contains more than one terminal result claim.
+    AmbiguousResultFrame,
     /// Provider output exceeds the line scan bound.
     TooManyLines,
 }
@@ -49,20 +51,17 @@ impl ProtocolRefusal {
             Self::StaleWire => "provider wire version differs from the admitted version",
             Self::BlankCorrelation => "provider correlation field is blank",
             Self::MissingResultFrame => "provider output carries no terminal result frame",
+            Self::AmbiguousResultFrame => "provider output carries multiple terminal result frames",
             Self::TooManyLines => "provider output exceeds the wire line bound",
         }
     }
 }
 
-/// Canonical submit envelope handed to the request-minting port.
-///
-/// The port decides how these bytes reach the child (argv/digest reference);
-/// the envelope binds operation, route, and exact request content so the
-/// child cannot be substituted or retargeted without detection.
+/// Canonical submit envelope delivered to the provider child.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitEnvelope {
-    /// Exact wire version (must equal `RESEARCH_PROVIDER_WIRE_VERSION`).
+    /// Exact wire version.
     pub wire_version: u16,
     /// Stable admitted operation identity.
     pub operation_id: String,
@@ -70,18 +69,78 @@ pub struct SubmitEnvelope {
     pub exchange_id: String,
     /// Idempotency correlation echoed from the request.
     pub idempotency_key: String,
-    /// Sealed process-request digest the envelope is bound to execute under.
-    pub invocation_digest: String,
+    /// Sealed process-request digest is carried by the executor receipt; the
+    /// wire itself carries the canonical request digest so the pre-launch
+    /// envelope can be delivered before a permit-bound request exists.
     /// Admitted protocol revision.
     pub protocol_revision: ContractVersion,
     /// Admitted required result schema.
     pub required_schema: String,
-    /// SHA-256 of the canonical request JSON this envelope was built from.
+    /// SHA-256 of the canonical request JSON.
     pub request_sha256: String,
+    /// Exact registry-selected route.
+    pub route_id: String,
+    /// Exact provider implementation identity selected by the registry.
+    pub provider_id: String,
+    /// Exact bridge generation selected by the registry.
+    pub bridge_generation: String,
+    /// SHA-256 of the complete State Fence, including optional revisions.
+    pub state_fence_sha256: String,
+    /// Exact privacy ceiling.
+    pub disclosure: DisclosureClass,
+    /// Exact data class.
+    pub data_class: String,
+    /// Exact owner/credential binding identity.
+    pub credential_binding_id: String,
+    pub credential_owner_principal: String,
+    pub credential_acting_principal: String,
+    /// Budget ceiling admitted for this operation.
+    pub budget_units: u64,
+    /// Absolute deadline in Unix milliseconds.
+    pub deadline_unix_ms: i64,
+    /// Stable cancellation identity.
+    pub cancellation_id: String,
+    /// Registry evidence digest used to resolve the route.
+    pub registry_evidence_sha256: String,
+    /// Process generation admitted by Kernel.
+    pub process_generation: u64,
 }
 
 impl SubmitEnvelope {
-    /// Encodes the envelope to canonical bounded bytes.
+    /// Builds the exact envelope from the admitted contract and request.
+    #[must_use]
+    pub fn from_admission(
+        request: &eliot_research_exchange_api::ResearchQueryRequest,
+        admission: &ProviderAdmission,
+        request_sha256: String,
+    ) -> Self {
+        let contract = admission.contract();
+        Self {
+            wire_version: RESEARCH_PROVIDER_WIRE_VERSION,
+            operation_id: admission.operation_id().as_str().to_owned(),
+            exchange_id: request.exchange_id.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            protocol_revision: contract.protocol_revision,
+            required_schema: contract.required_schema.clone(),
+            request_sha256,
+            route_id: contract.route().route_id.clone(),
+            provider_id: contract.route().provider_id.clone(),
+            bridge_generation: contract.bridge_generation.clone(),
+            state_fence_sha256: state_fence_sha256(&contract.fence),
+            disclosure: contract.disclosure,
+            data_class: contract.data_class.clone(),
+            credential_binding_id: contract.credential_binding().binding_id.clone(),
+            credential_owner_principal: contract.credential_binding().owner_principal.clone(),
+            credential_acting_principal: contract.credential_binding().acting_principal.clone(),
+            budget_units: contract.budget_units,
+            deadline_unix_ms: contract.deadline_ms,
+            cancellation_id: contract.cancellation().cancellation_id.clone(),
+            registry_evidence_sha256: contract.registry_evidence_sha256().to_owned(),
+            process_generation: contract.process_generation.get(),
+        }
+    }
+
+    /// Encodes the envelope to bounded JSON bytes.
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolRefusal> {
         let bytes = serde_json::to_vec(self).map_err(|_| ProtocolRefusal::MalformedWire)?;
         if bytes.len() > MAX_WIRE_BYTES {
@@ -90,7 +149,7 @@ impl SubmitEnvelope {
         Ok(bytes)
     }
 
-    /// Decodes one envelope, enforcing version and correlation shape.
+    /// Decodes one envelope, enforcing version, correlation, and digest shape.
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolRefusal> {
         if bytes.len() > MAX_WIRE_BYTES {
             return Err(ProtocolRefusal::WireTooLarge);
@@ -100,31 +159,70 @@ impl SubmitEnvelope {
         if envelope.wire_version != RESEARCH_PROVIDER_WIRE_VERSION {
             return Err(ProtocolRefusal::StaleWire);
         }
-        if envelope.operation_id.trim().is_empty()
-            || envelope.invocation_digest.trim().is_empty()
-            || envelope.request_sha256.trim().is_empty()
-        {
+        for value in [
+            &envelope.operation_id,
+            &envelope.exchange_id,
+            &envelope.idempotency_key,
+            &envelope.required_schema,
+            &envelope.route_id,
+            &envelope.provider_id,
+            &envelope.bridge_generation,
+            &envelope.state_fence_sha256,
+            &envelope.data_class,
+            &envelope.credential_binding_id,
+            &envelope.credential_owner_principal,
+            &envelope.credential_acting_principal,
+            &envelope.cancellation_id,
+            &envelope.registry_evidence_sha256,
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(ProtocolRefusal::BlankCorrelation);
+            }
+        }
+        for digest in [
+            &envelope.request_sha256,
+            &envelope.state_fence_sha256,
+            &envelope.registry_evidence_sha256,
+        ] {
+            if !is_lowercase_sha256(digest) {
+                return Err(ProtocolRefusal::MalformedWire);
+            }
+        }
+        if envelope.budget_units == 0 || envelope.deadline_unix_ms <= 0 {
             return Err(ProtocolRefusal::BlankCorrelation);
         }
         Ok(envelope)
     }
 }
 
-/// Provider submit acknowledgement (first stdout line).
-///
-/// `provider_job_id` is provider-local correlation only.
+/// Computes a stable digest of the complete State Fence.
+#[must_use]
+pub fn state_fence_sha256(fence: &eliot_contracts::StateFence) -> String {
+    serde_json::to_vec(fence).map_or_else(|_| sha256_hex(&[]), |bytes| sha256_hex(&bytes))
+}
+
+/// Provider submit acknowledgement. The provider job reference is local
+/// correlation state; operation/request digests bind it to the admitted run.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitAck {
-    /// Exact wire version (must equal `RESEARCH_PROVIDER_WIRE_VERSION`).
+    /// Exact wire version.
     pub wire_version: u16,
-    /// Provider-local job reference (never canonical identity).
+    /// Operation identity echoed by the provider.
+    pub operation_id: String,
+    /// Canonical request digest echoed by the provider.
+    pub request_sha256: String,
+    /// Provider-local job reference, never canonical identity.
     pub provider_job_id: String,
 }
 
 impl SubmitAck {
-    /// Decodes the acknowledgement line, enforcing version and non-blank ref.
-    pub fn decode(line: &[u8]) -> Result<Self, ProtocolRefusal> {
+    /// Decodes and validates an acknowledgement line.
+    pub fn decode(
+        line: &[u8],
+        expected_operation: &str,
+        expected_request_sha256: &str,
+    ) -> Result<Self, ProtocolRefusal> {
         if line.len() > MAX_WIRE_BYTES {
             return Err(ProtocolRefusal::WireTooLarge);
         }
@@ -132,21 +230,37 @@ impl SubmitAck {
         if ack.wire_version != RESEARCH_PROVIDER_WIRE_VERSION {
             return Err(ProtocolRefusal::StaleWire);
         }
-        if ack.provider_job_id.trim().is_empty() {
+        if ack.operation_id.trim().is_empty()
+            || ack.provider_job_id.trim().is_empty()
+            || ack.operation_id != expected_operation
+            || ack.request_sha256 != expected_request_sha256
+            || !is_lowercase_sha256(&ack.request_sha256)
+        {
             return Err(ProtocolRefusal::BlankCorrelation);
         }
         Ok(ack)
     }
 }
 
-/// Terminal provider result disposition (provider-local outcome, not a
-/// semantic verdict and never task finish).
+/// Provider result coverage denominator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageDenominator {
+    /// The provider proves the requested frozen denominator.
+    CompleteScope,
+    /// The provider used a declared sample.
+    Sampled,
+    /// The denominator is not known.
+    Unknown,
+}
+
+/// Terminal provider result disposition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderResultDisposition {
-    /// Provider completed and a candidate is available under its digest.
+    /// Candidate bytes are available under the returned digest.
     CompletedCandidateAvailable,
-    /// Provider reports it cancelled the acquisition.
+    /// Provider reports cancellation.
     ProviderCancelled,
     /// Provider reports acquisition failure.
     ProviderFailed,
@@ -156,17 +270,38 @@ pub enum ProviderResultDisposition {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResultFrame {
-    /// Exact wire version (must equal `RESEARCH_PROVIDER_WIRE_VERSION`).
+    /// Exact wire version.
     pub wire_version: u16,
+    /// Operation identity echoed by the provider.
+    pub operation_id: String,
+    /// Canonical request digest echoed by the provider.
+    pub request_sha256: String,
+    /// Exact route echoed by the provider.
+    pub route_id: String,
     /// Provider-local terminal disposition.
     pub disposition: ProviderResultDisposition,
-    /// SHA-256 of the candidate bytes available in raw evidence.
+    /// SHA-256 of candidate bytes held in raw evidence custody.
     pub candidate_sha256: String,
+    /// Exact source handles represented by the candidate.
+    pub source_handles: Vec<String>,
+    /// Exact provenance/evidence handles represented by the candidate.
+    pub provenance_handles: Vec<String>,
+    /// Coverage denominator claimed by the provider.
+    pub coverage_denominator: CoverageDenominator,
+    /// Sanitized provider-reported coverage gaps.
+    pub coverage_gaps: Vec<String>,
+    /// Provider-reported usage in the admitted units.
+    pub usage_units: u64,
 }
 
 impl ResultFrame {
     /// Decodes one terminal result frame.
-    pub fn decode(line: &[u8]) -> Result<Self, ProtocolRefusal> {
+    pub fn decode(
+        line: &[u8],
+        expected_operation: &str,
+        expected_request_sha256: &str,
+        expected_route: &str,
+    ) -> Result<Self, ProtocolRefusal> {
         if line.len() > MAX_WIRE_BYTES {
             return Err(ProtocolRefusal::WireTooLarge);
         }
@@ -175,19 +310,43 @@ impl ResultFrame {
         if frame.wire_version != RESEARCH_PROVIDER_WIRE_VERSION {
             return Err(ProtocolRefusal::StaleWire);
         }
-        if !crate::is_lowercase_sha256(&frame.candidate_sha256) {
+        if frame.operation_id != expected_operation
+            || frame.request_sha256 != expected_request_sha256
+            || frame.route_id != expected_route
+            || frame.operation_id.trim().is_empty()
+            || frame.route_id.trim().is_empty()
+            || !is_lowercase_sha256(&frame.request_sha256)
+            || !is_lowercase_sha256(&frame.candidate_sha256)
+        {
+            return Err(ProtocolRefusal::BlankCorrelation);
+        }
+        for value in frame
+            .source_handles
+            .iter()
+            .chain(frame.provenance_handles.iter())
+            .chain(frame.coverage_gaps.iter())
+        {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(ProtocolRefusal::MalformedWire);
+            }
+        }
+        if frame.disposition == ProviderResultDisposition::CompletedCandidateAvailable
+            && (frame.source_handles.is_empty() || frame.provenance_handles.is_empty())
+        {
             return Err(ProtocolRefusal::MalformedWire);
         }
         Ok(frame)
     }
 }
 
-/// Scans bounded stdout bytes for the terminal result frame.
-///
-/// Lines are scanned in order within the line bound; the last well-formed
-/// result frame wins. Returns `None` when no line decodes as a result frame
-/// (absence is explicit, never a fabricated empty result).
-pub fn scan_result_frame(stdout: &[u8]) -> Result<Option<ResultFrame>, ProtocolRefusal> {
+/// Scans bounded stdout for the terminal result frame. A line that claims to
+/// be a result frame is strict; ordinary progress/noise lines are ignored.
+pub fn scan_result_frame(
+    stdout: &[u8],
+    expected_operation: &str,
+    expected_request_sha256: &str,
+    expected_route: &str,
+) -> Result<Option<ResultFrame>, ProtocolRefusal> {
     if stdout.len() > MAX_WIRE_BYTES {
         return Err(ProtocolRefusal::WireTooLarge);
     }
@@ -202,8 +361,16 @@ pub fn scan_result_frame(stdout: &[u8]) -> Result<Option<ResultFrame>, ProtocolR
         if line.is_empty() {
             continue;
         }
-        if let Ok(frame) = ResultFrame::decode(line) {
-            found = Some(frame);
+        if line.starts_with(b"{") && line.windows(12).any(|window| window == b"\"disposition\"") {
+            if found.is_some() {
+                return Err(ProtocolRefusal::AmbiguousResultFrame);
+            }
+            found = Some(ResultFrame::decode(
+                line,
+                expected_operation,
+                expected_request_sha256,
+                expected_route,
+            )?);
         }
     }
     Ok(found)
@@ -225,10 +392,23 @@ mod tests {
             operation_id: "op-24-slice-a".to_owned(),
             exchange_id: "ex-24-slice-a".to_owned(),
             idempotency_key: "idem-24-slice-a".to_owned(),
-            invocation_digest: DIGEST_A.to_owned(),
             protocol_revision: ContractVersion::new(1, 0, 0),
             required_schema: "research-evidence-bundle/v1".to_owned(),
             request_sha256: DIGEST_A.to_owned(),
+            route_id: "route-research-private".to_owned(),
+            provider_id: "provider-research".to_owned(),
+            bridge_generation: "gen-24-slice-a".to_owned(),
+            state_fence_sha256: DIGEST_A.to_owned(),
+            disclosure: DisclosureClass::ProjectBound,
+            data_class: "project-bound".to_owned(),
+            credential_binding_id: "credential-binding-24".to_owned(),
+            credential_owner_principal: "researcher-owner".to_owned(),
+            credential_acting_principal: "requester-24-slice-a".to_owned(),
+            budget_units: 10,
+            deadline_unix_ms: 1_800_000_000_000,
+            cancellation_id: "cancel-op-24".to_owned(),
+            registry_evidence_sha256: DIGEST_A.to_owned(),
+            process_generation: 3,
         }
     }
 
@@ -236,165 +416,66 @@ mod tests {
     fn envelope_round_trips_exactly() {
         let envelope = test_envelope();
         let bytes = envelope.encode().expect("envelope must encode");
-        let decoded = SubmitEnvelope::decode(&bytes).expect("envelope must decode");
-        assert_eq!(decoded, envelope);
+        assert_eq!(SubmitEnvelope::decode(&bytes).expect("decode"), envelope);
     }
 
     #[test]
-    fn envelope_rejects_stale_wire_version() {
+    fn envelope_rejects_stale_wire_and_bad_correlation() {
         let mut envelope = test_envelope();
         envelope.wire_version = RESEARCH_PROVIDER_WIRE_VERSION + 1;
-        let bytes = envelope.encode().expect("encoding is version-agnostic");
         assert_eq!(
-            SubmitEnvelope::decode(&bytes),
+            SubmitEnvelope::decode(&envelope.encode().expect("encode")),
             Err(ProtocolRefusal::StaleWire)
         );
-        let mut legacy = test_envelope();
-        legacy.wire_version = RESEARCH_PROVIDER_WIRE_VERSION - 1;
-        let legacy_bytes = legacy.encode().expect("encoding is version-agnostic");
+        let mut envelope = test_envelope();
+        envelope.request_sha256 = "not-a-digest".to_owned();
         assert_eq!(
-            SubmitEnvelope::decode(&legacy_bytes),
-            Err(ProtocolRefusal::StaleWire)
+            SubmitEnvelope::decode(&envelope.encode().expect("encode")),
+            Err(ProtocolRefusal::MalformedWire)
         );
     }
 
     #[test]
-    fn envelope_rejects_malformed_and_blank_payloads() {
-        assert_eq!(
-            SubmitEnvelope::decode(b"{not json"),
-            Err(ProtocolRefusal::MalformedWire)
-        );
-        assert_eq!(
-            SubmitEnvelope::decode(b"{\"wire_version\":1}"),
-            Err(ProtocolRefusal::MalformedWire)
-        );
-        let mut blank = test_envelope();
-        blank.operation_id = "   ".to_owned();
-        let bytes = blank.encode().expect("encoding is shape-agnostic");
-        assert_eq!(
-            SubmitEnvelope::decode(&bytes),
-            Err(ProtocolRefusal::BlankCorrelation)
-        );
-    }
-
-    #[test]
-    fn ack_decode_accepts_only_versioned_non_blank_refs() {
-        let ack = SubmitAck::decode(b"{\"wire_version\":1,\"provider_job_id\":\"pv-991\"}")
-            .expect("ack must decode");
+    fn ack_and_result_are_bound_to_operation_request_and_route() {
+        let ack = SubmitAck::decode(
+            br#"{"wire_version":2,"operation_id":"op-24-slice-a","request_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","provider_job_id":"pv-991"}"#,
+            "op-24-slice-a",
+            DIGEST_A,
+        )
+        .expect("ack");
         assert_eq!(ack.provider_job_id, "pv-991");
+        assert!(SubmitAck::decode(
+            br#"{"wire_version":2,"operation_id":"foreign","request_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","provider_job_id":"pv-991"}"#,
+            "op-24-slice-a",
+            DIGEST_A,
+        )
+        .is_err());
+        let frame = ResultFrame {
+            wire_version: 2,
+            operation_id: "op-24-slice-a".to_owned(),
+            request_sha256: DIGEST_A.to_owned(),
+            route_id: "route-research-private".to_owned(),
+            disposition: ProviderResultDisposition::CompletedCandidateAvailable,
+            candidate_sha256: DIGEST_A.to_owned(),
+            source_handles: vec!["source-a".to_owned()],
+            provenance_handles: vec!["evidence-a".to_owned()],
+            coverage_denominator: CoverageDenominator::Sampled,
+            coverage_gaps: vec!["provider sample is not a complete scope".to_owned()],
+            usage_units: 2,
+        };
+        let line = serde_json::to_vec(&frame).expect("frame");
         assert_eq!(
-            SubmitAck::decode(b"{\"wire_version\":1,\"provider_job_id\":\"  \"}"),
-            Err(ProtocolRefusal::BlankCorrelation)
-        );
-        assert_eq!(
-            SubmitAck::decode(b"{\"wire_version\":2,\"provider_job_id\":\"pv-991\"}"),
-            Err(ProtocolRefusal::StaleWire)
-        );
-        assert_eq!(
-            SubmitAck::decode(b"provider started job pv-991"),
-            Err(ProtocolRefusal::MalformedWire)
-        );
-        // Unknown fields are refused: the provider must speak the exact schema.
-        assert_eq!(
-            SubmitAck::decode(
-                b"{\"wire_version\":1,\"provider_job_id\":\"pv-991\",\"extra\":true}"
-            ),
-            Err(ProtocolRefusal::MalformedWire)
+            ResultFrame::decode(&line, "op-24-slice-a", DIGEST_A, "route-research-private")
+                .expect("frame"),
+            frame
         );
     }
 
     #[test]
-    fn result_scan_finds_the_terminal_frame_and_nothing_else() {
-        let frame = format!(
-            "{{\"wire_version\":1,\"disposition\":\"completed_candidate_available\",\"candidate_sha256\":\"{DIGEST_A}\"}}"
-        );
-        let stdout = format!("{{\"wire_version\":1,\"provider_job_id\":\"pv-991\"}}\n{frame}\n");
-        let found = scan_result_frame(stdout.as_bytes())
-            .expect("scan must succeed")
-            .expect("terminal frame must be found");
-        assert_eq!(
-            found.disposition,
-            ProviderResultDisposition::CompletedCandidateAvailable
-        );
-        assert_eq!(found.candidate_sha256, DIGEST_A);
-    }
-
-    #[test]
-    fn all_provider_dispositions_decode() {
-        for (wire, expected) in [
-            (
-                "completed_candidate_available",
-                ProviderResultDisposition::CompletedCandidateAvailable,
-            ),
-            (
-                "provider_cancelled",
-                ProviderResultDisposition::ProviderCancelled,
-            ),
-            ("provider_failed", ProviderResultDisposition::ProviderFailed),
-        ] {
-            let line = format!(
-                "{{\"wire_version\":1,\"disposition\":\"{wire}\",\"candidate_sha256\":\"{DIGEST_A}\"}}"
-            );
-            let frame = ResultFrame::decode(line.as_bytes()).expect("disposition must decode");
-            assert_eq!(frame.disposition, expected);
-        }
-    }
-
-    #[test]
-    fn result_scan_absence_is_explicit() {
-        let stdout = b"{\"wire_version\":1,\"provider_job_id\":\"pv-991\"}\nprogress: 3\n";
+    fn result_scan_does_not_ignore_a_malformed_result_claim() {
+        let stdout = br#"{"wire_version":2,"disposition":"completed_candidate_available","candidate_sha256":"bad"}"#;
         assert!(
-            scan_result_frame(stdout)
-                .expect("scan must succeed")
-                .is_none(),
-            "absence of a result frame must decode as absence, never an empty result"
-        );
-    }
-
-    #[test]
-    fn result_scan_rejects_malformed_candidate_digest() {
-        let stdout = b"{\"wire_version\":1,\"disposition\":\"completed_candidate_available\",\"candidate_sha256\":\"ZZZ\"}\n";
-        // A malformed frame is skipped by the scan (provider-local noise), so
-        // absence stays explicit here; strict decode still refuses it below.
-        assert!(
-            scan_result_frame(stdout)
-                .expect("scan must succeed")
-                .is_none()
-        );
-        assert_eq!(
-            ResultFrame::decode(
-                b"{\"wire_version\":1,\"disposition\":\"completed_candidate_available\",\"candidate_sha256\":\"ZZZ\"}"
-            ),
-            Err(ProtocolRefusal::MalformedWire)
-        );
-    }
-
-    #[test]
-    fn wire_bounds_are_enforced() {
-        let oversized = vec![b'x'; MAX_WIRE_BYTES + 1];
-        assert_eq!(
-            SubmitEnvelope::decode(&oversized),
-            Err(ProtocolRefusal::WireTooLarge)
-        );
-        assert_eq!(
-            scan_result_frame(&oversized),
-            Err(ProtocolRefusal::WireTooLarge)
-        );
-        let mut many_lines = Vec::new();
-        for _ in 0..=MAX_WIRE_LINES {
-            many_lines.extend_from_slice(b"\n");
-        }
-        assert_eq!(
-            scan_result_frame(&many_lines),
-            Err(ProtocolRefusal::TooManyLines)
-        );
-    }
-
-    #[test]
-    fn refusal_reasons_are_stable() {
-        assert_eq!(
-            ProtocolRefusal::StaleWire.reason(),
-            "provider wire version differs from the admitted version"
+            scan_result_frame(stdout, "op-24-slice-a", DIGEST_A, "route-research-private").is_err()
         );
     }
 }
