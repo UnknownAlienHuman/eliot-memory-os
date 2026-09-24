@@ -461,6 +461,26 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// [`OrsError::RecoveryProblemRetained`]. Neither path deletes the staged
     /// record nor falls back to plaintext.
     fn accept_after_stage(&self, request: ReservationRequest) -> Result<AcceptedPending, OrsError>;
+    /// Proves the read-back staging for one already-staged reservation token
+    /// and returns `ACCEPTED_PENDING` (issue #1713, I5.2/I5.6).
+    ///
+    /// This is the exact proof [`accept_after_stage`](Self::accept_after_stage)
+    /// runs after its own `stage_and_reserve`: the committed envelope must
+    /// decode and hash-validate, its identity must match the token operation,
+    /// and the operation index must resolve to this reservation. Only then
+    /// may `ACCEPTED_PENDING` be observed. A read-back validation failure
+    /// retains a durable [`RecoveryProblem`] instead of deleting or
+    /// fabricating the staged payload, and fails with
+    /// [`OrsError::RecoveryProblemRetained`]; a missing envelope or index
+    /// fails with [`OrsError::StagingNotDurable`].
+    ///
+    /// Kernel admission requires this proof before sealing a reservation
+    /// staged through [`stage_and_reserve`](Self::stage_and_reserve), so both
+    /// staging entries share one proof implementation and one owner.
+    fn verify_staged_reservation(
+        &self,
+        token: &WriterReservationToken,
+    ) -> Result<AcceptedPending, OrsError>;
     /// Revalidates one staged envelope by identity without interpreting its
     /// payload (issue #1925).
     ///
@@ -7642,6 +7662,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let token = self
             .stage_and_reserve(request)
             .map_err(|error| OrsError::StagingNotDurable(error.to_string()))?;
+        self.verify_staged_reservation(&token)
+    }
+
+    fn verify_staged_reservation(
+        &self,
+        token: &WriterReservationToken,
+    ) -> Result<AcceptedPending, OrsError> {
         // Read-back proof: the committed envelope must decode and validate,
         // and the operation index must resolve to this reservation. Only then
         // may ACCEPTED_PENDING be observed. A read-back validation failure
@@ -7686,7 +7713,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                         .map_err(storage)?
                         .map(|value| raw_fingerprint(value.value()))
                 };
-                let retained = self.retain_staging_problem(&token, &error, fingerprint)?;
+                let retained = self.retain_staging_problem(token, &error, fingerprint)?;
                 Err(OrsError::RecoveryProblemRetained {
                     operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
                 })
@@ -8276,6 +8303,21 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         request: ReservationRequest,
     ) -> Result<AcceptedPending, OrsError> {
         self.store.accept_after_stage(request)
+    }
+
+    /// Proves the read-back staging for one already-staged reservation token
+    /// and returns `ACCEPTED_PENDING` (issue #1713).
+    ///
+    /// The same proof [`accept_after_stage`](Self::accept_after_stage) runs
+    /// after staging: committed envelope hash-validated and indexed under the
+    /// token operation. Kernel admission requires this before sealing a
+    /// reservation; a failed proof retains a durable Recovery Problem and
+    /// never deletes or fabricates staged state.
+    pub fn verify_staged_reservation(
+        &self,
+        token: &WriterReservationToken,
+    ) -> Result<AcceptedPending, OrsError> {
+        self.store.verify_staged_reservation(token)
     }
 
     /// Revalidates one staged envelope by operation identity, retaining a

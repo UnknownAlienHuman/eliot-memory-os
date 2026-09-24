@@ -595,6 +595,12 @@ pub fn reserve_for_transition(
             detail: "ORS token does not bind the admitted reservation inputs".to_owned(),
         });
     }
+    // I5.2/I5.6 (issue #1713): a sealed reservation exists only after the
+    // read-back proof — the committed envelope hash-validated and indexed
+    // under this operation. This is the exact proof `accept_after_stage`
+    // requires before `ACCEPTED_PENDING`; a failed proof (including a
+    // retained Recovery Problem) fails closed here and seals nothing.
+    let _accepted = owner.ors.verify_staged_reservation(&token)?;
     Ok(SealedReservation {
         token,
         created_at_ms: seed.created_at_ms,
@@ -1229,7 +1235,7 @@ pub struct StartupUnknownOperation {
     /// Recovery owner preserved from the token.
     pub recovery_owner: String,
     /// Fixed-vocabulary ambiguity reason (`no store receipt`,
-    /// `reconciliation refused`).
+    /// `reconciliation refused`, `staged envelope unverifiable`).
     pub reason: String,
 }
 
@@ -1308,6 +1314,31 @@ async fn reconcile_one_record<T: EbpStoreTransport + 'static>(
         return Ok(StartupRecordOutcome::Pending {
             reason: "fence mismatch".to_owned(),
         });
+    }
+    // I5.2 (issue #1713): the staged envelope must still hash-verify at
+    // restart before any receipt reconciliation. Terminal records keep the
+    // existing disposition path (their envelopes may already be
+    // retention-pruned after terminal disposition); only unresolved work is
+    // gated here. A corrupt or missing envelope retains a durable Recovery
+    // Problem in ORS through the owner verifier, and the operation stays
+    // visible as unknown work: never reconciled from untrusted staging,
+    // never replayed, never dropped.
+    if !matches!(
+        record.state,
+        eliot_ors::ReservationState::Finalized | eliot_ors::ReservationState::Released
+    ) {
+        let staged_id =
+            eliot_ors::OperationIdentity::new(token.operation_id.as_str()).map_err(|error| {
+                ReservationWriteError::Binding {
+                    operation_id: token.operation_id.as_str().to_owned(),
+                    detail: format!("startup scan cannot address the staged envelope: {error}"),
+                }
+            })?;
+        if owner.ors.verify_staged_envelope(&staged_id).is_err() {
+            return Ok(StartupRecordOutcome::Unknown {
+                reason: "staged envelope unverifiable".to_owned(),
+            });
+        }
     }
     let operation_id = OperationId::new(token.operation_id.as_str()).map_err(|error| {
         ReservationWriteError::Binding {

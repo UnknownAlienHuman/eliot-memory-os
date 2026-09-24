@@ -32,12 +32,12 @@ use crate::commit_recovery::recover_commit;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     begin_execute_after_send, cancel_before_send, ensure_eligible, finalize_reservation,
-    mark_unknown_outcome, reconcile_receipt, reserve_for_transition, writer_epoch_for_fence,
-    writer_epoch_for_fence_from_epoch,
+    mark_unknown_outcome, reconcile_pending_at_startup, reconcile_receipt, reserve_for_transition,
+    writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
 };
 use crate::{
     CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
-    StoreClientFault, StoreClientFaultHarness, UserAutomationOwnerLookup,
+    StartupReconciliation, StoreClientFault, StoreClientFaultHarness, UserAutomationOwnerLookup,
     UserAutomationOwnerSnapshot,
 };
 
@@ -721,6 +721,67 @@ impl KernelStoreGateway {
             ));
         }
         Ok(())
+    }
+
+    /// Reconciles persisted staged-write reservations against exact canonical
+    /// Store receipts at startup (I5.6 step 17, issue #1713).
+    ///
+    /// Production startup link for
+    /// [`reconcile_pending_at_startup`]: binds the composition reservation
+    /// from the live fence tuple (same pattern as [`Self::drain_reserved`]),
+    /// then enumerates the persisted ORS recovery projection and reconciles
+    /// every staged operation through the named canonical receipt path.
+    /// Operations with an exact receipt finalize through the real receipt
+    /// path; operations without one — or with an unverifiable staged
+    /// envelope — stay visible as pending/unknown work, never synthesized,
+    /// retried, or released. A `Blocked` readiness verdict keeps ordinary
+    /// admission fenced. Without a bound ORS this fails closed with an
+    /// explicit error, never a synthetic empty report.
+    pub async fn reconcile_staged_at_startup(
+        &self,
+        limit: u16,
+    ) -> Result<StartupReconciliation, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err(
+                "canonical-store gateway is fenced for rebind; refusing staged startup reconciliation"
+                    .to_owned(),
+            );
+        }
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "staged startup reconciliation requires the composition-bound ORS; refusing with no staged state"
+                .to_owned()
+        })?;
+        // Short lock scope, never held across ORS or network work: the owner
+        // and fence below are values, and the scan runs after release.
+        let (owner, fence) = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            if service.generation_fenced() {
+                return Err("Kernel generation is fenced".to_owned());
+            }
+            let live_epoch = service.authority_epoch();
+            if self
+                .route_epoch
+                .as_ref()
+                .is_none_or(|bound| !bound.is_same_authority(&live_epoch))
+            {
+                return Err(
+                    "canonical-store route is outside the active Kernel generation".to_owned(),
+                );
+            }
+            let fence = StateFence::new(live_epoch.clone(), self.route.active_generation());
+            let writer_epoch = writer_epoch_for_fence_from_epoch(&live_epoch)
+                .map_err(|error| error.to_string())?;
+            let owner = CompositionReservation::bind(commit_ors, writer_epoch)
+                .map_err(|error| error.to_string())?;
+            (owner, fence)
+        };
+        reconcile_pending_at_startup(&owner, &fence, &self.store, limit)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Reads one bounded, opaque Store recovery snapshot through the active
