@@ -3328,6 +3328,10 @@ impl RedbRecoveryStore {
     /// fence is unchanged. A `Requested` operation cannot receive a result
     /// (it must be admitted first); terminal states without a result cannot
     /// gain one.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the result-retention transaction keeps replay, lifecycle, and immutable-view joins together"
+    )]
     pub fn persist_host_request_result(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -3364,7 +3368,11 @@ impl RedbRecoveryStore {
                         table
                             .get(view_key)
                             .map_err(storage)?
-                            .map(|value| decode::<eliot_store_api::CampaignLearningStateViewPublication>(value.value()))
+                            .map(|value| {
+                                decode::<eliot_store_api::CampaignLearningStateViewPublication>(
+                                    value.value(),
+                                )
+                            })
                             .transpose()?
                     };
                     match current {
@@ -3446,7 +3454,11 @@ impl RedbRecoveryStore {
                 table
                     .get(view_key)
                     .map_err(storage)?
-                    .map(|value| decode::<eliot_store_api::CampaignLearningStateViewPublication>(value.value()))
+                    .map(|value| {
+                        decode::<eliot_store_api::CampaignLearningStateViewPublication>(
+                            value.value(),
+                        )
+                    })
                     .transpose()?
             };
             match current {
@@ -3509,7 +3521,7 @@ impl RedbRecoveryStore {
         request_digest: &str,
         publications: &[eliot_store_api::CampaignSourcePublication],
     ) -> Result<(), OrsError> {
-        eliot_store_api::validate_digest(request_digest, "campaign_source.request_digest")
+        eliot_store_api::validate_sha256_hex(request_digest, "campaign_source.request_digest")
             .map_err(|error| OrsError::Contract(error.to_string()))?;
         if publications.is_empty() || publications.len() > 64 {
             return Err(OrsError::InvalidField {
@@ -3531,7 +3543,7 @@ impl RedbRecoveryStore {
         let write = self.database.begin_write().map_err(storage)?;
         let operation_text = operation_id.as_str().to_owned();
         {
-            let mut heads = write.open_table(CAMPAIGN_SOURCE_HEADS).map_err(storage)?;
+            let heads = write.open_table(CAMPAIGN_SOURCE_HEADS).map_err(storage)?;
             let mut pending = write.open_table(CAMPAIGN_SOURCE_PENDING).map_err(storage)?;
             for publication in publications {
                 let key = campaign_source_key(&publication.record)?;
@@ -3550,7 +3562,8 @@ impl RedbRecoveryStore {
                 if current.as_ref() == Some(&publication.next_head()) {
                     // Exact replay after the canonical receipt and source
                     // head were both committed.
-                    let row_key = campaign_source_record_key(&key, &publication.record.content_digest);
+                    let row_key =
+                        campaign_source_record_key(&key, &publication.record.content_digest);
                     let records = write.open_table(CAMPAIGN_SOURCE_RECORDS).map_err(storage)?;
                     let same_record = records
                         .get(row_key.as_str())
@@ -3632,8 +3645,7 @@ impl RedbRecoveryStore {
                 if !seen.insert(key.clone()) {
                     return Err(campaign_source_identity_conflict(&key));
                 }
-                let row_key =
-                    campaign_source_record_key(&key, &publication.record.content_digest);
+                let row_key = campaign_source_record_key(&key, &publication.record.content_digest);
                 let current_head = heads
                     .get(key.as_str())
                     .map_err(storage)?
@@ -3715,13 +3727,12 @@ impl RedbRecoveryStore {
                     .map_err(storage)?
                     .map(|value| decode::<CampaignSourceReservation>(value.value()))
                     .transpose()?;
-                if let Some(existing) = existing {
-                    if existing.operation_id == operation_id.as_str()
-                        && existing.request_digest == request_digest
-                        && existing.publication == *publication
-                    {
-                        pending.remove(key.as_str()).map_err(storage)?;
-                    }
+                if let Some(existing) = existing
+                    && existing.operation_id == operation_id.as_str()
+                    && existing.request_digest == request_digest
+                    && existing.publication == *publication
+                {
+                    pending.remove(key.as_str()).map_err(storage)?;
                 }
             }
         }
@@ -11846,11 +11857,8 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         request_digest: &str,
         publications: &[eliot_store_api::CampaignSourcePublication],
     ) -> Result<(), OrsError> {
-        self.store.reserve_campaign_source_publications(
-            operation_id,
-            request_digest,
-            publications,
-        )
+        self.store
+            .reserve_campaign_source_publications(operation_id, request_digest, publications)
     }
 
     /// Finalizes typed campaign sources from the exact committed owner
@@ -11877,11 +11885,8 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         request_digest: &str,
         publications: &[eliot_store_api::CampaignSourcePublication],
     ) -> Result<(), OrsError> {
-        self.store.abort_campaign_source_publications(
-            operation_id,
-            request_digest,
-            publications,
-        )
+        self.store
+            .abort_campaign_source_publications(operation_id, request_digest, publications)
     }
 
     /// Reads one immutable campaign owner source and its current head at one
@@ -12229,6 +12234,9 @@ fn campaign_view_publication(
     let Some(value) = response.get("campaign_learning_state_view") else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
     let publication: eliot_store_api::CampaignLearningStateViewPublication =
         serde_json::from_value(value.clone()).map_err(|_| OrsError::InvalidField {
             field: "host_request_result.campaign_learning_state_view",
@@ -12247,16 +12255,14 @@ fn campaign_view_identity_conflict(view_id: &str) -> OrsError {
     }
 }
 
-fn campaign_source_key(
-    record: &eliot_store_api::CampaignSourceRecord,
-) -> Result<String, OrsError> {
+fn campaign_source_key(record: &eliot_store_api::CampaignSourceRecord) -> Result<String, OrsError> {
     campaign_source_key_parts(record.role, &record.owner_id, &record.record_id)
 }
 
 fn campaign_source_key_parts(
-    role: eliot_learning_contracts::CampaignSourceRole,
-    owner_id: &eliot_learning_contracts::OwnerId,
-    record_id: &eliot_learning_contracts::CampaignOwnerRecordId,
+    role: eliot_store_api::CampaignSourceRole,
+    owner_id: &eliot_store_api::OwnerId,
+    record_id: &eliot_store_api::CampaignOwnerRecordId,
 ) -> Result<String, OrsError> {
     let key_bytes = eliot_store_api::canonical_json_bytes(&(role, owner_id, record_id))
         .map_err(|error| OrsError::Contract(error.to_string()))?;
