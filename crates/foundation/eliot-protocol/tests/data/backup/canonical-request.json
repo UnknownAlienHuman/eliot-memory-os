@@ -1,0 +1,24 @@
+{
+  "contract": "eliot.foundation.backup",
+  "wire_version": 1,
+  "operation_binding": {
+    "operation_id": "backup-op-001",
+    "request_id": "backup-origin-001",
+    "idempotency_key": "backup-stable-001",
+    "operation_kind": "REQUEST_CAPTURE"
+  },
+  "stable_mutation_bytes": "{\"archive_id\":\"archive-001\",\"class\":\"FULL_RECOVERY\",\"source_installation\":\"src-001\"}",
+  "canonical_request_hash": "9f2c4a8bd0e1f3a5c6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f809",
+  "transport_attempt_a": {
+    "request_id": "backup-transport-a",
+    "idempotency_key": "backup-transport-a",
+    "digest": "9f2c4a8bd0e1f3a5c6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f809"
+  },
+  "transport_attempt_b": {
+    "request_id": "backup-transport-b",
+    "idempotency_key": "backup-transport-b",
+    "digest": "9f2c4a8bd0e1f3a5c6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f809"
+  },
+  "rule": "fresh transport identities share one stable mutation digest; changed mutation bytes yield IDENTITY_CONFLICT",
+  "role": "REQUESTER"
+}

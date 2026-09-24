@@ -1,0 +1,24 @@
+{
+  "contract": "eliot.foundation.backup",
+  "wire_version": 1,
+  "reconcile_query": {
+    "operation": "RECONCILE_RESTORE",
+    "operation_binding": {
+      "operation_id": "backup-op-009",
+      "request_id": "backup-origin-009",
+      "idempotency_key": "backup-stable-009",
+      "operation_kind": "RESTORE_STEP"
+    },
+    "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "retained_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "role": "REQUESTER",
+    "rule": "reconcile reads retained digests only; no recompute"
+  },
+  "acknowledgements": [
+    { "outcome": "DURABLE", "advance": false, "note": "transport ack only" },
+    { "outcome": "RECONCILED", "advance": true, "note": "owner reconcile receipt" },
+    { "outcome": "UNKNOWN", "advance": false, "note": "stays unknown; retry reconcile, never assume success" },
+    { "outcome": "PARTIAL", "advance": false, "note": "partial is not complete-known-zero" }
+  ],
+  "replay_rule": "same identity with changed bytes returns REPLAY_CONFLICT and performs no transition"
+}

@@ -1,0 +1,30 @@
+{
+  "contract": "eliot.foundation.backup",
+  "wire_version": 1,
+  "frame": {
+    "kind": "Request",
+    "request_id": "backup-req-001",
+    "stream_id": "backup-stream-001",
+    "operation": "REQUEST_CAPTURE"
+  },
+  "request_identity": {
+    "request_id": "backup-req-001",
+    "idempotency_key": "backup-transport-001",
+    "principal": "requester-principal",
+    "session_id": "session-001",
+    "role": "REQUESTER"
+  },
+  "event_envelope": {
+    "stream_id": "backup-stream-001",
+    "event_id": "backup-evt-001",
+    "request_id": "backup-req-001",
+    "fence_id": "fence-001",
+    "ack_required": true
+  },
+  "correlation_rule": "frame.request_id equals request_identity.request_id equals envelope.request_id; envelope preserves stream_id, event_id and fence",
+  "negative_example": {
+    "frame_request_id": "backup-req-001",
+    "envelope_request_id": "backup-req-002",
+    "verdict": "reject_before_dispatch"
+  }
+}

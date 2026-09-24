@@ -1,0 +1,20 @@
+{
+  "contract": "eliot.foundation.backup",
+  "wire_version": 1,
+  "phases": ["CAPTURE", "STORE", "ORS", "SPOOL", "VERIFY", "REHEARSE", "CUTOVER"],
+  "grid": {
+    "REQUESTER": { "CAPTURE": "deny", "STORE": "deny", "ORS": "deny", "SPOOL": "deny", "VERIFY": "deny", "REHEARSE": "deny", "CUTOVER": "deny" },
+    "CAPTURE_OWNER": { "CAPTURE": "allow", "STORE": "deny", "ORS": "deny", "SPOOL": "deny", "VERIFY": "deny", "REHEARSE": "deny", "CUTOVER": "deny" },
+    "STORE_OWNER": { "CAPTURE": "deny", "STORE": "allow", "ORS": "deny", "SPOOL": "deny", "VERIFY": "deny", "REHEARSE": "deny", "CUTOVER": "deny" },
+    "ORS_OWNER": { "CAPTURE": "deny", "STORE": "deny", "ORS": "allow", "SPOOL": "deny", "VERIFY": "deny", "REHEARSE": "deny", "CUTOVER": "deny" },
+    "SPOOL_OWNER": { "CAPTURE": "deny", "STORE": "deny", "ORS": "deny", "SPOOL": "allow", "VERIFY": "deny", "REHEARSE": "deny", "CUTOVER": "deny" },
+    "VERIFIER": { "CAPTURE": "deny", "STORE": "deny", "ORS": "deny", "SPOOL": "deny", "VERIFY": "allow", "REHEARSE": "allow", "CUTOVER": "deny" },
+    "INSTALLATION_AUTHORITY": { "CAPTURE": "deny", "STORE": "deny", "ORS": "deny", "SPOOL": "deny", "VERIFY": "deny", "REHEARSE": "deny", "CUTOVER": "allow" },
+    "HOST_FORENSIC": { "CAPTURE": "deny", "STORE": "deny", "ORS": "deny", "SPOOL": "deny", "VERIFY": "deny", "REHEARSE": "deny", "CUTOVER": "deny" }
+  },
+  "redaction_boundary_vectors": [
+    { "input": "oversize_page_body", "verdict": "reject", "exposes": "receipt_digest_only" },
+    { "input": "oversize_diagnostic_text", "verdict": "reject", "exposes": "receipt_digest_only" },
+    { "input": "redacted_source_content", "verdict": "accept_redacted", "exposes": "receipt_digest_only" }
+  ]
+}
