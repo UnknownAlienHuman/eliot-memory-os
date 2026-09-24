@@ -2,18 +2,31 @@ use std::collections::BTreeMap;
 
 use eliot_learning_contracts::CampaignHarnessOverlayCandidate;
 
-use crate::{AdmittedDeltaPair, OverlayComposeInput, OverlayError, base, bounds, changes};
+use crate::{
+    AdmittedDeltaPair, OverlayComposeInput, OverlayError, base, bounds, changes, lifecycle,
+};
 
 /// Compose one deterministic, candidate-only task-local overlay.
+///
+/// Freezes the caller-supplied pre-evaluation fields onto the candidate
+/// before sealing, and advances the overlay lifecycle from `Proposed` to
+/// `ShapeValidated`. Local admission (`ShapeValidated` to `LocalAdmitted`)
+/// is enforced separately by [`crate::admit_local_with_refs`].
 pub fn compose_campaign_harness_overlay(
     input: &OverlayComposeInput<'_>,
 ) -> Result<CampaignHarnessOverlayCandidate, OverlayError> {
     bounds::preflight(input)?;
     base::validate_base(input)?;
     validate_admission_pairs(input)?;
-    let mut candidate = assemble_candidate(input, changes::collect_changes(input)?)?;
+    let changes = changes::collect_changes(input)?;
+    input.frozen.validate_nontrivial(changes.len())?;
+    let mut candidate = assemble_candidate(input, changes)?;
     candidate.seal()?;
     candidate.validate_against_view_and_deltas(input.view, input.deltas)?;
+    lifecycle::transition(
+        lifecycle::OverlayLifecycle::Proposed,
+        lifecycle::LifecycleEvent::ValidateShape,
+    )?;
     Ok(candidate)
 }
 
@@ -65,6 +78,10 @@ fn assemble_candidate(
     let candidate = CampaignHarnessOverlayCandidate {
         binding: input.view.binding.clone(),
         overlay_id: input.overlay_id.clone(),
+        campaign_id: input.view.campaign_id.clone(),
+        admission_receipt: None,
+        revision: 1,
+        supersedes: None,
         base_view_digest: input.view.canonical_digest.clone(),
         parent_revision: input.parent_revision,
         admitted_delta_ids: ids,
@@ -77,6 +94,14 @@ fn assemble_candidate(
         fixed_before_observation_discriminator: input
             .fixed_before_observation_discriminator
             .clone(),
+        intended_mechanism: input.frozen.intended_mechanism.clone(),
+        prediction: input.frozen.prediction.clone(),
+        expected_observable: input.frozen.expected_observable.clone(),
+        possible_regressions: input.frozen.possible_regressions.clone(),
+        confounders: input.frozen.confounders.clone(),
+        preserved_success_constraint: input.frozen.preserved_success_constraint.clone(),
+        next_discriminator_text: input.frozen.next_discriminator_text.clone(),
+        rollback_condition: input.frozen.rollback_condition.clone(),
         expires_at_ms: input.expires_at_ms,
         invalidated: false,
         canonical_digest: String::new(),

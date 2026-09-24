@@ -1,7 +1,9 @@
-//! Pure composition of a bounded, task-local learning overlay candidate.
+//! Pure composition of a bounded, task-local learning overlay candidate plus
+//! governed local admission, lifecycle, pre-evaluation freeze, and expiry
+//! enforcement for that candidate.
 //!
-//! This crate consumes an immutable A-32 state view and an exact set of
-//! externally admitted-for-evaluation A-32 delta candidates. It never admits,
+//! The composer consumes an immutable A-32 state view and an exact set of
+//! externally admitted-for-evaluation A-32 delta candidates. It never
 //! activates, delivers, evaluates, persists, or promotes an overlay. The
 //! supported composer only changes deterministic verification ordering and
 //! search/probe stopping surfaces; broader protected-owner evidence remains an
@@ -18,10 +20,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admission;
 mod base;
 mod bounds;
 mod changes;
 mod compose;
+pub mod expiry;
+pub mod freeze;
+pub mod lifecycle;
 mod remove;
 
 use eliot_contracts::{ArtifactId, TaskRevision};
@@ -31,7 +37,14 @@ use eliot_learning_contracts::{
 };
 use thiserror::Error;
 
+pub use admission::{
+    AdmissionReceipt, AuthoritativeRefs, RevalidationRequest, admit_local, admit_local_with_refs,
+    revalidate_for_campaign,
+};
 pub use compose::compose_campaign_harness_overlay;
+pub use expiry::{check_candidate_retrievable, check_retrievable};
+pub use freeze::{FrozenPreEvaluation, freeze_before_evaluation_text, frozen_digest};
+pub use lifecycle::{LifecycleEvent, OverlayLifecycle, transition};
 pub use remove::{
     overlay_base_states, overlay_inverse_operations, overlay_proposed_states, remove_overlay,
 };
@@ -81,6 +94,8 @@ pub struct OverlayComposeInput<'a> {
     pub protected_surface_proposed_digest: &'a str,
     /// Discriminator fixed before any observation.
     pub fixed_before_observation_discriminator: &'a ArtifactId,
+    /// Manifest-equivalent fields frozen before any evaluation (S209).
+    pub frozen: &'a FrozenPreEvaluation,
     /// Candidate expiry in Unix milliseconds.
     pub expires_at_ms: u64,
     /// Explicit caller observation time used only for expiry comparison.

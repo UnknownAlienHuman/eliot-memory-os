@@ -14,13 +14,17 @@ use uuid::Uuid;
 pub mod candidate_bounds;
 pub mod governed_screen;
 pub mod learning_closure;
+pub mod overlay_policy_routing;
 pub mod producer;
 
 pub use governed_screen::{
     CarriageMark, PresentedLearning, bounds_to_context_error, check_governed_carriage,
     datetime_from_unix,
 };
-pub use producer::{LearningProduction, produce_learning_candidate};
+pub use overlay_policy_routing::{ImprovementCandidateDraft, route_rejected_surface};
+pub use producer::{
+    LearningProduction, produce_learning_candidate, route_overlay_task_policy_change,
+};
 
 pub mod promotion_input;
 
