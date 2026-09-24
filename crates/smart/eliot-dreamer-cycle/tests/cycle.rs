@@ -2108,18 +2108,132 @@ fn no_progress_streak_exhaustion_with_in_flight_operation_emits_reconciliation()
     busy_max_streak.no_progress_streak = eliot_dreamer_cycle::MAX_NO_PROGRESS;
     busy_max_streak.seal().unwrap();
 
-    let event = eliot_dreamer_cycle::DurableEvent::RestartObserved(eliot_dreamer_cycle::RestartEvidence {
-        fence: busy_max_streak.fence.clone(),
-        revision: busy_max_streak.revision,
-    });
+    let event =
+        eliot_dreamer_cycle::DurableEvent::RestartObserved(eliot_dreamer_cycle::RestartEvidence {
+            fence: busy_max_streak.fence.clone(),
+            revision: busy_max_streak.revision,
+        });
     let result = step_durable_job(&busy_max_streak, &event).unwrap();
-    assert_eq!(result.next_state.phase, eliot_dreamer_cycle::DurablePhase::Reconciling);
-    assert_eq!(result.disposition, eliot_dreamer_cycle::DurableDisposition::ReconciliationRequired);
     assert_eq!(
-        result.next_state.current_operation.as_ref().map(|o| &o.operation_id),
-        busy_max_streak.current_operation.as_ref().map(|o| &o.operation_id)
+        result.next_state.phase,
+        eliot_dreamer_cycle::DurablePhase::Reconciling
+    );
+    assert_eq!(
+        result.disposition,
+        eliot_dreamer_cycle::DurableDisposition::ReconciliationRequired
+    );
+    assert_eq!(
+        result
+            .next_state
+            .current_operation
+            .as_ref()
+            .map(|o| &o.operation_id),
+        busy_max_streak
+            .current_operation
+            .as_ref()
+            .map(|o| &o.operation_id)
     );
     assert_eq!(result.commands.len(), 1);
-    assert!(matches!(result.commands[0], eliot_dreamer_cycle::DurableCommand::ReconcileOperation(_)));
-    assert!(!result.commands.iter().any(|c| matches!(c, eliot_dreamer_cycle::DurableCommand::EscalateBlocked(_))));
+    assert!(matches!(
+        result.commands[0],
+        eliot_dreamer_cycle::DurableCommand::ReconcileOperation(_)
+    ));
+    assert!(
+        !result
+            .commands
+            .iter()
+            .any(|c| matches!(c, eliot_dreamer_cycle::DurableCommand::EscalateBlocked(_)))
+    );
+}
+
+#[test]
+fn cycle_plan_rejects_rehashed_request_field_substitutions_and_duplicates() {
+    let test_fence = fence();
+    let policy = policy(&test_fence, "bundle_validation");
+    let request = pending(&policy);
+    let current = state(&policy, request);
+    let sample = sample_cycle(&current, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    let plan = plan_cycle(&sample, &current, &policy, None).unwrap();
+
+    macro_rules! reject_rehashed {
+        ($field:ident, $value:expr) => {{
+            let mut candidate = plan.clone();
+            candidate.requests[0].$field = $value;
+            candidate.plan_digest = candidate.computed_digest().unwrap();
+            assert!(
+                candidate.validate(&sample, &current, &policy).is_err(),
+                "rehashed {} substitution was accepted",
+                stringify!($field)
+            );
+        }};
+    }
+
+    reject_rehashed!(request_id, RequestId::new("request-foreign").unwrap());
+    reject_rehashed!(operation_id, OperationId::new("operation-foreign").unwrap());
+    reject_rehashed!(attempt_id, AgentAttemptId::new("attempt-foreign").unwrap());
+    reject_rehashed!(owner, "foreign-owner".to_owned());
+    reject_rehashed!(kind, RequestKind::CurationScreen);
+    reject_rehashed!(phase, CyclePhase::Screened);
+    reject_rehashed!(payload_digest, DIGEST_B.to_owned());
+    reject_rehashed!(task_id, "foreign-task".to_owned());
+    reject_rehashed!(scope_id, "foreign-scope".to_owned());
+    let mut foreign_fence = fence();
+    foreign_fence.resource_generation = ResourceGeneration::new(99).unwrap();
+    reject_rehashed!(state_fence, foreign_fence);
+    reject_rehashed!(
+        predecessor_receipt_id,
+        Some(eliot_contracts::ReceiptId::new("foreign-receipt").unwrap())
+    );
+    reject_rehashed!(reason, "foreign reason".to_owned());
+
+    let mut duplicate = plan.clone();
+    duplicate.requests.push(duplicate.requests[0].clone());
+    duplicate.plan_digest = duplicate.computed_digest().unwrap();
+    assert!(matches!(
+        duplicate.validate(&sample, &current, &policy),
+        Err(CycleError::IdentityConflict { .. })
+    ));
+}
+
+#[test]
+fn cycle_plan_rechecks_blocked_outcome_and_experiment_kind() {
+    let fence = fence();
+    let policy = policy(&fence, "bundle_validation");
+    let request = pending(&policy);
+    let current = state(&policy, request.clone());
+    let sample = sample_cycle(&current, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    let plan = plan_cycle(&sample, &current, &policy, None).unwrap();
+
+    let mut wrong_kind = plan.clone();
+    wrong_kind.experiments[0].kind = ExperimentKind::ReconciliationProbe;
+    wrong_kind.plan_digest = wrong_kind.computed_digest().unwrap();
+    assert!(wrong_kind.validate(&sample, &current, &policy).is_err());
+
+    let blocked_outcome = outcome(
+        &request,
+        receipt(
+            &request,
+            generic_for(&request, OutcomeDisposition::Rejected),
+            None,
+        ),
+        OutcomeDisposition::Rejected,
+        false,
+    );
+    let blocked_state = step_dreamer_cycle(&current, &[blocked_outcome], &policy)
+        .unwrap()
+        .next_state;
+    let blocked_sample =
+        sample_cycle(&blocked_state, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    let blocked_plan = plan_cycle(&blocked_sample, &blocked_state, &policy, None).unwrap();
+    assert!(blocked_plan.requests.is_empty());
+    assert!(blocked_plan.experiments.is_empty());
+
+    let mut injected = blocked_plan;
+    injected.requests.push(plan.requests[0].clone());
+    injected.plan_digest = injected.computed_digest().unwrap();
+    assert!(
+        injected
+            .validate(&blocked_sample, &blocked_state, &policy)
+            .is_err()
+    );
 }
