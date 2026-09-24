@@ -14,6 +14,7 @@ mod assessment;
 mod bounds;
 mod contracts;
 mod error;
+pub mod overlay_display_1864;
 
 pub use assessment::{AssessmentInput, AssessmentResultOrIncomplete, assess_learning_activation};
 pub use contracts::{
@@ -21,6 +22,7 @@ pub use contracts::{
     MAX_METRICS, MAX_OUTPUT_BYTES, MAX_REFERENCES, MAX_STAGES, MissingAssessmentField,
 };
 pub use error::ActivationAssessmentError;
+pub use overlay_display_1864::{OverlayDisplay, OverlayDisplayInput, display_admitted_overlay};
 
 pub use eliot_learning_contracts::{
     ActivationSection, ActivationStatus, AdherenceSection, AdherenceStatus, AssessmentDimension,

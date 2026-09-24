@@ -62,6 +62,41 @@ pub struct LearningProduction<'a> {
     pub verified: &'a VerifiedLearningAdmission<'a>,
 }
 
+/// Route an overlay-rejected task-level policy change into an Improvement
+/// draft (S220b).
+///
+/// The overlay composer admits only bounded search/probe stopping and
+/// verification ordering; it never applies task-level policy itself.
+/// When a change rejected from that local path names
+/// a task-level surface, the Context Compiler must not apply it alone: this
+/// bridge files it as an [`ImprovementCandidateDraft`] carrying the
+/// permit-bound overlay and task lineage, for promotion as an Improvement or
+/// plan candidate through a Task Controller plan revision plus Governor
+/// admission.
+///
+/// # Errors
+///
+/// Returns the [`route_rejected_surface`] error when `surface` names a local
+/// overlay surface (`"local_surface"`), when any input is blank
+/// (`"empty_field"`), or when the production request carries no overlay
+/// lineage (`"missing_overlay"`).
+pub fn route_overlay_task_policy_change(
+    surface: &str,
+    target: &str,
+    source_delta_id: &str,
+    request: &LearningProduction<'_>,
+) -> Result<crate::overlay_policy_routing::ImprovementCandidateDraft, &'static str> {
+    use crate::overlay_policy_routing::route_rejected_surface;
+    let overlay_id = request.overlay_id.ok_or("missing_overlay")?;
+    route_rejected_surface(
+        surface,
+        target,
+        overlay_id,
+        source_delta_id,
+        request.binding.task_id.as_str(),
+    )
+}
+
 /// Produce one learning-marked candidate bound to an owner-verified permit.
 ///
 /// Refuses archived/unknown backlog entries, permit-subject mismatches,

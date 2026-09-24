@@ -125,6 +125,7 @@ pub fn assess_learning_activation(
     }
     validate_owner_lineage(input)?;
     validate_activation_sections(input)?;
+    prove_overlay_displayable(input)?;
     let input_snapshot = snapshot(input)?;
     let stages = expected_stages(input.stages, input.policy)?;
     let dimensions = expected_dimensions(input.dimensions, input.policy)?;
@@ -243,6 +244,47 @@ pub enum AssessmentResultOrIncomplete {
     Candidate(Box<AssessmentResult>),
     /// Mandatory evidence was absent; no identity was fabricated.
     Incomplete(Box<IncompleteAssessment>),
+}
+
+/// Prove the admitted nontrivial overlay is displayable from sealed sources.
+///
+/// An attempt with an admitted overlay must be able to display the immutable
+/// revision, parent, source delta, pre-evaluation prediction, expected
+/// observable, regressions/confounders, preserved-success constraint, next
+/// discriminator, and rollback condition (acceptance A1). Assessment refuses
+/// to certify an activation whose overlay cannot render that bundle: every
+/// text comes from the sealed [`CampaignHarnessOverlayCandidate`] carried in
+/// the input, which [`validate`] already proved digest-covered.
+///
+/// [`validate`]: eliot_learning_contracts::CampaignHarnessOverlayCandidate::validate
+fn prove_overlay_displayable(input: &AssessmentInput<'_>) -> Result<(), ActivationAssessmentError> {
+    use crate::overlay_display_1864::{OverlayDisplayInput, display_admitted_overlay};
+    let overlay = input.overlay;
+    let admitted_ids: Vec<String> = overlay
+        .admitted_delta_ids
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    let parent = format!("task-revision:{}", overlay.parent_revision.value());
+    let display_input = OverlayDisplayInput {
+        overlay_id: overlay.overlay_id.as_str(),
+        revision: overlay.revision,
+        parent_revision: &parent,
+        admitted_delta_ids: &admitted_ids,
+        prediction: &overlay.prediction,
+        expected_observable: &overlay.expected_observable,
+        regressions: &overlay.possible_regressions,
+        confounders: &overlay.confounders,
+        preserved_success: &overlay.preserved_success_constraint,
+        next_discriminator: &overlay.next_discriminator_text,
+        rollback_condition: &overlay.rollback_condition,
+    };
+    display_admitted_overlay(&display_input).map_err(|_| {
+        ActivationAssessmentError::LineageMismatch {
+            field: "overlay.display",
+        }
+    })?;
+    Ok(())
 }
 
 fn validate_identity(input: &AssessmentInput<'_>) -> Result<(), ActivationAssessmentError> {

@@ -13,7 +13,8 @@ use eliot_learning_contracts::{
     SlotProjection, SlotRequirement, SlotSpec, SourceDenominator, ValueState,
 };
 use eliot_learning_overlay::{
-    AdmittedDeltaPair, OverlayComposeInput, OverlayError, compose_campaign_harness_overlay,
+    AdmittedDeltaPair, FrozenPreEvaluation, OverlayComposeInput, OverlayError,
+    compose_campaign_harness_overlay,
 };
 use std::collections::BTreeMap;
 
@@ -61,6 +62,20 @@ struct Fixture {
     view: CampaignLearningStateView,
     targets: [TargetId; 3],
     discriminator: ArtifactId,
+    frozen: FrozenPreEvaluation,
+}
+
+fn frozen() -> FrozenPreEvaluation {
+    FrozenPreEvaluation {
+        intended_mechanism: "overlay-fixture-mechanism".to_owned(),
+        prediction: "overlay-fixture-prediction".to_owned(),
+        expected_observable: "overlay-fixture-observable".to_owned(),
+        possible_regressions: "overlay-fixture-regressions".to_owned(),
+        confounders: "overlay-fixture-confounders".to_owned(),
+        preserved_success_constraint: "overlay-fixture-preserved".to_owned(),
+        next_discriminator_text: "overlay-fixture-next".to_owned(),
+        rollback_condition: "overlay-fixture-rollback".to_owned(),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -173,6 +188,7 @@ fn fixture() -> Fixture {
         view,
         targets,
         discriminator: aid("next-discriminator"),
+        frozen: frozen(),
     }
 }
 
@@ -295,6 +311,7 @@ fn input<'a>(
         protected_surface_base_digest: "0000000000000000000000000000000000000000000000000000000000000000",
         protected_surface_proposed_digest: "0000000000000000000000000000000000000000000000000000000000000000",
         fixed_before_observation_discriminator: &fixture.discriminator,
+        frozen: &fixture.frozen,
         expires_at_ms: 2_000,
         observed_at_ms: 1_000,
     }
@@ -855,6 +872,7 @@ fn case_04_task_target_scope_fence_base_parent_mismatch() {
                 view: stale_view,
                 targets: fixture.targets.clone(),
                 discriminator: fixture.discriminator.clone(),
+                frozen: fixture.frozen.clone(),
             },
             &[stale_delta],
             &pairs,
@@ -878,6 +896,7 @@ fn case_04_task_target_scope_fence_base_parent_mismatch() {
         view: fenced,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&fenced_fixture, &[fenced_delta], &pairs,)),
@@ -921,6 +940,7 @@ fn case_05_missing_stale_wrong_parent_revision() {
         view: parentless,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&parentless_fixture, &[parentless_delta], &pairs,)),
@@ -942,6 +962,7 @@ fn case_05_missing_stale_wrong_parent_revision() {
         view: resealed,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     let stale_result =
         compose_campaign_harness_overlay(&input(&stale_fixture, &[stale_delta], &pairs));
@@ -986,6 +1007,7 @@ fn case_06_same_base_id_with_changed_digest() {
         view: evolved.clone(),
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&evolved_fixture, &[pinned_old], &pairs)),
@@ -1535,6 +1557,7 @@ fn case_18_authority_privacy_secret_widening_rejected() {
         view,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&exposed, &[private], &pairs)),
@@ -1726,6 +1749,7 @@ fn case_22_missing_wrong_revision_cycle_partial_dependency_closure() {
         view: partial,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&partial_fixture, &[partial_delta], &pairs)),
@@ -1956,6 +1980,7 @@ fn case_29_mandatory_task_local_scope_expiry_and_cancellation() {
         view: cancelled,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     let cancelled_result =
         compose_campaign_harness_overlay(&input(&cancelled_fixture, &[cancelled_delta], &pairs));
@@ -2138,6 +2163,7 @@ fn case_34_complete_and_partial_delta_surface_dependency_denominators() {
         view: partial,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&partial_fixture, &[partial_delta], &pairs)),
@@ -2156,6 +2182,7 @@ fn case_34_complete_and_partial_delta_surface_dependency_denominators() {
         view: miscounted,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&miscounted_fixture, &[miscounted_delta], &pairs,)),
@@ -2174,6 +2201,7 @@ fn case_34_complete_and_partial_delta_surface_dependency_denominators() {
         view: omitted,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&omitted_fixture, &[omitted_delta], &pairs)),
@@ -2183,32 +2211,7 @@ fn case_34_complete_and_partial_delta_surface_dependency_denominators() {
     ));
 }
 
-// WORK_UNIT_CASE: 618/35
-#[test]
-fn case_35_every_independent_item_output_work_bound_and_frontier() {
-    let fixture = fixture();
-    let empty: Vec<AttemptLearningDeltaCandidate> = vec![];
-    let pairs = admitted(&empty);
-    assert!(matches!(
-        compose_campaign_harness_overlay(&input(&fixture, &empty, &pairs)),
-        Err(OverlayError::Bound { field: "deltas" })
-    ));
-    let mut crowded = Vec::new();
-    for index in 0..129 {
-        let (operation, inverse) = operation_add(&fixture.targets[0], "crowded");
-        crowded.push(delta(
-            &fixture.view,
-            &format!("many-{index}"),
-            operation,
-            inverse,
-        ));
-    }
-    let pairs = admitted(&crowded);
-    assert!(matches!(
-        compose_campaign_harness_overlay(&input(&fixture, &crowded, &pairs)),
-        Err(OverlayError::Bound { field: "deltas" })
-    ));
-    let (operation, _) = operation_add(&fixture.targets[0], "oversized");
+fn oversized_delta(fixture: &Fixture, operation: ChangeOperation) -> AttemptLearningDeltaCandidate {
     let mut oversized = AttemptLearningDeltaCandidate {
         binding: fixture.view.binding.clone(),
         attempt_id: eliot_learning_contracts::AgentAttemptId::new("attempt-oversized")
@@ -2241,6 +2244,36 @@ fn case_35_every_independent_item_output_work_bound_and_frontier() {
         })
         .collect();
     oversized.seal().expect("delta seal");
+    oversized
+}
+
+// WORK_UNIT_CASE: 618/35
+#[test]
+fn case_35_every_independent_item_output_work_bound_and_frontier() {
+    let fixture = fixture();
+    let empty: Vec<AttemptLearningDeltaCandidate> = vec![];
+    let pairs = admitted(&empty);
+    assert!(matches!(
+        compose_campaign_harness_overlay(&input(&fixture, &empty, &pairs)),
+        Err(OverlayError::Bound { field: "deltas" })
+    ));
+    let mut crowded = Vec::new();
+    for index in 0..129 {
+        let (operation, inverse) = operation_add(&fixture.targets[0], "crowded");
+        crowded.push(delta(
+            &fixture.view,
+            &format!("many-{index}"),
+            operation,
+            inverse,
+        ));
+    }
+    let pairs = admitted(&crowded);
+    assert!(matches!(
+        compose_campaign_harness_overlay(&input(&fixture, &crowded, &pairs)),
+        Err(OverlayError::Bound { field: "deltas" })
+    ));
+    let (operation, _) = operation_add(&fixture.targets[0], "oversized");
+    let oversized = oversized_delta(&fixture, operation);
     let pairs = admitted(std::slice::from_ref(&oversized));
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&fixture, &[oversized], &pairs)),
@@ -2259,6 +2292,7 @@ fn case_35_every_independent_item_output_work_bound_and_frontier() {
         view: verbose,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&verbose_fixture, &[verbose_delta], &pairs)),
@@ -2279,6 +2313,7 @@ fn case_35_every_independent_item_output_work_bound_and_frontier() {
         view: unexplored,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&unexplored_fixture, &[unexplored_delta], &pairs,)),
@@ -2625,6 +2660,7 @@ fn case_43_changed_base_fence_admission_discriminator_invalidates_digest() {
         view: evolved,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     let evolved_candidate =
         compose_campaign_harness_overlay(&input(&evolved_fixture, &[evolved_delta], &pairs))
@@ -2650,6 +2686,7 @@ fn case_43_changed_base_fence_admission_discriminator_invalidates_digest() {
         view,
         targets: fixture.targets.clone(),
         discriminator: fixture.discriminator.clone(),
+        frozen: fixture.frozen.clone(),
     };
     let rotated_candidate =
         compose_campaign_harness_overlay(&input(&rotated, &[rotated_delta], &pairs))

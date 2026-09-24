@@ -734,3 +734,146 @@ where
     }
     Ok(())
 }
+
+/// Maximum governed reference length in bytes for one cross-task admission field.
+pub const CROSS_TASK_ADMISSION_REF_MAX_LEN: usize = 8192;
+
+/// Governed cross-task admission revalidating overlay scope for another campaign.
+///
+/// A `LOCAL_ADMITTED` overlay is ineligible outside its active campaign unless a
+/// new governed admission revalidates scope, authority, retention, evaluator,
+/// and rollback. Each reference is an owner-issued handle; this predicate only
+/// checks presence and bounds, never the referenced content.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CrossTaskAdmission {
+    /// Revalidated scope handle for the requesting campaign.
+    pub scope_ref: String,
+    /// Revalidated authority handle for the requesting campaign.
+    pub authority_ref: String,
+    /// Revalidated retention handle for the requesting campaign.
+    pub retention_ref: String,
+    /// Revalidated evaluator handle for the requesting campaign.
+    pub evaluator_ref: String,
+    /// Revalidated rollback handle for the requesting campaign.
+    pub rollback_ref: String,
+}
+
+impl CrossTaskAdmission {
+    /// Validate that every revalidated reference is present and bounded.
+    pub fn validate(&self) -> Result<(), LearningContractError> {
+        for (value, field) in [
+            (self.scope_ref.as_str(), "cross_task_admission.scope_ref"),
+            (
+                self.authority_ref.as_str(),
+                "cross_task_admission.authority_ref",
+            ),
+            (
+                self.retention_ref.as_str(),
+                "cross_task_admission.retention_ref",
+            ),
+            (
+                self.evaluator_ref.as_str(),
+                "cross_task_admission.evaluator_ref",
+            ),
+            (
+                self.rollback_ref.as_str(),
+                "cross_task_admission.rollback_ref",
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(LearningContractError::Missing { field });
+            }
+            if value.len() > CROSS_TASK_ADMISSION_REF_MAX_LEN {
+                return Err(LearningContractError::Bound { field });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Eligibility of an overlay to influence a compatible attempt.
+///
+/// This is a pure predicate over already-observed flags: it never admits,
+/// activates, or carries over an overlay by itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayEligibility {
+    /// The overlay may influence the requesting attempt.
+    Eligible,
+    /// The overlay must not influence the requesting attempt.
+    NotEligible {
+        /// Machine-stable reason for the denial.
+        reason: &'static str,
+    },
+}
+
+/// Decide whether an overlay may influence a compatible attempt before closure.
+///
+/// Before closure, only the exact non-expired `LOCAL_ADMITTED` overlay of the
+/// active campaign may influence a compatible attempt. Cross-task carryover
+/// requires a new governed admission that revalidates scope, authority,
+/// retention, evaluator, and rollback. Expiry invalidates influence; it does
+/// not silently retain the last behavior.
+///
+/// The checks run in order: invalidation, expiry, binding compatibility, then
+/// campaign scope. A same-campaign request accepts `None` or a valid
+/// admission; a cross-campaign request requires `Some` valid admission.
+pub fn overlay_eligibility(
+    overlay_campaign: &str,
+    requesting_campaign: &str,
+    invalidated: bool,
+    expires_at_ms: u64,
+    now_ms: u64,
+    binding_compatible: bool,
+    cross_task: Option<&CrossTaskAdmission>,
+) -> OverlayEligibility {
+    if invalidated {
+        return OverlayEligibility::NotEligible {
+            reason: "overlay_invalidated",
+        };
+    }
+    if expires_at_ms == 0 || now_ms >= expires_at_ms {
+        return OverlayEligibility::NotEligible {
+            reason: "overlay_expired",
+        };
+    }
+    if !binding_compatible {
+        return OverlayEligibility::NotEligible {
+            reason: "binding_incompatible",
+        };
+    }
+    if overlay_campaign.trim().is_empty() || requesting_campaign.trim().is_empty() {
+        return OverlayEligibility::NotEligible {
+            reason: "campaign_scope_missing",
+        };
+    }
+    if overlay_campaign == requesting_campaign {
+        match cross_task {
+            None => OverlayEligibility::Eligible,
+            Some(admission) => {
+                if admission.validate().is_ok() {
+                    OverlayEligibility::Eligible
+                } else {
+                    OverlayEligibility::NotEligible {
+                        reason: "cross_task_admission_invalid",
+                    }
+                }
+            }
+        }
+    } else {
+        match cross_task {
+            Some(admission) => {
+                if admission.validate().is_ok() {
+                    OverlayEligibility::Eligible
+                } else {
+                    OverlayEligibility::NotEligible {
+                        reason: "cross_task_admission_invalid",
+                    }
+                }
+            }
+            None => OverlayEligibility::NotEligible {
+                reason: "cross_task_admission_required",
+            },
+        }
+    }
+}

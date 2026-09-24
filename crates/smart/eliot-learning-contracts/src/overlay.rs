@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     delta::{ChangeOperation, ChangeSurface, InverseChange, ValueState},
     error::LearningContractError,
-    identity::{ContractBinding, OverlayId, TargetId, digest_without_field, validate_digest},
+    identity::{
+        CampaignId, ContractBinding, OverlayId, TargetId, digest_without_field, validate_digest,
+    },
 };
 
 /// Whether a value came from the immutable base or the proposed overlay.
@@ -120,6 +122,17 @@ pub struct CampaignHarnessOverlayCandidate {
     pub binding: ContractBinding,
     /// Overlay candidate identity.
     pub overlay_id: OverlayId,
+    /// Campaign this overlay is admitted for; cross-campaign reuse is rejected.
+    pub campaign_id: CampaignId,
+    /// Governor receipt admitting the local overlay effect (`LOCAL_ADMITTED`).
+    #[serde(default)]
+    pub admission_receipt: Option<ArtifactId>,
+    /// Monotonic overlay revision within the campaign, starting at 1.
+    #[serde(default = "default_overlay_revision")]
+    pub revision: u32,
+    /// Previous overlay revision superseded by this candidate, if any.
+    #[serde(default)]
+    pub supersedes: Option<OverlayId>,
     /// Exact view/base revision being overlaid.
     pub base_view_digest: String,
     /// Parent task revision used for compatibility.
@@ -140,6 +153,30 @@ pub struct CampaignHarnessOverlayCandidate {
     pub protected_surface_proposed_digest: String,
     /// Discriminator fixed before observing the overlay.
     pub fixed_before_observation_discriminator: ArtifactId,
+    /// Intended causal mechanism, frozen before any evaluation (S209).
+    #[serde(default)]
+    pub intended_mechanism: String,
+    /// Outcome predicted when the mechanism holds, frozen pre-evaluation.
+    #[serde(default)]
+    pub prediction: String,
+    /// Observable confirming the prediction, frozen pre-evaluation.
+    #[serde(default)]
+    pub expected_observable: String,
+    /// Plausible regressions, frozen pre-evaluation.
+    #[serde(default)]
+    pub possible_regressions: String,
+    /// Known confounders, frozen pre-evaluation.
+    #[serde(default)]
+    pub confounders: String,
+    /// Success that must be preserved, frozen pre-evaluation.
+    #[serde(default)]
+    pub preserved_success_constraint: String,
+    /// Next-discriminator text, frozen pre-evaluation.
+    #[serde(default)]
+    pub next_discriminator_text: String,
+    /// Rollback condition, frozen pre-evaluation.
+    #[serde(default)]
+    pub rollback_condition: String,
     /// Expiry deadline in Unix milliseconds.
     pub expires_at_ms: u64,
     /// Explicit cancellation/invalidation marker.
@@ -153,6 +190,7 @@ impl CampaignHarnessOverlayCandidate {
     pub fn validate(&self) -> Result<(), LearningContractError> {
         self.binding.validate()?;
         self.overlay_id.validate()?;
+        self.validate_governed_admission()?;
         validate_digest(&self.base_view_digest, "overlay.base_view_digest")?;
         validate_digest(
             &self.protected_surface_base_digest,
@@ -194,6 +232,7 @@ impl CampaignHarnessOverlayCandidate {
                 });
             }
         }
+        self.validate_frozen_pre_evaluation()?;
         for change in &self.changes {
             change.validate()?;
         }
@@ -249,7 +288,71 @@ impl CampaignHarnessOverlayCandidate {
         Ok(())
     }
 
+    /// Validate campaign-local governed admission: campaign identity, revision
+    /// clock, receipt handle and supersedes chain head.
+    fn validate_governed_admission(&self) -> Result<(), LearningContractError> {
+        self.campaign_id.validate()?;
+        if self.revision == 0 {
+            return Err(LearningContractError::Missing {
+                field: "overlay.revision",
+            });
+        }
+        if let Some(receipt) = &self.admission_receipt
+            && receipt.as_str().trim().is_empty()
+        {
+            return Err(LearningContractError::Missing {
+                field: "overlay.admission_receipt",
+            });
+        }
+        if let Some(previous) = &self.supersedes {
+            previous.validate()?;
+            if *previous == self.overlay_id {
+                return Err(LearningContractError::ScopeMismatch {
+                    field: "overlay.supersedes",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the pre-evaluation frozen manifest-equivalent fields (S209).
+    ///
+    /// Every nontrivial revision carries at least one change (enforced above),
+    /// so all eight frozen texts must be present and bounded. There is no
+    /// trivial revision that may skip the freeze.
+    fn validate_frozen_pre_evaluation(&self) -> Result<(), LearningContractError> {
+        for (value, field) in [
+            (&self.intended_mechanism, "overlay.intended_mechanism"),
+            (&self.prediction, "overlay.prediction"),
+            (&self.expected_observable, "overlay.expected_observable"),
+            (&self.possible_regressions, "overlay.possible_regressions"),
+            (&self.confounders, "overlay.confounders"),
+            (
+                &self.preserved_success_constraint,
+                "overlay.preserved_success_constraint",
+            ),
+            (
+                &self.next_discriminator_text,
+                "overlay.next_discriminator_text",
+            ),
+            (&self.rollback_condition, "overlay.rollback_condition"),
+        ] {
+            if value.trim().is_empty() {
+                return Err(LearningContractError::Missing { field });
+            }
+            if value.chars().count() > 8192 {
+                return Err(LearningContractError::Bound { field });
+            }
+        }
+        Ok(())
+    }
+
     /// Populate the canonical overlay digest.
+    ///
+    /// The digest covers the governed admission shape (`campaign_id`,
+    /// `admission_receipt`, `revision`, `supersedes`), the pre-evaluation
+    /// frozen fields, together with every other field except
+    /// `canonical_digest` itself.
     pub fn seal(&mut self) -> Result<(), LearningContractError> {
         self.canonical_digest = digest_without_field(self, "canonical_digest")?;
         Ok(())
@@ -267,6 +370,11 @@ impl CampaignHarnessOverlayCandidate {
         deltas: &[crate::delta::AttemptLearningDeltaCandidate],
     ) -> Result<(), LearningContractError> {
         self.validate()?;
+        if self.campaign_id != view.campaign_id {
+            return Err(LearningContractError::ScopeMismatch {
+                field: "overlay.campaign",
+            });
+        }
         if self.binding != view.binding || self.base_view_digest != view.canonical_digest {
             return Err(LearningContractError::ScopeMismatch {
                 field: "overlay.view_lineage",
@@ -332,6 +440,10 @@ impl CampaignHarnessOverlayCandidate {
         }
         Ok(())
     }
+}
+
+fn default_overlay_revision() -> u32 {
+    1
 }
 
 fn ensure_unique<'a, I>(values: I, field: &'static str) -> Result<(), LearningContractError>
