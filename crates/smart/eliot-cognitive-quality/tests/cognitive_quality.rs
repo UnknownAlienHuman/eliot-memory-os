@@ -26,8 +26,10 @@ use eliot_epistemic_contracts::{
 };
 use eliot_learning_contracts::identity::SourceLineage;
 use eliot_learning_contracts::{
-    ContractBinding, HarnessActivationReceiptCandidate, LifecycleStage, OverlayId, ProofCeiling,
-    SourceDenominator, StageDisposition, StageObservation, TargetId,
+    ActivationSection, ActivationStatus, AdherenceSection, AdherenceStatus, ContractBinding,
+    DeliverySection, DeliveryStatus, HarnessActivationReceiptCandidate, LifecycleStage, OverlayId,
+    ProofCeiling, RetrievalSection, RetrievalStatus, SourceDenominator, StageDisposition,
+    StageObservation, TargetId,
 };
 use eliot_observation_contracts::{
     BankProjection, CoverageDisposition, CoverageEvidence, CoverageGap, ExperienceRecordRef,
@@ -151,6 +153,42 @@ fn receipt_with(binding: ContractBinding) -> HarnessActivationReceiptCandidate {
         attrition: vec![],
         confounders: vec![],
         independent_evaluator_receipt: None,
+        compiled_view_ref: aid("compiled-view-cogq"),
+        context_compiler_revision: "compiler-rev-cogq".to_owned(),
+        render_profile_revision: "render-rev-cogq".to_owned(),
+        stable_harness_refs: vec![],
+        task_family_harness_refs: vec![],
+        skill_refs: vec![],
+        memory_refs: vec![],
+        procedure_refs: vec![],
+        preserved_success_ref: None,
+        eligibility_and_retrieval_reason: None,
+        retrieval: RetrievalSection {
+            status: RetrievalStatus::Unknown,
+            expansion_or_tool_query_refs: vec![],
+        },
+        delivery: DeliverySection {
+            status: DeliveryStatus::Missing,
+            packet_position: None,
+            serialized_digest: None,
+            bytes: None,
+            actual_tokens: None,
+        },
+        activation: ActivationSection {
+            status: ActivationStatus::Unknown,
+            acknowledgement_ref: None,
+            observation_limit_reason: None,
+            first_qualifying_observable_use_ref: None,
+        },
+        adherence: AdherenceSection {
+            status: AdherenceStatus::Unknown,
+            early_mid_final_checkpoint_refs: vec![],
+            prescribed_or_avoided_action_and_required_verifier_refs: vec![],
+        },
+        conflicts_suppression_or_compaction_loss: vec![],
+        downstream_decision_action_artifact_and_verifier_refs: vec![],
+        receipt_completeness_and_missing_fields: vec![],
+        invalidation_expiry_and_missingness: vec![],
         canonical_digest: String::new(),
     };
     receipt.seal().expect("fixture seal");
@@ -331,10 +369,7 @@ fn status_denominator_mismatch_is_rejected() {
         vec![],
     )
     .expect_err("observed must equal carried refs");
-    assert!(matches!(
-        made,
-        QualityError::IncompleteDenominator { .. }
-    ));
+    assert!(matches!(made, QualityError::IncompleteDenominator { .. }));
 }
 
 #[test]
@@ -374,10 +409,7 @@ fn skill_lifecycle_assesses_valid_closure() {
 fn skill_lifecycle_empty_receipts_are_rejected() {
     let error = assess_skill_lifecycle(aid("assess-skill-1"), &status(), &[])
         .expect_err("empty receipts must fail");
-    assert!(matches!(
-        error,
-        QualityError::IncompleteDenominator { .. }
-    ));
+    assert!(matches!(error, QualityError::IncompleteDenominator { .. }));
 }
 
 #[test]
@@ -400,8 +432,13 @@ fn skill_lifecycle_receipt_fence_mismatch_is_rejected() {
 
 #[test]
 fn tool_surface_cites_version_handles() {
-    let made = assess_tool_surface(aid("assess-tool-1"), &status(), &[receipt()], &[aid("tool-v1")])
-        .expect("valid tool assessment");
+    let made = assess_tool_surface(
+        aid("assess-tool-1"),
+        &status(),
+        &[receipt()],
+        &[aid("tool-v1")],
+    )
+    .expect("valid tool assessment");
     made.validate().expect("candidate validates");
     assert_eq!(
         made.section,
@@ -414,10 +451,7 @@ fn tool_surface_cites_version_handles() {
 fn tool_surface_empty_versions_are_rejected() {
     let error = assess_tool_surface(aid("assess-tool-1"), &status(), &[receipt()], &[])
         .expect_err("empty versions must fail");
-    assert!(matches!(
-        error,
-        QualityError::IncompleteDenominator { .. }
-    ));
+    assert!(matches!(error, QualityError::IncompleteDenominator { .. }));
 }
 
 #[test]
@@ -441,12 +475,10 @@ fn dreamer_economics_assesses_jobs_by_handle() {
 
 #[test]
 fn dreamer_economics_empty_jobs_are_rejected() {
-    let error = assess_dreamer_economics(aid("assess-dream-1"), scope(), fence(), &[receipt()], &[])
-        .expect_err("empty jobs must fail");
-    assert!(matches!(
-        error,
-        QualityError::IncompleteDenominator { .. }
-    ));
+    let error =
+        assess_dreamer_economics(aid("assess-dream-1"), scope(), fence(), &[receipt()], &[])
+            .expect_err("empty jobs must fail");
+    assert!(matches!(error, QualityError::IncompleteDenominator { .. }));
 }
 
 #[test]
@@ -489,10 +521,7 @@ fn self_quality_without_projection_is_rejected() {
         &[aid("obl-1")],
     )
     .expect_err("missing projections must fail");
-    assert!(matches!(
-        error,
-        QualityError::IncompleteDenominator { .. }
-    ));
+    assert!(matches!(error, QualityError::IncompleteDenominator { .. }));
 }
 
 #[test]
@@ -524,10 +553,7 @@ fn self_quality_empty_obligations_are_rejected() {
         &[],
     )
     .expect_err("empty obligations must fail");
-    assert!(matches!(
-        error,
-        QualityError::IncompleteDenominator { .. }
-    ));
+    assert!(matches!(error, QualityError::IncompleteDenominator { .. }));
 }
 
 #[test]
@@ -587,10 +613,7 @@ fn intervention_missing_verifiers_are_rejected() {
         None,
     )
     .expect_err("missing verifiers must fail");
-    assert!(matches!(
-        error,
-        QualityError::IncompleteDenominator { .. }
-    ));
+    assert!(matches!(error, QualityError::IncompleteDenominator { .. }));
 }
 
 #[test]
@@ -645,15 +668,18 @@ fn candidate_foreign_version_is_rejected_before_wire_acceptance() {
     made.contract_version = ContractVersion::new(9, 9, 9);
     let error = made.validate().expect_err("foreign version must fail");
     assert!(matches!(error, QualityError::InvalidField { .. }));
-    let error = recheck_candidate(&made, &OwnerSnapshot {
-        statuses: vec![],
-        receipts: vec![],
-        journals: vec![],
-        banks: vec![],
-        feedbacks: vec![],
-        positions: vec![],
-        attested_handles: vec![],
-    })
+    let error = recheck_candidate(
+        &made,
+        &OwnerSnapshot {
+            statuses: vec![],
+            receipts: vec![],
+            journals: vec![],
+            banks: vec![],
+            feedbacks: vec![],
+            positions: vec![],
+            attested_handles: vec![],
+        },
+    )
     .expect_err("foreign version must fail recheck");
     assert!(matches!(error, QualityError::InvalidField { .. }));
 }
@@ -883,8 +909,12 @@ fn recheck_attested_handles_pass() {
 fn recheck_resolves_propagated_omissions_via_attestation() {
     let gapped = status_with_omission();
     let receipt_value = receipt();
-    let made = assess_skill_lifecycle(aid("assess-skill-1"), &gapped, std::slice::from_ref(&receipt_value))
-        .expect("valid assessment");
+    let made = assess_skill_lifecycle(
+        aid("assess-skill-1"),
+        &gapped,
+        std::slice::from_ref(&receipt_value),
+    )
+    .expect("valid assessment");
     assert_eq!(made.omissions.len(), 1);
     let snapshot = OwnerSnapshot {
         statuses: vec![&gapped],

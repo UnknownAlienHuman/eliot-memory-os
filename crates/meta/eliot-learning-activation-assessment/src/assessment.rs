@@ -4,10 +4,12 @@ use std::collections::BTreeSet;
 
 use eliot_contracts::ArtifactId;
 use eliot_learning_contracts::{
+    ActivationSection, ActivationStatus, AdherenceSection, AdherenceStatus,
     AttemptLearningDeltaCandidate, CampaignHarnessOverlayCandidate, CampaignLearningStateView,
-    ContractBinding, DimensionAssessment, DimensionStatus, HarnessActivationReceiptCandidate,
-    LearningAssessmentCandidate, LearningStateViewRecipe, MetricObservation, StageDisposition,
-    StageObservation, TargetId, identity::validate_external_id,
+    ContractBinding, DeliverySection, DimensionAssessment, DimensionStatus,
+    HarnessActivationReceiptCandidate, LearningAssessmentCandidate, LearningStateViewRecipe,
+    MetricObservation, RetrievalSection, StageDisposition, StageObservation, TargetId,
+    identity::validate_external_id,
 };
 
 use crate::{
@@ -57,6 +59,42 @@ pub struct AssessmentInput<'a> {
     pub external_review_refs: &'a [ArtifactId],
     /// Caller-supplied finite assessment parameters.
     pub policy: &'a AssessmentPolicy,
+    /// Full compiled-from campaign learning state view ref.
+    pub compiled_view_ref: &'a ArtifactId,
+    /// Revision of the context compiler that rendered this attempt.
+    pub context_compiler_revision: &'a str,
+    /// Revision of the render profile used for this attempt.
+    pub render_profile_revision: &'a str,
+    /// Exact stable harness refs compiled into this attempt.
+    pub stable_harness_refs: &'a [ArtifactId],
+    /// Task-family harness refs compiled into this attempt.
+    pub task_family_harness_refs: &'a [ArtifactId],
+    /// Skill refs compiled into this attempt.
+    pub skill_refs: &'a [ArtifactId],
+    /// Memory refs compiled into this attempt.
+    pub memory_refs: &'a [ArtifactId],
+    /// Procedure refs compiled into this attempt.
+    pub procedure_refs: &'a [ArtifactId],
+    /// Preserved success set or constraints ref, when one applies.
+    pub preserved_success_ref: Option<&'a ArtifactId>,
+    /// Eligibility and retrieval reason for this attempt.
+    pub eligibility_and_retrieval_reason: Option<&'a str>,
+    /// Retrieval evidence; orthogonal to delivery/activation/adherence.
+    pub retrieval: &'a RetrievalSection,
+    /// Delivery evidence; orthogonal to retrieval/activation/adherence.
+    pub delivery: &'a DeliverySection,
+    /// Observable-activation evidence; orthogonal to the other sections.
+    pub activation: &'a ActivationSection,
+    /// Adherence evidence; orthogonal to the other sections.
+    pub adherence: &'a AdherenceSection,
+    /// Conflict, suppression or compaction-loss refs for this attempt.
+    pub conflicts_suppression_or_compaction_loss: &'a [ArtifactId],
+    /// Downstream decision, action, artifact and verifier refs.
+    pub downstream_refs: &'a [ArtifactId],
+    /// Receipt completeness notes and missing-field names.
+    pub receipt_completeness_and_missing_fields: &'a [String],
+    /// Invalidation, expiry and missingness notes.
+    pub invalidation_expiry_and_missingness: &'a [String],
 }
 
 /// Construct canonical activation and assessment candidates from evidence.
@@ -86,37 +124,11 @@ pub fn assess_learning_activation(
         return Ok(outcome);
     }
     validate_owner_lineage(input)?;
+    validate_activation_sections(input)?;
     let input_snapshot = snapshot(input)?;
     let stages = expected_stages(input.stages, input.policy)?;
     let dimensions = expected_dimensions(input.dimensions, input.policy)?;
-    let mut activation = HarnessActivationReceiptCandidate {
-        binding: input.binding.clone(),
-        activation_id: required_id(input.activation_id, "activation_id")?,
-        target: input.target.clone(),
-        view_digest: input.view.canonical_digest.clone(),
-        delta_id: input.delta.delta_id.clone(),
-        overlay_id: input.overlay.overlay_id.clone(),
-        admission_receipt: required_id(input.admission_receipt, "admission_receipt")?,
-        activation_request_receipt: required_id(
-            input.activation_request_receipt,
-            "activation_request_receipt",
-        )?,
-        stages,
-        // The canonical view owns the observed member denominator. The local
-        // policy denominator is only used for synthesized unknown rows.
-        member_denominator: input.view.denominator,
-        metrics: input.metrics.to_vec(),
-        attrition: input.attrition.to_vec(),
-        confounders: input.confounders.to_vec(),
-        independent_evaluator_receipt: input.independent_evaluator_receipt.cloned(),
-        canonical_digest: String::new(),
-    };
-    activation
-        .seal()
-        .map_err(|error| ActivationAssessmentError::contract("activation.seal", error))?;
-    activation
-        .validate_against_lineage(input.view, input.delta, input.overlay)
-        .map_err(|error| ActivationAssessmentError::contract("activation.lineage", error))?;
+    let activation = build_activation_candidate(input, stages)?;
     let mut assessment = LearningAssessmentCandidate {
         binding: input.binding.clone(),
         target: input.target.clone(),
@@ -155,6 +167,70 @@ pub fn assess_learning_activation(
         "output",
     )?;
     Ok(outcome)
+}
+
+/// Build the immutable activation receipt candidate from caller evidence.
+///
+/// All harness, compiler, retrieval, delivery, activation, adherence, and
+/// downstream fields are cloned from the supplied input without synthesis;
+/// the guards in [`validate_activation_sections`] and the canonical
+/// [`HarnessActivationReceiptCandidate::validate_against_lineage`] reject
+/// ack-as-use substitution and evidence-free observed adherence.
+fn build_activation_candidate(
+    input: &AssessmentInput<'_>,
+    stages: Vec<StageObservation>,
+) -> Result<HarnessActivationReceiptCandidate, ActivationAssessmentError> {
+    let mut activation = HarnessActivationReceiptCandidate {
+        binding: input.binding.clone(),
+        activation_id: required_id(input.activation_id, "activation_id")?,
+        target: input.target.clone(),
+        view_digest: input.view.canonical_digest.clone(),
+        delta_id: input.delta.delta_id.clone(),
+        overlay_id: input.overlay.overlay_id.clone(),
+        admission_receipt: required_id(input.admission_receipt, "admission_receipt")?,
+        activation_request_receipt: required_id(
+            input.activation_request_receipt,
+            "activation_request_receipt",
+        )?,
+        stages,
+        // The canonical view owns the observed member denominator. The local
+        // policy denominator is only used for synthesized unknown rows.
+        member_denominator: input.view.denominator,
+        metrics: input.metrics.to_vec(),
+        attrition: input.attrition.to_vec(),
+        confounders: input.confounders.to_vec(),
+        independent_evaluator_receipt: input.independent_evaluator_receipt.cloned(),
+        compiled_view_ref: input.compiled_view_ref.clone(),
+        context_compiler_revision: input.context_compiler_revision.to_owned(),
+        render_profile_revision: input.render_profile_revision.to_owned(),
+        stable_harness_refs: input.stable_harness_refs.to_vec(),
+        task_family_harness_refs: input.task_family_harness_refs.to_vec(),
+        skill_refs: input.skill_refs.to_vec(),
+        memory_refs: input.memory_refs.to_vec(),
+        procedure_refs: input.procedure_refs.to_vec(),
+        preserved_success_ref: input.preserved_success_ref.cloned(),
+        eligibility_and_retrieval_reason: input.eligibility_and_retrieval_reason.map(str::to_owned),
+        retrieval: input.retrieval.clone(),
+        delivery: input.delivery.clone(),
+        activation: input.activation.clone(),
+        adherence: input.adherence.clone(),
+        conflicts_suppression_or_compaction_loss: input
+            .conflicts_suppression_or_compaction_loss
+            .to_vec(),
+        downstream_decision_action_artifact_and_verifier_refs: input.downstream_refs.to_vec(),
+        receipt_completeness_and_missing_fields: input
+            .receipt_completeness_and_missing_fields
+            .to_vec(),
+        invalidation_expiry_and_missingness: input.invalidation_expiry_and_missingness.to_vec(),
+        canonical_digest: String::new(),
+    };
+    activation
+        .seal()
+        .map_err(|error| ActivationAssessmentError::contract("activation.seal", error))?;
+    activation
+        .validate_against_lineage(input.view, input.delta, input.overlay)
+        .map_err(|error| ActivationAssessmentError::contract("activation.lineage", error))?;
+    Ok(activation)
 }
 
 /// Result arm preserving a constructed candidate or explicit incomplete input.
@@ -266,6 +342,144 @@ pub(crate) fn validate_supplied_evidence(
     Ok(())
 }
 
+/// Crate-local guard for the new receipt sections plus uniqueness of the new
+/// reference slices. The canonical contracts crate re-enforces these;
+/// this guard fails fast before any candidate is sealed.
+pub(crate) fn validate_activation_sections(
+    input: &AssessmentInput<'_>,
+) -> Result<(), ActivationAssessmentError> {
+    // Honest bounded accounting for the new borrowed evidence. `bounds::preflight`
+    // (not owned by this work unit) serializes only the original fields, so the
+    // new fields are counted here under the same caller-supplied byte limit.
+    #[derive(serde::Serialize)]
+    struct NewFieldPreflight<'a> {
+        compiled_view_ref: &'a ArtifactId,
+        context_compiler_revision: &'a str,
+        render_profile_revision: &'a str,
+        stable_harness_refs: &'a [ArtifactId],
+        task_family_harness_refs: &'a [ArtifactId],
+        skill_refs: &'a [ArtifactId],
+        memory_refs: &'a [ArtifactId],
+        procedure_refs: &'a [ArtifactId],
+        preserved_success_ref: Option<&'a ArtifactId>,
+        eligibility_and_retrieval_reason: Option<&'a str>,
+        retrieval: &'a RetrievalSection,
+        delivery: &'a DeliverySection,
+        activation: &'a ActivationSection,
+        adherence: &'a AdherenceSection,
+        conflicts_suppression_or_compaction_loss: &'a [ArtifactId],
+        downstream_refs: &'a [ArtifactId],
+        receipt_completeness_and_missing_fields: &'a [String],
+        invalidation_expiry_and_missingness: &'a [String],
+    }
+    let bounded = NewFieldPreflight {
+        compiled_view_ref: input.compiled_view_ref,
+        context_compiler_revision: input.context_compiler_revision,
+        render_profile_revision: input.render_profile_revision,
+        stable_harness_refs: input.stable_harness_refs,
+        task_family_harness_refs: input.task_family_harness_refs,
+        skill_refs: input.skill_refs,
+        memory_refs: input.memory_refs,
+        procedure_refs: input.procedure_refs,
+        preserved_success_ref: input.preserved_success_ref,
+        eligibility_and_retrieval_reason: input.eligibility_and_retrieval_reason,
+        retrieval: input.retrieval,
+        delivery: input.delivery,
+        activation: input.activation,
+        adherence: input.adherence,
+        conflicts_suppression_or_compaction_loss: input.conflicts_suppression_or_compaction_loss,
+        downstream_refs: input.downstream_refs,
+        receipt_completeness_and_missing_fields: input.receipt_completeness_and_missing_fields,
+        invalidation_expiry_and_missingness: input.invalidation_expiry_and_missingness,
+    };
+    let _ = bounded_serialized_len(
+        &bounded,
+        input
+            .policy
+            .max_input_bytes
+            .min(crate::contracts::MAX_INPUT_BYTES),
+        "input",
+    )?;
+    ensure_unique_local(input.stable_harness_refs, "stable_harness_refs")?;
+    ensure_unique_local(input.task_family_harness_refs, "task_family_harness_refs")?;
+    ensure_unique_local(input.skill_refs, "skill_refs")?;
+    ensure_unique_local(input.memory_refs, "memory_refs")?;
+    ensure_unique_local(input.procedure_refs, "procedure_refs")?;
+    ensure_unique_local(
+        input.conflicts_suppression_or_compaction_loss,
+        "conflicts_suppression_or_compaction_loss",
+    )?;
+    ensure_unique_local(input.downstream_refs, "downstream_refs")?;
+    ensure_unique_local(
+        &input.retrieval.expansion_or_tool_query_refs,
+        "retrieval.expansion_or_tool_query_refs",
+    )?;
+    ensure_unique_local(
+        &input.adherence.early_mid_final_checkpoint_refs,
+        "adherence.early_mid_final_checkpoint_refs",
+    )?;
+    ensure_unique_local(
+        &input
+            .adherence
+            .prescribed_or_avoided_action_and_required_verifier_refs,
+        "adherence.prescribed_or_avoided_action_and_required_verifier_refs",
+    )?;
+    // An acknowledgement never substitutes for the first qualifying observable
+    // use ref: Observed activation requires a distinct, non-blank use ref.
+    if input.activation.status == ActivationStatus::Observed {
+        let qualifies = matches!(
+            &input.activation.first_qualifying_observable_use_ref,
+            Some(id)
+                if !id.as_str().trim().is_empty()
+                    && Some(id) != input.activation.acknowledgement_ref.as_ref()
+        );
+        if !qualifies {
+            return Err(ActivationAssessmentError::LineageMismatch {
+                field: "activation.first_qualifying_observable_use_ref",
+            });
+        }
+    }
+    // Observed adherence requires checkpoint and action/verifier evidence.
+    validate_observation_guards(input)?;
+    Ok(())
+}
+
+fn validate_observation_guards(
+    input: &AssessmentInput<'_>,
+) -> Result<(), ActivationAssessmentError> {
+    // Observed adherence requires checkpoint and action/verifier evidence;
+    // missing or inconclusive observability stays UNKNOWN upstream.
+    if matches!(
+        input.adherence.status,
+        AdherenceStatus::ObservedFollowed
+            | AdherenceStatus::ObservedPartial
+            | AdherenceStatus::ObservedViolated
+    ) && (input.adherence.early_mid_final_checkpoint_refs.is_empty()
+        || input
+            .adherence
+            .prescribed_or_avoided_action_and_required_verifier_refs
+            .is_empty())
+    {
+        return Err(ActivationAssessmentError::LineageMismatch {
+            field: "adherence.evidence",
+        });
+    }
+    Ok(())
+}
+
+fn ensure_unique_local(
+    ids: &[ArtifactId],
+    field: &'static str,
+) -> Result<(), ActivationAssessmentError> {
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id.as_str()) {
+            return Err(ActivationAssessmentError::Duplicate { field });
+        }
+    }
+    Ok(())
+}
+
 fn snapshot(
     input: &AssessmentInput<'_>,
 ) -> Result<crate::contracts::AssessmentInputSnapshot, ActivationAssessmentError> {
@@ -288,6 +502,28 @@ fn snapshot(
         independent_evaluator_receipt: input.independent_evaluator_receipt.cloned(),
         dimensions: input.dimensions.to_vec(),
         external_review_refs: input.external_review_refs.to_vec(),
+        compiled_view_ref: input.compiled_view_ref.clone(),
+        context_compiler_revision: input.context_compiler_revision.to_owned(),
+        render_profile_revision: input.render_profile_revision.to_owned(),
+        stable_harness_refs: input.stable_harness_refs.to_vec(),
+        task_family_harness_refs: input.task_family_harness_refs.to_vec(),
+        skill_refs: input.skill_refs.to_vec(),
+        memory_refs: input.memory_refs.to_vec(),
+        procedure_refs: input.procedure_refs.to_vec(),
+        preserved_success_ref: input.preserved_success_ref.cloned(),
+        eligibility_and_retrieval_reason: input.eligibility_and_retrieval_reason.map(str::to_owned),
+        retrieval: input.retrieval.clone(),
+        delivery: input.delivery.clone(),
+        activation: input.activation.clone(),
+        adherence: input.adherence.clone(),
+        conflicts_suppression_or_compaction_loss: input
+            .conflicts_suppression_or_compaction_loss
+            .to_vec(),
+        downstream_refs: input.downstream_refs.to_vec(),
+        receipt_completeness_and_missing_fields: input
+            .receipt_completeness_and_missing_fields
+            .to_vec(),
+        invalidation_expiry_and_missingness: input.invalidation_expiry_and_missingness.to_vec(),
         input_digest: String::new(),
     };
     snapshot.seal()?;

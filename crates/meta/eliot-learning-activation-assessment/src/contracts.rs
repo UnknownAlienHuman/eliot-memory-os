@@ -2,10 +2,11 @@
 
 use eliot_contracts::ArtifactId;
 use eliot_learning_contracts::{
-    AssessmentDimension, AttemptLearningDeltaCandidate, CampaignHarnessOverlayCandidate,
-    CampaignLearningStateView, CausalCeiling, ContractBinding, DimensionAssessment,
-    HarnessActivationReceiptCandidate, LearningAssessmentCandidate, LearningStateViewRecipe,
-    LifecycleStage, MetricObservation, SourceDenominator, StageObservation,
+    ActivationSection, AdherenceSection, AssessmentDimension, AttemptLearningDeltaCandidate,
+    CampaignHarnessOverlayCandidate, CampaignLearningStateView, CausalCeiling, ContractBinding,
+    DeliverySection, DimensionAssessment, HarnessActivationReceiptCandidate,
+    LearningAssessmentCandidate, LearningStateViewRecipe, LifecycleStage, MetricObservation,
+    RetrievalSection, SourceDenominator, StageObservation,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -119,6 +120,42 @@ pub struct AssessmentInputSnapshot {
     pub independent_evaluator_receipt: Option<ArtifactId>,
     pub dimensions: Vec<DimensionAssessment>,
     pub external_review_refs: Vec<ArtifactId>,
+    /// Full compiled-from campaign learning state view ref.
+    pub compiled_view_ref: ArtifactId,
+    /// Revision of the context compiler that rendered this attempt.
+    pub context_compiler_revision: String,
+    /// Revision of the render profile used for this attempt.
+    pub render_profile_revision: String,
+    /// Exact stable harness refs compiled into this attempt.
+    pub stable_harness_refs: Vec<ArtifactId>,
+    /// Task-family harness refs compiled into this attempt.
+    pub task_family_harness_refs: Vec<ArtifactId>,
+    /// Skill refs compiled into this attempt.
+    pub skill_refs: Vec<ArtifactId>,
+    /// Memory refs compiled into this attempt.
+    pub memory_refs: Vec<ArtifactId>,
+    /// Procedure refs compiled into this attempt.
+    pub procedure_refs: Vec<ArtifactId>,
+    /// Preserved success set or constraints ref, when one applies.
+    pub preserved_success_ref: Option<ArtifactId>,
+    /// Eligibility and retrieval reason for this attempt.
+    pub eligibility_and_retrieval_reason: Option<String>,
+    /// Retrieval evidence; orthogonal to delivery/activation/adherence.
+    pub retrieval: RetrievalSection,
+    /// Delivery evidence; orthogonal to retrieval/activation/adherence.
+    pub delivery: DeliverySection,
+    /// Observable-activation evidence; orthogonal to the other sections.
+    pub activation: ActivationSection,
+    /// Adherence evidence; orthogonal to the other sections.
+    pub adherence: AdherenceSection,
+    /// Conflict, suppression or compaction-loss refs for this attempt.
+    pub conflicts_suppression_or_compaction_loss: Vec<ArtifactId>,
+    /// Downstream decision, action, artifact and verifier refs.
+    pub downstream_refs: Vec<ArtifactId>,
+    /// Receipt completeness notes and missing-field names.
+    pub receipt_completeness_and_missing_fields: Vec<String>,
+    /// Invalidation, expiry and missingness notes.
+    pub invalidation_expiry_and_missingness: Vec<String>,
     /// Digest over all fields above, excluding this field.
     pub input_digest: String,
 }
@@ -200,6 +237,34 @@ impl AssessmentResult {
             &self.input.external_review_refs,
             "external_review_refs",
         )?;
+        crate::bounds::ensure_unique_refs(&self.input.stable_harness_refs, "stable_harness_refs")?;
+        crate::bounds::ensure_unique_refs(
+            &self.input.task_family_harness_refs,
+            "task_family_harness_refs",
+        )?;
+        crate::bounds::ensure_unique_refs(&self.input.skill_refs, "skill_refs")?;
+        crate::bounds::ensure_unique_refs(&self.input.memory_refs, "memory_refs")?;
+        crate::bounds::ensure_unique_refs(&self.input.procedure_refs, "procedure_refs")?;
+        crate::bounds::ensure_unique_refs(
+            &self.input.conflicts_suppression_or_compaction_loss,
+            "conflicts_suppression_or_compaction_loss",
+        )?;
+        crate::bounds::ensure_unique_refs(&self.input.downstream_refs, "downstream_refs")?;
+        crate::bounds::ensure_unique_refs(
+            &self.input.retrieval.expansion_or_tool_query_refs,
+            "retrieval.expansion_or_tool_query_refs",
+        )?;
+        crate::bounds::ensure_unique_refs(
+            &self.input.adherence.early_mid_final_checkpoint_refs,
+            "adherence.early_mid_final_checkpoint_refs",
+        )?;
+        crate::bounds::ensure_unique_refs(
+            &self
+                .input
+                .adherence
+                .prescribed_or_avoided_action_and_required_verifier_refs,
+            "adherence.prescribed_or_avoided_action_and_required_verifier_refs",
+        )?;
         crate::assessment::validate_supplied_evidence(
             &self.input.metrics,
             &self.input.stages,
@@ -240,6 +305,31 @@ impl AssessmentResult {
                 != self.input.independent_evaluator_receipt
             || self.assessment.external_review_refs != self.input.external_review_refs
             || self.assessment.activation_digest != self.activation.canonical_digest
+            || self.activation.compiled_view_ref != self.input.compiled_view_ref
+            || self.activation.context_compiler_revision != self.input.context_compiler_revision
+            || self.activation.render_profile_revision != self.input.render_profile_revision
+            || self.activation.stable_harness_refs != self.input.stable_harness_refs
+            || self.activation.task_family_harness_refs != self.input.task_family_harness_refs
+            || self.activation.skill_refs != self.input.skill_refs
+            || self.activation.memory_refs != self.input.memory_refs
+            || self.activation.procedure_refs != self.input.procedure_refs
+            || self.activation.preserved_success_ref != self.input.preserved_success_ref
+            || self.activation.eligibility_and_retrieval_reason
+                != self.input.eligibility_and_retrieval_reason
+            || self.activation.retrieval != self.input.retrieval
+            || self.activation.delivery != self.input.delivery
+            || self.activation.activation != self.input.activation
+            || self.activation.adherence != self.input.adherence
+            || self.activation.conflicts_suppression_or_compaction_loss
+                != self.input.conflicts_suppression_or_compaction_loss
+            || self
+                .activation
+                .downstream_decision_action_artifact_and_verifier_refs
+                != self.input.downstream_refs
+            || self.activation.receipt_completeness_and_missing_fields
+                != self.input.receipt_completeness_and_missing_fields
+            || self.activation.invalidation_expiry_and_missingness
+                != self.input.invalidation_expiry_and_missingness
         {
             return Err(crate::ActivationAssessmentError::LineageMismatch {
                 field: "result.retained_evidence",
