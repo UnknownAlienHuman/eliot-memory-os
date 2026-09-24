@@ -39,13 +39,16 @@
   "projection_refs": [],
   "outbox_refs": [],
   "operation_manifest_digest": "manifest-991-k1",
+  "admission_digest": "518c987ac99c5a9083306e91cc5ca295ecde7020f34bfb96433456bc5b088bb4",
+  "mutation_plan_digest": "9033e7bfdc20de7263977195f0c60f40e89fa152e4d13a7cf580e5c6d2430cfb",
+  "semantic_source_revisions": [],
   "error_code": null,
   "resubmission": "none",
   "committed_at": "commit-sequence-0000000000000001",
   "envelope": {
     "identity": {
-      "receipt_id": "receipt-40d6d166b1d2f35db126eab059e6e702e35008d3f5ca70cbf8855d6765cdc748",
-      "canonical_sha256": "40d6d166b1d2f35db126eab059e6e702e35008d3f5ca70cbf8855d6765cdc748"
+      "receipt_id": "receipt-c177e5a6aa57571ac8b63099c031c227176f5ece9de0b1945349192fbcddbe92",
+      "canonical_sha256": "c177e5a6aa57571ac8b63099c031c227176f5ece9de0b1945349192fbcddbe92"
     },
     "core": {
       "contract": {
@@ -165,7 +168,7 @@
       "artifacts": [
         {
           "artifact_id": "store-transition:op-991-k1",
-          "sha256": "ab94b2fc85515acb60899a88b2c1aa6c50e7db7c6903e6760495fd27a413eced",
+          "sha256": "e9a61dc5d2566319c67bb1f9ee841c2914a1bffbb0136180203176286446ceba",
           "role": "OPERATION",
           "source_revision": "manifest-991-k1"
         },

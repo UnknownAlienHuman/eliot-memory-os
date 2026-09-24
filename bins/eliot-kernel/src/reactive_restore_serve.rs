@@ -39,10 +39,12 @@ pub async fn serve_reactive_restore(
     context: &RequestMetadata,
     query: &ReactiveRestoreQuery,
 ) -> Result<ReactiveRestoreReply, ReactiveServiceError> {
-    query.validate().map_err(|_| ReactiveServiceError::InvalidField {
-        field: "restore.query",
-        reason: "query shape invalid",
-    })?;
+    query
+        .validate()
+        .map_err(|_| ReactiveServiceError::InvalidField {
+            field: "restore.query",
+            reason: "query shape invalid",
+        })?;
     if query.session_id != admitted_session {
         return Err(ReactiveServiceError::InvalidField {
             field: "restore.session_id",
@@ -103,11 +105,11 @@ mod tests {
         HostProcessBinding, KernelActivationPermit, KernelControlCommand, KernelReadyReceipt,
         KernelServiceState, ProcessObservation, RestartBudget,
     };
-    use eliot_store_api::StoreError;
     use eliot_runtime_contracts::{
         HealthVector, RegisteredActivityWakePolicy, ServiceProcessState, SupervisionJournalEpoch,
         SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
     };
+    use eliot_store_api::StoreError;
     use eliot_store_api::{
         NamedReadOperation, NamedReadRequest, NamedReadResponse, OrderingHead, RevisionHead,
         StoreHealth,
@@ -213,9 +215,7 @@ mod tests {
         let mut service = KernelService::new([7; 32], 2, 4).expect("service");
         let candidate = candidate_binding();
         service.reconcile(candidate.clone()).expect("reconcile");
-        service
-            .apply(KernelControlCommand::Shadow)
-            .expect("shadow");
+        service.apply(KernelControlCommand::Shadow).expect("shadow");
         service
             .apply(KernelControlCommand::PrepareHandoff)
             .expect("handoff");
@@ -227,10 +227,8 @@ mod tests {
             journal_sequence: 7,
             generation: live_generation(),
             authority_epoch: candidate.kernel_epoch.clone(),
-            activation_nonce: eliot_platform::KernelActivationNonce::new(handle(
-                &"a".repeat(64),
-            ))
-            .expect("nonce"),
+            activation_nonce: eliot_platform::KernelActivationNonce::new(handle(&"a".repeat(64)))
+                .expect("nonce"),
         };
         let activation = service
             .activate_permit(&permit, live_generation(), "c".repeat(64))
@@ -423,10 +421,7 @@ mod tests {
             &rotated,
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(ReactiveServiceError::FenceMismatch)
-        ));
+        assert!(matches!(result, Err(ReactiveServiceError::FenceMismatch)));
     }
 
     #[tokio::test]
@@ -446,11 +441,13 @@ mod tests {
         .expect("serve");
         assert_eq!(reply.session_id, "session-live-1");
         assert_eq!(reply.state_fence, test_fence());
-        assert!(reply
-            .ledger_json
-            .as_deref()
-            .expect("ledger served")
-            .contains("reactive-injection-receipts/v1"));
+        assert!(
+            reply
+                .ledger_json
+                .as_deref()
+                .expect("ledger served")
+                .contains("reactive-injection-receipts/v1")
+        );
         assert_eq!(reply.snapshots.len(), 1);
         assert_eq!(reply.snapshots[0].uri, "eliot://evidence/source-9");
         assert_eq!(reply.snapshots[0].content, b"snapshot-bytes-9");

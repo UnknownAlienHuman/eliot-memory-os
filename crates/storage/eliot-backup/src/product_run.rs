@@ -295,10 +295,7 @@ pub fn run_restore(
         first_phases,
         obligations_satisfied: evidence.obligations.all_satisfied(),
         ors_suspension: evidence.obligations.ors_suspension.state,
-        reconciliation: evidence
-            .obligations
-            .unresolved_effect_reconciliation
-            .state,
+        reconciliation: evidence.obligations.unresolved_effect_reconciliation.state,
         user_broker: evidence.obligations.user_broker_invalidation.state,
         isolated_root: outcome.root.display().to_string(),
         journal_path: outcome.journal_path.display().to_string(),

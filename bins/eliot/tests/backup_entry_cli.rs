@@ -227,9 +227,7 @@ fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
         BackupArtifact, BackupClass, BackupInput, CanonicalRecord, EventRange, ExportFence,
         OrsSnapshotFence, WatchdogSpoolFence,
     };
-    use eliot_contracts::{
-        EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex,
-    };
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
     use eliot_security_contracts::{PurgeLedgerEntry, PurgeLocation, PurgeState};
     use eliot_store_api::{
         CommitId, EventId, OperationId, OperationManifestDigest, Resubmission, TransitionClass,
@@ -272,6 +270,13 @@ fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
                 "manifest-{operation}"
             ))
             .expect("manifest digest"),
+            // Standalone-fixture issue-#18 values (not bound to a
+            // transition): this seed only exercises backup-entry export,
+            // never digest bindings. Shapes stay valid so `validate()`
+            // reaches the behavior under test.
+            admission_digest: "e".repeat(64),
+            mutation_plan_digest: "f".repeat(64),
+            semantic_source_revisions: Vec::new(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),
@@ -334,8 +339,10 @@ fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
             schema_generation: "schema-1".to_owned(),
             export_fence: export_fence(count),
             canonical_events: events,
-            projections: vec![CanonicalRecord::new("test-event", "event-1", json!({"projection": "event-1"}))
-                .expect("projection")],
+            projections: vec![
+                CanonicalRecord::new("test-event", "event-1", json!({"projection": "event-1"}))
+                    .expect("projection"),
+            ],
             receipts,
             blobs: Vec::new(),
             purge_ledger: if with_purge {
@@ -386,10 +393,7 @@ fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
 
     // Full issuance from coherent exporter material.
     let export_path = temp.path().join("export-full.json");
-    fs::write(
-        &export_path,
-        serde_json::to_vec(&full_export(true, false))?,
-    )?;
+    fs::write(&export_path, serde_json::to_vec(&full_export(true, false))?)?;
     let out_dir = temp.path().join("out-full");
     let output = run(&[
         "backup",
@@ -488,10 +492,7 @@ fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
 
     // A purge-carrying archive issues, but restore refuses the erasure receipt.
     let export_purge = temp.path().join("export-purge.json");
-    fs::write(
-        &export_purge,
-        serde_json::to_vec(&full_export(true, true))?,
-    )?;
+    fs::write(&export_purge, serde_json::to_vec(&full_export(true, true))?)?;
     let out_purge = temp.path().join("out-purge");
     let output = run(&[
         "backup",

@@ -507,13 +507,16 @@ impl SurrealStoreAdapter {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, AdapterError> {
-        apply::apply_prepared(
+        // Boxed: the inner future holds the multi-kilobyte canonical
+        // `PreparedTransition` across provider awaits, exceeding the default
+        // future-size lint.
+        Box::pin(apply::apply_prepared(
             self,
             ctx,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
-        )
+        ))
         .await
     }
 
@@ -533,14 +536,17 @@ impl SurrealStoreAdapter {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         authorities: &[Option<ExactJsonBytes>],
     ) -> Result<WriteReceipt, AdapterError> {
-        apply::apply_prepared_with_authority(
+        // Boxed: the inner future holds the multi-kilobyte canonical
+        // `PreparedTransition` across provider awaits, exceeding the default
+        // future-size lint.
+        Box::pin(apply::apply_prepared_with_authority(
             self,
             ctx,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
             authorities,
-        )
+        ))
         .await
     }
 
@@ -592,13 +598,16 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError> {
-        apply::apply_prepared(
+        // Boxed: the inner future holds the multi-kilobyte canonical
+        // `PreparedTransition` across provider awaits, exceeding the default
+        // future-size lint.
+        Box::pin(apply::apply_prepared(
             self,
             ctx,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
-        )
+        ))
         .await
         .map_err(AdapterError::into_store_error)
     }

@@ -41,7 +41,8 @@ use eliot_store_api::{
     ScopeId, ScopeRevisionView, SecurityContext, StoreError, StoreGenesisRequest, StoreHealth,
     StoreHealthStatus, StoreRecoveryRequest, StoreRequest, TransitionClass,
     WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
-    WriteReceiptStatus, WriterEpochBinding, sha256_hex,
+    WriteReceiptStatus, WriterEpochBinding, bind_issue18_digests, render_semantic_source_revisions,
+    sha256_hex,
 };
 use serde_json::{Value, json};
 
@@ -64,7 +65,7 @@ fn context() -> RequestMeta {
 }
 
 fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransition {
-    eliot_store_api::PreparedTransition {
+    let mut transition = eliot_store_api::PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-admit-1").unwrap(),
             idempotency_key: "idem-admit-1".to_owned(),
@@ -81,6 +82,12 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: OperationManifestDigest::new("manifest-admit-1").unwrap(),
+        // Derived bindings, never placeholders. The envelope path renders
+        // the admitted expected heads; every request built on this
+        // transition below carries exactly `revision_heads()`.
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: render_semantic_source_revisions(&revision_heads()),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!("observation-admit-1"))]),
@@ -92,7 +99,9 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    bind_issue18_digests(&mut transition).unwrap();
+    transition
 }
 
 fn transition() -> eliot_store_api::PreparedTransition {
@@ -303,11 +312,25 @@ fn valid_bounded_projection_and_request_round_trip() {
     );
     assert_eq!(
         from_fixture.admission.prepared_transition_digest,
-        "7265472a978bd13efd07fed9487cb1667fc0e43142709ed5dde33a13cc89b038"
+        "3d9dd652702e2df81373b4c180299229a519da0b2a491550ccb1bf7171c1e0ea"
     );
     assert_eq!(
         from_fixture.admission.reservation_token_digest,
-        "746d87f6c80bfbe72063173cb56608940bf148bb57dd43cb95ea7a670eeab7f2"
+        "3d6eb8c4fac7952e74d71565a158c633c426384cbe0ef5a692d6d945d33707f3"
+    );
+    // Issue #18: the frozen transition carries derived (never defaulted)
+    // decision/plan digests plus the rendered source revisions.
+    assert_eq!(
+        from_fixture.transition.admission_digest,
+        "85c55439e5ab7cab499f106a2cfad50fe9a7dd0c3d6796b15278963bb02ff7e4"
+    );
+    assert_eq!(
+        from_fixture.transition.mutation_plan_digest,
+        "f67bc87634ad01aa2ccbdcd3bb8546e379fed288e3886193c42942c648cbbae2"
+    );
+    assert_eq!(
+        from_fixture.transition.semantic_source_revisions,
+        vec!["rev-admit-1@3".to_owned()]
     );
     assert_eq!(from_fixture.admission.scopes.len(), 1);
     assert_eq!(
@@ -1041,6 +1064,12 @@ impl StubClient {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-stub").unwrap(),
+            // Frozen probe fixture: format-valid shapes and `[]` source
+            // revisions; equality with a transition is enforced by the
+            // receipt-issuing path, not here.
+            admission_digest: "d".repeat(64),
+            mutation_plan_digest: "c".repeat(64),
+            semantic_source_revisions: Vec::new(),
             error_code: Some(ErrorCode::Conflict),
             resubmission: Resubmission::None,
             committed_at: None,

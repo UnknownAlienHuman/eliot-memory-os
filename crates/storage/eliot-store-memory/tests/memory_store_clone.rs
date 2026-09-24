@@ -16,7 +16,7 @@ use eliot_contracts::{
 use eliot_store_api::{
     CONTRACT_VERSION, CanonicalRequestView, EffectClass, EventProjectionRelationIntents,
     NamedOperationManifest, OperationId, OrderingScopeId, PreparedTransition, RequestMeta, ScopeId,
-    StateFence, StoreError, TransitionClass, canonical_request_hash,
+    StateFence, StoreError, TransitionClass, bind_issue18_digests, canonical_request_hash,
 };
 use eliot_store_memory::MemoryStore;
 use serde_json::{Value, json};
@@ -103,6 +103,11 @@ fn transition(
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "a".repeat(64),
         operation_manifest_digest: manifest()?.digest,
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; no semantic source is bound here (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![eliot_store_api::NamedMutationRequest {
             operation: eliot_store_api::NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([(String::from("subject"), json!(operation))]),
@@ -115,6 +120,7 @@ fn transition(
         security: eliot_store_api::SecurityContext::default(),
         required_proof_and_approval_refs: vec![],
     };
+    bind_issue18_digests(&mut prepared)?;
     let ctx = request_meta(fence)?;
     let view = CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
     prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;

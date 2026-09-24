@@ -48,6 +48,11 @@
     "requested_effect_ceiling": "CANDIDATE",
     "admission_contract_set_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "operation_manifest_digest": "manifest-991-1",
+    "admission_digest": "65d841961651858bb39f2aae9be0caa546f3a63bd19ad26f3034a378dcfd2da9",
+    "mutation_plan_digest": "cd3207fea3533719d0445bc2cd73c9501dea5bb0a1cdd6195dbf13260f744ab6",
+    "semantic_source_revisions": [
+      "rev-991-1@3"
+    ],
     "named_operations": [
       {
         "operation": "CaptureObservation",

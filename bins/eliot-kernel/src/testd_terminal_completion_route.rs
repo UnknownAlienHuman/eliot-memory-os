@@ -119,7 +119,7 @@ pub(crate) enum Response {
         job_id: String,
         receipt_sha256: String,
         request_digest: String,
-        receipt: WriteReceipt,
+        receipt: Box<WriteReceipt>,
     },
 }
 

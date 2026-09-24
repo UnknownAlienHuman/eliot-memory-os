@@ -643,7 +643,7 @@ fn build_notification_transition(
             reason: "notification ordering scope identity is invalid",
         }
     })?;
-    let transition = PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: request.operation.clone(),
         state_fence: request.state_fence.clone(),
         scope_id: scope,
@@ -653,6 +653,11 @@ fn build_notification_transition(
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: admission_digest,
         operation_manifest_digest: manifest_digest.clone(),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; this Kernel leg binds no semantic source (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![notification_mutation_request(parameters)],
         event_projection_relation_intents: EventProjectionRelationIntents {
             event_ids: Vec::new(),
@@ -662,6 +667,8 @@ fn build_notification_transition(
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut transition)
+        .map_err(NotificationServiceError::from_store)?;
     transition
         .validate()
         .map_err(NotificationServiceError::from_store)?;

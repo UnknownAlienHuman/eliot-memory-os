@@ -520,6 +520,12 @@ mod tests {
                     projection_refs: Vec::new(),
                     outbox_refs: Vec::new(),
                     operation_manifest_digest: transition.operation_manifest_digest.clone(),
+                    // Issue-#18 bindings are copied exactly from the admitted
+                    // transition, never defaulted; equality is enforced by
+                    // the receipt-issuing path below.
+                    admission_digest: transition.admission_digest.clone(),
+                    mutation_plan_digest: transition.mutation_plan_digest.clone(),
+                    semantic_source_revisions: transition.semantic_source_revisions.clone(),
                     error_code: None,
                     resubmission: Resubmission::None,
                     committed_at: Some(format!("commit-sequence-{sequence:016}")),

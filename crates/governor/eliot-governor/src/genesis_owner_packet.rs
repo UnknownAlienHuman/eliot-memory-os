@@ -365,7 +365,7 @@ fn genesis_payload(
             return Err(CompositionError::Recovery(
                 "policy has no all-absent genesis payload; it is served independently of genesis"
                     .to_owned(),
-            ))
+            ));
         }
     };
     let bytes =

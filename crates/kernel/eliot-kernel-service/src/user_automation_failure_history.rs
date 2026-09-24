@@ -150,7 +150,7 @@ pub fn build_failure_transition(
             .map_err(|error| StoreError::Serialization(error.to_string()))?,
     );
     let automation_id = request.revision.automation_id.clone();
-    let transition = PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: request.identity.clone(),
         state_fence: request.context.state_fence.clone(),
         scope_id: ScopeId::new(USER_AUTOMATION_SCOPE)?,
@@ -160,6 +160,11 @@ pub fn build_failure_transition(
         requested_effect_ceiling: TransitionClass::UserAutomation.maximum_effect(),
         admission_contract_set_digest: admission_digest,
         operation_manifest_digest: manifest_digest.clone(),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; this Kernel leg binds no semantic source (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![operation],
         event_projection_relation_intents: eliot_store_api::EventProjectionRelationIntents {
             event_ids: Vec::new(),
@@ -169,6 +174,7 @@ pub fn build_failure_transition(
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut transition)?;
     transition.validate()?;
     Ok((transition, manifest_digest))
 }

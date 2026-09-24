@@ -1095,7 +1095,10 @@ impl DaemonStartupEvidence {
                 field: "daemon_evidence.fence",
             });
         }
-        handle(&self.config_mirror_digest, "daemon_evidence.config_mirror_digest")?;
+        handle(
+            &self.config_mirror_digest,
+            "daemon_evidence.config_mirror_digest",
+        )?;
         if let Some(policy) = &self.policy_mirror_digest {
             handle(policy, "daemon_evidence.policy_mirror_digest")?;
         }
@@ -2947,10 +2950,7 @@ impl HostStartupEvidence {
     /// generation binding) is checked by the request boundary and the Kernel
     /// consumer; this rejects malformed carriers fail-closed.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
-        validate_digest(
-            &self.candidate_digest,
-            "startup_evidence.candidate_digest",
-        )?;
+        validate_digest(&self.candidate_digest, "startup_evidence.candidate_digest")?;
         self.state_fence
             .validate()
             .map_err(|_| KernelServiceError::InvalidField {
@@ -4018,8 +4018,7 @@ mod tests {
             "host-scm-watchdog:4242".to_owned(),
         ] {
             let mut bad = good.clone();
-            bad.scm_watchdog_observation_digest =
-                handle_value(&bad_scm);
+            bad.scm_watchdog_observation_digest = handle_value(&bad_scm);
             assert!(
                 bad.validate().is_err(),
                 "malformed SCM digest must fail: {bad_scm}"
@@ -4425,10 +4424,7 @@ mod tests {
             config_mirror_digest: handle_value("config-mirror-1"),
             policy_mirror_digest: Some(handle_value("policy-mirror-1")),
             capability_registry_digest: Some(registry),
-            required_capabilities: Some(vec![
-                "blob.read".to_owned(),
-                "config.read".to_owned(),
-            ]),
+            required_capabilities: Some(vec!["blob.read".to_owned(), "config.read".to_owned()]),
             capability_outcomes: Some(outcomes),
             evidence_refs: vec![handle_value("daemon-evidence-ref-1")],
         }
@@ -4436,10 +4432,7 @@ mod tests {
 
     #[test]
     fn daemon_startup_evidence_validates_shaped_fields() {
-        assert_eq!(
-            DAEMON_STARTUP_EVIDENCE_OPERATION,
-            "daemon_startup_evidence"
-        );
+        assert_eq!(DAEMON_STARTUP_EVIDENCE_OPERATION, "daemon_startup_evidence");
         daemon_evidence()
             .validate()
             .expect("absence-marked evidence must validate");
@@ -4516,8 +4509,9 @@ mod tests {
         assert_eq!(forward, reversed, "digest must not depend on outcome order");
         assert_eq!(forward.len(), 64, "digest must be SHA-256 hex");
         assert!(
-            forward.bytes().all(|byte| byte.is_ascii_hexdigit()
-                && !byte.is_ascii_uppercase()),
+            forward
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
             "digest must be lowercase hex"
         );
         let altered = daemon_capability_registry_digest(&[

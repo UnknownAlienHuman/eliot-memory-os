@@ -5201,6 +5201,12 @@ mod tests {
                     projection_refs: Vec::new(),
                     outbox_refs: Vec::new(),
                     operation_manifest_digest: transition.operation_manifest_digest.clone(),
+                    // Issue-#18 bindings are copied exactly from the admitted
+                    // transition, never defaulted; equality is enforced by
+                    // the receipt-issuing path below.
+                    admission_digest: transition.admission_digest.clone(),
+                    mutation_plan_digest: transition.mutation_plan_digest.clone(),
+                    semantic_source_revisions: transition.semantic_source_revisions.clone(),
                     error_code: None,
                     resubmission: Resubmission::None,
                     committed_at: Some(format!("commit-sequence-{sequence:016}")),
@@ -6842,6 +6848,13 @@ mod tests {
             outbox_refs: Vec::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest")
                 .expect("manifest digest"),
+            // Standalone-fixture issue-#18 values (not bound to a
+            // transition): this seed only exercises refresh/head
+            // rejection, never digest bindings. Shapes stay valid so
+            // `validate()` reaches the behavior under test.
+            admission_digest: "e".repeat(64),
+            mutation_plan_digest: "f".repeat(64),
+            semantic_source_revisions: Vec::new(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

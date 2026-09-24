@@ -1203,8 +1203,8 @@ mod tests {
         use eliot_store_api::{
             EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
-            ScopeId, SecurityContext, TransitionClass, canonical_request_hash,
-            operation_manifest_set_digest,
+            ScopeId, SecurityContext, TransitionClass, bind_issue18_digests,
+            canonical_request_hash, operation_manifest_set_digest,
         };
 
         const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -1241,6 +1241,11 @@ mod tests {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: set_digest,
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; no semantic source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -1256,6 +1261,7 @@ mod tests {
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        bind_issue18_digests(&mut transition).unwrap_or_else(|_| unreachable!());
         transition.identity.canonical_request_hash = canonical_request_hash(
             &CanonicalRequestView::from_apply(&context, &transition, &[], &[]),
         )
@@ -2122,7 +2128,7 @@ mod live_surreal_evidence_pack_e2e {
     ) -> PreparedTransition {
         let entries = generated_operation_manifests().expect("operation catalogue generates");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
-        PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new(format!("op-t11-live-{tag}"))
                     .expect("operation identity"),
@@ -2137,6 +2143,11 @@ mod live_surreal_evidence_pack_e2e {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: set_digest.as_str().to_owned(),
             operation_manifest_digest: set_digest,
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -2148,7 +2159,9 @@ mod live_surreal_evidence_pack_e2e {
             },
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     fn verification_intent() -> QueryIntent {

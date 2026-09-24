@@ -7,6 +7,7 @@ mod cognitive_runner;
 mod commands;
 mod config;
 mod delegation_runtime;
+mod disposition;
 mod dogfood;
 mod host_runtime;
 mod mcp_stdio;
@@ -21,6 +22,7 @@ mod windows_service;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use disposition::run_facade_disposition_guards;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
@@ -2032,6 +2034,8 @@ fn main() -> Result<()> {
         .stack_size(32 * 1024 * 1024)
         .spawn(move || -> Result<()> {
             init_tracing();
+            run_facade_disposition_guards()
+                .map_err(|reason| anyhow::anyhow!("facade disposition guard failed: {reason}"))?;
             let cli = Cli::parse();
             let (config, implicit_instance) = match cli.config {
                 Some(config) => (config, None),

@@ -243,7 +243,7 @@ mod idempotency_tests {
             state_fence: fence.clone(),
             clock: eliot_contracts::ClockReading::default(),
         };
-        let transition = eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new("op-idem").expect("operation"),
                 idempotency_key: "idem-key".to_owned(),
@@ -258,6 +258,11 @@ mod idempotency_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-idem")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!("op-idem"))]),
@@ -270,6 +275,7 @@ mod idempotency_tests {
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
         (context, transition)
     }
 

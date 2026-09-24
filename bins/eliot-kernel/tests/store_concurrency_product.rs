@@ -187,6 +187,11 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: set_digest(),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; no semantic source is bound here (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -199,6 +204,7 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
     transition.identity.canonical_request_hash = canonical_request_hash(
         &CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]),
     )
@@ -1353,10 +1359,7 @@ async fn precommit_crash_hook_stays_unknown_without_provider_effect() {
         .reconcile(ApiOperationId::new("op-994-fault-pre").expect("operation"))
         .await
         .expect("reconcile");
-    assert!(
-        absent.is_none(),
-        "crashed write left no provider effect"
-    );
+    assert!(absent.is_none(), "crashed write left no provider effect");
     // Unknown is never retried blindly: the same reserved inputs are refused
     // while the faulted attempt's ORS reservation stands.
     let (ctx_dup, transition_dup, rev_dup, ord_dup, seed_dup) =

@@ -44,16 +44,15 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::RequestMetadata;
 use eliot_context_candidates::ProjectionState;
+use eliot_contracts::RequestMetadata;
 use eliot_read::{
     BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
     ReadApi, ReadError, RequiredAssurance, StateRequest, TimeScope,
 };
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, ReadConsistency, RevisionHead, RevisionKey,
-    ScopeId, ScopeRevisionView, WriteReceiptStatus,
-    epistemic_revision::EpistemicPositionReadback,
+    ScopeId, ScopeRevisionView, WriteReceiptStatus, epistemic_revision::EpistemicPositionReadback,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -86,7 +85,9 @@ pub enum ContextInputsError {
     #[error("context reconstruction request is invalid: {0}")]
     RequestInvalid(String),
     /// Exact-fence reads require at least one dependency revision.
-    #[error("context reconstruction requires at least one dependency revision for exact-fence reads")]
+    #[error(
+        "context reconstruction requires at least one dependency revision for exact-fence reads"
+    )]
     MissingDependencies,
     /// The dependency-head closure could not be established.
     #[error("context reconstruction closure is unavailable: {0}")]
@@ -137,7 +138,11 @@ pub struct ContextReconstructionRequest {
 impl ContextReconstructionRequest {
     /// Validates the closed request shape without performing any read.
     pub fn validate(&self) -> Result<(), ContextInputsError> {
-        if self.dependency_revisions.values().any(|revision| *revision == 0) {
+        if self
+            .dependency_revisions
+            .values()
+            .any(|revision| *revision == 0)
+        {
             return Err(ContextInputsError::RequestInvalid(
                 "dependency revisions must be non-zero".to_owned(),
             ));
@@ -156,9 +161,7 @@ impl ContextReconstructionRequest {
                 "evidence_subject must be non-blank text".to_owned(),
             ));
         }
-        if self.evidence_max_records == 0
-            || self.evidence_max_records > EVIDENCE_PACK_MAX_RECORDS
-        {
+        if self.evidence_max_records == 0 || self.evidence_max_records > EVIDENCE_PACK_MAX_RECORDS {
             return Err(ContextInputsError::RequestInvalid(format!(
                 "evidence_max_records must be within 1..={EVIDENCE_PACK_MAX_RECORDS}"
             )));
@@ -312,11 +315,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         let negative_memory = self.acquire_projection_inputs(ctx, request).await?;
         let evidence = self.acquire_evidence(ctx, request).await?;
         let affordances = self
-            .acquire_state(
-                ctx,
-                request,
-                NamedReadOperation::GetCapabilityEvidenceState,
-            )
+            .acquire_state(ctx, request, NamedReadOperation::GetCapabilityEvidenceState)
             .await?;
         let heads_after = self.scope_heads(ctx, request).await?;
         if heads_after != heads_before {
@@ -554,8 +553,11 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 });
             }
         };
-        let state =
-            classify_evidence_payload(&response.payload, &request.scope_id, &request.evidence_subject);
+        let state = classify_evidence_payload(
+            &response.payload,
+            &request.scope_id,
+            &request.evidence_subject,
+        );
         Ok(RoleAcquisition {
             operation: response.operation,
             state,
@@ -583,13 +585,7 @@ fn bounded_reason(prefix: &'static str, detail: impl std::fmt::Display) -> Strin
     let mut reason = format!("{prefix}: {detail}");
     reason = reason
         .chars()
-        .map(|cell| {
-            if cell.is_control() {
-                ' '
-            } else {
-                cell
-            }
-        })
+        .map(|cell| if cell.is_control() { ' ' } else { cell })
         .collect();
     let trimmed = reason.trim().to_owned();
     let reason = if trimmed.is_empty() {
@@ -621,22 +617,18 @@ fn classify_read_error(error: ReadError) -> Result<ProjectionState, ContextInput
         ReadError::Store(detail) => Ok(ProjectionState::Unavailable {
             reason: bounded_reason("store read failed", detail),
         }),
-        ReadError::OperationNotAllowed { operation, context } => {
-            Ok(ProjectionState::Unavailable {
-                reason: bounded_reason(
-                    "operation not supported for input reconstruction",
-                    format!("{operation:?} for {context}"),
-                ),
-            })
-        }
-        ReadError::InvalidIntentOperation { operation, mode } => {
-            Ok(ProjectionState::Unavailable {
-                reason: bounded_reason(
-                    "operation does not support this query mode",
-                    format!("{operation:?} for {mode:?}"),
-                ),
-            })
-        }
+        ReadError::OperationNotAllowed { operation, context } => Ok(ProjectionState::Unavailable {
+            reason: bounded_reason(
+                "operation not supported for input reconstruction",
+                format!("{operation:?} for {context}"),
+            ),
+        }),
+        ReadError::InvalidIntentOperation { operation, mode } => Ok(ProjectionState::Unavailable {
+            reason: bounded_reason(
+                "operation does not support this query mode",
+                format!("{operation:?} for {mode:?}"),
+            ),
+        }),
         ReadError::ResponseMismatch => Ok(ProjectionState::Stale {
             reason: "named read response changed operation or fence".to_owned(),
         }),
@@ -658,9 +650,10 @@ fn classify_read_error(error: ReadError) -> Result<ProjectionState, ContextInput
         ReadError::InvalidField { field, reason } => Err(ContextInputsError::RequestRejected(
             bounded_reason("invalid read field", format!("{field}: {reason}")),
         )),
-        ReadError::EmptyField(field) => Err(ContextInputsError::RequestRejected(
-            bounded_reason("empty read field", field),
-        )),
+        ReadError::EmptyField(field) => Err(ContextInputsError::RequestRejected(bounded_reason(
+            "empty read field",
+            field,
+        ))),
         ReadError::DuplicateField(field) => Err(ContextInputsError::RequestRejected(
             bounded_reason("duplicate read field", field),
         )),
@@ -688,7 +681,9 @@ fn classify_opaque_payload(payload: &Value) -> ProjectionState {
 /// `None` from a successful read is an authoritative empty positions view.
 /// A non-committed or undecodable payload is `Unavailable`, never empty and
 /// never promoted: only an external receipt proves an admitted position.
-fn decode_epistemic_payload(payload: &Value) -> (ProjectionState, Option<EpistemicPositionReadback>) {
+fn decode_epistemic_payload(
+    payload: &Value,
+) -> (ProjectionState, Option<EpistemicPositionReadback>) {
     let readback: Option<EpistemicPositionReadback> = match serde_json::from_value(payload.clone())
     {
         Ok(value) => value,
@@ -719,11 +714,7 @@ fn decode_epistemic_payload(payload: &Value) -> (ProjectionState, Option<Epistem
 /// explicit `truncated: false` and matching totals. A truncated pack is
 /// `Partial`; a payload whose provenance does not describe its records is
 /// `Unknown`. Transport and catalogue failures never reach this function.
-fn classify_evidence_payload(
-    payload: &Value,
-    scope: &ScopeId,
-    subject: &str,
-) -> ProjectionState {
+fn classify_evidence_payload(payload: &Value, scope: &ScopeId, subject: &str) -> ProjectionState {
     let unavailable = |detail: &str| ProjectionState::Unavailable {
         reason: bounded_reason("evidence payload fails its contract", detail),
     };
@@ -801,10 +792,7 @@ mod reconstruction_tests {
     fn store_and_churn_failures_are_never_empty() -> ProofResult {
         let unavailable =
             classify_read_error(ReadError::Store(StoreReadFailure::UnknownOperation))?;
-        assert!(matches!(
-            unavailable,
-            ProjectionState::Unavailable { .. }
-        ));
+        assert!(matches!(unavailable, ProjectionState::Unavailable { .. }));
         let stale = classify_read_error(ReadError::RevisionChurn)?;
         assert!(matches!(stale, ProjectionState::Stale { .. }));
         let blocked = classify_read_error(ReadError::MissingDependencies)?;
@@ -931,12 +919,13 @@ mod reconstruction_tests {
     fn test_fence() -> ProofResult<eliot_contracts::StateFence> {
         use std::num::NonZeroU64;
         let lineage = eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")?;
-        let epoch = eliot_contracts::EpochId::new(lineage, NonZeroU64::new(1).ok_or(
-            eliot_store_api::StoreError::InvalidField {
+        let epoch = eliot_contracts::EpochId::new(
+            lineage,
+            NonZeroU64::new(1).ok_or(eliot_store_api::StoreError::InvalidField {
                 field: "test.sequence",
                 reason: "must be non-zero",
-            },
-        )?)?;
+            })?,
+        )?;
         Ok(eliot_contracts::StateFence::new(
             epoch,
             eliot_contracts::ResourceGeneration::genesis(),

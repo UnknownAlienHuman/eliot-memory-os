@@ -188,6 +188,94 @@ pub fn verify_canonical_request_hash(
     }
 }
 
+/// Canonical admission-decision view hashed by [`admission_digest_hex`]
+/// (issue #18 W2/W3/A1/A2/A3).
+///
+/// Documented byte layout of the I05-06 step-12 admission-DECISION digest:
+/// canonical JSON (keys sorted recursively, arrays order-significant) of
+/// exactly these bound values, in any key order after canonicalization:
+/// `contract_set_digest` (the admitted contract-set INPUT digest, carried on
+/// the transition as `admission_contract_set_digest`), `transition_class`
+/// (snake case), `requested_effect_ceiling` (screaming case),
+/// `scope_id` (transparent text), and `task_id` (string or null).
+/// The named-operation plan is NOT repeated here: it is bound separately by
+/// [`mutation_plan_digest_hex`]. The digest is lowercase SHA-256 hex over
+/// those canonical bytes.
+#[derive(Serialize)]
+struct CanonicalAdmissionDecision<'a> {
+    contract_set_digest: &'a str,
+    transition_class: TransitionClass,
+    requested_effect_ceiling: EffectClass,
+    scope_id: &'a str,
+    task_id: Option<&'a str>,
+}
+
+/// Computes the I05-06 step-12 admission-DECISION digest (issue #18).
+///
+/// This binds the admission DECISION (contract-set input plus the admitted
+/// class, ceiling, scope, and task binding) and is distinct from the
+/// contract-set input digest it covers. Every input is already covered by
+/// [`canonical_request_bytes`], so the canonical request hash coverage is
+/// unchanged; this binding only names the decision digest explicitly.
+pub fn admission_digest_hex(transition: &PreparedTransition) -> Result<String, StoreError> {
+    let view = CanonicalAdmissionDecision {
+        contract_set_digest: &transition.admission_contract_set_digest,
+        transition_class: transition.transition_class,
+        requested_effect_ceiling: transition.requested_effect_ceiling,
+        scope_id: transition.scope_id.as_str(),
+        task_id: transition.task_id.as_deref(),
+    };
+    let bytes = canonical_json_bytes(&view)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Computes the I05-06 YAML `mutation_plan_hash` equivalent (issue #18).
+///
+/// Lowercase hex SHA-256 over the canonical bytes of the exact ordered
+/// [`NamedMutationRequest`] plan. Execution order is significant: the plan
+/// is hashed verbatim and never reordered (canonicalization sorts object
+/// keys only, never arrays). This binds the authorized plan content and is
+/// distinct from the authorizing catalogue manifest digest carried as
+/// `operation_manifest_digest`. The plan content is already covered by
+/// [`canonical_request_bytes`] via `semantic_commands`, so canonical
+/// request hash coverage is unchanged.
+pub fn mutation_plan_digest_hex(
+    named_operations: &[NamedMutationRequest],
+) -> Result<String, StoreError> {
+    let bytes = canonical_json_bytes(&named_operations)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Recomputes the mutation-plan digest and rejects divergence with the typed
+/// mismatch error (issue #18).
+pub fn verify_mutation_plan_digest(transition: &PreparedTransition) -> Result<(), StoreError> {
+    let observed = mutation_plan_digest_hex(&transition.named_operations)?;
+    if observed == transition.mutation_plan_digest {
+        Ok(())
+    } else {
+        Err(StoreError::TransitionDigestMismatch {
+            expected: bound_digest(&transition.mutation_plan_digest),
+            observed: bound_digest(&observed),
+        })
+    }
+}
+
+/// Recomputes the admission-decision digest and rejects divergence with the
+/// typed mismatch error (issue #18).
+pub fn verify_admission_digest(transition: &PreparedTransition) -> Result<(), StoreError> {
+    let observed = admission_digest_hex(transition)?;
+    if observed == transition.admission_digest {
+        Ok(())
+    } else {
+        Err(StoreError::TransitionDigestMismatch {
+            expected: bound_digest(&transition.admission_digest),
+            observed: bound_digest(&observed),
+        })
+    }
+}
+
 fn bound_digest(value: &str) -> String {
     value.chars().take(MAX_DIGEST_DETAIL_CHARS).collect()
 }
@@ -447,6 +535,9 @@ mod tests {
             requested_effect_ceiling: view.requested_effect_ceiling,
             admission_contract_set_digest: view.admission_contract_set_digest.clone(),
             operation_manifest_digest: view.operation_manifest_digest.clone(),
+            admission_digest: "e".repeat(64),
+            mutation_plan_digest: "f".repeat(64),
+            semantic_source_revisions: Vec::new(),
             named_operations: view.semantic_commands.clone(),
             event_projection_relation_intents: view.event_projection_relation_intents.clone(),
             security: view.security.clone(),
@@ -459,5 +550,87 @@ mod tests {
             &view.expected_ordering_heads,
         );
         assert_eq!(rebuilt, view);
+    }
+
+    fn bound_transition() -> PreparedTransition {
+        let view = golden_view();
+        let mut transition = PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: view.operation_id.clone(),
+                idempotency_key: view.idempotency_key.clone(),
+                canonical_request_hash: "d".repeat(64),
+            },
+            state_fence: fence(),
+            scope_id: view.scope_id.clone(),
+            task_id: view.task_id.clone(),
+            ordering_scopes: vec![OrderingScopeId::new("scope-golden").expect("ordering")],
+            transition_class: view.transition_class,
+            requested_effect_ceiling: view.requested_effect_ceiling,
+            admission_contract_set_digest: view.admission_contract_set_digest.clone(),
+            operation_manifest_digest: view.operation_manifest_digest.clone(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
+            named_operations: view.semantic_commands.clone(),
+            event_projection_relation_intents: view.event_projection_relation_intents.clone(),
+            security: view.security.clone(),
+            required_proof_and_approval_refs: view.required_proof_and_approval_refs.clone(),
+        };
+        crate::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
+    }
+
+    #[test]
+    fn issue18_digests_bind_derived_content_and_verify() {
+        let transition = bound_transition();
+        // The mutation-plan digest binds the exact ordered plan and forks
+        // when execution order changes.
+        let plan_digest =
+            mutation_plan_digest_hex(&transition.named_operations).expect("plan digest computes");
+        assert_eq!(transition.mutation_plan_digest, plan_digest);
+        let mut two_command = transition.named_operations.clone();
+        two_command.push(NamedMutationRequest {
+            operation: NamedMutationOperation::AppendAuditEvent,
+            parameters: BTreeMap::from([("note".to_owned(), serde_json::json!("audit-golden-1"))]),
+        });
+        let ordered_digest =
+            mutation_plan_digest_hex(&two_command).expect("ordered digest computes");
+        let mut reordered = two_command.clone();
+        reordered.rotate_right(1);
+        assert_ne!(
+            mutation_plan_digest_hex(&reordered).expect("reordered digest computes"),
+            ordered_digest
+        );
+        assert!(verify_mutation_plan_digest(&transition).is_ok());
+        // The admission-decision digest binds the decision, never the bare
+        // contract-set input: it differs from the input digest and forks
+        // when the admitted class changes.
+        let decision_digest = admission_digest_hex(&transition).expect("decision digest computes");
+        assert_eq!(transition.admission_digest, decision_digest);
+        assert_ne!(decision_digest, transition.admission_contract_set_digest);
+        let mut reclassed = transition.clone();
+        reclassed.transition_class = TransitionClass::Epistemic;
+        assert_ne!(
+            admission_digest_hex(&reclassed).expect("reclassed digest computes"),
+            decision_digest
+        );
+        assert!(verify_admission_digest(&transition).is_ok());
+    }
+
+    #[test]
+    fn issue18_digest_tampering_maps_to_the_typed_mismatch() {
+        let transition = bound_transition();
+        let mut tampered_plan = transition.clone();
+        tampered_plan.mutation_plan_digest = "0".repeat(64);
+        assert!(matches!(
+            verify_mutation_plan_digest(&tampered_plan),
+            Err(StoreError::TransitionDigestMismatch { .. })
+        ));
+        let mut tampered_admission = transition.clone();
+        tampered_admission.admission_digest = "1".repeat(64);
+        assert!(matches!(
+            verify_admission_digest(&tampered_admission),
+            Err(StoreError::TransitionDigestMismatch { .. })
+        ));
     }
 }

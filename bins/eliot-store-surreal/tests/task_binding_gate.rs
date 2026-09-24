@@ -58,7 +58,7 @@ fn transition(
 ) -> PreparedTransition {
     let entries = eliot_store_api::generated_operation_manifests().expect("catalogue");
     let set_digest = eliot_store_api::operation_manifest_set_digest(&entries).expect("set digest");
-    PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-1929-1").expect("operation id"),
             idempotency_key: "idem-1929-1".to_owned(),
@@ -72,6 +72,11 @@ fn transition(
         requested_effect_ceiling: ceiling,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: set_digest,
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; this fixture leg binds no semantic source (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation,
             parameters: params,
@@ -83,7 +88,9 @@ fn transition(
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: refs,
-    }
+    };
+    eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+    transition
 }
 
 fn capture(task: Option<&str>, refs: Vec<String>) -> PreparedTransition {

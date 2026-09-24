@@ -1646,7 +1646,7 @@ pub(crate) fn read_testd_terminal_completion(
                 job_id: request.job_id.clone(),
                 receipt_sha256: request.receipt_sha256.clone(),
                 request_digest: request.request_digest.clone(),
-                receipt,
+                receipt: Box::new(receipt),
             },
         );
     }

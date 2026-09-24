@@ -281,7 +281,7 @@ mod tests {
     fn transition(fence: &StateFence) -> PreparedTransition {
         let entries = generated_operation_manifests().expect("catalogue");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest");
-        PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-daemon-1").expect("operation id"),
                 idempotency_key: "idem-daemon-1".to_owned(),
@@ -295,6 +295,11 @@ mod tests {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "a".repeat(64),
             operation_manifest_digest: set_digest,
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; this fixture leg binds no semantic source (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -309,7 +314,9 @@ mod tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     fn ordering_head(fence: &StateFence) -> OrderingHeadExpectation {

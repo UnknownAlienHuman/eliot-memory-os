@@ -89,7 +89,7 @@ fn ctx(op: &str) -> RequestMeta {
 }
 
 fn transition(op: &str, scopes: &[&str]) -> PreparedTransition {
-    PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new(op).unwrap(),
             idempotency_key: format!("idem-{op}"),
@@ -106,6 +106,11 @@ fn transition(op: &str, scopes: &[&str]) -> PreparedTransition {
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: OperationManifestDigest::new("manifest-993").unwrap(),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; this fixture leg binds no semantic source (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: std::collections::BTreeMap::from([(
@@ -120,7 +125,9 @@ fn transition(op: &str, scopes: &[&str]) -> PreparedTransition {
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    eliot_store_api::bind_issue18_digests(&mut transition).unwrap();
+    transition
 }
 
 fn binding(scope: &str, reserved: u64, expected: u64) -> ReservedScopeBinding {
@@ -262,6 +269,11 @@ fn commit_receipt(attempt: &ExecutableAttempt) -> WriteReceipt {
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        // Issue-#18 bindings are copied exactly from the admitted
+        // transition, never defaulted.
+        admission_digest: transition.admission_digest.clone(),
+        mutation_plan_digest: transition.mutation_plan_digest.clone(),
+        semantic_source_revisions: transition.semantic_source_revisions.clone(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),

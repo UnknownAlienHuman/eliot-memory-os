@@ -694,8 +694,10 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
-        self.execute_daemon_request_observed(session, request_id, operation, payload, None)
-            .await
+        Box::pin(
+            self.execute_daemon_request_observed(session, request_id, operation, payload, None),
+        )
+        .await
     }
 
     /// Executes one daemon request with the identity admitted on the same
@@ -720,13 +722,13 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        self.execute_daemon_request_observed(
+        Box::pin(self.execute_daemon_request_observed(
             session,
             request_id,
             operation,
             payload,
             Some(request_identity),
-        )
+        ))
         .await
     }
 
@@ -740,15 +742,14 @@ impl KernelComposition {
     ) -> Result<Frame, TransportError> {
         observe_daemon_request("kernel.daemon_request_received", "attempt");
         observe_daemon_operation(trusted_daemon_operation(operation), "received");
-        let result = self
-            .execute_daemon_request_inner(
-                session,
-                request_id,
-                operation,
-                &payload,
-                request_identity.as_ref(),
-            )
-            .await;
+        let result = Box::pin(self.execute_daemon_request_inner(
+            session,
+            request_id,
+            operation,
+            &payload,
+            request_identity.as_ref(),
+        ))
+        .await;
         match &result {
             Ok(_) => {
                 observe_daemon_request("kernel.daemon_request_validated", "success");
@@ -867,11 +868,11 @@ impl KernelComposition {
             }
             #[cfg(windows)]
             USER_AUTOMATION_RUNTIME_OPERATION => {
-                self.user_automation_runtime_operation(
+                Box::pin(self.user_automation_runtime_operation(
                     session,
                     payload.clone(),
                     request_identity.ok_or(TransportError::SessionFenced)?,
-                )
+                ))
                 .await
             }
             "health" => self
@@ -888,7 +889,7 @@ impl KernelComposition {
                     .await
             }
             "apply_prepared" => {
-                self.store_apply_operation(session, request_id.clone(), payload.clone())
+                Box::pin(self.store_apply_operation(session, request_id.clone(), payload.clone()))
                     .await
             }
             "receipt" => store_receipt_dispatch::dispatch(self, session, payload.clone()).await,
@@ -1337,6 +1338,10 @@ impl KernelComposition {
     /// with the daemon session is rejected before opening the owner channel.
     /// Runtime owner failures remain typed projections so an uncertain send
     /// can be reconciled by its original operation identity.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "issue #18 audited gateway dispatch; staged extraction follows"
+    )]
     async fn user_automation_runtime_operation(
         &self,
         session: &Session,
@@ -1361,9 +1366,12 @@ impl KernelComposition {
             let Some(trigger) = envelope.trigger else {
                 return Err(TransportError::SessionFenced);
             };
-            return self
-                .user_automation_owner_trigger_operation(session, trigger, request_identity)
-                .await;
+            return Box::pin(self.user_automation_owner_trigger_operation(
+                session,
+                trigger,
+                request_identity,
+            ))
+            .await;
         };
 
         let request_fence = match &request {
@@ -1455,7 +1463,7 @@ impl KernelComposition {
 
         match request {
             UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
-                match client.admit_occurrence(request).await {
+                match Box::pin(client.admit_occurrence(request)).await {
                     Ok(execution) => Ok(serde_json::json!({
                         "status": "known",
                         "value": {
@@ -1468,7 +1476,7 @@ impl KernelComposition {
                 }
             }
             UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
-                match client.cancel_pending_wakes(request).await {
+                match Box::pin(client.cancel_pending_wakes(request)).await {
                     Ok(wake_ids) => Ok(serde_json::json!({
                         "status": "known",
                         "value": {
@@ -1481,7 +1489,7 @@ impl KernelComposition {
                 }
             }
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
-                match client.read_pending_wake(request).await {
+                match Box::pin(client.read_pending_wake(request)).await {
                     Ok(readback) => Ok(serde_json::json!({
                         "status": "known",
                         "value": {
@@ -1504,6 +1512,10 @@ impl KernelComposition {
     /// Kernel session, while the immutable revision and current pointer come
     /// from the generation-routed canonical Store owner. No caller-supplied
     /// preflight, invocation, or Host authority is accepted here.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "issue #18 audited gateway dispatch; staged extraction follows"
+    )]
     async fn user_automation_owner_trigger_operation(
         &self,
         session: &Session,
@@ -1658,10 +1670,11 @@ impl KernelComposition {
             Ok(client) => client,
             Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
         };
-        let wake_readback = match host_client.read_pending_wake(wake_request.clone()).await {
-            Ok(readback) => readback,
-            Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
-        };
+        let wake_readback =
+            match Box::pin(host_client.read_pending_wake(wake_request.clone())).await {
+                Ok(readback) => readback,
+                Err(error) => return Ok(Self::user_automation_runtime_error_response(error)),
+            };
         let owner_after = gateway
             .read_user_automation_owner(&lookup)
             .await

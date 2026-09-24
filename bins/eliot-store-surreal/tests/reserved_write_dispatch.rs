@@ -314,7 +314,7 @@ fn transition() -> PreparedTransition {
     // catalogue gate re-checks it before any provider I/O.
     let entries = eliot_store_api::generated_operation_manifests().unwrap();
     let set_digest = eliot_store_api::operation_manifest_set_digest(&entries).unwrap();
-    PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-991-d1").unwrap(),
             idempotency_key: "idem-991-d1".to_owned(),
@@ -328,6 +328,11 @@ fn transition() -> PreparedTransition {
         requested_effect_ceiling: eliot_store_api::EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: set_digest,
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; this fixture leg binds no semantic source (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!("observation-991-d1"))]),
@@ -339,7 +344,9 @@ fn transition() -> PreparedTransition {
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    eliot_store_api::bind_issue18_digests(&mut transition).unwrap();
+    transition
 }
 
 fn valid_request() -> ReservedWriteRequest {

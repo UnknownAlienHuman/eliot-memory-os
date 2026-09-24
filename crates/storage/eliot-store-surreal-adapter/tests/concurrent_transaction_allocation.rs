@@ -145,6 +145,11 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: OperationManifestDigest::new("manifest-1").expect("manifest"),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; no semantic source is bound here (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -157,6 +162,7 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
     transition.operation_manifest_digest =
         operation_manifest_set_digest(&generated_operation_manifests().expect("catalogue"))
             .expect("manifest digest");

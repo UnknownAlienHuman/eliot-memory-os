@@ -34,8 +34,8 @@ use eliot_coordination::{
 use eliot_store_api::{OrderingHeadExpectation, RevisionHeadExpectation, StateFence, StoreError};
 
 use super::{
-    swarm_plan_attachment_ownership::AttachmentOwnershipScope, CanonicalAttachmentStoreError,
-    CanonicalSwarmPlanAttachmentStore, SwarmPlanAttachmentService,
+    CanonicalAttachmentStoreError, CanonicalSwarmPlanAttachmentStore, SwarmPlanAttachmentService,
+    swarm_plan_attachment_ownership::AttachmentOwnershipScope,
 };
 
 /// The single Governor-to-swarm attachment composition.
@@ -158,7 +158,12 @@ mod tests {
     fn composition_covers_single_service_scope() {
         let composition = SwarmAttachmentComposition::new(SwarmPlanAttachmentService::new());
         assert_eq!(composition.ownership_scope().services(), 1);
-        assert!(composition.store().is_empty().expect("store state is readable"));
+        assert!(
+            composition
+                .store()
+                .is_empty()
+                .expect("store state is readable")
+        );
     }
 
     #[test]
@@ -191,7 +196,10 @@ mod tests {
             })) => assert_eq!(existing, winner),
             other => panic!("second job must conflict with the winner, got {other:?}"),
         }
-        assert_eq!(composition.store().len().expect("store state is readable"), 1);
+        assert_eq!(
+            composition.store().len().expect("store state is readable"),
+            1
+        );
     }
 
     #[test]
@@ -245,7 +253,10 @@ mod tests {
         }
         assert_eq!(winners.len(), 1, "exactly one first-bind may succeed");
         assert_eq!(conflicts, 7);
-        assert_eq!(composition.store().len().expect("store state is readable"), 1);
+        assert_eq!(
+            composition.store().len().expect("store state is readable"),
+            1
+        );
     }
 
     #[test]
@@ -282,6 +293,11 @@ mod tests {
             composition.vend_consumer("   ", PLAN, FENCE_DIGEST),
             Err(SwarmPlanAttachmentError::InvalidField("admission_digest"))
         );
-        assert!(composition.store().is_empty().expect("store state is readable"));
+        assert!(
+            composition
+                .store()
+                .is_empty()
+                .expect("store state is readable")
+        );
     }
 }

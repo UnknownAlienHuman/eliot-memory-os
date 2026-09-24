@@ -1385,11 +1385,17 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            // Issue-#18 bindings are copied exactly from the canonical
+            // genesis transition; genesis binds no semantic source.
+            admission_digest: transition.admission_digest.clone(),
+            mutation_plan_digest: transition.mutation_plan_digest.clone(),
+            semantic_source_revisions: Vec::new(),
             error_code: None,
             resubmission: eliot_store_api::Resubmission::None,
             committed_at: Some(format!("commit-sequence-{0:016}", 1)),
             envelope: None,
         };
+        eliot_store_api::bind_issue18_receipt(&transition, &mut receipt, &[]);
         assert_eq!(context.state_fence, transition.state_fence);
         assert_eq!(context.state_fence, receipt.state_fence);
         assert_eq!(receipt.operation_id, transition.identity.operation_id);
@@ -1428,6 +1434,16 @@ mod tests {
         Vec<OrderingHeadExpectation>,
     ) {
         let context = context_for(fence, "apply-request-1", "source");
+        let revision_heads = vec![RevisionHeadExpectation {
+            key: RevisionKey::new("scope:one").expect("key"),
+            expected_revision: 1,
+            state_fence: fence.clone(),
+        }];
+        let ordering_heads = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope-authority").expect("ordering"),
+            expected_sequence: 1,
+            state_fence: fence.clone(),
+        }];
         let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("apply-op-1").expect("operation id"),
@@ -1443,6 +1459,15 @@ mod tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-authority")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; the admitted expected heads render here via
+            // `render_semantic_source_revisions`, mirroring the Governor
+            // envelope path.
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: eliot_store_api::render_semantic_source_revisions(
+                &revision_heads,
+            ),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -1458,16 +1483,7 @@ mod tests {
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
-        let revision_heads = vec![RevisionHeadExpectation {
-            key: RevisionKey::new("scope:one").expect("key"),
-            expected_revision: 1,
-            state_fence: fence.clone(),
-        }];
-        let ordering_heads = vec![OrderingHeadExpectation {
-            scope: OrderingScopeId::new("scope-authority").expect("ordering"),
-            expected_sequence: 1,
-            state_fence: fence.clone(),
-        }];
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
         let view = CanonicalRequestView::from_apply(
             &context,
             &transition,
@@ -1496,6 +1512,12 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            // Issue-#18 bindings are copied exactly from the admitted
+            // transition, never defaulted; equality is enforced by the
+            // receipt-issuing path.
+            admission_digest: transition.admission_digest.clone(),
+            mutation_plan_digest: transition.mutation_plan_digest.clone(),
+            semantic_source_revisions: transition.semantic_source_revisions.clone(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),
@@ -2058,7 +2080,17 @@ mod tests {
 
     fn reserved_request(fence: &StateFence) -> ReservedWriteRequest {
         let context = context_for(fence, "reserved-request-1", "source-991-k");
-        let transition = PreparedTransition {
+        let expected_revision_heads = vec![RevisionHeadExpectation {
+            key: RevisionKey::new("rev-991-k1").expect("key"),
+            expected_revision: 3,
+            state_fence: fence.clone(),
+        }];
+        let expected_ordering_heads = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope-991-k1").expect("ordering"),
+            expected_sequence: 6,
+            state_fence: fence.clone(),
+        }];
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-991-k1").expect("operation id"),
                 idempotency_key: "idem-991-k1".to_owned(),
@@ -2073,6 +2105,15 @@ mod tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-991-k1")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; the admitted expected heads render here via
+            // `render_semantic_source_revisions`, mirroring the Governor
+            // envelope path.
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: eliot_store_api::render_semantic_source_revisions(
+                &expected_revision_heads,
+            ),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!("observation-991-k1"))]),
@@ -2085,6 +2126,7 @@ mod tests {
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
         let admission = WriteAdmissionProjection::bind(
             &transition,
             WriteAdmissionParams {
@@ -2117,16 +2159,8 @@ mod tests {
             context,
             transition,
             admission,
-            expected_revision_heads: vec![RevisionHeadExpectation {
-                key: RevisionKey::new("rev-991-k1").expect("key"),
-                expected_revision: 3,
-                state_fence: fence.clone(),
-            }],
-            expected_ordering_heads: vec![OrderingHeadExpectation {
-                scope: OrderingScopeId::new("scope-991-k1").expect("ordering"),
-                expected_sequence: 6,
-                state_fence: fence.clone(),
-            }],
+            expected_revision_heads,
+            expected_ordering_heads,
         };
         request.validate().expect("reserved request validates");
         request
@@ -2154,6 +2188,12 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            // Issue-#18 bindings are copied exactly from the admitted
+            // transition, never defaulted; equality is enforced by the
+            // receipt-issuing path.
+            admission_digest: transition.admission_digest.clone(),
+            mutation_plan_digest: transition.mutation_plan_digest.clone(),
+            semantic_source_revisions: transition.semantic_source_revisions.clone(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

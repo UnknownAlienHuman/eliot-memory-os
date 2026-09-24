@@ -2099,8 +2099,7 @@ fn committed_erasure_receipt() -> eliot_store_api::WriteReceipt {
             relation_kinds: Vec::new(),
         },
     };
-    let mut prepared =
-        eliot_store_api::admit_erasure_transition(&request).expect("erasure admits");
+    let mut prepared = eliot_store_api::admit_erasure_transition(&request).expect("erasure admits");
     let view = eliot_store_api::CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
     prepared.identity.canonical_request_hash =
         eliot_store_api::canonical_request_hash(&view).expect("request digest");
@@ -2171,10 +2170,7 @@ impl RestoreTarget for ErasureProbeTarget {
     fn import_receipt(&mut self, _: &eliot_store_api::WriteReceipt) -> Result<(), BackupError> {
         Ok(())
     }
-    fn import_projection(
-        &mut self,
-        _: &eliot_backup::CanonicalRecord,
-    ) -> Result<(), BackupError> {
+    fn import_projection(&mut self, _: &eliot_backup::CanonicalRecord) -> Result<(), BackupError> {
         Ok(())
     }
     fn suspend_ors_operations(
@@ -2183,10 +2179,7 @@ impl RestoreTarget for ErasureProbeTarget {
     ) -> Result<(), BackupError> {
         Ok(())
     }
-    fn rebuild_projections(
-        &mut self,
-        _: &eliot_backup::RestoredFence,
-    ) -> Result<(), BackupError> {
+    fn rebuild_projections(&mut self, _: &eliot_backup::RestoredFence) -> Result<(), BackupError> {
         Ok(())
     }
     fn verify_receipt_event_chain(
@@ -2285,8 +2278,7 @@ fn restore_executor_refuses_rehydration_from_committed_erasure_receipt() {
         );
     }
     let bundle = probe_bundle_with_events_and_receipts(canonical_events, vec![erasure]);
-    let plan =
-        RestorePlan::compile(&bundle, target_context("target-1712-erasure")).expect("plan");
+    let plan = RestorePlan::compile(&bundle, target_context("target-1712-erasure")).expect("plan");
     let mut target = ErasureProbeTarget { calls: Vec::new() };
     let mut journal = MapJournal::new();
     assert_eq!(
@@ -2296,10 +2288,7 @@ fn restore_executor_refuses_rehydration_from_committed_erasure_receipt() {
         ))
     );
     assert!(
-        !target
-            .calls
-            .iter()
-            .any(|call| call.starts_with("receipt:")),
+        !target.calls.iter().any(|call| call.starts_with("receipt:")),
         "the erasure receipt phase must never reach the target: {:?}",
         target.calls
     );
@@ -2347,6 +2336,13 @@ fn restore_executor_imports_non_erasure_receipt_untouched() {
             "manifest-control-1712",
         )
         .expect("manifest"),
+        // Standalone-fixture issue-#18 values (not bound to a transition):
+        // this control only exercises the non-erasure restore path, never
+        // digest bindings. Shapes stay valid so `validate()` reaches the
+        // behavior under test.
+        admission_digest: "e".repeat(64),
+        mutation_plan_digest: "f".repeat(64),
+        semantic_source_revisions: Vec::new(),
         error_code: None,
         resubmission: eliot_store_api::Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),
@@ -2355,8 +2351,7 @@ fn restore_executor_imports_non_erasure_receipt_untouched() {
     control.validate().expect("control receipt is well-formed");
     assert!(control.refuse_rehydration_from_erasure().is_ok());
     let bundle = probe_bundle_with_events_and_receipts(Vec::new(), vec![control]);
-    let plan =
-        RestorePlan::compile(&bundle, target_context("target-1712-control")).expect("plan");
+    let plan = RestorePlan::compile(&bundle, target_context("target-1712-control")).expect("plan");
     let mut target = ErasureProbeTarget { calls: Vec::new() };
     let mut journal = MapJournal::new();
     let result = plan.execute_with_journal(&bundle, &mut target, &mut journal);

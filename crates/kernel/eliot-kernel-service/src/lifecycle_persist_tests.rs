@@ -419,6 +419,11 @@ impl FakeStore {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: manifest,
+            // Issue-#18 bindings are copied exactly from the admitted
+            // transition, never defaulted.
+            admission_digest: transition.admission_digest.clone(),
+            mutation_plan_digest: transition.mutation_plan_digest.clone(),
+            semantic_source_revisions: transition.semantic_source_revisions.clone(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),
@@ -585,6 +590,13 @@ fn committed_receipt(
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: manifest,
+        // Standalone-fixture issue-#18 values (not bound to a transition):
+        // this seed only exercises hop-chain persistence, never digest
+        // bindings. Shapes stay valid so `validate()` reaches the behavior
+        // under test.
+        admission_digest: "e".repeat(64),
+        mutation_plan_digest: "f".repeat(64),
+        semantic_source_revisions: Vec::new(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),
