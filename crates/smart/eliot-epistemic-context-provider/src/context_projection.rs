@@ -18,9 +18,7 @@
 #![forbid(unsafe_code)]
 
 use eliot_context_contracts::ProviderId;
-use eliot_epistemic_contracts::{
-    CurrentEpistemicPosition, ProviderContribution,
-};
+use eliot_epistemic_contracts::{CurrentEpistemicPosition, ProviderContribution};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -67,9 +65,7 @@ impl EpistemicContextContribution {
     ///
     /// The owner rejects superseded positions and runs closed validation;
     /// this adapter only attaches the provider identity afterward.
-    pub fn from_position(
-        position: &CurrentEpistemicPosition,
-    ) -> Result<Self, ContributionError> {
+    pub fn from_position(position: &CurrentEpistemicPosition) -> Result<Self, ContributionError> {
         let contribution = ProviderContribution::contribute(position)?;
         Self::from_contribution(contribution)
     }

@@ -23,8 +23,8 @@
 
 use eliot_contracts::StateFence;
 use eliot_observation_contracts::{
-    ExperienceRecordRef, ExperienceSourceFamily, ObservationError, ObservationScope,
-    ProjectionCoverage, ProjectionOmission, MAX_PROJECTION_MEMBERS, MAX_PROJECTION_OMISSIONS,
+    ExperienceRecordRef, ExperienceSourceFamily, MAX_PROJECTION_MEMBERS, MAX_PROJECTION_OMISSIONS,
+    ObservationError, ObservationScope, ProjectionCoverage, ProjectionOmission,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

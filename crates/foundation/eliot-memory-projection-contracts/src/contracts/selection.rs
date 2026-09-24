@@ -411,10 +411,7 @@ impl MemorySelectionTrace {
                 ));
             }
             let expected = intent.kinds.contains(&record.kind);
-            let selected = matches!(
-                entry.disposition,
-                SelectionDisposition::Selected
-            );
+            let selected = matches!(entry.disposition, SelectionDisposition::Selected);
             if selected != expected {
                 return Err(SelectionError::Upstream(
                     MemoryProjectionError::CoverageMismatch {
