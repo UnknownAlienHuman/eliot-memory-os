@@ -40,6 +40,7 @@ mod recovery;
 mod schema_contract;
 pub(crate) mod surreal_automation;
 pub(crate) mod surreal_experience;
+pub(crate) mod surreal_learning;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 use atomic_write::{TxLane, to_value, write_transaction};
@@ -993,7 +994,8 @@ async fn rendezvous_before_transaction(adapter: &SurrealStoreAdapter) -> Result<
 /// exact same-operation receipt reconciliation before replay.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the apply attempt carries the exact admitted contract: context, transition, both head sets, authorities, lane"
+    clippy::too_many_lines,
+    reason = "the apply attempt carries the exact admitted contract: context, transition, both head sets, authorities, lane; each admitted leg computes its row writes inline before receipt planning"
 )]
 async fn apply_with_retry(
     adapter: &SurrealStoreAdapter,
@@ -1092,6 +1094,10 @@ async fn apply_with_retry(
         // row writes beside the automation legs under the same discipline.
         let experience_writes =
             surreal_experience::prepare_experience_writes(db, &adapter.config, &transition).await?;
+        // Issue #1868: admitted learning-record legs compute their row
+        // writes beside the experience legs under the same discipline.
+        let learning_writes =
+            surreal_learning::prepare_learning_writes(db, &adapter.config, &transition).await?;
 
         let first_attempt = semantic_plan.is_none();
         let plan = if let Some(semantic) = &semantic_plan {
@@ -1134,6 +1140,7 @@ async fn apply_with_retry(
             &reactive_writes,
             &automation_writes,
             &experience_writes,
+            &learning_writes,
         )
         .await
         {
@@ -2242,7 +2249,7 @@ mod concurrent_allocation_tests {
         use super::super::{
             apply_prepared_with_authority, apply_prepared_without_write_guard, atomic_write,
             build_receipt, client, read_fence, surreal_automation, surreal_experience,
-            surreal_reactive, validate_receipt_identity,
+            surreal_learning, surreal_reactive, validate_receipt_identity,
         };
         use crate::client::session_pool::SessionRole;
         use crate::config::{ClientSetLimits, SurrealAdapterConfig};
@@ -2624,6 +2631,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                &surreal_learning::LearningWrites::default(),
             )
             .await
             .expect("first writer commits");
@@ -2647,6 +2655,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                &surreal_learning::LearningWrites::default(),
             )
             .await
             {
@@ -2693,6 +2702,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                &surreal_learning::LearningWrites::default(),
             )
             .await
             .expect("bounded retry commits");

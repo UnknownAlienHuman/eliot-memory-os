@@ -378,6 +378,9 @@ async fn named_read_payload(
         NamedReadOperation::GetAgentFeedbackRange => {
             experience_feedback_range_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetLearningRecordRange => {
+            learning_record_range_payload(db, &adapter.config, query, state_fence).await
+        }
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
         }
@@ -2249,6 +2252,120 @@ async fn experience_feedback_range_payload(
         records.push(json!({
             "handle": row.handle,
             "revision": row.revision,
+            "record_json": row.record_json,
+            "record_digest": row.record_digest,
+        }));
+    }
+    if records.len() > limit {
+        records.pop();
+        truncated = true;
+    }
+    let matched_total = projection_len(records.len())?;
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                state_fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX)),
+            )
+            .map_err(AdapterError::Store)?,
+        )
+    } else {
+        None
+    };
+    Ok(json!({
+        "records": records,
+        "matched_total": matched_total,
+        "truncated": truncated,
+        "next_cursor": next_cursor,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Reads learning rows and projects the bounded same-fence, same-scope
+/// record set (issue #1868).
+///
+/// Parameters are re-validated here (membership and shape via the
+/// catalogue gate upstream; value rules here) so a misrouted query fails
+/// closed without touching state. Scope arrives through the typed
+/// `scope_id` request field; an over-bound page request fails closed
+/// through the typed decoder before any row is read. Rows project
+/// verbatim record documents plus presented digests in key order with an
+/// explicit truncation marker. The optional closed kind filter narrows
+/// to one record kind; rows outside the filter never leave the store.
+async fn learning_record_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetLearningRecordRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded = eliot_store_api::decode_learning_read(query.operation, &query.parameters)
+        .map_err(AdapterError::Store)?;
+    let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "learning range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let kind_filter: Option<String> = decoded
+        .record_kind
+        .as_ref()
+        .map(|kind| kind.as_str().to_owned());
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    // Fetch covers the skip window plus one probe row: the row scan is
+    // O(table) like every other range read on this contour, and the
+    // probe decides truncation without a second query.
+    let fetch = start
+        .unwrap_or(0)
+        .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+        .saturating_add(1);
+    let fetch = usize::try_from(fetch).unwrap_or(usize::MAX);
+    let rows = super::surreal_learning::read_learning_for_read(
+        db,
+        config,
+        scope_id.as_str(),
+        kind_filter.as_deref(),
+        fetch,
+    )
+    .await?;
+    let mut records = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
+        if records.len() > limit {
+            truncated = true;
+            break;
+        }
+        records.push(json!({
+            "record_kind": row.record_kind,
+            "handle": row.handle,
             "record_json": row.record_json,
             "record_digest": row.record_digest,
         }));
