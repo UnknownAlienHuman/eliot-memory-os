@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 
 use super::surreal_automation::{AutomationWrites, automation_write_statements};
 use super::surreal_experience::{ExperienceWrites, experience_write_statements};
+use super::surreal_learning::{LearningWrites, learning_write_statements};
 use super::surreal_reactive::{ReactiveWrites, reactive_write_statements};
 use crate::client;
 use crate::config::SurrealAdapterConfig;
@@ -90,6 +91,7 @@ const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "automation_invocation_conflict",
     "experience_bank_conflict",
     "experience_feedback_conflict",
+    "learning_record_conflict",
 ];
 
 /// Provider markers proving a deterministic semantic conflict: stale
@@ -210,6 +212,7 @@ pub(super) async fn write_transaction(
     reactive: &ReactiveWrites,
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
+    learning: &LearningWrites,
 ) -> Result<(), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let (sql, bindings) = build_apply_statements(
@@ -225,6 +228,7 @@ pub(super) async fn write_transaction(
         reactive,
         automation,
         experience,
+        learning,
     )?;
     // 688-B classifies provider replies after the atomic RPC: deterministic
     // fence/head markers are conflicts, while an unavailable or unclassified
@@ -286,6 +290,7 @@ fn build_apply_statements(
     reactive: &ReactiveWrites,
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
+    learning: &LearningWrites,
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let revision = plan.next_revision_heads.first().ok_or_else(|| {
@@ -505,6 +510,9 @@ fn build_apply_statements(
     // #223 experience writes and #325 finish owner snapshots commit atomically
     // with the canonical receipt.
     append_experience_statements(&mut sql, &mut bindings, experience)?;
+    // #1868 learning-record writes commit atomically beside the experience
+    // rows under the same create-or-converge contract.
+    append_learning_statements(&mut sql, &mut bindings, learning)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
 
@@ -811,6 +819,28 @@ fn append_experience_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "experience binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+/// Appends canonical learning-record row writes (issue #1868).
+///
+/// Same atomicity contract as the experience fragment: create-or-converge
+/// rows commit in the same transaction as the receipt and outbox rows.
+/// Binding collisions fail closed instead of silently overwriting a
+/// canonical binding.
+fn append_learning_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    learning: &LearningWrites,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) = learning_write_statements(learning);
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "learning binding collided with a canonical binding".to_owned(),
             ));
         }
     }
@@ -1796,6 +1826,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            &LearningWrites::default(),
         )
         .expect("statements assemble");
         assert!(sql.starts_with(schema::TX_BEGIN), "one transaction opens");
@@ -1845,6 +1876,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            &LearningWrites::default(),
         )
         .expect("create path assembles");
         assert!(
@@ -1872,6 +1904,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            &LearningWrites::default(),
         )
         .expect("genesis assembles");
         assert!(
@@ -1903,6 +1936,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            &LearningWrites::default(),
         )
         .expect("statements assemble");
         assert_eq!(
