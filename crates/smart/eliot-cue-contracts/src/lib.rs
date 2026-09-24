@@ -78,7 +78,8 @@ pub use relation::RelationEdge;
 pub use snapshot::{CueSnapshot, RebuildIdentity, SnapshotMember};
 pub use version::{
     ClosedSnapshotRow, ConversionDisposition, CueComparisonKey, CueProjectionDenominator,
-    CueSourceValue, MAX_EDGE_WEIGHT_MILLI, SnapshotEdgeWeight, cue_row_id,
+    CueSnapshotClosure, CueSnapshotFanout, CueSourceValue, MAX_EDGE_WEIGHT_MILLI,
+    SnapshotEdgeWeight, cue_row_id,
 };
 
 /// Schema revision of this vocabulary. A change to any wire shape changes it.

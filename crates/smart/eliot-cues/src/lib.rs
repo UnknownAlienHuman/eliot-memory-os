@@ -31,9 +31,12 @@
 //! | 15 | `adapt_bind` | `AdapterEntry` | one A-12 call + echo check |
 //! | 16 | `adapt_rebuild_snapshot` | `AdapterEntry` | one A-13 call + digest check |
 //! | 17 | `adapt_activate` | `AdapterEntry` | one A-14a call + result validation |
-//! | 18 | `legacy_row_id_v2` | `AdapterEntry` | frozen owner `cue_row_id` projection |
-//! | 19 | `require_reobservation` | `AdapterEntry` | typed refusal with exact owner/revision pointer |
-//! | 20 | `request_legacy_delivery` | `InertHandoff` | validates envelope, names handoff, no completion |
+//! | 18 | `legacy_row_id_v2` | `AdapterEntry` | refuses stored legacy values until fresh owner input |
+//! | 19 | `legacy_row_id_v2_from_fresh_observation` | `AdapterEntry` | frozen owner `cue_row_id` projection after fresh normalization |
+//! | 20 | `preserve_v1_row_bytes` | `AdapterEntry` | exact v1 row bytes plus replay identity |
+//! | 21 | `preserve_v1_snapshot_bytes` | `AdapterEntry` | exact v1 snapshot bytes plus row identities |
+//! | 22 | `require_reobservation` | `AdapterEntry` | typed refusal with exact owner/revision pointer |
+//! | 23 | `request_legacy_delivery` | `InertHandoff` | validates envelope, names handoff, no completion |
 //!
 //! Removed duplicates (compile-proof; see `tests/legacy_facade.rs`):
 //! local `CueKind`/`MatchMode`/`CueStrength`, all `normalize_value*`
@@ -153,6 +156,11 @@ pub struct LegacyDeliveryHandoff {
 pub struct V1RowMigration {
     /// Legacy row identity kept byte-identical.
     pub legacy_row_id: String,
+    /// Exact v1 row bytes retained for replay. Empty is reserved for the
+    /// identity-only compatibility constructor; a byte-closed migration uses
+    /// [`preserve_v1_row_bytes`].
+    #[serde(default)]
+    pub legacy_bytes: Vec<u8>,
     /// Explicit conversion disposition from the owner vocabulary.
     pub disposition: eliot_cue_contracts::ConversionDisposition,
 }
@@ -165,34 +173,112 @@ pub struct V1RowMigration {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct V1SnapshotMigration {
+    /// Legacy snapshot identity, when the v1 envelope supplied one.
+    #[serde(default)]
+    pub legacy_snapshot_id: String,
+    /// Exact v1 snapshot bytes retained for replay. Empty is reserved for
+    /// the identity-only compatibility constructor.
+    #[serde(default)]
+    pub legacy_snapshot_bytes: Vec<u8>,
     /// One entry per preserved legacy row.
     pub rows: Vec<V1RowMigration>,
     /// Migration proof ceiling (candidate artifact only).
     pub ceiling: eliot_cue_contracts::ProofCeiling,
 }
 
-/// Preserves one legacy row identity for replay without converting it.
+/// Refuses an identity-only legacy row migration.
+///
+/// A replay claim without the original bytes is not a closed migration. Use
+/// [`preserve_v1_row_bytes`] with the exact v1 payload instead.
 pub fn preserve_v1_row(legacy_row_id: &str) -> Result<V1RowMigration, FacadeError> {
     if legacy_row_id.trim().is_empty() || legacy_row_id.chars().any(char::is_control) {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_row_id",
         });
     }
+    Err(FacadeError::MigrationRequired {
+        owner: "legacy-v1-replay",
+        revision: "raw-bytes-required",
+    })
+}
+
+/// Preserves the exact v1 row bytes and identity for replay.
+pub fn preserve_v1_row_bytes(
+    legacy_row_id: &str,
+    legacy_bytes: &[u8],
+) -> Result<V1RowMigration, FacadeError> {
+    if legacy_row_id.trim().is_empty() || legacy_row_id.chars().any(char::is_control) {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_row_id",
+        });
+    }
+    if legacy_bytes.is_empty() {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_bytes",
+        });
+    }
     Ok(V1RowMigration {
         legacy_row_id: legacy_row_id.to_owned(),
+        legacy_bytes: legacy_bytes.to_vec(),
         disposition: eliot_cue_contracts::ConversionDisposition::V1ReplayPreserved {
             legacy_row_id: legacy_row_id.to_owned(),
         },
     })
 }
 
-/// Preserves a set of legacy row identities for replay without converting them.
+/// Refuses an identity-only legacy snapshot migration.
+///
+/// A replay claim without the original snapshot bytes is not closed. Use
+/// [`preserve_v1_snapshot_bytes`] with the exact v1 payload instead.
 pub fn preserve_v1_snapshot(row_ids: &[String]) -> Result<V1SnapshotMigration, FacadeError> {
+    if row_ids
+        .iter()
+        .any(|row_id| row_id.trim().is_empty() || row_id.chars().any(char::is_control))
+    {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_row_id",
+        });
+    }
+    Err(FacadeError::MigrationRequired {
+        owner: "legacy-v1-replay",
+        revision: "raw-bytes-required",
+    })
+}
+
+/// Preserves a v1 snapshot identity, exact bytes, and every row identity.
+pub fn preserve_v1_snapshot_bytes(
+    legacy_snapshot_id: &str,
+    legacy_snapshot_bytes: &[u8],
+    row_ids: &[String],
+) -> Result<V1SnapshotMigration, FacadeError> {
+    if legacy_snapshot_id.trim().is_empty() || legacy_snapshot_id.chars().any(char::is_control) {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_snapshot_id",
+        });
+    }
+    if legacy_snapshot_bytes.is_empty() {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_snapshot_bytes",
+        });
+    }
     let mut rows = Vec::with_capacity(row_ids.len());
     for row_id in row_ids {
-        rows.push(preserve_v1_row(row_id)?);
+        if row_id.trim().is_empty() || row_id.chars().any(char::is_control) {
+            return Err(FacadeError::EnvelopeInvalid {
+                field: "legacy_row_id",
+            });
+        }
+        rows.push(V1RowMigration {
+            legacy_row_id: row_id.to_owned(),
+            legacy_bytes: Vec::new(),
+            disposition: eliot_cue_contracts::ConversionDisposition::V1ReplayPreserved {
+                legacy_row_id: row_id.to_owned(),
+            },
+        });
     }
     Ok(V1SnapshotMigration {
+        legacy_snapshot_id: legacy_snapshot_id.to_owned(),
+        legacy_snapshot_bytes: legacy_snapshot_bytes.to_vec(),
         rows,
         ceiling: eliot_cue_contracts::ProofCeiling::CandidateArtifact,
     })
@@ -280,7 +366,7 @@ pub enum FacadeError {
 /// `InertHandoff`. `tests/legacy_facade.rs` enforces the exact row count
 /// so additions stay deliberate, and the reexport rows resolve by type
 /// identity, not prose.
-pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 20] = [
+pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 23] = [
     ("CueKind", "ReexportOwner", "eliot-cue-contracts"),
     ("MatchMode", "ReexportOwner", "eliot-cue-contracts"),
     (
@@ -293,11 +379,15 @@ pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 20] = [
         "InertHandoff",
         "B-RCTX/Host (#612); no completion fabricated",
     ),
-    ("V1RowMigration", "LegacyDTO", "inert v1 replay identity"),
+    (
+        "V1RowMigration",
+        "LegacyDTO",
+        "v1 replay identity and raw-byte slot",
+    ),
     (
         "V1SnapshotMigration",
         "LegacyDTO",
-        "inert v1 replay identity",
+        "v1 replay identity and raw-byte slot",
     ),
     ("FacadeError", "FacadeSurface", "closed refusal vocabulary"),
     (
@@ -313,12 +403,22 @@ pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 20] = [
     (
         "preserve_v1_row",
         "AdapterEntry",
-        "inert replay constructor",
+        "identity-only compatibility constructor",
     ),
     (
         "preserve_v1_snapshot",
         "AdapterEntry",
-        "inert replay constructor",
+        "identity-only compatibility constructor",
+    ),
+    (
+        "preserve_v1_row_bytes",
+        "AdapterEntry",
+        "exact v1 row bytes and identity",
+    ),
+    (
+        "preserve_v1_snapshot_bytes",
+        "AdapterEntry",
+        "exact v1 snapshot bytes and row identities",
     ),
     (
         "decode_legacy_kind",
@@ -337,7 +437,12 @@ pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 20] = [
     (
         "legacy_row_id_v2",
         "AdapterEntry",
-        "frozen owner cue_row_id projection",
+        "refuses stored legacy values",
+    ),
+    (
+        "legacy_row_id_v2_from_fresh_observation",
+        "AdapterEntry",
+        "frozen owner cue_row_id after fresh normalization",
     ),
     (
         "require_reobservation",

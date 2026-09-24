@@ -6,12 +6,12 @@
 
 use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    CanonicalCueIdentity, ClosedSnapshotRow, CueContractError, CueProjectionDenominator, Digest,
-    MAX_SNAPSHOT_MEMBERS, MatchMode, NormalizationProfile, SnapshotEdgeWeight, SnapshotId,
-    SourceHandle, TargetHandle, bounds,
+    CanonicalCueIdentity, ClosedSnapshotRow, CueContractError, CueProjectionDenominator,
+    CueSnapshotClosure, Digest, MAX_SNAPSHOT_MEMBERS, MatchMode, NormalizationProfile,
+    SnapshotEdgeWeight, SnapshotId, SourceHandle, TargetHandle, bounds,
 };
 
 #[derive(Serialize)]
@@ -19,9 +19,21 @@ struct SnapshotPreimage<'a> {
     schema_revision: &'a str,
     snapshot_id: &'a SnapshotId,
     state_fence: &'a StateFence,
+    #[serde(skip_serializing_if = "is_zero")]
+    source_revision: u64,
     normalization_profile: &'a NormalizationProfile,
     source_denominator: Vec<&'a SourceHandle>,
     members: Vec<&'a SnapshotMember>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    closure: Option<&'a CueSnapshotClosure>,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde passes field references to skip predicates"
+)]
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// One admitted cue-to-target pair inside a snapshot.
@@ -118,6 +130,15 @@ pub struct CueSnapshot {
     pub rebuild: RebuildIdentity,
     /// The causal snapshot this was built against.
     pub state_fence: StateFence,
+    /// Source revision frozen into a closed snapshot. Open legacy fixtures use
+    /// zero and are not complete publication claims.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_revision: u64,
+    /// Retained closed row/edge/denominator/fanout state. `None` is reserved
+    /// for the explicitly open compatibility builder; current production
+    /// candidates always carry this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure: Option<CueSnapshotClosure>,
 }
 
 impl CueSnapshot {
@@ -136,7 +157,31 @@ impl CueSnapshot {
             members,
             rebuild,
             state_fence,
+            source_revision: 0,
+            closure: None,
         }
+    }
+
+    /// Attaches an immutable closure to a snapshot and freezes its source
+    /// revision from the denominator. The caller must recompute
+    /// [`Self::rebuild`]'s digest after this operation.
+    #[must_use]
+    pub fn with_closure(mut self, closure: CueSnapshotClosure) -> Self {
+        self.source_revision = closure.denominator.source_revision;
+        self.closure = Some(closure);
+        self
+    }
+
+    /// Returns whether this snapshot carries a self-contained closed record.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closure.is_some()
+    }
+
+    /// Returns the retained closure, if this is a closed snapshot.
+    #[must_use]
+    pub const fn retained_closure(&self) -> Option<&CueSnapshotClosure> {
+        self.closure.as_ref()
     }
 
     /// Returns the versioned canonical JSON preimage, excluding `digest`.
@@ -155,13 +200,32 @@ impl CueSnapshot {
                 .cmp(&right.canonical.canonical_cue_id)
                 .then(left.target.cmp(&right.target))
         });
+        let closure = self.closure.as_ref().map(|value| {
+            let mut value = value.clone();
+            value.rows.sort_by(|left, right| {
+                left.member
+                    .canonical
+                    .canonical_cue_id
+                    .cmp(&right.member.canonical.canonical_cue_id)
+                    .then(left.member.target.cmp(&right.member.target))
+            });
+            value
+                .relation_edges
+                .sort_by(|left, right| left.relation_edge_id.cmp(&right.relation_edge_id));
+            value
+                .edge_weights
+                .sort_by(|left, right| left.edge.cmp(&right.edge));
+            value
+        });
         let preimage = SnapshotPreimage {
             schema_revision: &self.schema_revision,
             snapshot_id: &self.snapshot_id,
             state_fence: &self.state_fence,
+            source_revision: self.source_revision,
             normalization_profile: &self.rebuild.normalization_profile,
             source_denominator: sources,
             members,
+            closure: closure.as_ref(),
         };
         let bytes = eliot_contracts::canonical_json_bytes(&preimage).map_err(|_| {
             CueContractError::Foundation {
@@ -184,23 +248,81 @@ impl CueSnapshot {
         self.canonical_payload_bytes()
     }
 
+    /// Checks closed-snapshot invariants using the closure retained on this
+    /// record. No denominator, row, endpoint, weight, or fanout argument is
+    /// needed: a closed snapshot is self-validating.
+    pub fn validate_self_closed(&self) -> Result<(), CueContractError> {
+        self.validate_rebuild()?;
+        let closure = self
+            .closure
+            .as_ref()
+            .ok_or(CueContractError::SnapshotNotRebuildable)?;
+        closure.validate_shape()?;
+        if self.source_revision == 0 || self.source_revision != closure.denominator.source_revision
+        {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
+        closure
+            .denominator
+            .validate_against(self.members.len(), closure.relation_edges.len())?;
+        crate::version::validate_closed_rows_at_revision(
+            &self.members,
+            &closure.rows,
+            self.source_revision,
+        )?;
+        validate_closed_endpoints(&self.members, &closure.relation_edges)?;
+        crate::version::validate_closed_weights_at_revision(
+            &closure.relation_edges,
+            &closure.edge_weights,
+            self.source_revision,
+        )?;
+        for source in &self.rebuild.source_denominator {
+            if !revision_marker_matches(source.provenance.revision.as_deref(), self.source_revision)
+            {
+                return Err(CueContractError::Foundation {
+                    field: "snapshot.source.revision",
+                });
+            }
+        }
+        for edge in &closure.relation_edges {
+            if !revision_marker_matches(
+                edge.evidence.provenance.revision.as_deref(),
+                self.source_revision,
+            ) {
+                return Err(CueContractError::Foundation {
+                    field: "snapshot.edge.revision",
+                });
+            }
+        }
+        if usize::try_from(closure.fanout.max_edges)
+            .is_ok_and(|limit| closure.relation_edges.len() > limit)
+        {
+            return Err(CueContractError::BoundExceeded {
+                field: "snapshot.fanout.max_edges",
+                limit: closure.fanout.max_edges as usize,
+            });
+        }
+        let mut outgoing = BTreeMap::<TargetHandle, usize>::new();
+        for edge in &closure.relation_edges {
+            let count = outgoing.entry(edge.from.clone()).or_default();
+            *count = count.saturating_add(1);
+            if *count > usize::from(closure.fanout.max_fanout) {
+                return Err(CueContractError::BoundExceeded {
+                    field: "snapshot.fanout.max_fanout",
+                    limit: usize::from(closure.fanout.max_fanout),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Checks closed-snapshot invariants beyond rebuildability.
     ///
-    /// On top of [`Self::validate`] this proves: the frozen denominator
-    /// reconciles present rows/edges against expected minus omitted counts;
-    /// every member is covered by exactly one closed row; frozen row identities
-    /// are unique (`snapshot.row_id`); semantic bindings — same kind, canonical
-    /// value, and target — are unique (`snapshot.semantic_binding`); every edge
-    /// cites existing member endpoints; and every edge carries exactly one
-    /// policy weight within the milli bound. An explicitly partial denominator
-    /// validates here; use
-    /// [`CueProjectionDenominator::is_empty_complete`] to distinguish
-    /// empty-complete from partial.
-    ///
-    /// # Errors
-    /// Fails closed on denominator mismatch, uncovered or double-covered
-    /// members, duplicate row identities, duplicate semantic bindings, missing
-    /// endpoints, missing or duplicate weights, and overweight edges.
+    /// For a closed record this compatibility seam verifies that the supplied
+    /// values are exactly the retained closure and then delegates to
+    /// [`Self::validate_self_closed`]. For an old open fixture it preserves the
+    /// former external validation behavior; current production callers use the
+    /// self-contained method above.
     pub fn validate_closed(
         &self,
         rows: &[ClosedSnapshotRow],
@@ -208,7 +330,17 @@ impl CueSnapshot {
         edges: &[crate::RelationEdge],
         weights: &[SnapshotEdgeWeight],
     ) -> Result<(), CueContractError> {
-        self.validate()?;
+        if let Some(closure) = &self.closure {
+            if rows != closure.rows.as_slice()
+                || *denominator != closure.denominator
+                || edges != closure.relation_edges.as_slice()
+                || weights != closure.edge_weights.as_slice()
+            {
+                return Err(CueContractError::SnapshotNotRebuildable);
+            }
+            return self.validate_self_closed();
+        }
+        self.validate_rebuild()?;
         denominator.validate()?;
         denominator.validate_against(self.members.len(), edges.len())?;
         crate::version::validate_closed_rows(&self.members, rows)?;
@@ -220,9 +352,19 @@ impl CueSnapshot {
     /// Checks the intrinsic rules this record owns.
     ///
     /// # Errors
-    /// Rejects a member set past its bound, a duplicate membership, and a
-    /// rebuild record whose digest does not match its own inputs.
+    /// Rejects a member set past its bound, a duplicate membership, a malformed
+    /// retained closure, and a rebuild record whose digest does not match its
+    /// own inputs. A record carrying a closure is always checked as a closed
+    /// snapshot; an open compatibility fixture remains explicitly open.
     pub fn validate(&self) -> Result<(), CueContractError> {
+        self.validate_rebuild()?;
+        if self.closure.is_some() {
+            self.validate_self_closed()?;
+        }
+        Ok(())
+    }
+
+    fn validate_rebuild(&self) -> Result<(), CueContractError> {
         self.validate_shape()?;
         if self.rebuild.digest != self.canonical_digest()? {
             return Err(CueContractError::SnapshotNotRebuildable);
@@ -249,6 +391,17 @@ impl CueSnapshot {
                 field: "snapshot.state_fence",
             })?;
         self.rebuild.normalization_profile.validate()?;
+        if self.source_revision != 0 && self.closure.is_none() {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
+        if let Some(closure) = &self.closure {
+            closure.validate_shape()?;
+            if self.source_revision == 0
+                || self.source_revision != closure.denominator.source_revision
+            {
+                return Err(CueContractError::SnapshotNotRebuildable);
+            }
+        }
         for source in &self.rebuild.source_denominator {
             source.validate()?;
         }
@@ -274,6 +427,10 @@ impl CueSnapshot {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the byte budget enumerates each retained snapshot leaf before canonicalization"
+    )]
     fn validate_payload_budget(&self) -> Result<(), CueContractError> {
         let mut measured_bytes = 0;
         bounds::bytes(
@@ -286,6 +443,7 @@ impl CueSnapshot {
             self.snapshot_id.as_str().len(),
             "snapshot.snapshot_id",
         )?;
+        bounds::bytes(&mut measured_bytes, 8, "snapshot.source_revision")?;
         bounds::bytes(
             &mut measured_bytes,
             self.rebuild.normalization_profile.profile_id.len(),
@@ -372,8 +530,57 @@ impl CueSnapshot {
             )?;
             bounds::bytes(&mut measured_bytes, 64, "snapshot.member.structure")?;
         }
+        if let Some(closure) = &self.closure {
+            Self::validate_closure_payload_budget(&mut measured_bytes, closure)?;
+        }
         Ok(())
     }
+
+    fn validate_closure_payload_budget(
+        measured_bytes: &mut usize,
+        closure: &CueSnapshotClosure,
+    ) -> Result<(), CueContractError> {
+        bounds::bytes(measured_bytes, closure.rows.len(), "snapshot.closure.rows")?;
+        bounds::bytes(
+            measured_bytes,
+            closure.relation_edges.len(),
+            "snapshot.closure.edges",
+        )?;
+        bounds::bytes(
+            measured_bytes,
+            closure.edge_weights.len(),
+            "snapshot.closure.weights",
+        )?;
+        bounds::bytes(measured_bytes, 64, "snapshot.closure.fanout")?;
+        for row in &closure.rows {
+            bounds::bytes(
+                measured_bytes,
+                row.member.canonical.canonical_value.len(),
+                "snapshot.closure.row.value",
+            )?;
+            bounds::bytes(
+                measured_bytes,
+                row.key.normalized_value.len(),
+                "snapshot.closure.row.key",
+            )?;
+        }
+        for edge in &closure.relation_edges {
+            bounds::bytes(
+                measured_bytes,
+                edge.from.as_str().len() + edge.to.as_str().len(),
+                "snapshot.closure.edge.endpoints",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn revision_marker_matches(value: Option<&str>, expected: u64) -> bool {
+    value.is_none_or(|revision| {
+        revision == expected.to_string()
+            || revision == format!("r{expected}")
+            || revision == format!("rev-{expected}")
+    })
 }
 
 fn validate_closed_endpoints(

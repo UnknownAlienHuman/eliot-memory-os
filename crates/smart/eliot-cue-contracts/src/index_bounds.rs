@@ -282,11 +282,18 @@ fn build_with_total(
             limit: MAX_INDEX_EDGES,
         });
     }
+    let closure_records = value.closure.as_ref().map_or(0, |closure| {
+        closure
+            .rows
+            .len()
+            .saturating_add(closure.edge_weights.len())
+    });
     let records = projections
         .len()
         .checked_add(edges.len())
         .and_then(|count| count.checked_add(value.members.len()))
         .and_then(|count| count.checked_add(value.rebuild.source_denominator.len()))
+        .and_then(|count| count.checked_add(closure_records))
         .ok_or(CueContractError::BoundExceeded {
             field: "index.records",
             limit: MAX_INDEX_INPUT_BYTES,
@@ -298,6 +305,9 @@ fn build_with_total(
             limit: MAX_INDEX_INPUT_BYTES,
         })?;
     add(total, structural_overhead, "index.records")?;
+    if value.closure.is_some() {
+        add(total, 4_096, "index.closure.structure")?;
+    }
     text(total, &value.schema_revision, "index.snapshot.schema")?;
     text(total, value.snapshot_id.as_str(), "index.snapshot.id")?;
     text(

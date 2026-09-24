@@ -14,7 +14,7 @@ use eliot_cue_binding::{
     derive_cue_binding_candidates,
 };
 use eliot_cue_contracts::{
-    CueSnapshotBuildCandidate, MatchMode as OwnerMatchMode, NormalizationProfile,
+    CueSnapshotBuildCandidate, MatchMode as OwnerMatchMode, NormalizationProfile, NormalizedCue,
     ObservedCue as OwnerObservedCue, TargetHandle,
 };
 use eliot_cue_index::rebuild_cue_snapshot;
@@ -255,11 +255,14 @@ pub fn adapt_activate(
     Ok(evaluation)
 }
 
-/// Projects one legacy row onto the frozen v2 row identity.
+/// Refuses a legacy row-to-v2 identity projection from stored legacy fields.
 ///
-/// Decodes kind and mode through the exact frozen vocabularies, then calls
-/// the frozen owner function once. The `cuev2:` prefix is checked on the
-/// way out: any other namespace is a response-identity failure.
+/// Legacy values were folded under a retired policy and do not carry proof of
+/// a fresh observation or normalization. The old entrypoint remains source
+/// compatible only so callers receive an explicit migration refusal; it never
+/// computes a v2 identity. Use
+/// [`legacy_row_id_v2_from_fresh_observation`] after the owner has produced
+/// fresh input.
 pub fn legacy_row_id_v2(
     scope: &str,
     kind: &str,
@@ -267,9 +270,63 @@ pub fn legacy_row_id_v2(
     value: &str,
     target: &TargetHandle,
 ) -> Result<String, FacadeError> {
-    let kind = decode_legacy_kind(kind)?;
-    let mode = decode_legacy_mode(mode)?;
-    let id = eliot_cue_contracts::cue_row_id(scope, kind, mode, value, target)?;
+    let _ = (scope, kind, mode, value, target);
+    Err(FacadeError::MigrationRequired {
+        owner: "eliot-cue-normalizer",
+        revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
+    })
+}
+
+/// Computes a v2 row identity only from a fresh owner observation and its
+/// normalized result.
+///
+/// The legacy row is an identity/replay anchor only. Every semantic input to
+/// [`eliot_cue_contracts::cue_row_id`] comes from the fresh normalized key;
+/// legacy spelling is never silently promoted to comparison material.
+pub fn legacy_row_id_v2_from_fresh_observation(
+    row: &LegacyEliotCuesV1Row,
+    observed: &OwnerObservedCue,
+    normalized: &NormalizedCue,
+) -> Result<String, FacadeError> {
+    row.validate()?;
+    let kind = decode_legacy_kind(&row.kind)?;
+    let mode_text = row.mode.as_deref().ok_or(FacadeError::MigrationRequired {
+        owner: "eliot-cue-normalizer",
+        revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
+    })?;
+    let mode = decode_legacy_mode(mode_text)?;
+    if observed.kind != kind
+        || observed.original_value != row.value
+        || observed.context.scope_id.as_str() != row.scope
+        || observed.source.target.as_str() != row.target
+        || &normalized.observed != observed
+    {
+        return Err(FacadeError::ContextMismatch {
+            field: "fresh_observation",
+        });
+    }
+    normalized.validate().map_err(FacadeError::Contract)?;
+    if !normalized.observed.context.lifecycle.is_active() {
+        return Err(FacadeError::MigrationRequired {
+            owner: "eliot-cue-normalizer",
+            revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
+        });
+    }
+    let key = normalized
+        .comparison_keys
+        .iter()
+        .find(|key| key.match_mode == mode)
+        .ok_or(FacadeError::MigrationRequired {
+            owner: "eliot-cue-normalizer",
+            revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
+        })?;
+    let id = eliot_cue_contracts::cue_row_id(
+        &row.scope,
+        kind,
+        mode,
+        &key.key_value,
+        &TargetHandle::new(row.target.clone())?,
+    )?;
     if !id.starts_with("cuev2:") {
         return Err(FacadeError::ResponseIdentityMismatch {
             what: "row_id.namespace",

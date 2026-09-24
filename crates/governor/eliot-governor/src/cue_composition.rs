@@ -3,24 +3,29 @@
 //! T11 section 5, slice T11.3 (part A, Governor): resolve admitted binding
 //! receipts and source existence from the reconstructed cue role
 //! ([`crate::context_inputs`]), then call the Smart owner entrypoint
-//! `eliot_cue_index::build_cue_snapshot` with an authoritative zero-edge set
-//! (`relation_edges=&[]`, `registry_revision=None`; `None` is valid only for
-//! an empty edge set per `crates/smart/eliot-cue-index/src/build.rs:24-32`).
+//! `eliot_cue_index::build_cue_snapshot_closed` with an authoritative zero-edge
+//! set and a denominator frozen at the current scope head. The closed candidate
+//! carries its rows, omissions, endpoints, weights, and direct-only fanout
+//! closure; the Governor never reconstructs a publishable open candidate.
 //!
 //! This is input reconstruction, not an admitted `ActiveUnderstandingView`:
 //!
 //! - the built value is a `CueSnapshotBuildCandidate` (candidate proof
 //!   ceiling), exposed as a derived read projection together with a
 //!   read-owner cache;
+//! - the candidate's snapshot is closed and self-validating; the Governor does
+//!   not substitute the open builder or retain closure arguments outside it;
 //! - snapshots are never published and admission is never authenticated here
 //!   (the index validator does not authenticate admission per
 //!   `build.rs:15-23`; `AdmittedCueBindingProjection::validate` checks the
 //!   join shape only);
-//! - zero edges mean an authoritative empty edge set: a provider error from
-//!   the build is propagated, never swallowed into an empty set;
+//! - zero edges mean an authoritative empty edge set with an explicit
+//!   direct-only fanout closure: a provider error from the build is propagated,
+//!   never swallowed into an empty set;
 //! - the built candidate is post-verified against the same source closure
-//!   (scope, fence, profile, heads, binding digests) before it is exposed,
-//!   including a `rebuild_cue_snapshot` round-trip through the owner.
+//!   (scope, fence, profile, source revision, binding digests) before it is
+//!   exposed, including a retained-closure rebuild round-trip through the
+//!   owner.
 //!
 //! The read-owner cache ([`CueReconstructionCache`]) is keyed by
 //! scope, source revisions (dependency heads plus admitted binding digests),
@@ -32,8 +37,8 @@ use std::collections::BTreeMap;
 use eliot_context_candidates::ProjectionState;
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_cue_contracts::{
-    AdmittedCueBindingProjection, CueSnapshotBuildCandidate, NormalizationProfile, SnapshotId,
-    WorkScopeId,
+    AdmittedCueBindingProjection, CueProjectionDenominator, CueSnapshotBuildCandidate,
+    NormalizationProfile, SnapshotId, WorkScopeId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -185,15 +190,30 @@ pub fn reconstruct_cue_snapshot(
     for (index, projection) in bindings.iter().enumerate() {
         check_binding_closure(index, projection, &scope, &inputs.state_fence)?;
     }
-    let key = cache_key(inputs, &bindings, &scope, snapshot_id, profile)?;
+    let source_revision = source_revision(inputs)?;
+    let key = cache_key(
+        inputs,
+        &bindings,
+        &scope,
+        snapshot_id,
+        profile,
+        source_revision,
+    )?;
     if let Some(retained) = cache.get(&key) {
         retained
             .validate()
             .map_err(|error| CueCompositionError::CueBuild(error.to_string()))?;
+        let Some(closure) = retained.retained_closure() else {
+            return Err(CueCompositionError::ClosureMismatch(
+                "retained candidate is not self-validating".to_owned(),
+            ));
+        };
         if retained.scope_id != scope
             || retained.snapshot.state_fence != inputs.state_fence
             || retained.snapshot.rebuild.normalization_profile != *profile
             || retained.snapshot.snapshot_id != *snapshot_id
+            || retained.snapshot.source_revision != source_revision
+            || closure.denominator.source_revision != source_revision
             || !retained.relation_edges.is_empty()
         {
             return Err(CueCompositionError::ClosureMismatch(
@@ -206,7 +226,8 @@ pub fn reconstruct_cue_snapshot(
             cache_hit: true,
         });
     }
-    let candidate = eliot_cue_index::build_cue_snapshot(
+    let denominator = CueProjectionDenominator::new(bindings.len(), 0, 0, 0, source_revision);
+    let candidate = eliot_cue_index::build_cue_snapshot_closed(
         &scope,
         snapshot_id.clone(),
         profile.clone(),
@@ -214,6 +235,8 @@ pub fn reconstruct_cue_snapshot(
         &bindings,
         &[],
         None,
+        &denominator,
+        &[],
     )
     .map_err(|error| CueCompositionError::CueBuild(error.to_string()))?;
     post_verify_candidate(
@@ -222,6 +245,7 @@ pub fn reconstruct_cue_snapshot(
         snapshot_id,
         profile,
         &inputs.state_fence,
+        source_revision,
     )?;
     cache.insert(key.clone(), candidate.clone());
     Ok(CueReconstruction {
@@ -235,6 +259,7 @@ pub fn reconstruct_cue_snapshot(
 #[derive(Serialize)]
 struct KeyShape<'a> {
     scope: &'a str,
+    source_revision: u64,
     heads_sha256: String,
     bindings_sha256: String,
     profile_id: &'a str,
@@ -244,6 +269,30 @@ struct KeyShape<'a> {
     fence_sha256: String,
 }
 
+/// Resolves the one current source revision used by the closed cue build.
+///
+/// The exact scope head is the source-revision authority for this derived
+/// projection. A missing or ambiguous head is not replaced with a default.
+fn source_revision(inputs: &SevenRoleInputs) -> Result<u64, CueCompositionError> {
+    let key = format!("scope:{}", inputs.scope_id.as_str());
+    let mut matching = inputs
+        .heads_after
+        .revision_heads
+        .iter()
+        .filter(|head| head.key.as_str() == key);
+    let Some(head) = matching.next() else {
+        return Err(CueCompositionError::ClosureMismatch(
+            "current scope source revision head is missing".to_owned(),
+        ));
+    };
+    if matching.next().is_some() || head.revision == 0 {
+        return Err(CueCompositionError::ClosureMismatch(
+            "current scope source revision head is ambiguous".to_owned(),
+        ));
+    }
+    Ok(head.revision)
+}
+
 /// Derives the cache key from the exact source closure.
 fn cache_key(
     inputs: &SevenRoleInputs,
@@ -251,6 +300,7 @@ fn cache_key(
     scope: &WorkScopeId,
     snapshot_id: &SnapshotId,
     profile: &NormalizationProfile,
+    source_revision: u64,
 ) -> Result<CueCacheKey, CueCompositionError> {
     let refused = |detail: &str| CueCompositionError::ClosureMismatch(detail.to_owned());
     let heads_bytes = canonical_json_bytes(&inputs.heads_after)
@@ -266,6 +316,7 @@ fn cache_key(
         canonical_json_bytes(&inputs.state_fence).map_err(|_| refused("fence is not canonical"))?;
     let shape = KeyShape {
         scope: scope.as_str(),
+        source_revision,
         heads_sha256: sha256_hex(&heads_bytes),
         bindings_sha256: sha256_hex(&bindings_bytes),
         profile_id: &profile.profile_id,
@@ -369,20 +420,19 @@ fn check_binding_closure(
     Ok(())
 }
 
-/// Post-verifies the built candidate against the same source closure before
+/// Post-verifies the closed candidate against the same source closure before
 /// exposing it.
 ///
-/// Checks scope, fence, profile, snapshot identity, and the authoritative
-/// empty edge set, validates through the owner, and round-trips an owner
-/// rebuild (valid for zero edges with `registry_revision=None`). Any
-/// mismatch fails closed; a provider error is never converted into an empty
-/// set.
+/// Checks scope, fence, profile, snapshot identity, source revision, and the
+/// authoritative empty edge set, validates the retained closure through the
+/// owner, and round-trips an owner rebuild using that same retained closure.
 fn post_verify_candidate(
     candidate: &CueSnapshotBuildCandidate,
     scope: &WorkScopeId,
     snapshot_id: &SnapshotId,
     profile: &NormalizationProfile,
     fence: &StateFence,
+    source_revision: u64,
 ) -> Result<(), CueCompositionError> {
     let mismatch = |detail: &str| CueCompositionError::ClosureMismatch(detail.to_owned());
     candidate
@@ -402,6 +452,16 @@ fn post_verify_candidate(
     if candidate.snapshot.snapshot_id != *snapshot_id {
         return Err(mismatch(
             "candidate snapshot identity differs from the request",
+        ));
+    }
+    let Some(closure) = candidate.retained_closure() else {
+        return Err(mismatch("candidate does not retain a closed snapshot"));
+    };
+    if candidate.snapshot.source_revision != source_revision
+        || closure.denominator.source_revision != source_revision
+    {
+        return Err(mismatch(
+            "candidate source revision differs from the closure head",
         ));
     }
     if !candidate.relation_edges.is_empty() {

@@ -180,6 +180,23 @@ impl CueProjectionDenominator {
 
     /// Rejects omitted counts that exceed the totals they are measured against.
     pub const fn validate(&self) -> Result<(), CueContractError> {
+        if self.source_revision == 0 {
+            return Err(CueContractError::InvalidText {
+                field: "denominator.source_revision",
+            });
+        }
+        if self.expected_rows > crate::MAX_SNAPSHOT_MEMBERS {
+            return Err(CueContractError::BoundExceeded {
+                field: "denominator.expected_rows",
+                limit: crate::MAX_SNAPSHOT_MEMBERS,
+            });
+        }
+        if self.expected_edges > crate::MAX_RELATION_EDGES {
+            return Err(CueContractError::BoundExceeded {
+                field: "denominator.expected_edges",
+                limit: crate::MAX_RELATION_EDGES,
+            });
+        }
         if self.omitted_rows > self.expected_rows {
             return Err(CueContractError::BoundExceeded {
                 field: "denominator.omitted_rows",
@@ -247,13 +264,34 @@ pub struct ClosedSnapshotRow {
     pub member: SnapshotMember,
     /// The exact key the member was admitted under.
     pub key: CueComparisonKey,
+    /// Frozen source revision admitted for this row.
+    #[serde(default)]
+    pub source_revision: u64,
 }
 
 impl ClosedSnapshotRow {
     /// Constructs one closed row. Call [`Self::validate`] before use.
     #[must_use]
     pub const fn new(member: SnapshotMember, key: CueComparisonKey) -> Self {
-        Self { member, key }
+        Self {
+            member,
+            key,
+            source_revision: 0,
+        }
+    }
+
+    /// Constructs a closed row with the source revision frozen into it.
+    #[must_use]
+    pub const fn new_at_revision(
+        member: SnapshotMember,
+        key: CueComparisonKey,
+        source_revision: u64,
+    ) -> Self {
+        Self {
+            member,
+            key,
+            source_revision,
+        }
     }
 
     /// Validates both sides and their kind agreement.
@@ -288,6 +326,9 @@ pub struct SnapshotEdgeWeight {
     pub edge: RelationEdgeId,
     /// Policy weight in milli units. Never above unity.
     pub weight_milli: u16,
+    /// Frozen source revision admitted for this edge.
+    #[serde(default)]
+    pub source_revision: u64,
 }
 
 impl SnapshotEdgeWeight {
@@ -295,12 +336,179 @@ impl SnapshotEdgeWeight {
     /// closure, not here, so a decoder can retain and reject corrupt input.
     #[must_use]
     pub const fn new(edge: RelationEdgeId, weight_milli: u16) -> Self {
-        Self { edge, weight_milli }
+        Self {
+            edge,
+            weight_milli,
+            source_revision: 0,
+        }
+    }
+
+    /// Constructs an edge weight with its frozen source revision.
+    #[must_use]
+    pub const fn new_at_revision(
+        edge: RelationEdgeId,
+        weight_milli: u16,
+        source_revision: u64,
+    ) -> Self {
+        Self {
+            edge,
+            weight_milli,
+            source_revision,
+        }
     }
 
     /// Validates the edge reference shape.
     pub fn validate(&self) -> Result<(), CueContractError> {
         bounds::text(self.edge.as_str(), "snapshot.edge_weight.edge")
+    }
+}
+
+/// Explicit activation limits retained by a closed snapshot.
+///
+/// The graph itself is immutable, but its traversal policy is part of the
+/// closure that makes a candidate safe to replay. A direct-only snapshot uses
+/// [`CueSnapshotFanout::direct_only`]; a graph-bearing snapshot must retain
+/// finite depth, fanout, edge, and path bounds. These are validation ceilings,
+/// not scheduling or authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct CueSnapshotFanout {
+    /// Maximum relation depth retained by this snapshot.
+    pub max_depth: u8,
+    /// Maximum outgoing edges considered from one node.
+    pub max_fanout: u16,
+    /// Maximum relation edges inspected by the bounded activation owner.
+    pub max_edges: u32,
+    /// Maximum edges in one derived path.
+    pub max_path_len: u16,
+}
+
+impl CueSnapshotFanout {
+    /// The exact direct-only closure used by a zero-edge snapshot.
+    #[must_use]
+    pub const fn direct_only() -> Self {
+        Self {
+            max_depth: 0,
+            max_fanout: 0,
+            max_edges: 0,
+            max_path_len: 0,
+        }
+    }
+
+    /// Constructs an explicit finite traversal closure.
+    #[must_use]
+    pub const fn bounded(
+        max_depth: u8,
+        max_fanout: u16,
+        max_edges: u32,
+        max_path_len: u16,
+    ) -> Self {
+        Self {
+            max_depth,
+            max_fanout,
+            max_edges,
+            max_path_len,
+        }
+    }
+
+    /// Validates that every retained traversal limit is finite and internally
+    /// consistent. A zero-depth closure is exactly direct-only.
+    pub fn validate(&self) -> Result<(), CueContractError> {
+        if self.max_depth == 0 {
+            if self.max_fanout != 0 || self.max_edges != 0 || self.max_path_len != 0 {
+                return Err(CueContractError::Foundation {
+                    field: "snapshot.fanout.direct_only",
+                });
+            }
+        } else if self.max_fanout == 0
+            || self.max_edges == 0
+            || self.max_path_len == 0
+            || usize::from(self.max_depth) > crate::MAX_PATH_LEN
+            || usize::from(self.max_fanout) > crate::MAX_RELATION_EDGES
+            || self.max_edges > u32::try_from(crate::MAX_RELATION_EDGES).unwrap_or(u32::MAX)
+            || usize::from(self.max_path_len) > crate::MAX_PATH_LEN
+        {
+            return Err(CueContractError::Foundation {
+                field: "snapshot.fanout",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// All state needed to validate one published cue snapshot without an external
+/// closure argument.
+///
+/// The fields are deliberately a closed set. A candidate may still be built by
+/// the legacy open constructor for package fixtures, but a candidate that
+/// carries this closure is self-validating and is the only shape accepted by
+/// the current Governor production path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct CueSnapshotClosure {
+    /// Frozen row/edge denominator and omission counts.
+    pub denominator: CueProjectionDenominator,
+    /// Exact row-to-comparison-key joins.
+    pub rows: Vec<ClosedSnapshotRow>,
+    /// Exact typed relation edges and their endpoints.
+    pub relation_edges: Vec<crate::RelationEdge>,
+    /// Exact policy weight for every retained edge.
+    pub edge_weights: Vec<SnapshotEdgeWeight>,
+    /// Explicit activation/fanout closure.
+    pub fanout: CueSnapshotFanout,
+}
+
+impl CueSnapshotClosure {
+    /// Constructs one immutable closure record.
+    #[must_use]
+    pub const fn new(
+        denominator: CueProjectionDenominator,
+        rows: Vec<ClosedSnapshotRow>,
+        relation_edges: Vec<crate::RelationEdge>,
+        edge_weights: Vec<SnapshotEdgeWeight>,
+        fanout: CueSnapshotFanout,
+    ) -> Self {
+        Self {
+            denominator,
+            rows,
+            relation_edges,
+            edge_weights,
+            fanout,
+        }
+    }
+
+    /// Validates the closure fields that do not depend on the member set.
+    pub fn validate_shape(&self) -> Result<(), CueContractError> {
+        self.denominator.validate()?;
+        self.fanout.validate()?;
+        bounds::collection(&self.rows, MAX_CLOSED_ROWS, "snapshot.rows")?;
+        bounds::collection(
+            &self.relation_edges,
+            MAX_CLOSED_WEIGHTS,
+            "snapshot.relation_edges",
+        )?;
+        bounds::collection(
+            &self.edge_weights,
+            MAX_CLOSED_WEIGHTS,
+            "snapshot.edge_weights",
+        )?;
+        for row in &self.rows {
+            row.validate()?;
+        }
+        for edge in &self.relation_edges {
+            edge.validate()?;
+        }
+        for weight in &self.edge_weights {
+            weight.validate()?;
+        }
+        if !self.relation_edges.is_empty() && self.fanout.max_depth == 0 {
+            return Err(CueContractError::Foundation {
+                field: "snapshot.fanout.edge",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -472,6 +680,23 @@ pub(crate) fn validate_closed_rows(
     Ok(row_ids)
 }
 
+/// Closed row join with the source revision frozen into every retained row.
+pub(crate) fn validate_closed_rows_at_revision(
+    members: &[SnapshotMember],
+    rows: &[ClosedSnapshotRow],
+    source_revision: u64,
+) -> Result<Vec<String>, CueContractError> {
+    let ids = validate_closed_rows(members, rows)?;
+    if source_revision == 0
+        || rows
+            .iter()
+            .any(|row| row.source_revision != source_revision)
+    {
+        return Err(CueContractError::SnapshotNotRebuildable);
+    }
+    Ok(ids)
+}
+
 /// Closed-validation weight join shared by [`CueSnapshot`](crate::CueSnapshot).
 pub(crate) fn validate_closed_weights(
     edges: &[crate::RelationEdge],
@@ -503,6 +728,23 @@ pub(crate) fn validate_closed_weights(
         }
     }
     if !expected.is_empty() {
+        return Err(CueContractError::SnapshotNotRebuildable);
+    }
+    Ok(())
+}
+
+/// Closed weight join with the source revision frozen into every retained edge.
+pub(crate) fn validate_closed_weights_at_revision(
+    edges: &[crate::RelationEdge],
+    weights: &[SnapshotEdgeWeight],
+    source_revision: u64,
+) -> Result<(), CueContractError> {
+    validate_closed_weights(edges, weights)?;
+    if source_revision == 0
+        || weights
+            .iter()
+            .any(|weight| weight.source_revision != source_revision)
+    {
         return Err(CueContractError::SnapshotNotRebuildable);
     }
     Ok(())
