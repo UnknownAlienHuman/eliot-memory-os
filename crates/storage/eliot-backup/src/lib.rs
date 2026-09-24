@@ -1433,6 +1433,21 @@ impl RestorePlan {
         {
             return Err(BackupError::PlanMismatch);
         }
+        // A hand-constructed or decoded plan cannot combine a target from one
+        // request with the fence of another: the compiled target proposal and
+        // the restored fence must agree exactly (issue #949).
+        if self.target.target_authority_epoch != self.restored_fence.authority_epoch
+            || self.target.target_resource_generation != self.restored_fence.resource_generation
+        {
+            return Err(BackupError::PlanMismatch);
+        }
+        // The destination must be an isolated root, never the source archive
+        // itself (issue #949). Active (non-advancing) destinations are refused
+        // by `RestoredFence::validate`; foreign destinations conflict on the
+        // transaction identity below.
+        if self.target.target_id == bundle.manifest.backup_id {
+            return Err(BackupError::PlanMismatch);
+        }
         let transaction = self.transaction()?;
         let journal_key = self.journal_key()?;
         let phases = restore_phases(bundle);
@@ -1453,10 +1468,10 @@ impl RestorePlan {
             journal.compare_and_swap(&journal_key, 0, initial.clone())?;
             initial
         };
-        validate_journal_record(&record, &journal_key, &transaction, &phases)?;
+        validate_journal_record(self, bundle, &record, &journal_key, &transaction, &phases)?;
 
         loop {
-            validate_journal_record(&record, &journal_key, &transaction, &phases)?;
+            validate_journal_record(self, bundle, &record, &journal_key, &transaction, &phases)?;
             match record.state {
                 RestoreJournalState::Completed => {
                     return record
@@ -1677,6 +1692,8 @@ fn next_revision(revision: u64) -> Result<u64, BackupError> {
 }
 
 fn validate_journal_record(
+    plan: &RestorePlan,
+    bundle: &BackupBundle,
     record: &RestoreJournalRecord,
     journal_key: &str,
     transaction: &RestoreTransaction,
@@ -1747,31 +1764,14 @@ fn validate_journal_record(
             }
         }
         RestoreJournalState::Completed => {
-            if completed_phases != phases.len()
-                || !matches!(record.phase, RestorePhase::FinalizeIsolatedRoot)
-                || record.final_receipt.is_none()
-            {
-                return Err(BackupError::RestoreJournalCorrupt);
-            }
-            let final_receipt = record
-                .final_receipt
-                .as_ref()
-                .ok_or(BackupError::RestoreJournalCorrupt)?;
-            if final_receipt.bundle_sha256 != transaction.bundle_sha256 {
-                return Err(BackupError::RestoreJournalMismatch);
-            }
-            let effect_receipt = record
-                .receipt
-                .as_ref()
-                .ok_or(BackupError::RestoreJournalCorrupt)?;
-            let intent = record
-                .intent
-                .as_ref()
-                .ok_or(BackupError::RestoreJournalCorrupt)?;
-            validate_effect_receipt(intent, effect_receipt)?;
-            if final_receipt.effect_receipt_sha256 != sha256(effect_receipt)? {
-                return Err(BackupError::RestoreJournalCorrupt);
-            }
+            validate_completed_record(
+                plan,
+                bundle,
+                record,
+                transaction,
+                completed_phases,
+                phases.len(),
+            )?;
         }
         RestoreJournalState::RollbackRequired => {
             if record.intent.is_none() || record.receipt.is_some() || record.final_receipt.is_some()
@@ -1779,6 +1779,59 @@ fn validate_journal_record(
                 return Err(BackupError::RestoreJournalCorrupt);
             }
         }
+    }
+    Ok(())
+}
+
+/// Binds a resumed `Completed` record to the current plan. A stored record
+/// cannot authenticate itself by bundle digest alone: the stored
+/// intent/receipt must bind the current transaction and final phase, and the
+/// final receipt must bind the current plan, destination, restored fence, and
+/// class proof level (issue #949). A forged foreign intent/receipt pair that
+/// agrees with each other still fails here.
+fn validate_completed_record(
+    plan: &RestorePlan,
+    bundle: &BackupBundle,
+    record: &RestoreJournalRecord,
+    transaction: &RestoreTransaction,
+    completed_phases: usize,
+    phases_len: usize,
+) -> Result<(), BackupError> {
+    if completed_phases != phases_len
+        || !matches!(record.phase, RestorePhase::FinalizeIsolatedRoot)
+        || record.final_receipt.is_none()
+    {
+        return Err(BackupError::RestoreJournalCorrupt);
+    }
+    let final_receipt = record
+        .final_receipt
+        .as_ref()
+        .ok_or(BackupError::RestoreJournalCorrupt)?;
+    let intent = record
+        .intent
+        .as_ref()
+        .ok_or(BackupError::RestoreJournalCorrupt)?;
+    let effect_receipt = record
+        .receipt
+        .as_ref()
+        .ok_or(BackupError::RestoreJournalCorrupt)?;
+    if intent.transaction_id != transaction.transaction_id
+        || intent.phase != record.phase
+        || intent.input_digest != sha256(&(transaction.transaction_id.as_str(), &record.phase))?
+        || effect_receipt.transaction_id != transaction.transaction_id
+        || effect_receipt.phase != record.phase
+    {
+        return Err(BackupError::RestoreJournalCorrupt);
+    }
+    validate_effect_receipt(intent, effect_receipt)?;
+    if final_receipt.bundle_sha256 != transaction.bundle_sha256
+        || final_receipt.plan_id != plan.plan_id
+        || final_receipt.target_id != plan.target.target_id
+        || final_receipt.restored_fence != plan.restored_fence
+        || final_receipt.effect_receipt_sha256 != sha256(effect_receipt)?
+        || final_receipt.evidence_level != RestoreEvidenceLevel::for_class(bundle.manifest.class)
+    {
+        return Err(BackupError::RestoreJournalMismatch);
     }
     Ok(())
 }
@@ -3415,9 +3468,10 @@ mod restore_tests {
     #[test]
     fn phase_skip_is_rejected_fail_closed() {
         let plan = plan();
+        let bundle = bundle_for(&plan);
         let journal_key = plan.journal_key().expect("journal key");
         let transaction = plan.transaction().expect("transaction");
-        let phases = restore_phases(&bundle_for(&plan));
+        let phases = restore_phases(&bundle);
         let record = RestoreJournalRecord {
             journal_key,
             transaction: transaction.clone(),
@@ -3430,7 +3484,14 @@ mod restore_tests {
             final_receipt: None,
         };
         assert_eq!(
-            validate_journal_record(&record, &record.journal_key, &transaction, &phases),
+            validate_journal_record(
+                &plan,
+                &bundle,
+                &record,
+                &record.journal_key,
+                &transaction,
+                &phases
+            ),
             Err(BackupError::RestorePhaseMismatch)
         );
     }
