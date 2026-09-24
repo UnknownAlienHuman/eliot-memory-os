@@ -1910,6 +1910,8 @@ dependencies = [
  "eliot-instrument-nextest",
  "eliot-integration-coverage",
  "eliot-kernel-core",
+ "eliot-learning-contracts",
+ "eliot-learning-delta",
  "eliot-maintenance",
  "eliot-mcp",
  "eliot-module-registry",
