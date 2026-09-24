@@ -48,7 +48,10 @@ pub struct StorageIoCause {
 }
 
 impl StorageIoCause {
-    pub(crate) fn new(error: io::Error, namespace: &'static str) -> Self {
+    /// Legacy-local seam: wraps the native failure observed by the legacy local
+    /// write path. Public so the owned `storage_exhausted` integration test can
+    /// construct the exact production shape; the native error itself stays private.
+    pub fn new(error: io::Error, namespace: &'static str) -> Self {
         Self { error, namespace }
     }
 
@@ -169,6 +172,12 @@ impl std::error::Error for StorageExhausted {
     }
 }
 
+impl From<StorageExhausted> for StoreError {
+    fn from(error: StorageExhausted) -> Self {
+        Self::StorageExhausted(Box::new(error))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error(transparent)]
@@ -268,5 +277,114 @@ impl StoreError {
             self,
             Self::ConnectionClosed | Self::Timeout { .. } | Self::Decode(_) | Self::WebSocket(_)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        StorageCleanup, StorageExhausted, StorageExhaustedEffect, StorageExhaustedRetry,
+        StorageExhaustedStage, StorageIoCause, StoreError,
+    };
+
+    fn exhausted_fixture() -> StorageExhausted {
+        StorageExhausted {
+            operation: "blob.put_bytes",
+            stage: StorageExhaustedStage::PayloadWrite,
+            storage_identity: "root-blake3:fixture-identity".to_owned(),
+            local_attempt_id: Some("local-attempt-9".to_owned()),
+            attempted_bytes: Some(11),
+            effect: StorageExhaustedEffect::StagedUnknown,
+            retry: StorageExhaustedRetry::CapacityRevalidationRequired,
+            cleanup: StorageCleanup::Removed,
+            cause: StorageIoCause::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "native detail with C:\\configured\\root must stay private",
+                ),
+                std::env::consts::OS,
+            ),
+        }
+    }
+
+    #[test]
+    fn by_value_conversion_preserves_every_field() {
+        let fixture = exhausted_fixture();
+        let StoreError::StorageExhausted(error) = StoreError::from(fixture) else {
+            panic!("by-value conversion left the capacity family");
+        };
+        assert_eq!(error.operation, "blob.put_bytes");
+        assert_eq!(error.stage, StorageExhaustedStage::PayloadWrite);
+        assert_eq!(error.storage_identity, "root-blake3:fixture-identity");
+        assert_eq!(error.local_attempt_id.as_deref(), Some("local-attempt-9"));
+        assert_eq!(error.attempted_bytes, Some(11));
+        assert_eq!(error.effect, StorageExhaustedEffect::StagedUnknown);
+        assert_eq!(
+            error.retry,
+            StorageExhaustedRetry::CapacityRevalidationRequired
+        );
+        assert!(matches!(error.cleanup, StorageCleanup::Removed));
+        assert_eq!(error.cause.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.cause.namespace(), std::env::consts::OS);
+    }
+
+    #[test]
+    fn boxed_conversion_preserves_identity() {
+        let fixture = exhausted_fixture();
+        let operation = fixture.operation;
+        let identity = fixture.storage_identity.clone();
+        let StoreError::StorageExhausted(error) = StoreError::from(Box::new(fixture)) else {
+            panic!("boxed conversion left the capacity family");
+        };
+        assert_eq!(error.operation, operation);
+        assert_eq!(error.storage_identity, identity);
+    }
+
+    #[test]
+    fn display_and_debug_never_leak_native_detail() {
+        let error = exhausted_fixture();
+        let display = format!("{error}");
+        let debug = format!("{error:?}");
+        assert!(display.contains("blob.put_bytes"));
+        assert!(!display.contains("C:\\configured\\root"));
+        assert!(!display.contains("native detail"));
+        assert!(!debug.contains("C:\\configured\\root"));
+        assert!(!debug.contains("native detail"));
+        assert!(debug.contains("root-blake3:fixture-identity"));
+    }
+
+    #[test]
+    fn cause_accessors_expose_only_bounded_evidence() {
+        let error = exhausted_fixture();
+        assert_eq!(error.cause.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.cause.namespace(), std::env::consts::OS);
+        assert!(std::error::Error::source(&error.cause).is_none());
+        let Some(source) = std::error::Error::source(&error) else {
+            panic!("capacity error lost its cause");
+        };
+        assert_eq!(
+            source.to_string(),
+            format!("{}", error.cause),
+            "error source surfaces only the bounded cause rendering"
+        );
+    }
+
+    #[test]
+    fn cleanup_variants_render_without_native_text() {
+        let removed = format!("{:?}", StorageCleanup::Removed);
+        let absent = format!("{:?}", StorageCleanup::Absent);
+        let not_attempted = format!("{:?}", StorageCleanup::NotAttempted);
+        assert!(removed.contains("Removed"));
+        assert!(absent.contains("Absent"));
+        assert!(not_attempted.contains("NotAttempted"));
+        let failed = format!(
+            "{:?}",
+            StorageCleanup::Failed(StorageIoCause::new(
+                std::io::Error::other("private cleanup detail"),
+                std::env::consts::OS,
+            ))
+        );
+        assert!(failed.contains("Failed"));
+        assert!(!failed.contains("private cleanup detail"));
     }
 }
