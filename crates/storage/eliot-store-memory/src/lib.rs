@@ -1399,54 +1399,77 @@ fn dispatch_apply_learning_state(
         if command.operation != NamedMutationOperation::RecordLearningRecord {
             continue;
         }
-        let decoded =
-            eliot_store_api::decode_learning_mutation(command.operation, &command.parameters)?;
-        let record_kind = decoded.record_kind.as_str().to_owned();
-        let key = learning_row_key(&record_kind, &decoded.handle, &decoded.record_digest);
-        let row_json = serde_json::to_value(&decoded.record_json)
-            .map_err(|error| StoreError::Serialization(error.to_string()))?;
-        match state.learning_record_rows.get(&key) {
-            Some(existing) if existing.record_json != decoded.record_json => {
-                return Err(StoreError::IdentityConflict);
-            }
-            Some(_) => {}
-            None => {
-                state.learning_record_rows.insert(
-                    key,
-                    LearningRecordRow {
-                        record_kind,
-                        handle: decoded.handle.clone(),
-                        record_digest: decoded.record_digest.clone(),
-                        record_json: decoded.record_json.clone(),
-                        state_fence: transition.state_fence.clone(),
-                        scope_id: transition.scope_id.to_string(),
-                        task_id: transition.task_id.clone(),
-                    },
-                );
-            }
-        }
-        let payload_digest = sha256_hex(
-            &canonical_json_bytes(&row_json)
-                .map_err(|error| StoreError::Serialization(error.to_string()))?,
-        );
-        let sequence = plan.next_outbox_sequence;
-        plan.next_outbox_sequence =
-            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
-        let outbox = OutboxIntent {
-            outbox_id: OutboxId::new(format!("outbox-{operation_key}-learning-{learning_index}"))?,
-            operation_id: transition.identity.operation_id.clone(),
-            sequence,
-            payload_digest,
-            state_fence: transition.state_fence.clone(),
-            arrival_fence: format!("arrival-{operation_key}"),
-            claim_fence: None,
-            state: OutboxState::Arrived,
-        };
-        outbox.validate()?;
-        plan.outbox_records.push(outbox);
-        learning_index = learning_index.saturating_add(1);
+        learning_index = apply_learning_record_command(
+            state,
+            transition,
+            plan,
+            &operation_key,
+            learning_index,
+            command,
+        )?;
     }
     Ok(())
+}
+
+/// Applies one admitted learning-record leg and appends its atomic outbox intent.
+///
+/// The row and outbox are prepared under the same locked transaction as the
+/// receipt. A new digest creates a new immutable row; a byte-identical replay
+/// converges, while a divergent same-key rewrite fails closed.
+fn apply_learning_record_command(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+    operation_key: &str,
+    learning_index: usize,
+    command: &eliot_store_api::NamedMutationRequest,
+) -> Result<usize, StoreError> {
+    let decoded =
+        eliot_store_api::decode_learning_mutation(command.operation, &command.parameters)?;
+    let record_kind = decoded.record_kind.as_str().to_owned();
+    let key = learning_row_key(&record_kind, &decoded.handle, &decoded.record_digest);
+    let row_json = serde_json::to_value(&decoded.record_json)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    match state.learning_record_rows.get(&key) {
+        Some(existing) if existing.record_json != decoded.record_json => {
+            return Err(StoreError::IdentityConflict);
+        }
+        Some(_) => {}
+        None => {
+            state.learning_record_rows.insert(
+                key,
+                LearningRecordRow {
+                    record_kind,
+                    handle: decoded.handle.clone(),
+                    record_digest: decoded.record_digest.clone(),
+                    record_json: decoded.record_json.clone(),
+                    state_fence: transition.state_fence.clone(),
+                    scope_id: transition.scope_id.to_string(),
+                    task_id: transition.task_id.clone(),
+                },
+            );
+        }
+    }
+    let payload_digest = sha256_hex(
+        &canonical_json_bytes(&row_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?,
+    );
+    let sequence = plan.next_outbox_sequence;
+    plan.next_outbox_sequence =
+        checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+    let outbox = OutboxIntent {
+        outbox_id: OutboxId::new(format!("outbox-{operation_key}-learning-{learning_index}"))?,
+        operation_id: transition.identity.operation_id.clone(),
+        sequence,
+        payload_digest,
+        state_fence: transition.state_fence.clone(),
+        arrival_fence: format!("arrival-{operation_key}"),
+        claim_fence: None,
+        state: OutboxState::Arrived,
+    };
+    outbox.validate()?;
+    plan.outbox_records.push(outbox);
+    Ok(learning_index.saturating_add(1))
 }
 
 /// Applies one decoded leg against the shared record model and returns the

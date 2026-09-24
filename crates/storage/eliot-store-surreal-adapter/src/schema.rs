@@ -322,24 +322,6 @@ DEFINE FIELD scope_id ON experience_feedback TYPE string;
 DEFINE FIELD task_id ON experience_feedback TYPE option<string>;
 ";
 
-/// Learning-record table (issue #1868).
-/// Additive delta in the experience style: `learning_record` carries one
-/// immutable row per joined kind/handle/digest key with the verbatim
-/// learning-record document plus presented digests. Applied explicitly
-/// where the owning slice proves it; never executed implicitly by the
-/// adapter.
-#[allow(dead_code)]
-pub(crate) const LEARNING_TABLES_DDL: &str = r"
-DEFINE TABLE learning_record SCHEMALESS;
-DEFINE FIELD record_kind ON learning_record TYPE string;
-DEFINE FIELD handle ON learning_record TYPE string;
-DEFINE FIELD record_json ON learning_record TYPE string;
-DEFINE FIELD record_digest ON learning_record TYPE string;
-DEFINE FIELD state_fence ON learning_record TYPE object;
-DEFINE FIELD scope_id ON learning_record TYPE string;
-DEFINE FIELD task_id ON learning_record TYPE option<string>;
-";
-
 pub(crate) const SCHEMA_DDL_V2: &str = r"
 DEFINE TABLE schema_meta SCHEMALESS;
 DEFINE FIELD generation ON schema_meta TYPE string;
