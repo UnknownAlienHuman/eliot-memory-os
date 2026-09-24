@@ -16,7 +16,7 @@ use eliot_contracts::ArtifactId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::batch::DenominatorState;
+use crate::contracts::batch::{DenominatorState, MemoryProjectionBatch};
 use crate::contracts::error::MemoryProjectionError;
 use crate::contracts::record::{MemoryKind, MemoryRole, MemoryScopeBinding};
 
@@ -229,6 +229,80 @@ impl ApplicableMemorySet {
         if !self.revalidation_required && accounted != *total {
             return Err(MemoryProjectionError::CoverageMismatch {
                 reason: "non-revalidation set must account for the exact known denominator",
+            });
+        }
+        Ok(())
+    }
+
+    /// Revalidate this verdict against the exact batch it describes.
+    ///
+    /// This method does not add source identity to the frozen set wire shape.
+    /// Callers that persist recovery state must additionally carry and check
+    /// [`MemoryProjectionBatch::canonical_digest`]. The join here prevents a
+    /// shape-valid set from being paired with different record kinds, roles,
+    /// binding, denominator, or proof-ceiling flags.
+    pub fn validate_against_batch(
+        &self,
+        batch: &MemoryProjectionBatch,
+    ) -> Result<(), MemoryProjectionError> {
+        self.validate()?;
+        batch.validate()?;
+        if self.binding != batch.binding
+            || self.denominator != batch.coverage.denominator
+            || self.truncated != batch.coverage.truncated
+            || self.revalidation_required != batch.coverage.revalidation_required
+        {
+            return Err(MemoryProjectionError::BindingMismatch {
+                left: "set.coverage",
+                right: "batch.coverage",
+            });
+        }
+
+        let mut dispositions = BTreeSet::new();
+        for entry in &self.applicable {
+            let Some(record) = batch
+                .records
+                .iter()
+                .find(|record| record.handle == entry.handle)
+            else {
+                return Err(MemoryProjectionError::CoverageMismatch {
+                    reason: "applicable set entry is absent from the bound batch",
+                });
+            };
+            if record.kind != entry.kind || record.roles != entry.roles {
+                return Err(MemoryProjectionError::BindingMismatch {
+                    left: "set.applicable",
+                    right: "batch.record",
+                });
+            }
+            dispositions.insert(entry.handle.as_str());
+        }
+        for entry in &self.excluded {
+            let Some(record) = batch
+                .records
+                .iter()
+                .find(|record| record.handle == entry.handle)
+            else {
+                return Err(MemoryProjectionError::CoverageMismatch {
+                    reason: "excluded set entry is absent from the bound batch",
+                });
+            };
+            if record.kind != entry.kind {
+                return Err(MemoryProjectionError::BindingMismatch {
+                    left: "set.excluded",
+                    right: "batch.record",
+                });
+            }
+            dispositions.insert(entry.handle.as_str());
+        }
+        if dispositions.len() != batch.records.len()
+            || batch
+                .records
+                .iter()
+                .any(|record| !dispositions.contains(record.handle.as_str()))
+        {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "set dispositions must equal exactly the batch record handles",
             });
         }
         Ok(())

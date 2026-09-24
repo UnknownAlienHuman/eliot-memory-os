@@ -115,8 +115,13 @@ fn batch(records: Vec<MemoryProjectionRecord>) -> MemoryProjectionBatch {
 }
 
 fn request(records: Vec<MemoryProjectionRecord>) -> ApplicabilityRequest {
+    let batch = batch(records);
+    let source_batch_digest = batch.canonical_digest().expect("batch source identity");
     ApplicabilityRequest {
-        batch: batch(records),
+        batch,
+        projection_read_receipt: aid("read-receipt-cc008"),
+        source_batch_digest,
+        missing_owner: None,
         task_key: "task-cc008:step-3".to_owned(),
         cue_hits: vec![],
     }
@@ -124,6 +129,13 @@ fn request(records: Vec<MemoryProjectionRecord>) -> ApplicabilityRequest {
 
 fn evaluate(records: Vec<MemoryProjectionRecord>) -> ApplicableMemorySet {
     evaluate_applicability(&request(records)).expect("fixture evaluation")
+}
+
+fn rebind_source(candidate: &mut ApplicabilityRequest) {
+    candidate.source_batch_digest = candidate
+        .batch
+        .canonical_digest()
+        .expect("valid fixture batch source identity");
 }
 
 fn excluded(set: &ApplicableMemorySet, handle: &str) -> ExcludedMemory {
@@ -252,6 +264,7 @@ fn missing_denominator_fails_closed() {
     candidate.batch.coverage.denominator = DenominatorState::Unknown {
         reason: "read side could not count".to_owned(),
     };
+    rebind_source(&mut candidate);
     let error = evaluate_applicability(&candidate).expect_err("unknown denominator");
     assert!(matches!(
         error,
@@ -270,6 +283,50 @@ fn known_positive_unaccounted_remainder_fails_before_evaluation() {
         eliot_memory_applicability::ApplicabilityError::Projection(
             eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
         )
+    ));
+}
+
+#[test]
+fn searched_state_is_bound_to_receipt_batch_digest_and_named_owner() {
+    let mut candidate = request(vec![record("mem-1")]);
+    let original_digest = candidate.source_batch_digest.clone();
+    let wire = serde_json::to_string(&candidate).expect("serialize request");
+    let decoded: ApplicabilityRequest =
+        serde_json::from_str(&wire).expect("deserialize request");
+    decoded.validate().expect("roundtrip retains search identity");
+    assert_eq!(decoded.projection_read_receipt, aid("read-receipt-cc008"));
+    assert_eq!(decoded.source_batch_digest, original_digest);
+
+    candidate.source_batch_digest = "0".repeat(64);
+    assert!(matches!(
+        evaluate_applicability(&candidate),
+        Err(eliot_memory_applicability::ApplicabilityError::InvalidField {
+            field: "request.source_batch_digest",
+            ..
+        })
+    ));
+
+    let mut unnamed_loss = request(vec![record("mem-1")]);
+    unnamed_loss.batch.coverage.denominator = DenominatorState::Known { total: 2 };
+    unnamed_loss.batch.coverage.omissions.push(
+        eliot_memory_projection_contracts::CoverageOmission {
+            handle: aid("mem-2"),
+            reason: "owner-read-failed".to_owned(),
+        },
+    );
+    unnamed_loss.batch.coverage.revalidation_required = true;
+    rebind_source(&mut unnamed_loss);
+    assert!(evaluate_applicability(&unnamed_loss).is_ok());
+
+    let mut contradictory_owner = request(vec![]);
+    contradictory_owner.missing_owner =
+        Some(SourceId::new("memory-read-owner").expect("fixture owner"));
+    assert!(matches!(
+        evaluate_applicability(&contradictory_owner),
+        Err(eliot_memory_applicability::ApplicabilityError::InvalidField {
+            field: "request.missing_owner",
+            ..
+        })
     ));
 }
 
@@ -313,6 +370,7 @@ fn truncated_batch_keeps_recovery_identity_batch_owned() {
     candidate.batch.coverage.truncated = true;
     candidate.batch.coverage.frontier = vec!["mem-2".to_owned(), "mem-3".to_owned()];
     candidate.batch.coverage.revalidation_required = true;
+    rebind_source(&mut candidate);
     let set = evaluate_applicability(&candidate).expect("truncated evaluation");
     assert!(set.truncated);
     assert!(set.revalidation_required);
@@ -329,6 +387,7 @@ fn truncation_and_revalidation_echo_to_the_set() {
     candidate.batch.coverage.truncated = true;
     candidate.batch.coverage.frontier = vec!["resume-after-mem-1".to_owned()];
     candidate.batch.coverage.revalidation_required = true;
+    rebind_source(&mut candidate);
     let set = evaluate_applicability(&candidate).expect("truncated evaluation");
     assert!(set.truncated);
     assert!(set.revalidation_required);
@@ -349,6 +408,8 @@ fn omission_recovery_identity_remains_batch_owned() {
     };
     candidate.batch.coverage.omissions.push(omission.clone());
     candidate.batch.coverage.revalidation_required = true;
+    candidate.missing_owner = Some(SourceId::new("memory-read-owner").expect("fixture owner"));
+    rebind_source(&mut candidate);
     let set = evaluate_applicability(&candidate).expect("lossy evaluation");
     assert!(set.revalidation_required);
     assert_eq!(candidate.batch.coverage.omissions, vec![omission]);

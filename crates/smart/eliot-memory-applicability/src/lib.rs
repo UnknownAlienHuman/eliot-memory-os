@@ -16,6 +16,9 @@
 //! - the frozen [`ApplicableMemorySet`] shape carries only disposition
 //!   handles and proof-ceiling flags; exact omission/frontier identities stay
 //!   on the input [`MemoryProjectionBatch`] for downstream recovery checks;
+//! - every request is bound to the exact read receipt and canonical batch
+//!   digest, and an unavailable owner is named rather than inferred from an
+//!   empty result;
 //! - evaluation order is deterministic input order; the output preserves it.
 //!
 //! Record checks run in a fixed documented order and the first failing rule
@@ -26,7 +29,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::ArtifactId;
+use eliot_contracts::{ArtifactId, SourceId};
 use eliot_evidence::EpistemicStatus;
 use eliot_memory_projection_contracts::{
     ApplicableMemory, ApplicableMemorySet, DenominatorState, ExcludedMemory, ExclusionReason,
@@ -73,6 +76,12 @@ pub enum ApplicabilityError {
 pub struct ApplicabilityRequest {
     /// Bounded projection to evaluate; the entire denominator.
     pub batch: MemoryProjectionBatch,
+    /// Exact read receipt that produced the searched-memory state.
+    pub projection_read_receipt: ArtifactId,
+    /// Canonical digest of the complete batch, including recovery identities.
+    pub source_batch_digest: String,
+    /// Owner that prevented a complete search, when recovery state is present.
+    pub missing_owner: Option<SourceId>,
     /// Exact-match key for negative-memory triggers (task/action identity).
     pub task_key: String,
     /// Advisory cue-hit handles; flags only, never proof.
@@ -83,6 +92,21 @@ impl ApplicabilityRequest {
     /// Validate batch shape, task key, and cue-hit bounds.
     pub fn validate(&self) -> Result<(), ApplicabilityError> {
         self.batch.validate()?;
+        if self.source_batch_digest != self.batch.canonical_digest()? {
+            return Err(ApplicabilityError::InvalidField {
+                field: "request.source_batch_digest",
+                reason: "does not equal the canonical complete batch",
+            });
+        }
+        if self.missing_owner.is_some()
+            && self.batch.coverage.omissions.is_empty()
+            && self.batch.coverage.frontier.is_empty()
+        {
+            return Err(ApplicabilityError::InvalidField {
+                field: "request.missing_owner",
+                reason: "named missing owner requires explicit omission or frontier recovery",
+            });
+        }
         if self.task_key.trim().is_empty() || self.task_key.chars().any(char::is_control) {
             return Err(ApplicabilityError::InvalidField {
                 field: "request.task_key",
@@ -254,6 +278,6 @@ pub fn evaluate_applicability(
         revalidation_required: request.batch.coverage.revalidation_required,
         cue_hits_considered: request.cue_hits.len(),
     };
-    set.validate()?;
+    set.validate_against_batch(&request.batch)?;
     Ok(set)
 }

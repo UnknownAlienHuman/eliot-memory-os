@@ -31,11 +31,13 @@
 //!   volume, digest lineage), never a merged verdict; observed counts never
 //!   substitute for the batch denominator, and no observation proves use,
 //!   decision delta, or benefit;
-//! - coverage is explicit, never a bare count: the assessment carries a
-//!   closed [`CoverageStatus`], the exact truncation frontier, the named
-//!   batch omissions, and the admitted projection omissions. A `Complete`
-//!   result exists only for lossless, fully accounted coverage; anything
-//!   else is `Inconclusive` with the exact evidence needed for recheck;
+//! - coverage is explicit, never a bare count: the request and assessment
+//!   carry the exact read receipt, canonical source-batch digest, and named
+//!   missing owner alongside a closed [`CoverageStatus`], the exact truncation
+//!   frontier, the named batch omissions, and the admitted projection
+//!   omissions. A `Complete` result exists only for lossless, fully accounted
+//!   coverage; anything else is `Inconclusive` with the exact evidence needed
+//!   for recheck;
 //! - assessment order is deterministic input order; counter-metric rule
 //!   counts are sorted by rule name.
 //!
@@ -52,7 +54,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_context_contracts::{
     CanonicalProjectionSet, ContextBinding, ContextError, OmissionRecord,
 };
-use eliot_contracts::{ArtifactId, ContractVersion, fences_match_exact};
+use eliot_contracts::{ArtifactId, ContractVersion, SourceId, fences_match_exact};
 use eliot_evidence::LifecycleState;
 use eliot_learning_contracts::identity::validate_digest as validate_learning_digest;
 use eliot_memory_projection_contracts::{
@@ -171,6 +173,12 @@ fn text(value: &str, field: &'static str) -> Result<(), QualityError> {
 pub struct QualityRequest {
     /// Bounded projection to assess; the entire denominator.
     pub batch: MemoryProjectionBatch,
+    /// Exact read receipt that produced the searched-memory state.
+    pub projection_read_receipt: ArtifactId,
+    /// Canonical digest of the complete source batch, including recovery state.
+    pub source_batch_digest: String,
+    /// Owner that prevented complete search, when applicable.
+    pub missing_owner: Option<SourceId>,
     /// Owner applicability verdict over exactly this batch.
     pub applicable: ApplicableMemorySet,
     /// Admitted task/continuity/safety/affordance projections by handle.
@@ -184,10 +192,16 @@ impl QualityRequest {
     pub fn validate(&self) -> Result<(), QualityError> {
         check_consumed_freeze()?;
         self.batch.validate()?;
+        if self.source_batch_digest != self.batch.canonical_digest()? {
+            return Err(QualityError::BindingMismatch {
+                left: "request.source_batch_digest",
+                right: "batch.canonical_digest",
+            });
+        }
         let DenominatorState::Known { .. } = &self.batch.coverage.denominator else {
             return Err(QualityError::MissingDenominator);
         };
-        self.applicable.validate()?;
+        self.applicable.validate_against_batch(&self.batch)?;
         if self.applicable.binding != self.batch.binding {
             return Err(QualityError::BindingMismatch {
                 left: "applicable.binding",
@@ -204,6 +218,16 @@ impl QualityRequest {
             });
         }
         self.projections.validate()?;
+        if self.missing_owner.is_some()
+            && self.batch.coverage.omissions.is_empty()
+            && self.batch.coverage.frontier.is_empty()
+            && self.projections.omissions.is_empty()
+        {
+            return Err(QualityError::InvalidField {
+                field: "request.missing_owner",
+                reason: "named missing owner requires explicit recovery evidence",
+            });
+        }
         let projection_binding = &self.projections.binding;
         if projection_binding.task_id != self.batch.binding.task_id
             || projection_binding.scope_id != self.batch.binding.scope_id
@@ -594,6 +618,12 @@ pub struct MemoryEcologyAssessment {
     pub contract_version: ContractVersion,
     /// Exact coverage posture of this assessment.
     pub status: CoverageStatus,
+    /// Read receipt echoed from the quality request.
+    pub projection_read_receipt: ArtifactId,
+    /// Canonical source-batch digest echoed from the quality request.
+    pub source_batch_digest: String,
+    /// Named owner that prevented complete search, when applicable.
+    pub missing_owner: Option<SourceId>,
     /// Binding echoed from the evaluated batch.
     pub binding: MemoryScopeBinding,
     /// Binding echoed from the admitted projection set.

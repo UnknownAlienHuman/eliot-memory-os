@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -165,6 +166,23 @@ impl MemoryProjectionBatch {
         let omitted = self.validate_omissions(&projected)?;
         self.validate_frontier(&projected, &omitted)?;
         self.validate_partition(projected.len(), omitted.len())
+    }
+
+    /// Compute the durable source identity of this exact batch.
+    ///
+    /// The frozen batch shape has no digest field. Consumers that must retain
+    /// omission/frontier recovery state therefore carry this value in their
+    /// own envelope and recompute it from the whole serialized batch. A
+    /// receipt or recovery identity that is not paired with this digest is
+    /// not bound to the batch it claims to describe.
+    pub fn canonical_digest(&self) -> Result<String, MemoryProjectionError> {
+        self.validate()?;
+        canonical_json_bytes(self)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| MemoryProjectionError::InvalidField {
+                field: "batch.canonical_digest",
+                reason: "batch is not canonically encodable",
+            })
     }
 
     fn validate_records(&self) -> Result<BTreeSet<String>, MemoryProjectionError> {

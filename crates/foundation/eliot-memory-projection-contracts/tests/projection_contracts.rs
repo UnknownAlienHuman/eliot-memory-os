@@ -15,9 +15,9 @@ use eliot_contracts::{
 };
 use eliot_evidence::{Assertability, EpistemicStatus, LifecycleState, Provenance};
 use eliot_memory_projection_contracts::{
-    CONTRACT_VERSION, CoverageOmission, DenominatorState, ExclusionReason, MemoryFreshness,
-    MemoryKind, MemoryProjectionBatch, MemoryProjectionRecord, MemoryRole, MemoryScopeBinding,
-    ProjectionCoverage,
+    ApplicableMemory, ApplicableMemorySet, CONTRACT_VERSION, CoverageOmission, DenominatorState,
+    ExclusionReason, MemoryFreshness, MemoryKind, MemoryProjectionBatch, MemoryProjectionRecord,
+    MemoryRole, MemoryScopeBinding, ProjectionCoverage,
 };
 use eliot_receipts::WorkScopeId;
 
@@ -123,6 +123,28 @@ pub fn batch() -> MemoryProjectionBatch {
         binding: binding(),
         records: vec![record("mem-1"), record("mem-2")],
         coverage: coverage_known(2),
+    }
+}
+
+fn applicable_set(candidate: &MemoryProjectionBatch) -> ApplicableMemorySet {
+    ApplicableMemorySet {
+        contract_version: CONTRACT_VERSION,
+        binding: candidate.binding.clone(),
+        applicable: candidate
+            .records
+            .iter()
+            .map(|entry| ApplicableMemory {
+                handle: entry.handle.clone(),
+                kind: entry.kind,
+                roles: entry.roles.clone(),
+                cue_hit: false,
+            })
+            .collect(),
+        excluded: vec![],
+        denominator: candidate.coverage.denominator.clone(),
+        truncated: candidate.coverage.truncated,
+        revalidation_required: candidate.coverage.revalidation_required,
+        cue_hits_considered: 0,
     }
 }
 
@@ -414,6 +436,48 @@ fn omission_entries_require_exact_reasons() {
     omission
         .validate()
         .expect_err("blank omission reason must fail");
+}
+
+#[test]
+fn durable_batch_digest_changes_with_recovery_partition() {
+    let complete = batch();
+    let complete_digest = complete
+        .canonical_digest()
+        .expect("complete batch has a source identity");
+    let mut omitted = complete.clone();
+    omitted.records.pop();
+    omitted.coverage.denominator = DenominatorState::Known { total: 2 };
+    omitted.coverage.revalidation_required = true;
+    omitted.coverage.omissions.push(CoverageOmission {
+        handle: aid("mem-2"),
+        reason: "fence-mismatch".to_owned(),
+    });
+    let omitted_digest = omitted
+        .canonical_digest()
+        .expect("omitted batch has a source identity");
+    assert_ne!(complete_digest, omitted_digest);
+}
+
+#[test]
+fn set_revalidation_binds_kind_roles_and_exact_batch_handles() {
+    let candidate = batch();
+    let set = applicable_set(&candidate);
+    set.validate_against_batch(&candidate)
+        .expect("exact set/batch join");
+
+    let mut changed_record = candidate.clone();
+    changed_record.records[0].kind = MemoryKind::Observation;
+    assert!(matches!(
+        set.validate_against_batch(&changed_record),
+        Err(eliot_memory_projection_contracts::MemoryProjectionError::BindingMismatch { .. })
+    ));
+
+    let mut missing_disposition = set;
+    missing_disposition.applicable.pop();
+    assert!(matches!(
+        missing_disposition.validate_against_batch(&candidate),
+        Err(eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. })
+    ));
 }
 
 #[test]
