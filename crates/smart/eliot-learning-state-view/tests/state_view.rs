@@ -13,13 +13,13 @@ use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRequirement, CampaignSourceResolution,
     CampaignSourceResolutionStatus, CampaignSourceRevisionRef, CampaignSourceRole, Completeness,
     ContractBinding, LearningStateViewRecipe, MemberProjection, OmissionPolicy, OwnerDisagreement,
-    OwnerId, SlotDisposition, SlotId, SlotProjection, SlotRequirement, SlotSpec, TargetId,
-    TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+    OwnerId, SlotDisposition, SlotId, SlotProjection, SlotRequirement, SlotSpec,
+    TASK_CONTROLLER_CAMPAIGN_OWNER_ID, TargetId,
 };
 use eliot_learning_contracts::{ProofCeiling, WorkScopeId};
 use eliot_learning_state_view::{
-    CampaignHistoryPlanInput, CampaignLearningStateCompilationInput, MAX_EVIDENCE,
-    MAX_LABEL_BYTES, MAX_RECORD_EVIDENCE, compile_campaign_learning_state_view,
+    CampaignHistoryPlanInput, CampaignLearningStateCompilationInput, MAX_EVIDENCE, MAX_LABEL_BYTES,
+    MAX_RECORD_EVIDENCE, compile_campaign_learning_state_view,
 };
 use eliot_reactive_context_plan::{
     CampaignBudgets, CampaignExperienceQuery, CampaignIntent, CampaignOutputMode, RetrievalPlan,
@@ -111,7 +111,9 @@ fn source_requirements(
                     .iter()
                     .find(|slot| slot.source_role == role)
                     .map(|slot| slot.owner.clone())
-                    .unwrap_or(OwnerId::from_artifact(artifact(&format!("source-owner-{index}"))?))
+                    .unwrap_or(OwnerId::from_artifact(artifact(&format!(
+                        "source-owner-{index}"
+                    ))?))
             };
             let absent = role == CampaignSourceRole::ActiveOverlay;
             let expected_reference = if absent || task_anchor {
@@ -129,7 +131,9 @@ fn source_requirements(
                     record_id: if task_record {
                         CampaignOwnerRecordId::Task(binding.task_id.clone())
                     } else {
-                        CampaignOwnerRecordId::Artifact(artifact(&format!("source-record-{index}"))?)
+                        CampaignOwnerRecordId::Artifact(artifact(&format!(
+                            "source-record-{index}"
+                        ))?)
                     },
                     revision: if task_record {
                         CampaignOwnerRevision::Task(TaskRevision::genesis())
@@ -286,9 +290,11 @@ fn compile_with(
             .slots
             .iter()
             .find(|spec| spec.slot_id == projection.slot_id)
-            .ok_or(eliot_learning_contracts::LearningContractError::ScopeMismatch {
-                field: "projection.slot_id",
-            })?;
+            .ok_or(
+                eliot_learning_contracts::LearningContractError::ScopeMismatch {
+                    field: "projection.slot_id",
+                },
+            )?;
         bound_recipe
             .source_requirements
             .iter_mut()
@@ -306,50 +312,64 @@ fn compile_with(
     bound_recipe.seal()?;
     *recipe = bound_recipe;
 
-    let source_resolutions: Vec<_> = recipe
-        .source_requirements
-        .iter()
-        .map(|requirement| {
-            let authenticated_task_anchor =
-                requirement.source_binding == CampaignSourceBinding::AuthenticatedTaskAnchor;
-            let reference = if authenticated_task_anchor {
-                Some(CampaignSourceRevisionRef {
+    let source_resolutions: Vec<_> =
+        recipe
+            .source_requirements
+            .iter()
+            .map(|requirement| {
+                let authenticated_task_anchor =
+                    requirement.source_binding == CampaignSourceBinding::AuthenticatedTaskAnchor;
+                let reference =
+                    if authenticated_task_anchor {
+                        Some(CampaignSourceRevisionRef {
+                            role: requirement.role,
+                            owner: requirement.owner.clone(),
+                            record_id: CampaignOwnerRecordId::Task(recipe.binding.task_id.clone()),
+                            revision: CampaignOwnerRevision::Task(
+                                recipe.binding.state_fence.task_revision.clone().expect(
+                                    "fixture fence carries its authenticated task revision",
+                                ),
+                            ),
+                            content_digest: digest("authenticated-task-anchor-614"),
+                            slot_projection_digests: vec![],
+                            recorded_state_fence: recipe.binding.state_fence.clone(),
+                        })
+                    } else {
+                        requirement.expected_reference.clone()
+                    };
+                CampaignSourceResolution {
                     role: requirement.role,
-                    owner: requirement.owner.clone(),
-                    record_id: CampaignOwnerRecordId::Task(recipe.binding.task_id.clone()),
-                    revision: CampaignOwnerRevision::Task(
-                        recipe
-                            .binding
-                            .state_fence
-                            .task_revision
-                            .clone()
-                            .expect("fixture fence carries its authenticated task revision"),
-                    ),
-                    content_digest: digest("authenticated-task-anchor-614"),
-                    slot_projection_digests: vec![],
-                    recorded_state_fence: recipe.binding.state_fence.clone(),
-                })
-            } else {
-                requirement.expected_reference.clone()
-            };
-            CampaignSourceResolution {
-                role: requirement.role,
-                status: if reference.is_some() {
-                    CampaignSourceResolutionStatus::Current
-                } else {
-                    CampaignSourceResolutionStatus::Missing
-                },
-                reference,
-                read_state_fence: recipe.binding.state_fence.clone(),
-            }
-        })
-        .collect();
+                    status: if reference.is_some() {
+                        CampaignSourceResolutionStatus::Current
+                    } else {
+                        CampaignSourceResolutionStatus::Missing
+                    },
+                    reference,
+                    read_state_fence: recipe.binding.state_fence.clone(),
+                }
+            })
+            .collect();
     let positions: Vec<_> = [
-        (CampaignPositionKind::Current, CampaignSourceRole::CurrentPosition),
-        (CampaignPositionKind::Experience, CampaignSourceRole::ExperiencePosition),
-        (CampaignPositionKind::Adaptation, CampaignSourceRole::AdaptationPosition),
-        (CampaignPositionKind::Evaluation, CampaignSourceRole::EvaluationPosition),
-        (CampaignPositionKind::EconomicsProgress, CampaignSourceRole::EconomicsProgress),
+        (
+            CampaignPositionKind::Current,
+            CampaignSourceRole::CurrentPosition,
+        ),
+        (
+            CampaignPositionKind::Experience,
+            CampaignSourceRole::ExperiencePosition,
+        ),
+        (
+            CampaignPositionKind::Adaptation,
+            CampaignSourceRole::AdaptationPosition,
+        ),
+        (
+            CampaignPositionKind::Evaluation,
+            CampaignSourceRole::EvaluationPosition,
+        ),
+        (
+            CampaignPositionKind::EconomicsProgress,
+            CampaignSourceRole::EconomicsProgress,
+        ),
     ]
     .into_iter()
     .map(|(kind, role)| {
@@ -442,17 +462,14 @@ fn complete_reconstruction_preserves_recipe_member_order_and_canonical_digest() 
     let first = projection(&recipe, 0, SlotDisposition::Current)?;
     let refs = vec![artifact("ref-z")?, artifact("ref-a")?];
     let view_id = artifact("view-explicit")?;
-    let view = compile(
-        &mut recipe,
-        std::slice::from_ref(&first),
-        &refs,
-    )?;
+    let view = compile(&mut recipe, std::slice::from_ref(&first), &refs)?;
     assert_eq!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     assert_ne!(view.view_id, view_id);
-    assert!(view
-        .view_id
-        .as_str()
-        .starts_with("campaign-learning-state-view:sha256:"));
+    assert!(
+        view.view_id
+            .as_str()
+            .starts_with("campaign-learning-state-view:sha256:")
+    );
     assert_eq!(view.binding.state_fence, recipe.binding.state_fence);
     assert_eq!(
         view.required_references,
@@ -480,7 +497,8 @@ fn shared_lineage_and_input_order_are_bound_before_compilation() -> TestResult {
     let second = projection_with_lineage(&recipe, 1, SlotDisposition::Current, &shared)?;
     let first = projection_with_lineage(&recipe, 0, SlotDisposition::Current, &shared)?;
     let before = recipe.canonical_digest.clone();
-    let view = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
         &[first.clone(), second.clone()],
         &[artifact("ref-a")?],
     )?;
@@ -510,7 +528,8 @@ fn shared_lineage_and_input_order_are_bound_before_compilation() -> TestResult {
     for member in &mut reverse_second.members {
         member.evidence.reverse();
     }
-    let reversed = compile(&mut recipe,
+    let reversed = compile(
+        &mut recipe,
         &[reverse_second, reverse_first],
         &[artifact("ref-a")?],
     )?;
@@ -538,7 +557,8 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
     ));
     let first = projection(&base_recipe, 0, SlotDisposition::Current)?;
     assert!(matches!(
-        compile(&mut base_recipe,
+        compile(
+            &mut base_recipe,
             std::slice::from_ref(&first),
             &[artifact("ref")?, artifact("ref")?]
         ),
@@ -569,7 +589,8 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
     oversized_dependency.seal()?;
     let oversized_projection = projection(&oversized_dependency, 0, SlotDisposition::Current)?;
     assert!(matches!(
-        compile(&mut oversized_dependency,
+        compile(
+            &mut oversized_dependency,
             &[oversized_projection],
             &[artifact("ref")?]
         ),
@@ -696,7 +717,8 @@ fn optional_stale_and_explicit_disagreement_are_preserved() -> TestResult {
     )?;
     let required = projection(&conditional, 0, SlotDisposition::Current)?;
     let blocked_optional = projection(&conditional, 1, SlotDisposition::Blocked)?;
-    let dependent = compile(&mut conditional,
+    let dependent = compile(
+        &mut conditional,
         &[required, blocked_optional.clone()],
         &[artifact("ref")?],
     )?;
@@ -752,7 +774,8 @@ fn minimal_complete_recipe_complete_view() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let view = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -825,7 +848,8 @@ fn exact_recipe_slot_status_disposition_vocabularies() -> TestResult {
             OmissionPolicy::RequiredSlots,
         )?;
         let supplied = projection(&recipe, 0, disposition)?;
-        let view = compile(&mut recipe,
+        let view = compile(
+            &mut recipe,
             std::slice::from_ref(&supplied),
             &[artifact("ref-1")?],
         )?;
@@ -840,7 +864,8 @@ fn exact_recipe_slot_status_disposition_vocabularies() -> TestResult {
     )?;
     let known_empty = projection(&empty, 0, SlotDisposition::KnownEmpty)?;
     assert!(known_empty.members.is_empty());
-    let view = compile(&mut empty,
+    let view = compile(
+        &mut empty,
         std::slice::from_ref(&known_empty),
         &[artifact("ref-1")?],
     )?;
@@ -904,7 +929,8 @@ fn task_target_scope_fence_recipe_mismatch() -> TestResult {
     let mut tampered = recipe.clone();
     tampered.target = TargetId::new("target-other")?;
     assert!(matches!(
-        compile(&mut tampered,
+        compile(
+            &mut tampered,
             std::slice::from_ref(&supplied),
             &[artifact("ref-1")?]
         ),
@@ -912,7 +938,8 @@ fn task_target_scope_fence_recipe_mismatch() -> TestResult {
     ));
     // A view stays bound to its exact recipe: resealing under another privacy
     // class breaks recipe binding even though the slot set is unchanged.
-    let view = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -940,7 +967,11 @@ fn duplicate_and_same_id_changed_payload_rejected() -> TestResult {
     changed.members[0].value_digest = Some(digest("changed-value"));
     changed.evidence.reverse();
     assert!(matches!(
-        compile(&mut recipe, &[first.clone(), changed], &[artifact("ref-1")?]),
+        compile(
+            &mut recipe,
+            &[first.clone(), changed],
+            &[artifact("ref-1")?]
+        ),
         Err(eliot_learning_contracts::LearningContractError::Duplicate { .. })
     ));
     // Same member identity twice inside one projection is a duplicate.
@@ -953,7 +984,8 @@ fn duplicate_and_same_id_changed_payload_rejected() -> TestResult {
     ));
     // Same required reference twice is a duplicate.
     assert!(matches!(
-        compile(&mut recipe,
+        compile(
+            &mut recipe,
             std::slice::from_ref(&first),
             &[artifact("ref-1")?, artifact("ref-1")?]
         ),
@@ -994,7 +1026,8 @@ fn exact_current_owner_projection_preserved() -> TestResult {
         member.evidence.reverse();
     }
     supplied.evidence.reverse();
-    let view = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -1032,7 +1065,8 @@ fn historical_stale_superseded_invalidated_projections() -> TestResult {
             OmissionPolicy::RequiredSlots,
         )?;
         let supplied = projection(&recipe, 0, disposition)?;
-        let view = compile(&mut recipe,
+        let view = compile(
+            &mut recipe,
             std::slice::from_ref(&supplied),
             &[artifact("ref-1")?],
         )?;
@@ -1048,7 +1082,8 @@ fn historical_stale_superseded_invalidated_projections() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let mut view = compile(&mut recipe,
+    let mut view = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -1089,7 +1124,8 @@ fn required_missing_versus_optional_absent() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&mixed, 0, SlotDisposition::Current)?;
-    let view = compile(&mut mixed,
+    let view = compile(
+        &mut mixed,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -1118,7 +1154,11 @@ fn conditional_required_true_false_unknown() -> TestResult {
         projection(&satisfied, 0, SlotDisposition::Current)?,
         projection(&satisfied, 1, SlotDisposition::Current)?,
     ];
-    let view = compile(&mut satisfied, &satisfied_projections, &[artifact("ref-1")?])?;
+    let view = compile(
+        &mut satisfied,
+        &satisfied_projections,
+        &[artifact("ref-1")?],
+    )?;
     assert_eq!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     // Predicate false: dependency present alone, conditional slot waits on the
     // frontier without failing the compilation.
@@ -1133,7 +1173,8 @@ fn conditional_required_true_false_unknown() -> TestResult {
         OmissionPolicy::ExplicitFrontier,
     )?;
     let only_dependency = projection(&frontier_recipe, 0, SlotDisposition::Current)?;
-    let view = compile(&mut frontier_recipe,
+    let view = compile(
+        &mut frontier_recipe,
         std::slice::from_ref(&only_dependency),
         &[artifact("ref-1")?],
     )?;
@@ -1180,7 +1221,8 @@ fn unavailable_and_blocked_owner_preserved() -> TestResult {
             OmissionPolicy::RequiredSlots,
         )?;
         let supplied = projection(&recipe, 0, disposition)?;
-        let view = compile(&mut recipe,
+        let view = compile(
+            &mut recipe,
             std::slice::from_ref(&supplied),
             &[artifact("ref-1")?],
         )?;
@@ -1243,10 +1285,7 @@ fn owner_disagreement_conflict_set_preserved() -> TestResult {
         projection(&recipe, 0, SlotDisposition::Conflicted)?,
         projection(&recipe, 1, SlotDisposition::Current)?,
     ];
-    let without = compile(&mut recipe,
-        &without_projections,
-        &[artifact("ref-1")?],
-    )?;
+    let without = compile(&mut recipe, &without_projections, &[artifact("ref-1")?])?;
     assert_ne!(view.canonical_digest, without.canonical_digest);
     assert!(without.owner_disagreements.is_empty());
     view.validate_against(&recipe)?;
@@ -1269,8 +1308,13 @@ fn no_latest_confidence_majority_selection() -> TestResult {
     let mut second = first.clone();
     second.members.reverse();
     second.evidence.reverse();
-    let view = compile(&mut recipe, std::slice::from_ref(&first), &[artifact("ref-1")?])?;
-    let reordered = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
+        std::slice::from_ref(&first),
+        &[artifact("ref-1")?],
+    )?;
+    let reordered = compile(
+        &mut recipe,
         std::slice::from_ref(&second),
         &[artifact("ref-1")?],
     )?;
@@ -1301,7 +1345,8 @@ fn transcript_substitution_rejected() -> TestResult {
     let mut fragment = supplied.clone();
     fragment.slot_id = SlotId::from_artifact(artifact("transcript-fragment")?);
     assert!(matches!(
-        compile(&mut recipe,
+        compile(
+            &mut recipe,
             &[supplied.clone(), fragment],
             &[artifact("ref-1")?]
         ),
@@ -1368,7 +1413,8 @@ fn privacy_authority_effect_proof_exclusion_visible() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let blocked = projection(&recipe, 0, SlotDisposition::Blocked)?;
-    let view = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
         std::slice::from_ref(&blocked),
         &[artifact("ref-1")?],
     )?;
@@ -1500,7 +1546,8 @@ fn known_empty_against_unavailable_partial_unknown() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let empty = projection(&declared, 0, SlotDisposition::KnownEmpty)?;
-    let view = compile(&mut declared,
+    let view = compile(
+        &mut declared,
         std::slice::from_ref(&empty),
         &[artifact("ref-1")?],
     )?;
@@ -1508,7 +1555,8 @@ fn known_empty_against_unavailable_partial_unknown() -> TestResult {
     // Unknown is partial evidence, never an empty declaration.
     let mut unknown = empty.clone();
     unknown.disposition = SlotDisposition::Unknown;
-    let view = compile(&mut declared,
+    let view = compile(
+        &mut declared,
         std::slice::from_ref(&unknown),
         &[artifact("ref-1")?],
     )?;
@@ -1537,7 +1585,8 @@ fn known_empty_against_unavailable_partial_unknown() -> TestResult {
     for member in &mut unavailable.members {
         member.disposition = SlotDisposition::Unavailable;
     }
-    let view = compile(&mut full,
+    let view = compile(
+        &mut full,
         std::slice::from_ref(&unavailable),
         &[artifact("ref-1")?],
     )?;
@@ -1563,7 +1612,8 @@ fn unexpected_and_duplicate_projection_disposition() -> TestResult {
     ));
     // The frontier excuses declared slots only; strangers stay rejected.
     assert!(matches!(
-        compile(&mut recipe,
+        compile(
+            &mut recipe,
             &[supplied.clone(), stranger],
             &[artifact("ref-1")?]
         ),
@@ -1571,7 +1621,8 @@ fn unexpected_and_duplicate_projection_disposition() -> TestResult {
     ));
     // A duplicate delivery of the same declared slot is rejected.
     assert!(matches!(
-        compile(&mut recipe,
+        compile(
+            &mut recipe,
             &[supplied.clone(), supplied],
             &[artifact("ref-1")?]
         ),
@@ -1630,7 +1681,8 @@ fn item_byte_exact_fit_and_one_over() -> TestResult {
     fitting.slots[0].accepted_type = "a".repeat(eliot_learning_state_view::MAX_LABEL_BYTES);
     fitting.seal()?;
     let supplied = projection(&fitting, 0, SlotDisposition::Current)?;
-    compile(&mut fitting,
+    compile(
+        &mut fitting,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -1650,7 +1702,11 @@ fn item_byte_exact_fit_and_one_over() -> TestResult {
             .evidence
             .push(artifact(&format!("slot-evidence-{index:04}"))?);
     }
-    compile(&mut recipe, std::slice::from_ref(&exact), &[artifact("ref-1")?])?;
+    compile(
+        &mut recipe,
+        std::slice::from_ref(&exact),
+        &[artifact("ref-1")?],
+    )?;
     let mut over = exact.clone();
     over.evidence.push(artifact("slot-evidence-over")?);
     assert!(matches!(
@@ -1671,10 +1727,7 @@ fn item_byte_exact_fit_and_one_over() -> TestResult {
     refs.push(artifact("ref-over")?);
     let over_projection = projection(&recipe, 0, SlotDisposition::Current)?;
     assert!(matches!(
-        compile(&mut recipe,
-            std::slice::from_ref(&over_projection),
-            &refs
-        ),
+        compile(&mut recipe, std::slice::from_ref(&over_projection), &refs),
         Err(eliot_learning_contracts::LearningContractError::Bound { .. })
     ));
     Ok(())
@@ -1689,7 +1742,8 @@ fn cursor_binds_snapshot_recipe_query_rejects_stale() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let view = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -1736,7 +1790,8 @@ fn bound_cutting_required_slot_yields_partial() -> TestResult {
         OmissionPolicy::ExplicitFrontier,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let view = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -1792,7 +1847,8 @@ fn source_to_view_exact_value_digest_equality() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let view = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -1866,11 +1922,13 @@ fn exact_replay_and_changed_same_id_conflict() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let first = compile(&mut recipe,
+    let first = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
-    let second = compile(&mut recipe,
+    let second = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -1880,7 +1938,8 @@ fn exact_replay_and_changed_same_id_conflict() -> TestResult {
     // never an alias of the earlier compilation.
     let mut changed = supplied.clone();
     changed.members[0].value_digest = Some(digest("changed-same-id"));
-    let replay = compile(&mut recipe,
+    let replay = compile(
+        &mut recipe,
         std::slice::from_ref(&changed),
         &[artifact("ref-1")?],
     )?;
@@ -1905,7 +1964,8 @@ fn no_newly_issued_transition_or_outcome_fields() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let view = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -1929,15 +1989,20 @@ fn no_newly_issued_transition_or_outcome_fields() -> TestResult {
         invalidation_reason,
         canonical_digest,
     } = view.clone();
-    assert!(view_id
-        .as_str()
-        .starts_with("campaign-learning-state-view:sha256:"));
+    assert!(
+        view_id
+            .as_str()
+            .starts_with("campaign-learning-state-view:sha256:")
+    );
     assert_eq!(recipe_id, recipe.recipe_id);
     assert_eq!(campaign_id, recipe.campaign_id);
     assert_eq!(target, recipe.target);
     assert_eq!(binding, recipe.binding);
     assert_eq!(recipe_digest, recipe.canonical_digest);
-    assert_eq!(provenance.source_resolutions.len(), CampaignSourceRole::all().len());
+    assert_eq!(
+        provenance.source_resolutions.len(),
+        CampaignSourceRole::all().len()
+    );
     assert_eq!(provenance.positions.len(), 5);
     assert_eq!(slots.len(), 1);
     assert_eq!(denominator, view.denominator);
@@ -1952,13 +2017,7 @@ fn no_newly_issued_transition_or_outcome_fields() -> TestResult {
     // Provenance names a few owner record families (such as outcomes and
     // delivery), but the view still carries no issued transition fields.
     let rendered = format!("{view:?}").to_lowercase();
-    for forbidden in [
-        "delta",
-        "activation",
-        "promotion",
-        "finish",
-        "transcript",
-    ] {
+    for forbidden in ["delta", "activation", "promotion", "finish", "transcript"] {
         assert!(!rendered.contains(forbidden), "view leaks {forbidden}");
     }
     Ok(())
@@ -1984,7 +2043,8 @@ fn bounded_malformed_property_input_never_panics() -> TestResult {
     let mut tampered = recipe.clone();
     tampered.slots[0].schema_digest = "zz".to_owned();
     assert!(matches!(
-        compile(&mut tampered,
+        compile(
+            &mut tampered,
             std::slice::from_ref(&supplied),
             &[artifact("ref-1")?]
         ),
@@ -2124,7 +2184,8 @@ fn complete_implies_current_allowed_required_slots() -> TestResult {
             OmissionPolicy::RequiredSlots,
         )?;
         let supplied = projection(&single, 0, disposition)?;
-        let view = compile(&mut single,
+        let view = compile(
+            &mut single,
             std::slice::from_ref(&supplied),
             &[artifact("ref-1")?],
         )?;
@@ -2142,7 +2203,8 @@ fn changing_owner_source_fence_recipe_invalidates_digest() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let baseline = compile(&mut recipe,
+    let baseline = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
@@ -2164,7 +2226,8 @@ fn changing_owner_source_fence_recipe_invalidates_digest() -> TestResult {
         .owner = next_owner_id;
     next_owner.seal()?;
     let owner_projection = projection(&next_owner, 0, SlotDisposition::Current)?;
-    let view = compile(&mut next_owner,
+    let view = compile(
+        &mut next_owner,
         std::slice::from_ref(&owner_projection),
         &[artifact("ref-1")?],
     )?;
@@ -2176,7 +2239,8 @@ fn changing_owner_source_fence_recipe_invalidates_digest() -> TestResult {
     // Changed source revision reseals the lineage and the view digest.
     let lineage = source("slot-0", 2)?;
     let revised = projection_with_lineage(&recipe, 0, SlotDisposition::Current, &lineage)?;
-    let view = compile(&mut recipe,
+    let view = compile(
+        &mut recipe,
         std::slice::from_ref(&revised),
         &[artifact("ref-1")?],
     )?;
@@ -2184,8 +2248,7 @@ fn changing_owner_source_fence_recipe_invalidates_digest() -> TestResult {
     // Changed fence and reference set each move the content-derived digest.
     let mut next_fence = recipe.clone();
     next_fence.binding.state_fence = fence_with_sequence(3);
-    next_fence.binding.state_fence.task_revision =
-        recipe.binding.state_fence.task_revision.clone();
+    next_fence.binding.state_fence.task_revision = recipe.binding.state_fence.task_revision.clone();
     next_fence.seal()?;
     let fence_projection = projection(&next_fence, 0, SlotDisposition::Current)?;
     let view = compile(
@@ -2201,7 +2264,8 @@ fn changing_owner_source_fence_recipe_invalidates_digest() -> TestResult {
     )?;
     assert_eq!(same_content.canonical_digest, baseline.canonical_digest);
     assert_eq!(same_content.view_id, baseline.view_id);
-    let relabeled = compile(&mut recipe,
+    let relabeled = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?, artifact("ref-2")?],
     )?;
@@ -2297,11 +2361,13 @@ fn no_store_clock_transcript_provider_mutation_path() -> TestResult {
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
     let digest_before = recipe.canonical_digest.clone();
-    let first = compile(&mut recipe,
+    let first = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
-    let second = compile(&mut recipe,
+    let second = compile(
+        &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
