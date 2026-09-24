@@ -130,16 +130,50 @@ pub fn sourced_evidence_from_repeated_verifier_failure(
     let verifier = verifier_ref.trim();
     let mut evidence_refs: Vec<String> = failure_refs.to_vec();
     evidence_refs.push(format!("verifier:{verifier}"));
-    Ok(SourcedEvidence {
-        source: EvidenceSource::EvaluatorVerdict,
-        evidence_refs,
+    sourced_evidence(
+        EvidenceSource::EvaluatorVerdict,
+        &evidence_refs,
+        trace_refs,
+        trigger_problem_or_metric,
+        &[format!("repeated verifier failure: {verifier}")],
+        &format!("verifier:{verifier}"),
+        owner_and_decision_authority,
+    )
+}
+
+/// Build sourced evidence for any I12.24 trigger source.
+///
+/// The single validated funnel for all [`EvidenceSource`] variants: every
+/// source's canonical refs enter the pipeline through this constructor, so a
+/// new source cannot bypass validation. Specialized mappers (conformance
+/// handoff, repeated verifier failure) delegate here.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one validated slot per sourced-evidence field; callers pass refs, not inline metrics"
+)]
+pub fn sourced_evidence(
+    source: EvidenceSource,
+    evidence_refs: &[String],
+    trace_refs: &[String],
+    trigger_problem_or_metric: &str,
+    root_cause_hypotheses: &[String],
+    validity_scope: &str,
+    owner_and_decision_authority: &str,
+) -> Result<SourcedEvidence, ImprovementError> {
+    require_refs(evidence_refs, "evidence_refs")?;
+    require_refs(trace_refs, "trace_refs")?;
+    let evidence = SourcedEvidence {
+        source,
+        evidence_refs: evidence_refs.to_vec(),
         trace_refs: trace_refs.to_vec(),
         trigger_problem_or_metric: trigger_problem_or_metric.to_string(),
-        root_cause_hypotheses: vec![format!("repeated verifier failure: {verifier}")],
+        root_cause_hypotheses: root_cause_hypotheses.to_vec(),
         counter_metrics: BTreeMap::new(),
-        validity_scope: format!("verifier:{verifier}"),
+        validity_scope: validity_scope.to_string(),
         owner_and_decision_authority: owner_and_decision_authority.to_string(),
-    })
+    };
+    evidence.validate()?;
+    Ok(evidence)
 }
 
 fn evidence_source_slug(source: EvidenceSource) -> &'static str {

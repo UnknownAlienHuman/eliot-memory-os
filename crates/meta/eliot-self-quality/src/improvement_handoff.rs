@@ -11,10 +11,10 @@
 //! Diagnosis never proves cause (see `diagnose.rs`): symptom refs map to
 //! `unproven-symptom:{ref}` hypotheses, never to proven-cause claims.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use eliot_conformance_contracts::SelfQualityHandoff;
-use eliot_improvement::evidence_sources::{EvidenceSource, SourcedEvidence};
+use eliot_improvement::evidence_sources::{EvidenceSource, SourcedEvidence, sourced_evidence};
 
 use crate::error::SelfQualityError;
 
@@ -60,22 +60,20 @@ pub fn sourced_evidence_from_handoff(
     if validity_scope.is_empty() {
         return Err(SelfQualityError::EmptyMapping("validity_scope"));
     }
-    let evidence = SourcedEvidence {
-        source: EvidenceSource::ConformanceDiagnosis,
-        evidence_refs: handoff.evidence_refs.clone(),
-        trace_refs: trace_set.into_iter().collect(),
-        trigger_problem_or_metric: trigger_problem_or_metric.to_string(),
-        root_cause_hypotheses: handoff
-            .symptom_refs
-            .iter()
-            .map(|value| format!("unproven-symptom:{value}"))
-            .collect(),
-        counter_metrics: BTreeMap::new(),
-        validity_scope: validity_scope.to_string(),
-        owner_and_decision_authority: handoff_owner_authority(handoff),
-    };
-    evidence
-        .validate()
-        .map_err(|_| SelfQualityError::EmptyMapping("evidence_refs"))?;
-    Ok(evidence)
+    let trace_refs: Vec<String> = trace_set.into_iter().collect();
+    let root_cause_hypotheses: Vec<String> = handoff
+        .symptom_refs
+        .iter()
+        .map(|value| format!("unproven-symptom:{value}"))
+        .collect();
+    sourced_evidence(
+        EvidenceSource::ConformanceDiagnosis,
+        &handoff.evidence_refs,
+        &trace_refs,
+        trigger_problem_or_metric,
+        &root_cause_hypotheses,
+        validity_scope,
+        &handoff_owner_authority(handoff),
+    )
+    .map_err(|_| SelfQualityError::EmptyMapping("evidence_refs"))
 }

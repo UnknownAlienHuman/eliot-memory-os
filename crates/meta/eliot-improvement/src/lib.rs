@@ -45,7 +45,7 @@ pub use budget_proof::{
     stamp_outcome_budget,
 };
 pub use evidence_sources::{
-    EvidenceSource, SourcedEvidence, candidate_from_evidence,
+    EvidenceSource, SourcedEvidence, candidate_from_evidence, sourced_evidence,
     sourced_evidence_from_repeated_verifier_failure,
 };
 pub use intake::{IntakeOutcome, IntakeRequest, intake_from_evidence};

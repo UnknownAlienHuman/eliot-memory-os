@@ -21,9 +21,10 @@ use std::collections::BTreeMap;
 use eliot_conformance_contracts::SelfQualityHandoff;
 use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_improvement::{
-    intake_from_evidence, record_owner_decision, stamp_outcome_budget, BudgetProof,
-    ImprovementBrief, ImprovementError, ImprovementSurface, IntakeOutcome, IntakeRequest,
-    OutcomeEvidence, OwnerDecision, OwnerDecisionKind, ReplayPlan, SafeBoundary, SourcedEvidence,
+    intake_from_evidence, record_owner_decision, sourced_evidence, stamp_outcome_budget,
+    BudgetProof, EvidenceSource, ImprovementBrief, ImprovementError, ImprovementSurface,
+    IntakeOutcome, IntakeRequest, OutcomeEvidence, OwnerDecision, OwnerDecisionKind, ReplayPlan,
+    SafeBoundary, SourcedEvidence,
 };
 use eliot_self_quality::improvement_handoff::sourced_evidence_from_handoff;
 use eliot_self_quality::SelfQualityError;
@@ -96,6 +97,50 @@ pub fn route_self_quality_handoff_to_backlog(
 ) -> Result<IntakeOutcome, IntakeBridgeError> {
     let evidence: SourcedEvidence =
         sourced_evidence_from_handoff(handoff, trigger_problem_or_metric, validity_scope)?;
+    run_intake(backlog, evidence, params)
+}
+
+/// Route canonical refs from any I12.24 evidence source into the backlog.
+///
+/// Covers every [`EvidenceSource`] variant (attempts, evaluator verdicts,
+/// campaign closure, conformance diagnosis, security incidents, accepted
+/// implementation deviations, complaints, Watchdog, Dreamer, Concilium
+/// suggestions): all enter through the single validated
+/// [`sourced_evidence`] funnel, then run the full intake. Pure
+/// orchestration: no promotion, no activation, no mutation beyond the
+/// caller-retained backlog.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one validated slot per sourced-evidence field plus the intake bundle"
+)]
+pub fn route_evidence_refs_to_backlog(
+    backlog: &mut BoundedBacklog,
+    source: EvidenceSource,
+    evidence_refs: &[String],
+    trace_refs: &[String],
+    trigger_problem_or_metric: &str,
+    root_cause_hypotheses: &[String],
+    validity_scope: &str,
+    owner_and_decision_authority: &str,
+    params: HandoffIntakeParams,
+) -> Result<IntakeOutcome, IntakeBridgeError> {
+    let evidence = sourced_evidence(
+        source,
+        evidence_refs,
+        trace_refs,
+        trigger_problem_or_metric,
+        root_cause_hypotheses,
+        validity_scope,
+        owner_and_decision_authority,
+    )?;
+    run_intake(backlog, evidence, params)
+}
+
+fn run_intake(
+    backlog: &mut BoundedBacklog,
+    evidence: SourcedEvidence,
+    params: HandoffIntakeParams,
+) -> Result<IntakeOutcome, IntakeBridgeError> {
     let request = IntakeRequest {
         project_id: params.project_id,
         target_surface: params.target_surface,
