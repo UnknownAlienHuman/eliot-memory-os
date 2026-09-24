@@ -12,4 +12,7 @@ pub enum SelfQualityError {
     /// The input, candidate, disposition, or handoff was rejected by the #971 contract.
     #[error("self-quality contract rejected: {0}")]
     Contract(#[from] SelfQualityContractError),
+    /// A handoff mapping had no usable refs for the improvement pipeline.
+    #[error("handoff mapping missing required refs: {0}")]
+    EmptyMapping(&'static str),
 }

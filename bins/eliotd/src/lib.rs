@@ -54,6 +54,7 @@ mod experience_runtime;
 mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
+pub mod improvement_intake;
 mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
