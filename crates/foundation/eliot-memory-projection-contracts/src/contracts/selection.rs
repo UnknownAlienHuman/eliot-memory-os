@@ -34,8 +34,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::error::MemoryProjectionError;
-use crate::record::{MemoryKind, MemoryScopeBinding};
+use crate::contracts::error::MemoryProjectionError;
+use crate::contracts::record::{MemoryKind, MemoryScopeBinding};
 use crate::{CONTRACT_VERSION, MemoryProjectionBatch};
 
 /// Selection failure: every case fails closed with its exact reason.

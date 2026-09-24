@@ -1,7 +1,7 @@
 //! Task-local applicability sets: the evaluator output contract.
 //!
 //! An [`ApplicableMemorySet`] is what `eliot-memory-applicability` returns
-//! for one [`MemoryProjectionBatch`](crate::batch::MemoryProjectionBatch):
+//! for one [`MemoryProjectionBatch`](crate::contracts::batch::MemoryProjectionBatch):
 //! the applicable handles with their preserved roles, plus every excluded
 //! handle with its exact substantive reason. Cue-hit evidence travels as a
 //! per-disposition flag only: a cue hit never promotes a record into
@@ -14,9 +14,9 @@ use eliot_contracts::ArtifactId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::batch::DenominatorState;
-use crate::error::MemoryProjectionError;
-use crate::record::{MemoryKind, MemoryRole, MemoryScopeBinding};
+use crate::contracts::batch::DenominatorState;
+use crate::contracts::error::MemoryProjectionError;
+use crate::contracts::record::{MemoryKind, MemoryRole, MemoryScopeBinding};
 
 fn text(value: &str, field: &'static str) -> Result<(), MemoryProjectionError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {

@@ -10,7 +10,7 @@
 //!
 //! Placement: the wave briefs name the Governor canonical observation owner
 //! as producer and no separate failure-observation crate, so this module is
-//! the projection-schema owner beside `experience_projection`: it reuses this
+//! the projection-schema owner beside `experience::projection`: it reuses this
 //! crate's [`ObservationScope`], [`SourceRevisionHandle`],
 //! [`CoverageEvidence`], handle, and fence vocabulary, and cites Governor
 //! journal records by handle only. Live admission, enumeration, and rebuild

@@ -10,11 +10,12 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod implementation;
 mod model;
-mod projection;
 mod validation;
 
 pub use error::ImplementationBriefError;
+pub use implementation::project_implementation_brief;
 pub use model::{
     ArchitectureAlignment, CurrentEvidenceTarget, EvidenceAxisSnapshot, EvidenceVerdict,
     IMPLEMENTATION_BRIEF_PROOF_CEILING, IMPLEMENTATION_BRIEF_SCHEMA_VERSION,
@@ -25,4 +26,3 @@ pub use model::{
     ImplementationStatementKind, MechanismAssessment, MechanismDisposition, ObligationAssessment,
     ProofStage, StageAssessment, StageDisposition,
 };
-pub use projection::project_implementation_brief;

@@ -244,7 +244,7 @@ impl EnvelopeHeader<'_> {
             });
         }
         self.scope.validate()?;
-        fence_shape(&self.fence, "projection.fence")?;
+        fence_shape(self.fence, "projection.fence")?;
         bounded_text(
             self.source_revision,
             "projection.source_revision",

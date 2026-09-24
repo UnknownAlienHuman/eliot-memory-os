@@ -17,7 +17,7 @@ use eliot_receipts::WorkScopeId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::MemoryProjectionError;
+use crate::MemoryProjectionError;
 
 /// Maximum inputs, outputs, commitments, effects, or lineage entries per view.
 pub const MAX_WORKFLOW_ENTRIES: usize = 64;
