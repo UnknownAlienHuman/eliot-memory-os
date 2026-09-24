@@ -329,14 +329,15 @@ impl RpcTransport {
 ///
 /// Closed allowlist (S-CONC-CLIENTS, issue #987): exactly the pure-read
 /// operations the adapter's production paths issue today — the canonical
-/// head/schema preflight reads (`read.*`) and the receipt/outbox readback
-/// (`recovery.snapshot`). Writes (`migration.apply`, canonical
+/// head/schema preflight reads (`read.*`), the receipt/outbox readback
+/// (`recovery.snapshot`), and the coherent snapshot point/page/end reads
+/// (`snapshot.*`, issue #951). Writes (`migration.apply`, canonical
 /// transactions), health probes, Dreamer rows (`dreamer.read_row`), test
 /// operations, and any unlisted operation stay on the facade session by
-/// default. A newly introduced or typoed `read.*`/`recovery.*` name is NOT
-/// admitted by naming convention: extending this mapping is the runtime
-/// integration's (#993) explicit decision, recorded here as a new entry, not
-/// a silent local widening.
+/// default. A newly introduced or typoed `read.*`/`recovery.*`/`snapshot.*`
+/// name is NOT admitted by naming convention: extending this mapping is the
+/// runtime integration's (#993) explicit decision, recorded here as a new
+/// entry, not a silent local widening.
 const POOL_READ_OPERATIONS: &[&str] = &[
     "read.all_ordering_heads",
     "read.all_revision_heads",
@@ -355,6 +356,9 @@ const POOL_READ_OPERATIONS: &[&str] = &[
     "read.schema_meta",
     "read.validation_snapshot",
     "recovery.snapshot",
+    crate::backup_snapshot::SNAPSHOT_BEGIN_OPERATION,
+    crate::backup_snapshot::SNAPSHOT_END_OPERATION,
+    crate::backup_snapshot::SNAPSHOT_PAGE_OPERATION,
 ];
 
 fn is_pool_read_operation(operation: &str) -> bool {
@@ -622,6 +626,9 @@ mod tests {
                 "read.schema_meta",
                 "read.validation_snapshot",
                 "recovery.snapshot",
+                "snapshot.begin",
+                "snapshot.end",
+                "snapshot.page",
             ]
         );
         for operation in admitted {
@@ -631,8 +638,8 @@ mod tests {
             );
         }
         // Writes, probes, Dreamer rows, test labels, and any unlisted name
-        // — including typoed or future `read.*`/`recovery.*` names — stay on
-        // the facade session until explicitly admitted above.
+        // — including typoed or future `read.*`/`recovery.*`/`snapshot.*`
+        // names — stay on the facade session until explicitly admitted above.
         for refused in [
             "migration.apply",
             "transaction.apply",
