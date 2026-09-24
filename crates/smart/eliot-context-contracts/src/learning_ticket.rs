@@ -165,3 +165,163 @@ pub fn ticket_fresh_for(
     }
     fences_match_exact(current_fence, &ticket.fence)
 }
+
+/// Schema version for the exact learning-record admission ticket.
+pub const LEARNING_RECORD_TICKET_SCHEMA_VERSION: u32 = 1;
+/// Digest domain for the exact learning-record admission ticket.
+pub const LEARNING_RECORD_TICKET_DIGEST_DOMAIN: &str =
+    "eliot.smart.context.learning-record-ticket.v1";
+
+/// Wire admission for one exact learning-record identity.
+///
+/// This is deliberately separate from the older influence-only ticket: the
+/// older shape remains a compatibility contour for context admission, while
+/// behavioral learning effects require this record-, scope-, fence-, and
+/// expiry-bound twin.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LearningRecordAdmissionTicket {
+    /// Exact ticket schema revision.
+    pub schema_version: u32,
+    /// Source campaign identity.
+    pub source_campaign_id: String,
+    /// Target task identity.
+    pub target_task_id: String,
+    /// Exact admission State Fence.
+    pub fence: StateFence,
+    /// Closed learning record kind.
+    pub record_kind: String,
+    /// Exact record handle.
+    pub record_handle: String,
+    /// Exact immutable record digest.
+    pub record_digest: String,
+    /// Exact canonical scope identity.
+    pub scope_id: String,
+    /// Absolute expiry deadline in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
+    /// Governor authority reference.
+    pub authority_ref: String,
+    /// Retention-policy reference.
+    pub retention_ref: String,
+    /// Evaluator reference.
+    pub evaluator_ref: String,
+    /// Rollback reference.
+    pub rollback_ref: String,
+    /// Digest over every preceding field.
+    pub digest: String,
+}
+
+impl LearningRecordAdmissionTicket {
+    /// Validate shape and the closed record-kind vocabulary.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        if self.schema_version != LEARNING_RECORD_TICKET_SCHEMA_VERSION {
+            return Err(ContextError::InvalidField(
+                "learning_record_ticket.schema_version",
+            ));
+        }
+        for (field, value) in [
+            (
+                "learning_record_ticket.source_campaign_id",
+                &self.source_campaign_id,
+            ),
+            (
+                "learning_record_ticket.target_task_id",
+                &self.target_task_id,
+            ),
+            ("learning_record_ticket.record_handle", &self.record_handle),
+            ("learning_record_ticket.scope_id", &self.scope_id),
+            ("learning_record_ticket.authority_ref", &self.authority_ref),
+            ("learning_record_ticket.retention_ref", &self.retention_ref),
+            ("learning_record_ticket.evaluator_ref", &self.evaluator_ref),
+            ("learning_record_ticket.rollback_ref", &self.rollback_ref),
+        ] {
+            validate_text(value, field)?;
+            if value.trim() != value {
+                return Err(ContextError::InvalidField(field));
+            }
+        }
+        if !matches!(
+            self.record_kind.as_str(),
+            "delta" | "overlay" | "closure" | "activation_receipt" | "candidate" | "view_ref"
+        ) {
+            return Err(ContextError::InvalidField(
+                "learning_record_ticket.record_kind",
+            ));
+        }
+        validate_digest(&self.record_digest, "learning_record_ticket.record_digest")?;
+        self.fence
+            .validate()
+            .map_err(|_| ContextError::InvalidFence)?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(ContextError::InvalidField(
+                "learning_record_ticket.expires_at_unix_ms",
+            ));
+        }
+        validate_digest(&self.digest, "learning_record_ticket.digest")?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct RecordTicketDigestInput<'a> {
+    domain: &'static str,
+    schema_version: u32,
+    source_campaign_id: &'a str,
+    target_task_id: &'a str,
+    fence: &'a StateFence,
+    record_kind: &'a str,
+    record_handle: &'a str,
+    record_digest: &'a str,
+    scope_id: &'a str,
+    expires_at_unix_ms: u64,
+    authority_ref: &'a str,
+    retention_ref: &'a str,
+    evaluator_ref: &'a str,
+    rollback_ref: &'a str,
+}
+
+/// Compute the exact record-admission ticket digest.
+pub fn learning_record_ticket_digest(
+    ticket: &LearningRecordAdmissionTicket,
+) -> Result<String, ContextError> {
+    let input = RecordTicketDigestInput {
+        domain: LEARNING_RECORD_TICKET_DIGEST_DOMAIN,
+        schema_version: ticket.schema_version,
+        source_campaign_id: ticket.source_campaign_id.trim(),
+        target_task_id: ticket.target_task_id.trim(),
+        fence: &ticket.fence,
+        record_kind: ticket.record_kind.trim(),
+        record_handle: ticket.record_handle.trim(),
+        record_digest: ticket.record_digest.trim(),
+        scope_id: ticket.scope_id.trim(),
+        expires_at_unix_ms: ticket.expires_at_unix_ms,
+        authority_ref: ticket.authority_ref.trim(),
+        retention_ref: ticket.retention_ref.trim(),
+        evaluator_ref: ticket.evaluator_ref.trim(),
+        rollback_ref: ticket.rollback_ref.trim(),
+    };
+    let bytes = eliot_contracts::canonical_json_bytes(&input)
+        .map_err(|_| ContextError::InvalidField("learning_record_ticket.canonical"))?;
+    Ok(eliot_contracts::sha256_hex(&bytes))
+}
+
+/// Check exact record-ticket integrity, live authority, fence, and expiry.
+pub fn learning_record_ticket_fresh_for(
+    ticket: &LearningRecordAdmissionTicket,
+    live_epoch: &EpochId,
+    live_generation: ResourceGeneration,
+    current_fence: &StateFence,
+    now_unix_ms: u64,
+) -> bool {
+    if ticket.validate().is_err() {
+        return false;
+    }
+    let Ok(recomputed) = learning_record_ticket_digest(ticket) else {
+        return false;
+    };
+    recomputed == ticket.digest
+        && ticket.fence.authority_epoch.is_same_authority(live_epoch)
+        && ticket.fence.resource_generation == live_generation
+        && fences_match_exact(current_fence, &ticket.fence)
+        && ticket.expires_at_unix_ms > now_unix_ms
+}

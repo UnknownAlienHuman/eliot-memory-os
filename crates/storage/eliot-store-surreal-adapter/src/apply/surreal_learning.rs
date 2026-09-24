@@ -3,30 +3,29 @@
 //!
 //! Mirrors the experience contour's closed leg through the store-api wire
 //! contract, persisted in one table: `learning_record` holds one
-//! immutable row per `(record_kind, handle, record_digest)` carrying the
-//! verbatim learning-record document. Documents stay opaque: lineage,
-//! sequencing, and digest re-proof are Governor-owned, and this module
-//! arbitrates keys and immutability only. Concurrent writers arbitrate
+//! immutable row per complete kind/handle/record-digest/scope/fence/expiry
+//! identity carrying the verbatim learning-record document. Documents stay
+//! opaque: lineage, sequencing, and digest re-proof are Governor-owned, and
+//! this module arbitrates keys and immutability only. Concurrent writers arbitrate
 //! through the in-transaction compare-and-set inside the canonical
 //! transaction; retries recompute from fresh rows, never from stale
 //! reads. Rows commit inside the canonical transaction beside the receipt
 //! and outbox rows, so rows, receipt, and outbox stay atomic.
 //!
-//! Rows are addressed by a joined record id
-//! (`record_kind` + `\x1f` + `handle` + `\x1f` + `record_digest`). The
-//! join is collision-free by construction: the wire contract admits a
-//! closed `record_kind` set with no control characters, rejects control
-//! characters in the handle, and the digest is fixed-shape hex, so the
-//! unit separator can never occur inside any part. The parts also travel
-//! as separate row fields, so no reader ever parses the address.
+//! Rows are addressed by a joined immutable identity containing the closed
+//! record kind, handle, record digest, exact scope identity and digest,
+//! exact State Fence digest, and expiry deadline. The join is
+//! collision-free by construction: the wire contract admits closed
+//! record-kind and fixed-shape digest values and rejects control characters
+//! in text parts, so the unit separator can never occur inside a part. The
+//! parts also travel as separate row fields, so no reader parses the address.
 //!
-//! The digest IS the immutable revision identity: a new digest is a new
-//! row, never an in-place rewrite; identical replays converge
-//! (`IdentityConflict` on divergent rewrite).
+//! A new complete identity is a new row, never an in-place rewrite;
+//! identical replays converge and divergent same-key rewrites fail closed.
 
 use eliot_store_api::{
     DecodedLearningMutation, NamedMutationOperation, StateFence, StoreError, TransitionClass,
-    decode_learning_mutation,
+    decode_learning_mutation, learning_fence_digest, learning_scope_digest,
 };
 use serde_json::{Map, Value, json};
 
@@ -35,12 +34,21 @@ use crate::client::{self, RpcTransport};
 use crate::error::AdapterError;
 use crate::schema;
 
-/// Joins one learning row address. Collision-free: the record kind is a
-/// closed discriminator without control characters, the handle may not
-/// contain control characters per the wire contract, and the digest is
-/// fixed-shape hex.
-fn learning_row_key(record_kind: &str, handle: &str, record_digest: &str) -> String {
-    format!("{record_kind}\x1f{handle}\x1f{record_digest}")
+/// Joins one learning row address. Scope, fence digest, and expiry are part
+/// of the immutable identity so a same-digest record cannot cross owner
+/// contours by address reuse.
+fn learning_row_key(
+    record_kind: &str,
+    handle: &str,
+    record_digest: &str,
+    scope_id: &str,
+    scope_digest: &str,
+    fence_digest: &str,
+    expires_at_unix_ms: u64,
+) -> String {
+    format!(
+        "{record_kind}\x1f{handle}\x1f{record_digest}\x1f{scope_id}\x1f{scope_digest}\x1f{fence_digest}\x1f{expires_at_unix_ms}"
+    )
 }
 
 /// One computed learning-record row write for the canonical transaction.
@@ -52,8 +60,14 @@ pub(crate) struct LearningRecordWrite {
     pub handle: String,
     /// Verbatim canonical record document.
     pub record_json: String,
-    /// Presented digest of the record bytes; the immutable revision identity.
+    /// Presented digest of the record bytes; part of the immutable identity.
     pub record_digest: String,
+    /// Exact scope digest carried by the closed mutation.
+    pub scope_digest: String,
+    /// Exact fence digest carried by the closed mutation.
+    pub fence_digest: String,
+    /// Absolute expiry deadline.
+    pub expires_at_unix_ms: u64,
     /// Admission fence of the transition.
     pub state_fence: StateFence,
     /// Scope provenance from the transition envelope.
@@ -80,8 +94,16 @@ pub(crate) struct StoredLearningRecord {
     pub record_json: String,
     /// Presented digest of the record bytes.
     pub record_digest: String,
+    /// Exact scope digest.
+    pub scope_digest: String,
+    /// Exact fence digest.
+    pub fence_digest: String,
+    /// Absolute expiry deadline.
+    pub expires_at_unix_ms: u64,
     /// Admission fence.
     pub state_fence: StateFence,
+    /// Exact scope identity carried by the immutable row.
+    pub scope_id: String,
 }
 
 /// Ensures the learning table exists (idempotent).
@@ -146,13 +168,27 @@ pub(crate) async fn prepare_learning_writes(
             handle,
             record_json,
             record_digest,
-            ..
+            scope_digest,
+            fence_digest,
+            idempotency_key: _,
+            expires_at_unix_ms,
         } = decoded;
+        let expected_scope_digest = learning_scope_digest(transition.scope_id.as_str())?;
+        let expected_fence_digest = learning_fence_digest(&transition.state_fence)?;
+        if scope_digest != expected_scope_digest || fence_digest != expected_fence_digest {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "learning.scope_fence_binding",
+                reason: "learning row digest does not match the canonical transition",
+            }));
+        }
         writes.records.push(LearningRecordWrite {
             record_kind: record_kind.as_str().to_owned(),
             handle,
             record_json,
             record_digest,
+            scope_digest,
+            fence_digest,
+            expires_at_unix_ms,
             state_fence: transition.state_fence.clone(),
             scope_id: transition.scope_id.to_string(),
             task_id: transition.task_id.clone(),
@@ -199,7 +235,11 @@ fn append_record_statement(
         json!(learning_row_key(
             &write.record_kind,
             &write.handle,
-            &write.record_digest
+            &write.record_digest,
+            &write.scope_id,
+            &write.scope_digest,
+            &write.fence_digest,
+            write.expires_at_unix_ms,
         )),
     );
     bindings.insert(
@@ -213,6 +253,9 @@ fn append_record_statement(
             "handle": write.handle,
             "record_json": write.record_json,
             "record_digest": write.record_digest,
+            "scope_digest": write.scope_digest,
+            "fence_digest": write.fence_digest,
+            "expires_at_unix_ms": write.expires_at_unix_ms,
             "state_fence": write.state_fence,
             "scope_id": write.scope_id,
             "task_id": write.task_id,
@@ -245,6 +288,17 @@ fn text_row_field(
         }))
 }
 
+fn expiry_row_field(object: &serde_json::Map<String, Value>) -> Result<u64, AdapterError> {
+    object
+        .get("expires_at_unix_ms")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "learning.expires_at_unix_ms",
+            reason: "learning row expiry must be a positive integer",
+        }))
+}
+
 fn fence_row_field(object: &serde_json::Map<String, Value>) -> Result<StateFence, AdapterError> {
     serde_json::from_value(
         object
@@ -271,7 +325,11 @@ fn decode_record_row(
         handle: text_row_field(object, "handle")?,
         record_json: text_row_field(object, "record_json")?,
         record_digest: text_row_field(object, "record_digest")?,
+        scope_digest: text_row_field(object, "scope_digest")?,
+        fence_digest: text_row_field(object, "fence_digest")?,
+        expires_at_unix_ms: expiry_row_field(object)?,
         state_fence: fence_row_field(object)?,
+        scope_id: text_row_field(object, "scope_id")?,
     })
 }
 
@@ -289,12 +347,12 @@ pub(crate) async fn read_learning_for_read(
 ) -> Result<Vec<StoredLearningRecord>, AdapterError> {
     let sql = if kind_filter.is_some() {
         format!(
-            "SELECT * FROM {} WHERE scope_id = $learning_scope AND record_kind = $learning_kind ORDER BY record_kind, handle, record_digest LIMIT {limit};",
+            "SELECT * FROM {} WHERE scope_id = $learning_scope AND record_kind = $learning_kind ORDER BY record_kind, handle, record_digest, scope_digest, fence_digest, expires_at_unix_ms LIMIT {limit};",
             schema::table::LEARNING_RECORD
         )
     } else {
         format!(
-            "SELECT * FROM {} WHERE scope_id = $learning_scope ORDER BY record_kind, handle, record_digest LIMIT {limit};",
+            "SELECT * FROM {} WHERE scope_id = $learning_scope ORDER BY record_kind, handle, record_digest, scope_digest, fence_digest, expires_at_unix_ms LIMIT {limit};",
             schema::table::LEARNING_RECORD
         )
     };

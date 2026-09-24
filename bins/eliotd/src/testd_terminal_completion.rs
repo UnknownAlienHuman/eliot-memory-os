@@ -8,21 +8,92 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{OperationId, TaskId, canonical_json_bytes};
-use eliot_governor::CanonicalPlanBinding;
+use eliot_governor::{CanonicalPlanBinding, LearningRecordPayload};
 use eliot_instrument_api::InstrumentInvocation;
 use eliot_protocol::RequestIdentity;
+use eliot_store_api::{LearningRecordKind, NamedReadResponse, ScopeId};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     JobState as TestdJobState, TestJob, TestdPendingVerifierDispatch, TestdStore,
     TestdTerminalCompletionEvidence, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
     verification_receipt_sha256,
 };
+use serde::Serialize;
 
 use crate::daemon_kernel_client::TESTD_OWNER_POLL_LIMIT;
 use crate::{DaemonComposition, DaemonError, DaemonKernelClient};
 
+/// Typed, owner-separated observation emitted when the TestD terminal owner
+/// closes a job. It records what was observed; it does not claim activation,
+/// adherence, benefit, or Governor admission.
+#[derive(Serialize)]
+struct TestdTerminalLearningRecord {
+    job_id: String,
+    process_operation_id: String,
+    task_id: String,
+    task_revision: u64,
+    scope_id: String,
+    state_fence: eliot_contracts::StateFence,
+    terminal_state: String,
+    verifier_receipt_sha256: String,
+    finish_decision: eliot_governor::FinishDecisionReceipt,
+    observed_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+}
+
 fn completion_error(error: impl std::fmt::Display) -> DaemonError {
     DaemonError::Lifecycle(format!("TestD terminal completion: {error}"))
+}
+
+fn readback_contains_identity(
+    response: &NamedReadResponse,
+    proposal: &eliot_governor::LearningRecordProposal,
+) -> bool {
+    let Some(records) = response
+        .payload
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    let expected_fence = serde_json::to_value(&proposal.identity.state_fence).ok();
+    let Ok(expected_scope_digest) =
+        eliot_store_api::learning_scope_digest(&proposal.identity.scope_id)
+    else {
+        return false;
+    };
+    let Ok(expected_fence_digest) =
+        eliot_store_api::learning_fence_digest(&proposal.identity.state_fence)
+    else {
+        return false;
+    };
+    records.iter().any(|record| {
+        record
+            .get("record_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some(proposal.identity.record_kind.as_str())
+            && record.get("handle").and_then(serde_json::Value::as_str)
+                == Some(proposal.identity.handle.as_str())
+            && record
+                .get("record_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(proposal.identity.record_digest.as_str())
+            && record
+                .get("expires_at_unix_ms")
+                .and_then(serde_json::Value::as_u64)
+                == Some(proposal.identity.expires_at_unix_ms)
+            && record.get("scope_id").and_then(serde_json::Value::as_str)
+                == Some(proposal.identity.scope_id.as_str())
+            && record
+                .get("scope_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_scope_digest.as_str())
+            && record
+                .get("fence_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_fence_digest.as_str())
+            && record.get("state_fence") == expected_fence.as_ref()
+    })
 }
 
 fn unix_ms() -> u64 {
@@ -31,6 +102,17 @@ fn unix_ms() -> u64 {
         .map_or(1, |duration| {
             u64::try_from(duration.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
         })
+}
+
+fn terminal_state_name(state: TestdJobState) -> Result<&'static str, DaemonError> {
+    match state {
+        TestdJobState::Succeeded => Ok("succeeded"),
+        TestdJobState::Failed => Ok("failed"),
+        TestdJobState::Cancelled => Ok("cancelled"),
+        _ => Err(completion_error(
+            "terminal evidence is not a settled terminal job",
+        )),
+    }
 }
 
 impl DaemonComposition {
@@ -283,6 +365,28 @@ impl DaemonComposition {
         Ok(committed)
     }
 
+    /// Reads the exact same-scope, same-fence learning range through the
+    /// authenticated Kernel named-read route. This is the production read
+    /// caller for the closed learning surface; it never opens a store client.
+    pub async fn read_learning_record_range(
+        &self,
+        kernel: &DaemonKernelClient,
+        scope_id: ScopeId,
+        record_kind: Option<LearningRecordKind>,
+        max_records: u16,
+    ) -> Result<NamedReadResponse, DaemonError> {
+        let request = eliot_store_api::learning_record_read_request(
+            scope_id,
+            record_kind,
+            max_records,
+            self.governor.kernel_snapshot().state_fence().clone(),
+        );
+        kernel
+            .store_named_async(request)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))
+    }
+
     /// Drives one bounded `TestD` owner step through the authenticated Kernel
     /// owner routes only. This is the production caller of the Governor
     /// finish path for productive verifier evidence:
@@ -416,7 +520,81 @@ impl DaemonComposition {
         let draft = finish_draft_from_testd_terminal_evidence(job, identity)?;
         let operation_id = OperationId::new(format!("testd-owner-finish-{}", job.job_id))
             .map_err(completion_error)?;
-        let _decision = self.finish_attempt(identity, operation_id, draft).await?;
+        let decision = self.finish_attempt(identity, operation_id, draft).await?;
+        if decision.state_fence != identity.request.state_fence
+            || decision.task_id
+                != identity
+                    .request
+                    .metadata
+                    .task_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+        {
+            return Err(completion_error(
+                "finish decision is not bound to the terminal request identity",
+            ));
+        }
+        let now_unix_ms = unix_ms();
+        let scope_id =
+            ScopeId::new(job.invocation.declared_scope.clone()).map_err(completion_error)?;
+        let verifier_receipt = job
+            .verification_receipt
+            .as_ref()
+            .ok_or_else(|| completion_error("terminal evidence has no durable verifier receipt"))?;
+        let observed_at_unix_ms = verifier_receipt
+            .finished_at
+            .known_time_ms
+            .or(verifier_receipt.finished_at.valid_time_ms)
+            .ok_or_else(|| completion_error("verifier receipt has no durable terminal clock"))?;
+        let observed_at_unix_ms = u64::try_from(observed_at_unix_ms)
+            .map_err(|_| completion_error("verifier clock is negative"))?;
+        let expires_at_unix_ms = observed_at_unix_ms.saturating_add(24 * 60 * 60 * 1_000);
+        let verifier_receipt_sha256 =
+            verification_receipt_sha256(verifier_receipt).map_err(completion_error)?;
+        let learning_record = TestdTerminalLearningRecord {
+            job_id: job.job_id.clone(),
+            process_operation_id: job.process.operation_id.clone(),
+            task_id: decision.task_id.clone(),
+            task_revision: decision.task_revision,
+            scope_id: scope_id.as_str().to_owned(),
+            state_fence: identity.request.state_fence.clone(),
+            terminal_state: terminal_state_name(job.state)?.to_owned(),
+            verifier_receipt_sha256,
+            finish_decision: decision,
+            observed_at_unix_ms,
+            expires_at_unix_ms,
+        };
+        let learning_record_json =
+            serde_json::to_value(&learning_record).map_err(completion_error)?;
+        let proposal = LearningRecordPayload::OwnerDefined {
+            kind: LearningRecordKind::Candidate,
+            handle: format!("testd-candidate-{}", job.job_id),
+            record: &learning_record_json,
+        }
+        .into_proposal(
+            &scope_id,
+            &identity.request.state_fence,
+            expires_at_unix_ms,
+            format!("learning-terminal-{}", job.job_id),
+        )
+        .map_err(completion_error)?;
+        self.commit_learning_record_proposal(
+            identity,
+            &proposal,
+            vec![learning_record.verifier_receipt_sha256.clone()],
+            None,
+            now_unix_ms,
+        )
+        .await?;
+        let readback = self
+            .read_learning_record_range(kernel, scope_id, Some(LearningRecordKind::Candidate), 8)
+            .await?;
+        if !readback_contains_identity(&readback, &proposal) {
+            return Err(completion_error(
+                "learning readback did not contain the exact committed identity",
+            ));
+        }
         kernel
             .acknowledge_testd_terminal_completion_async(&job.job_id, *committed)
             .await

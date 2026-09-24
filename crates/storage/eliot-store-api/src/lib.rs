@@ -201,13 +201,15 @@ pub use experience_store::{
 
 pub use learning_store::{
     DecodedLearningMutation, DecodedLearningRead, LEARNING_PARAM_CURSOR,
-    LEARNING_PARAM_FENCE_DIGEST, LEARNING_PARAM_HANDLE, LEARNING_PARAM_IDEMPOTENCY_KEY,
-    LEARNING_PARAM_MAX_RECORDS, LEARNING_PARAM_RECORD_DIGEST, LEARNING_PARAM_RECORD_JSON,
-    LEARNING_PARAM_RECORD_KIND, LEARNING_PARAM_SCOPE_DIGEST, LEARNING_RECORD_MUTATION_NAME,
-    LEARNING_RECORD_READ_NAME, LEARNING_STORE_SCHEMA_V1, LearningRecordKind,
-    MAX_LEARNING_HANDLE_BYTES, MAX_LEARNING_IDEMPOTENCY_BYTES, MAX_LEARNING_PAGE_RECORDS,
-    MAX_LEARNING_RECORD_JSON_BYTES, decode_learning_mutation, decode_learning_read,
-    learning_record_commit_params, learning_record_mutation_request, learning_record_read_request,
+    LEARNING_PARAM_EXPIRES_AT_UNIX_MS, LEARNING_PARAM_FENCE_DIGEST, LEARNING_PARAM_HANDLE,
+    LEARNING_PARAM_IDEMPOTENCY_KEY, LEARNING_PARAM_MAX_RECORDS, LEARNING_PARAM_RECORD_DIGEST,
+    LEARNING_PARAM_RECORD_JSON, LEARNING_PARAM_RECORD_KIND, LEARNING_PARAM_SCOPE_DIGEST,
+    LEARNING_RECORD_MUTATION_NAME, LEARNING_RECORD_READ_NAME, LEARNING_STORE_SCHEMA_V1,
+    LearningRecordIdentity, LearningRecordKind, MAX_LEARNING_HANDLE_BYTES,
+    MAX_LEARNING_IDEMPOTENCY_BYTES, MAX_LEARNING_PAGE_RECORDS, MAX_LEARNING_RECORD_JSON_BYTES,
+    decode_learning_mutation, decode_learning_read, learning_fence_digest,
+    learning_record_commit_params, learning_record_commit_params_from_identity,
+    learning_record_mutation_request, learning_record_read_request, learning_scope_digest,
     reject_direct_learning_write, validate_learning_mutation_params, validate_learning_read_params,
 };
 
@@ -859,10 +861,11 @@ pub enum NamedReadOperation {
     GetAgentFeedbackRange,
     /// Canonical learning-record range read (issue #1868, I12.24).
     ///
-    /// Durable same-scope learning rows keyed `(record_kind, handle,
-    /// record_digest)`, driven only through the closed learning leg under
-    /// the held transaction lock. The read projects verbatim record
-    /// documents; admission re-proof stays Governor-owned at the read edge.
+    /// Durable same-scope learning rows keyed by the complete
+    /// kind/handle/record-digest/scope/fence/expiry identity, driven only
+    /// through the closed learning leg under the held transaction lock. The
+    /// read projects verbatim record documents; admission re-proof stays
+    /// Governor-owned at the read edge.
     GetLearningRecordRange,
 }
 
@@ -956,10 +959,11 @@ pub enum NamedMutationOperation {
     /// must carry [`TransitionClass::CaptureCandidate`], the declared
     /// candidate-only effect ceiling, and the closed learning typed
     /// parameters (closed record kind, verbatim record document, presented
-    /// digests, handle, idempotency key). The store bridge persists the
-    /// document verbatim, arbitrates `(record_kind, handle, record_digest)`
-    /// keys with convergent replay, and never derives semantics,
-    /// admission, or effectiveness: durability never implies effectiveness.
+    /// record/scope/fence digests, exact expiry, handle, idempotency key).
+    /// The store bridge persists the document verbatim, arbitrates the
+    /// complete kind/handle/digest/scope/fence/expiry identity with
+    /// convergent replay, and never derives semantics, admission, or
+    /// effectiveness: durability never implies effectiveness.
     RecordLearningRecord,
 }
 

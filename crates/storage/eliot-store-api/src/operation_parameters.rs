@@ -80,9 +80,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::learning_store::{
-    LEARNING_PARAM_CURSOR, LEARNING_PARAM_FENCE_DIGEST, LEARNING_PARAM_HANDLE,
-    LEARNING_PARAM_IDEMPOTENCY_KEY, LEARNING_PARAM_MAX_RECORDS, LEARNING_PARAM_RECORD_DIGEST,
-    LEARNING_PARAM_RECORD_JSON, LEARNING_PARAM_RECORD_KIND, LEARNING_PARAM_SCOPE_DIGEST,
+    LEARNING_PARAM_CURSOR, LEARNING_PARAM_EXPIRES_AT_UNIX_MS, LEARNING_PARAM_FENCE_DIGEST,
+    LEARNING_PARAM_HANDLE, LEARNING_PARAM_IDEMPOTENCY_KEY, LEARNING_PARAM_MAX_RECORDS,
+    LEARNING_PARAM_RECORD_DIGEST, LEARNING_PARAM_RECORD_JSON, LEARNING_PARAM_RECORD_KIND,
+    LEARNING_PARAM_SCOPE_DIGEST,
 };
 use crate::{
     CONTROL_FIELD_DENYLIST, NamedMutationOperation, NamedReadOperation, OperationId, StoreError,
@@ -833,10 +834,11 @@ static COMMIT_EXPERIENCE_PARAMETERS: [ParameterDeclaration; 6] = [
 /// Closed commit parameters for the learning-record leg (issue #1868):
 /// the closed record-kind discriminator, the exact record handle, the
 /// verbatim record document, the presented record/scope/fence digests,
-/// and the idempotency key. The kind is bound by the discriminator
-/// parameter over the closed [`LearningRecordKind`](crate::LearningRecordKind)
-/// set, never by a per-kind table.
-static COMMIT_LEARNING_PARAMETERS: [ParameterDeclaration; 7] = [
+/// the exact expiry deadline, and the idempotency key. The kind is bound by
+/// the discriminator parameter over the closed
+/// [`LearningRecordKind`](crate::LearningRecordKind) set, never by a
+/// per-kind table.
+static COMMIT_LEARNING_PARAMETERS: [ParameterDeclaration; 8] = [
     ParameterDeclaration {
         name: LEARNING_PARAM_RECORD_KIND,
         shape: ParameterShape::Subject,
@@ -869,6 +871,11 @@ static COMMIT_LEARNING_PARAMETERS: [ParameterDeclaration; 7] = [
     },
     ParameterDeclaration {
         name: LEARNING_PARAM_IDEMPOTENCY_KEY,
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: LEARNING_PARAM_EXPIRES_AT_UNIX_MS,
         shape: ParameterShape::Subject,
         required: true,
     },
@@ -1164,10 +1171,11 @@ pub const fn declared_read_parameters(
 /// `record_revision` as its decimal string, `scope_digest`,
 /// `fence_digest`, `idempotency_key`; family bound by the operation
 /// variant, digest re-proof at the Governor read edge);
-/// `RecordLearningRecord` declares the seven required commit fields
+/// `RecordLearningRecord` declares the eight required commit fields
 /// (`record_kind` over the closed learning-kind set, `handle`,
 /// `record_json`, `record_digest`, `scope_digest`, `fence_digest`,
-/// `idempotency_key`; digest IS the immutable revision identity);
+/// `expires_at_unix_ms`, `idempotency_key`; the complete tuple is the
+/// immutable revision identity);
 /// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.

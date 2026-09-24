@@ -88,6 +88,9 @@ fn map_admission_error(error: LearningAdmissionError) -> BoundsError {
         | LearningAdmissionError::GovernorNotAdmitting
         | LearningAdmissionError::StaleAuthorityEpoch
         | LearningAdmissionError::GenerationMismatch
+        | LearningAdmissionError::MissingRecordBinding
+        | LearningAdmissionError::RecordIdentityMismatch
+        | LearningAdmissionError::AdmissionExpired
         | LearningAdmissionError::DigestMismatch => BoundsError::GovernorAuthorityUnconfirmed,
     }
 }

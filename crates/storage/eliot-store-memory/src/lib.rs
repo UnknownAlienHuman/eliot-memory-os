@@ -1353,14 +1353,21 @@ fn dispatch_apply_experience_state(
     Ok(())
 }
 
-/// Joins one learning row address. Collision-free by the same
-/// control-character argument as the experience contour: the record kind
-/// is a closed wire spelling, the handle may not contain `\x1f` per the
-/// wire contract (control characters are rejected), and the digest is a
-/// fixed 64 lowercase hex SHA-256, so key order is stable and the joined
-/// triple is unambiguous.
-fn learning_row_key(record_kind: &str, handle: &str, record_digest: &str) -> String {
-    format!("{record_kind}\x1f{handle}\x1f{record_digest}")
+/// Joins one learning row address. The complete identity includes scope,
+/// fence digest, and expiry so equal record digests in different owner
+/// contours cannot converge on one immutable row.
+fn learning_row_key(
+    record_kind: &str,
+    handle: &str,
+    record_digest: &str,
+    scope_id: &str,
+    scope_digest: &str,
+    fence_digest: &str,
+    expires_at_unix_ms: u64,
+) -> String {
+    format!(
+        "{record_kind}\x1f{handle}\x1f{record_digest}\x1f{scope_id}\x1f{scope_digest}\x1f{fence_digest}\x1f{expires_at_unix_ms}"
+    )
 }
 
 /// Executes admitted learning-record legs on already-locked state
@@ -1368,12 +1375,13 @@ fn learning_row_key(record_kind: &str, handle: &str, record_digest: &str) -> Str
 ///
 /// Runs beside [`dispatch_apply_experience_state`] under the same lock as
 /// the receipt commit: one identity, one receipt, recoverable replay
-/// without duplicate work. Rows are immutable and create-only per joined
-/// `(record_kind, handle, record_digest)` key (a new digest is a new row,
-/// never an in-place rewrite; divergent rewrites fail closed; identical
-/// replays converge); the presented digests travel on the row for
-/// readback binding. Each command appends one outbox intent bound to the
-/// resulting row bytes, so rows and their outbox intents commit
+/// without duplicate work. Rows are immutable and create-only per the
+/// complete kind/handle/record-digest/scope/fence/expiry key (a new exact
+/// identity is a new row, never an in-place rewrite; divergent rewrites
+/// fail closed; identical replays converge); the presented scope/fence
+/// digests and expiry travel on the row for readback binding. Each command
+/// appends one outbox intent bound to the resulting row bytes, so rows and
+/// their outbox intents commit
 /// atomically via [`commit_transaction`]. The dispatch writes ONLY the
 /// learning table: owner records are never rewritten, and durability
 /// never implies effectiveness (admission stays Governor-owned).
@@ -1427,11 +1435,51 @@ fn apply_learning_record_command(
     let decoded =
         eliot_store_api::decode_learning_mutation(command.operation, &command.parameters)?;
     let record_kind = decoded.record_kind.as_str().to_owned();
-    let key = learning_row_key(&record_kind, &decoded.handle, &decoded.record_digest);
-    let row_json = serde_json::to_value(&decoded.record_json)
-        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let scope_id = transition.scope_id.to_string();
+    let expected_scope_digest =
+        eliot_store_api::learning_scope_digest(transition.scope_id.as_str())?;
+    let expected_fence_digest = eliot_store_api::learning_fence_digest(&transition.state_fence)?;
+    if decoded.scope_digest != expected_scope_digest
+        || decoded.fence_digest != expected_fence_digest
+    {
+        return Err(StoreError::InvalidField {
+            field: "learning.scope_fence_binding",
+            reason: "learning row digest does not match the canonical transition",
+        });
+    }
+    let key = learning_row_key(
+        &record_kind,
+        &decoded.handle,
+        &decoded.record_digest,
+        &scope_id,
+        &decoded.scope_digest,
+        &decoded.fence_digest,
+        decoded.expires_at_unix_ms,
+    );
+    let row_json = serde_json::json!({
+        "record_kind": record_kind.clone(),
+        "handle": decoded.handle.clone(),
+        "record_digest": decoded.record_digest.clone(),
+        "record_json": decoded.record_json.clone(),
+        "scope_digest": decoded.scope_digest.clone(),
+        "fence_digest": decoded.fence_digest.clone(),
+        "expires_at_unix_ms": decoded.expires_at_unix_ms,
+        "state_fence": transition.state_fence.clone(),
+        "scope_id": scope_id.clone(),
+        "task_id": transition.task_id.clone(),
+    });
     match state.learning_record_rows.get(&key) {
-        Some(existing) if existing.record_json != decoded.record_json => {
+        Some(existing)
+            if existing.record_kind != record_kind
+                || existing.handle != decoded.handle
+                || existing.record_digest != decoded.record_digest
+                || existing.record_json != decoded.record_json
+                || existing.scope_digest != decoded.scope_digest
+                || existing.fence_digest != decoded.fence_digest
+                || existing.expires_at_unix_ms != decoded.expires_at_unix_ms
+                || existing.state_fence != transition.state_fence
+                || existing.scope_id != scope_id =>
+        {
             return Err(StoreError::IdentityConflict);
         }
         Some(_) => {}
@@ -1443,8 +1491,11 @@ fn apply_learning_record_command(
                     handle: decoded.handle.clone(),
                     record_digest: decoded.record_digest.clone(),
                     record_json: decoded.record_json.clone(),
+                    scope_digest: decoded.scope_digest.clone(),
+                    fence_digest: decoded.fence_digest.clone(),
+                    expires_at_unix_ms: decoded.expires_at_unix_ms,
                     state_fence: transition.state_fence.clone(),
-                    scope_id: transition.scope_id.to_string(),
+                    scope_id,
                     task_id: transition.task_id.clone(),
                 },
             );
@@ -1993,6 +2044,11 @@ fn learning_range_payload(
             "handle": row.handle,
             "record_digest": row.record_digest,
             "record_json": row.record_json,
+            "scope_digest": row.scope_digest,
+            "fence_digest": row.fence_digest,
+            "expires_at_unix_ms": row.expires_at_unix_ms,
+            "state_fence": row.state_fence,
+            "scope_id": row.scope_id,
         }));
     }
     if records.len() > limit {
@@ -3802,17 +3858,19 @@ struct ExperienceFeedbackRow {
 
 /// One immutable learning-record row: the verbatim Governor-admitted
 /// record document for one closed record kind + handle with its presented
-/// digest as the immutable revision identity, plus the admission fence
-/// and task-binding provenance (issue #1868, I12.24). Rows are
-/// create-only keyed by the joined `(record_kind, handle, record_digest)`
-/// triple; divergent rewrites fail closed and identical replays converge.
-/// Durability never implies effectiveness: admission stays Governor-owned.
+/// digest, exact scope/fence digests, and expiry as part of the immutable
+/// identity. Rows are create-only keyed by the complete identity; divergent
+/// rewrites fail closed and identical replays converge. Durability never
+/// implies effectiveness: admission stays Governor-owned.
 #[derive(Clone, Debug, PartialEq)]
 struct LearningRecordRow {
     record_kind: String,
     handle: String,
     record_digest: String,
     record_json: String,
+    scope_digest: String,
+    fence_digest: String,
+    expires_at_unix_ms: u64,
     state_fence: StateFence,
     scope_id: String,
     task_id: Option<String>,
@@ -3940,12 +3998,11 @@ struct MemoryState {
     /// Immutable agent-feedback rows keyed by joined `(handle, revision)`
     /// (issue #223). Same durable rule as the bank rows.
     experience_feedback_rows: BTreeMap<String, ExperienceFeedbackRow>,
-    /// Immutable learning-record rows keyed by joined
-    /// `(record_kind, handle, record_digest)` (issue #1868, I12.24).
-    /// Verbatim Governor-admitted record documents with presented digests
-    /// as immutable revision identities, driven only through the closed
-    /// learning leg under the held transaction lock; divergent rewrites
-    /// fail closed.
+    /// Immutable learning-record rows keyed by the complete
+    /// kind/handle/record-digest/scope/fence/expiry identity (issue #1868,
+    /// I12.24). Verbatim Governor-admitted record documents with exact
+    /// identity fields, driven only through the closed learning leg under
+    /// the held transaction lock; divergent rewrites fail closed.
     learning_record_rows: BTreeMap<String, LearningRecordRow>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,

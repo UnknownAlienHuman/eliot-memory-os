@@ -55,7 +55,9 @@ pub use identity::{
     ProofBinding, ProviderId, ProviderRole, SemanticRole, SourceSnapshot,
 };
 pub use learning_ticket::{
+    LEARNING_RECORD_TICKET_DIGEST_DOMAIN, LEARNING_RECORD_TICKET_SCHEMA_VERSION,
     LEARNING_TICKET_DIGEST_DOMAIN, LEARNING_TICKET_SCHEMA_VERSION, LearningAdmissionTicket,
+    LearningRecordAdmissionTicket, learning_record_ticket_digest, learning_record_ticket_fresh_for,
     learning_ticket_digest, ticket_fresh_for,
 };
 pub use measurement::{

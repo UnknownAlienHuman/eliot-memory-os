@@ -664,8 +664,6 @@ impl DaemonComposition {
         scope_id: eliot_store_api::ScopeId,
         proof_refs: Vec<String>,
         permit: Option<&eliot_governor::LearningAdmissionPermit>,
-        admitted: bool,
-        admission_receipt_present: bool,
         expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
         expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
     ) -> Result<(eliot_store_api::WriteReceipt, bool), DaemonError> {
@@ -674,6 +672,10 @@ impl DaemonComposition {
                 "learning commit guard: {error}"
             )))
         })?;
+        let live_fence = self.governor.kernel_snapshot().state_fence().clone();
+        let record_identity =
+            eliot_governor::learning_record_identity_from_request(&request, &scope_id, &live_fence)
+                .map_err(DaemonError::Composition)?;
         let receipt = eliot_governor::commit_learning_record(
             &self.governor,
             identity,
@@ -688,15 +690,88 @@ impl DaemonComposition {
         if self.governor.refresh_from_kernel().is_err() {
             self.view_stale = true;
         }
-        let live_fence = self.governor.kernel_snapshot().state_fence();
         let effective = eliot_governor::learning_effective_under_admission(
             self.governor.governor(),
             permit,
             &live_fence,
-            admitted,
-            admission_receipt_present,
+            &record_identity,
+            unix_ms(),
         );
         Ok((receipt, effective))
+    }
+
+    /// Issues an owner-bound permit for one exact learning-record identity.
+    /// The returned permit is still verified again at commit time; possession
+    /// of the claim alone is not behavioral authority.
+    pub fn admit_learning_record(
+        &self,
+        claim: &eliot_governor::LearningRecordAdmissionClaim,
+    ) -> Result<eliot_governor::LearningAdmissionPermit, DaemonError> {
+        eliot_governor::issue_learning_record_admission(self.governor.governor(), claim)
+            .map_err(|error| DaemonError::Composition(CompositionError::Owner(error.to_string())))
+    }
+
+    /// Production typed learning-record commit path. The proposal carries the
+    /// exact record kind/handle/digest/scope/fence/expiry tuple, and the
+    /// optional permit is checked against that same tuple before the neutral
+    /// Kernel port is called. No Store client or direct durable path exists in
+    /// this composition root.
+    pub async fn commit_learning_record_proposal(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        proposal: &eliot_governor::LearningRecordProposal,
+        proof_refs: Vec<String>,
+        permit: Option<&eliot_governor::LearningAdmissionPermit>,
+        now_unix_ms: u64,
+    ) -> Result<(eliot_store_api::WriteReceipt, bool), DaemonError> {
+        proposal.validate().map_err(DaemonError::Composition)?;
+        let live_fence = self.governor.kernel_snapshot().state_fence().clone();
+        let receipt = eliot_governor::commit_learning_record_with_admission(
+            &self.governor,
+            identity,
+            proposal,
+            proof_refs,
+            Vec::new(),
+            Vec::new(),
+            permit,
+            now_unix_ms,
+        )
+        .await
+        .map_err(DaemonError::Composition)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        let effective = eliot_governor::learning_effective_under_admission(
+            self.governor.governor(),
+            permit,
+            &live_fence,
+            &proposal.identity,
+            now_unix_ms,
+        );
+        Ok((receipt, effective))
+    }
+
+    /// Issues an exact record-bound permit and immediately submits the same
+    /// proposal through the authenticated Governor/Kernel path. This is the
+    /// production convenience for owners that hold a claim rather than an
+    /// already-verified permit; the commit still rechecks the binding.
+    pub async fn commit_learning_record_proposal_with_claim(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        proposal: &eliot_governor::LearningRecordProposal,
+        proof_refs: Vec<String>,
+        claim: &eliot_governor::LearningRecordAdmissionClaim,
+        now_unix_ms: u64,
+    ) -> Result<(eliot_store_api::WriteReceipt, bool), DaemonError> {
+        let permit = self.admit_learning_record(claim)?;
+        self.commit_learning_record_proposal(
+            identity,
+            proposal,
+            proof_refs,
+            Some(&permit),
+            now_unix_ms,
+        )
+        .await
     }
     /// Returns the retained owner receipt for an already-committed
     /// experience record, if this composition committed its idempotency

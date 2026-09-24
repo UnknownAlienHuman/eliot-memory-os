@@ -2368,6 +2368,11 @@ async fn learning_record_range_payload(
             "handle": row.handle,
             "record_json": row.record_json,
             "record_digest": row.record_digest,
+            "scope_digest": row.scope_digest,
+            "fence_digest": row.fence_digest,
+            "expires_at_unix_ms": row.expires_at_unix_ms,
+            "state_fence": row.state_fence,
+            "scope_id": row.scope_id,
         }));
     }
     if records.len() > limit {

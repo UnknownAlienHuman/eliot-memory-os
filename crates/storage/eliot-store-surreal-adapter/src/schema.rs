@@ -78,12 +78,11 @@ pub(crate) mod table {
     /// Immutable agent-feedback row per handle + owner revision
     /// (issue #223). Same create-only rule as the bank rows.
     pub(crate) const EXPERIENCE_FEEDBACK: &str = "experience_feedback";
-    /// Immutable learning-record row per record kind + handle + record
-    /// digest (issue #1868). One row per joined
-    /// `(record_kind, handle, record_digest)` key carrying the verbatim
-    /// learning-record document. Create-only; divergent rewrites fail
-    /// closed. The digest IS the immutable revision identity: a new
-    /// digest is a new row, never an in-place rewrite.
+    /// Immutable learning-record row per complete kind/handle/digest/scope/
+    /// fence/expiry identity (issue #1868). One row per the joined exact
+    /// identity carrying the verbatim learning-record document. Create-only;
+    /// divergent rewrites fail closed. A new complete identity is a new row,
+    /// never an in-place rewrite.
     pub(crate) const LEARNING_RECORD: &str = "learning_record";
 }
 

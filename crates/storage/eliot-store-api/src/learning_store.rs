@@ -16,9 +16,10 @@
 //!   autonomous persistence systems and carry no store path of their own.
 //! * "The view never accepts writes and never resolves disagreement between
 //!   owners… A new owner revision rebuilds the view rather than mutating it
-//!   in place." (L143) — rows are keyed `(record_kind, handle,
-//!   record_digest)`; a new digest is a new row, never an in-place rewrite;
-//!   identical replays converge (`IdentityConflict` on divergent rewrite).
+//!   in place." (L143) — rows are keyed by the complete
+//!   kind/handle/record-digest/scope/fence/expiry identity; a new exact
+//!   identity is a new row, never an in-place rewrite; identical replays
+//!   converge (`IdentityConflict` on divergent rewrite).
 //! * "Actor/Refiner proposes the artifact; Governor admits its local effect;
 //!   Context Compiler activates it for a compatible attempt… The artifact
 //!   has no independent authority." (L209) — the propose/admit/activate
@@ -36,9 +37,9 @@
 //!
 //! Record documents travel as opaque strings: the store preserves them
 //! verbatim and validates shape/bounds/closed kind membership
-//! structurally. The presented `record_digest` is shape-checked here; the
-//! digest IS the immutable revision identity at the backend. Owner data
-//! travels only as opaque reference digests (`scope_digest`,
+//! structurally. The complete kind/handle/record-digest/scope/fence/
+//! expiry tuple is the immutable revision identity at the backend. Owner
+//! data travels only as opaque reference digests (`scope_digest`,
 //! `fence_digest`); adapters write ONLY the learning tables and never
 //! rewrite owner records. The store never derives semantics from the
 //! document bytes. Read queries project bounded same-fence, same-scope
@@ -46,11 +47,12 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
-    ReadConsistency, ScopeId, StateFence, StoreError,
+    ReadConsistency, ScopeId, StateFence, StoreError, canonical_json_bytes,
 };
 
 /// Versioned wire/schema identity for canonical learning state.
@@ -73,6 +75,8 @@ pub const LEARNING_PARAM_SCOPE_DIGEST: &str = "scope_digest";
 pub const LEARNING_PARAM_FENCE_DIGEST: &str = "fence_digest";
 /// Deterministic commit idempotency key (mutation).
 pub const LEARNING_PARAM_IDEMPOTENCY_KEY: &str = "idempotency_key";
+/// Absolute expiry deadline in Unix milliseconds (mutation).
+pub const LEARNING_PARAM_EXPIRES_AT_UNIX_MS: &str = "expires_at_unix_ms";
 /// Decimal page-size bound (range reads, required).
 pub const LEARNING_PARAM_MAX_RECORDS: &str = "max_records";
 /// Opaque range continuation cursor (range reads, optional).
@@ -96,7 +100,8 @@ pub const MAX_LEARNING_PAGE_RECORDS: u16 = 64;
 /// One closed set covers every durable learning record named in Work
 /// (view refs, activation receipts, deltas, overlays, closures,
 /// candidates) without a per-kind table/authority split.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LearningRecordKind {
     /// A proposed behavioral delta record.
     Delta,
@@ -141,11 +146,84 @@ impl LearningRecordKind {
     }
 }
 
+/// Exact immutable identity of one learning record revision.
+///
+/// The scope, State Fence, and expiry are part of the identity rather than
+/// mutable row annotations. A digest alone is therefore not a cross-scope or
+/// cross-fence collision key, and an expired revision cannot be replayed as a
+/// current influence under a new deadline.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningRecordIdentity {
+    /// Closed record-kind discriminator.
+    pub record_kind: LearningRecordKind,
+    /// Exact canonical record handle.
+    pub handle: String,
+    /// Presented immutable record revision digest.
+    pub record_digest: String,
+    /// Exact canonical scope identity.
+    pub scope_id: String,
+    /// Exact admission State Fence.
+    pub state_fence: StateFence,
+    /// Absolute expiry deadline in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
+}
+
+impl LearningRecordIdentity {
+    /// Validate the complete identity before it reaches a named mutation.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.record_kind.as_str().is_empty() {
+            return Err(StoreError::InvalidField {
+                field: "learning.record_kind",
+                reason: "record kind is required",
+            });
+        }
+        if self.handle.trim().is_empty()
+            || self.handle.chars().any(char::is_control)
+            || self.handle.len() > MAX_LEARNING_HANDLE_BYTES
+        {
+            return Err(StoreError::InvalidField {
+                field: "learning.handle",
+                reason: "record handle is blank, overlong, or contains control characters",
+            });
+        }
+        crate::validate_sha256_hex(&self.record_digest, "learning.record_digest")?;
+        if self.scope_id.trim().is_empty() || self.scope_id.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "learning.scope_id",
+                reason: "scope identity is blank or contains control characters",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| StoreError::InvalidField {
+                field: "learning.state_fence",
+                reason: "learning identity fence is invalid",
+            })?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(StoreError::InvalidField {
+                field: "learning.expires_at_unix_ms",
+                reason: "expiry deadline must be non-zero",
+            });
+        }
+        Ok(())
+    }
+
+    /// Canonical identity digest used by the Governor operation identity.
+    pub fn identity_digest(&self) -> Result<String, StoreError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(self)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        Ok(crate::sha256_hex(&bytes))
+    }
+}
+
 /// Raw validated mutation decoded from a mutation parameter map.
 ///
 /// Documents stay opaque strings: the backend persists them verbatim and
-/// arbitrates `(record_kind, handle, record_digest)` keys. This struct
-/// carries no learning semantics beyond closed kind membership.
+/// arbitrates the complete kind/handle/record-digest/scope/fence/expiry
+/// identity. This struct carries no learning semantics beyond closed kind
+/// membership and structural identity fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedLearningMutation {
     /// Closed record-kind discriminator.
@@ -162,6 +240,8 @@ pub struct DecodedLearningMutation {
     pub fence_digest: String,
     /// Deterministic commit idempotency key.
     pub idempotency_key: String,
+    /// Absolute expiry deadline in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
 }
 
 /// Decoded range read with its closed kind filter and page bound.
@@ -174,6 +254,10 @@ pub struct DecodedLearningRead {
 }
 
 /// Builds a learning-record commit parameter map from Governor-produced parts.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the closed wire parameter list mirrors the named operation schema"
+)]
 pub fn learning_record_commit_params(
     record_kind: LearningRecordKind,
     handle: String,
@@ -182,6 +266,7 @@ pub fn learning_record_commit_params(
     scope_digest: String,
     fence_digest: String,
     idempotency_key: String,
+    expires_at_unix_ms: u64,
 ) -> BTreeMap<String, Value> {
     BTreeMap::from([
         (
@@ -209,7 +294,56 @@ pub fn learning_record_commit_params(
             LEARNING_PARAM_IDEMPOTENCY_KEY.to_owned(),
             Value::String(idempotency_key),
         ),
+        (
+            LEARNING_PARAM_EXPIRES_AT_UNIX_MS.to_owned(),
+            Value::String(expires_at_unix_ms.to_string()),
+        ),
     ])
+}
+
+/// Computes the exact digest of a scope identity used by learning rows.
+pub fn learning_scope_digest(scope_id: &str) -> Result<String, StoreError> {
+    if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "learning.scope_id",
+            reason: "scope identity is blank or contains control characters",
+        });
+    }
+    let bytes = canonical_json_bytes(&scope_id)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    Ok(crate::sha256_hex(&bytes))
+}
+
+/// Computes the exact digest of a State Fence used by learning rows.
+pub fn learning_fence_digest(state_fence: &StateFence) -> Result<String, StoreError> {
+    state_fence
+        .validate()
+        .map_err(|_| StoreError::InvalidField {
+            field: "learning.state_fence",
+            reason: "learning identity fence is invalid",
+        })?;
+    let bytes = canonical_json_bytes(state_fence)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    Ok(crate::sha256_hex(&bytes))
+}
+
+/// Builds the closed mutation parameters from an exact typed identity.
+pub fn learning_record_commit_params_from_identity(
+    identity: &LearningRecordIdentity,
+    record_json: String,
+    idempotency_key: String,
+) -> Result<BTreeMap<String, Value>, StoreError> {
+    identity.validate()?;
+    Ok(learning_record_commit_params(
+        identity.record_kind,
+        identity.handle.clone(),
+        record_json,
+        identity.record_digest.clone(),
+        learning_scope_digest(&identity.scope_id)?,
+        learning_fence_digest(&identity.state_fence)?,
+        idempotency_key,
+        identity.expires_at_unix_ms,
+    ))
 }
 
 /// Builds the closed `RecordLearningRecord` mutation request.
@@ -253,10 +387,12 @@ pub fn learning_record_read_request(
 ///
 /// Value rules (closed kind membership, bounded non-blank text, hex
 /// digests) run here so every backend shares one acceptance boundary.
-/// Digest recomputation stays Governor-owned: the presented digest is
-/// shape-checked here; the digest IS the immutable revision identity at
-/// the backend. Record documents stay opaque strings; the store never
-/// derives semantics from them.
+/// Scope/fence digest recomputation and record-content semantics stay
+/// Governor-owned: the store checks the presented values against the
+/// canonical transition envelope, while the complete
+/// kind/handle/digest/scope/fence/expiry tuple is the immutable revision
+/// identity. Record documents stay opaque strings; the store never derives
+/// semantics from them.
 pub fn validate_learning_mutation_params(
     operation: NamedMutationOperation,
     parameters: &BTreeMap<String, Value>,
@@ -304,6 +440,18 @@ pub fn validate_learning_mutation_params(
             reason: "idempotency key exceeds the bounded length",
         });
     }
+    let expires_at_unix_ms = text_param(parameters, LEARNING_PARAM_EXPIRES_AT_UNIX_MS)?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "learning.expires_at_unix_ms",
+            reason: "expiry deadline must be a decimal Unix millisecond value",
+        })?;
+    if expires_at_unix_ms == 0 {
+        return Err(StoreError::InvalidField {
+            field: "learning.expires_at_unix_ms",
+            reason: "expiry deadline must be non-zero",
+        });
+    }
     Ok(())
 }
 
@@ -337,6 +485,12 @@ pub fn decode_learning_mutation(
         scope_digest: text_of(LEARNING_PARAM_SCOPE_DIGEST)?,
         fence_digest: text_of(LEARNING_PARAM_FENCE_DIGEST)?,
         idempotency_key: text_of(LEARNING_PARAM_IDEMPOTENCY_KEY)?,
+        expires_at_unix_ms: text_of(LEARNING_PARAM_EXPIRES_AT_UNIX_MS)?
+            .parse::<u64>()
+            .map_err(|_| StoreError::InvalidField {
+                field: "learning.expires_at_unix_ms",
+                reason: "expiry deadline must be a decimal Unix millisecond value",
+            })?,
     })
 }
 

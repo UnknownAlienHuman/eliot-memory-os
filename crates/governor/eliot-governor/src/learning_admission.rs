@@ -36,13 +36,15 @@
 //! enforced by the retrieval gate holding the overlay record.
 
 use eliot_context_contracts::{
-    LEARNING_TICKET_SCHEMA_VERSION, LearningAdmissionTicket, learning_ticket_digest,
+    LEARNING_RECORD_TICKET_SCHEMA_VERSION, LEARNING_TICKET_SCHEMA_VERSION, LearningAdmissionTicket,
+    LearningRecordAdmissionTicket, learning_record_ticket_digest, learning_ticket_digest,
 };
 use eliot_contracts::{StateFence, fences_match_exact};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{Governor, GovernorState};
+use eliot_store_api::LearningRecordIdentity;
 
 /// Stable identity of this admission contract.
 pub const LEARNING_ADMISSION_CONTRACT: &str = "eliot.governor.learning-admission";
@@ -110,6 +112,93 @@ impl LearningAdmissionClaim {
     }
 }
 
+/// Exact record binding attached to a behavioral learning admission.
+///
+/// The older [`LearningAdmissionClaim`] remains available for context
+/// admission compatibility. Behavioral learning effects must use this binding
+/// and the record-bound issuance/verification functions below; a caller-owned
+/// boolean or an unbound influence ticket can never make a record effective.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LearningRecordAdmissionBinding {
+    /// Closed learning record kind.
+    pub record_kind: String,
+    /// Exact record handle.
+    pub record_handle: String,
+    /// Exact immutable record digest.
+    pub record_digest: String,
+    /// Exact canonical scope identity.
+    pub scope_id: String,
+    /// Exact State Fence under which the record may affect behavior.
+    pub state_fence: StateFence,
+    /// Absolute expiry deadline in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
+}
+
+impl LearningRecordAdmissionBinding {
+    /// Build a binding from the canonical store identity.
+    #[must_use]
+    pub fn from_identity(identity: &LearningRecordIdentity) -> Self {
+        Self {
+            record_kind: identity.record_kind.as_str().to_owned(),
+            record_handle: identity.handle.clone(),
+            record_digest: identity.record_digest.clone(),
+            scope_id: identity.scope_id.clone(),
+            state_fence: identity.state_fence.clone(),
+            expires_at_unix_ms: identity.expires_at_unix_ms,
+        }
+    }
+
+    fn validate(&self) -> Result<(), LearningAdmissionError> {
+        if !matches!(
+            self.record_kind.as_str(),
+            "delta" | "overlay" | "closure" | "activation_receipt" | "candidate" | "view_ref"
+        ) {
+            return Err(LearningAdmissionError::RecordIdentityMismatch);
+        }
+        for (field, value) in [
+            ("record_handle", &self.record_handle),
+            ("record_digest", &self.record_digest),
+            ("scope_id", &self.scope_id),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(LearningAdmissionError::MissingField(field));
+            }
+        }
+        if self.record_digest.len() != 64
+            || !self
+                .record_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(LearningAdmissionError::RecordIdentityMismatch);
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| LearningAdmissionError::RecordIdentityMismatch)?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(LearningAdmissionError::MissingField("expires_at_unix_ms"));
+        }
+        Ok(())
+    }
+}
+
+/// Claim for an exact learning-record behavioral admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LearningRecordAdmissionClaim {
+    /// Existing campaign/task/owner admission claim.
+    pub admission: LearningAdmissionClaim,
+    /// Exact record binding required for behavioral effect.
+    pub record: LearningRecordAdmissionBinding,
+}
+
+impl LearningRecordAdmissionClaim {
+    /// Validate both the owner claim and exact record binding.
+    pub fn validate(&self) -> Result<(), LearningAdmissionError> {
+        self.admission.validate()?;
+        self.record.validate()
+    }
+}
+
 /// Fail-closed learning admission errors. Stale epoch, stale fence, and
 /// digest mismatch are distinct refusals; none refreshes silently.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -132,6 +221,12 @@ pub enum LearningAdmissionError {
     DigestMismatch,
     #[error("presented fence does not exactly match the admitted fence")]
     StaleStateFence,
+    #[error("learning admission has no exact record binding")]
+    MissingRecordBinding,
+    #[error("learning admission record identity does not match the committed record")]
+    RecordIdentityMismatch,
+    #[error("learning admission has expired")]
+    AdmissionExpired,
 }
 
 /// Owner-issued learning admission permit (opaque in-process handle).
@@ -144,6 +239,7 @@ pub enum LearningAdmissionError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LearningAdmissionPermit {
     ticket: LearningAdmissionTicket,
+    record_binding: Option<LearningRecordAdmissionBinding>,
 }
 
 impl LearningAdmissionPermit {
@@ -185,6 +281,41 @@ impl LearningAdmissionPermit {
     /// ticket alone authorizes nothing without live verification.
     pub fn ticket(&self) -> &LearningAdmissionTicket {
         &self.ticket
+    }
+
+    /// Exact record binding, when this permit was issued for behavioral
+    /// learning rather than the legacy context-only contour.
+    pub fn record_binding(&self) -> Option<&LearningRecordAdmissionBinding> {
+        self.record_binding.as_ref()
+    }
+
+    /// Mint the exact wire twin from this already owner-issued permit.
+    pub fn record_ticket(&self) -> Result<LearningRecordAdmissionTicket, LearningAdmissionError> {
+        let binding = self
+            .record_binding()
+            .ok_or(LearningAdmissionError::MissingRecordBinding)?;
+        if binding.state_fence != *self.fence() {
+            return Err(LearningAdmissionError::RecordIdentityMismatch);
+        }
+        let mut ticket = LearningRecordAdmissionTicket {
+            schema_version: LEARNING_RECORD_TICKET_SCHEMA_VERSION,
+            source_campaign_id: self.source_campaign_id().to_owned(),
+            target_task_id: self.target_task_id().to_owned(),
+            fence: self.fence().clone(),
+            record_kind: binding.record_kind.clone(),
+            record_handle: binding.record_handle.clone(),
+            record_digest: binding.record_digest.clone(),
+            scope_id: binding.scope_id.clone(),
+            expires_at_unix_ms: binding.expires_at_unix_ms,
+            authority_ref: self.authority_ref().to_owned(),
+            retention_ref: self.retention_ref().to_owned(),
+            evaluator_ref: self.evaluator_ref().to_owned(),
+            rollback_ref: self.rollback_ref().to_owned(),
+            digest: String::new(),
+        };
+        ticket.digest = learning_record_ticket_digest(&ticket)
+            .map_err(|_| LearningAdmissionError::RecordIdentityMismatch)?;
+        Ok(ticket)
     }
 }
 
@@ -261,6 +392,7 @@ pub fn issue_learning_admission(
     check_live_admission(governor, claim)?;
     Ok(LearningAdmissionPermit {
         ticket: mint_ticket(claim)?,
+        record_binding: None,
     })
 }
 
@@ -277,6 +409,132 @@ pub fn issue_learning_ticket(
 ) -> Result<LearningAdmissionTicket, LearningAdmissionError> {
     check_live_admission(governor, claim)?;
     mint_ticket(claim)
+}
+
+/// Mint an owner-issued permit bound to one exact learning record identity.
+///
+/// This is the only issuance path accepted by behavioral learning
+/// effectiveness. The opaque permit carries the binding privately; callers
+/// cannot replace it after issuance.
+pub fn issue_learning_record_admission(
+    governor: &Governor,
+    claim: &LearningRecordAdmissionClaim,
+) -> Result<LearningAdmissionPermit, LearningAdmissionError> {
+    check_live_admission(governor, &claim.admission)?;
+    claim.validate()?;
+    if claim.record.state_fence != claim.admission.fence {
+        return Err(LearningAdmissionError::RecordIdentityMismatch);
+    }
+    Ok(LearningAdmissionPermit {
+        ticket: mint_ticket(&claim.admission)?,
+        record_binding: Some(claim.record.clone()),
+    })
+}
+
+/// Mint the serializable exact-record twin of a record-bound permit.
+pub fn issue_learning_record_ticket(
+    governor: &Governor,
+    claim: &LearningRecordAdmissionClaim,
+) -> Result<LearningRecordAdmissionTicket, LearningAdmissionError> {
+    check_live_admission(governor, &claim.admission)?;
+    claim.validate()?;
+    if claim.record.state_fence != claim.admission.fence {
+        return Err(LearningAdmissionError::RecordIdentityMismatch);
+    }
+    let mut ticket = LearningRecordAdmissionTicket {
+        schema_version: LEARNING_RECORD_TICKET_SCHEMA_VERSION,
+        source_campaign_id: trim_owned(&claim.admission.source_campaign_id),
+        target_task_id: trim_owned(&claim.admission.target_task_id),
+        fence: claim.admission.fence.clone(),
+        record_kind: claim.record.record_kind.clone(),
+        record_handle: claim.record.record_handle.clone(),
+        record_digest: claim.record.record_digest.clone(),
+        scope_id: claim.record.scope_id.clone(),
+        expires_at_unix_ms: claim.record.expires_at_unix_ms,
+        authority_ref: trim_owned(&claim.admission.authority_ref),
+        retention_ref: trim_owned(&claim.admission.retention_ref),
+        evaluator_ref: trim_owned(&claim.admission.evaluator_ref),
+        rollback_ref: trim_owned(&claim.admission.rollback_ref),
+        digest: String::new(),
+    };
+    ticket.digest = learning_record_ticket_digest(&ticket)
+        .map_err(|_| LearningAdmissionError::RecordIdentityMismatch)?;
+    Ok(ticket)
+}
+
+/// Rebind a record-bound permit to the current owner and exact record.
+///
+/// This check is intentionally separate from legacy influence verification:
+/// a valid owner permit without the exact record binding is not sufficient
+/// for behavioral effect.
+pub fn verify_learning_record_admission<'a>(
+    governor: &Governor,
+    permit: &'a LearningAdmissionPermit,
+    current_fence: &StateFence,
+    identity: &LearningRecordIdentity,
+    now_unix_ms: u64,
+) -> Result<VerifiedLearningAdmission<'a>, LearningAdmissionError> {
+    identity
+        .validate()
+        .map_err(|_| LearningAdmissionError::RecordIdentityMismatch)?;
+    let binding = permit
+        .record_binding()
+        .ok_or(LearningAdmissionError::MissingRecordBinding)?;
+    let expected = LearningRecordAdmissionBinding::from_identity(identity);
+    if binding != &expected {
+        return Err(LearningAdmissionError::RecordIdentityMismatch);
+    }
+    if binding.expires_at_unix_ms <= now_unix_ms {
+        return Err(LearningAdmissionError::AdmissionExpired);
+    }
+    verify_learning_admission(governor, permit, current_fence)
+}
+
+/// Verify the exact wire record ticket against live owner state and time.
+pub fn verify_learning_record_ticket(
+    governor: &Governor,
+    ticket: &LearningRecordAdmissionTicket,
+    current_fence: &StateFence,
+    identity: &LearningRecordIdentity,
+    now_unix_ms: u64,
+) -> Result<(), LearningAdmissionError> {
+    identity
+        .validate()
+        .map_err(|_| LearningAdmissionError::RecordIdentityMismatch)?;
+    if ticket.record_kind != identity.record_kind.as_str()
+        || ticket.record_handle != identity.handle
+        || ticket.record_digest != identity.record_digest
+        || ticket.scope_id != identity.scope_id
+        || ticket.expires_at_unix_ms != identity.expires_at_unix_ms
+        || ticket.fence != identity.state_fence
+    {
+        return Err(LearningAdmissionError::RecordIdentityMismatch);
+    }
+    if !admitting(governor.snapshot().state) {
+        return Err(LearningAdmissionError::GovernorNotAdmitting);
+    }
+    ticket
+        .validate()
+        .map_err(|_| LearningAdmissionError::RecordIdentityMismatch)?;
+    let recomputed = learning_record_ticket_digest(ticket)
+        .map_err(|_| LearningAdmissionError::RecordIdentityMismatch)?;
+    if recomputed != ticket.digest {
+        return Err(LearningAdmissionError::DigestMismatch);
+    }
+    let live_epoch = &governor.config().authority_epoch;
+    let live_generation = governor.config().resource_generation;
+    if !ticket.fence.authority_epoch.is_same_authority(live_epoch)
+        || ticket.fence.resource_generation != live_generation
+    {
+        return Err(LearningAdmissionError::DigestMismatch);
+    }
+    if !fences_match_exact(current_fence, &ticket.fence) {
+        return Err(LearningAdmissionError::StaleStateFence);
+    }
+    if ticket.expires_at_unix_ms <= now_unix_ms {
+        return Err(LearningAdmissionError::AdmissionExpired);
+    }
+    Ok(())
 }
 
 /// Lifetime-bound verified handle: proof that `permit` was re-bound to the

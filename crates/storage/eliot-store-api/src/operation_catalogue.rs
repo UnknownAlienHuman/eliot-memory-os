@@ -429,10 +429,11 @@ struct ActivatedMutationDescriptor {
 /// experience-bank/feedback rows with the closed experience typed
 /// contract); `RecordLearningRecord` persists `Candidate` through the
 /// `CaptureCandidate` family (issue #1868, I12.24: Store-owned durable
-/// learning rows keyed `(record_kind, handle, record_digest)` with the
-/// closed learning typed contract; the only Kernel-owned learning
-/// surface, so learning crates can never become autonomous persistence
-/// systems). All sixteen address no scope, mirroring the scope-free read
+/// learning rows keyed by the complete kind/handle/record-digest/scope/
+/// fence/expiry identity with the closed learning typed contract; the only
+/// Kernel-owned learning surface, so learning crates can never become
+/// autonomous persistence systems). All sixteen address no scope, mirroring
+/// the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
 const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 16] = [

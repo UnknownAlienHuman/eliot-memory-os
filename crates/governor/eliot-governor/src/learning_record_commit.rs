@@ -10,14 +10,11 @@
 //!   `Candidate` ceiling — the same family as the experience legs of issue
 //!   #223), invoked through
 //!   [`GovernorComposition::commit_canonical`](crate::composition::GovernorComposition::commit_canonical).
-//!   The closed wire shape (the `record_kind` discriminator, the
-//!   `(record_kind, handle, record_digest)` key, opaque owner-reference
-//!   digests, and the direct-write guard) is owned by the `learning_store`
-//!   seam module in `eliot-store-api`
-//!   (`crates/storage/eliot-store-api/src/learning_store.rs`); the
-//!   constructors here build requests only through that seam's builders
-//!   (`learning_record_commit_params`, `learning_record_mutation_request`,
-//!   `reject_direct_learning_write`) and never invent a store operation.
+//!   The closed wire shape (the `record_kind` discriminator, the complete
+//!   kind/handle/digest/scope/fence/expiry identity, and the direct-write
+//!   guard) is owned by the `learning_store` seam module in
+//!   `eliot-store-api`; the typed constructors here build requests only
+//!   through that seam's builders and never invent a store operation.
 //! - Effectiveness ONLY through verified Governor admission (I12.24 line
 //!   179: Governor admission is required before any behavioral effect; line
 //!   209: the artifact has no independent authority). A durable record
@@ -28,20 +25,21 @@
 //!   digests (`scope_digest`, `fence_digest`, owner revision strings);
 //!   learning dispatch writes only the learning tables and never rewrites
 //!   owner records.
-//! - Revision rule: the `record_digest` IS the immutable revision identity.
-//!   A new digest is a new row (never an in-place rewrite); identical
-//!   replays converge (`IdentityConflict` on divergent rewrite). A new
-//!   owner revision rebuilds the view rather than mutating it in place
+//! - Revision rule: the complete kind/handle/record-digest/scope/fence/
+//!   expiry tuple is the immutable revision identity. A new complete
+//!   identity is a new row (never an in-place rewrite); identical replays
+//!   converge (`IdentityConflict` on divergent rewrite). A new owner
+//!   revision rebuilds the view rather than mutating it in place
 //!   (I12.24 line 143).
 //!
 //! Envelope field provenance for [`commit_learning_record`] (every field
 //! bound, none synthesized; mirrors `commit_experience_bank`):
 //!
 //! ```text
-//! operation_id            derived deterministically as
-//!                         `learning-record:{kind}:{handle}:{record_digest}`
-//!                         (stable across retries, unique per record
-//!                         revision: the digest IS the revision identity)
+//! operation_id            derived deterministically from the exact
+//!                         kind/handle/record-digest/scope/fence/expiry
+//!                         identity (stable across retries, unique per
+//!                         immutable record identity)
 //! request                 the caller-supplied request metadata, cloned
 //!                         verbatim
 //! idempotency_key         the named request's deterministic key, checked
@@ -51,8 +49,8 @@
 //!                         lineage, never a task binding
 //! transition_class        CaptureCandidate; ceiling Candidate
 //! admission_contract_set_digest
-//!                         the presented record digest from the decoded
-//!                         named request
+//!                         the exact kind/handle/digest/scope/fence/expiry
+//!                         identity digest from the decoded named request
 //! operation_manifest_digest
 //!                         computed live from
 //!                         `generated_operation_manifests`
@@ -80,94 +78,491 @@
 //! at apply. The owner re-validates the envelope, fence, identity, and
 //! heads again downstream.
 //!
-//! The M1 product caller (eliotd) drives these functions with its retained
-//! neutral Kernel port and live head expectations; this module never
-//! accepts a caller-created `PreparedTransition` (there is no such
-//! parameter), never invents digests (owner `scope_digest`/`fence_digest`
-//! refs arrive opaque from the caller), and never reinterprets the
-//! receipt.
+//! The M1 product caller (eliotd) drives the typed proposal and exact
+//! admission path with its retained neutral Kernel port and live head
+//! expectations; this module never accepts a caller-created
+//! `PreparedTransition` (there is no such parameter), never invents a
+//! record digest, and never reinterprets the receipt.
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, StateFence};
+use eliot_learning_contracts::{
+    AttemptLearningDeltaCandidate, CampaignHarnessOverlayCandidate, CampaignLearningStateView,
+    ClosureHandoff, HarnessActivationReceiptCandidate, LearningStateViewRecipe,
+};
 use eliot_learning_delta::{LearningDeltaError, StoredLearningDelta};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
-    EffectClass, EventProjectionRelationIntents, LearningRecordKind, NamedMutationRequest,
-    OrderingHeadExpectation, RevisionHeadExpectation, ScopeId, SecurityContext, TransitionClass,
-    WriteReceipt, WriteReceiptStatus, canonical_json_bytes, decode_learning_mutation,
-    generated_operation_manifests, learning_record_commit_params, learning_record_mutation_request,
-    operation_manifest_set_digest, reject_direct_learning_write,
+    EffectClass, EventProjectionRelationIntents, LearningRecordIdentity, LearningRecordKind,
+    NamedMutationRequest, OrderingHeadExpectation, RevisionHeadExpectation, ScopeId,
+    SecurityContext, TransitionClass, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
+    decode_learning_mutation, generated_operation_manifests, learning_fence_digest,
+    learning_record_commit_params_from_identity, learning_record_mutation_request,
+    learning_scope_digest, operation_manifest_set_digest, reject_direct_learning_write,
 };
+use serde::Serialize;
 
 use crate::Governor;
 use crate::composition::{CompositionError, GovernorComposition, KernelGenerationPort};
-use crate::learning_admission::{LearningAdmissionPermit, verify_learning_admission};
+use crate::learning_admission::{
+    LearningAdmissionClaim, LearningAdmissionPermit, LearningRecordAdmissionClaim,
+    verify_learning_record_admission,
+};
 
-/// Builds the closed `RecordLearningRecord` mutation request for one
-/// validated stored delta.
-///
-/// Validates the record first (`record.validate()?`, which enforces the
-/// admitted-disposition receipt rule); binds kind `Delta`, the
-/// `delta_artifact` handle, the canonical JSON of the record document, and
-/// the already-hex64 `delta_digest`; threads the caller-supplied opaque
-/// owner `scope_digest`/`fence_digest` refs through untouched; then asserts
-/// the built output travels the named operation via
-/// `reject_direct_learning_write` (defense in depth: our own output must
-/// pass our own guard) before returning.
-pub fn learning_record_mutation_request_for_delta(
-    record: &StoredLearningDelta,
-    scope_digest: &str,
-    fence_digest: &str,
-    idempotency_key: String,
-) -> Result<NamedMutationRequest, LearningDeltaError> {
-    record.validate()?;
-    let record_json = String::from_utf8(canonical_json_bytes(record).map_err(|_| {
-        LearningDeltaError::InvalidInput {
-            field: "stored.record_json",
+/// A typed, immutable learning-record proposal ready for the named Kernel
+/// mutation. The identity is carried separately from the opaque request so
+/// admission, operation identity, row identity, and effectiveness all compare
+/// the same tuple.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LearningRecordProposal {
+    /// Exact record identity, including scope, State Fence, and expiry.
+    pub identity: LearningRecordIdentity,
+    /// Closed `RecordLearningRecord` request built from the identity.
+    pub request: NamedMutationRequest,
+}
+
+impl LearningRecordProposal {
+    /// Re-decode and cross-check the request against the typed identity.
+    pub fn validate(&self) -> Result<(), CompositionError> {
+        self.identity
+            .validate()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        reject_direct_learning_write(&self.request)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let decoded = decode_learning_mutation(self.request.operation, &self.request.parameters)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        if decoded.record_kind != self.identity.record_kind
+            || decoded.handle != self.identity.handle
+            || decoded.record_digest != self.identity.record_digest
+            || decoded.expires_at_unix_ms != self.identity.expires_at_unix_ms
+            || decoded.scope_digest
+                != learning_scope_digest(&self.identity.scope_id)
+                    .map_err(|error| CompositionError::Owner(error.to_string()))?
+            || decoded.fence_digest
+                != learning_fence_digest(&self.identity.state_fence)
+                    .map_err(|error| CompositionError::Owner(error.to_string()))?
+        {
+            return Err(CompositionError::Owner(
+                "learning request does not match its exact record identity".to_owned(),
+            ));
         }
-    })?)
-    .map_err(|_| LearningDeltaError::InvalidInput {
-        field: "stored.record_json",
-    })?;
-    let request = learning_record_mutation_request(learning_record_commit_params(
+        Ok(())
+    }
+
+    /// Attach the ordinary owner claim to this exact record identity.
+    pub fn admission_claim(
+        &self,
+        admission: LearningAdmissionClaim,
+    ) -> LearningRecordAdmissionClaim {
+        LearningRecordAdmissionClaim {
+            admission,
+            record: crate::learning_admission::LearningRecordAdmissionBinding::from_identity(
+                &self.identity,
+            ),
+        }
+    }
+}
+
+/// Build a typed proposal for an owner-defined serializable learning record.
+///
+/// The caller supplies a typed Rust value and the record kind/handle; the
+/// Governor computes the exact presented digest from canonical bytes. This is
+/// the production escape hatch for a record family whose contract is already
+/// owned by another first-party module, without permitting a raw store write.
+pub fn learning_record_proposal_from_serializable<T: Serialize>(
+    kind: LearningRecordKind,
+    handle: String,
+    record: &T,
+    scope_id: &ScopeId,
+    state_fence: &StateFence,
+    expires_at_unix_ms: u64,
+    idempotency_key: String,
+) -> Result<LearningRecordProposal, CompositionError> {
+    let bytes =
+        canonical_json_bytes(record).map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let record_digest = eliot_contracts::sha256_hex(&bytes);
+    proposal_from_record(
+        kind,
+        handle,
+        record_digest,
+        record,
+        scope_id,
+        state_fence,
+        expires_at_unix_ms,
+        idempotency_key,
+    )
+}
+
+/// Build a typed proposal from a validated serializable learning contract.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact identity, document, and idempotency fields are one closed handoff"
+)]
+fn proposal_from_record<T: Serialize>(
+    kind: LearningRecordKind,
+    handle: String,
+    record_digest: String,
+    record: &T,
+    scope_id: &ScopeId,
+    state_fence: &StateFence,
+    expires_at_unix_ms: u64,
+    idempotency_key: String,
+) -> Result<LearningRecordProposal, CompositionError> {
+    let record_json =
+        canonical_json_bytes(record).map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let record_json = String::from_utf8(record_json)
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let identity = LearningRecordIdentity {
+        record_kind: kind,
+        handle,
+        record_digest,
+        scope_id: scope_id.as_str().to_owned(),
+        state_fence: state_fence.clone(),
+        expires_at_unix_ms,
+    };
+    let parameters =
+        learning_record_commit_params_from_identity(&identity, record_json, idempotency_key)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let request = learning_record_mutation_request(parameters);
+    let proposal = LearningRecordProposal { identity, request };
+    proposal.validate()?;
+    Ok(proposal)
+}
+
+/// Build the exact proposal for a stored learning delta.
+pub fn learning_record_proposal_for_delta(
+    record: &StoredLearningDelta,
+    scope_id: &ScopeId,
+    state_fence: &StateFence,
+    expires_at_unix_ms: u64,
+    idempotency_key: String,
+) -> Result<LearningRecordProposal, CompositionError> {
+    record
+        .validate()
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    if record.state_fence != *state_fence {
+        return Err(CompositionError::Owner(
+            "stored delta fence differs from the proposal fence".to_owned(),
+        ));
+    }
+    proposal_from_record(
         LearningRecordKind::Delta,
         record.delta_artifact.as_str().to_owned(),
-        record_json,
         record.delta_digest.clone(),
-        scope_digest.to_owned(),
-        fence_digest.to_owned(),
+        record,
+        scope_id,
+        state_fence,
+        expires_at_unix_ms,
         idempotency_key,
-    ));
-    reject_direct_learning_write(&request).map_err(|_| LearningDeltaError::InvalidInput {
-        field: "learning.operation",
-    })?;
-    Ok(request)
+    )
+}
+
+/// Build the exact proposal for a governed overlay candidate.
+pub fn learning_record_proposal_for_overlay(
+    record: &CampaignHarnessOverlayCandidate,
+    scope_id: &ScopeId,
+    state_fence: &StateFence,
+    expires_at_unix_ms: u64,
+    idempotency_key: String,
+) -> Result<LearningRecordProposal, CompositionError> {
+    record
+        .validate()
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    if record.binding.scope.as_str() != scope_id.as_str() {
+        return Err(CompositionError::Owner(
+            "overlay scope differs from the proposal scope".to_owned(),
+        ));
+    }
+    if record.binding.state_fence != *state_fence {
+        return Err(CompositionError::Owner(
+            "overlay fence differs from the proposal fence".to_owned(),
+        ));
+    }
+    proposal_from_record(
+        LearningRecordKind::Overlay,
+        record.overlay_id.as_str().to_owned(),
+        record.canonical_digest.clone(),
+        record,
+        scope_id,
+        state_fence,
+        expires_at_unix_ms,
+        idempotency_key,
+    )
+}
+
+/// Build the exact proposal for a closure handoff candidate.
+pub fn learning_record_proposal_for_closure(
+    record: &ClosureHandoff,
+    scope_id: &ScopeId,
+    state_fence: &StateFence,
+    expires_at_unix_ms: u64,
+    idempotency_key: String,
+) -> Result<LearningRecordProposal, CompositionError> {
+    record
+        .validate()
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    if record.binding.scope.as_str() != scope_id.as_str() {
+        return Err(CompositionError::Owner(
+            "closure scope differs from the proposal scope".to_owned(),
+        ));
+    }
+    if record.binding.state_fence != *state_fence {
+        return Err(CompositionError::Owner(
+            "closure fence differs from the proposal fence".to_owned(),
+        ));
+    }
+    proposal_from_record(
+        LearningRecordKind::Closure,
+        record.assessment_id.as_str().to_owned(),
+        record.canonical_digest.clone(),
+        record,
+        scope_id,
+        state_fence,
+        expires_at_unix_ms,
+        idempotency_key,
+    )
+}
+
+/// Build the exact proposal for an activation receipt candidate.
+pub fn learning_record_proposal_for_activation_receipt(
+    record: &HarnessActivationReceiptCandidate,
+    scope_id: &ScopeId,
+    state_fence: &StateFence,
+    expires_at_unix_ms: u64,
+    idempotency_key: String,
+) -> Result<LearningRecordProposal, CompositionError> {
+    record
+        .validate()
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    if record.binding.scope.as_str() != scope_id.as_str() {
+        return Err(CompositionError::Owner(
+            "activation receipt scope differs from the proposal scope".to_owned(),
+        ));
+    }
+    if record.binding.state_fence != *state_fence {
+        return Err(CompositionError::Owner(
+            "activation receipt fence differs from the proposal fence".to_owned(),
+        ));
+    }
+    proposal_from_record(
+        LearningRecordKind::ActivationReceipt,
+        record.activation_id.as_str().to_owned(),
+        record.canonical_digest.clone(),
+        record,
+        scope_id,
+        state_fence,
+        expires_at_unix_ms,
+        idempotency_key,
+    )
+}
+
+/// Build the exact proposal for a reusable learning candidate.
+pub fn learning_record_proposal_for_candidate(
+    record: &AttemptLearningDeltaCandidate,
+    scope_id: &ScopeId,
+    state_fence: &StateFence,
+    expires_at_unix_ms: u64,
+    idempotency_key: String,
+) -> Result<LearningRecordProposal, CompositionError> {
+    record
+        .validate()
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    if record.binding.scope.as_str() != scope_id.as_str() {
+        return Err(CompositionError::Owner(
+            "candidate scope differs from the proposal scope".to_owned(),
+        ));
+    }
+    if record.binding.state_fence != *state_fence {
+        return Err(CompositionError::Owner(
+            "candidate fence differs from the proposal fence".to_owned(),
+        ));
+    }
+    proposal_from_record(
+        LearningRecordKind::Candidate,
+        record.delta_id.as_str().to_owned(),
+        record.canonical_digest.clone(),
+        record,
+        scope_id,
+        state_fence,
+        expires_at_unix_ms,
+        idempotency_key,
+    )
+}
+
+/// Build the exact proposal for an immutable learning-state view reference.
+pub fn learning_record_proposal_for_view_ref(
+    record: &CampaignLearningStateView,
+    recipe: &LearningStateViewRecipe,
+    scope_id: &ScopeId,
+    state_fence: &StateFence,
+    expires_at_unix_ms: u64,
+    idempotency_key: String,
+) -> Result<LearningRecordProposal, CompositionError> {
+    record
+        .validate_against(recipe)
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    if record.binding.scope.as_str() != scope_id.as_str() {
+        return Err(CompositionError::Owner(
+            "learning view scope differs from the proposal scope".to_owned(),
+        ));
+    }
+    if record.binding.state_fence != *state_fence {
+        return Err(CompositionError::Owner(
+            "learning view fence differs from the proposal fence".to_owned(),
+        ));
+    }
+    proposal_from_record(
+        LearningRecordKind::ViewRef,
+        record.view_id.as_str().to_owned(),
+        record.canonical_digest.clone(),
+        record,
+        scope_id,
+        state_fence,
+        expires_at_unix_ms,
+        idempotency_key,
+    )
+}
+
+/// Closed typed dispatch used by production owners to select one of the six
+/// learning record contracts without constructing a raw store command.
+pub enum LearningRecordPayload<'a> {
+    /// Stored attempt delta.
+    Delta(&'a StoredLearningDelta),
+    /// Task-local overlay candidate.
+    Overlay(&'a CampaignHarnessOverlayCandidate),
+    /// Closure handoff candidate.
+    Closure(&'a ClosureHandoff),
+    /// Activation receipt candidate.
+    ActivationReceipt(&'a HarnessActivationReceiptCandidate),
+    /// Reusable learning candidate.
+    Candidate(&'a AttemptLearningDeltaCandidate),
+    /// Immutable state-view reference.
+    ViewRef(&'a CampaignLearningStateView, &'a LearningStateViewRecipe),
+    /// A typed owner-defined record that already has a first-party Rust
+    /// contract outside this module (for example the daemon's terminal
+    /// observation receipt). The Governor still computes the canonical
+    /// digest and builds the same named request.
+    OwnerDefined {
+        /// Closed record kind.
+        kind: LearningRecordKind,
+        /// Stable owner handle.
+        handle: String,
+        /// Typed serializable record value.
+        record: &'a serde_json::Value,
+    },
+}
+
+impl LearningRecordPayload<'_> {
+    /// Convert the typed payload into one exact named-operation proposal.
+    pub fn into_proposal(
+        self,
+        scope_id: &ScopeId,
+        state_fence: &StateFence,
+        expires_at_unix_ms: u64,
+        idempotency_key: String,
+    ) -> Result<LearningRecordProposal, CompositionError> {
+        match self {
+            Self::Delta(record) => learning_record_proposal_for_delta(
+                record,
+                scope_id,
+                state_fence,
+                expires_at_unix_ms,
+                idempotency_key,
+            ),
+            Self::Overlay(record) => learning_record_proposal_for_overlay(
+                record,
+                scope_id,
+                state_fence,
+                expires_at_unix_ms,
+                idempotency_key,
+            ),
+            Self::Closure(record) => learning_record_proposal_for_closure(
+                record,
+                scope_id,
+                state_fence,
+                expires_at_unix_ms,
+                idempotency_key,
+            ),
+            Self::ActivationReceipt(record) => learning_record_proposal_for_activation_receipt(
+                record,
+                scope_id,
+                state_fence,
+                expires_at_unix_ms,
+                idempotency_key,
+            ),
+            Self::Candidate(record) => learning_record_proposal_for_candidate(
+                record,
+                scope_id,
+                state_fence,
+                expires_at_unix_ms,
+                idempotency_key,
+            ),
+            Self::ViewRef(record, recipe) => learning_record_proposal_for_view_ref(
+                record,
+                recipe,
+                scope_id,
+                state_fence,
+                expires_at_unix_ms,
+                idempotency_key,
+            ),
+            Self::OwnerDefined {
+                kind,
+                handle,
+                record,
+            } => learning_record_proposal_from_serializable(
+                kind,
+                handle,
+                record,
+                scope_id,
+                state_fence,
+                expires_at_unix_ms,
+                idempotency_key,
+            ),
+        }
+    }
+}
+
+///
+/// Builds the exact named request for a stored delta. The scope, State Fence,
+/// and expiry are required inputs; there is no unbounded or unbound legacy
+/// construction path.
+pub fn learning_record_mutation_request_for_delta(
+    record: &StoredLearningDelta,
+    scope_id: &ScopeId,
+    state_fence: &StateFence,
+    expires_at_unix_ms: u64,
+    idempotency_key: String,
+) -> Result<NamedMutationRequest, LearningDeltaError> {
+    learning_record_proposal_for_delta(
+        record,
+        scope_id,
+        state_fence,
+        expires_at_unix_ms,
+        idempotency_key,
+    )
+    .map(|proposal| proposal.request)
+    .map_err(|_| LearningDeltaError::InvalidInput {
+        field: "stored.learning_identity",
+    })
 }
 
 /// Report whether a durable learning record is locally effective under a
 /// Governor admission.
 ///
-/// A durable-but-unadmitted record (or a stale permit) stays non-effective
-/// (A3): returns `true` only when the caller-observed `admitted` flag and
-/// admission-receipt presence both hold AND `permit` is present AND
-/// [`verify_learning_admission`] rebinds it to the live owner
-/// epoch/generation and `current_fence`. Any refusal means no behavioral
-/// effect, even though the record itself remains durable. Delivery still
-/// travels the existing `delivery_allowed` / `delta_delivery_allowed` path.
+/// The permit is checked against the exact record identity and current
+/// owner/fence/time. Caller-provided admission booleans are deliberately not
+/// accepted: presence of a receipt-shaped value is not authentication.
 pub fn learning_effective_under_admission(
     governor: &Governor,
     permit: Option<&LearningAdmissionPermit>,
     current_fence: &StateFence,
-    admitted: bool,
-    admission_receipt_present: bool,
+    identity: &LearningRecordIdentity,
+    now_unix_ms: u64,
 ) -> bool {
-    if !admitted || !admission_receipt_present {
-        return false;
-    }
     let Some(permit) = permit else {
         return false;
     };
-    verify_learning_admission(governor, permit, current_fence).is_ok()
+    verify_learning_record_admission(governor, permit, current_fence, identity, now_unix_ms).is_ok()
 }
 
 /// Fail-closed freshness check over the owner-returned receipt (issue #223
@@ -245,6 +640,30 @@ fn check_learning_commit_freshness(
     Ok(())
 }
 
+/// Decode the exact identity carried by one closed learning mutation.
+pub fn learning_record_identity_from_request(
+    request: &NamedMutationRequest,
+    scope_id: &ScopeId,
+    state_fence: &StateFence,
+) -> Result<LearningRecordIdentity, CompositionError> {
+    reject_direct_learning_write(request)
+        .map_err(|error| CompositionError::Owner(format!("learning commit guard: {error}")))?;
+    let decoded = decode_learning_mutation(request.operation, &request.parameters)
+        .map_err(|error| CompositionError::Owner(format!("learning commit parameters: {error}")))?;
+    let identity = LearningRecordIdentity {
+        record_kind: decoded.record_kind,
+        handle: decoded.handle,
+        record_digest: decoded.record_digest,
+        scope_id: scope_id.as_str().to_owned(),
+        state_fence: state_fence.clone(),
+        expires_at_unix_ms: decoded.expires_at_unix_ms,
+    };
+    identity
+        .validate()
+        .map_err(|error| CompositionError::Owner(format!("learning identity invalid: {error}")))?;
+    Ok(identity)
+}
+
 /// Commits one prebuilt named learning-record request through the canonical
 /// owner.
 ///
@@ -289,16 +708,38 @@ pub async fn commit_learning_record<P: KernelGenerationPort + ?Sized>(
             "learning commit idempotency key does not match the named request key".to_owned(),
         ));
     }
-    let operation_id = OperationId::new(format!(
-        "learning-record-{}-{}-{}",
-        decoded.record_kind.as_str(),
-        decoded.handle,
-        decoded.record_digest,
-    ))
-    .map_err(|error| {
-        CompositionError::Owner(format!("learning operation identity invalid: {error}"))
-    })?;
     let envelope_fence = identity.request.metadata.state_fence.clone();
+    let record_identity = LearningRecordIdentity {
+        record_kind: decoded.record_kind,
+        handle: decoded.handle.clone(),
+        record_digest: decoded.record_digest.clone(),
+        scope_id: scope_id.as_str().to_owned(),
+        state_fence: envelope_fence.clone(),
+        expires_at_unix_ms: decoded.expires_at_unix_ms,
+    };
+    record_identity
+        .validate()
+        .map_err(|error| CompositionError::Owner(format!("learning identity invalid: {error}")))?;
+    let expected_scope_digest = learning_scope_digest(scope_id.as_str()).map_err(|error| {
+        CompositionError::Owner(format!("learning scope digest invalid: {error}"))
+    })?;
+    let expected_fence_digest = learning_fence_digest(&envelope_fence).map_err(|error| {
+        CompositionError::Owner(format!("learning fence digest invalid: {error}"))
+    })?;
+    if decoded.scope_digest != expected_scope_digest
+        || decoded.fence_digest != expected_fence_digest
+    {
+        return Err(CompositionError::Owner(
+            "learning record scope/fence digest does not match the canonical envelope".to_owned(),
+        ));
+    }
+    let record_identity_digest = record_identity
+        .identity_digest()
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let operation_id = OperationId::new(format!("learning-record-v2-{record_identity_digest}"))
+        .map_err(|error| {
+            CompositionError::Owner(format!("learning operation identity invalid: {error}"))
+        })?;
     let manifest_digest =
         operation_manifest_set_digest(&generated_operation_manifests().map_err(|error| {
             CompositionError::Owner(format!("operation manifest set unavailable: {error}"))
@@ -314,7 +755,7 @@ pub async fn commit_learning_record<P: KernelGenerationPort + ?Sized>(
         task_id: None,
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: decoded.record_digest.clone(),
+        admission_contract_set_digest: record_identity_digest,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![request],
         event_projection_relation_intents: EventProjectionRelationIntents {
@@ -337,4 +778,54 @@ pub async fn commit_learning_record<P: KernelGenerationPort + ?Sized>(
         &ordering_expectations,
     )?;
     Ok(receipt)
+}
+
+/// Commit and optionally authenticate one exact learning-record proposal.
+///
+/// A supplied permit is checked against the same identity before the owner
+/// receives the request. The permit is never used as a substitute for the
+/// request's scope/fence/digest fields; both sides must agree.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact commit caller carries the complete owner handoff"
+)]
+pub async fn commit_learning_record_with_admission<P: KernelGenerationPort + ?Sized>(
+    composition: &GovernorComposition<P>,
+    request_identity: &RequestIdentity,
+    proposal: &LearningRecordProposal,
+    proof_refs: Vec<String>,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    permit: Option<&LearningAdmissionPermit>,
+    now_unix_ms: u64,
+) -> Result<WriteReceipt, CompositionError> {
+    proposal.validate()?;
+    let live_fence = request_identity.request.state_fence.clone();
+    if proposal.identity.state_fence != live_fence {
+        return Err(CompositionError::Owner(
+            "learning proposal fence differs from the request fence".to_owned(),
+        ));
+    }
+    if let Some(permit) = permit {
+        verify_learning_record_admission(
+            composition.governor(),
+            permit,
+            &live_fence,
+            &proposal.identity,
+            now_unix_ms,
+        )
+        .map_err(|error| CompositionError::Owner(format!("learning admission refused: {error}")))?;
+    }
+    commit_learning_record(
+        composition,
+        request_identity,
+        proposal.request.clone(),
+        ScopeId::new(proposal.identity.scope_id.clone()).map_err(|error| {
+            CompositionError::Owner(format!("learning scope identity invalid: {error}"))
+        })?,
+        proof_refs,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+    .await
 }

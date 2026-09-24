@@ -97,18 +97,26 @@ pub use eliot_finish::FinishDecisionReceipt;
 pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
 pub use learning_admission::{
     LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
-    LearningAdmissionError, LearningAdmissionPermit, VerifiedLearningAdmission,
-    issue_learning_admission, issue_learning_ticket, verify_learning_admission,
+    LearningAdmissionError, LearningAdmissionPermit, LearningRecordAdmissionBinding,
+    LearningRecordAdmissionClaim, VerifiedLearningAdmission, issue_learning_admission,
+    issue_learning_record_admission, issue_learning_record_ticket, issue_learning_ticket,
+    verify_learning_admission, verify_learning_record_admission, verify_learning_record_ticket,
     verify_learning_ticket,
 };
 pub use learning_delta_integration::{
     AttemptCloseError, admission_claim_for_delta, close_attempt_with_activation_receipt,
     delta_delivery_allowed, derive_delta_at_boundary, emit_activation_receipt_at_attempt_close,
-    issue_delta_admission, retry_lineage_for_delta, store_derived_delta, verify_delta_delivery,
+    issue_delta_admission, issue_record_delta_admission, record_admission_claim_for_delta,
+    retry_lineage_for_delta, store_derived_delta, verify_delta_delivery,
 };
 pub use learning_record_commit::{
-    commit_learning_record, learning_effective_under_admission,
-    learning_record_mutation_request_for_delta,
+    LearningRecordPayload, LearningRecordProposal, commit_learning_record,
+    commit_learning_record_with_admission, learning_effective_under_admission,
+    learning_record_identity_from_request, learning_record_mutation_request_for_delta,
+    learning_record_proposal_for_activation_receipt, learning_record_proposal_for_candidate,
+    learning_record_proposal_for_closure, learning_record_proposal_for_delta,
+    learning_record_proposal_for_overlay, learning_record_proposal_for_view_ref,
+    learning_record_proposal_from_serializable,
 };
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,

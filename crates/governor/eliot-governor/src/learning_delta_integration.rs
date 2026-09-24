@@ -26,12 +26,14 @@ use eliot_learning_delta::{
     DerivationContext, DerivationPolicy, LearningDeltaError, RefinerDraft, StoredDeltaDisposition,
     StoredLearningDelta, delivery_allowed, derive_attempt_learning_outcome,
 };
+use eliot_store_api::LearningRecordIdentity;
 use thiserror::Error;
 
 use crate::Governor;
 use crate::learning_admission::{
     LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim, LearningAdmissionError,
-    LearningAdmissionPermit, issue_learning_admission, verify_learning_admission,
+    LearningAdmissionPermit, LearningRecordAdmissionBinding, LearningRecordAdmissionClaim,
+    issue_learning_admission, issue_learning_record_admission, verify_learning_record_admission,
 };
 
 /// Derive a candidate learning outcome only at a consequential boundary.
@@ -150,6 +152,50 @@ pub fn admission_claim_for_delta(
     }
 }
 
+/// Build the exact record-bound admission claim for a stored delta.
+///
+/// The legacy [`admission_claim_for_delta`] remains the context-compat
+/// contour; behavioral delta delivery uses this typed binding instead.
+#[allow(clippy::too_many_arguments)]
+pub fn record_admission_claim_for_delta(
+    campaign_id: &str,
+    target_task_id: &str,
+    fence: StateFence,
+    delta_artifact_id: &str,
+    delta_digest: &str,
+    scope_id: &str,
+    expires_at_unix_ms: u64,
+    overlay_id: Option<&str>,
+    scope_ref: &str,
+    authority_ref: &str,
+    retention_ref: &str,
+    evaluator_ref: &str,
+    rollback_ref: &str,
+) -> LearningRecordAdmissionClaim {
+    LearningRecordAdmissionClaim {
+        admission: admission_claim_for_delta(
+            campaign_id,
+            target_task_id,
+            fence.clone(),
+            delta_artifact_id,
+            overlay_id,
+            scope_ref,
+            authority_ref,
+            retention_ref,
+            evaluator_ref,
+            rollback_ref,
+        ),
+        record: LearningRecordAdmissionBinding {
+            record_kind: "delta".to_owned(),
+            record_handle: delta_artifact_id.to_owned(),
+            record_digest: delta_digest.to_owned(),
+            scope_id: scope_id.to_owned(),
+            state_fence: fence,
+            expires_at_unix_ms,
+        },
+    }
+}
+
 /// Issue a Governor admission permit for a stored-delta claim.
 ///
 /// Governor admission is required before any behavioral effect (I12.24 line
@@ -162,17 +208,25 @@ pub fn issue_delta_admission(
     issue_learning_admission(governor, claim)
 }
 
-/// Verify that a delta delivery permit is currently admitted.
-///
-/// Admitted-only delivery (A4): returns `true` only when
-/// `verify_learning_admission` rebinds the permit to the live owner
-/// epoch/generation and the current fence. Any refusal means no delivery.
+/// Issue the exact record-bound permit used by behavioral delta delivery.
+pub fn issue_record_delta_admission(
+    governor: &Governor,
+    claim: &LearningRecordAdmissionClaim,
+) -> Result<LearningAdmissionPermit, LearningAdmissionError> {
+    issue_learning_record_admission(governor, claim)
+}
+
+/// Verify that a delta delivery permit is currently admitted for the exact
+/// record identity and before its expiry. A legacy influence-only permit is
+/// intentionally insufficient for behavioral delivery.
 pub fn verify_delta_delivery(
     governor: &Governor,
     permit: &LearningAdmissionPermit,
     current_fence: &StateFence,
+    identity: &LearningRecordIdentity,
+    now_unix_ms: u64,
 ) -> bool {
-    verify_learning_admission(governor, permit, current_fence).is_ok()
+    verify_learning_record_admission(governor, permit, current_fence, identity, now_unix_ms).is_ok()
 }
 
 /// Check whether a stored delta may be delivered under a receipt.
