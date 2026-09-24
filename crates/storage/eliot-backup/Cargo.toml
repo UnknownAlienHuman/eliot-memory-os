@@ -13,6 +13,7 @@ workspace_admission = "admitted bounded non-runtime product surface per #1873 (o
 aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
 eliot-blob-api.workspace = true
 eliot-contracts.workspace = true
+eliot-ecxf = { path = "../eliot-ecxf", version = "0.1.0" }
 eliot-platform-windows.workspace = true
 eliot-security-contracts.workspace = true
 eliot-store-api.workspace = true
