@@ -1,6 +1,6 @@
 use eliot_agent_contracts::{AgentAttemptId, TargetId};
 use eliot_contracts::{
-    ArtifactId, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId, RequestId,
+    ArtifactId, AuthorityEpoch, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId, RequestId,
     ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_evidence::EvidenceFreshness;
@@ -20,6 +20,16 @@ fn target(value: &str) -> Result<TargetId, Box<dyn std::error::Error>> {
 }
 
 fn binding(tag: &str) -> Result<ContractBinding, Box<dyn std::error::Error>> {
+    let mut state_fence = StateFence::new(
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch"),
+        ResourceGeneration::genesis(),
+    );
+    state_fence.task_revision = Some(TaskRevision::genesis());
     Ok(ContractBinding {
         schema_version: 1,
         policy_revision: PolicyRevision::genesis(),
@@ -28,15 +38,7 @@ fn binding(tag: &str) -> Result<ContractBinding, Box<dyn std::error::Error>> {
         product_id: ProductId::new("eliot")?,
         task_id: TaskId::new(format!("task-{tag}"))?,
         scope: WorkScopeId::new(format!("scope-{tag}"))?,
-        state_fence: StateFence::new(
-            EpochId::new(
-                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                    .expect("valid test lineage"),
-                std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
-            )
-            .expect("valid test epoch"),
-            ResourceGeneration::genesis(),
-        ),
+        state_fence,
         source: identity::SourceLineage {
             owner: SourceId::new(format!("source-{tag}"))?,
             snapshot: aid(&format!("snapshot-{tag}"))?,
@@ -51,12 +53,227 @@ fn slot(tag: &str, target: &TargetId) -> Result<state_view::SlotSpec, Box<dyn st
     Ok(state_view::SlotSpec {
         slot_id: SlotId::from_artifact(aid(&format!("slot-{tag}"))?),
         owner: OwnerId::from_artifact(aid(&format!("owner-{tag}"))?),
+        source_role: CampaignSourceRole::ArtifactProjection,
         target: target.clone(),
         requirement: SlotRequirement::Required,
         declared_members: vec![MemberId::from_artifact(aid(&format!("member-{tag}"))?)],
         accepted_type: "strategy/v1".to_owned(),
         schema_digest: digest("strategy-schema"),
     })
+}
+
+fn source_revision(
+    role: CampaignSourceRole,
+    content_digest: &str,
+    binding: &ContractBinding,
+) -> CampaignOwnerRevision {
+    match role {
+        CampaignSourceRole::TaskObjective
+        | CampaignSourceRole::TaskAcceptance
+        | CampaignSourceRole::TaskPlan
+        | CampaignSourceRole::TaskOpenItems
+        | CampaignSourceRole::ContextRecipe
+        | CampaignSourceRole::ContextDelivery
+        | CampaignSourceRole::CurrentPosition => {
+            CampaignOwnerRevision::Task(TaskRevision::genesis())
+        }
+        CampaignSourceRole::GovernorEpoch => {
+            CampaignOwnerRevision::AuthorityEpoch(AuthorityEpoch::genesis())
+        }
+        CampaignSourceRole::GovernorPolicy | CampaignSourceRole::ContextToolPolicy => {
+            CampaignOwnerRevision::Policy(binding.policy_revision)
+        }
+        CampaignSourceRole::MemoryProjection
+        | CampaignSourceRole::StableHarness
+        | CampaignSourceRole::TaskFamilyHarness => CampaignOwnerRevision::ResourceGeneration(
+            binding.state_fence.resource_generation,
+        ),
+        CampaignSourceRole::FrozenAnchor | CampaignSourceRole::ArtifactProjection => {
+            CampaignOwnerRevision::ResourceSnapshot(content_digest.to_owned())
+        }
+        _ => CampaignOwnerRevision::Counter(1),
+    }
+}
+
+fn campaign_source_contract(
+    binding: &ContractBinding,
+) -> Result<(Vec<CampaignSourceRequirement>, CampaignLearningStateProvenance), Box<dyn std::error::Error>> {
+    let mut requirements = Vec::with_capacity(CampaignSourceRole::all().len());
+    let mut resolutions = Vec::with_capacity(CampaignSourceRole::all().len());
+    for (index, role) in CampaignSourceRole::all().into_iter().enumerate() {
+        let task_anchor = role == CampaignSourceRole::TaskPlan;
+        let owner = if task_anchor {
+            OwnerId::from_artifact(aid(TASK_CONTROLLER_CAMPAIGN_OWNER_ID)?)
+        } else {
+            OwnerId::from_artifact(aid(&format!("source-owner-a-{index}"))?)
+        };
+        let expected_reference = if role == CampaignSourceRole::ActiveOverlay || task_anchor {
+            None
+        } else {
+            let content_digest = digest(&format!("source-content-a-{index}"));
+            let record_id = match role {
+                CampaignSourceRole::TaskObjective
+                | CampaignSourceRole::TaskAcceptance
+                | CampaignSourceRole::TaskOpenItems => {
+                    CampaignOwnerRecordId::Task(binding.task_id.clone())
+                }
+                _ => CampaignOwnerRecordId::Artifact(aid(&format!("source-record-a-{index}"))?),
+            };
+            Some(CampaignSourceRevisionRef {
+                role,
+                owner: owner.clone(),
+                record_id,
+                revision: source_revision(role, &content_digest, binding),
+                content_digest,
+                slot_projection_digests: vec![],
+                recorded_state_fence: binding.state_fence.clone(),
+            })
+        };
+        let absent = role == CampaignSourceRole::ActiveOverlay;
+        let reference = if task_anchor {
+            Some(CampaignSourceRevisionRef {
+                role,
+                owner: owner.clone(),
+                record_id: CampaignOwnerRecordId::Task(binding.task_id.clone()),
+                revision: CampaignOwnerRevision::Task(
+                    binding
+                        .state_fence
+                        .task_revision
+                        .clone()
+                        .expect("task anchor revision"),
+                ),
+                content_digest: digest("task-anchor-a"),
+                slot_projection_digests: vec![],
+                recorded_state_fence: binding.state_fence.clone(),
+            })
+        } else {
+            expected_reference.clone()
+        };
+        requirements.push(CampaignSourceRequirement {
+            role,
+            source_binding: if absent {
+                CampaignSourceBinding::ExplicitlyAbsent
+            } else if task_anchor {
+                CampaignSourceBinding::AuthenticatedTaskAnchor
+            } else {
+                CampaignSourceBinding::ExactReference
+            },
+            owner,
+            expected_reference: expected_reference.clone(),
+            load_bearing: !absent,
+        });
+        resolutions.push(CampaignSourceResolution {
+            role,
+            status: if reference.is_some() {
+                CampaignSourceResolutionStatus::Current
+            } else {
+                CampaignSourceResolutionStatus::Missing
+            },
+            reference,
+            read_state_fence: binding.state_fence.clone(),
+        });
+    }
+    let position_specs = [
+        (CampaignPositionKind::Current, CampaignSourceRole::CurrentPosition),
+        (CampaignPositionKind::Experience, CampaignSourceRole::ExperiencePosition),
+        (CampaignPositionKind::Adaptation, CampaignSourceRole::AdaptationPosition),
+        (CampaignPositionKind::Evaluation, CampaignSourceRole::EvaluationPosition),
+        (CampaignPositionKind::EconomicsProgress, CampaignSourceRole::EconomicsProgress),
+    ];
+    let positions = position_specs
+        .into_iter()
+        .map(|(kind, source_role)| {
+            let source = resolutions
+                .iter()
+                .find(|resolution| resolution.role == source_role)
+                .and_then(|resolution| resolution.reference.as_ref())
+                .expect("position role has an exact source reference");
+            CampaignPositionRef {
+                kind,
+                source_role,
+                record_id: source.record_id.clone(),
+                revision: source.revision.clone(),
+                source_content_digest: source.content_digest.clone(),
+                position_digest: source.content_digest.clone(),
+            }
+        })
+        .collect();
+    let frozen_anchor_digest = resolutions
+        .iter()
+        .find(|resolution| resolution.role == CampaignSourceRole::FrozenAnchor)
+        .and_then(|resolution| resolution.reference.as_ref())
+        .map(|reference| reference.content_digest.clone())
+        .expect("frozen anchor has an exact source reference");
+    Ok((
+        requirements,
+        CampaignLearningStateProvenance {
+            source_resolutions: resolutions,
+            frozen_anchor_digest,
+            positions,
+            history_plans: vec![CampaignHistoryPlanReference {
+                retrieval_plan_digest: digest("retrieval-plan-a"),
+                selected_handles: vec![aid("history-handle-a")?],
+                summary_digest: Some(digest("history-summary-a")),
+                diff_digests: vec![digest("history-diff-a")],
+                policy_slice_handles: vec![],
+            }],
+            generated_at_ms: 1_790_208_000_000,
+            expires_at_ms: None,
+            rebuild_reason: None,
+        },
+    ))
+}
+
+fn bind_slot_source_contract(
+    recipe: &mut LearningStateViewRecipe,
+    provenance: &mut CampaignLearningStateProvenance,
+    projections: &[SlotProjection],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for spec in &recipe.slots {
+        let requirement = recipe
+            .source_requirements
+            .iter_mut()
+            .find(|requirement| requirement.role == spec.source_role)
+            .expect("slot source role is declared");
+        requirement.owner = spec.owner.clone();
+        requirement.expected_reference.as_mut().expect("slot source is declared").owner = spec.owner.clone();
+        let resolution = provenance
+            .source_resolutions
+            .iter_mut()
+            .find(|resolution| resolution.role == spec.source_role)
+            .expect("slot source role is resolved");
+        resolution.reference.as_mut().expect("slot source is current").owner = spec.owner.clone();
+    }
+    for projection in projections {
+        let spec = recipe
+            .slots
+            .iter()
+            .find(|spec| spec.slot_id == projection.slot_id)
+            .expect("projection is declared by recipe");
+        let projection_digest = projection.canonical_digest()?;
+        recipe
+            .source_requirements
+            .iter_mut()
+            .find(|requirement| requirement.role == spec.source_role)
+            .expect("slot source role is declared")
+            .expected_reference
+            .as_mut()
+            .expect("slot source is declared")
+            .slot_projection_digests
+            .push(CampaignSlotProjectionDigest { slot_id: projection.slot_id.clone(), digest: projection_digest.clone() });
+        provenance
+            .source_resolutions
+            .iter_mut()
+            .find(|resolution| resolution.role == spec.source_role)
+            .expect("slot source role is resolved")
+            .reference
+            .as_mut()
+            .expect("slot source is current")
+            .slot_projection_digests
+            .push(CampaignSlotProjectionDigest { slot_id: projection.slot_id.clone(), digest: projection_digest });
+    }
+    recipe.seal()?;
+    Ok(())
 }
 
 fn recipe_and_view()
@@ -66,18 +283,21 @@ fn recipe_and_view()
     let spec = slot("a", &target)?;
     let mut optional = slot("optional", &target)?;
     optional.requirement = SlotRequirement::Optional;
+    optional.source_role = CampaignSourceRole::MemoryProjection;
+    let (source_requirements, mut provenance) = campaign_source_contract(&binding)?;
     let mut recipe = LearningStateViewRecipe {
         recipe_id: aid("recipe-a")?,
         campaign_id: CampaignId::from_artifact(aid("campaign-a")?),
         target: target.clone(),
         binding: binding.clone(),
         slots: vec![spec.clone(), optional.clone()],
+        source_requirements,
+        active_overlay_policy: CampaignActiveOverlayPolicy::ExplicitlyAbsentAllowed,
         freshness: EvidenceFreshness::ExactCandidate,
         privacy_class: "task-local".to_owned(),
         omission_policy: OmissionPolicy::RequiredSlots,
         canonical_digest: String::new(),
     };
-    recipe.seal()?;
     let member = MemberProjection {
         member_id: spec.declared_members[0].clone(),
         owner: spec.owner.clone(),
@@ -87,6 +307,13 @@ fn recipe_and_view()
         value_digest: Some(digest("strategy-value")),
         evidence: vec![aid("evidence-view")?],
     };
+    let slots = vec![SlotProjection {
+        slot_id: spec.slot_id.clone(),
+        disposition: SlotDisposition::Current,
+        members: vec![member],
+        evidence: vec![aid("evidence-slot")?],
+    }];
+    bind_slot_source_contract(&mut recipe, &mut provenance, &slots)?;
     let mut view = CampaignLearningStateView {
         view_id: aid("view-a")?,
         recipe_id: recipe.recipe_id.clone(),
@@ -94,12 +321,8 @@ fn recipe_and_view()
         target,
         binding,
         recipe_digest: recipe.canonical_digest.clone(),
-        slots: vec![SlotProjection {
-            slot_id: spec.slot_id,
-            disposition: SlotDisposition::Current,
-            members: vec![member],
-            evidence: vec![aid("evidence-slot")?],
-        }],
+        provenance,
+        slots,
         denominator: SourceDenominator {
             declared: 2,
             observed: 1,
@@ -113,7 +336,7 @@ fn recipe_and_view()
         invalidation_reason: None,
         canonical_digest: String::new(),
     };
-    view.seal()?;
+    view.seal_content_addressed()?;
     Ok((recipe, view))
 }
 
