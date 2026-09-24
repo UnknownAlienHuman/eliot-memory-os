@@ -10,7 +10,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{ArtifactId, ContractId, ResourceGeneration, TransactionSequence};
+use eliot_contracts::{ArtifactId, ContractId, ResourceGeneration, TaskId, TransactionSequence};
+pub use eliot_learning_contracts::{
+    CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind, CampaignPositionRef,
+    CampaignSlotProjectionDigest, CampaignSourceBinding, CampaignSourceRole,
+    OwnerDisagreement, SlotProjection, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+};
+pub use eliot_learning_contracts::{CampaignLearningStateView, LearningStateViewRecipe, OwnerId};
 pub use eliot_contracts::{
     ContractError, ContractVersion, ErrorCode, OperationId, RequestMetadata, StateFence,
     canonical_json_bytes, sha256_hex,
@@ -803,6 +809,989 @@ pub enum ReadConsistency {
     ExactFence,
 }
 
+/// Closed discriminator for the typed owner document stored in a campaign
+/// source record. Publisher and consumer edges must decode this body as the
+/// named concrete contract and call its validator; the discriminator by
+/// itself is not owner proof.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CampaignSourceDocumentSchema {
+    LearningStateViewRecipe,
+    CampaignLearningStateView,
+    TaskObjective,
+    TaskAcceptance,
+    TaskPlan,
+    TaskOpenItems,
+    AttemptLineageLatestOutcomes,
+    GovernorAdmission,
+    GovernorEpoch,
+    GovernorPolicy,
+    ContextRecipe,
+    ContextToolPolicy,
+    ContextDelivery,
+    EvaluatorContract,
+    EvaluatorHoldout,
+    EvaluationResults,
+    MemoryProjection,
+    ExperienceProjection,
+    ArtifactProjection,
+    FrozenAnchor,
+    StableHarness,
+    TaskFamilyHarness,
+    ActiveOverlay,
+    CurrentPosition,
+    ExperiencePosition,
+    AdaptationPosition,
+    EvaluationPosition,
+    EconomicsProgress,
+    RetrievalPlan,
+}
+
+/// Closed-schema, canonical-json transport for an owner-validated document.
+/// The owner-specific publisher and consumer deserialize `body` into the
+/// concrete type selected by `schema`, validate it, and bind the digest.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignSourceDocument {
+    pub schema: CampaignSourceDocumentSchema,
+    pub schema_version: u16,
+    pub body: Value,
+}
+
+impl CampaignSourceDocument {
+    /// Current schema version for campaign source documents.
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    /// Validate the closed envelope and its canonical encoded size. Semantic
+    /// validation remains at the concrete owner boundary selected by `schema`.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(StoreError::InvalidField {
+                field: "campaign_source.document.schema_version",
+                reason: "unsupported schema version",
+            });
+        }
+        if !self.body.is_object() {
+            return Err(StoreError::InvalidField {
+                field: "campaign_source.document.body",
+                reason: "must be a typed contract object",
+            });
+        }
+        if canonical_json_bytes(&self.body)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?
+            .len()
+            > MAX_EXACT_JSON_BYTES
+        {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        if self.schema == CampaignSourceDocumentSchema::LearningStateViewRecipe {
+            let recipe: LearningStateViewRecipe = serde_json::from_value(self.body.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            recipe.validate().map_err(|_| StoreError::InvalidField {
+                    field: "campaign_source.learning_state_view_recipe",
+                    reason: "typed recipe validation failed",
+                })?;
+        }
+        if self.schema == CampaignSourceDocumentSchema::CampaignLearningStateView {
+            let view: CampaignLearningStateView = serde_json::from_value(self.body.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            view.validate_content_addressed()
+                .map_err(|_| StoreError::InvalidField {
+                    field: "campaign_source.campaign_learning_state_view",
+                    reason: "typed content-addressed view validation failed",
+                })?;
+        }
+        Ok(())
+    }
+}
+
+/// Exact immutable source-owner record returned by the named read.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignSourceRecord {
+    pub role: CampaignSourceRole,
+    pub owner_id: OwnerId,
+    pub record_id: CampaignOwnerRecordId,
+    pub revision: CampaignOwnerRevision,
+    pub content_digest: String,
+    pub recorded_state_fence: StateFence,
+    /// Digests computed by the owner from exact current slot projections.
+    pub slot_projection_digests: Vec<CampaignSlotProjectionDigest>,
+    /// Exact bounded slot values from the same owner read that computed the
+    /// digests. Consumers verify each canonical digest before compilation.
+    pub slot_projections: Vec<SlotProjection>,
+    /// Required artifact handles emitted by the owner projection.
+    pub required_references: Vec<ArtifactId>,
+    /// Explicit owner disagreements emitted by the owner projection.
+    pub disagreements: Vec<OwnerDisagreement>,
+    /// Existing validated retrieval plans and bounded results returned by
+    /// the same owner read; plans are never synthesized from task labels.
+    pub history_plans: Vec<CampaignHistoryPlanRecord>,
+    pub document: CampaignSourceDocument,
+}
+
+impl CampaignSourceRecord {
+    /// Constructs one immutable source row and computes its content digest.
+    /// The caller must already have obtained the payload from the admitted
+    /// owner boundary for `role`; validation below only checks its closed
+    /// typed shape and exact integrity bindings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        role: CampaignSourceRole,
+        owner_id: OwnerId,
+        record_id: CampaignOwnerRecordId,
+        revision: CampaignOwnerRevision,
+        recorded_state_fence: StateFence,
+        slot_projection_digests: Vec<CampaignSlotProjectionDigest>,
+        slot_projections: Vec<SlotProjection>,
+        required_references: Vec<ArtifactId>,
+        disagreements: Vec<OwnerDisagreement>,
+        history_plans: Vec<CampaignHistoryPlanRecord>,
+        document: CampaignSourceDocument,
+    ) -> Result<Self, StoreError> {
+        let mut record = Self {
+            role,
+            owner_id,
+            record_id,
+            revision,
+            content_digest: String::new(),
+            recorded_state_fence,
+            slot_projection_digests,
+            slot_projections,
+            required_references,
+            disagreements,
+            history_plans,
+            document,
+        };
+        record.content_digest = record.computed_digest()?;
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Validate source identity, digest, original fence, and typed document
+    /// envelope. The digest binds all immutable record fields except itself.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(self.owner_id.as_str(), "campaign_source.owner_id")?;
+        validate_campaign_record_id(&self.record_id)?;
+        validate_campaign_revision(&self.revision)?;
+        validate_digest(&self.content_digest, "campaign_source.content_digest")?;
+        self.recorded_state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        self.document.validate()?;
+        validate_campaign_slot_payloads(
+            &self.slot_projection_digests,
+            &self.slot_projections,
+        )?;
+        unique(
+            self.required_references.iter().map(ArtifactId::as_str),
+            "campaign_source.required_references",
+        )?;
+        if self.disagreements.len() > 256 {
+            return Err(StoreError::InvalidField {
+                field: "campaign_source.disagreements",
+                reason: "exceeds the owner-projection bound",
+            });
+        }
+        for disagreement in &self.disagreements {
+            disagreement.validate().map_err(|_| StoreError::InvalidField {
+                field: "campaign_source.disagreements",
+                reason: "contains an invalid owner disagreement",
+            })?;
+        }
+        if self.history_plans.len() > 64 {
+            return Err(StoreError::InvalidField {
+                field: "campaign_source.history_plans",
+                reason: "exceeds the bounded history-plan count",
+            });
+        }
+        for plan in &self.history_plans {
+            plan.validate()?;
+        }
+        if !campaign_role_accepts_schema(self.role, self.document.schema) {
+            return Err(StoreError::InvalidField {
+                field: "campaign_source.document.schema",
+                reason: "document schema does not match source role",
+            });
+        }
+        let observed = self.computed_digest()?;
+        if observed != self.content_digest {
+            return Err(StoreError::TransitionDigestMismatch {
+                expected: self.content_digest.clone(),
+                observed,
+            });
+        }
+        Ok(())
+    }
+
+    /// Compute the canonical immutable-record digest used by owner references.
+    pub fn computed_digest(&self) -> Result<String, StoreError> {
+        let bytes = canonical_json_bytes(&CampaignSourceRecordDigestInput {
+            role: self.role,
+            owner_id: &self.owner_id,
+            record_id: &self.record_id,
+            revision: &self.revision,
+            recorded_state_fence: &self.recorded_state_fence,
+            slot_projection_digests: &self.slot_projection_digests,
+            slot_projections: &self.slot_projections,
+            required_references: &self.required_references,
+            disagreements: &self.disagreements,
+            history_plans: &self.history_plans,
+            document: &self.document,
+        })
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+#[derive(Serialize)]
+struct CampaignSourceRecordDigestInput<'a> {
+    role: CampaignSourceRole,
+    owner_id: &'a OwnerId,
+    record_id: &'a CampaignOwnerRecordId,
+    revision: &'a CampaignOwnerRevision,
+    recorded_state_fence: &'a StateFence,
+    slot_projection_digests: &'a [CampaignSlotProjectionDigest],
+    slot_projections: &'a [SlotProjection],
+    required_references: &'a [ArtifactId],
+    disagreements: &'a [OwnerDisagreement],
+    history_plans: &'a [CampaignHistoryPlanRecord],
+    document: &'a CampaignSourceDocument,
+}
+
+/// Exact RetrievalPlan plus its bounded result references from an owner read.
+/// `plan` is decoded as the native
+/// `eliot_reactive_context_plan::RetrievalPlan`
+/// and validated by its owner at both publication and consumption boundaries.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignHistoryPlanRecord {
+    /// Complete typed plan in canonical JSON form.
+    pub plan: Value,
+    /// Canonical SHA-256 over `plan`.
+    pub plan_digest: String,
+    /// Handles selected through that exact plan.
+    pub selected_handles: Vec<ArtifactId>,
+    /// Digest of an optional retained bounded summary.
+    pub summary_digest: Option<String>,
+    /// Digests of retained bounded diffs.
+    pub diff_digests: Vec<String>,
+    /// Handles of policy-permitted bounded history slices.
+    pub policy_slice_handles: Vec<ArtifactId>,
+}
+
+impl CampaignHistoryPlanRecord {
+    /// Validate exact plan bytes and bounded result handles/digests.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if !self.plan.is_object() {
+            return Err(StoreError::InvalidField {
+                field: "campaign_source.history_plan.plan",
+                reason: "must be a typed RetrievalPlan object",
+            });
+        }
+        validate_digest(&self.plan_digest, "campaign_source.history_plan.plan_digest")?;
+        let bytes = canonical_json_bytes(&self.plan)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let observed = sha256_hex(&bytes);
+        if observed != self.plan_digest {
+            return Err(StoreError::TransitionDigestMismatch {
+                expected: self.plan_digest.clone(),
+                observed,
+            });
+        }
+        if self.selected_handles.len() > 256
+            || self.diff_digests.len() > 256
+            || self.policy_slice_handles.len() > 256
+        {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        unique(
+            self.selected_handles.iter().map(ArtifactId::as_str),
+            "campaign_source.history_plan.selected_handles",
+        )?;
+        unique(
+            self.policy_slice_handles.iter().map(ArtifactId::as_str),
+            "campaign_source.history_plan.policy_slice_handles",
+        )?;
+        for digest in &self.diff_digests {
+            validate_digest(digest, "campaign_source.history_plan.diff_digest")?;
+        }
+        if let Some(digest) = &self.summary_digest {
+            validate_digest(digest, "campaign_source.history_plan.summary_digest")?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_campaign_slot_payloads(
+    digests: &[CampaignSlotProjectionDigest],
+    projections: &[SlotProjection],
+) -> Result<(), StoreError> {
+    if digests.len() != projections.len() {
+        return Err(StoreError::InvalidField {
+            field: "campaign_source.slot_projections",
+            reason: "every digest must have exactly one owner projection",
+        });
+    }
+    let mut by_slot = BTreeMap::new();
+    for projection in projections {
+        projection.validate().map_err(|_| StoreError::InvalidField {
+            field: "campaign_source.slot_projections",
+            reason: "contains an invalid slot projection",
+        })?;
+        if by_slot.insert(projection.slot_id.as_str(), projection).is_some() {
+            return Err(StoreError::Duplicate {
+                field: "campaign_source.slot_projections.slot_id",
+            });
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for digest in digests {
+        let slot_id = digest.slot_id.as_str();
+        if !seen.insert(slot_id) {
+            return Err(StoreError::Duplicate {
+                field: "campaign_source.slot_projection_digests.slot_id",
+            });
+        }
+        digest.slot_id.validate().map_err(|_| StoreError::InvalidField {
+            field: "campaign_source.slot_projection_digests.slot_id",
+            reason: "invalid slot identity",
+        })?;
+        validate_digest(&digest.digest, "campaign_source.slot_projection_digest")?;
+        let projection = by_slot.get(slot_id).ok_or(StoreError::InvalidField {
+            field: "campaign_source.slot_projection_digests",
+            reason: "digest has no exact owner projection",
+        })?;
+        let observed = projection
+            .canonical_digest()
+            .map_err(|_| StoreError::InvalidField {
+                field: "campaign_source.slot_projection_digests",
+                reason: "owner projection failed canonical digest validation",
+            })?;
+        if observed != digest.digest {
+            return Err(StoreError::TransitionDigestMismatch {
+                expected: digest.digest.clone(),
+                observed,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Exact current owner head returned alongside the selected immutable body.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignSourceHead {
+    pub role: CampaignSourceRole,
+    pub owner_id: OwnerId,
+    pub record_id: CampaignOwnerRecordId,
+    pub revision: CampaignOwnerRevision,
+    pub content_digest: String,
+    pub recorded_state_fence: StateFence,
+    pub slot_projection_digests: Vec<CampaignSlotProjectionDigest>,
+}
+
+impl CampaignSourceHead {
+    /// Validate the exact current-head reference.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(self.owner_id.as_str(), "campaign_source_head.owner_id")?;
+        validate_campaign_record_id(&self.record_id)?;
+        validate_campaign_revision(&self.revision)?;
+        validate_digest(&self.content_digest, "campaign_source_head.content_digest")?;
+        self.recorded_state_fence
+            .validate()
+            .map_err(StoreError::Foundation)
+    }
+}
+
+/// Closed owner families allowed to publish immutable campaign sources.
+/// Each family has an exact role and owner binding; the record's owner label
+/// is never independently trusted as authority.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CampaignSourcePublisher {
+    /// Authenticated Task Controller task proposal/state transition.
+    TaskController,
+    /// Context compiler recipe/tool policy and admitted session delivery.
+    ContextCompiler,
+    /// Product evaluator's typed plan, holdout policy projection, and report.
+    ProductEvaluation,
+    /// Native Governor canonical-admission, authority-epoch, and policy rows.
+    GovernorAuthority,
+    /// Governor observation owner's admitted bank and feedback projections.
+    ExperienceObservation,
+}
+
+/// Typed, CAS-bound source publication carried only by a canonical
+/// `PreparedTransition`. The Kernel stores it in ORS only after the canonical
+/// owner transition returns a committed receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignSourcePublication {
+    /// Closed producer family authorized for the source role.
+    pub publisher: CampaignSourcePublisher,
+    /// Exact immutable owner output, validated by its owner before building
+    /// this publication and revalidated at the store boundary.
+    pub record: CampaignSourceRecord,
+    /// Exact current head observed before the owner transition, or `None` on
+    /// first publication. ORS checks this CAS before and after the commit.
+    pub expected_head: Option<CampaignSourceHead>,
+}
+
+impl CampaignSourcePublication {
+    /// Validate publisher/role/owner/schema/native identity binding and CAS
+    /// shape before a canonical transition is admitted.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.record.validate()?;
+        if !campaign_publisher_accepts_record(self.publisher, &self.record) {
+            return Err(StoreError::InvalidField {
+                field: "campaign_source.publisher",
+                reason: "publisher does not own this role, schema, identity, or revision type",
+            });
+        }
+        if let Some(head) = &self.expected_head {
+            head.validate()?;
+            if !campaign_head_matches_record_key(head, &self.record)
+                || head.revision == self.record.revision
+            {
+                return Err(StoreError::InvalidField {
+                    field: "campaign_source.expected_head",
+                    reason: "expected head must bind the same owner key and an older record",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the exact post-publication head represented by this source row.
+    pub fn next_head(&self) -> CampaignSourceHead {
+        CampaignSourceHead {
+            role: self.record.role,
+            owner_id: self.record.owner_id.clone(),
+            record_id: self.record.record_id.clone(),
+            revision: self.record.revision.clone(),
+            content_digest: self.record.content_digest.clone(),
+            recorded_state_fence: self.record.recorded_state_fence.clone(),
+            slot_projection_digests: self.record.slot_projection_digests.clone(),
+        }
+    }
+}
+
+fn campaign_head_matches_record_key(
+    head: &CampaignSourceHead,
+    record: &CampaignSourceRecord,
+) -> bool {
+    head.role == record.role
+        && head.owner_id == record.owner_id
+        && head.record_id == record.record_id
+}
+
+fn campaign_publisher_accepts_record(
+    publisher: CampaignSourcePublisher,
+    record: &CampaignSourceRecord,
+) -> bool {
+    use CampaignSourcePublisher as P;
+    use CampaignSourceRole as R;
+    let role_allowed = match publisher {
+        P::TaskController => matches!(
+            record.role,
+            R::TaskObjective | R::TaskAcceptance | R::TaskPlan | R::TaskOpenItems
+        ),
+        P::ContextCompiler => matches!(
+            record.role,
+            R::ContextRecipe | R::ContextToolPolicy | R::ContextDelivery
+        ),
+        P::ProductEvaluation => matches!(
+            record.role,
+            R::EvaluatorContract | R::EvaluatorHoldout | R::EvaluationResults
+        ),
+        P::GovernorAuthority => matches!(
+            record.role,
+            R::GovernorAdmission | R::GovernorEpoch | R::GovernorPolicy
+        ),
+        P::ExperienceObservation => record.role == R::ExperienceProjection,
+    };
+    if !role_allowed {
+        return false;
+    }
+    match publisher {
+        P::TaskController if record.owner_id.as_str() != TASK_CONTROLLER_CAMPAIGN_OWNER_ID => {
+            return false;
+        }
+        P::ContextCompiler if record.role != R::ContextDelivery => {
+            if record.owner_id.as_str() != "owner:eliot-context/context-compiler" {
+                return false;
+            }
+        }
+        P::ContextCompiler => {
+            // The dynamic delivery owner is copied from a validated native
+            // SessionDeliverySnapshot at the admitted owner boundary. This
+            // equality rejects a detached/self-selected outer owner label;
+            // the Kernel caller separately requires the exact retained
+            // snapshot owner and digest readback before publication.
+            if record
+                .document
+                .body
+                .get("owner_id")
+                .and_then(Value::as_str)
+                != Some(record.owner_id.as_str())
+            {
+                return false;
+            }
+        }
+        P::ProductEvaluation
+            if record.owner_id.as_str() != "owner:eliot-instrument/product-evaluation" =>
+        {
+            return false;
+        }
+        P::GovernorAuthority
+            if !matches!(
+                (record.role, record.owner_id.as_str(), &record.record_id, &record.revision),
+                (
+                    R::GovernorAdmission,
+                    "owner:eliot-governor/canonical",
+                    CampaignOwnerRecordId::Task(_),
+                    CampaignOwnerRevision::Counter(_)
+                ) | (
+                    R::GovernorEpoch,
+                    "owner:eliot-governor/authority",
+                    CampaignOwnerRecordId::Resource(_),
+                    CampaignOwnerRevision::AuthorityEpoch(_)
+                ) | (
+                    R::GovernorPolicy,
+                    "owner:eliot-governor/policy",
+                    CampaignOwnerRecordId::Resource(_),
+                    CampaignOwnerRevision::Policy(_)
+                )
+            ) =>
+        {
+            return false;
+        }
+        P::ExperienceObservation
+            if record.owner_id.as_str() != "governor-owner:observation"
+                || !matches!(
+                    (&record.record_id, &record.revision),
+                    (
+                        CampaignOwnerRecordId::Resource(key),
+                        CampaignOwnerRevision::Counter(_)
+                    ) if key.starts_with("experience_bank:")
+                        || key.starts_with("experience_feedback:")
+                ) =>
+        {
+            return false;
+        }
+        P::TaskController
+        | P::ContextCompiler
+        | P::ProductEvaluation
+        | P::GovernorAuthority
+        | P::ExperienceObservation => {}
+    }
+    matches!(
+        (record.role, &record.record_id, &record.revision),
+        (R::TaskObjective | R::TaskAcceptance | R::TaskPlan | R::TaskOpenItems,
+            CampaignOwnerRecordId::Task(_), CampaignOwnerRevision::Task(_))
+        | (R::GovernorAdmission,
+            CampaignOwnerRecordId::Task(_), CampaignOwnerRevision::Counter(_))
+        | (R::GovernorEpoch,
+            CampaignOwnerRecordId::Resource(_), CampaignOwnerRevision::AuthorityEpoch(_))
+        | (R::GovernorPolicy,
+            CampaignOwnerRecordId::Resource(_), CampaignOwnerRevision::Policy(_))
+        | (R::ExperienceProjection,
+            CampaignOwnerRecordId::Resource(_), CampaignOwnerRevision::Counter(_))
+        | (R::ContextRecipe | R::ContextToolPolicy,
+            CampaignOwnerRecordId::Decision(_), CampaignOwnerRevision::Task(_))
+        | (R::ContextDelivery,
+            CampaignOwnerRecordId::Resource(_), CampaignOwnerRevision::ResourceSnapshot(_))
+        | (R::EvaluatorContract | R::EvaluatorHoldout | R::EvaluationResults,
+            CampaignOwnerRecordId::Contract(_), CampaignOwnerRevision::ResourceSnapshot(_))
+    )
+}
+
+/// Typed selectors for `GetCampaignSourceRevision`. An absent expected
+/// revision and digest requests the current head for the exact source key; an
+/// expected revision and digest together verify that the old immutable
+/// reference is still current. Partial expectations are rejected.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignSourceRevisionLookup {
+    pub role: CampaignSourceRole,
+    pub owner_id: OwnerId,
+    pub record_id: CampaignOwnerRecordId,
+    pub expected_revision: Option<CampaignOwnerRevision>,
+    pub expected_content_digest: Option<String>,
+}
+
+impl CampaignSourceRevisionLookup {
+    /// Validate the exact typed selector without treating it as evidence.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(self.owner_id.as_str(), "campaign_source_lookup.owner_id")?;
+        validate_campaign_record_id(&self.record_id)?;
+        if let Some(revision) = &self.expected_revision {
+            validate_campaign_revision(revision)?;
+        }
+        match (&self.expected_revision, &self.expected_content_digest) {
+            (Some(_), Some(digest)) => {
+                validate_digest(digest, "campaign_source_lookup.expected_content_digest")?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(StoreError::InvalidField {
+                    field: "campaign_source_lookup.expected_reference",
+                    reason: "expected revision and digest must be supplied together",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Serialize this selector into the closed named-read parameter map.
+    pub fn named_parameters(&self) -> Result<BTreeMap<String, Value>, StoreError> {
+        self.validate()?;
+        let mut parameters = BTreeMap::new();
+        parameters.insert(
+            "lookup".to_owned(),
+            serde_json::to_value(self)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        Ok(parameters)
+    }
+}
+
+/// Named read outcome for one exact owner key.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CampaignSourceReadStatus {
+    Current,
+    Stale,
+    Blocked,
+    Missing,
+}
+
+/// Current or stale owner readback. The read fence is independent of the
+/// fence originally recorded on the immutable source record.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignSourceRevisionRead {
+    pub status: CampaignSourceReadStatus,
+    pub source: Option<CampaignSourceRecord>,
+    pub current_head: Option<CampaignSourceHead>,
+    pub read_state_fence: StateFence,
+}
+
+impl CampaignSourceRevisionRead {
+    /// Validate response consistency after decoding the named-read payload.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.read_state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if let Some(source) = &self.source {
+            source.validate()?;
+        }
+        if let Some(head) = &self.current_head {
+            head.validate()?;
+        }
+        match self.status {
+            CampaignSourceReadStatus::Current => {
+                let (Some(source), Some(head)) = (&self.source, &self.current_head) else {
+                    return Err(StoreError::InvalidField {
+                        field: "campaign_source_read",
+                        reason: "CURRENT requires source and current head",
+                    });
+                };
+                if !campaign_record_matches_head(source, head) {
+                    return Err(StoreError::InvalidField {
+                        field: "campaign_source_read",
+                        reason: "CURRENT source differs from current head",
+                    });
+                }
+            }
+            CampaignSourceReadStatus::Stale => {
+                if self.current_head.is_none() {
+                    return Err(StoreError::InvalidField {
+                        field: "campaign_source_read.current_head",
+                        reason: "STALE requires a current head",
+                    });
+                }
+            }
+            CampaignSourceReadStatus::Blocked | CampaignSourceReadStatus::Missing => {
+                if self.source.is_some() || self.current_head.is_some() {
+                    return Err(StoreError::InvalidField {
+                        field: "campaign_source_read",
+                        reason: "BLOCKED and MISSING must not carry source records",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode the stable `payload.campaign_source_revision` field of a named
+    /// read and require the exact response operation/fence.
+    pub fn from_named_read_response(
+        response: &NamedReadResponse,
+    ) -> Result<Self, StoreError> {
+        if response.operation != NamedReadOperation::GetCampaignSourceRevision {
+            return Err(StoreError::InvalidField {
+                field: "campaign_source_read.operation",
+                reason: "unexpected named-read operation",
+            });
+        }
+        let payload = response
+            .payload
+            .get("campaign_source_revision")
+            .cloned()
+            .ok_or(StoreError::InvalidField {
+                field: "campaign_source_read.payload",
+                reason: "missing campaign_source_revision",
+            })?;
+        let read: Self = serde_json::from_value(payload)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        read.validate()?;
+        if read.read_state_fence != response.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        Ok(read)
+    }
+}
+
+/// Immutable generated view envelope. Its key is content-addressed and the
+/// task/scope/fence fields are checked against the typed view binding before
+/// storage. This is a bounded projection, never a campaign transcript.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignLearningStateViewPublication {
+    pub view_id: ArtifactId,
+    pub task_id: TaskId,
+    pub scope_id: ScopeId,
+    pub state_fence: StateFence,
+    pub content_digest: String,
+    pub view: CampaignLearningStateView,
+}
+
+impl CampaignLearningStateViewPublication {
+    /// Validate immutable content identity and exact task/scope/fence binding.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.view
+            .validate_content_addressed()
+            .map_err(|_| StoreError::InvalidField {
+                field: "campaign_learning_state_view.view",
+                reason: "typed content-addressed view validation failed",
+            })?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        validate_text(self.task_id.as_str(), "campaign_learning_state_view.task_id")?;
+        validate_text(self.scope_id.as_str(), "campaign_learning_state_view.scope_id")?;
+        validate_digest(
+            &self.content_digest,
+            "campaign_learning_state_view.content_digest",
+        )?;
+        if self.view.view_id != self.view_id
+            || self.view.binding.task_id != self.task_id
+            || self.view.binding.scope.as_str() != self.scope_id.as_str()
+            || self.view.binding.state_fence != self.state_fence
+        {
+            return Err(StoreError::InvalidField {
+                field: "campaign_learning_state_view.binding",
+                reason: "view identity or admitted binding differs from publication key",
+            });
+        }
+        let bytes = canonical_json_bytes(&self.view)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let observed = sha256_hex(&bytes);
+        if observed != self.content_digest {
+            return Err(StoreError::TransitionDigestMismatch {
+                expected: self.content_digest.clone(),
+                observed,
+            });
+        }
+        Ok(())
+    }
+
+    /// Serialize the exact publication into the named mutation parameter map.
+    pub fn named_parameters(&self) -> Result<BTreeMap<String, Value>, StoreError> {
+        self.validate()?;
+        let mut parameters = BTreeMap::new();
+        parameters.insert(
+            "publication".to_owned(),
+            serde_json::to_value(self)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        Ok(parameters)
+    }
+}
+
+/// Exact key for the immutable generated-view read.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignLearningStateViewLookup {
+    pub view_id: ArtifactId,
+    pub task_id: TaskId,
+    pub scope_id: ScopeId,
+}
+
+impl CampaignLearningStateViewLookup {
+    /// Validate selectors; they narrow the read and never grant authority.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(self.view_id.as_str(), "campaign_learning_state_view_lookup.view_id")?;
+        validate_text(self.task_id.as_str(), "campaign_learning_state_view_lookup.task_id")?;
+        validate_text(self.scope_id.as_str(), "campaign_learning_state_view_lookup.scope_id")
+    }
+
+    /// Serialize the exact key into the named read parameter map.
+    pub fn named_parameters(&self) -> Result<BTreeMap<String, Value>, StoreError> {
+        self.validate()?;
+        let mut parameters = BTreeMap::new();
+        parameters.insert(
+            "lookup".to_owned(),
+            serde_json::to_value(self)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        Ok(parameters)
+    }
+}
+
+/// Named read status for an immutable generated view.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CampaignLearningStateViewReadStatus {
+    Current,
+    Missing,
+    Blocked,
+}
+
+/// Result of the exact generated-view lookup. A successful body remains
+/// subject to the daemon's recipe and owner-revision validation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignLearningStateViewRead {
+    pub status: CampaignLearningStateViewReadStatus,
+    pub publication: Option<CampaignLearningStateViewPublication>,
+    pub read_state_fence: StateFence,
+}
+
+impl CampaignLearningStateViewRead {
+    /// Validate the typed read response and its distinct read fence.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.read_state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        match self.status {
+            CampaignLearningStateViewReadStatus::Current => {
+                self.publication
+                    .as_ref()
+                    .ok_or(StoreError::InvalidField {
+                        field: "campaign_learning_state_view_read.publication",
+                        reason: "CURRENT requires a publication",
+                    })?
+                    .validate()?;
+            }
+            CampaignLearningStateViewReadStatus::Missing
+            | CampaignLearningStateViewReadStatus::Blocked => {
+                if self.publication.is_some() {
+                    return Err(StoreError::InvalidField {
+                        field: "campaign_learning_state_view_read.publication",
+                        reason: "MISSING and BLOCKED must not carry a publication",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode the stable `payload.campaign_learning_state_view` field and
+    /// require an exact operation and read fence.
+    pub fn from_named_read_response(
+        response: &NamedReadResponse,
+    ) -> Result<Self, StoreError> {
+        if response.operation != NamedReadOperation::GetCampaignLearningStateView {
+            return Err(StoreError::InvalidField {
+                field: "campaign_learning_state_view_read.operation",
+                reason: "unexpected named-read operation",
+            });
+        }
+        let payload = response
+            .payload
+            .get("campaign_learning_state_view")
+            .cloned()
+            .ok_or(StoreError::InvalidField {
+                field: "campaign_learning_state_view_read.payload",
+                reason: "missing campaign_learning_state_view",
+            })?;
+        let read: Self = serde_json::from_value(payload)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        read.validate()?;
+        if read.read_state_fence != response.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        Ok(read)
+    }
+}
+
+fn validate_campaign_record_id(record_id: &CampaignOwnerRecordId) -> Result<(), StoreError> {
+    match record_id {
+        CampaignOwnerRecordId::Artifact(value) => validate_text(value.as_str(), "campaign_source.record_id"),
+        CampaignOwnerRecordId::Contract(value) => validate_text(value.as_str(), "campaign_source.record_id"),
+        CampaignOwnerRecordId::Decision(value) => validate_text(value.as_str(), "campaign_source.record_id"),
+        CampaignOwnerRecordId::Task(value) => validate_text(value.as_str(), "campaign_source.record_id"),
+        CampaignOwnerRecordId::Resource(value) => validate_text(value, "campaign_source.record_id"),
+    }
+}
+
+fn validate_campaign_revision(revision: &CampaignOwnerRevision) -> Result<(), StoreError> {
+    if let CampaignOwnerRevision::ResourceSnapshot(value) = revision {
+        validate_text(value, "campaign_source.revision")?;
+    }
+    Ok(())
+}
+
+fn campaign_role_accepts_schema(
+    role: CampaignSourceRole,
+    schema: CampaignSourceDocumentSchema,
+) -> bool {
+    use CampaignSourceDocumentSchema as D;
+    use CampaignSourceRole as R;
+    matches!(
+        (role, schema),
+        (R::TaskPlan, D::LearningStateViewRecipe | D::TaskPlan)
+            | (R::TaskObjective, D::TaskObjective)
+            | (R::TaskAcceptance, D::TaskAcceptance)
+            | (R::TaskOpenItems, D::TaskOpenItems)
+            | (R::AttemptLineageLatestOutcomes, D::AttemptLineageLatestOutcomes)
+            | (R::GovernorAdmission, D::GovernorAdmission)
+            | (R::GovernorEpoch, D::GovernorEpoch)
+            | (R::GovernorPolicy, D::GovernorPolicy)
+            | (R::ContextRecipe, D::ContextRecipe)
+            | (R::ContextToolPolicy, D::ContextToolPolicy)
+            | (R::ContextDelivery, D::ContextDelivery)
+            | (R::EvaluatorContract, D::EvaluatorContract)
+            | (R::EvaluatorHoldout, D::EvaluatorHoldout)
+            | (R::EvaluationResults, D::EvaluationResults)
+            | (R::MemoryProjection, D::MemoryProjection)
+            | (R::ExperienceProjection, D::ExperienceProjection)
+            | (R::ArtifactProjection, D::ArtifactProjection)
+            | (R::FrozenAnchor, D::FrozenAnchor)
+            | (R::StableHarness, D::StableHarness)
+            | (R::TaskFamilyHarness, D::TaskFamilyHarness)
+            | (R::ActiveOverlay, D::ActiveOverlay)
+            | (R::CurrentPosition, D::CurrentPosition)
+            | (R::ExperiencePosition, D::ExperiencePosition)
+            | (R::AdaptationPosition, D::AdaptationPosition)
+            | (R::EvaluationPosition, D::EvaluationPosition)
+            | (R::EconomicsProgress, D::EconomicsProgress)
+    )
+}
+
+fn campaign_record_matches_head(record: &CampaignSourceRecord, head: &CampaignSourceHead) -> bool {
+    record.role == head.role
+        && record.owner_id == head.owner_id
+        && record.record_id == head.record_id
+        && record.revision == head.revision
+        && record.content_digest == head.content_digest
+        && record.recorded_state_fence == head.recorded_state_fence
+        && record.slot_projection_digests == head.slot_projection_digests
+}
+
 /// Closed named read catalogue.  Physical query names never cross this API.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -832,6 +1821,12 @@ pub enum NamedReadOperation {
     GetReactiveInjectionState,
     /// Canonical resource-snapshot read (issue #1941 C4).
     GetResourceSnapshot,
+    /// Exact, fenced read of an immutable campaign owner revision and its
+    /// current head (issue #1862).
+    GetCampaignSourceRevision,
+    /// Exact lookup of an immutable generated campaign learning-state view
+    /// (issue #1862).
+    GetCampaignLearningStateView,
     /// Canonical user-automation read (issue #1779).
     GetUserAutomationState,
     /// Canonical experience-bank range read (issue #223).

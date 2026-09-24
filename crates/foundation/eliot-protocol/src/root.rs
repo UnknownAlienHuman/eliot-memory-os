@@ -37,3 +37,12 @@ pub use host_event_ingest::{
     HostEventStreamCursorWire, MAX_HOST_EVENT_INGEST_TEXT_BYTES, MAX_HOST_EVENT_REDACTED_CLASSES,
     MAX_HOST_EVENT_STREAM_ID_BYTES,
 };
+
+mod task_controller;
+pub use task_controller::{
+    TASK_CONTROLLER_ATTEMPT_WIRE_ID, TASK_CONTROLLER_ATTEMPT_WIRE_VERSION,
+    TASK_CONTROLLER_INVOCATION_WIRE_ID, TASK_CONTROLLER_INVOCATION_WIRE_VERSION,
+    TASK_CONTROLLER_RESULT_BODY_WIRE_ID, TASK_CONTROLLER_RESULT_BODY_WIRE_VERSION,
+    TaskControllerAction, TaskControllerAttempt, TaskControllerInvocation,
+    TaskControllerResultBody,
+};

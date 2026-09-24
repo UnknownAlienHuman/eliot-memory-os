@@ -35,6 +35,7 @@ use eliot_governor::{
     GovernorTaskLifecycle, KernelTransitionPort, TaskCommand, TaskCommandContext,
     TaskLifecycleError, TaskProposal, TaskRecord,
 };
+use eliot_learning_contracts::LearningStateViewRecipe;
 
 /// Forwards the task-command path to the single Governor task owner.
 ///
@@ -76,6 +77,21 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
             .await
     }
 
+    /// Forwards a task proposal that atomically publishes its typed campaign
+    /// learning-state recipe through the Task Controller's canonical
+    /// `UpdateTaskState` commit.
+    pub async fn propose_task_with_learning_state_recipe(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+    ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError> {
+        self.inner
+            .propose_task_with_learning_state_recipe(identity, operation_id, proposal, recipe)
+            .await
+    }
+
     /// Forwards one guarded task command to the Governor canonical path and
     /// returns only the exact issued receipt.
     pub async fn apply_task(
@@ -88,6 +104,30 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
     ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError> {
         self.inner
             .apply_task(identity, operation_id, task_id, context, command)
+            .await
+    }
+
+    /// Forwards a guarded task command that atomically publishes its typed
+    /// campaign learning-state recipe through the Task Controller's canonical
+    /// `UpdateTaskState` commit.
+    pub async fn apply_task_with_learning_state_recipe(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        task_id: eliot_contracts::TaskId,
+        context: TaskCommandContext,
+        command: TaskCommand,
+        recipe: LearningStateViewRecipe,
+    ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError> {
+        self.inner
+            .apply_task_with_learning_state_recipe(
+                identity,
+                operation_id,
+                task_id,
+                context,
+                command,
+                recipe,
+            )
             .await
     }
 }
