@@ -86,9 +86,10 @@ pub use notification_state::{
 };
 
 pub use payload_authority::{
-    CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, MAX_EXACT_JSON_BYTES,
-    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, json_shape_name,
-    number_token_would_narrow, reject_control_parameter_name,
+    CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, HISTORICAL_TRUNCATION_SIGNATURE,
+    HistoricalRecordDisposition, HistoricalRecordProvenance, MAX_EXACT_JSON_BYTES,
+    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, dispose_historical_record,
+    json_shape_name, number_token_would_narrow, reject_control_parameter_name,
 };
 
 pub use reactive_state::{
@@ -215,7 +216,7 @@ pub use operation_parameters::{
     ParameterDeclaration, ParameterSchemaField, ParameterShape, declared_read_parameters,
     named_mutation_operation_by_name, named_mutation_operation_name, named_read_operation_by_name,
     named_read_operation_name, parameter_schema_digest, project_parameter_schema,
-    validate_typed_read_parameters,
+    validate_typed_read_parameters, verify_declaration_holds_no_payload_encoding,
 };
 
 pub use revocation_history::{
