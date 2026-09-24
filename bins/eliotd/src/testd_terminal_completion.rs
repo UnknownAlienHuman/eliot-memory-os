@@ -7,6 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::improvement_candidate_route::consume_improvement_terminal;
 use eliot_contracts::{OperationId, TaskId, canonical_json_bytes};
 use eliot_governor::CanonicalPlanBinding;
 use eliot_instrument_api::InstrumentInvocation;
@@ -413,12 +414,43 @@ impl DaemonComposition {
                     )
                 })?,
         );
+        let improvement_outcome = if let Some(record) = &evidence.improvement {
+            // Publication is committed first; the decision then rehydrates the
+            // canonical owner fact rather than trusting a worker row or a
+            // caller-supplied verdict.
+            self.governor
+                .refresh_from_kernel()
+                .map_err(DaemonError::Composition)?;
+            let fact = self
+                .governor
+                .read_testd_verifier_execution_fact(&identity.request.state_fence, &job.job_id)
+                .map_err(DaemonError::Composition)?;
+            Some(
+                consume_improvement_terminal(
+                    record,
+                    &fact,
+                    committed.as_ref(),
+                    &evidence.improvement_prior_attempts,
+                    unix_ms(),
+                )
+                .map_err(|error| completion_error(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let draft = finish_draft_from_testd_terminal_evidence(job, identity)?;
         let operation_id = OperationId::new(format!("testd-owner-finish-{}", job.job_id))
             .map_err(completion_error)?;
-        let _decision = self.finish_attempt(identity, operation_id, draft).await?;
+        if evidence.improvement.is_none() {
+            let _decision = self.finish_attempt(identity, operation_id, draft).await?;
+        }
         kernel
-            .acknowledge_testd_terminal_completion_async(&job.job_id, *committed)
+            .acknowledge_testd_terminal_completion_async(
+                &job.job_id,
+                *committed,
+                improvement_outcome,
+                false,
+            )
             .await
             .map_err(|error| DaemonError::Kernel(error.to_string()))?;
         Ok(())

@@ -118,11 +118,11 @@ use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    JobState as TestdJobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    KernelProcessAdmissionRequest, ProcessAdmission, RetryPolicy, TESTD_PRODUCTIVE_PROFILE,
-    TargetRoots, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore,
-    TestdVerifierDispatchBinding, TestdVerifierJobSubmission, issue_process_admission,
-    testd_profile_binding, verification_receipt_sha256,
+    ImprovementExperimentRecord, ImprovementProposal, JobState as TestdJobState,
+    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
+    ProcessAdmission, RetryPolicy, TESTD_PRODUCTIVE_PROFILE, TargetRoots, TestdOwnerSubmitRequest,
+    TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
+    issue_process_admission, testd_profile_binding, verification_receipt_sha256,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1226,6 +1226,27 @@ pub(crate) async fn submit_testd_owner_job(
     let operation_id = request.submission.invocation.request.request_id.as_str();
     let job_digest = sha256_hex(operation_id.as_bytes());
     let job_id = format!("testd-{job_digest}");
+    let improvement_record = request
+        .submission
+        .improvement
+        .as_ref()
+        .map(|improvement| {
+            let proposal = ImprovementProposal::from_kernel_facts(
+                improvement,
+                identity,
+                &request.submission.invocation,
+                &request.process_tool,
+                &job_id,
+                &request.submission.project_id,
+                source_root.to_string_lossy().as_ref(),
+                authenticated.principal_ref(),
+                now_unix_ms,
+            )
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+            ImprovementExperimentRecord::predeclared(&job_id, proposal)
+                .map_err(|error| DispatchLaunchError::Gate(error.to_string()))
+        })
+        .transpose()?;
     let state_dir = work_root.join(".eliot");
     std::fs::create_dir_all(&state_dir)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
@@ -1336,7 +1357,7 @@ pub(crate) async fn submit_testd_owner_job(
     let permit = issue_process_admission(&provider, &process_request)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let submission = TestdVerifierJobSubmission {
-        job_id,
+        job_id: job_id.clone(),
         project_id: request.submission.project_id.clone(),
         invocation: request.submission.invocation.clone(),
         target_roots,
@@ -1354,9 +1375,21 @@ pub(crate) async fn submit_testd_owner_job(
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let store = TestdStore::open(&owner_path, RetryPolicy::default())
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    let job = store
-        .submit_productive_verifier(submission, identity.clone(), permit, now_unix_ms)
-        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let job = if let Some(improvement) = improvement_record {
+        store
+            .submit_productive_verifier_with_improvement(
+                submission,
+                identity.clone(),
+                permit,
+                improvement,
+                now_unix_ms,
+            )
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+    } else {
+        store
+            .submit_productive_verifier(submission, identity.clone(), permit, now_unix_ms)
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+    };
     Ok(TestdOwnerSubmitResponse {
         job_id: job.job_id,
         operation_id: job.process.operation_id,

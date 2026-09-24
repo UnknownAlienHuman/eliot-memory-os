@@ -31,10 +31,23 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod claim;
+pub mod improvement;
 
 pub use claim::{
     ClaimBindingExpectation, ExpiredRunningReconciliation, reconcile_expired_running,
     validate_claim_binding,
+};
+pub use improvement::{
+    IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_EXPERIMENT_SCHEMA, IMPROVEMENT_KERNEL_OWNER,
+    IMPROVEMENT_OWNER, IMPROVEMENT_PRODUCT_OWNER, IMPROVEMENT_TESTD_OWNER,
+    IMPROVEMENT_VERIFIER_OWNER, ImprovementDiscriminator, ImprovementExperimentBudget,
+    ImprovementExperimentDisposition, ImprovementExperimentOutcome, ImprovementExperimentRecord,
+    ImprovementExperimentRequest, ImprovementExperimentState, ImprovementExperimentTarget,
+    ImprovementMetricDisposition, ImprovementOperationBinding, ImprovementOperationKind,
+    ImprovementOperationSet, ImprovementPriorAttempt, ImprovementPriorOutcome,
+    ImprovementPrivacyClass, ImprovementProposal, ImprovementRiskClass, ImprovementSourceBinding,
+    IndependentExecutionEvidence, MechanismDeclaration, MechanismDeclarationReceipt,
+    RollbackContract, is_improvement_no_progress,
 };
 
 // ---- Closed testd profile to executable binding registry (issue #20) ----
@@ -466,6 +479,8 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_meta_v1")
 /// rewriting job payloads.
 const ADMITTED_IDENTITIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("testd_admitted_identities_v1");
+/// Durable improvement proposal/replay/outcome sidecars keyed by TestD job.
+const IMPROVEMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_improvements_v1");
 
 /// Persistent daemon failures.
 #[derive(Debug, Error)]
@@ -1328,12 +1343,17 @@ pub const TESTD_OWNER_WIRE_VERSION: u16 = 1;
 /// Governor-resolved input to the Kernel-owned productive TestD owner.
 /// `source_root` is the TaskContract WorkScope result; `project_id` is an
 /// opaque project identity and is never interpreted as a filesystem path.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestdOwnerJobSubmission {
     pub project_id: String,
     pub invocation: InstrumentInvocation,
     pub source_root: String,
+    /// Optional actual `eliot-improvement` candidate/intake declaration. The
+    /// authenticated Kernel owner stamps all runtime bindings into the
+    /// durable proposal before the job can be dispatched.
+    #[serde(default)]
+    pub improvement: Option<improvement::ImprovementExperimentRequest>,
 }
 
 impl TestdOwnerJobSubmission {
@@ -1352,6 +1372,12 @@ impl TestdOwnerJobSubmission {
                 reason: "productive submission requires the registered TestD profile and no caller arguments",
             });
         }
+        if let Some(request) = &self.improvement {
+            request.validate()?;
+            if request.project_id != self.project_id {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
         Ok(())
     }
 }
@@ -1367,7 +1393,7 @@ pub struct TestdProcessToolIntent {
 }
 
 /// Typed request for the authenticated Kernel owner-submit operation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestdOwnerSubmitRequest {
     pub wire_id: String,
@@ -1474,6 +1500,13 @@ pub struct TestdPendingVerifierDispatch {
 pub struct TestdTerminalCompletionEvidence {
     pub job: TestJob,
     pub request_identity: RequestIdentity,
+    /// Durable candidate declaration joined to this terminal row, when the
+    /// productive job was admitted as an improvement experiment.
+    #[serde(default)]
+    pub improvement: Option<improvement::ImprovementExperimentRecord>,
+    /// Prior material attempts read from the same durable TestD owner store.
+    #[serde(default)]
+    pub improvement_prior_attempts: Vec<improvement::ImprovementPriorAttempt>,
 }
 
 /// Contract spelling used by the test-execution-plane boundary.
@@ -2411,6 +2444,7 @@ impl TestdStore {
         // stores migrate idempotently without rewriting job payloads.
         let write = db.begin_write().map_err(database)?;
         drop(write.open_table(ADMITTED_IDENTITIES).map_err(database)?);
+        drop(write.open_table(IMPROVEMENTS).map_err(database)?);
         write.commit().map_err(database)?;
         Ok(Self {
             database: Arc::new(db),
@@ -2431,6 +2465,346 @@ impl TestdStore {
                     .map(Some)
                     .map_err(|error| TestdError::Corrupt(error.to_string()))
             })
+    }
+
+    /// Returns the durable improvement sidecar for one TestD job.
+    pub fn improvement_record(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<improvement::ImprovementExperimentRecord>, TestdError> {
+        validate_text(job_id, "job_id")?;
+        let read = self.database.begin_read().map_err(database)?;
+        let table = read.open_table(IMPROVEMENTS).map_err(database)?;
+        table
+            .get(job_id)
+            .map_err(database)?
+            .map_or(Ok(None), |value| {
+                serde_json::from_slice(value.value())
+                    .map(Some)
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))
+            })
+    }
+
+    /// Persists the predeclared improvement sidecar before a productive job
+    /// can be dispatched. Exact replay is idempotent; changed material under
+    /// one job identity is a durable conflict.
+    pub fn attach_improvement_predeclaration(
+        &self,
+        record: improvement::ImprovementExperimentRecord,
+        now: u64,
+    ) -> Result<improvement::ImprovementExperimentRecord, TestdError> {
+        if now == 0 {
+            return Err(TestdError::InvalidBinding);
+        }
+        record.validate()?;
+        let write = self.database.begin_write().map_err(database)?;
+        let job = {
+            let jobs = write.open_table(JOBS).map_err(database)?;
+            let value = jobs
+                .get(record.job_id.as_str())
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("improvement job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        if job.job_id != record.job_id
+            || job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+            || job.state != JobState::Queued
+            || job.attempts != 0
+            || job.lease.is_some()
+            || job.verifier_dispatch.is_some()
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let current_discriminator = record
+            .proposal
+            .request
+            .new_discriminator
+            .as_ref()
+            .map(|value| value.discriminator_id.as_str());
+        for item in write
+            .open_table(IMPROVEMENTS)
+            .map_err(database)?
+            .iter()
+            .map_err(database)?
+        {
+            let (_, value) = item.map_err(database)?;
+            let prior =
+                serde_json::from_slice::<improvement::ImprovementExperimentRecord>(value.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            let prior_discriminator = prior
+                .proposal
+                .request
+                .new_discriminator
+                .as_ref()
+                .map(|value| value.discriminator_id.as_str());
+            if prior.job_id != record.job_id
+                && prior.requires_reconciliation()
+                && prior.proposal.material_digest == record.proposal.material_digest
+                && prior_discriminator == current_discriminator
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        let mut table = write.open_table(IMPROVEMENTS).map_err(database)?;
+        if let Some(existing) = table
+            .get(record.job_id.as_str())
+            .map_err(database)?
+            .map(|value| {
+                serde_json::from_slice::<improvement::ImprovementExperimentRecord>(value.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))
+            })
+            .transpose()?
+        {
+            if existing == record {
+                return Ok(existing);
+            }
+            return Err(TestdError::JobConflict(record.job_id));
+        }
+        let encoded =
+            serde_json::to_vec(&record).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        table
+            .insert(record.job_id.as_str(), encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        write.commit().map_err(database)?;
+        Ok(record)
+    }
+
+    /// Returns prior failed material attempts for the no-progress decision.
+    pub fn improvement_prior_attempts(
+        &self,
+        proposal: &improvement::ImprovementProposal,
+    ) -> Result<Vec<improvement::ImprovementPriorAttempt>, TestdError> {
+        proposal.validate()?;
+        let read = self.database.begin_read().map_err(database)?;
+        let table = read.open_table(IMPROVEMENTS).map_err(database)?;
+        let mut attempts = Vec::new();
+        for item in table.iter().map_err(database)? {
+            let (_, value) = item.map_err(database)?;
+            let record: improvement::ImprovementExperimentRecord =
+                serde_json::from_slice(value.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            if record.proposal.request.project_id != proposal.request.project_id {
+                continue;
+            }
+            let prior_outcome = if record.requires_reconciliation() {
+                improvement::ImprovementPriorOutcome::Unknown
+            } else if record.is_failed_attempt() {
+                improvement::ImprovementPriorOutcome::Failed
+            } else if record.outcome.is_some() {
+                improvement::ImprovementPriorOutcome::Passed
+            } else {
+                improvement::ImprovementPriorOutcome::Pending
+            };
+            let job_id = record.job_id.clone();
+            let material_digest = record.proposal.material_digest.clone();
+            let discriminator_id = record
+                .proposal
+                .request
+                .new_discriminator
+                .as_ref()
+                .map(|value| value.discriminator_id.clone());
+            attempts.push(improvement::ImprovementPriorAttempt {
+                job_id,
+                material_digest,
+                discriminator_id,
+                outcome: prior_outcome,
+            });
+        }
+        attempts.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        Ok(attempts)
+    }
+
+    /// Reconciles a previously unknown terminal outcome with a newly
+    /// executed, exact evidence identity. The original committed receipt and
+    /// proposal are retained; only the sidecar outcome can move forward, and
+    /// the transaction records the reconciliation event.
+    pub fn reconcile_improvement_terminal(
+        &self,
+        job_id: &str,
+        outcome: improvement::ImprovementExperimentOutcome,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        if now == 0 {
+            return Err(TestdError::InvalidBinding);
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let jobs = write.open_table(JOBS).map_err(database)?;
+            let value = jobs
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("improvement job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        if !matches!(
+            job.state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) || job.lease.is_some()
+            || job.verifier_dispatch.is_none()
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let committed_receipt_json = job
+            .terminal_publication
+            .as_ref()
+            .and_then(|publication| publication.committed_receipt_json.as_deref())
+            .ok_or(TestdError::InvalidBinding)?;
+        let committed_receipt: serde_json::Value =
+            serde_json::from_str(committed_receipt_json).map_err(|_| TestdError::InvalidBinding)?;
+        let committed_receipt_digest = sha256_hex(
+            &canonical_json_bytes(&committed_receipt).map_err(|_| TestdError::InvalidBinding)?,
+        );
+        if outcome.committed_receipt_sha256 != committed_receipt_digest {
+            return Err(TestdError::InvalidBinding);
+        }
+        let mut record = {
+            let table = write.open_table(IMPROVEMENTS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or(TestdError::InvalidBinding)?;
+            serde_json::from_slice::<improvement::ImprovementExperimentRecord>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        record.reconcile_unknown_outcome(&outcome)?;
+        let encoded_record =
+            serde_json::to_vec(&record).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        {
+            let mut table = write.open_table(IMPROVEMENTS).map_err(database)?;
+            table
+                .insert(job_id, encoded_record.as_slice())
+                .map_err(database)?;
+        }
+        job.updated_at_ms = now;
+        let encoded_job =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        {
+            let mut table = write.open_table(JOBS).map_err(database)?;
+            table
+                .insert(job_id, encoded_job.as_slice())
+                .map_err(database)?;
+        }
+        append_event(
+            &write,
+            &job,
+            Some(job.state),
+            job.state,
+            "improvement-unknown-reconciled",
+            now,
+            Some(format!(
+                "disposition={:?}",
+                record.outcome.as_ref().map(|value| value.disposition)
+            )),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
+    /// Records the terminal-evaluator receipt and the exact independent
+    /// improvement disposition in one owner transaction. The committed
+    /// canonical receipt is retained only after Governor/daemon validation.
+    pub fn acknowledge_improvement_terminal(
+        &self,
+        job_id: &str,
+        receipt_sha256: &str,
+        committed_receipt_json: String,
+        outcome: improvement::ImprovementExperimentOutcome,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        if !is_binding_digest(receipt_sha256) || now == 0 {
+            return Err(TestdError::InvalidBinding);
+        }
+        let receipt_value: serde_json::Value = serde_json::from_str(&committed_receipt_json)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let canonical =
+            canonical_json_bytes(&receipt_value).map_err(|_| TestdError::InvalidBinding)?;
+        if String::from_utf8(canonical.clone()).map_err(|_| TestdError::InvalidBinding)?
+            != committed_receipt_json
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let jobs = write.open_table(JOBS).map_err(database)?;
+            let value = jobs.get(job_id).map_err(database)?.ok_or_else(|| {
+                TestdError::Corrupt("improvement terminal job not found".to_owned())
+            })?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        let publication = job
+            .terminal_publication
+            .as_mut()
+            .ok_or(TestdError::InvalidBinding)?;
+        if publication.receipt_sha256 != receipt_sha256
+            || !matches!(
+                job.state,
+                JobState::Succeeded | JobState::Failed | JobState::Cancelled
+            )
+            || job.lease.is_some()
+            || job.verifier_dispatch.is_none()
+            || verification_receipt_sha256(
+                job.verification_receipt
+                    .as_ref()
+                    .ok_or(TestdError::InvalidBinding)?,
+            )? != receipt_sha256
+            || outcome.committed_receipt_sha256 != receipt_sha256
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let mut record = {
+            let table = write.open_table(IMPROVEMENTS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or(TestdError::InvalidBinding)?;
+            serde_json::from_slice::<improvement::ImprovementExperimentRecord>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        record.apply_outcome(&outcome)?;
+        if let Some(existing) = &publication.committed_receipt_json
+            && existing != &committed_receipt_json
+        {
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        publication.committed_receipt_json = Some(committed_receipt_json);
+        record.validate()?;
+        let encoded_record =
+            serde_json::to_vec(&record).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        {
+            let mut table = write.open_table(IMPROVEMENTS).map_err(database)?;
+            table
+                .insert(job_id, encoded_record.as_slice())
+                .map_err(database)?;
+        }
+        job.updated_at_ms = now;
+        let encoded_job =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        {
+            let mut table = write.open_table(JOBS).map_err(database)?;
+            table
+                .insert(job_id, encoded_job.as_slice())
+                .map_err(database)?;
+        }
+        append_event(
+            &write,
+            &job,
+            Some(job.state),
+            job.state,
+            "improvement-terminal-outcome",
+            now,
+            Some(format!(
+                "disposition={:?}",
+                record.outcome.as_ref().map(|value| value.disposition)
+            )),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
     }
 
     /// Attaches the exact Governor request and current plan before a
@@ -2715,13 +3089,43 @@ impl TestdStore {
             return Err(TestdError::InvalidBinding);
         }
         if let Some(existing) = &job.source_observation_before {
-            if existing == &observation {
+            if existing != &observation {
+                return Err(TestdError::JobConflict(job_id.to_owned()));
+            }
+            let has_improvement = write
+                .open_table(IMPROVEMENTS)
+                .map_err(database)?
+                .get(job_id)
+                .map_err(database)?
+                .is_some();
+            if !has_improvement {
                 return Ok(job);
             }
-            return Err(TestdError::JobConflict(job_id.to_owned()));
         }
-        job.source_observation_before = Some(observation);
+        job.source_observation_before = Some(observation.clone());
         job.updated_at_ms = now;
+        if let Some(value) = write
+            .open_table(IMPROVEMENTS)
+            .map_err(database)?
+            .get(job_id)
+            .map_err(database)?
+        {
+            let mut record =
+                serde_json::from_slice::<improvement::ImprovementExperimentRecord>(value.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            if let Some(existing) = &record.source_observation {
+                if existing != &observation {
+                    return Err(TestdError::JobConflict(job_id.to_owned()));
+                }
+            } else {
+                record.source_observation = Some(observation);
+                record.validate()?;
+                let encoded = serde_json::to_vec(&record)
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                let mut table = write.open_table(IMPROVEMENTS).map_err(database)?;
+                table.insert(job_id, encoded.as_slice()).map_err(database)?;
+            }
+        }
         let encoded =
             serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         let mut table = write.open_table(JOBS).map_err(database)?;
@@ -2797,6 +3201,24 @@ impl TestdStore {
         {
             return Err(TestdError::InvalidBinding);
         }
+        if let Some(value) = write
+            .open_table(IMPROVEMENTS)
+            .map_err(database)?
+            .get(job_id)
+            .map_err(database)?
+        {
+            let record =
+                serde_json::from_slice::<improvement::ImprovementExperimentRecord>(value.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            if record.source_observation.is_none()
+                || !matches!(
+                    record.state,
+                    improvement::ImprovementExperimentState::Predeclared
+                )
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
         if let Some(existing) = &job.terminal_publication {
             if existing.receipt_sha256 == receipt_sha256 {
                 return Ok(job);
@@ -2807,6 +3229,21 @@ impl TestdStore {
             receipt_sha256: receipt_sha256.to_owned(),
             committed_receipt_json: None,
         });
+        if let Some(value) = write
+            .open_table(IMPROVEMENTS)
+            .map_err(database)?
+            .get(job_id)
+            .map_err(database)?
+        {
+            let mut record =
+                serde_json::from_slice::<improvement::ImprovementExperimentRecord>(value.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            record.mark_terminal_evidence_pending()?;
+            let encoded = serde_json::to_vec(&record)
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            let mut table = write.open_table(IMPROVEMENTS).map_err(database)?;
+            table.insert(job_id, encoded.as_slice()).map_err(database)?;
+        }
         job.updated_at_ms = now;
         let encoded =
             serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
@@ -2878,6 +3315,7 @@ impl TestdStore {
         let read = self.database.begin_read().map_err(database)?;
         let jobs = read.open_table(JOBS).map_err(database)?;
         let identities = read.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+        let improvements = read.open_table(IMPROVEMENTS).map_err(database)?;
         let mut pending = Vec::new();
         for item in jobs.iter().map_err(database)? {
             let (key, value) = item.map_err(database)?;
@@ -2917,10 +3355,40 @@ impl TestdStore {
             {
                 return Err(TestdError::InvalidBinding);
             }
+            let improvement = improvements
+                .get(job.job_id.as_str())
+                .map_err(database)?
+                .map(|value| {
+                    serde_json::from_slice::<improvement::ImprovementExperimentRecord>(
+                        value.value(),
+                    )
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))
+                })
+                .transpose()?;
+            if let Some(record) = &improvement {
+                record.validate()?;
+                if record.proposal.experiment_id != job.job_id
+                    || record.proposal.request.project_id != job.project_id
+                {
+                    return Err(TestdError::InvalidBinding);
+                }
+            }
             pending.push(TestdTerminalCompletionEvidence {
                 job,
                 request_identity,
+                improvement,
+                improvement_prior_attempts: Vec::new(),
             });
+        }
+        drop(improvements);
+        drop(identities);
+        drop(jobs);
+        drop(read);
+        for entry in &mut pending {
+            if let Some(record) = &entry.improvement {
+                entry.improvement_prior_attempts =
+                    self.improvement_prior_attempts(&record.proposal)?;
+            }
         }
         pending.sort_by(|left, right| left.job.job_id.cmp(&right.job.job_id));
         pending.truncate(limit);
@@ -2972,6 +3440,15 @@ impl TestdStore {
         if publication.receipt_sha256 != receipt_sha256 {
             return Err(TestdError::InvalidBinding);
         }
+        let has_improvement = write
+            .open_table(IMPROVEMENTS)
+            .map_err(database)?
+            .get(job_id)
+            .map_err(database)?
+            .is_some();
+        if has_improvement {
+            return Err(TestdError::InvalidBinding);
+        }
         if let Some(existing) = &publication.committed_receipt_json {
             if existing == &committed_receipt_json {
                 return Ok(job);
@@ -3019,6 +3496,7 @@ impl TestdStore {
             priority,
             at_ms,
             None,
+            None,
         )
     }
 
@@ -3036,9 +3514,22 @@ impl TestdStore {
         priority: i32,
         at_ms: u64,
         identity: Option<RequestIdentity>,
+        improvement: Option<improvement::ImprovementExperimentRecord>,
     ) -> Result<TestJob, TestdError> {
         validate_text(&job_id, "job_id")?;
         validate_text(&project_id, "project_id")?;
+        if improvement.is_some() && identity.is_none() {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(record) = &improvement {
+            record.validate()?;
+            if record.job_id != job_id
+                || record.proposal.experiment_id != job_id
+                || record.proposal.request.project_id != project_id
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
         invocation
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
@@ -3124,6 +3615,28 @@ impl TestdStore {
             if existing.payload_digest != digest {
                 return Err(TestdError::JobConflict(job_id));
             }
+            let retained_improvement = {
+                let table = write.open_table(IMPROVEMENTS).map_err(database)?;
+                table
+                    .get(job_id.as_str())
+                    .map_err(database)?
+                    .map(|value| {
+                        serde_json::from_slice::<improvement::ImprovementExperimentRecord>(
+                            value.value(),
+                        )
+                        .map_err(|error| TestdError::Corrupt(error.to_string()))
+                    })
+                    .transpose()?
+            };
+            match (&improvement, retained_improvement) {
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(TestdError::JobConflict(job_id));
+                }
+                (Some(expected), Some(retained)) if expected != &retained => {
+                    return Err(TestdError::JobConflict(job_id));
+                }
+                _ => {}
+            }
             if let Some(identity) = identity {
                 let retained = {
                     let table = write.open_table(ADMITTED_IDENTITIES).map_err(database)?;
@@ -3182,6 +3695,35 @@ impl TestdStore {
             }
             return Ok(existing);
         }
+        if let Some(record) = &improvement {
+            let current_discriminator = record
+                .proposal
+                .request
+                .new_discriminator
+                .as_ref()
+                .map(|value| value.discriminator_id.as_str());
+            let table = write.open_table(IMPROVEMENTS).map_err(database)?;
+            for item in table.iter().map_err(database)? {
+                let (_, value) = item.map_err(database)?;
+                let prior = serde_json::from_slice::<improvement::ImprovementExperimentRecord>(
+                    value.value(),
+                )
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                let prior_discriminator = prior
+                    .proposal
+                    .request
+                    .new_discriminator
+                    .as_ref()
+                    .map(|value| value.discriminator_id.as_str());
+                if prior.job_id != record.job_id
+                    && prior.requires_reconciliation()
+                    && prior.proposal.material_digest == record.proposal.material_digest
+                    && prior_discriminator == current_discriminator
+                {
+                    return Err(TestdError::InvalidBinding);
+                }
+            }
+        }
         let sequence_key = format!("project:{project_id}");
         let sequence = {
             let mut meta = write.open_table(META).map_err(database)?;
@@ -3237,6 +3779,15 @@ impl TestdStore {
                 .map_err(database)?;
             drop(table);
         }
+        if let Some(record) = improvement {
+            let encoded = serde_json::to_vec(&record)
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            let mut table = write.open_table(IMPROVEMENTS).map_err(database)?;
+            table
+                .insert(job_id.as_str(), encoded.as_slice())
+                .map_err(database)?;
+            drop(table);
+        }
         append_event(&write, &job, None, JobState::Queued, "submit", at_ms, None)?;
         if has_identity {
             append_event(
@@ -3282,6 +3833,46 @@ impl TestdStore {
             submission.priority,
             now,
             Some(identity),
+            None,
+        )
+    }
+
+    /// Kernel-owner productive submission with an immutable improvement
+    /// declaration committed in the same redb transaction as the job and
+    /// authenticated identity. This is the only owner entry that can create
+    /// an improvement experiment; ordinary verifier jobs remain unchanged.
+    pub fn submit_productive_verifier_with_improvement(
+        &self,
+        submission: TestdVerifierJobSubmission,
+        identity: RequestIdentity,
+        permit: ProcessAdmissionPermit,
+        improvement: improvement::ImprovementExperimentRecord,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        submission.validate()?;
+        identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        improvement.validate()?;
+        if now == 0
+            || identity.request.metadata != submission.invocation.request
+            || identity.request.state_fence != submission.invocation.request.state_fence
+            || improvement.job_id != submission.job_id
+            || improvement.proposal.experiment_id != submission.job_id
+            || improvement.proposal.request.project_id != submission.project_id
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        self.submit_inner(
+            submission.job_id,
+            submission.project_id,
+            submission.invocation,
+            permit,
+            submission.target_roots,
+            submission.priority,
+            now,
+            Some(identity),
+            Some(improvement),
         )
     }
 
@@ -3306,6 +3897,16 @@ impl TestdStore {
         // it needs a fresh claim, lease, and permit binding.
         self.reconcile_expired_running_all(now)?;
         let candidates = self.ready_heads(now)?;
+        for candidate in &candidates {
+            if let Some(record) = self.improvement_record(&candidate.job_id)?
+                && (!matches!(
+                    record.state,
+                    improvement::ImprovementExperimentState::Predeclared
+                ) || record.source_observation.is_none())
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
         let Some(candidate) = candidates
             .into_iter()
             .filter(|candidate| {

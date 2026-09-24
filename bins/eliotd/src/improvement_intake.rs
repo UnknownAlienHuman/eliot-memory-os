@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 
 use eliot_conformance_contracts::SelfQualityHandoff;
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_improvement::{
     BudgetProof, EvidenceSource, ImprovementBrief, ImprovementError, ImprovementSurface,
@@ -28,6 +29,10 @@ use eliot_improvement::{
 };
 use eliot_self_quality::SelfQualityError;
 use eliot_self_quality::improvement_handoff::sourced_evidence_from_handoff;
+use eliot_testd_core::{
+    ImprovementDiscriminator, ImprovementExperimentRequest, ImprovementPrivacyClass,
+    ImprovementRiskClass, MechanismDeclaration, RollbackContract,
+};
 use thiserror::Error;
 
 /// Failures of the daemon improvement-intake bridge.
@@ -39,6 +44,10 @@ pub enum IntakeBridgeError {
     /// The improvement intake refused the request.
     #[error("improvement intake failed: {0}")]
     Intake(#[from] ImprovementError),
+    /// The exact candidate/brief/budget bridge could not be serialized or
+    /// failed its owner-side shape checks.
+    #[error("improvement experiment bridge failed: {0}")]
+    Bridge(String),
 }
 
 /// Owned intake parameters beyond the mapped handoff evidence.
@@ -81,7 +90,122 @@ pub struct HandoffIntakeParams {
     pub budget_proof: BudgetProof,
 }
 
-/// Route one real conformance-diagnosis handoff into the improvement backlog.
+/// Owner-supplied experiment declaration that is not present in the
+/// `eliot-improvement` candidate itself. It is supplied by the current
+/// Governor/TestD intake edge before the candidate can be submitted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImprovementExperimentDeclaration {
+    /// Predeclared falsifiable mechanism.
+    pub mechanism: MechanismDeclaration,
+    /// Expected measurable delta.
+    pub expected_delta: String,
+    /// Exact expected metric names.
+    pub expected_metric_names: Vec<String>,
+    /// Exact minimum expected deltas.
+    pub expected_deltas: BTreeMap<String, f64>,
+    /// Candidate counter-metric names.
+    pub counter_metric_names: Vec<String>,
+    /// Closed risk class.
+    pub risk_class: ImprovementRiskClass,
+    /// Closed privacy class.
+    pub privacy_class: ImprovementPrivacyClass,
+    /// Independent Instrument evaluator identity.
+    pub evaluator_id: String,
+    /// Owner of rollback/forward repair.
+    pub rollback_owner_id: String,
+    /// Exact forward-repair route.
+    pub forward_repair_ref: String,
+    /// Exact invalidation set.
+    pub invalidation_set: Vec<String>,
+    /// Optional new discriminator for a repeated experiment.
+    pub new_discriminator: Option<ImprovementDiscriminator>,
+}
+
+/// Projects the actual admitted candidate, safe-boundary brief, and budget
+/// proof into the durable `TestD` request contract. This is the real intake
+/// bridge: the returned request contains canonical bytes, not a candidate id
+/// or a self-reported pass flag.
+pub fn build_testd_improvement_request(
+    outcome: &IntakeOutcome,
+    declaration: &ImprovementExperimentDeclaration,
+) -> Result<ImprovementExperimentRequest, IntakeBridgeError> {
+    if !outcome.admitted {
+        return Err(IntakeBridgeError::Bridge(
+            "merged or rejected intake cannot start a new experiment".to_owned(),
+        ));
+    }
+    outcome
+        .candidate
+        .validate()
+        .map_err(|error| IntakeBridgeError::Bridge(error.to_string()))?;
+    outcome
+        .brief
+        .validate()
+        .map_err(|error| IntakeBridgeError::Bridge(error.to_string()))?;
+    outcome
+        .budget_proof
+        .supports_promotion()
+        .map_err(|error| IntakeBridgeError::Bridge(error.to_string()))?;
+    let candidate_json = canonical_json(&outcome.candidate)?;
+    let brief_json = canonical_json(&outcome.brief)?;
+    let budget_json = canonical_json(&outcome.budget_proof)?;
+    let target_surface = serde_json::to_value(outcome.candidate.target_surface)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .ok_or_else(|| {
+            IntakeBridgeError::Bridge("candidate target surface is not serializable".to_owned())
+        })?;
+    let rollback = RollbackContract::new(
+        declaration.rollback_owner_id.clone(),
+        outcome.candidate.rollback.clone(),
+        declaration.forward_repair_ref.clone(),
+        declaration.invalidation_set.clone(),
+    )
+    .map_err(|error| IntakeBridgeError::Bridge(error.to_string()))?;
+    let mut expected_metric_names = declaration.expected_metric_names.clone();
+    expected_metric_names.sort();
+    let mut counter_metric_names = declaration.counter_metric_names.clone();
+    counter_metric_names.sort();
+    let request = ImprovementExperimentRequest {
+        candidate_id: outcome.candidate.candidate_id.clone(),
+        candidate_revision: outcome.candidate.revision,
+        candidate_digest: sha256_hex(candidate_json.as_bytes()),
+        candidate_json,
+        intake_brief_id: outcome.brief.brief_id.clone(),
+        evaluator_id: declaration.evaluator_id.clone(),
+        intake_brief_digest: sha256_hex(brief_json.as_bytes()),
+        intake_brief_json: brief_json,
+        project_id: outcome.candidate.project_id.clone(),
+        target_surface,
+        delivery_target: outcome.candidate.delivery_target.clone(),
+        canary_plan: outcome.candidate.canary_plan.clone(),
+        stop_condition: outcome.candidate.stop_condition.clone(),
+        mechanism: declaration.mechanism.clone(),
+        expected_delta: declaration.expected_delta.clone(),
+        expected_metric_names,
+        expected_deltas: declaration.expected_deltas.clone(),
+        counter_metric_names,
+        risk_class: declaration.risk_class,
+        effect_ceiling: eliot_testd_core::IMPROVEMENT_EFFECT_CEILING.to_owned(),
+        privacy_class: declaration.privacy_class,
+        budget_ledger_ref: outcome.budget_proof.budget_ledger_ref.clone(),
+        budget_proof_digest: sha256_hex(budget_json.as_bytes()),
+        budget_proof_json: budget_json,
+        rollback,
+        new_discriminator: declaration.new_discriminator.clone(),
+    };
+    request
+        .validate()
+        .map_err(|error| IntakeBridgeError::Bridge(error.to_string()))?;
+    Ok(request)
+}
+
+fn canonical_json<T: serde::Serialize>(value: &T) -> Result<String, IntakeBridgeError> {
+    let bytes = canonical_json_bytes(value)
+        .map_err(|error| IntakeBridgeError::Bridge(error.to_string()))?;
+    String::from_utf8(bytes).map_err(|error| IntakeBridgeError::Bridge(error.to_string()))
+}
+
 ///
 /// Maps the inert handoff to sourced evidence, then runs the full intake:
 /// evidence-bound candidate, safe-boundary brief, application-class gate,

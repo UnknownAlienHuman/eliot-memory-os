@@ -262,12 +262,10 @@ pub(super) fn run() -> Result<(), String> {
     if let Some(facts) = kernel.owner_session_facts() {
         composition.note_owner_session_binding(facts);
     }
-    // #1145: root the Governor-owned improvement candidate route in the
-    // production daemon: report the pipeline owner at startup (diagnostics
-    // only). The candidate → experiment → evaluation → admission path itself
-    // runs through `eliotd::govern_improvement_candidate` on live requests;
-    // this reference keeps the owner identity observable without adding
-    // policy semantics to the composition root.
+    // #1145: report the Governor-owned improvement decision identity at
+    // startup. The live candidate path is the authenticated TestD owner
+    // submit/terminal drain; this diagnostic does not create a candidate or
+    // claim that startup itself executes an experiment.
     tracing::info!(
         target: "eliotd::diagnostics",
         event = "eliotd.improvement_pipeline_owner",

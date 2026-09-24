@@ -12,8 +12,8 @@
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_store_api::WriteReceipt;
 use eliot_testd_core::{
-    RetryPolicy, TestdOwnerSubmitRequest, TestdPendingVerifierDispatch,
-    TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
+    ImprovementExperimentOutcome, RetryPolicy, TestdOwnerSubmitRequest,
+    TestdPendingVerifierDispatch, TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +61,10 @@ pub(crate) const OWNER_WIRE_VERSION: u16 = eliot_testd_core::TESTD_OWNER_WIRE_VE
 
 pub(crate) type OwnerSubmitRequest = TestdOwnerSubmitRequest;
 
+#[allow(
+    clippy::struct_field_names,
+    reason = "request_digest is the exact wire-bound field name retained for compatibility"
+)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Request {
@@ -338,6 +342,10 @@ impl OwnerPendingTerminalsRequest {
     dead_code,
     reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
 )]
+#[allow(
+    clippy::struct_field_names,
+    reason = "request_digest is the exact wire-bound field name retained for compatibility"
+)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OwnerAcknowledgeTerminalRequest {
@@ -345,6 +353,14 @@ pub(crate) struct OwnerAcknowledgeTerminalRequest {
     pub wire_version: u16,
     pub job_id: String,
     pub receipt: WriteReceipt,
+    /// Optional exact candidate outcome. When present, the owner commits the
+    /// canonical receipt and improvement disposition atomically.
+    #[serde(default)]
+    pub improvement: Option<ImprovementExperimentOutcome>,
+    /// Reuse of this existing owner wire for a later exact unknown-outcome
+    /// reconciliation. It is never a blind retry and never creates a job.
+    #[serde(default)]
+    pub reconcile: bool,
     pub request_digest: String,
 }
 
@@ -361,6 +377,9 @@ impl OwnerAcknowledgeTerminalRequest {
         )?;
         validate_job_id(&self.job_id)?;
         self.receipt.validate().map_err(|error| error.to_string())?;
+        if self.reconcile && self.improvement.is_none() {
+            return Err("reconciliation requires an exact improvement outcome".to_owned());
+        }
         validate_digest(&self.request_digest)?;
         let expected = self.compute_request_digest()?;
         if expected != self.request_digest {
@@ -394,6 +413,8 @@ impl OwnerAcknowledgeTerminalRequest {
             wire_version: u16,
             job_id: &'a str,
             receipt_sha256: &'a str,
+            improvement: Option<&'a ImprovementExperimentOutcome>,
+            reconcile: bool,
         }
         let receipt_sha256 = self.receipt_sha256()?;
         let bytes = canonical_json_bytes(&Canonical {
@@ -401,6 +422,8 @@ impl OwnerAcknowledgeTerminalRequest {
             wire_version: self.wire_version,
             job_id: &self.job_id,
             receipt_sha256: &receipt_sha256,
+            improvement: self.improvement.as_ref(),
+            reconcile: self.reconcile,
         })
         .map_err(|error| error.to_string())?;
         Ok(sha256_hex(&bytes))
@@ -613,14 +636,31 @@ impl KernelComposition {
             .receipt_json()
             .map_err(|_| TransportError::SessionFenced)?;
         let store = self.testd_owner_store()?;
-        let job = store
-            .record_terminal_publication_receipt(
-                &request.job_id,
-                &receipt_sha256,
-                receipt_json,
-                now,
-            )
-            .map_err(|_| TransportError::SessionFenced)?;
+        let job = if request.reconcile {
+            let improvement = request.improvement.ok_or(TransportError::SessionFenced)?;
+            store
+                .reconcile_improvement_terminal(&request.job_id, improvement, now)
+                .map_err(|_| TransportError::SessionFenced)?
+        } else if let Some(improvement) = request.improvement {
+            store
+                .acknowledge_improvement_terminal(
+                    &request.job_id,
+                    &receipt_sha256,
+                    receipt_json,
+                    improvement,
+                    now,
+                )
+                .map_err(|_| TransportError::SessionFenced)?
+        } else {
+            store
+                .record_terminal_publication_receipt(
+                    &request.job_id,
+                    &receipt_sha256,
+                    receipt_json,
+                    now,
+                )
+                .map_err(|_| TransportError::SessionFenced)?
+        };
         let committed = job
             .terminal_publication
             .as_ref()

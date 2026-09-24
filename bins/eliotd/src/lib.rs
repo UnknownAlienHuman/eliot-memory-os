@@ -23,7 +23,9 @@ use eliot_governor::{
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
-use eliot_protocol::{AgentActivationResolutionResult, AgentActivationResolutionTicket};
+use eliot_protocol::{
+    AgentActivationResolutionResult, AgentActivationResolutionTicket, RequestIdentity,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -164,9 +166,10 @@ pub use governor_local_read::{
     serve_admitted_local_read,
 };
 pub use improvement_candidate_route::{
-    ImprovementRouteRequest, check_improvement_repeat, improvement_operation_owners,
-    improvement_route_owner, reconcile_improvement_unknown, route_improvement_candidate,
+    ImprovementRouteError, consume_improvement_terminal, durable_disposition,
+    improvement_route_owner,
 };
+pub use improvement_intake::ImprovementExperimentDeclaration;
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
@@ -248,7 +251,7 @@ pub enum DaemonError {
     /// Exact Kernel/provider or Governor recovery admission failed.
     #[error("Governor composition: {0}")]
     Composition(#[from] CompositionError),
-    /// Governor-owned FinishAttempt evaluation or canonical persistence
+    /// Governor-owned `FinishAttempt` evaluation or canonical persistence
     /// rejected the candidate.
     #[error("Governor FinishAttempt: {0}")]
     Finish(#[from] FinishAttemptError),
@@ -323,20 +326,6 @@ pub fn closure_debt_pending(terminal: bool) -> bool {
 #[must_use]
 pub fn governed_improvement_pipeline_owner() -> &'static str {
     improvement_candidate_route::improvement_route_owner()
-}
-
-/// Routes one improvement candidate through the Governor-owned pipeline.
-///
-/// Production caller of [`improvement_candidate_route::route_improvement_candidate`]
-/// (and transitively of `eliot_maintenance::run_improvement_candidate_pipeline`
-/// and `admit_improvement_candidate`). Pure thin forwarder for the
-/// candidate → experiment → independent evaluation → rejected-or-canary-admitted
-/// path (#1100/#18/#20); Kernel activation (#11) stays a handoff, never executed
-/// here.
-pub fn govern_improvement_candidate(
-    request: improvement_candidate_route::ImprovementRouteRequest<'_>,
-) -> Result<eliot_maintenance::ImprovementTerminalDisposition, eliot_maintenance::PipelineError> {
-    improvement_candidate_route::route_improvement_candidate(request)
 }
 
 /// Readiness/status projection emitted by the daemon. It is derived only
@@ -442,6 +431,68 @@ pub struct DaemonComposition {
 }
 
 impl DaemonComposition {
+    /// Submits one real admitted improvement candidate through the authenticated
+    /// Kernel/TestD owner route. The intake outcome carries the actual
+    /// `eliot-improvement` candidate, safe-boundary brief, and budget proof;
+    /// this method does not synthesize any of those values or open `TestD`'s
+    /// database. The authenticated owner stamps the current fence, target,
+    /// budget, deadline, mechanism receipt, and operation set before the job
+    /// can be claimed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the authenticated candidate, target, source, and tool context remain separate bindings"
+    )]
+    pub async fn submit_improvement_candidate(
+        &self,
+        kernel: &DaemonKernelClient,
+        identity: &RequestIdentity,
+        outcome: &eliot_improvement::IntakeOutcome,
+        declaration: &ImprovementExperimentDeclaration,
+        invocation: eliot_instrument_api::InstrumentInvocation,
+        source_root: String,
+        process_tool: eliot_testd_core::TestdProcessToolIntent,
+    ) -> Result<eliot_testd_core::TestdOwnerSubmitResponse, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let improvement = improvement_intake::build_testd_improvement_request(outcome, declaration)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let submission = eliot_testd_core::TestdOwnerJobSubmission {
+            project_id: outcome.candidate.project_id.clone(),
+            invocation,
+            source_root,
+            improvement: Some(improvement),
+        };
+        kernel
+            .submit_testd_improvement_owner(identity, submission, process_tool)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))
+    }
+
+    /// Reconciles a previously persisted unknown improvement outcome through
+    /// the existing authenticated `TestD` owner wire. The supplied outcome must
+    /// contain a new independent evidence/run identity; the owner rejects a
+    /// blind retry or a changed proposal.
+    #[allow(
+        clippy::large_futures,
+        reason = "the owner-wire reconciliation keeps the exact receipt and outcome in one async boundary"
+    )]
+    pub async fn reconcile_improvement_candidate(
+        &self,
+        kernel: &DaemonKernelClient,
+        job_id: &str,
+        receipt: eliot_store_api::WriteReceipt,
+        outcome: eliot_testd_core::ImprovementExperimentOutcome,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        kernel
+            .reconcile_testd_improvement_terminal_async(job_id, receipt, outcome)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))
+    }
+
     /// Composes the daemon only from a Host-approved authenticated Kernel port.
     ///
     /// The port is retained exactly once. Its snapshot and the recovered owner

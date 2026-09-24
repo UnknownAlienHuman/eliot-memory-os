@@ -3778,6 +3778,27 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
+    /// Rehydrates the exact canonical verifier fact for one committed TestD
+    /// terminal. The daemon uses this owner read only after publication; a
+    /// caller-held verdict is never accepted as a substitute.
+    pub fn read_testd_verifier_execution_fact(
+        &self,
+        state_fence: &eliot_contracts::StateFence,
+        job_id: &str,
+    ) -> Result<CanonicalVerifierExecutionFact, CompositionError> {
+        let fact = self
+            .owners
+            .canonical
+            .read_verifier_execution_fact(state_fence)?;
+        if fact.job_id != job_id {
+            return Err(CompositionError::Recovery(
+                "canonical verifier fact job identity does not match the requested TestD job"
+                    .to_owned(),
+            ));
+        }
+        Ok(fact)
+    }
+
     /// Runs the production `FinishAttempt` path and returns only after the
     /// canonical receipt has committed. Publication is performed by the
     /// daemon composition through `refresh_from_kernel`, using the same

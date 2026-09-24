@@ -12,7 +12,7 @@ use crate::brief::{ImprovementBrief, SafeBoundary, brief_at_safe_boundary};
 use crate::budget_proof::{BudgetProof, require_matched_budget_for_promotion};
 use crate::candidate_bounds::{AdmitOutcome, BoundedBacklog};
 use crate::evidence_sources::{SourcedEvidence, candidate_from_evidence};
-use crate::{ImprovementError, ImprovementSurface, ReplayPlan};
+use crate::{ImprovementCandidate, ImprovementError, ImprovementSurface, ReplayPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -53,6 +53,10 @@ pub struct IntakeOutcome {
     pub candidate_id: String,
     pub admitted: bool,
     pub merged_into: Option<String>,
+    /// Exact candidate bytes/value admitted or merged at this intake pass.
+    pub candidate: ImprovementCandidate,
+    /// Exact budget proof consumed by the intake gate.
+    pub budget_proof: BudgetProof,
     pub brief: ImprovementBrief,
 }
 
@@ -135,7 +139,7 @@ pub fn intake_from_evidence(
     )?;
     require_matched_budget_for_promotion(Some(&budget_proof))?;
     let outcome = backlog
-        .admit(candidate, value, owner)
+        .admit(candidate.clone(), value, owner)
         .map_err(|e| ImprovementError::BacklogRefused(e.to_string()))?;
     let (candidate_id, admitted, merged_into) = match outcome {
         AdmitOutcome::Admitted { candidate_id } => (candidate_id, true, None),
@@ -148,6 +152,8 @@ pub fn intake_from_evidence(
         candidate_id,
         admitted,
         merged_into,
+        candidate,
+        budget_proof,
         brief,
     })
 }

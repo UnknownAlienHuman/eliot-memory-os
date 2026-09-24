@@ -2405,7 +2405,9 @@ name = "eliot-maintenance"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-instrument-api",
  "eliot-runtime-contracts",
+ "eliot-testd-core",
  "schemars",
  "serde",
  "serde_json",

@@ -26,7 +26,9 @@ use eliot_protocol::{
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
 use eliot_testd_core::{
-    TestdPendingVerifierDispatch, TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
+    TestdOwnerJobSubmission, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse,
+    TestdPendingVerifierDispatch, TestdProcessToolIntent, TestdTerminalCompletionEvidence,
+    TestdVerifierDispatchBinding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1112,6 +1114,10 @@ pub(super) struct TestdOwnerAckTerminalRequest {
     pub wire_version: u16,
     pub job_id: String,
     pub receipt: WriteReceipt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub improvement: Option<eliot_testd_core::ImprovementExperimentOutcome>,
+    #[serde(default)]
+    pub reconcile: bool,
     pub request_digest: String,
 }
 
@@ -1201,6 +1207,8 @@ fn testd_owner_bind_request_digest(
 fn testd_owner_ack_request_digest(
     job_id: &str,
     receipt_sha256: &str,
+    improvement: Option<&eliot_testd_core::ImprovementExperimentOutcome>,
+    reconcile: bool,
 ) -> Result<String, KernelPortError> {
     #[derive(Serialize)]
     struct Canonical<'a> {
@@ -1208,18 +1216,57 @@ fn testd_owner_ack_request_digest(
         wire_version: u16,
         job_id: &'a str,
         receipt_sha256: &'a str,
+        improvement: Option<&'a eliot_testd_core::ImprovementExperimentOutcome>,
+        reconcile: bool,
     }
     let bytes = canonical_json_bytes(&Canonical {
         wire_id: TESTD_OWNER_ACK_TERMINAL_OPERATION,
         wire_version: TESTD_OWNER_WIRE_VERSION,
         job_id,
         receipt_sha256,
+        improvement,
+        reconcile,
     })
     .map_err(|error| KernelPortError::Contract(error.to_string()))?;
     Ok(sha256_hex(&bytes))
 }
 
 impl DaemonKernelClient {
+    /// Submits one actual improvement candidate through the existing
+    /// authenticated `TestD` owner-submit route. The daemon may use this leg
+    /// only for a request carrying an improvement declaration; ordinary
+    /// productive submissions remain on the `TestD` worker session.
+    pub(super) async fn submit_testd_improvement_owner(
+        &self,
+        identity: &RequestIdentity,
+        submission: TestdOwnerJobSubmission,
+        process_tool: TestdProcessToolIntent,
+    ) -> Result<TestdOwnerSubmitResponse, KernelPortError> {
+        if submission.improvement.is_none() {
+            return Err(KernelPortError::Contract(
+                "daemon owner submit requires an improvement declaration".to_owned(),
+            ));
+        }
+        let request = TestdOwnerSubmitRequest {
+            wire_id: eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION.to_owned(),
+            wire_version: eliot_testd_core::TESTD_OWNER_WIRE_VERSION,
+            submission,
+            process_tool,
+            request_digest: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let value = self
+            .transact_async_with_identity(
+                eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION,
+                serde_json::json!({ "request": request }),
+                identity.clone(),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
+    }
+
     /// Polls the Kernel-owned pending verifier dispatches. The response
     /// carries the full durable job plus the exact admitted frame identity;
     /// the daemon computes the canonical plan binding from its Governor
@@ -1321,18 +1368,27 @@ impl DaemonKernelClient {
         &self,
         job_id: &str,
         receipt: WriteReceipt,
+        improvement: Option<eliot_testd_core::ImprovementExperimentOutcome>,
+        reconcile: bool,
     ) -> Result<WriteReceipt, KernelPortError> {
         testd_owner_job_id(job_id)?;
         receipt
             .validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         let receipt_sha256 = testd_owner_receipt_sha256(&receipt)?;
-        let request_digest = testd_owner_ack_request_digest(job_id, &receipt_sha256)?;
+        let request_digest = testd_owner_ack_request_digest(
+            job_id,
+            &receipt_sha256,
+            improvement.as_ref(),
+            reconcile,
+        )?;
         let request = TestdOwnerAckTerminalRequest {
             wire_id: TESTD_OWNER_ACK_TERMINAL_OPERATION.to_owned(),
             wire_version: TESTD_OWNER_WIRE_VERSION,
             job_id: job_id.to_owned(),
             receipt,
+            improvement,
+            reconcile,
             request_digest,
         };
         let value = self
@@ -1351,6 +1407,19 @@ impl DaemonKernelClient {
             ));
         }
         Ok(response.receipt)
+    }
+
+    /// Reconciles a previously persisted unknown improvement outcome through
+    /// the same authenticated `TestD` owner wire. The owner requires a new
+    /// evidence/run identity and cannot be used to retry an un-evidenced job.
+    pub(super) async fn reconcile_testd_improvement_terminal_async(
+        &self,
+        job_id: &str,
+        receipt: WriteReceipt,
+        outcome: eliot_testd_core::ImprovementExperimentOutcome,
+    ) -> Result<WriteReceipt, KernelPortError> {
+        self.acknowledge_testd_terminal_completion_async(job_id, receipt, Some(outcome), true)
+            .await
     }
 }
 

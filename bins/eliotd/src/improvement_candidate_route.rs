@@ -1,163 +1,240 @@
-//! Production improvement-candidate route: candidate to experiment to evaluation.
+//! Production `TestD` terminal consumer for Governor improvement admission.
 //!
-//! This module is the production caller of the Governor-owned improvement
-//! pipeline (`#1100`, Governor `#18`, Testd `#20`). One improvement candidate
-//! flows through bounded experiment to independent evaluation to Governor
-//! admission, ending rejected or canary-admitted.
-//!
-//! Ownership split (handoff only, never executed here):
-//! - Testd (`#20`) executes the bounded experiment and measures it;
-//! - the Instrument verifier family (`#20`/`#1111`) independently evaluates;
-//! - Governor maintenance (`G-19`, `#18`) admits through
-//!   `run_improvement_candidate_pipeline` (transitively
-//!   `admit_improvement_candidate`);
-//! - Kernel generation/canary activation (`#11`) is a handoff request the
-//!   Kernel owner must independently authorize and execute.
-//!
-//! This route is advisory-only: it never promotes, activates, installs,
-//! completes, or issues authority. Pure delegation to the Governor owner
-//! crate; no state machines, policy semantics, stores, providers,
-//! credentials, or repair logic live here.
+//! The old public forwarder was not an execution path. This module is called
+//! only by the daemon's existing `TestD` terminal drain. It rehydrates the
+//! durable improvement sidecar and the canonical verifier fact, projects the
+//! exact independent evidence axes, asks Governor maintenance for a candidate
+//! disposition, and returns an outcome for the authenticated owner
+//! acknowledgement. It never opens a store, launches a process, or promotes a
+//! generation.
 
+use std::collections::BTreeMap;
+
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_governor::CanonicalVerifierExecutionFact;
 use eliot_maintenance::{
-    ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionDecision,
-    ImprovementAdmissionPolicy, ImprovementCandidateView, ImprovementEvidenceView,
-    ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal, RollbackContract,
-    detect_no_progress, proposal_digest, reconcile_unknown_activation,
-    run_improvement_candidate_pipeline,
+    ImprovementTerminalDisposition, build_improvement_outcome, evaluate_improvement_experiment,
+};
+use eliot_store_api::WriteReceipt;
+use eliot_testd_core::{
+    ImprovementExperimentOutcome, ImprovementExperimentRecord, ImprovementExperimentState,
+    ImprovementMetricDisposition, ImprovementSourceBinding, IndependentExecutionEvidence,
 };
 
-/// Borrowed inputs for one production improvement-candidate route call.
-///
-/// Mirrors [`eliot_maintenance::ImprovementPipelineInputs`] so the production
-/// caller forwards the exact borrowed set the Governor pipeline owns, without
-/// restating any validation, binding, or admission semantics.
-#[derive(Clone, Copy, Debug)]
-pub struct ImprovementRouteRequest<'a> {
-    /// Governor-side proposal under review.
-    pub proposal: &'a ImprovementProposal,
-    /// Testd-owned bounded experiment plan.
-    pub experiment: &'a ExperimentPlan,
-    /// Independent activation evidence for the bound candidate and experiment.
-    pub evidence: &'a ActivationEvidence,
-    /// Rollback contract named before admission.
-    pub rollback: &'a RollbackContract,
-    /// Candidate view consumed by Governor admission.
-    pub candidate: &'a ImprovementCandidateView,
-    /// Independent evidence view consumed by Governor admission.
-    pub admission_evidence: &'a ImprovementEvidenceView,
-    /// Policy governing Governor admission.
-    pub policy: &'a ImprovementAdmissionPolicy,
+/// Failure in the production terminal consumer. It is surfaced to the
+/// existing daemon drain diagnostics and never converted into a candidate
+/// acknowledgement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ImprovementRouteError {
+    /// The canonical fact or durable sidecar is not an exact join.
+    InvalidBinding(String),
+    /// Governor maintenance refused the evidence.
+    Admission(String),
+    /// The durable outcome could not be built.
+    Outcome(String),
 }
 
-/// Routes one improvement candidate through the Governor-owned pipeline.
+impl std::fmt::Display for ImprovementRouteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidBinding(reason) | Self::Admission(reason) | Self::Outcome(reason) => {
+                formatter.write_str(reason)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImprovementRouteError {}
+
+/// Consumes one canonical verifier fact for one durable improvement sidecar.
 ///
-/// This is the production caller of
-/// [`eliot_maintenance::run_improvement_candidate_pipeline`] (and transitively
-/// of `admit_improvement_candidate`). Pure thin forwarder: it constructs the
-/// Governor-owned [`eliot_maintenance::ImprovementPipelineInputs`] from the
-/// borrowed request and returns the advisory-only terminal disposition.
-/// Never promotes, activates, or completes; a `CanaryAdmitted` disposition
-/// carries only a handoff request for Kernel (`#11`) authorization.
-pub fn route_improvement_candidate(
-    request: ImprovementRouteRequest<'_>,
-) -> Result<eliot_maintenance::ImprovementTerminalDisposition, eliot_maintenance::PipelineError> {
-    let _proposal_digest = proposal_digest(request.proposal);
-    let _operation_owners = improvement_operation_owners(&request.rollback.rollback_owner_id);
-    run_improvement_candidate_pipeline(ImprovementPipelineInputs {
-        proposal: request.proposal,
-        experiment: request.experiment,
-        evidence: request.evidence,
-        rollback: request.rollback,
-        candidate: request.candidate,
-        admission_evidence: request.admission_evidence,
-        policy: request.policy,
+/// `committed_receipt` is the canonical owner receipt returned by the
+/// Governor verifier-fact publication. Its digest is part of the independent
+/// evidence identity; a worker receipt or caller-provided boolean is not
+/// accepted.
+pub fn consume_improvement_terminal(
+    record: &ImprovementExperimentRecord,
+    fact: &CanonicalVerifierExecutionFact,
+    committed_receipt: &WriteReceipt,
+    prior_attempts: &[eliot_testd_core::ImprovementPriorAttempt],
+    recorded_at_unix_ms: u64,
+) -> Result<ImprovementExperimentOutcome, ImprovementRouteError> {
+    record
+        .validate()
+        .map_err(|error| ImprovementRouteError::InvalidBinding(error.to_string()))?;
+    if record.state != ImprovementExperimentState::TerminalEvidencePending
+        || record.source_observation.is_none()
+    {
+        return Err(ImprovementRouteError::InvalidBinding(
+            "improvement sidecar is not in terminal-evidence-pending state".to_owned(),
+        ));
+    }
+    fact.validate(&record.proposal.state_fence)
+        .map_err(|error| ImprovementRouteError::InvalidBinding(error.to_string()))?;
+    committed_receipt
+        .validate()
+        .map_err(|error| ImprovementRouteError::InvalidBinding(error.to_string()))?;
+    if fact.job_id != record.job_id
+        || fact.task_id != record.proposal.target.task_id
+        || fact.state_fence != record.proposal.state_fence
+        || record.source_observation.as_ref().is_some_and(|source| {
+            fact.source_observation.as_ref().is_none_or(|range| {
+                range.before.repository_root != source.repository_root
+                    || range.before.branch != source.branch
+                    || range.before.commit != source.commit
+                    || range.before.dirty_state_sha256 != source.dirty_state_sha256
+            })
+        })
+    {
+        return Err(ImprovementRouteError::InvalidBinding(
+            "canonical verifier fact does not bind the durable improvement job/fence".to_owned(),
+        ));
+    }
+    let receipt_sha256 = canonical_receipt_digest(committed_receipt)?;
+    let fact_bytes = canonical_json_bytes(fact)
+        .map_err(|error| ImprovementRouteError::InvalidBinding(error.to_string()))?;
+    let fact_digest = sha256_hex(&fact_bytes);
+    let evidence = independent_evidence_from_fact(record, fact, receipt_sha256, fact_digest)?;
+    let disposition = evaluate_improvement_experiment(&record.proposal, &evidence, prior_attempts)
+        .map_err(|error| ImprovementRouteError::Admission(error.to_string()))?;
+    build_improvement_outcome(
+        &record.proposal,
+        &evidence,
+        &disposition,
+        recorded_at_unix_ms,
+    )
+    .map_err(|error| ImprovementRouteError::Outcome(error.to_string()))
+}
+
+/// Projects only identities and measured values already present in the
+/// canonical verifier fact. Missing metric values become `Incomplete`; they do
+/// not become a pass by default.
+fn independent_evidence_from_fact(
+    record: &ImprovementExperimentRecord,
+    fact: &CanonicalVerifierExecutionFact,
+    committed_receipt_sha256: String,
+    fact_digest: String,
+) -> Result<IndependentExecutionEvidence, ImprovementRouteError> {
+    let source_binding = match &fact.source_observation {
+        Some(range) if range.before == range.after => ImprovementSourceBinding::ExactUnchanged,
+        Some(_) => ImprovementSourceBinding::Changed,
+        None => ImprovementSourceBinding::Absent,
+    };
+    let mut observed_metric_deltas = BTreeMap::new();
+    let mut counter_metric_deltas = BTreeMap::new();
+    let mut metric_dispositions = BTreeMap::new();
+    for name in &record.proposal.request.expected_metric_names {
+        match metric_delta(&fact.verification_run, name) {
+            Some(value) => {
+                let expected = record
+                    .proposal
+                    .request
+                    .expected_deltas
+                    .get(name)
+                    .copied()
+                    .unwrap_or(f64::NAN);
+                metric_dispositions.insert(
+                    name.clone(),
+                    if value >= expected {
+                        ImprovementMetricDisposition::Meets
+                    } else {
+                        ImprovementMetricDisposition::Misses
+                    },
+                );
+                observed_metric_deltas.insert(name.clone(), value);
+            }
+            None => {
+                metric_dispositions.insert(name.clone(), ImprovementMetricDisposition::Incomplete);
+            }
+        }
+    }
+    for name in &record.proposal.request.counter_metric_names {
+        match metric_delta(&fact.verification_run, name) {
+            Some(value) => {
+                metric_dispositions.insert(
+                    name.clone(),
+                    if value < 0.0 {
+                        ImprovementMetricDisposition::Regresses
+                    } else {
+                        ImprovementMetricDisposition::Meets
+                    },
+                );
+                counter_metric_deltas.insert(name.clone(), value);
+            }
+            None => {
+                metric_dispositions.insert(name.clone(), ImprovementMetricDisposition::Incomplete);
+            }
+        }
+    }
+    let raw_evidence_refs = fact
+        .raw_artifact_bindings
+        .iter()
+        .map(|artifact| artifact.handle.clone())
+        .collect();
+    let normalized_evidence_refs = fact
+        .verification_run
+        .evidence
+        .iter()
+        .map(|evidence| evidence.evidence_id.to_string())
+        .collect();
+    let evidence = IndependentExecutionEvidence {
+        evidence_id: fact_digest,
+        verifier_id: fact.verification_run.verifier.to_string(),
+        verifier_run_id: fact.verification_run.run_id.to_string(),
+        job_id: fact.job_id.clone(),
+        operation_id: record
+            .proposal
+            .operation_id(eliot_testd_core::ImprovementOperationKind::Evaluate)
+            .ok_or_else(|| {
+                ImprovementRouteError::InvalidBinding(
+                    "improvement proposal has no evaluator operation".to_owned(),
+                )
+            })?
+            .to_owned(),
+        executed_operation_id: fact.receipt.operation_id.clone(),
+        invocation_id: fact.verification_run.invocation_id.to_string(),
+        outcome: fact.verification_run.outcome,
+        coverage: fact.verification_run.coverage,
+        freshness: fact.verification_run.freshness,
+        source_binding,
+        observed_metric_deltas,
+        counter_metric_deltas,
+        metric_dispositions,
+        raw_evidence_refs,
+        normalized_evidence_refs,
+        state_fence: fact.state_fence.clone(),
+        committed_receipt_sha256,
+    };
+    evidence
+        .validate_for(&record.proposal, &record.job_id)
+        .map_err(|error| ImprovementRouteError::InvalidBinding(error.to_string()))?;
+    Ok(evidence)
+}
+
+fn metric_delta(run: &eliot_instrument_api::VerificationRun, metric_name: &str) -> Option<f64> {
+    run.evidence.iter().find_map(|evidence| {
+        let value = evidence.value.get("metric_deltas")?.as_object()?;
+        value.get(metric_name)?.as_f64()
     })
 }
 
-/// Returns the owning identity for each of the eight distinct pipeline operations.
-///
-/// Production caller of [`ImprovementOperation::owner`]: Propose/Admit/Promote
-/// resolve to Governor maintenance, Execute/Measure to Testd, Evaluate to the
-/// independent Instrument verifier, `CanaryActivate` to Kernel (handoff only),
-/// and Rollback to the bound rollback-contract owner.
-#[must_use]
-pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, String); 8] {
-    [
-        (
-            ImprovementOperation::Propose.as_str(),
-            ImprovementOperation::Propose
-                .owner(rollback_owner_id)
-                .to_string(),
-        ),
-        (
-            ImprovementOperation::ExecuteExperiment.as_str(),
-            ImprovementOperation::ExecuteExperiment
-                .owner(rollback_owner_id)
-                .to_string(),
-        ),
-        (
-            ImprovementOperation::Measure.as_str(),
-            ImprovementOperation::Measure
-                .owner(rollback_owner_id)
-                .to_string(),
-        ),
-        (
-            ImprovementOperation::Evaluate.as_str(),
-            ImprovementOperation::Evaluate
-                .owner(rollback_owner_id)
-                .to_string(),
-        ),
-        (
-            ImprovementOperation::Admit.as_str(),
-            ImprovementOperation::Admit
-                .owner(rollback_owner_id)
-                .to_string(),
-        ),
-        (
-            ImprovementOperation::CanaryActivate.as_str(),
-            ImprovementOperation::CanaryActivate
-                .owner(rollback_owner_id)
-                .to_string(),
-        ),
-        (
-            ImprovementOperation::Promote.as_str(),
-            ImprovementOperation::Promote
-                .owner(rollback_owner_id)
-                .to_string(),
-        ),
-        (
-            ImprovementOperation::Rollback.as_str(),
-            ImprovementOperation::Rollback
-                .owner(rollback_owner_id)
-                .to_string(),
-        ),
-    ]
+fn canonical_receipt_digest(receipt: &WriteReceipt) -> Result<String, ImprovementRouteError> {
+    let bytes = canonical_json_bytes(receipt)
+        .map_err(|error| ImprovementRouteError::InvalidBinding(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
 }
 
-/// Reports whether a proposal repeats a prior digest without new signal.
-///
-/// Production caller of [`detect_no_progress`].
+/// Returns the Governor owner identity for diagnostics and owner joins.
 #[must_use]
-pub fn check_improvement_repeat(
-    prior_digest: &str,
-    proposal: &ImprovementProposal,
-    new_discriminator: bool,
-) -> bool {
-    detect_no_progress(prior_digest, proposal, new_discriminator)
+pub const fn improvement_route_owner() -> &'static str {
+    eliot_maintenance::IMPROVEMENT_PIPELINE_OWNER
 }
 
-/// Reconciles an unknown external activation outcome without retrying blindly.
-///
-/// Production caller of [`reconcile_unknown_activation`].
+/// Converts a maintenance decision to its stable testd disposition without
+/// re-deciding it in the daemon.
 #[must_use]
-pub fn reconcile_improvement_unknown(
-    prior: &ImprovementAdmissionDecision,
-) -> eliot_maintenance::ImprovementTerminalDisposition {
-    reconcile_unknown_activation(prior)
-}
-
-/// Returns the Governor maintenance owner identity for the improvement route.
-pub fn improvement_route_owner() -> &'static str {
-    IMPROVEMENT_PIPELINE_OWNER
+pub fn durable_disposition(
+    disposition: &ImprovementTerminalDisposition,
+) -> eliot_testd_core::ImprovementExperimentDisposition {
+    disposition.durable_disposition()
 }

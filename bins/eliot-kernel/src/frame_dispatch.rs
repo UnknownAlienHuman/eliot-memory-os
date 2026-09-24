@@ -1487,9 +1487,17 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
         observe_frame("kernel.frame_testd_owner_submit", "attempt");
-        if operation != super::testd_terminal_completion_route::OWNER_SUBMIT_OPERATION
-            || session.module_generation.module_id.as_str() != TESTD_MODULE_ID
-        {
+        if operation != super::testd_terminal_completion_route::OWNER_SUBMIT_OPERATION {
+            return Err(TransportError::SessionFenced);
+        }
+        let request =
+            super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let testd_session = session.module_generation.module_id.as_str() == TESTD_MODULE_ID;
+        let daemon_improvement_session = session.module_generation.module_id.as_str()
+            == super::ACTIVE_DAEMON_CALLER
+            && request.submission.improvement.is_some();
+        if !testd_session && !daemon_improvement_session {
             return Err(TransportError::SessionFenced);
         }
         session
@@ -1510,9 +1518,6 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let request =
-            super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
-                .map_err(|_| TransportError::SessionFenced)?;
         let response =
             super::dispatch_launch::submit_testd_owner_job(self, identity, &request, unix_ms())
                 .await
