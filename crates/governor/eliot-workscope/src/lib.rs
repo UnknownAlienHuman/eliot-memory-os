@@ -19,6 +19,7 @@ mod guard;
 mod identity;
 mod issuance;
 mod resolver;
+mod scanner;
 
 pub use caller::{
     DescriptorPolicy, ObservedScopeResources, ReceiptAdmission, TriggerAdmission, WithholdReason,
@@ -41,6 +42,15 @@ pub use resolver::{
     BindingToken, HostObservedHandles, ManifestBoundaryClaim, RegisteredInstanceEvidence,
     ResolutionOutcome, ResolutionRequest, ResolutionTier, ResumedTaskEvidence, SessionTaskClaim,
     WorkScopeResolver,
+};
+pub use scanner::{
+    AdapterEvidence, ArtifactDirEvidence, BootstrapScanEvidence, BootstrapScanOutcome,
+    BootstrapScanner, ChangeSummary, DiscoveryLeaseRequest, DiscoveryOperation,
+    EditorWorkspaceEvidence, ExistingRecordEvidence, FileTypeCount, ForbiddenScanClass,
+    MAX_DISCOVERY_CONSUMPTION, ManifestEvidence, OnboardingRecommendation, PrivacyBoundary,
+    ProvisionalScopeProfile, RegisteredBuildProfile, RootServiceEvidence,
+    SCAN_PRIVACY_BOUNDARY_REQUIRED, ScanDisclosureReceipt, ScannerResolverInputs,
+    authorize_operation, candidate_source_roles, derive_lease_ref, issue_discovery_lease,
 };
 
 /// Returns whether a retained binding describes a resource descriptor.
