@@ -2939,11 +2939,16 @@ fn run_installation_effect(
                 )) {
                     Ok(root) => root,
                     Err(error) => {
-                        write_installation_error(
-                            "INSTALLATION_APPLY_ERROR",
+                        // E3: the retained Host root cannot be reopened after
+                        // the bootstrap prefix applied. Persist the same
+                        // durable typed rejection as E4/E5 so a later
+                        // recover/rollback reaches RolledBack; an unconfirmed
+                        // rejection stays INSTALLATION_APPLY_RECOVERY_REQUIRED.
+                        return Ok(report_post_bootstrap_failure(
+                            &mut coordinator,
+                            &transaction_id,
                             &format!("retained Host root could not be reopened: {error}"),
-                        );
-                        return Ok(INVALID_REQUEST_EXIT);
+                        ));
                     }
                 };
                 let registry = match RedbInstallationRegistry::open_at(host_root) {
@@ -2951,16 +2956,15 @@ fn run_installation_effect(
                     Err(error) => {
                         // E4: persist a durable typed rejection so a later
                         // recover/rollback reaches RolledBack and removes exactly
-                        // the CreatedByTransaction service registrations.
-                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id) {
-                            let _ = coordinator
-                                .persist_non_effect_rejection(&transaction_id, pending_ref);
-                        }
-                        write_installation_error(
-                            "INSTALLATION_APPLY_ERROR",
+                        // the CreatedByTransaction service registrations. The
+                        // persist result is projected, never discarded: an
+                        // unconfirmed rejection is
+                        // INSTALLATION_APPLY_RECOVERY_REQUIRED (unknown).
+                        return Ok(report_post_bootstrap_failure(
+                            &mut coordinator,
+                            &transaction_id,
                             &format!("pending registry could not be opened: {error}"),
-                        );
-                        return Ok(INVALID_REQUEST_EXIT);
+                        ));
                     }
                 };
                 let expected_revision = match registry.load() {
@@ -2968,15 +2972,12 @@ fn run_installation_effect(
                     Err(error) => {
                         // E5: same durable rejection as E4 (registry unreadable
                         // after open is UNKNOWN_OUTCOME/ROLLBACK_REQUIRED).
-                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id) {
-                            let _ = coordinator
-                                .persist_non_effect_rejection(&transaction_id, pending_ref);
-                        }
-                        write_installation_error(
-                            "INSTALLATION_APPLY_ERROR",
+                        // The persist result is projected, never discarded.
+                        return Ok(report_post_bootstrap_failure(
+                            &mut coordinator,
+                            &transaction_id,
                             &format!("pending registry preflight failed: {error}"),
-                        );
-                        return Ok(INVALID_REQUEST_EXIT);
+                        ));
                     }
                 };
                 if let Err(error) = coordinator.stage_bootstrap_pending_activation(
@@ -2988,7 +2989,8 @@ fn run_installation_effect(
                     // present (Activating) do NOT persist — mark_unknown is
                     // refused in Activating — and resume via the existing
                     // Activating reconcile / terminal query path. Only persist
-                    // while still Registering (CAS never happened).
+                    // while still Registering (CAS never happened); the persist
+                    // result is projected, never discarded.
                     let still_registering = match coordinator.store().load(&transaction_id) {
                         Ok(Some(current)) => {
                             current.stage() == InstallationStage::Registering
@@ -2996,11 +2998,12 @@ fn run_installation_effect(
                         }
                         Ok(None) | Err(_) => false,
                     };
-                    if still_registering
-                        && let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id)
-                    {
-                        let _ =
-                            coordinator.persist_non_effect_rejection(&transaction_id, pending_ref);
+                    if still_registering {
+                        return Ok(report_post_bootstrap_failure(
+                            &mut coordinator,
+                            &transaction_id,
+                            &format!("pending registry projection failed: {error}"),
+                        ));
                     }
                     write_installation_error(
                         "INSTALLATION_APPLY_ERROR",
@@ -3855,6 +3858,64 @@ fn write_installation_error_with_reference(code: &str, detail: &str, reference: 
             "scope": INSTALLATION_SCOPE,
         })
     );
+}
+
+/// Projects a post-bootstrap non-effect failure observed after the Host
+/// bootstrap prefix (Host-root reopen, registry open/load, registry
+/// projection staging: `E3`/`E4`/`E5` and the still-`Registering` branch of
+/// `E6`).
+///
+/// The coordinator-owned durable typed rejection is always attempted and its
+/// result is never discarded: success keeps the existing
+/// `INSTALLATION_APPLY_ERROR` with a recoverable-rollback note (the stored
+/// `Registering → RollbackRequired` transition lets a later recover reach
+/// `RolledBack` and remove exactly the `CreatedByTransaction` registrations);
+/// when the rejection cannot be confirmed the outcome stays truthful
+/// `INSTALLATION_APPLY_RECOVERY_REQUIRED` per `I3.15`
+/// (`UNKNOWN_OUTCOME/ROLLBACK_REQUIRED` until read-back reconciliation), never
+/// a plain apply error that would imply durable recovery. The
+/// transaction/fence/owner gates are untouched: a refusal in `Activating` (or
+/// a store CAS failure) surfaces here as unconfirmed, it is never overridden.
+fn report_post_bootstrap_failure<S>(
+    coordinator: &mut WindowsInstallationCoordinator<S>,
+    transaction_id: &PlatformHandle,
+    detail: &str,
+) -> i32
+where
+    S: InstallationTransactionStore,
+{
+    let pending_ref = match registry_projection_pending_ref(transaction_id) {
+        Ok(pending_ref) => pending_ref,
+        Err(error) => {
+            write_installation_error(
+                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                &format!(
+                    "{detail}; durable rejection reference could not be built ({error}): recovery is required and rollback readiness is unknown"
+                ),
+            );
+            return INVALID_REQUEST_EXIT;
+        }
+    };
+    match coordinator.persist_non_effect_rejection(transaction_id, pending_ref) {
+        Ok(_) => {
+            write_installation_error(
+                "INSTALLATION_APPLY_ERROR",
+                &format!(
+                    "{detail}; durable typed rejection persisted: run installation recover with the exact --store and --transaction-id to roll back CreatedByTransaction registrations"
+                ),
+            );
+            INVALID_REQUEST_EXIT
+        }
+        Err(error) => {
+            write_installation_error(
+                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                &format!(
+                    "{detail}; durable rejection could not be confirmed ({error}): recovery is required and rollback readiness is unknown"
+                ),
+            );
+            INVALID_REQUEST_EXIT
+        }
+    }
 }
 
 fn installation_preflight_error(
