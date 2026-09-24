@@ -707,9 +707,30 @@ fn existing_fault_fixtures_keep_their_classification() -> TestResult<()> {
     Ok(())
 }
 
+/// Enforces the `## Work` item "removal of `.github/temporary/work-unit-876.md`,
+/// if present": the work-unit marker must not exist at the repository root
+/// above this crate. A present marker fails the guard, so the file is removed
+/// rather than left behind as hidden cleanup.
+fn assert_work_unit_marker_absent() -> TestResult<()> {
+    for ancestor in std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors() {
+        let marker = ancestor.join(".github/temporary/work-unit-876.md");
+        if marker.is_file() {
+            return Err(format!(
+                "work-unit marker still present at {}: remove it",
+                marker.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 // WORK_UNIT_CASE: 876/18
 #[test]
 fn source_api_diff_guard_binds_the_allowed_surface() -> TestResult<()> {
+    // Work-unit marker removal: `.github/temporary/work-unit-876.md` must be
+    // absent (removed when present); a leftover marker fails the guard here.
+    assert_work_unit_marker_absent()?;
     // No cross-store owner: the legacy donor must not gain a dependency edge on
     // the current provider crates owned by #864 or on the Surreal adapter.
     for forbidden in ["eliot-blob", "eliot-store-api", "surreal"] {
