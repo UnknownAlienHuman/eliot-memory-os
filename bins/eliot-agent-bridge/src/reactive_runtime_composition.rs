@@ -30,9 +30,7 @@
 use eliot_agent_bridge_core::{AttachBinding, BridgeError, ResourceUri};
 use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_mcp::{KernelHostRequestPort, PortFailure};
-use eliot_protocol::{
-    MAX_RESTORE_URIS, ReactiveRestoreQuery, ReactiveRestoreReply, RestoredSnapshot,
-};
+use eliot_protocol::{MAX_RESTORE_URIS, ReactiveRestoreQuery};
 
 use super::BridgeRunner;
 
@@ -199,6 +197,7 @@ mod tests {
         HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
         HostInvocationRequest,
     };
+    use eliot_protocol::{ReactiveRestoreReply, RestoredSnapshot};
     use std::num::NonZeroU64;
 
     use super::super::{

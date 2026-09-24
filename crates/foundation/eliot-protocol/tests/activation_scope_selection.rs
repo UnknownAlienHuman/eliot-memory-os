@@ -34,6 +34,7 @@ fn ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {
         connection_id: "activation-scope-connection-v2-1".to_owned(),
         state_fence: StateFence::new(test_epoch(7), ResourceGeneration::new(11)?),
         kernel_deadline_unix_ms: 10_000,
+        successor_of: None,
         ticket_sha256: String::new(),
     }
     .with_computed_digest()

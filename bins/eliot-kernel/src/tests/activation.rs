@@ -70,6 +70,7 @@ fn activation_test_entry(deadline: u64) -> (String, AgentActivationPending) {
         connection_id: request.connection_id.clone(),
         state_fence,
         kernel_deadline_unix_ms: deadline,
+        successor_of: None,
         ticket_sha256: "c".repeat(64),
     };
     (
@@ -78,13 +79,14 @@ fn activation_test_entry(deadline: u64) -> (String, AgentActivationPending) {
             ticket,
             request,
             claim_lease_until_unix_ms: None,
+            successor_of: None,
         },
     )
 }
 
 #[cfg(windows)]
 #[test]
-fn activation_claim_lease_retries_transient_resolution_without_duplicate_claim() {
+fn activation_claim_lease_expiry_never_requeues_the_ticket() {
     let (ticket_id, entry) = activation_test_entry(2_000);
     let mut pending = AgentActivationPendingState::default();
     pending.fifo.push_back(ticket_id.clone());
@@ -93,10 +95,12 @@ fn activation_claim_lease_retries_transient_resolution_without_duplicate_claim()
     let first = pending.claim_at(1).expect("first claim");
     assert_eq!(first.ticket_id, "activation-ticket-test");
     assert!(pending.claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS).is_none());
-    let retry = pending
-        .claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS + 1)
-        .expect("claim after lease expiry");
-    assert_eq!(retry, first, "retry reuses the exact Kernel ticket");
+    assert!(
+        pending
+            .claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS + 1)
+            .is_none(),
+        "claim expiry is reconciliation evidence, not a semantic retry"
+    );
 }
 
 #[cfg(windows)]
@@ -225,6 +229,7 @@ fn activation_v2_ticket(ticket_id: &str, deadline: u64) -> AgentActivationResolu
             ResourceGeneration::new(1).expect("resource generation"),
         ),
         kernel_deadline_unix_ms: deadline,
+        successor_of: None,
         ticket_sha256: String::new(),
     }
     .with_computed_digest()
@@ -238,6 +243,16 @@ fn activation_v2_entry(ticket: &AgentActivationResolutionTicket) -> AgentActivat
         ticket: ticket.clone(),
         request: template.request,
         claim_lease_until_unix_ms: None,
+        successor_of: ticket.successor_of.as_ref().map(|predecessor| {
+            eliot_ors::ActivationSuccessorBinding {
+                predecessor_ticket_id: predecessor.predecessor_ticket_id.clone(),
+                predecessor_ticket_sha256: predecessor.predecessor_ticket_sha256.clone(),
+                predecessor_result_sha256: predecessor.predecessor_result_sha256.clone(),
+                dependency_ref: predecessor.dependency_ref.clone(),
+                observed_dependency_revision: predecessor.observed_dependency_revision.clone(),
+                not_before_unix_ms: predecessor.not_before_unix_ms,
+            }
+        }),
     }
 }
 
@@ -330,8 +345,7 @@ fn activation_host_envelope(
 fn activation_kernel_with_ticket(
     name: &str,
     ticket: &AgentActivationResolutionTicket,
-    canonical: Option<eliot_protocol::AgentActivationResolutionResult>,
-    raw: Option<eliot_protocol::AgentActivationResolutionResult>,
+    result: Option<eliot_protocol::AgentActivationResolutionResult>,
 ) -> (std::path::PathBuf, KernelComposition) {
     let root = std::env::temp_dir().join(format!(
         "eliot-kernel-activation-v2-{name}-{}",
@@ -339,6 +353,38 @@ fn activation_kernel_with_ticket(
     ));
     std::fs::create_dir_all(&root).expect("test work root");
     let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    let entry = activation_v2_entry(ticket);
+    kernel
+        .generation_gateway
+        .ors
+        .stage_activation_ticket(
+            &eliot_ors::ActivationLifecycleRecord {
+                ticket_id: ticket.ticket_id.clone(),
+                ticket_sha256: ticket.ticket_sha256.clone(),
+                ticket_payload: serde_json::to_string(ticket).expect("ticket payload"),
+                activation_request_id: entry.request.request_identity.request.metadata.request_id.as_str().to_owned(),
+                activation_request_sha256: entry.request.request_sha256.clone(),
+                connection_id: ticket.connection_id.clone(),
+                state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
+                kernel_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
+                cancellation_id: entry.request.request_identity.cancellation_id.clone(),
+                state: eliot_ors::ActivationLifecycleState::Pending,
+                lifecycle_order: 0,
+                result_sha256: None,
+                claim_owner: None,
+                claim_expires_at_unix_ms: None,
+                successor_of: entry.successor_of.clone(),
+                successor_ticket_id: None,
+                terminal_reason: None,
+            },
+            1,
+        )
+        .expect("stage activation lifecycle");
+    kernel
+        .generation_gateway
+        .ors
+        .claim_activation_ticket(&ticket.ticket_id, "eliotd", 2, 3)
+        .expect("claim activation lifecycle");
     {
         let mut pending = kernel
             .agent_activation_pending
@@ -346,30 +392,17 @@ fn activation_kernel_with_ticket(
             .expect("pending lock");
         pending
             .entries
-            .insert(ticket.ticket_id.clone(), activation_v2_entry(ticket));
-        if let Some(result) = canonical {
-            pending.retain_activation_result(AgentActivationResultRecord {
-                result,
-                phase: AgentActivationResultPhase::AcceptedTerminal,
-                ticket_connection: ticket.connection_id.clone(),
-                retention_order: 0,
-            });
+            .insert(ticket.ticket_id.clone(), entry);
+        if let Some(result) = result {
+            kernel
+                .retain_activation_result_durably(
+                    &mut pending,
+                    ticket,
+                    &result,
+                    AgentActivationResultPhase::AcceptedTerminal,
+                )
+                .expect("retain activation result");
         }
-    }
-    if let Some(result) = raw {
-        kernel
-            .agent_activation_results
-            .lock()
-            .expect("raw result lock")
-            .insert(
-                ticket.ticket_id.clone(),
-                AgentActivationResultRecord {
-                    result,
-                    phase: AgentActivationResultPhase::AcceptedTerminal,
-                    ticket_connection: ticket.connection_id.clone(),
-                    retention_order: 0,
-                },
-            );
     }
     (root, kernel)
 }
@@ -677,12 +710,44 @@ fn activation_kernel_with_live_bridge_ticket(
     let ticket = ticket
         .with_computed_digest()
         .expect("live bridge ticket digest");
+    let entry = activation_v2_entry(&ticket);
+    kernel
+        .generation_gateway
+        .ors
+        .stage_activation_ticket(
+            &eliot_ors::ActivationLifecycleRecord {
+                ticket_id: ticket.ticket_id.clone(),
+                ticket_sha256: ticket.ticket_sha256.clone(),
+                ticket_payload: serde_json::to_string(&ticket).expect("ticket payload"),
+                activation_request_id: entry.request.request_identity.request.metadata.request_id.as_str().to_owned(),
+                activation_request_sha256: entry.request.request_sha256.clone(),
+                connection_id: ticket.connection_id.clone(),
+                state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
+                kernel_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
+                cancellation_id: entry.request.request_identity.cancellation_id.clone(),
+                state: eliot_ors::ActivationLifecycleState::Pending,
+                lifecycle_order: 0,
+                result_sha256: None,
+                claim_owner: None,
+                claim_expires_at_unix_ms: None,
+                successor_of: entry.successor_of.clone(),
+                successor_ticket_id: None,
+                terminal_reason: None,
+            },
+            1,
+        )
+        .expect("stage live activation lifecycle");
+    kernel
+        .generation_gateway
+        .ors
+        .claim_activation_ticket(&ticket.ticket_id, "eliotd", 2, 3)
+        .expect("claim live activation lifecycle");
     kernel
         .agent_activation_pending
         .lock()
         .expect("pending lock")
         .entries
-        .insert(ticket.ticket_id.clone(), activation_v2_entry(&ticket));
+        .insert(ticket.ticket_id.clone(), entry);
     (root, kernel, ticket)
 }
 
@@ -705,6 +770,47 @@ fn activation_retention_record(
 }
 
 #[cfg(windows)]
+fn retain_test_activation_result(
+    ors: &eliot_ors::RedbRecoveryStore,
+    ticket: &AgentActivationResolutionTicket,
+    result: &eliot_protocol::AgentActivationResolutionResult,
+) {
+    let entry = activation_v2_entry(ticket);
+    ors.stage_activation_ticket(
+        &eliot_ors::ActivationLifecycleRecord {
+            ticket_id: ticket.ticket_id.clone(),
+            ticket_sha256: ticket.ticket_sha256.clone(),
+            ticket_payload: serde_json::to_string(ticket).expect("ticket payload"),
+            activation_request_id: entry.request.request_identity.request.metadata.request_id.as_str().to_owned(),
+            activation_request_sha256: entry.request.request_sha256.clone(),
+            connection_id: ticket.connection_id.clone(),
+            state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
+            kernel_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
+            cancellation_id: entry.request.request_identity.cancellation_id.clone(),
+            state: eliot_ors::ActivationLifecycleState::Pending,
+            lifecycle_order: 0,
+            result_sha256: None,
+            claim_owner: None,
+            claim_expires_at_unix_ms: None,
+            successor_of: None,
+            successor_ticket_id: None,
+            terminal_reason: None,
+        },
+        1,
+    )
+    .expect("stage activation lifecycle");
+    ors.claim_activation_ticket(&ticket.ticket_id, "eliotd", 2, 3)
+        .expect("claim activation lifecycle");
+    ors.commit_activation_result(
+        &activation_retention_record(ticket, result),
+        "eliotd",
+        None,
+        2,
+    )
+    .expect("commit activation result");
+}
+
+#[cfg(windows)]
 #[test]
 fn activation_result_ledger_rehydrates_without_bridge_state_or_session() {
     let root = std::env::temp_dir().join(format!(
@@ -717,24 +823,28 @@ fn activation_result_ledger_rehydrates_without_bridge_state_or_session() {
     let result = activation_v2_resolved(&ticket, 1_000);
     let ors_path = root.join(".eliot").join("kernel-ors.redb");
     let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
-    ors.retain_activation_result(&activation_retention_record(&ticket, &result))
-        .expect("retain activation result");
+    retain_test_activation_result(&ors, &ticket, &result);
     drop(ors);
 
     let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("rehydrate kernel");
-    let ledger = kernel
-        .agent_activation_results
+    let pending = kernel
+        .agent_activation_pending
         .lock()
-        .expect("result ledger lock");
-    assert_eq!(ledger.len(), 1);
+        .expect("activation state lock");
+    assert_eq!(pending.results.len(), 1);
     assert_eq!(
-        ledger
+        pending
+            .results
             .get(&ticket.ticket_id)
             .expect("rehydrated ticket")
             .result,
         result
     );
-    drop(ledger);
+    assert_eq!(
+        pending.lifecycle(&ticket.ticket_id),
+        AgentActivationLifecycle::Accepted
+    );
+    drop(pending);
     assert!(
         kernel
             .agent_activation_pending
@@ -758,7 +868,7 @@ fn activation_result_ledger_rehydrates_without_bridge_state_or_session() {
         .expect("rehydrated result reconciles");
     assert_eq!(
         ack.outcome,
-        eliot_protocol::AgentActivationResultAckOutcome::Reconciled
+        eliot_protocol::AgentActivationResultAckOutcome::Accepted
     );
     let missing =
         AgentActivationResultReconcile::new("activation-ticket-missing".to_owned(), "f".repeat(64))
@@ -789,8 +899,7 @@ fn activation_result_ledger_typed_corruption_fences_startup() {
     result.ticket_sha256 = "e".repeat(64);
     let ors_path = root.join(".eliot").join("kernel-ors.redb");
     let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
-    ors.retain_activation_result(&activation_retention_record(&ticket, &result))
-        .expect("retain typed-corrupt result");
+    retain_test_activation_result(&ors, &ticket, &result);
     drop(ors);
 
     let Err(error) = KernelComposition::new(KernelConfig::new(&root)) else {
@@ -806,7 +915,7 @@ fn activation_host_request_resolves_canonical_v2_envelope_result() {
     let ticket = activation_v2_ticket("activation-ticket-v2", 2_000);
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) =
-        activation_kernel_with_ticket("canonical", &ticket, Some(result.clone()), None);
+        activation_kernel_with_ticket("canonical", &ticket, Some(result.clone()));
     let envelope = activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
     let resolved = kernel
         .host_request_activation_resolution(&envelope)
@@ -819,71 +928,10 @@ fn activation_host_request_resolves_canonical_v2_envelope_result() {
 
 #[cfg(windows)]
 #[test]
-fn activation_host_request_falls_back_to_raw_result_map() {
-    let ticket = activation_v2_ticket("activation-ticket-raw", 2_000);
-    let result = activation_v2_resolved(&ticket, 1_000);
-    let (root, kernel) =
-        activation_kernel_with_ticket("raw-fallback", &ticket, None, Some(result.clone()));
-    let envelope = activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
-    let resolved = kernel
-        .host_request_activation_resolution(&envelope)
-        .expect("raw P-04 result must stay addressable");
-    assert_eq!(resolved.result_sha256, result.result_sha256);
-    drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[cfg(windows)]
-#[test]
-fn activation_host_request_conflicting_ledgers_fail_closed() {
-    let ticket = activation_v2_ticket("activation-ticket-priority", 2_000);
-    let canonical = activation_v2_resolved(&ticket, 1_000);
-    let raw = activation_v2_resolved(&ticket, 1_001);
-    assert_ne!(
-        canonical.result_sha256, raw.result_sha256,
-        "fixture requires two distinct result identities"
-    );
-    let (root, kernel) =
-        activation_kernel_with_ticket("priority", &ticket, Some(canonical.clone()), Some(raw));
-    let envelope =
-        activation_host_envelope(&ticket, &canonical.result_sha256, &ticket.connection_id);
-    let error = kernel
-        .host_request_activation_resolution(&envelope)
-        .expect_err("conflicting ledger entries for one ticket must conflict");
-    assert!(
-        matches!(error, TransportError::IdentityConflict),
-        "unexpected error: {error:?}"
-    );
-    drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[cfg(windows)]
-#[test]
-fn activation_host_request_matching_ledgers_stay_idempotent() {
-    let ticket = activation_v2_ticket("activation-ticket-dual-match", 2_000);
-    let result = activation_v2_resolved(&ticket, 1_000);
-    let (root, kernel) = activation_kernel_with_ticket(
-        "dual-match",
-        &ticket,
-        Some(result.clone()),
-        Some(result.clone()),
-    );
-    let envelope = activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
-    let resolved = kernel
-        .host_request_activation_resolution(&envelope)
-        .expect("exact digest match across both ledgers stays idempotent");
-    assert_eq!(resolved.result_sha256, result.result_sha256);
-    drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[cfg(windows)]
-#[test]
 fn activation_host_request_without_any_result_is_unknown() {
     let ticket = activation_v2_ticket("activation-ticket-unknown", 2_000);
     let probe = activation_v2_resolved(&ticket, 1_000);
-    let (root, kernel) = activation_kernel_with_ticket("unknown", &ticket, None, None);
+    let (root, kernel) = activation_kernel_with_ticket("unknown", &ticket, None);
     let envelope = activation_host_envelope(&ticket, &probe.result_sha256, &ticket.connection_id);
     let error = kernel
         .host_request_activation_resolution(&envelope)
@@ -902,7 +950,7 @@ fn activation_host_request_non_resolved_v2_fails_closed() {
     let ticket = activation_v2_ticket("activation-ticket-negative", 2_000);
     let failed = activation_v2_failed(&ticket, 1_000);
     let (root, kernel) =
-        activation_kernel_with_ticket("negative", &ticket, Some(failed.clone()), None);
+        activation_kernel_with_ticket("negative", &ticket, Some(failed.clone()));
     let envelope = activation_host_envelope(&ticket, &failed.result_sha256, &ticket.connection_id);
     let error = kernel
         .host_request_activation_resolution(&envelope)
@@ -921,7 +969,7 @@ fn activation_host_request_wrong_connection_fails_closed() {
     let ticket = activation_v2_ticket("activation-ticket-conn", 2_000);
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) =
-        activation_kernel_with_ticket("connection", &ticket, Some(result.clone()), None);
+        activation_kernel_with_ticket("connection", &ticket, Some(result.clone()));
     let envelope = activation_host_envelope(&ticket, &result.result_sha256, "other-connection");
     let error = kernel
         .host_request_activation_resolution(&envelope)
@@ -949,7 +997,7 @@ fn activation_host_request_projected_retry_answers_from_retained_result() {
     let ticket = activation_v2_ticket("activation-ticket-projected-retry-203", 2_000);
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) =
-        activation_kernel_with_ticket("projected-retry-203", &ticket, Some(result.clone()), None);
+        activation_kernel_with_ticket("projected-retry-203", &ticket, Some(result.clone()));
     // Project the bridge leg: the pending entry is consumed but the exact
     // v2 record stays retained for replay/reconcile.
     {
@@ -992,7 +1040,7 @@ fn activation_host_request_projected_retry_wrong_connection_fails_closed() {
     let ticket = activation_v2_ticket("activation-ticket-projected-conn-203", 2_000);
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) =
-        activation_kernel_with_ticket("projected-conn-203", &ticket, Some(result.clone()), None);
+        activation_kernel_with_ticket("projected-conn-203", &ticket, Some(result.clone()));
     {
         let mut pending = kernel
             .agent_activation_pending
@@ -1014,61 +1062,6 @@ fn activation_host_request_projected_retry_wrong_connection_fails_closed() {
 
 #[cfg(windows)]
 #[test]
-fn activation_raw_negative_projection_rejects_tampered_result_with_pending_preserved() {
-    use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
-
-    let ticket = activation_v2_ticket("activation-ticket-raw-tamper-203", 2_000);
-    let valid = activation_v2_failed(&ticket, 1_000);
-    let (root, kernel) =
-        activation_kernel_with_ticket("raw-tamper-203", &ticket, None, Some(valid.clone()));
-    let mut tampered = valid.clone();
-    tampered.ticket_sha256 = "0".repeat(64);
-    let frame = Frame {
-        protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
-        encoding_profile: EncodingProfile::JsonV1,
-        connection_id: ticket.connection_id.clone(),
-        request_id: None,
-        kind: FrameKind::Request,
-        message_type: MessageType::Execute,
-        request_identity: None,
-        payload: ProtocolPayload::Json(serde_json::Value::Null),
-        trace_context: std::collections::BTreeMap::new(),
-    };
-    let error = kernel
-        .activation_result_response(&ticket.connection_id, &frame, &ticket.ticket_id, &tampered)
-        .expect_err("tampered negative result must be rejected before mutation");
-    assert!(
-        matches!(error, TransportError::SessionFenced),
-        "unexpected error: {error:?}"
-    );
-    // Pending evidence is preserved: the exact ticket entry and the retained
-    // raw result survive the rejected projection verbatim.
-    {
-        let pending = kernel
-            .agent_activation_pending
-            .lock()
-            .expect("pending lock");
-        assert!(
-            pending.entries.contains_key(&ticket.ticket_id),
-            "rejected projection must preserve the pending entry"
-        );
-    }
-    {
-        let results = kernel
-            .agent_activation_results
-            .lock()
-            .expect("raw result lock");
-        let retained = results
-            .get(&ticket.ticket_id)
-            .expect("rejected projection must preserve the retained result");
-        assert_eq!(retained.result.result_sha256, valid.result_sha256);
-    }
-    drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[cfg(windows)]
-#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the restart test keeps direct-seed and live-bridge routes side by side"
@@ -1077,10 +1070,13 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
     let no_result_ticket = activation_v2_ticket("activation-ticket-no-result-deadline", 2_000);
     let no_result = activation_v2_failed(&no_result_ticket, 1_000);
     let (no_result_root, no_result_kernel) =
-        activation_kernel_with_ticket("no-result-deadline", &no_result_ticket, None, None);
+        activation_kernel_with_ticket("no-result-deadline", &no_result_ticket, None);
 
     let timeout = no_result_kernel
-        .submit_agent_activation_resolution_result(no_result.clone())
+        .submit_agent_activation_result(
+            eliot_protocol::AgentActivationResultSubmit::new(no_result.clone())
+                .expect("no-result submit"),
+        )
         .expect_err("a result-less expired ticket must return Timeout");
     assert!(
         matches!(timeout, TransportError::Timeout),
@@ -1090,7 +1086,10 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
     let restarted_no_result = KernelComposition::new(KernelConfig::new(&no_result_root))
         .expect("restart without a retained result");
     let unknown_after_restart = restarted_no_result
-        .submit_agent_activation_resolution_result(no_result.clone())
+        .submit_agent_activation_result(
+            eliot_protocol::AgentActivationResultSubmit::new(no_result.clone())
+                .expect("no-result submit"),
+        )
         .expect_err("a result-less ticket is not restored as a pending entry");
     assert!(
         matches!(unknown_after_restart, TransportError::UnknownRequest),
@@ -1134,7 +1133,7 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
         .expect("exact commit-route terminal negative replay after restart");
     assert_eq!(
         commit_replay.outcome,
-        eliot_protocol::AgentActivationResultAckOutcome::ExactReplay
+        eliot_protocol::AgentActivationResultAckOutcome::Accepted
     );
     assert_eq!(commit_replay.result, Some(commit_failed.clone()));
 
@@ -1168,8 +1167,7 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
     std::fs::create_dir_all(retained_root.join(".eliot")).expect("retained test root");
     let ors_path = retained_root.join(".eliot").join("kernel-ors.redb");
     let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open retained ORS");
-    ors.retain_activation_result(&activation_retention_record(&ticket, &failed))
-        .expect("retain terminal negative");
+    retain_test_activation_result(&ors, &ticket, &failed);
     drop(ors);
 
     let kernel = KernelComposition::new(KernelConfig::new(&retained_root))
@@ -1191,7 +1189,7 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
         .expect("exact terminal negative replay after restart");
     assert_eq!(
         replay.outcome,
-        eliot_protocol::AgentActivationResultAckOutcome::ExactReplay
+        eliot_protocol::AgentActivationResultAckOutcome::Accepted
     );
     assert_eq!(replay.result, Some(failed.clone()));
 
@@ -1211,17 +1209,6 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
     assert!(
         matches!(conflict, TransportError::IdentityConflict),
         "unexpected changed replay error: {conflict:?}"
-    );
-
-    kernel
-        .submit_agent_activation_resolution_result(failed)
-        .expect("raw exact terminal negative replay after restart");
-    let raw_conflict = kernel
-        .submit_agent_activation_resolution_result(changed)
-        .expect_err("raw changed replay after restart must conflict");
-    assert!(
-        matches!(raw_conflict, TransportError::IdentityConflict),
-        "unexpected raw changed replay error: {raw_conflict:?}"
     );
 
     drop(kernel);

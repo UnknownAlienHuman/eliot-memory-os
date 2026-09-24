@@ -2210,6 +2210,8 @@ pub struct CanonicalAdmissionOwner {
 #[serde(deny_unknown_fields)]
 pub struct GovernorActivationSnapshot {
     pub state_fence: StateFence,
+    /// Current canonical owner revision observed with this snapshot.
+    pub owner_revision: u64,
     pub principal_id: String,
     pub session_id: String,
     pub task_id: TaskId,
@@ -4689,6 +4691,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         Ok(GovernorActivationSnapshot {
             state_fence,
+            owner_revision: self.owners.canonical.owner_revision(),
             principal_id: work.session.principal_id,
             session_id: work.session.session_id,
             task_id,
@@ -4700,6 +4703,26 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         })
     }
 
+    /// Returns the current canonical owner revision used by activation
+    /// dependency observations.
+    #[must_use]
+    pub fn activation_owner_revision(&self) -> u64 {
+        self.owners.canonical.owner_revision()
+    }
+
+    /// Returns the current revision of the named activation-readiness
+    /// dependency. The value combines the canonical owner revision with the
+    /// live readiness phase, so a successor cannot claim material change from
+    /// elapsed time alone.
+    #[must_use]
+    pub fn activation_dependency_revision(&self) -> String {
+        format!(
+            "{}:{:?}",
+            self.owners.canonical.owner_revision(),
+            self.readiness
+        )
+    }
+
     /// Governor-internal typed semantic outcome for activation resolution.
     ///
     /// This is the sole typed discriminator; it classifies every resolver path
@@ -4707,19 +4730,20 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// map losslessly to the protocol v2 result; dropping an error variant is a
     /// composition defect.
     pub fn resolve_activation_outcome(&self, now: u64) -> GovernorActivationOutcome {
+        let dependency_revision = self.activation_dependency_revision();
         if self.readiness != CompositionReadiness::Ready {
             return GovernorActivationOutcome::NotReady {
                 recovery_handle: "governor.readiness:not-ready".to_owned(),
                 retry: GovernorRetryDirective::new(
                     "governor.readiness",
-                    format!("{:?}", self.readiness),
+                    dependency_revision,
                     now.saturating_add(1).max(1),
                 ),
             };
         }
         match self.read_unique_agent_activation(now) {
             Ok(snapshot) => GovernorActivationOutcome::Resolved(snapshot),
-            Err(error) => classify_activation_error(&error, now),
+            Err(error) => classify_activation_error(&error, now, &dependency_revision),
         }
     }
 
@@ -4882,7 +4906,11 @@ fn validate_service_observations(
     Ok(())
 }
 
-fn classify_activation_error(error: &CompositionError, now: u64) -> GovernorActivationOutcome {
+fn classify_activation_error(
+    error: &CompositionError,
+    now: u64,
+    dependency_revision: &str,
+) -> GovernorActivationOutcome {
     let message = error.to_string();
     // NotReady is the only transient retry signal.
     if matches!(error, CompositionError::NotReady)
@@ -4893,7 +4921,7 @@ fn classify_activation_error(error: &CompositionError, now: u64) -> GovernorActi
             recovery_handle: "governor.readiness:not-ready".to_owned(),
             retry: GovernorRetryDirective::new(
                 "governor.readiness",
-                message.clone(),
+                dependency_revision.to_owned(),
                 now.saturating_add(1).max(1),
             ),
         };
@@ -6713,6 +6741,7 @@ mod tests {
                 "task revision does not match the activation fence".to_owned(),
             ),
             20,
+            "1:Ready",
         );
         assert_eq!(stale.kind_str(), "STALE_FENCE");
         assert!(!stale.is_resolved());
@@ -6723,6 +6752,7 @@ mod tests {
                 "session lifecycle record is not an exact active activation match".to_owned(),
             ),
             20,
+            "1:Ready",
         );
         // This particular message is treated as FailedInternal by the classifier
         // (it does not match the narrow TaskSelection pattern), proving that

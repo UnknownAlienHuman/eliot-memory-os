@@ -1528,6 +1528,7 @@ mod tests {
                     plan_revision: "plan-revision-1".to_owned(),
                 }),
             },
+            resolution: None,
             response_sha256: String::new(),
         }
         .with_computed_digest()

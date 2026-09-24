@@ -15,7 +15,7 @@
 //! Public construction semantics remain on `KernelComposition`; this ordinary
 //! module only houses their implementation.
 use super::{
-    AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityEpoch,
+    ArtifactId, AuthorityDescriptorContour, AuthorityEpoch,
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
     AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner,
     ContractId, DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId,
@@ -1249,7 +1249,7 @@ impl KernelComposition {
         #[cfg(not(windows))]
         let store_handoff_init = None;
         #[cfg(windows)]
-        let agent_activation_results = Self::rehydrate_agent_activation_results(&ors)?;
+        let agent_activation_pending = Self::rehydrate_agent_activation_state(&ors)?;
         // Implements #1967: start the ordered I1.11 coordinator at step zero.
         // Composition construction alone does not prove Host-owned startup,
         // Blob manifest, Store readiness, reconciliation, handshake, mirror,
@@ -1387,11 +1387,9 @@ impl KernelComposition {
             #[cfg(windows)]
             agent_bridge_connections: Mutex::new(BTreeMap::new()),
             #[cfg(windows)]
-            agent_activation_pending: Mutex::new(AgentActivationPendingState::default()),
+            agent_activation_pending: Mutex::new(agent_activation_pending),
             #[cfg(windows)]
             agent_activation_changed: tokio::sync::Notify::new(),
-            #[cfg(windows)]
-            agent_activation_results: Mutex::new(agent_activation_results),
             #[cfg(windows)]
             host_request_connection_index: Mutex::new(BTreeMap::new()),
             #[cfg(windows)]

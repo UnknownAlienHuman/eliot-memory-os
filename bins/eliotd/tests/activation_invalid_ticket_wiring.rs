@@ -50,6 +50,7 @@ fn valid_ticket() -> TestResult<AgentActivationResolutionTicket> {
         connection_id: "activation-connection-202-1".to_owned(),
         state_fence: test_fence()?,
         kernel_deadline_unix_ms: 10_000,
+        successor_of: None,
         ticket_sha256: String::new(),
     }
     .with_computed_digest()

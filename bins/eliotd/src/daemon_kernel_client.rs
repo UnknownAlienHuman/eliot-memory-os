@@ -271,14 +271,24 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        let ack_value = value.get("ack").cloned().ok_or_else(|| {
-            super::DaemonError::Kernel("Kernel submit response omitted acknowledgement".to_owned())
-        })?;
-        let ack: AgentActivationResultAck = serde_json::from_value(ack_value)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ActivationSubmitResponse {
+            accepted: bool,
+            ack: AgentActivationResultAck,
+        }
+        let response: ActivationSubmitResponse = serde_json::from_value(value)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        ack.validate()
+        if !response.accepted {
+            return Err(super::DaemonError::Kernel(
+                "Kernel submit response was not accepted".to_owned(),
+            ));
+        }
+        response
+            .ack
+            .validate_against_result(result)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        Ok(ack)
+        Ok(response.ack)
     }
 
     #[cfg(windows)]
@@ -296,16 +306,25 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        let ack_value = value.get("ack").cloned().ok_or_else(|| {
-            super::DaemonError::Kernel(
-                "Kernel reconcile response omitted acknowledgement".to_owned(),
-            )
-        })?;
-        let ack: AgentActivationResultAck = serde_json::from_value(ack_value)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ActivationReconcileResponse {
+            ack: AgentActivationResultAck,
+        }
+        let response: ActivationReconcileResponse = serde_json::from_value(value)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        ack.validate()
+        response
+            .ack
+            .validate()
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        Ok(ack)
+        if response.ack.replay_key()
+            != (query.ticket_id.as_str(), query.result_sha256.as_str())
+        {
+            return Err(super::DaemonError::Kernel(
+                "Kernel reconcile response identity mismatch".to_owned(),
+            ));
+        }
+        Ok(response.ack)
     }
 
     pub fn connect(config: &super::DaemonConfig) -> Result<Arc<Self>, super::DaemonError> {

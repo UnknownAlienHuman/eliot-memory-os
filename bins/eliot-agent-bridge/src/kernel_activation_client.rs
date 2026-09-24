@@ -104,21 +104,28 @@ pub(super) fn denial_directive_kind(code: AgentBridgeActivationDenialCode) -> &'
     }
 }
 
-/// I7.20 agent-facing projection triple for a typed activation denial.
-///
-/// Returns `(reason_code, disposition, directive_kind)` by routing through
-/// [`denial_reason_code`], [`agent_disposition_for_denial`], and
-/// [`denial_directive_kind`]. Carries the I7.20 disposition/directive literals
-/// inline (no core-crate const import); the core crate also projects the same
-/// triple through the `ActivationPortOutcome::DeniedDetailed` carrier.
-pub(super) fn denied_details_for(
+/// Projects the closed Kernel denial code to the current I7.20 alias
+/// catalogue. The typed result remains the source of candidate/retry/failure
+/// detail; this function only supplies the stable control reason.
+fn agent_reason_code(
     code: AgentBridgeActivationDenialCode,
-) -> (&'static str, &'static str, &'static str) {
-    (
-        denial_reason_code(code),
-        agent_disposition_for_denial(code),
-        denial_directive_kind(code),
-    )
+    has_semantic_result: bool,
+) -> &'static str {
+    match code {
+        AgentBridgeActivationDenialCode::ScopeAmbiguous => {
+            eliot_protocol::AGENT_BRIDGE_AMBIGUOUS_RESULT
+        }
+        AgentBridgeActivationDenialCode::StaleFence => {
+            eliot_protocol::AGENT_BRIDGE_STALE_STATE_FENCE
+        }
+        AgentBridgeActivationDenialCode::SemanticResolutionUnavailable if has_semantic_result => {
+            eliot_protocol::AGENT_BRIDGE_UNKNOWN_OUTCOME
+        }
+        AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
+            eliot_protocol::AGENT_BRIDGE_DEADLINE_EXCEEDED
+        }
+        other => denial_reason_code(other),
+    }
 }
 
 /// Transport failure stays distinct from a typed denial: deadline/unknown
@@ -387,22 +394,26 @@ impl KernelTransportOwner {
         })?;
         let response =
             decode_activation_response(&wire, &activation_request, &self.admitted.receipt)?;
+        let resolution = response.resolution.clone().map(Box::new);
         match response.disposition {
             eliot_protocol::AgentBridgeActivationDisposition::Denied { reason_code } => {
-                // I7.20 agent-facing projection: (reason_code, disposition, directive)
-                // triple. Selection denials carry candidate-recovery with no
-                // auto-selection; NOT_READY requires a new ticket on retry; stale
-                // fence is fail-closed; internal/semantic failures resolve to the
-                // distinct failure capsule. Transport ProviderFailure stays
-                // distinct: deadline/unknown never collapses into a known negative.
-                let (code_str, disposition, directive) = denied_details_for(reason_code);
-                debug_assert_eq!(code_str, denial_reason_code(reason_code));
-                assert!(!disposition.is_empty());
-                assert!(!directive.is_empty());
+                // I7.20 agent-facing projection: the closed control triple is
+                // paired with the exact typed semantic result. Selection,
+                // retry, fence, and failure details therefore survive the
+                // Kernel -> port -> core boundary instead of being rebuilt
+                // from a reason string.
+                let (disposition, directive) = (
+                    agent_disposition_for_denial(reason_code),
+                    denial_directive_kind(reason_code),
+                );
+                let code_str = agent_reason_code(reason_code, resolution.is_some());
+                debug_assert!(!disposition.is_empty());
+                debug_assert!(!directive.is_empty());
                 Ok(ActivationPortOutcome::DeniedDetailed {
                     reason_code: code_str,
                     disposition,
                     directive_kind: directive,
+                    resolution,
                 })
             }
             eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } => {

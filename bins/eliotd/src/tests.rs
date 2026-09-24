@@ -47,6 +47,7 @@ fn resolution_ticket() -> Result<AgentActivationResolutionTicket, Box<dyn std::e
         connection_id: "connection-1".to_owned(),
         state_fence: StateFence::new(test_epoch(1)?, ResourceGeneration::new(1)?),
         kernel_deadline_unix_ms: 100,
+        successor_of: None,
         ticket_sha256: String::new(),
     }
     .with_computed_digest()
@@ -60,6 +61,7 @@ fn semantic_resolution_mapping_is_immutable_and_ticket_bound()
     ticket.validate()?;
     let snapshot = eliot_governor::GovernorActivationSnapshot {
         state_fence: ticket.state_fence.clone(),
+        owner_revision: 1,
         principal_id: "principal-1".to_owned(),
         session_id: "session-1".to_owned(),
         task_id: eliot_contracts::TaskId::new("task-1")?,

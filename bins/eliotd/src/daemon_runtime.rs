@@ -1280,12 +1280,15 @@ fn classify_submit_ack(
             ticket.ticket_id
         )));
     }
+    ack.validate_against_result(result).map_err(|error| {
+        ActivationDispatchError::Hard(format!(
+            "Kernel activation result ack payload mismatch: {error}"
+        ))
+    })?;
     match ack.outcome {
-        AgentActivationResultAckOutcome::Accepted
-        | AgentActivationResultAckOutcome::ExactReplay
-        | AgentActivationResultAckOutcome::Reconciled => {
-            // #740: ack record. Accepted/replayed/reconciled correlation is
-            // not completed work; no completion is claimed here.
+        AgentActivationResultAckOutcome::Accepted => {
+            // #740: ack record. Stable retained-result correlation is not
+            // completed work; no completion is claimed here.
             let _ = eliotd::diagnostics::emit_activation_ack(
                 &ticket.ticket_id,
                 &result.result_sha256,
@@ -1314,9 +1317,12 @@ fn classify_reconcile_ack(
     submit_detail: &str,
 ) -> Result<(), ActivationDispatchError> {
     match ack.outcome {
-        AgentActivationResultAckOutcome::Accepted
-        | AgentActivationResultAckOutcome::ExactReplay
-        | AgentActivationResultAckOutcome::Reconciled => {
+        AgentActivationResultAckOutcome::Accepted => {
+            ack.validate_against_result(result).map_err(|error| {
+                ActivationDispatchError::Hard(format!(
+                    "Kernel activation reconcile ack payload mismatch: {error}"
+                ))
+            })?;
             // #740: reconcile-ack record. Reconciled retention is not
             // completed work; no completion is claimed here.
             let _ = eliotd::diagnostics::emit_activation_ack(
@@ -1343,15 +1349,12 @@ fn classify_reconcile_ack(
     }
 }
 
-/// Observes the transient `NotReady` deferral coupling without adding retry
-/// policy. Reconsideration requires the declared due time (`not_before`) plus
-/// fresh Governor evidence (changed named dependency revision); Kernel owns
-/// that gate (`bins/eliot-kernel/src/agent_bridge.rs::not_ready_supersede_allowed`,
-/// `bins/eliot-kernel/src/lib.rs::AgentActivationResultPhase::DeferredNotReady`).
-/// Claim-lease expiry alone never triggers a daemon retry, and this loop keeps
-/// no cache or timer for it: the next Kernel-issued claim drives any gated
-/// supersede, and a changed same-ticket result that misses the gate conflicts
-/// on the submit path.
+/// Observes the transient `NotReady` deferral without adding retry policy.
+/// The predecessor result remains immutable. Reconsideration is possible only
+/// through a fresh Kernel-issued successor ticket after the declared due time
+/// (`not_before`) and only when the named dependency revision has materially
+/// changed; Kernel owns that gate. Claim-lease expiry never triggers reuse, and
+/// any changed result under the predecessor ticket is an identity conflict.
 fn observe_transient_deferral(result: &AgentActivationResolutionResult) {
     if result.is_transient_retry() {
         if let Some(not_before) = transient_not_before(result) {
@@ -2272,6 +2275,7 @@ mod tests {
             connection_id: "connection-1".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
+            successor_of: None,
             ticket_sha256: String::new(),
         }
         .with_computed_digest()
@@ -2346,6 +2350,7 @@ mod tests {
             connection_id: "connection-23".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
+            successor_of: None,
             ticket_sha256: String::new(),
         }
         .with_computed_digest()
@@ -2430,6 +2435,7 @@ mod tests {
             connection_id: "connection-24".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
+            successor_of: None,
             ticket_sha256: String::new(),
         }
         .with_computed_digest()
@@ -2475,11 +2481,11 @@ mod tests {
             other => panic!("expected typed Unknown, got {other:?}"),
         }
 
-        // A durable retained record surviving the reconnect answers the same
-        // query as Reconciled. The daemon settles the original result
-        // identity verbatim; it never asks Governor to resolve the ticket a
-        // second time.
-        let reconciled = AgentActivationResultAck::reconciled(&result).expect("reconciled ack");
+        // A durable retained record surviving the reconnect answers with the
+        // same stable positive acknowledgement. The daemon settles the
+        // original result identity verbatim and never asks Governor to resolve
+        // the ticket a second time.
+        let reconciled = AgentActivationResultAck::accepted(&result).expect("reconciled ack");
         classify_reconcile_ack(
             &ticket,
             &result,
@@ -2527,6 +2533,7 @@ mod tests {
             connection_id: "connection-25".to_owned(),
             state_fence: fence,
             kernel_deadline_unix_ms: 100,
+            successor_of: None,
             ticket_sha256: String::new(),
         }
         .with_computed_digest()
@@ -2541,21 +2548,20 @@ mod tests {
         .expect("valid test result");
         let original_sha = result.result_sha256.clone();
 
-        // Every positive acknowledgement settles with unit and echoes the
-        // retained result verbatim. The classifier takes only the ticket,
-        // the retained result, and the ack: no composition or session
-        // handle enters, so no Session, authority, or Finish can be minted
-        // on this path.
-        for ack in [
-            AgentActivationResultAck::accepted(&result).expect("accept ack"),
-            AgentActivationResultAck::replayed(&result).expect("replay ack"),
-            AgentActivationResultAck::reconciled(&result).expect("reconcile ack"),
-        ] {
-            classify_submit_ack(&ticket, &result, &ack).expect("positive ack settles");
-            assert_eq!(ack.ticket_id, ticket.ticket_id);
-            assert_eq!(ack.result_sha256, result.result_sha256);
-            assert_eq!(ack.result.as_ref(), Some(&result));
-        }
+        // The single positive acknowledgement shape settles with unit and
+        // echoes the retained result verbatim. Fresh commit, exact replay,
+        // and reconcile all use these identical bytes. The classifier takes
+        // only the ticket, retained result, and ack: no composition or Session
+        // handle enters, so no Session, authority, or Finish can be minted.
+        let ack = AgentActivationResultAck::accepted(&result).expect("accept ack");
+        let replay_ack = AgentActivationResultAck::accepted(&result).expect("replay ack");
+        let reconcile_ack = AgentActivationResultAck::accepted(&result).expect("reconcile ack");
+        assert_eq!(ack, replay_ack);
+        assert_eq!(ack, reconcile_ack);
+        classify_submit_ack(&ticket, &result, &ack).expect("positive ack settles");
+        assert_eq!(ack.ticket_id, ticket.ticket_id);
+        assert_eq!(ack.result_sha256, result.result_sha256);
+        assert_eq!(ack.result.as_ref(), Some(&result));
 
         // Unknown is not a settlement: it preserves the original identity
         // in a typed outcome instead of minting anything.

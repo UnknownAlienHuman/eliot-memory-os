@@ -1265,10 +1265,10 @@ impl KernelDisconnect {
 
 /// Emits the Kernel activation-result acknowledgement record.
 ///
-/// The acknowledgement outcome (`accepted`, `exact-replay`, `reconciled`,
-/// `unknown`) is correlation only: an acknowledgement is never completed
-/// work, so the record carries no completion claim. `Unknown` preserves the
-/// original ticket/result identity verbatim for the shutdown drain.
+/// The stable acknowledgement outcome (`accepted` or `unknown`) is correlation
+/// only: an acknowledgement is never completed work, so the record carries no
+/// completion claim. `Unknown` preserves the original ticket/result identity
+/// verbatim for the shutdown drain.
 pub fn emit_activation_ack(
     ticket_id: &str,
     result_sha256: &str,
@@ -1278,8 +1278,6 @@ pub fn emit_activation_ack(
     let result = sanitize_identity(result_sha256);
     let outcome_text = match outcome {
         AgentActivationResultAckOutcome::Accepted => "accepted",
-        AgentActivationResultAckOutcome::ExactReplay => "exact-replay",
-        AgentActivationResultAckOutcome::Reconciled => "reconciled",
         AgentActivationResultAckOutcome::Unknown => STATE_UNKNOWN,
     };
     emit_line(

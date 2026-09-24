@@ -10,17 +10,21 @@ mod protocol_v1;
 
 pub use protocol_v1::*;
 
+pub mod activation_resolution_v1;
+
 mod activation_resolution;
 pub use activation_resolution::{
     AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_ID, AGENT_ACTIVATION_RESOLUTION_RESULT_WIRE_VERSION,
     AGENT_ACTIVATION_RESULT_ACK_WIRE_ID, AGENT_ACTIVATION_RESULT_ACK_WIRE_VERSION,
     AGENT_ACTIVATION_RESULT_RECONCILE_WIRE_ID, AGENT_ACTIVATION_RESULT_RECONCILE_WIRE_VERSION,
     AGENT_ACTIVATION_RESULT_SUBMIT_WIRE_ID, AGENT_ACTIVATION_RESULT_SUBMIT_WIRE_VERSION,
-    AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
-    AgentActivationResolutionResult, AgentActivationResolvedBinding, AgentActivationResultAck,
-    AgentActivationResultAckOutcome, AgentActivationResultReconcile, AgentActivationResultSubmit,
-    AgentActivationRetryDirective, AgentActivationSelectionDirective,
-    MAX_AGENT_ACTIVATION_CANDIDATES,
+    AgentActivationCandidateCoverage, AgentActivationDependencyObservation,
+    AgentActivationOwnerEvidence, AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult,
+    AgentActivationResolvedBinding, AgentActivationResultAck, AgentActivationResultAckOutcome,
+    AgentActivationResultReconcile, AgentActivationResultSubmit, AgentActivationRetryDirective,
+    AgentActivationSelectionDirective, AGENT_ACTIVATION_OWNER_ID,
+    MAX_AGENT_ACTIVATION_CANDIDATES, binding_digest, decode_agent_activation_result_submit,
 };
 
 mod invalid_ticket;

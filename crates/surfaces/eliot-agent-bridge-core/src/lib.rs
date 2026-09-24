@@ -22,7 +22,9 @@ pub use eliot_observation_contracts::{
 };
 pub use eliot_process::{FencingToken, Generation};
 pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope};
-use eliot_protocol::{EventAckReceipt, EventIdentityKey, ReplayLedger};
+use eliot_protocol::{
+    AgentActivationResolutionResult, EventAckReceipt, EventIdentityKey, ReplayLedger,
+};
 use eliot_skill::{
     ActivatedSkillDisplay, DependencyVersion, HotsetDeliveryAck, HotsetDeliveryReceipt,
     LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
@@ -583,6 +585,9 @@ pub enum ActivationPortOutcome {
         reason_code: &'static str,
         disposition: &'static str,
         directive_kind: &'static str,
+        /// Exact daemon result, when the denial carries semantic detail.
+        /// `None` is reserved for Kernel-owned no-result refusals.
+        resolution: Option<Box<AgentActivationResolutionResult>>,
     },
 }
 
@@ -1011,10 +1016,33 @@ impl AgentBridgeCore {
         let activation = host.activate(&request)?;
         let grant = match activation {
             ActivationPortOutcome::Authenticated(result) => ActivationGrant::seal(result)?,
-            ActivationPortOutcome::Denied { reason_code }
-            | ActivationPortOutcome::DeniedDetailed { reason_code, .. } => {
+            ActivationPortOutcome::Denied { reason_code } => {
                 validate_text(reason_code, "activation_denial.reason_code")?;
                 return Err(BridgeError::ActivationDenied(reason_code));
+            }
+            ActivationPortOutcome::DeniedDetailed {
+                reason_code,
+                disposition,
+                directive_kind,
+                resolution,
+            } => {
+                validate_text(reason_code, "activation_denial.reason_code")?;
+                validate_text(disposition, "activation_denial.disposition")?;
+                validate_text(directive_kind, "activation_denial.directive_kind")?;
+                if let Some(result) = resolution.as_deref() {
+                    result
+                        .validate()
+                        .map_err(|_| BridgeError::InvalidContract {
+                            field: "activation_denial.resolution",
+                            reason: "must be a valid typed semantic result",
+                        })?;
+                }
+                return Err(BridgeError::ActivationDeniedDetailed {
+                    reason_code: reason_code.to_owned(),
+                    disposition: disposition.to_owned(),
+                    directive_kind: directive_kind.to_owned(),
+                    resolution,
+                });
             }
         };
         if let Some(current) = &self.active {
@@ -2027,6 +2055,13 @@ pub enum BridgeError {
     NotAttached,
     #[error("activation denied by the trusted host provider: {0}")]
     ActivationDenied(&'static str),
+    #[error("activation denied by the trusted host provider: {reason_code}")]
+    ActivationDeniedDetailed {
+        reason_code: String,
+        disposition: String,
+        directive_kind: String,
+        resolution: Option<Box<AgentActivationResolutionResult>>,
+    },
     #[error("stale session, generation, or state fence")]
     StaleAuthority,
     #[error("EXTERNAL_ATTACH_RECONCILIATION_REQUIRED")]

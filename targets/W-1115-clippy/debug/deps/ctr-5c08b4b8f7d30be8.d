@@ -1,0 +1,11 @@
+C:\Development\Rust\projects\eliot-swarm\W4-1115\targets\W-1115-clippy\debug\deps\ctr-5c08b4b8f7d30be8.d: C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\lib.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors\ctr128.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors\ctr32.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors\ctr64.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\backend.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\ctr_core.rs
+
+C:\Development\Rust\projects\eliot-swarm\W4-1115\targets\W-1115-clippy\debug\deps\libctr-5c08b4b8f7d30be8.rmeta: C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\lib.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors\ctr128.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors\ctr32.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors\ctr64.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\backend.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\ctr_core.rs
+
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\lib.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors\ctr128.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors\ctr32.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\flavors\ctr64.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\backend.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ctr-0.9.2\src\ctr_core.rs:

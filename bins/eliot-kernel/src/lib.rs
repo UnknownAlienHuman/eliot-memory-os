@@ -351,9 +351,10 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
-    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionResult,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
-    AgentActivationResultSubmit, AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition,
+    AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition,
     AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
     AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
     AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
@@ -561,18 +562,9 @@ pub struct KernelComposition {
     agent_activation_pending: Mutex<AgentActivationPendingState>,
     #[cfg(windows)]
     agent_activation_changed: tokio::sync::Notify,
-    /// Full typed semantic resolution results retained verbatim under their
-    /// exact ticket identities, keyed by ticket id. This is the rehydrated
-    /// result ledger only; it never contains pending entries or live bindings.
-    ///
-    /// Every one of the seven closed dispositions shares one
-    /// exact-replay/conflict ledger here. Only a `Resolved`
-    /// disposition can later yield a transport Session, and that Session is
-    /// created exactly once by the bridge activation path. The map lives
-    /// beside the pending table (rather than inside its entries) so the
-    /// ticket ledger shape stays additive.
-    #[cfg(windows)]
-    agent_activation_results: Mutex<BTreeMap<String, AgentActivationResultRecord>>,
+    /// Full typed semantic resolution results are projected into the single
+    /// `agent_activation_pending` owner below. ORS remains the durable
+    /// authority; there is no second in-memory semantic ledger.
     /// Connection-scoped index of staged P-04 host-request operations. The
     /// durable ORS record is the owner; this index only lets disconnect revoke
     /// fence the presenting connection's still-uncertain operations to
@@ -664,6 +656,10 @@ struct AgentActivationPendingState {
     /// entries are skipped when this order is pruned so an active bridge
     /// waiter can never lose the result it is waiting to project.
     result_order: VecDeque<String>,
+    /// Kernel-owned lifecycle fence for each ticket. It is deliberately
+    /// separate from the result payload: a cancellation/expiry terminal can
+    /// never be confused with a semantic `FailedInternal` result.
+    lifecycle: BTreeMap<String, AgentActivationLifecycle>,
 }
 
 #[cfg(windows)]
@@ -674,17 +670,43 @@ struct AgentActivationPending {
     /// Private Kernel claim lease; it is deliberately absent from the wire
     /// ticket so retries cannot mint or select a caller-owned identity.
     claim_lease_until_unix_ms: Option<u64>,
+    /// A fresh ticket may be linked to one retained `NotReady` predecessor;
+    /// the predecessor result itself is immutable and is never replaced.
+    successor_of: Option<AgentActivationSuccessorBinding>,
 }
 
-/// Replay/commit/conflict disposition shared by the activation result
-/// entry classifiers (v2 result legs).
+/// Closed Kernel lifecycle fence for one activation ticket.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActivationDecisionDisposition {
-    Commit,
-    ExactReplay,
-    Conflict,
+enum AgentActivationLifecycle {
+    Pending,
+    Claimed,
+    Accepted,
+    DeferredNotReady,
+    Cancelled,
+    Expired,
+    Reconciling,
 }
+
+#[cfg(windows)]
+impl From<eliot_ors::ActivationLifecycleState> for AgentActivationLifecycle {
+    fn from(state: eliot_ors::ActivationLifecycleState) -> Self {
+        match state {
+            eliot_ors::ActivationLifecycleState::Pending => Self::Pending,
+            eliot_ors::ActivationLifecycleState::Claimed => Self::Claimed,
+            eliot_ors::ActivationLifecycleState::ResultAccepted => Self::Accepted,
+            eliot_ors::ActivationLifecycleState::DeferredNotReady => Self::DeferredNotReady,
+            eliot_ors::ActivationLifecycleState::Cancelled => Self::Cancelled,
+            eliot_ors::ActivationLifecycleState::Expired => Self::Expired,
+            eliot_ors::ActivationLifecycleState::Reconciling => Self::Reconciling,
+        }
+    }
+}
+
+/// Immutable predecessor evidence cached from the durable ORS lifecycle. ORS
+/// remains the authority; this is not a second semantic result or resolver.
+#[cfg(windows)]
+type AgentActivationSuccessorBinding = eliot_ors::ActivationSuccessorBinding;
 
 /// Submission phase of one retained v2 semantic result.
 ///
@@ -716,7 +738,6 @@ enum AgentActivationResultPhase {
 struct AgentActivationResultRecord {
     result: AgentActivationResolutionResult,
     phase: AgentActivationResultPhase,
-    ticket_connection: String,
     retention_order: u64,
 }
 
@@ -746,6 +767,97 @@ fn classify_activation_result(
 
 #[cfg(windows)]
 impl AgentActivationPendingState {
+    pub(crate) fn from_rehydrated_results(
+        results: BTreeMap<String, AgentActivationResultRecord>,
+        lifecycle: BTreeMap<String, AgentActivationLifecycle>,
+    ) -> Self {
+        let mut state = Self::default();
+        let mut result_order = results
+            .values()
+            .map(|record| record.result.ticket_id.clone())
+            .collect::<Vec<_>>();
+        result_order.sort_by_key(|ticket_id| {
+            results
+                .get(ticket_id)
+                .map_or(0, |record| record.retention_order)
+        });
+        state.result_order = result_order.into_iter().collect();
+        state.lifecycle = lifecycle;
+        state.results = results;
+        state
+    }
+
+    fn mark_lifecycle(&mut self, ticket_id: &str, lifecycle: AgentActivationLifecycle) {
+        self.lifecycle.insert(ticket_id.to_owned(), lifecycle);
+        if self.lifecycle.len() > eliot_ors::MAX_ACTIVATION_LIFECYCLE_RECORDS {
+            if let Some(oldest) = self
+                .lifecycle
+                .iter()
+                .find(|(candidate, _)| {
+                    !self.entries.contains_key(*candidate)
+                        && !self.results.contains_key(*candidate)
+                })
+                .map(|(candidate, _)| candidate.clone())
+            {
+                self.lifecycle.remove(&oldest);
+            }
+        }
+    }
+
+    fn lifecycle(&self, ticket_id: &str) -> AgentActivationLifecycle {
+        self.lifecycle
+            .get(ticket_id)
+            .copied()
+            .unwrap_or(AgentActivationLifecycle::Pending)
+    }
+
+    /// Finds the one retained `NotReady` predecessor that may authorize a
+    /// fresh successor ticket. A same-ticket replacement is never returned.
+    fn successor_binding_for(
+        &self,
+        now: u64,
+    ) -> Result<Option<AgentActivationSuccessorBinding>, TransportError> {
+        let mut candidates = self
+            .results
+            .values()
+            .filter(|record| {
+                self.lifecycle(&record.result.ticket_id)
+                    == AgentActivationLifecycle::DeferredNotReady
+                    && matches!(
+                        &record.result.disposition,
+                        AgentActivationResolutionDisposition::NotReady { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|record| record.retention_order);
+        let Some(record) = candidates.last().copied() else {
+            return Ok(None);
+        };
+        let AgentActivationResolutionDisposition::NotReady { retry, .. } =
+            &record.result.disposition
+        else {
+            return Err(TransportError::SessionFenced);
+        };
+        if now < retry.not_before_unix_ms {
+            return Err(TransportError::IdentityConflict);
+        }
+        if self.entries.values().any(|entry| {
+            entry.successor_of.as_ref().is_some_and(|successor| {
+                successor.predecessor_ticket_id == record.result.ticket_id
+            })
+        }) {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(Some(AgentActivationSuccessorBinding {
+            predecessor_ticket_id: record.result.ticket_id.clone(),
+            predecessor_ticket_sha256: record.result.ticket_sha256.clone(),
+            predecessor_result_sha256: record.result.result_sha256.clone(),
+            dependency_ref: retry.dependency_ref.clone(),
+            observed_dependency_revision: retry.observed_dependency_revision.clone(),
+            not_before_unix_ms: retry.not_before_unix_ms,
+        }))
+    }
+
     fn claim_at(&mut self, now: u64) -> Option<AgentActivationResolutionTicket> {
         let queue_len = self.fifo.len();
         for _ in 0..queue_len {
@@ -763,19 +875,12 @@ impl AgentActivationPendingState {
             if activation_deadline_expired(now, entry.ticket.kernel_deadline_unix_ms) {
                 continue;
             }
-            if entry
-                .claim_lease_until_unix_ms
-                .is_some_and(|lease_until| now < lease_until)
-            {
-                self.fifo.push_back(ticket_id);
-                continue;
-            }
             entry.claim_lease_until_unix_ms = Some(
                 now.saturating_add(AGENT_ACTIVATION_CLAIM_LEASE_MS)
                     .min(entry.ticket.kernel_deadline_unix_ms),
             );
             let ticket = entry.ticket.clone();
-            self.fifo.push_back(ticket_id);
+            self.mark_lifecycle(&ticket_id, AgentActivationLifecycle::Claimed);
             return Some(ticket);
         }
         None
@@ -929,6 +1034,8 @@ pub enum KernelFrameAction {
     Daemon {
         /// Correlation identity to echo in the response.
         request_id: RequestId,
+        /// Exact authenticated request identity admitted on the same frame.
+        identity: RequestIdentity,
         /// Closed operation name from the daemon application wire.
         operation: String,
         /// Bounded operation payload.

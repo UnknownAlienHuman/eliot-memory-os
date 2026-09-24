@@ -110,6 +110,7 @@ fn valid_ticket(id: &str) -> TestResult<AgentActivationResolutionTicket> {
         connection_id: format!("{id}:connection"),
         state_fence: test_fence(1)?,
         kernel_deadline_unix_ms: 100,
+        successor_of: None,
         ticket_sha256: String::new(),
     }
     .with_computed_digest()
@@ -198,6 +199,7 @@ fn ticket_bound_to_admission(
         connection_id: receipt.connection_id.clone(),
         state_fence: receipt.state_fence.clone(),
         kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
+        successor_of: None,
         ticket_sha256: String::new(),
     }
     .with_computed_digest()?)
@@ -366,8 +368,10 @@ fn accepted_exact_replay_reuses_one_resolution_identity() -> TestResult {
             failure_handle: "activation:test-failure".to_owned(),
         },
     )?;
-    let replay = AgentActivationResultAck::replayed(&result)?;
+    let replay = AgentActivationResultAck::accepted(&result)?;
+    let initial = AgentActivationResultAck::accepted(&result)?;
     replay.validate()?;
+    assert_eq!(replay, initial);
     assert_eq!(replay.ticket_id, ticket.ticket_id);
     assert_eq!(replay.result_sha256, result.result_sha256);
     assert_eq!(replay.result.as_ref(), Some(&result));

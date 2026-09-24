@@ -35,7 +35,9 @@ use crate::cutover_ownership::{
     GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
 };
 use crate::{
-    AcceptedPending, ActivationResultRetentionRecord, ActiveSessionBinding, AdmissionReservation,
+    AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
+    ActivationRecoverySnapshot, ActivationResultRetentionPhase,
+    ActivationResultRetentionRecord, ActiveSessionBinding, AdmissionReservation,
     AdmissionReservationActivation, AdmissionReservationReceipt, AdmissionReservationRelease,
     AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
@@ -111,6 +113,8 @@ const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
 const ACTIVATION_RESULT_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_agent_activation_results_v1");
+const ACTIVATION_LIFECYCLES: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_agent_activation_lifecycles_v1");
 const NATIVE_WORKER_CLAIMS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_native_worker_claims_v1");
 const REPLAY_STREAMS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_streams_v1");
@@ -557,21 +561,60 @@ pub trait OperationalRecoveryStore: Send + Sync {
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
-    /// Atomically retains one opaque Kernel activation result before its
-    /// acknowledgement may be emitted. An exact replay returns the durable
-    /// record; a changed ticket/result identity conflicts and never overwrites.
-    fn retain_activation_result(
+    /// Durably stages one pending activation ticket before in-memory
+    /// publication or daemon claim. A successor is admitted only through the
+    /// exact durable `NotReady` predecessor and due-time gate.
+    fn stage_activation_ticket(
+        &self,
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+    ) -> Result<ActivationLifecycleRecord, OrsError>;
+    /// Claims one pending activation ticket for the authenticated daemon.
+    /// Claim expiry never reopens semantic work; it transitions the ticket to
+    /// durable reconciliation.
+    fn claim_activation_ticket(
+        &self,
+        ticket_id: &str,
+        claim_owner: &str,
+        now_unix_ms: u64,
+        claim_expires_at_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError>;
+    /// Atomically admits one exact result and advances its lifecycle row.
+    /// Existing exact retention replays; changed identity or a terminal
+    /// result-less lifecycle conflicts and never overwrites.
+    fn commit_activation_result(
         &self,
         record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
     ) -> Result<ActivationResultRetentionRecord, OrsError>;
-    /// Loads one retained activation result by exact ticket and result identity.
+    /// Durably terminalizes one result-less ticket as cancelled, expired, or
+    /// reconciling. Accepted/result-bearing states never transition here.
+    fn terminate_activation_without_result(
+        &self,
+        ticket_id: &str,
+        target: ActivationLifecycleState,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError>;
+    /// Loads one activation lifecycle row by exact ticket identity.
+    fn load_activation_lifecycle(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError>;
+    /// Loads retained activation results by exact ticket and result identity.
     fn load_activation_result(
         &self,
         ticket_id: &str,
         result_sha256: &str,
     ) -> Result<Option<ActivationResultRetentionRecord>, OrsError>;
-    /// Prunes the oldest retained activation results until both hard bounds
-    /// are satisfied. Pruning is atomic and does not interpret payloads.
+    /// Loads lifecycle and result rows under one coherent ORS read snapshot.
+    fn load_activation_recovery_snapshot(
+        &self,
+    ) -> Result<ActivationRecoverySnapshot, OrsError>;
+    /// Prunes the oldest unreferenced retained activation results until both
+    /// hard bounds are satisfied. Lifecycle-referenced rows are never pruned.
     fn prune_activation_results(&self) -> Result<u64, OrsError>;
     /// Stages one native-worker claim intent before any acknowledgement.
     ///
@@ -808,6 +851,21 @@ impl persistence_codec::PersistedValue for ActivationResultRetentionRecord {
             return Err(OrsError::IntegrityProblem {
                 record_type: Self::RECORD_TYPE,
                 reason: "retained activation result has no ORS retention order".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for ActivationLifecycleRecord {
+    const RECORD_TYPE: &'static str = "activation_lifecycle";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()?;
+        if self.lifecycle_order == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "activation lifecycle has no ORS lifecycle order".to_owned(),
             });
         }
         Ok(())
@@ -1696,17 +1754,256 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
-    /// Atomically retains one opaque Kernel activation result before its
-    /// acknowledgement may be emitted. The ORS transaction assigns order and
-    /// prunes only after the new row is durable within the same transaction.
-    pub fn retain_activation_result(
+    /// Durably stages one pending activation ticket before it is published in
+    /// memory or returned to a daemon claim.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ORS write transaction keeps lifecycle identity, successor binding, and capacity pruning atomic"
+    )]
+    pub fn stage_activation_ticket(
         &self,
-        record: &ActivationResultRetentionRecord,
-    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+    ) -> Result<ActivationLifecycleRecord, OrsError> {
         record.validate()?;
+        if record.state != ActivationLifecycleState::Pending
+            || record.lifecycle_order != 0
+            || record.result_sha256.is_some()
+            || record.claim_owner.is_some()
+            || record.successor_ticket_id.is_some()
+            || record.terminal_reason.is_some()
+        {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_stage",
+                reason: "staging requires one clean pending ticket without result or claim",
+            });
+        }
+        if now_unix_ms >= record.kernel_deadline_unix_ms {
+            return Err(OrsError::ActivationLifecycleExpired {
+                ticket_id: record.ticket_id.clone(),
+            });
+        }
         let write = self.database.begin_write().map_err(storage)?;
         let key = record.record_key().to_owned();
-        let existing: Option<ActivationResultRetentionRecord> = {
+        let existing: Option<ActivationLifecycleRecord> = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        if let Some(existing) = existing {
+            if !existing.same_immutable_identity(record) {
+                return Err(OrsError::ActivationLifecycleIdentityConflict {
+                    ticket_id: key,
+                });
+            }
+            write.commit().map_err(storage)?;
+            return Ok(existing);
+        }
+
+        let mut lifecycle_rows = Vec::new();
+        {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            for entry in table.iter().map_err(storage)? {
+                let (existing_key, value) = entry.map_err(storage)?;
+                let existing: ActivationLifecycleRecord = decode(value.value())?;
+                if existing_key.value() != existing.record_key() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "activation_lifecycle",
+                        reason: "table key does not match ticket identity".to_owned(),
+                    });
+                }
+                lifecycle_rows.push(existing);
+            }
+        }
+        if lifecycle_rows.len() >= crate::MAX_ACTIVATION_LIFECYCLE_RECORDS {
+            let removable = lifecycle_rows
+                .iter()
+                .filter(|existing| {
+                    existing.state == ActivationLifecycleState::ResultAccepted
+                        && existing.successor_ticket_id.is_none()
+                })
+                .min_by_key(|existing| existing.lifecycle_order)
+                .cloned();
+            let Some(removable) = removable else {
+                return Err(OrsError::ProjectionLimitExceeded);
+            };
+            {
+                let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+                table.remove(removable.record_key()).map_err(storage)?;
+            }
+            {
+                let mut table = write
+                    .open_table(ACTIVATION_RESULT_RETENTION)
+                    .map_err(storage)?;
+                table.remove(removable.record_key()).map_err(storage)?;
+            }
+            lifecycle_rows.retain(|existing| existing.ticket_id != removable.ticket_id);
+        }
+        if lifecycle_rows.iter().any(|existing| {
+            existing.activation_request_id == record.activation_request_id
+                || existing.successor_of.as_ref().is_some_and(|successor| {
+                    record.successor_of.as_ref().is_some_and(|candidate| {
+                        successor.predecessor_ticket_id == candidate.predecessor_ticket_id
+                            && successor.predecessor_result_sha256
+                                == candidate.predecessor_result_sha256
+                    })
+                })
+        }) {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key,
+            });
+        }
+
+        let order = Self::next_operational_order(&write)?;
+        let mut next = record.clone();
+        next.lifecycle_order = order;
+        if let Some(successor) = &record.successor_of {
+            let predecessor = lifecycle_rows
+                .iter()
+                .find(|existing| existing.ticket_id == successor.predecessor_ticket_id)
+                .ok_or_else(|| OrsError::ActivationLifecycleIdentityConflict {
+                    ticket_id: key.clone(),
+                })?;
+            if predecessor.state != ActivationLifecycleState::DeferredNotReady
+                || predecessor.ticket_sha256 != successor.predecessor_ticket_sha256
+                || predecessor.result_sha256.as_deref()
+                    != Some(successor.predecessor_result_sha256.as_str())
+                || predecessor.successor_ticket_id.is_some()
+                || now_unix_ms < successor.not_before_unix_ms
+            {
+                return Err(OrsError::ActivationLifecycleIdentityConflict {
+                    ticket_id: key,
+                });
+            }
+            let mut updated_predecessor = predecessor.clone();
+            updated_predecessor.successor_ticket_id = Some(record.ticket_id.clone());
+            updated_predecessor.lifecycle_order = order;
+            updated_predecessor.validate()?;
+            let predecessor_key = updated_predecessor.record_key().to_owned();
+            let payload = encode(&updated_predecessor)?;
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .insert(predecessor_key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        next.validate()?;
+        let payload = encode(&next)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table.insert(key.as_str(), payload.as_str()).map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)?;
+        Ok(next)
+    }
+
+    /// Claims one pending ticket for the authenticated daemon. An expired
+    /// claim becomes durable reconciliation and is never silently reissued.
+    pub fn claim_activation_ticket(
+        &self,
+        ticket_id: &str,
+        claim_owner: &str,
+        now_unix_ms: u64,
+        claim_expires_at_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        crate::model::validate_text(ticket_id, "activation_claim_ticket_id")?;
+        crate::model::validate_text(claim_owner, "activation_claim_owner")?;
+        if claim_expires_at_unix_ms <= now_unix_ms {
+            return Err(OrsError::InvalidField {
+                field: "activation_claim_expiry",
+                reason: "claim expiry must be later than the admission time",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<ActivationLifecycleRecord> = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .get(ticket_id)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(mut existing) = existing else {
+            write.commit().map_err(storage)?;
+            return Ok(None);
+        };
+        if existing.state == ActivationLifecycleState::Claimed {
+            if existing.claim_owner.as_deref() == Some(claim_owner)
+                && existing.claim_expires_at_unix_ms == Some(claim_expires_at_unix_ms)
+                && existing.claim_expires_at_unix_ms.is_some_and(|expiry| expiry > now_unix_ms)
+            {
+                write.commit().map_err(storage)?;
+                return Ok(Some(existing));
+            }
+            return Err(OrsError::ActivationLifecycleStateConflict {
+                ticket_id: ticket_id.to_owned(),
+                state: existing.state,
+                expected: ActivationLifecycleState::Pending,
+            });
+        }
+        if existing.state != ActivationLifecycleState::Pending {
+            return Err(OrsError::ActivationLifecycleStateConflict {
+                ticket_id: ticket_id.to_owned(),
+                state: existing.state,
+                expected: ActivationLifecycleState::Pending,
+            });
+        }
+        if now_unix_ms >= existing.kernel_deadline_unix_ms {
+            existing.state = ActivationLifecycleState::Expired;
+            existing.lifecycle_order = Self::next_operational_order(&write)?;
+            existing.terminal_reason = Some("deadline elapsed before durable claim".to_owned());
+            existing.validate()?;
+            let payload = encode(&existing)?;
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .insert(existing.record_key(), payload.as_str())
+                .map_err(storage)?;
+            drop(table);
+            write.commit().map_err(storage)?;
+            return Err(OrsError::ActivationLifecycleExpired {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        existing.state = ActivationLifecycleState::Claimed;
+        existing.claim_owner = Some(claim_owner.to_owned());
+        existing.claim_expires_at_unix_ms = Some(claim_expires_at_unix_ms);
+        existing.lifecycle_order = Self::next_operational_order(&write)?;
+        existing.validate()?;
+        let payload = encode(&existing)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(existing.record_key(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)?;
+        Ok(Some(existing))
+    }
+
+    /// Atomically inserts one result and advances the exact claimed lifecycle
+    /// row. Result retention cannot exist without its lifecycle binding.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ORS write transaction keeps result admission, deadline CAS, and lifecycle publication atomic"
+    )]
+    pub fn commit_activation_result(
+        &self,
+        record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
+    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        record.validate()?;
+        crate::model::validate_text(claim_owner, "activation_result_claim_owner")?;
+        if record.retention_order != 0 {
+            return Err(OrsError::InvalidField {
+                field: "activation_result_retention_order",
+                reason: "caller-supplied retention order must be zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.record_key().to_owned();
+        let existing_result: Option<ActivationResultRetentionRecord> = {
             let table = write
                 .open_table(ACTIVATION_RESULT_RETENTION)
                 .map_err(storage)?;
@@ -1716,29 +2013,239 @@ impl RedbRecoveryStore {
                 .map(|value| decode(value.value()))
                 .transpose()?
         };
-        if let Some(existing) = existing {
-            if !existing.same_identity(record) {
-                return Err(OrsError::ActivationResultRetentionIdentityConflict { ticket_id: key });
+        let lifecycle: ActivationLifecycleRecord = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            let bytes = table.get(key.as_str()).map_err(storage)?.ok_or_else(|| {
+                OrsError::ActivationLifecycleIdentityConflict {
+                    ticket_id: key.clone(),
+                }
+            })?;
+            let lifecycle: ActivationLifecycleRecord = decode(bytes.value())?;
+            drop(bytes);
+            lifecycle
+        };
+        if lifecycle.ticket_sha256 != record.ticket_sha256
+            || lifecycle.connection_id != record.connection_id
+            || lifecycle.state_fence != record.state_fence
+        {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: key,
+            });
+        }
+        if let Some(existing_result) = existing_result {
+            if !existing_result.same_identity(record)
+                || lifecycle.result_sha256.as_deref()
+                    != Some(existing_result.result_sha256.as_str())
+            {
+                return Err(OrsError::ActivationResultRetentionIdentityConflict {
+                    ticket_id: key,
+                });
             }
             write.commit().map_err(storage)?;
-            return Ok(existing);
+            return Ok(existing_result);
         }
-
-        let mut next = record.clone();
-        next.retention_order = Self::next_operational_order(&write)?;
-        next.validate()?;
-        let payload = encode(&next)?;
+        if now_unix_ms >= lifecycle.kernel_deadline_unix_ms {
+            if lifecycle.result_sha256.is_none()
+                && matches!(
+                    lifecycle.state,
+                    ActivationLifecycleState::Pending | ActivationLifecycleState::Claimed
+                )
+            {
+                let mut expired = lifecycle;
+                expired.state = ActivationLifecycleState::Expired;
+                expired.claim_owner = None;
+                expired.claim_expires_at_unix_ms = None;
+                expired.lifecycle_order = Self::next_operational_order(&write)?;
+                expired.terminal_reason =
+                    Some("deadline elapsed before durable result admission".to_owned());
+                expired.validate()?;
+                let payload = encode(&expired)?;
+                let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+                table
+                    .insert(expired.record_key(), payload.as_str())
+                    .map_err(storage)?;
+                drop(table);
+                write.commit().map_err(storage)?;
+            }
+            return Err(OrsError::ActivationLifecycleExpired { ticket_id: key });
+        }
+        if lifecycle.state != ActivationLifecycleState::Claimed
+            || lifecycle.claim_owner.as_deref() != Some(claim_owner)
         {
+            return Err(OrsError::ActivationLifecycleStateConflict {
+                ticket_id: key,
+                state: lifecycle.state,
+                expected: ActivationLifecycleState::Claimed,
+            });
+        }
+        match (
+            lifecycle.successor_of.as_ref(),
+            dependency_observation,
+        ) {
+            (None, None) => {}
+            (Some(predecessor), Some((dependency_ref, observed_revision))) => {
+                if dependency_ref != predecessor.dependency_ref
+                    || observed_revision == predecessor.observed_dependency_revision
+                    || now_unix_ms < predecessor.not_before_unix_ms
+                {
+                    return Err(OrsError::ActivationLifecycleIdentityConflict {
+                        ticket_id: key,
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::ActivationLifecycleIdentityConflict {
+                    ticket_id: key,
+                });
+            }
+        }
+        let order = Self::next_operational_order(&write)?;
+        let mut retained = record.clone();
+        retained.retention_order = order;
+        retained.validate()?;
+        let mut next_lifecycle = lifecycle;
+        next_lifecycle.state = match retained.phase {
+            ActivationResultRetentionPhase::AcceptedTerminal => {
+                ActivationLifecycleState::ResultAccepted
+            }
+            ActivationResultRetentionPhase::DeferredNotReady => {
+                ActivationLifecycleState::DeferredNotReady
+            }
+        };
+        next_lifecycle.result_sha256 = Some(retained.result_sha256.clone());
+        next_lifecycle.claim_owner = None;
+        next_lifecycle.claim_expires_at_unix_ms = None;
+        next_lifecycle.terminal_reason = None;
+        next_lifecycle.lifecycle_order = order;
+        next_lifecycle.validate()?;
+        {
+            let payload = encode(&retained)?;
             let mut table = write
                 .open_table(ACTIVATION_RESULT_RETENTION)
                 .map_err(storage)?;
             table
-                .insert(key.as_str(), payload.as_str())
+                .insert(retained.record_key(), payload.as_str())
                 .map_err(storage)?;
         }
-        Self::prune_activation_results_in_write(&write)?;
+        {
+            let payload = encode(&next_lifecycle)?;
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .insert(next_lifecycle.record_key(), payload.as_str())
+                .map_err(storage)?;
+        }
         write.commit().map_err(storage)?;
-        Ok(next)
+        Ok(retained)
+    }
+
+    /// Terminalizes one result-less ticket without erasing accepted results.
+    pub fn terminate_activation_without_result(
+        &self,
+        ticket_id: &str,
+        target: ActivationLifecycleState,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        crate::model::validate_text(ticket_id, "activation_terminal_ticket_id")?;
+        crate::model::validate_text(reason, "activation_terminal_reason")?;
+        if !matches!(
+            target,
+            ActivationLifecycleState::Cancelled
+                | ActivationLifecycleState::Expired
+                | ActivationLifecycleState::Reconciling
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "activation_terminal_target",
+                reason: "resultless terminal target must be cancelled, expired, or reconciling",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<ActivationLifecycleRecord> = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            table
+                .get(ticket_id)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(mut existing) = existing else {
+            write.commit().map_err(storage)?;
+            return Ok(None);
+        };
+        if existing.state == target {
+            if existing.terminal_reason.as_deref() != Some(reason) {
+                return Err(OrsError::ActivationLifecycleIdentityConflict {
+                    ticket_id: ticket_id.to_owned(),
+                });
+            }
+            write.commit().map_err(storage)?;
+            return Ok(Some(existing));
+        }
+        if existing.result_sha256.is_some()
+            || matches!(
+                existing.state,
+                ActivationLifecycleState::DeferredNotReady
+                    | ActivationLifecycleState::ResultAccepted
+            )
+        {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        let allowed = match target {
+            ActivationLifecycleState::Cancelled => {
+                existing.state == ActivationLifecycleState::Pending
+            }
+            ActivationLifecycleState::Expired => {
+                matches!(
+                    existing.state,
+                    ActivationLifecycleState::Pending | ActivationLifecycleState::Claimed
+                ) && now_unix_ms >= existing.kernel_deadline_unix_ms
+            }
+            ActivationLifecycleState::Reconciling => matches!(
+                existing.state,
+                ActivationLifecycleState::Pending | ActivationLifecycleState::Claimed
+            ),
+            _ => false,
+        };
+        if !allowed {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        existing.state = target;
+        existing.claim_owner = None;
+        existing.claim_expires_at_unix_ms = None;
+        existing.terminal_reason = Some(reason.to_owned());
+        existing.lifecycle_order = Self::next_operational_order(&write)?;
+        existing.validate()?;
+        let payload = encode(&existing)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .insert(existing.record_key(), payload.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)?;
+        Ok(Some(existing))
+    }
+
+    /// Loads one activation lifecycle row by exact ticket identity.
+    pub fn load_activation_lifecycle(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        crate::model::validate_text(ticket_id, "activation_lifecycle_ticket_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        table
+            .get(ticket_id)
+            .map_err(storage)?
+            .map(|value| {
+                let record: ActivationLifecycleRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
     }
 
     /// Loads one retained activation result by exact ticket and result identity.
@@ -1796,6 +2303,108 @@ impl RedbRecoveryStore {
         Ok(records)
     }
 
+    /// Loads lifecycle and retained-result rows under one coherent ORS read
+    /// transaction. Cross-table integrity is checked before publication.
+    pub fn load_activation_recovery_snapshot(
+        &self,
+    ) -> Result<ActivationRecoverySnapshot, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let lifecycle_table = read.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        let mut lifecycles = Vec::new();
+        for entry in lifecycle_table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: ActivationLifecycleRecord = decode(value.value())?;
+            if key.value() != record.record_key() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "table key does not match ticket identity".to_owned(),
+                });
+            }
+            record.validate()?;
+            lifecycles.push(record);
+        }
+        drop(lifecycle_table);
+        let result_table = read
+            .open_table(ACTIVATION_RESULT_RETENTION)
+            .map_err(storage)?;
+        let mut results = Vec::new();
+        for entry in result_table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: ActivationResultRetentionRecord = decode(value.value())?;
+            if key.value() != record.record_key() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "table key does not match ticket identity".to_owned(),
+                });
+            }
+            record.validate()?;
+            results.push(record);
+        }
+        drop(result_table);
+        if lifecycles.len() > crate::MAX_ACTIVATION_LIFECYCLE_RECORDS
+            || results.len() > crate::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
+        {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let result_by_ticket = results
+            .iter()
+            .map(|record| (record.ticket_id.as_str(), record))
+            .collect::<BTreeMap<_, _>>();
+        for lifecycle in &lifecycles {
+            match (
+                &lifecycle.result_sha256,
+                result_by_ticket.get(lifecycle.ticket_id.as_str()),
+            ) {
+                (None, None) => {}
+                (Some(digest), Some(result)) if digest == &result.result_sha256 => {}
+                _ => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "activation_lifecycle",
+                        reason: "lifecycle and retained-result bindings disagree".to_owned(),
+                    });
+                }
+            }
+            if let Some(successor) = &lifecycle.successor_of {
+                let predecessor = lifecycles
+                    .iter()
+                    .find(|candidate| candidate.ticket_id == successor.predecessor_ticket_id)
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "activation_lifecycle",
+                        reason: "successor predecessor is missing".to_owned(),
+                    })?;
+                if predecessor.state != ActivationLifecycleState::DeferredNotReady
+                    || predecessor.ticket_sha256 != successor.predecessor_ticket_sha256
+                    || predecessor.result_sha256.as_deref()
+                        != Some(successor.predecessor_result_sha256.as_str())
+                    || predecessor.successor_ticket_id.as_deref()
+                        != Some(lifecycle.ticket_id.as_str())
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "activation_lifecycle",
+                        reason: "successor predecessor binding is inconsistent".to_owned(),
+                    });
+                }
+            }
+        }
+        for result in &results {
+            if !lifecycles
+                .iter()
+                .any(|lifecycle| lifecycle.ticket_id == result.ticket_id)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "retained result has no lifecycle owner".to_owned(),
+                });
+            }
+        }
+        lifecycles.sort_by_key(|record| record.lifecycle_order);
+        results.sort_by_key(|record| record.retention_order);
+        Ok(ActivationRecoverySnapshot {
+            lifecycles,
+            results,
+        })
+    }
+
     /// Prunes the oldest retained activation results until the count and
     /// aggregate payload bounds are both satisfied.
     pub fn prune_activation_results(&self) -> Result<u64, OrsError> {
@@ -1806,6 +2415,15 @@ impl RedbRecoveryStore {
     }
 
     fn prune_activation_results_in_write(write: &redb::WriteTransaction) -> Result<u64, OrsError> {
+        let protected = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            let mut protected = BTreeSet::new();
+            for entry in table.iter().map_err(storage)? {
+                let (key, _) = entry.map_err(storage)?;
+                protected.insert(key.value().to_owned());
+            }
+            protected
+        };
         let mut rows = {
             let table = write
                 .open_table(ACTIVATION_RESULT_RETENTION)
@@ -1841,25 +2459,28 @@ impl RedbRecoveryStore {
                     reason: "retention payload size overflow".to_owned(),
                 })
         })?;
-        let mut remove_count = 0usize;
-        while rows.len().saturating_sub(remove_count)
+        let mut remove_keys = Vec::new();
+        while rows.len().saturating_sub(remove_keys.len())
             > crate::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
             || total_payload_bytes > crate::MAX_ACTIVATION_RESULT_TOTAL_PAYLOAD_BYTES
         {
-            let (_, oldest) = &rows[remove_count];
-            total_payload_bytes = total_payload_bytes.saturating_sub(oldest.payload_bytes());
-            remove_count += 1;
+            let candidate = rows
+                .iter()
+                .find(|(key, _)| !protected.contains(key) && !remove_keys.contains(key))
+                .ok_or(OrsError::ProjectionLimitExceeded)?;
+            total_payload_bytes = total_payload_bytes.saturating_sub(candidate.1.payload_bytes());
+            remove_keys.push(candidate.0.clone());
         }
-        if remove_count == 0 {
+        if remove_keys.is_empty() {
             return Ok(0);
         }
         let mut table = write
             .open_table(ACTIVATION_RESULT_RETENTION)
             .map_err(storage)?;
-        for (key, _) in rows.into_iter().take(remove_count) {
+        for key in &remove_keys {
             table.remove(key.as_str()).map_err(storage)?;
         }
-        u64::try_from(remove_count).map_err(|_| OrsError::IntegrityProblem {
+        u64::try_from(remove_keys.len()).map_err(|_| OrsError::IntegrityProblem {
             record_type: "activation_result_retention",
             reason: "pruned record count exceeds counter".to_owned(),
         })
@@ -4845,6 +5466,7 @@ impl RedbRecoveryStore {
                     .open_table(ACTIVATION_RESULT_RETENTION)
                     .map_err(storage)?,
             );
+            drop(write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?);
             drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
             drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
             drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
@@ -4864,8 +5486,93 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
             }
         }
+        Self::validate_activation_lifecycle_table(&write)?;
         Self::validate_activation_result_retention_table(&write)?;
+        Self::validate_activation_cross_table_bindings(&write)?;
         write.commit().map_err(storage)
+    }
+
+    fn validate_activation_cross_table_bindings(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        let lifecycle_table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        let mut lifecycles = BTreeMap::new();
+        for entry in lifecycle_table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: ActivationLifecycleRecord = decode(value.value())?;
+            lifecycles.insert(key.value().to_owned(), record);
+        }
+        drop(lifecycle_table);
+        let result_table = write
+            .open_table(ACTIVATION_RESULT_RETENTION)
+            .map_err(storage)?;
+        for entry in result_table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let result: ActivationResultRetentionRecord = decode(value.value())?;
+            let lifecycle = lifecycles.get(key.value()).ok_or_else(|| {
+                OrsError::MigrationRequired {
+                    reason: "existing activation result lacks a durable lifecycle owner"
+                        .to_owned(),
+                }
+            })?;
+            if lifecycle.result_sha256.as_deref() != Some(result.result_sha256.as_str()) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "existing result and lifecycle bindings disagree".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_activation_lifecycle_table(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        let mut rows = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: ActivationLifecycleRecord = decode(value.value())?;
+            if key.value() != record.record_key() || record.lifecycle_order == 0 {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "table key or lifecycle order is invalid".to_owned(),
+                });
+            }
+            rows.push(record);
+        }
+        if rows.len() > crate::MAX_ACTIVATION_LIFECYCLE_RECORDS {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "activation_lifecycle",
+                reason: "lifecycle record bound exceeded".to_owned(),
+            });
+        }
+        for successor_row in rows
+            .iter()
+            .filter_map(|record| record.successor_of.as_ref().map(|binding| (record, binding)))
+        {
+            let (successor_row, successor) = successor_row;
+            let predecessor = rows
+                .iter()
+                .find(|record| record.ticket_id == successor.predecessor_ticket_id)
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "successor predecessor is missing".to_owned(),
+                })?;
+            if predecessor.state != ActivationLifecycleState::DeferredNotReady
+                || predecessor.ticket_sha256 != successor.predecessor_ticket_sha256
+                || predecessor.result_sha256.as_deref()
+                    != Some(successor.predecessor_result_sha256.as_str())
+                || predecessor.successor_ticket_id.as_deref()
+                    != Some(successor_row.ticket_id.as_str())
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_lifecycle",
+                    reason: "successor predecessor binding is invalid".to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn validate_activation_result_retention_table(
@@ -4918,7 +5625,78 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    fn reconcile_interrupted_activation_tickets(&self) -> Result<(), OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut rows = {
+            let table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            let mut rows = Vec::new();
+            for entry in table.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                let record: ActivationLifecycleRecord = decode(value.value())?;
+                if key.value() != record.record_key() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "activation_lifecycle",
+                        reason: "table key does not match ticket identity".to_owned(),
+                    });
+                }
+                rows.push(record);
+            }
+            rows
+        };
+        let open_ids = rows
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    ActivationLifecycleState::Pending | ActivationLifecycleState::Claimed
+                )
+            })
+            .map(|record| record.ticket_id.clone())
+            .collect::<BTreeSet<_>>();
+        if open_ids.is_empty() {
+            write.commit().map_err(storage)?;
+            return Ok(());
+        }
+        let order = Self::next_operational_order(&write)?;
+        for record in &mut rows {
+            if record
+                .successor_of
+                .as_ref()
+                .is_some_and(|successor| open_ids.contains(&successor.predecessor_ticket_id))
+            {
+                continue;
+            }
+            if open_ids.contains(&record.ticket_id) {
+                record.state = ActivationLifecycleState::Reconciling;
+                record.claim_owner = None;
+                record.claim_expires_at_unix_ms = None;
+                record.terminal_reason = Some("restart interrupted activation lifecycle".to_owned());
+                record.lifecycle_order = order;
+                record.validate()?;
+            } else if record
+                .successor_ticket_id
+                .as_ref()
+                .is_some_and(|successor_id| open_ids.contains(successor_id))
+            {
+                record.successor_ticket_id = None;
+                record.lifecycle_order = order;
+                record.validate()?;
+            }
+        }
+        {
+            let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+            for record in &rows {
+                let payload = encode(record)?;
+                table
+                    .insert(record.record_key(), payload.as_str())
+                    .map_err(storage)?;
+            }
+        }
+        write.commit().map_err(storage)
+    }
+
     fn recover_interrupted_execution(&self) -> Result<(), OrsError> {
+        self.reconcile_interrupted_activation_tickets()?;
         loop {
             let write = self.database.begin_write().map_err(storage)?;
             let mut interrupted = Vec::with_capacity(usize::from(crate::MAX_RECOVERY_PAGE));
@@ -8003,11 +8781,67 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::load_host_request(self, operation_id, request_digest)
     }
 
-    fn retain_activation_result(
+    fn stage_activation_ticket(
+        &self,
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+    ) -> Result<ActivationLifecycleRecord, OrsError> {
+        RedbRecoveryStore::stage_activation_ticket(self, record, now_unix_ms)
+    }
+
+    fn claim_activation_ticket(
+        &self,
+        ticket_id: &str,
+        claim_owner: &str,
+        now_unix_ms: u64,
+        claim_expires_at_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        RedbRecoveryStore::claim_activation_ticket(
+            self,
+            ticket_id,
+            claim_owner,
+            now_unix_ms,
+            claim_expires_at_unix_ms,
+        )
+    }
+
+    fn commit_activation_result(
         &self,
         record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
     ) -> Result<ActivationResultRetentionRecord, OrsError> {
-        RedbRecoveryStore::retain_activation_result(self, record)
+        RedbRecoveryStore::commit_activation_result(
+            self,
+            record,
+            claim_owner,
+            dependency_observation,
+            now_unix_ms,
+        )
+    }
+
+    fn terminate_activation_without_result(
+        &self,
+        ticket_id: &str,
+        target: ActivationLifecycleState,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        RedbRecoveryStore::terminate_activation_without_result(
+            self,
+            ticket_id,
+            target,
+            reason,
+            now_unix_ms,
+        )
+    }
+
+    fn load_activation_lifecycle(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        RedbRecoveryStore::load_activation_lifecycle(self, ticket_id)
     }
 
     fn load_activation_result(
@@ -8016,6 +8850,12 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         result_sha256: &str,
     ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
         RedbRecoveryStore::load_activation_result(self, ticket_id, result_sha256)
+    }
+
+    fn load_activation_recovery_snapshot(
+        &self,
+    ) -> Result<ActivationRecoverySnapshot, OrsError> {
+        RedbRecoveryStore::load_activation_recovery_snapshot(self)
     }
 
     fn prune_activation_results(&self) -> Result<u64, OrsError> {
@@ -8366,12 +9206,69 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         self.store.load_host_request(operation_id, request_digest)
     }
 
-    /// Retains one opaque Kernel activation result before acknowledgement.
-    pub fn retain_activation_result(
+    /// Durably stages one pending activation ticket before publication.
+    pub fn stage_activation_ticket(
+        &self,
+        record: &ActivationLifecycleRecord,
+        now_unix_ms: u64,
+    ) -> Result<ActivationLifecycleRecord, OrsError> {
+        self.store.stage_activation_ticket(record, now_unix_ms)
+    }
+
+    /// Claims one pending activation ticket for the authenticated daemon.
+    pub fn claim_activation_ticket(
+        &self,
+        ticket_id: &str,
+        claim_owner: &str,
+        now_unix_ms: u64,
+        claim_expires_at_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        self.store.claim_activation_ticket(
+            ticket_id,
+            claim_owner,
+            now_unix_ms,
+            claim_expires_at_unix_ms,
+        )
+    }
+
+    /// Atomically commits one result with its lifecycle CAS.
+    pub fn commit_activation_result(
         &self,
         record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
     ) -> Result<ActivationResultRetentionRecord, OrsError> {
-        self.store.retain_activation_result(record)
+        self.store.commit_activation_result(
+            record,
+            claim_owner,
+            dependency_observation,
+            now_unix_ms,
+        )
+    }
+
+    /// Terminalizes one result-less activation ticket.
+    pub fn terminate_activation_without_result(
+        &self,
+        ticket_id: &str,
+        target: ActivationLifecycleState,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        self.store.terminate_activation_without_result(
+            ticket_id,
+            target,
+            reason,
+            now_unix_ms,
+        )
+    }
+
+    /// Loads one activation lifecycle row.
+    pub fn load_activation_lifecycle(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
+        self.store.load_activation_lifecycle(ticket_id)
     }
 
     /// Loads one retained activation result by exact ticket and result identity.
@@ -8383,7 +9280,14 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         self.store.load_activation_result(ticket_id, result_sha256)
     }
 
-    /// Prunes oldest activation results under the hard retention bounds.
+    /// Loads coherent activation lifecycle and result recovery state.
+    pub fn load_activation_recovery_snapshot(
+        &self,
+    ) -> Result<ActivationRecoverySnapshot, OrsError> {
+        self.store.load_activation_recovery_snapshot()
+    }
+
+    /// Prunes oldest unreferenced activation results under hard bounds.
     pub fn prune_activation_results(&self) -> Result<u64, OrsError> {
         self.store.prune_activation_results()
     }

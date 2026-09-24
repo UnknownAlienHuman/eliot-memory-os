@@ -5,9 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::{
-    AGENT_BRIDGE_ACTIVATION_WINDOW_MS, ActivationDecisionDisposition, ActivationResultDisposition,
-    AgentActivationPending, AgentActivationPendingState, AgentActivationResultPhase,
-    AgentActivationResultRecord, AgentBridgeHandshake, AgentBridgeProfile, KernelBuildError,
+    AGENT_ACTIVATION_CLAIM_LEASE_MS, AGENT_BRIDGE_ACTIVATION_WINDOW_MS,
+    ActivationResultDisposition, AgentActivationLifecycle,
+    AgentActivationPending, AgentActivationPendingState,
+    AgentActivationResultPhase, AgentActivationResultRecord, AgentBridgeHandshake,
+    AgentBridgeProfile, KernelBuildError,
     KernelComposition, activation_deadline_expired, classify_activation_result,
     load_agent_bridge_declaration, sha256_json, unix_ms,
 };
@@ -26,7 +28,7 @@ use eliot_protocol::{
     AgentActivationResolvedBinding, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, AgentBridgeActivationDenialCode, AgentBridgeActivationFence,
     AgentBridgeActivationRequest, AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding,
-    AgentBridgePeerChallenge, Frame, FrameKind, MessageType, ProtocolPayload,
+    AgentBridgePeerChallenge, Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity,
 };
 
 fn observe_bridge(event: &'static str, outcome: &'static str) {
@@ -219,6 +221,14 @@ impl KernelComposition {
             Err(poisoned) => (poisoned.into_inner(), true),
         };
         let revoked = std::mem::take(&mut *connections);
+        let removed = pending.entries.keys().cloned().collect::<Vec<_>>();
+        for ticket_id in &removed {
+            self.persist_resultless_activation_revocation(
+                pending,
+                ticket_id,
+                "bridge profile promotion reached a resultless terminal boundary",
+            )?;
+        }
         pending.fifo.clear();
         pending.entries.clear();
         drop(connections);
@@ -626,6 +636,8 @@ impl KernelComposition {
         if pending.entries.len() >= 32 {
             return Err(TransportError::RegistryFull);
         }
+        let enqueue_now = unix_ms();
+        let successor_of = pending.successor_binding_for(enqueue_now)?;
         let ticket_nonce = fresh_activation_nonce_material()
             .map_err(|_| TransportError::SessionFenced)?
             .to_string();
@@ -639,6 +651,18 @@ impl KernelComposition {
             connection_id: connection_id.to_owned(),
             state_fence: receipt.state_fence.clone(),
             kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
+            successor_of: successor_of.as_ref().map(|successor| {
+                eliot_protocol::AgentActivationTicketPredecessor {
+                    predecessor_ticket_id: successor.predecessor_ticket_id.clone(),
+                    predecessor_ticket_sha256: successor.predecessor_ticket_sha256.clone(),
+                    predecessor_result_sha256: successor.predecessor_result_sha256.clone(),
+                    dependency_ref: successor.dependency_ref.clone(),
+                    observed_dependency_revision: successor
+                        .observed_dependency_revision
+                        .clone(),
+                    not_before_unix_ms: successor.not_before_unix_ms,
+                }
+            }),
             ticket_sha256: String::new(),
         }
         .with_computed_digest()
@@ -646,6 +670,44 @@ impl KernelComposition {
         ticket
             .validate_against(&request, &receipt)
             .map_err(|_| TransportError::SessionFenced)?;
+        self.generation_gateway
+            .ors
+            .stage_activation_ticket(
+                &eliot_ors::ActivationLifecycleRecord {
+                    ticket_id: ticket.ticket_id.clone(),
+                    ticket_sha256: ticket.ticket_sha256.clone(),
+                    ticket_payload: serde_json::to_string(&ticket)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                    activation_request_id: request
+                        .request_identity
+                        .request
+                        .metadata
+                        .request_id
+                        .as_str()
+                        .to_owned(),
+                    activation_request_sha256: request.request_sha256.clone(),
+                    connection_id: connection_id.to_owned(),
+                    state_fence: sha256_json(&ticket.state_fence)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                    kernel_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
+                    cancellation_id: request.request_identity.cancellation_id.clone(),
+                    state: eliot_ors::ActivationLifecycleState::Pending,
+                    lifecycle_order: 0,
+                    result_sha256: None,
+                    claim_owner: None,
+                    claim_expires_at_unix_ms: None,
+                    successor_of: successor_of.clone(),
+                    successor_ticket_id: None,
+                    terminal_reason: None,
+                },
+                enqueue_now,
+            )
+            .map_err(|error| match error {
+                eliot_ors::OrsError::ActivationLifecycleIdentityConflict { .. } => {
+                    TransportError::IdentityConflict
+                }
+                _ => TransportError::SessionFenced,
+            })?;
         pending.fifo.push_back(ticket.ticket_id.clone());
         if pending.replay.len() >= 64
             && let Some(oldest) = pending.replay.keys().next().cloned()
@@ -661,8 +723,10 @@ impl KernelComposition {
                 ticket: ticket.clone(),
                 request,
                 claim_lease_until_unix_ms: None,
+                successor_of,
             },
         );
+        pending.mark_lifecycle(&ticket.ticket_id, AgentActivationLifecycle::Pending);
         self.agent_activation_changed.notify_waiters();
         Ok(ticket)
     }
@@ -677,7 +741,32 @@ impl KernelComposition {
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        Ok(pending.claim_at(unix_ms()))
+        loop {
+            let now = unix_ms();
+            let Some(ticket) = pending.claim_at(now) else {
+                return Ok(None);
+            };
+            let claim_expires_at = now
+                .saturating_add(AGENT_ACTIVATION_CLAIM_LEASE_MS)
+                .min(ticket.kernel_deadline_unix_ms);
+            match self.generation_gateway.ors.claim_activation_ticket(
+                &ticket.ticket_id,
+                "eliotd",
+                now,
+                claim_expires_at,
+            ) {
+                Ok(Some(_)) => return Ok(Some(ticket)),
+                Ok(None) | Err(_) => {
+                    pending.mark_lifecycle(
+                        &ticket.ticket_id,
+                        AgentActivationLifecycle::Reconciling,
+                    );
+                    pending.entries.remove(&ticket.ticket_id);
+                    self.agent_activation_changed.notify_waiters();
+                    return Err(TransportError::SessionFenced);
+                }
+            }
+        }
     }
 
     /// Validates that the ticket's bridge leg is still owned by the live
@@ -740,48 +829,58 @@ impl KernelComposition {
         Ok(())
     }
 
-    /// Decides whether a changed same-ticket submission may supersede a
-    /// retained `NotReady` deferral instead of conflicting.
-    ///
-    /// Terminality is decided by the retained submission phase, not by
-    /// re-matching text: only a record in phase `DeferredNotReady` can be
-    /// superseded at all. Within that phase, reconsideration additionally
-    /// requires due time (the new observation must not predate the retained
-    /// `not_before`) and fresh Governor evidence: a re-observed `NotReady`
-    /// must carry a changed named dependency revision for the same
-    /// dependency, while any non-`NotReady` outcome at or after due time is
-    /// itself the fresh evidence. Human detail and log text never
-    /// participate; only the retained phase plus typed disposition fields
-    /// decide.
+    /// Validates a result for a fresh successor ticket against its immutable
+    /// predecessor. Same-ticket replacement is intentionally absent.
     #[cfg(windows)]
-    fn not_ready_supersede_allowed(
-        retained: &AgentActivationResultRecord,
+    fn successor_result_allowed(
+        &self,
+        pending: &AgentActivationPendingState,
+        successor: &super::AgentActivationSuccessorBinding,
         incoming: &AgentActivationResolutionResult,
-    ) -> bool {
-        if retained.phase != AgentActivationResultPhase::DeferredNotReady {
-            return false;
+    ) -> Result<(), TransportError> {
+        let predecessor = pending
+            .results
+            .get(&successor.predecessor_ticket_id)
+            .ok_or(TransportError::IdentityConflict)?;
+        if predecessor.result.result_sha256 != successor.predecessor_result_sha256
+            || predecessor.result.ticket_id != successor.predecessor_ticket_id
+        {
+            return Err(TransportError::IdentityConflict);
         }
         let AgentActivationResolutionDisposition::NotReady {
-            retry: retained_retry,
+            retry: predecessor_retry,
             ..
-        } = &retained.result.disposition
+        } = &predecessor.result.disposition
         else {
-            return false;
+            return Err(TransportError::IdentityConflict);
         };
-        if incoming.resolved_at_unix_ms < retained_retry.not_before_unix_ms {
-            return false;
+        if incoming.resolved_at_unix_ms < predecessor_retry.not_before_unix_ms
+            || incoming.resolved_at_unix_ms < successor.not_before_unix_ms
+        {
+            return Err(TransportError::Timeout);
         }
-        match &incoming.disposition {
-            AgentActivationResolutionDisposition::NotReady {
-                retry: incoming_retry,
-                ..
-            } => {
-                incoming_retry.dependency_ref != retained_retry.dependency_ref
-                    || incoming_retry.observed_dependency_revision
-                        != retained_retry.observed_dependency_revision
-            }
-            _ => true,
+        let observation = incoming
+            .dependency_observation
+            .as_ref()
+            .ok_or(TransportError::IdentityConflict)?;
+        if predecessor.result.ticket_sha256 != successor.predecessor_ticket_sha256
+            || observation.dependency_ref != successor.dependency_ref
+            || observation.observed_dependency_revision
+                == successor.observed_dependency_revision
+        {
+            return Err(TransportError::IdentityConflict);
         }
+        if let AgentActivationResolutionDisposition::NotReady {
+            retry: incoming_retry,
+            ..
+        } = &incoming.disposition
+            && (incoming_retry.dependency_ref != observation.dependency_ref
+                || incoming_retry.observed_dependency_revision
+                    != observation.observed_dependency_revision)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
     }
 
     /// Maps one validated disposition to its retention phase: only
@@ -799,25 +898,88 @@ impl KernelComposition {
         }
     }
 
-    /// Decodes and validates the opaque ORS retention payloads before Kernel
-    /// construction can reach any readiness boundary. The result map is the
-    /// only state restored here; pending tickets, connections, leases, and
-    /// Sessions remain fresh-process state.
+    /// Decodes and validates one coherent ORS lifecycle/result snapshot before
+    /// Kernel readiness. No live connection, claim, pending entry, or Session is
+    /// restored; result-bearing and terminal/reconciling identities are.
     #[cfg(windows)]
-    pub(super) fn rehydrate_agent_activation_results(
+    pub(super) fn rehydrate_agent_activation_state(
         ors: &eliot_ors::RedbRecoveryStore,
-    ) -> Result<BTreeMap<String, AgentActivationResultRecord>, KernelBuildError> {
-        let records = ors.load_all_activation_results().map_err(|_| {
-            KernelBuildError::Ors("activation result retention load failed".to_owned())
+    ) -> Result<AgentActivationPendingState, KernelBuildError> {
+        let snapshot = ors.load_activation_recovery_snapshot().map_err(|_| {
+            KernelBuildError::Ors("activation recovery snapshot load failed".to_owned())
         })?;
-        if records.len() > eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS {
+        if snapshot.lifecycles.len() > eliot_ors::MAX_ACTIVATION_LIFECYCLE_RECORDS
+            || snapshot.results.len() > eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
+        {
             return Err(KernelBuildError::Ors(
-                "activation result retention bound exceeded".to_owned(),
+                "activation recovery retention bound exceeded".to_owned(),
             ));
+        }
+        let mut lifecycle = BTreeMap::new();
+        for durable in snapshot.lifecycles {
+            durable.validate().map_err(|_| {
+                KernelBuildError::Ors("activation lifecycle record is invalid".to_owned())
+            })?;
+            let ticket: AgentActivationResolutionTicket =
+                serde_json::from_str(&durable.ticket_payload).map_err(|_| {
+                    KernelBuildError::Ors("activation lifecycle ticket payload is invalid".to_owned())
+                })?;
+            ticket.validate().map_err(|_| {
+                KernelBuildError::Ors("activation lifecycle ticket validation failed".to_owned())
+            })?;
+            let ticket_json = serde_json::to_string(&ticket).map_err(|_| {
+                KernelBuildError::Ors("activation lifecycle ticket encoding failed".to_owned())
+            })?;
+            let fence_digest = sha256_json(&ticket.state_fence).map_err(|_| {
+                KernelBuildError::Ors("activation lifecycle fence digest failed".to_owned())
+            })?;
+            let ticket_successor = ticket.successor_of.as_ref().map(|successor| {
+                eliot_ors::ActivationSuccessorBinding {
+                    predecessor_ticket_id: successor.predecessor_ticket_id.clone(),
+                    predecessor_ticket_sha256: successor.predecessor_ticket_sha256.clone(),
+                    predecessor_result_sha256: successor.predecessor_result_sha256.clone(),
+                    dependency_ref: successor.dependency_ref.clone(),
+                    observed_dependency_revision: successor
+                        .observed_dependency_revision
+                        .clone(),
+                    not_before_unix_ms: successor.not_before_unix_ms,
+                }
+            });
+            if durable.ticket_id != ticket.ticket_id
+                || durable.ticket_sha256 != ticket.ticket_sha256
+                || durable.activation_request_id
+                    != ticket.activation_request_id.as_str()
+                || durable.activation_request_sha256 != ticket.activation_request_sha256
+                || durable.connection_id != ticket.connection_id
+                || durable.state_fence != fence_digest
+                || durable.kernel_deadline_unix_ms != ticket.kernel_deadline_unix_ms
+                || durable.ticket_payload != ticket_json
+                || durable.successor_of != ticket_successor
+                || matches!(
+                    durable.state,
+                    eliot_ors::ActivationLifecycleState::Pending
+                        | eliot_ors::ActivationLifecycleState::Claimed
+                )
+            {
+                return Err(KernelBuildError::Ors(
+                    "activation lifecycle identity validation failed".to_owned(),
+                ));
+            }
+            if lifecycle
+                .insert(
+                    durable.ticket_id.clone(),
+                    AgentActivationLifecycle::from(durable.state),
+                )
+                .is_some()
+            {
+                return Err(KernelBuildError::Ors(
+                    "activation lifecycle ticket identity is duplicated".to_owned(),
+                ));
+            }
         }
         let mut results = BTreeMap::new();
         let mut retention_orders = BTreeSet::new();
-        for retained in records {
+        for retained in snapshot.results {
             if !retention_orders.insert(retained.retention_order) {
                 return Err(KernelBuildError::Ors(
                     "activation result retention order is not unique".to_owned(),
@@ -859,6 +1021,19 @@ impl KernelComposition {
                     AgentActivationResolutionDisposition::NotReady { .. }
                 ),
             };
+            let lifecycle_matches = matches!(
+                (
+                    lifecycle.get(&ticket.ticket_id),
+                    retained.phase
+                ),
+                (
+                    Some(AgentActivationLifecycle::Accepted),
+                    eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal
+                ) | (
+                    Some(AgentActivationLifecycle::DeferredNotReady),
+                    eliot_ors::ActivationResultRetentionPhase::DeferredNotReady
+                )
+            );
             if retained.ticket_id != ticket.ticket_id
                 || retained.ticket_sha256 != ticket.ticket_sha256
                 || retained.result_sha256 != result.result_sha256
@@ -867,6 +1042,7 @@ impl KernelComposition {
                 || retained.ticket_payload != ticket_json
                 || retained.result_payload != result_json
                 || !phase_matches
+                || !lifecycle_matches
             {
                 return Err(KernelBuildError::Ors(
                     "activation result retention identity validation failed".to_owned(),
@@ -885,7 +1061,6 @@ impl KernelComposition {
                                 AgentActivationResultPhase::DeferredNotReady
                             }
                         },
-                        ticket_connection: ticket.connection_id,
                         retention_order: retained.retention_order,
                     },
                 )
@@ -896,89 +1071,18 @@ impl KernelComposition {
                 ));
             }
         }
-        Ok(results)
+        Ok(AgentActivationPendingState::from_rehydrated_results(
+            results, lifecycle,
+        ))
     }
 
     #[cfg(windows)]
-    fn validate_activation_result_ledgers(
-        pending: &AgentActivationPendingState,
-        raw: &BTreeMap<String, AgentActivationResultRecord>,
-    ) -> Result<(), TransportError> {
-        if !pending.result_ledger_is_consistent()
-            || raw.len() > eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
-        {
-            return Err(TransportError::SessionFenced);
-        }
-        let mut retention_orders = BTreeSet::new();
-        for (ticket_id, record) in raw {
-            if ticket_id != &record.result.ticket_id
-                || !retention_orders.insert(record.retention_order)
-                || Self::result_phase_for_disposition(&record.result.disposition) != record.phase
-            {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        let mut canonical_orders = BTreeSet::new();
-        for (ticket_id, canonical) in &pending.results {
-            if !canonical_orders.insert(canonical.retention_order)
-                || Self::result_phase_for_disposition(&canonical.result.disposition)
-                    != canonical.phase
-            {
-                return Err(TransportError::SessionFenced);
-            }
-            let Some(raw_record) = raw.get(ticket_id) else {
-                continue;
-            };
-            if canonical.result != raw_record.result
-                || canonical.phase != raw_record.phase
-                || canonical.ticket_connection != raw_record.ticket_connection
-                || canonical.retention_order != raw_record.retention_order
-            {
-                return Err(TransportError::IdentityConflict);
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn stage_raw_activation_results(
-        raw: &BTreeMap<String, AgentActivationResultRecord>,
-        pending: &AgentActivationPendingState,
-        record: AgentActivationResultRecord,
-    ) -> Option<BTreeMap<String, AgentActivationResultRecord>> {
-        let ticket_id = record.result.ticket_id.clone();
-        let required = if raw.contains_key(&ticket_id) {
-            0
-        } else {
-            raw.len()
-                .saturating_add(1)
-                .saturating_sub(eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS)
-        };
-        let mut candidates = raw
-            .iter()
-            .filter(|(candidate, _)| !pending.entries.contains_key(*candidate))
-            .map(|(candidate, existing)| (candidate.clone(), existing.retention_order))
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|(_, retention_order)| *retention_order);
-        if candidates.len() < required {
-            return None;
-        }
-        let mut staged = raw.clone();
-        for (victim, _) in candidates.into_iter().take(required) {
-            staged.remove(&victim)?;
-        }
-        staged.insert(ticket_id, record);
-        (staged.len() <= eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS).then_some(staged)
-    }
-
-    #[cfg(windows)]
-    fn retain_activation_result_durably(
+    pub(super) fn retain_activation_result_durably(
         &self,
         pending: &mut AgentActivationPendingState,
         ticket: &AgentActivationResolutionTicket,
         result: &AgentActivationResolutionResult,
         phase: AgentActivationResultPhase,
-        retain_canonical: bool,
     ) -> Result<(), TransportError> {
         let retention_phase = match phase {
             AgentActivationResultPhase::AcceptedTerminal => {
@@ -1002,159 +1106,95 @@ impl KernelComposition {
             phase: retention_phase,
             retention_order: 0,
         };
-        let canonical_stage = if retain_canonical {
-            Some(
-                pending
-                    .stage_result_retention(AgentActivationResultRecord {
-                        result: result.clone(),
-                        phase,
-                        ticket_connection: ticket.connection_id.clone(),
-                        retention_order: 0,
-                    })
-                    .ok_or(TransportError::SessionFenced)?,
-            )
-        } else {
-            if !pending.result_ledger_is_consistent() {
-                return Err(TransportError::SessionFenced);
-            }
-            None
-        };
-        // Keep the pending -> raw owner order through the durable write and
-        // both in-memory swaps. The staged map is prepared before ORS, so a
-        // capacity or identity fence cannot publish a raw/canonical fragment.
-        let mut results = self
-            .agent_activation_results
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        Self::validate_activation_result_ledgers(pending, &results)?;
-        let staged_raw = Self::stage_raw_activation_results(
-            &results,
-            pending,
-            AgentActivationResultRecord {
+        let canonical_stage = pending
+            .stage_result_retention(AgentActivationResultRecord {
                 result: result.clone(),
                 phase,
-                ticket_connection: ticket.connection_id.clone(),
-                retention_order: results
-                    .get(&ticket.ticket_id)
-                    .map_or(0, |existing| existing.retention_order),
-            },
-        )
-        .ok_or(TransportError::SessionFenced)?;
+                retention_order: 0,
+            })
+            .ok_or(TransportError::SessionFenced)?;
+        // ORS is the sole durable semantic authority. Its lifecycle/result CAS
+        // decides deadline, claim, successor, and immutable replay before the
+        // in-memory projection is published.
+        let dependency_observation = result
+            .dependency_observation
+            .as_ref()
+            .map(|observation| {
+                (
+                    observation.dependency_ref.as_str(),
+                    observation.observed_dependency_revision.as_str(),
+                )
+            });
         let retained = self
             .generation_gateway
             .ors
-            .retain_activation_result(&record)
-            .map_err(|_| TransportError::SessionFenced)?;
-        let mut staged_raw = staged_raw;
-        debug_assert!(staged_raw.contains_key(&retained.ticket_id));
-        if let Some(raw_record) = staged_raw.get_mut(&retained.ticket_id) {
-            raw_record.retention_order = retained.retention_order;
-        }
-        *results = staged_raw;
-        if let Some(staged) = canonical_stage {
-            pending.publish_staged_result_retention(
-                staged,
-                &retained.ticket_id,
-                retained.retention_order,
-            );
-        }
+            .commit_activation_result(
+                &record,
+                "eliotd",
+                dependency_observation,
+                unix_ms(),
+            )
+            .map_err(|error| match error {
+                eliot_ors::OrsError::ActivationLifecycleExpired { .. } => {
+                    TransportError::Timeout
+                }
+                eliot_ors::OrsError::ActivationLifecycleIdentityConflict { .. }
+                | eliot_ors::OrsError::ActivationResultRetentionIdentityConflict { .. }
+                | eliot_ors::OrsError::ActivationLifecycleStateConflict { .. } => {
+                    TransportError::IdentityConflict
+                }
+                _ => TransportError::SessionFenced,
+            })?;
+        pending.publish_staged_result_retention(
+            canonical_stage,
+            &retained.ticket_id,
+            retained.retention_order,
+        );
         Ok(())
     }
 
-    /// Submits against an already-retained per-ticket record: exact digest
-    /// replay is idempotent, and a changed result supersedes only a
-    /// still-open `NotReady` deferral that meets the due-time plus
-    /// changed-revision gate. Anything else is an identity conflict.
+    /// Submits against an already-retained per-ticket record. Exact digest
+    /// replay returns the same stable acknowledgement; every changed payload
+    /// under the immutable ticket is an identity conflict. Reconsideration
+    /// uses a fresh successor ticket, never a same-ticket replacement.
     ///
-    /// The caller holds `agent_activation_pending` for the whole operation.
-    /// That lock is the existing Kernel owner for the canonical-v2 pending
-    /// ledger and therefore also serializes this compatibility leg with the
-    /// raw P-04 submission path before either path can write its result.
+    /// The caller holds `agent_activation_pending` across the durable identity
+    /// decision and in-memory publication.
     #[cfg(windows)]
     fn submit_against_retained_result(
         &self,
-        pending: &mut AgentActivationPendingState,
-        entry_ticket: Option<AgentActivationResolutionTicket>,
+        _pending: &mut AgentActivationPendingState,
+        _entry_ticket: Option<AgentActivationResolutionTicket>,
         retained: &AgentActivationResultRecord,
         incoming: AgentActivationResolutionResult,
     ) -> Result<AgentActivationResultAck, TransportError> {
-        let ticket_id = incoming.ticket_id.clone();
+        if Self::result_phase_for_disposition(&retained.result.disposition) != retained.phase {
+            return Err(TransportError::SessionFenced);
+        }
         match classify_activation_result(Some(&retained.result), &incoming) {
             ActivationResultDisposition::ExactReplay => {
-                return AgentActivationResultAck::replayed(&retained.result)
+                return AgentActivationResultAck::accepted(&retained.result)
                     .map_err(|_| TransportError::SessionFenced);
             }
-            ActivationResultDisposition::Commit => {
-                return Err(TransportError::SessionFenced);
+            // ORS retains one immutable result identity per ticket. A changed
+            // same-ticket result is never a NotReady replacement; only a fresh
+            // successor ticket can be considered by the admission path.
+            ActivationResultDisposition::Commit | ActivationResultDisposition::Conflict => {
+                Err(TransportError::IdentityConflict)
             }
-            ActivationResultDisposition::Conflict => {}
         }
-        // A changed result supersedes only a still-open `NotReady`
-        // deferral that meets the due-time plus changed-revision gate.
-        // The bridge leg must still be open (pending entry present):
-        // once the waiter has projected, the record is terminal and any
-        // changed result conflicts, so no orphaned Session can be minted
-        // for a completed bridge.
-        let Some(entry_ticket) = entry_ticket else {
-            return Err(TransportError::IdentityConflict);
-        };
-        if !Self::not_ready_supersede_allowed(retained, &incoming) {
-            return Err(TransportError::IdentityConflict);
-        }
-        incoming
-            .validate_against(&entry_ticket)
-            .map_err(|_| TransportError::SessionFenced)?;
-        self.validate_result_bridge_leg(&entry_ticket)?;
-        if !pending.entries.contains_key(&ticket_id)
-            || pending
-                .results
-                .get(&ticket_id)
-                .is_some_and(|record| record.result.result_sha256 != retained.result.result_sha256)
-        {
-            return Err(TransportError::IdentityConflict);
-        }
-        let phase = Self::result_phase_for_disposition(&incoming.disposition);
-        let ack = AgentActivationResultAck::accepted(&incoming)
-            .map_err(|_| TransportError::SessionFenced)?;
-        self.retain_activation_result_durably(pending, &entry_ticket, &incoming, phase, true)?;
-        self.agent_activation_changed.notify_waiters();
-        Ok(ack)
     }
 
-    /// Returns one ticket's retained identity across both in-process result
-    /// representations while the caller holds the pending-state mutex.
-    ///
-    /// `pending.results` is the canonical-v2 envelope ledger and
-    /// `agent_activation_results` is the raw P-04 compatibility ledger. They
-    /// may contain the same exact result, but a changed same-ticket result is
-    /// never resolved by preferring one representation. The check happens
-    /// before the caller can reach durable retention, making the existing
-    /// Kernel owner the cross-representation CAS guard.
+    /// Returns the canonical in-memory projection of the durable result.
+    /// The ORS mirror is checked only during the publish transaction; it is
+    /// never consulted as an alternate semantic result source.
     #[cfg(windows)]
     fn retained_activation_result_for_ticket(
         &self,
         pending: &AgentActivationPendingState,
         ticket_id: &str,
     ) -> Result<Option<AgentActivationResultRecord>, TransportError> {
-        let raw = self
-            .agent_activation_results
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        Self::validate_activation_result_ledgers(pending, &raw)?;
-        let canonical = pending.results.get(ticket_id).cloned();
-        let raw = raw.get(ticket_id).cloned();
-        match (canonical, raw) {
-            (Some(canonical), Some(raw))
-                if canonical.result != raw.result
-                    || canonical.phase != raw.phase
-                    || canonical.ticket_connection != raw.ticket_connection
-                    || canonical.retention_order != raw.retention_order =>
-            {
-                Err(TransportError::IdentityConflict)
-            }
-            (Some(canonical), _) => Ok(Some(canonical)),
-            (None, raw) => Ok(raw),
-        }
+        Ok(pending.results.get(ticket_id).cloned())
     }
 
     /// Accepts one v2 semantic result for its exact pending ticket. This is
@@ -1169,11 +1209,23 @@ impl KernelComposition {
     /// expiry, which never invalidates a terminal accepted result); a
     /// changed same-ticket result is `IdentityConflict` unless it meets the
     /// `NotReady` supersede gate while the bridge leg is still open.
-    #[cfg(windows)]
+    #[cfg(all(test, windows))]
     pub(super) fn submit_agent_activation_result(
         &self,
         submit: AgentActivationResultSubmit,
     ) -> Result<AgentActivationResultAck, TransportError> {
+        self.submit_agent_activation_result_authenticated(submit, None, None)
+    }
+
+    pub(super) fn submit_agent_activation_result_authenticated(
+        &self,
+        submit: AgentActivationResultSubmit,
+        session: Option<&Session>,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<AgentActivationResultAck, TransportError> {
+        if let (Some(session), Some(identity)) = (session, request_identity) {
+            Self::validate_activation_submitter(session, Some(identity))?;
+        }
         observe_bridge("kernel.bridge_activation_result_submit", "attempt");
         // Unknown submission versions are rejected before any inner result
         // field is adopted.
@@ -1191,13 +1243,11 @@ impl KernelComposition {
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        let entry_ticket = pending
-            .entries
-            .get(&ticket_id)
-            .map(|entry| entry.ticket.clone());
+        let entry = pending.entries.get(&ticket_id).cloned();
+        let entry_ticket = entry.as_ref().map(|entry| entry.ticket.clone());
         // Restart rehydrates the durable result ledger, while pending tickets
-        // remain fresh-process state. Classify both retained representations
-        // before requiring a live pending entry or consulting the deadline.
+        // remain fresh-process state. Classify retained identities before
+        // requiring a live pending entry or consulting the deadline.
         let retained = self.retained_activation_result_for_ticket(&pending, &ticket_id)?;
         if let Some(retained) = retained {
             return self.submit_against_retained_result(
@@ -1211,6 +1261,35 @@ impl KernelComposition {
         let Some(entry_ticket) = entry_ticket else {
             return Err(TransportError::UnknownRequest);
         };
+        if matches!(
+            pending.lifecycle(&ticket_id),
+            AgentActivationLifecycle::Cancelled
+                | AgentActivationLifecycle::Expired
+                | AgentActivationLifecycle::Reconciling
+        ) {
+            return Err(TransportError::IdentityConflict);
+        }
+        if let Some(successor) = entry.as_ref().and_then(|entry| entry.successor_of.as_ref()) {
+            let ticket_predecessor = entry_ticket
+                .successor_of
+                .as_ref()
+                .ok_or(TransportError::IdentityConflict)?;
+            if ticket_predecessor.predecessor_ticket_id != successor.predecessor_ticket_id
+                || ticket_predecessor.predecessor_ticket_sha256
+                    != successor.predecessor_ticket_sha256
+                || ticket_predecessor.predecessor_result_sha256
+                    != successor.predecessor_result_sha256
+                || ticket_predecessor.dependency_ref != successor.dependency_ref
+                || ticket_predecessor.observed_dependency_revision
+                    != successor.observed_dependency_revision
+                || ticket_predecessor.not_before_unix_ms != successor.not_before_unix_ms
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            self.successor_result_allowed(&pending, successor, &incoming)?;
+        } else if entry_ticket.successor_of.is_some() {
+            return Err(TransportError::IdentityConflict);
+        }
         incoming
             .validate_against(&entry_ticket)
             .map_err(|_| TransportError::SessionFenced)?;
@@ -1228,7 +1307,15 @@ impl KernelComposition {
         let phase = Self::result_phase_for_disposition(&incoming.disposition);
         let ack = AgentActivationResultAck::accepted(&incoming)
             .map_err(|_| TransportError::SessionFenced)?;
-        self.retain_activation_result_durably(&mut pending, &entry_ticket, &incoming, phase, true)?;
+        self.retain_activation_result_durably(&mut pending, &entry_ticket, &incoming, phase)?;
+        pending.mark_lifecycle(
+            &ticket_id,
+            if phase == AgentActivationResultPhase::DeferredNotReady {
+                AgentActivationLifecycle::DeferredNotReady
+            } else {
+                AgentActivationLifecycle::Accepted
+            },
+        );
         pending.fifo.retain(|queued_id| queued_id != &ticket_id);
         drop(pending);
         self.agent_activation_changed.notify_waiters();
@@ -1242,127 +1329,52 @@ impl KernelComposition {
     /// an unknown ticket returns a typed `Unknown` so the daemon resubmits
     /// its retained result instead of re-reading, and a digest mismatch is
     /// an identity conflict that must never overwrite retention.
-    #[cfg(windows)]
+    #[cfg(all(test, windows))]
     pub(super) fn reconcile_agent_activation_result(
         &self,
         query: &AgentActivationResultReconcile,
     ) -> Result<AgentActivationResultAck, TransportError> {
+        self.reconcile_agent_activation_result_authenticated(query, None, None)
+    }
+
+    pub(super) fn reconcile_agent_activation_result_authenticated(
+        &self,
+        query: &AgentActivationResultReconcile,
+        session: Option<&Session>,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<AgentActivationResultAck, TransportError> {
+        if let (Some(session), Some(identity)) = (session, request_identity) {
+            Self::validate_activation_submitter(session, Some(identity))?;
+        }
         observe_bridge("kernel.bridge_activation_reconcile", "attempt");
         query
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
-        let pending = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let results = self
-            .agent_activation_results
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        Self::validate_activation_result_ledgers(&pending, &results)?;
-        match results.get(&query.ticket_id) {
-            None => {
-                AgentActivationResultAck::unknown(query).map_err(|_| TransportError::SessionFenced)
+        let retained = match self.generation_gateway.ors.load_activation_result(
+            &query.ticket_id,
+            &query.result_sha256,
+        ) {
+            Ok(retained) => retained,
+            Err(eliot_ors::OrsError::ActivationResultRetentionIdentityConflict { .. }) => {
+                return Err(TransportError::IdentityConflict);
             }
-            Some(record) if record.result.result_sha256 == query.result_sha256 => {
-                AgentActivationResultAck::reconciled(&record.result)
-                    .map_err(|_| TransportError::SessionFenced)
-            }
-            Some(_) => Err(TransportError::IdentityConflict),
-        }
-    }
-
-    /// Classifies one typed resolution result against the retained ledger.
-    ///
-    /// An exact replay of the same ticket, digests, fence, observation
-    /// instant, and disposition commits nothing new; any changed binding under
-    /// the same ticket identity is a conflict. Dispositions are compared as
-    /// opaque typed values: no disposition outranks another here.
-    #[cfg(windows)]
-    fn classify_activation_result_for_entry(
-        existing: Option<&AgentActivationResolutionResult>,
-        incoming: &AgentActivationResolutionResult,
-    ) -> ActivationDecisionDisposition {
-        match existing {
-            None => ActivationDecisionDisposition::Commit,
-            Some(existing) if existing == incoming => ActivationDecisionDisposition::ExactReplay,
-            Some(_) => ActivationDecisionDisposition::Conflict,
-        }
-    }
-
-    /// Records one full typed semantic resolution result for its exact ticket.
-    ///
-    /// The result is stored verbatim in the ticket-keyed result map beside
-    /// the pending table: all seven closed dispositions (`Resolved`,
-    /// `TaskSelectionRequired`, `ScopeSelectionRequired`, `ScopeAmbiguous`,
-    /// `NotReady`, `StaleFence`, `FailedInternal`) share one
-    /// exact-replay/conflict ledger and one Kernel ticket deadline. No
-    /// disposition is mapped, selected, or completed here, and no transport
-    /// Session is created here for any disposition. The bridge await path
-    /// creates a Session only for a `Resolved` disposition.
-    #[cfg(windows)]
-    pub(super) fn submit_agent_activation_resolution_result(
-        &self,
-        result: AgentActivationResolutionResult,
-    ) -> Result<(), TransportError> {
+            Err(_) => return Err(TransportError::SessionFenced),
+        };
+        let Some(retained) = retained else {
+            return AgentActivationResultAck::unknown(query)
+                .map_err(|_| TransportError::SessionFenced);
+        };
+        let result: AgentActivationResolutionResult =
+            serde_json::from_str(&retained.result_payload)
+                .map_err(|_| TransportError::SessionFenced)?;
         result
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
-        let _transition = self.agent_bridge_transition_read()?;
-        // Hold the same Kernel owner guard used by the canonical-v2 submit
-        // path. The raw P-04 compatibility result must win or fail against
-        // both representations before ORS or either in-memory ledger writes.
-        let mut pending = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        // The durable result ledger is rehydrated before any fresh pending
-        // tickets are admitted. Classify replay/conflict first so a retained
-        // terminal negative cannot be laundered into Timeout after restart.
-        let retained = self.retained_activation_result_for_ticket(&pending, &result.ticket_id)?;
-        match Self::classify_activation_result_for_entry(
-            retained.as_ref().map(|record| &record.result),
-            &result,
-        ) {
-            ActivationDecisionDisposition::ExactReplay => return Ok(()),
-            ActivationDecisionDisposition::Conflict => {
-                return Err(TransportError::IdentityConflict);
-            }
-            ActivationDecisionDisposition::Commit => {}
-        }
-        let entry_ticket = pending
-            .entries
-            .get(&result.ticket_id)
-            .map(|entry| entry.ticket.clone())
-            .ok_or(TransportError::UnknownRequest)?;
-        result
-            .validate_against(&entry_ticket)
-            .map_err(|_| TransportError::SessionFenced)?;
-        match Self::classify_activation_result_for_entry(
-            retained.as_ref().map(|record| &record.result),
-            &result,
-        ) {
-            ActivationDecisionDisposition::ExactReplay => return Ok(()),
-            ActivationDecisionDisposition::Conflict => {
-                return Err(TransportError::IdentityConflict);
-            }
-            ActivationDecisionDisposition::Commit => {}
-        }
-        if activation_deadline_expired(unix_ms(), entry_ticket.kernel_deadline_unix_ms) {
-            return Err(TransportError::Timeout);
-        }
-        let ticket_id = entry_ticket.ticket_id.clone();
-        if !pending.entries.contains_key(&ticket_id) {
+        if result.ticket_id != query.ticket_id || result.result_sha256 != query.result_sha256 {
             return Err(TransportError::IdentityConflict);
         }
-        let phase = Self::result_phase_for_disposition(&result.disposition);
-        self.retain_activation_result_durably(&mut pending, &entry_ticket, &result, phase, false)?;
-        pending.fifo.retain(|queued_id| queued_id != &ticket_id);
-        drop(pending);
-        drop(result);
-        self.agent_activation_changed.notify_waiters();
-        Ok(())
+        AgentActivationResultAck::accepted(&result).map_err(|_| TransportError::SessionFenced)
     }
 
     /// Maps one non-`Resolved` daemon disposition to its exact agent-visible
@@ -1445,7 +1457,13 @@ impl KernelComposition {
             | AgentActivationResolutionDisposition::FailedInternal { .. } => {
                 let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
                     .ok_or(TransportError::SessionFenced)?;
-                self.denied_result_response_frame(connection_id, original, pending, reason_code)
+                self.denied_result_response_frame(
+                    connection_id,
+                    original,
+                    pending,
+                    result,
+                    reason_code,
+                )
             }
         }
     }
@@ -1461,7 +1479,7 @@ impl KernelComposition {
     /// other disposition revokes the connection and returns the immediate
     /// typed denial carrying that disposition's exact denial code, without
     /// creating a Session. The match stays exhaustive with no wildcard arm.
-    #[cfg(windows)]
+    #[cfg(all(test, windows))]
     pub(super) fn activation_result_response(
         &self,
         connection_id: &str,
@@ -1473,7 +1491,7 @@ impl KernelComposition {
         self.activation_result_response_under_transition(connection_id, frame, ticket_id, result)
     }
 
-    #[cfg(windows)]
+    #[cfg(all(test, windows))]
     fn activation_result_response_under_transition(
         &self,
         connection_id: &str,
@@ -1523,31 +1541,17 @@ impl KernelComposition {
             | AgentActivationResolutionDisposition::NotReady { .. }
             | AgentActivationResolutionDisposition::StaleFence { .. }
             | AgentActivationResolutionDisposition::FailedInternal { .. } => {
-                pending.entries.remove(ticket_id);
-                self.revoke_agent_bridge_under_transition(connection_id, &mut pending)?;
                 let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
                     .ok_or(TransportError::SessionFenced)?;
-                let response =
-                    AgentBridgeActivationResponse::denied(&pending_entry.request, reason_code)
-                        .map_err(|_| TransportError::SessionFenced)?;
-                response
-                    .validate_request(&pending_entry.request)
-                    .map_err(|_| TransportError::SessionFenced)?;
-                let reply = Frame {
-                    protocol_version: frame.protocol_version,
-                    encoding_profile: frame.encoding_profile,
-                    connection_id: connection_id.to_owned(),
-                    request_id: Some(response.request_id.clone()),
-                    kind: FrameKind::Response,
-                    message_type: MessageType::Result,
-                    request_identity: None,
-                    payload: ProtocolPayload::Json(
-                        serde_json::to_value(response)
-                            .map_err(|_| TransportError::SessionFenced)?,
-                    ),
-                    trace_context: frame.trace_context.clone(),
-                };
-                reply.validate()?;
+                let reply = self.denied_result_response_frame(
+                    connection_id,
+                    frame,
+                    &pending_entry,
+                    result,
+                    reason_code,
+                )?;
+                pending.entries.remove(ticket_id);
+                self.revoke_agent_bridge_under_transition(connection_id, &mut pending)?;
                 Ok(reply)
             }
         }
@@ -1560,7 +1564,7 @@ impl KernelComposition {
     /// ticket and Governor-owned result, and the fresh Session nonce is the
     /// only Kernel-minted value. It is never called for a non-`Resolved`
     /// disposition.
-    #[cfg(windows)]
+    #[cfg(all(test, windows))]
     fn activation_response_frame_for_resolution(
         &self,
         connection_id: &str,
@@ -1571,6 +1575,13 @@ impl KernelComposition {
     ) -> Result<Frame, TransportError> {
         result
             .validate_against(&pending.ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let owner_evidence = result
+            .owner_evidence
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        owner_evidence
+            .validate_against_binding(binding, &pending.ticket.state_fence)
             .map_err(|_| TransportError::SessionFenced)?;
         if pending.ticket.ticket_id != result.ticket_id
             || pending.ticket.connection_id != connection_id
@@ -1657,6 +1668,7 @@ impl KernelComposition {
             disposition: eliot_protocol::AgentBridgeActivationDisposition::Authenticated {
                 binding: Box::new(authenticated),
             },
+            resolution: None,
             response_sha256: String::new(),
         }
         .with_computed_digest()
@@ -1699,10 +1711,15 @@ impl KernelComposition {
         connection_id: &str,
         original: &Frame,
         pending: &AgentActivationPending,
+        result: &AgentActivationResolutionResult,
         reason_code: AgentBridgeActivationDenialCode,
     ) -> Result<Frame, TransportError> {
-        let response = AgentBridgeActivationResponse::denied(&pending.request, reason_code)
-            .map_err(|_| TransportError::SessionFenced)?;
+        let response = AgentBridgeActivationResponse::denied_with_resolution(
+            &pending.request,
+            reason_code,
+            result.clone(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
         response
             .validate_request(&pending.request)
             .map_err(|_| TransportError::SessionFenced)?;
@@ -1763,8 +1780,7 @@ impl KernelComposition {
         let ticket = self.enqueue_agent_bridge_activation(connection_id, frame)?;
         loop {
             enum BridgeWaiterOutcome {
-                V2ResultAvailable,
-                RawResultAvailable,
+                ResultAvailable,
                 Waiting,
                 Gone,
             }
@@ -1774,54 +1790,20 @@ impl KernelComposition {
                     .agent_activation_pending
                     .lock()
                     .map_err(|_| TransportError::SessionFenced)?;
-                // Priority preserves each side's relative order: the v2
-                // envelope result wins over the unenveloped P-04 result
-                // (v2 production path). An accepted result on any leg
-                // always wins the deadline race below.
                 match pending.entries.get(&ticket.ticket_id) {
                     None => BridgeWaiterOutcome::Gone,
-                    Some(_) => {
-                        if pending.results.contains_key(&ticket.ticket_id) {
-                            BridgeWaiterOutcome::V2ResultAvailable
-                        } else {
-                            drop(pending);
-                            if self
-                                .agent_activation_results
-                                .lock()
-                                .map_err(|_| TransportError::SessionFenced)?
-                                .contains_key(&ticket.ticket_id)
-                            {
-                                BridgeWaiterOutcome::RawResultAvailable
-                            } else {
-                                BridgeWaiterOutcome::Waiting
-                            }
-                        }
+                    Some(_) if pending.results.contains_key(&ticket.ticket_id) => {
+                        BridgeWaiterOutcome::ResultAvailable
                     }
+                    Some(_) => BridgeWaiterOutcome::Waiting,
                 }
             };
             match outcome {
-                BridgeWaiterOutcome::V2ResultAvailable => {
+                BridgeWaiterOutcome::ResultAvailable => {
                     return self.project_retained_activation_result(
                         connection_id,
                         frame,
                         &ticket.ticket_id,
-                    );
-                }
-                BridgeWaiterOutcome::RawResultAvailable => {
-                    let result = {
-                        self.agent_activation_results
-                            .lock()
-                            .map_err(|_| TransportError::SessionFenced)?
-                            .get(&ticket.ticket_id)
-                            .cloned()
-                            .ok_or(TransportError::SessionFenced)?
-                            .result
-                    };
-                    return self.activation_result_response(
-                        connection_id,
-                        frame,
-                        &ticket.ticket_id,
-                        &result,
                     );
                 }
                 BridgeWaiterOutcome::Gone => {
@@ -1914,12 +1896,36 @@ impl KernelComposition {
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
+        if pending.results.contains_key(&ticket.ticket_id) {
+            drop(pending);
+            return self.project_retained_activation_result_under_transition(
+                connection_id,
+                frame,
+                &ticket.ticket_id,
+            );
+        }
         let request = pending
             .entries
             .get(&ticket.ticket_id)
             .ok_or(TransportError::SessionFenced)?
             .request
             .clone();
+        self.generation_gateway
+            .ors
+            .terminate_activation_without_result(
+                &ticket.ticket_id,
+                eliot_ors::ActivationLifecycleState::Expired,
+                "deadline elapsed before result retention",
+                unix_ms(),
+            )
+            .map_err(|error| match error {
+                eliot_ors::OrsError::ActivationLifecycleIdentityConflict { .. }
+                | eliot_ors::OrsError::ActivationResultRetentionIdentityConflict { .. } => {
+                    TransportError::IdentityConflict
+                }
+                _ => TransportError::SessionFenced,
+            })?;
+        pending.mark_lifecycle(&ticket.ticket_id, AgentActivationLifecycle::Expired);
         pending.entries.remove(&ticket.ticket_id);
         self.revoke_agent_bridge_under_transition(connection_id, &mut pending)?;
         // Result-less expiry has no daemon disposition to project, so it keeps
@@ -2083,6 +2089,47 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    fn persist_resultless_activation_revocation(
+        &self,
+        pending: &mut AgentActivationPendingState,
+        ticket_id: &str,
+        reason: &'static str,
+    ) -> Result<(), TransportError> {
+        if pending.results.contains_key(ticket_id) {
+            return Ok(());
+        }
+        let target = match pending.lifecycle(ticket_id) {
+            AgentActivationLifecycle::Pending => eliot_ors::ActivationLifecycleState::Cancelled,
+            AgentActivationLifecycle::Claimed => {
+                eliot_ors::ActivationLifecycleState::Reconciling
+            }
+            AgentActivationLifecycle::Cancelled => return Ok(()),
+            AgentActivationLifecycle::Expired => return Ok(()),
+            AgentActivationLifecycle::Reconciling => return Ok(()),
+            AgentActivationLifecycle::Accepted | AgentActivationLifecycle::DeferredNotReady => {
+                return Err(TransportError::IdentityConflict);
+            }
+        };
+        self.generation_gateway
+            .ors
+            .terminate_activation_without_result(ticket_id, target, reason, unix_ms())
+            .map_err(|_| TransportError::SessionFenced)?;
+        pending.mark_lifecycle(
+            ticket_id,
+            match target {
+                eliot_ors::ActivationLifecycleState::Cancelled => {
+                    AgentActivationLifecycle::Cancelled
+                }
+                eliot_ors::ActivationLifecycleState::Reconciling => {
+                    AgentActivationLifecycle::Reconciling
+                }
+                _ => return Err(TransportError::SessionFenced),
+            },
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
     fn cleanup_agent_bridge_activation_response_under_transition(
         &self,
         connection_id: &str,
@@ -2106,6 +2153,11 @@ impl KernelComposition {
             .map(|(ticket_id, _)| ticket_id.clone())
             .collect::<Vec<_>>();
         for ticket_id in &removed {
+            self.persist_resultless_activation_revocation(
+                pending,
+                ticket_id,
+                "bridge response cleanup reached a resultless terminal boundary",
+            )?;
             pending.entries.remove(ticket_id);
         }
         let live_ticket_ids = pending.entries.keys().cloned().collect::<BTreeSet<_>>();
@@ -2187,6 +2239,11 @@ impl KernelComposition {
             .map(|(ticket_id, _)| ticket_id.clone())
             .collect::<Vec<_>>();
         for ticket_id in &removed {
+            self.persist_resultless_activation_revocation(
+                pending,
+                ticket_id,
+                "bridge response cleanup reached a resultless terminal boundary",
+            )?;
             pending.entries.remove(ticket_id);
         }
         let live_ticket_ids = pending.entries.keys().cloned().collect::<BTreeSet<_>>();

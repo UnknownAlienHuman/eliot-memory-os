@@ -1,0 +1,13 @@
+C:\Development\Rust\projects\eliot-swarm\W4-1115\targets\W-1115-clippy\debug\deps\aes-8c5618e4001d20d1.d: C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\lib.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\soft.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\soft\fixslice64.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\autodetect.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\utils.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\aes128.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\aes192.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\aes256.rs
+
+C:\Development\Rust\projects\eliot-swarm\W4-1115\targets\W-1115-clippy\debug\deps\libaes-8c5618e4001d20d1.rmeta: C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\lib.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\soft.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\soft\fixslice64.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\autodetect.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\utils.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\aes128.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\aes192.rs C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\aes256.rs
+
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\lib.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\soft.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\soft\fixslice64.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\autodetect.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\utils.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\aes128.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\aes192.rs:
+C:\Users\kleym\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\aes-0.8.4\src\ni\aes256.rs:

@@ -144,6 +144,7 @@ pub enum RowFamilyKind {
     UnknownCommitRecovery,
     CutoverOwnership,
     HostRequests,
+    ActivationLifecycle,
     ActivationResultRetention,
     NativeWorkerClaims,
     ReplayStreams,
@@ -178,6 +179,7 @@ impl RowFamilyKind {
             Self::StoreRebindReplay | Self::StoreFailureRetention => RowDisposition::ForensicOnly,
             Self::AuthorityHandoffs
             | Self::HostRequests
+            | Self::ActivationLifecycle
             | Self::ActivationResultRetention
             | Self::NativeWorkerClaims
             | Self::CutoverOwnership => RowDisposition::NonrestorableHistorical,

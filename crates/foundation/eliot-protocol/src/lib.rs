@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::{AgentActivationResolutionDisposition, AgentActivationResolutionResult};
+
 mod pipe_name;
 pub mod reactive_context;
 pub use pipe_name::{
@@ -150,6 +152,14 @@ pub const AGENT_BRIDGE_NOT_READY: &str = "NOT_READY";
 pub const AGENT_BRIDGE_STALE_FENCE: &str = "STALE_FENCE";
 /// Stable denial code projecting a daemon `FAILED_INTERNAL` disposition.
 pub const AGENT_BRIDGE_FAILED_INTERNAL: &str = "FAILED_INTERNAL";
+/// I7.20 state/conflict alias for an ambiguous scope result.
+pub const AGENT_BRIDGE_AMBIGUOUS_RESULT: &str = "AMBIGUOUS_RESULT";
+/// I7.20 state/conflict alias for a stale State Fence result.
+pub const AGENT_BRIDGE_STALE_STATE_FENCE: &str = "STALE_STATE_FENCE";
+/// I7.20 capacity alias for a result-less deadline outcome.
+pub const AGENT_BRIDGE_DEADLINE_EXCEEDED: &str = "DEADLINE_EXCEEDED";
+/// I7.20 security/recovery alias for an unknown result-less outcome.
+pub const AGENT_BRIDGE_UNKNOWN_OUTCOME: &str = "UNKNOWN_OUTCOME";
 /// Stable wire identity for a Kernel-to-eliotd semantic-resolution ticket.
 pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-ticket";
@@ -1772,6 +1782,55 @@ impl AgentBridgeActivationRequest {
     }
 }
 
+/// Immutable predecessor binding carried by one fresh successor ticket.
+///
+/// The predecessor result remains immutable. This evidence lets the trusted
+/// semantic owner observe the exact named dependency on a later read and lets
+/// Kernel reject early or unchanged-revision reconsideration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActivationTicketPredecessor {
+    pub predecessor_ticket_id: String,
+    pub predecessor_ticket_sha256: String,
+    pub predecessor_result_sha256: String,
+    pub dependency_ref: String,
+    pub observed_dependency_revision: String,
+    pub not_before_unix_ms: u64,
+}
+
+impl AgentActivationTicketPredecessor {
+    /// Validates the bounded predecessor identity and due-time shape.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        text(
+            &self.predecessor_ticket_id,
+            "agent_activation_resolution_ticket.predecessor_ticket_id",
+        )?;
+        lowercase_sha256(
+            &self.predecessor_ticket_sha256,
+            "agent_activation_resolution_ticket.predecessor_ticket_sha256",
+        )?;
+        lowercase_sha256(
+            &self.predecessor_result_sha256,
+            "agent_activation_resolution_ticket.predecessor_result_sha256",
+        )?;
+        text(
+            &self.dependency_ref,
+            "agent_activation_resolution_ticket.dependency_ref",
+        )?;
+        text(
+            &self.observed_dependency_revision,
+            "agent_activation_resolution_ticket.observed_dependency_revision",
+        )?;
+        if self.not_before_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_ticket.not_before_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Correlation-only ticket handed from Kernel to the trusted eliotd resolver.
 ///
 /// This binds the exact pre-semantic request and transport receipt without
@@ -1798,6 +1857,9 @@ pub struct AgentActivationResolutionTicket {
     pub state_fence: StateFence,
     /// Kernel-owned absolute resolution deadline.
     pub kernel_deadline_unix_ms: u64,
+    /// Exact durable predecessor evidence when this is a fresh successor.
+    #[serde(default)]
+    pub successor_of: Option<AgentActivationTicketPredecessor>,
     /// Lowercase SHA-256 over every ticket field except this field.
     pub ticket_sha256: String,
 }
@@ -1869,6 +1931,15 @@ impl AgentActivationResolutionTicket {
                 field: "agent_activation_resolution_ticket.kernel_deadline_unix_ms",
                 reason: "must be greater than zero",
             });
+        }
+        if let Some(predecessor) = &self.successor_of {
+            predecessor.validate()?;
+            if predecessor.not_before_unix_ms >= self.kernel_deadline_unix_ms {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_resolution_ticket.successor_of",
+                    reason: "successor due time must precede the fresh ticket deadline",
+                });
+            }
         }
         lowercase_sha256(
             &self.ticket_sha256,
@@ -2111,6 +2182,10 @@ pub struct AgentBridgeActivationResponse {
     pub request_sha256: String,
     /// Typed activation outcome.
     pub disposition: AgentBridgeActivationDisposition,
+    /// Exact daemon semantic result for a result-bearing denial. Kernel-owned
+    /// refusals and result-less expiry carry `None`.
+    #[serde(default)]
+    pub resolution: Option<AgentActivationResolutionResult>,
     /// Lowercase SHA-256 over every response field except this field.
     pub response_sha256: String,
 }
@@ -2134,9 +2209,33 @@ impl AgentBridgeActivationResponse {
             request_id: request.request_identity.request.metadata.request_id.clone(),
             request_sha256: request.request_sha256.clone(),
             disposition: AgentBridgeActivationDisposition::Denied { reason_code },
+            resolution: None,
             response_sha256: String::new(),
         }
         .with_computed_digest()
+    }
+
+    /// Constructs a result-bearing denial while retaining the exact typed
+    /// daemon result for the agent-facing surface.
+    pub fn denied_with_resolution(
+        request: &AgentBridgeActivationRequest,
+        reason_code: AgentBridgeActivationDenialCode,
+        resolution: AgentActivationResolutionResult,
+    ) -> Result<Self, ProtocolError> {
+        request.validate()?;
+        resolution.validate()?;
+        let response = Self {
+            wire_id: AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID.to_owned(),
+            wire_version: Self::CONTRACT_VERSION,
+            request_id: request.request_identity.request.metadata.request_id.clone(),
+            request_sha256: request.request_sha256.clone(),
+            disposition: AgentBridgeActivationDisposition::Denied { reason_code },
+            resolution: Some(resolution),
+            response_sha256: String::new(),
+        }
+        .with_computed_digest()?;
+        response.validate_resolution_against(reason_code)?;
+        Ok(response)
     }
 
     /// Returns canonical bytes covered by `response_sha256`.
@@ -2186,6 +2285,70 @@ impl AgentBridgeActivationResponse {
             return Err(ProtocolError::InvalidField {
                 field: "agent_bridge_activation_response.response_sha256",
                 reason: "activation response digest mismatch",
+            });
+        }
+        match &self.disposition {
+            AgentBridgeActivationDisposition::Authenticated { .. } if self.resolution.is_some() => {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_bridge_activation_response.resolution",
+                    reason: "authenticated responses cannot carry a negative result",
+                });
+            }
+            AgentBridgeActivationDisposition::Denied { reason_code } => {
+                self.validate_resolution_against(*reason_code)?;
+            }
+            AgentBridgeActivationDisposition::Authenticated { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Validates that a result-bearing denial carries the exact matching
+    /// disposition. Kernel-owned no-result refusals use the dedicated
+    /// `SemanticResolutionUnavailable` code and carry no semantic payload.
+    pub fn validate_resolution_against(
+        &self,
+        reason_code: AgentBridgeActivationDenialCode,
+    ) -> Result<(), ProtocolError> {
+        let Some(result) = &self.resolution else {
+            if reason_code != AgentBridgeActivationDenialCode::SemanticResolutionUnavailable {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_bridge_activation_response.resolution",
+                    reason: "a result-bearing denial requires the exact semantic result",
+                });
+            }
+            return Ok(());
+        };
+        result.validate()?;
+        let expected = match &result.disposition {
+            AgentActivationResolutionDisposition::Resolved { .. } => {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_bridge_activation_response.resolution",
+                    reason: "Resolved cannot be projected as a denial",
+                });
+            }
+            AgentActivationResolutionDisposition::TaskSelectionRequired { .. } => {
+                AgentBridgeActivationDenialCode::TaskSelectionRequired
+            }
+            AgentActivationResolutionDisposition::ScopeSelectionRequired { .. } => {
+                AgentBridgeActivationDenialCode::ScopeSelectionRequired
+            }
+            AgentActivationResolutionDisposition::ScopeAmbiguous { .. } => {
+                AgentBridgeActivationDenialCode::ScopeAmbiguous
+            }
+            AgentActivationResolutionDisposition::NotReady { .. } => {
+                AgentBridgeActivationDenialCode::NotReady
+            }
+            AgentActivationResolutionDisposition::StaleFence { .. } => {
+                AgentBridgeActivationDenialCode::StaleFence
+            }
+            AgentActivationResolutionDisposition::FailedInternal { .. } => {
+                AgentBridgeActivationDenialCode::FailedInternal
+            }
+        };
+        if expected != reason_code {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.resolution",
+                reason: "denial code does not match the exact semantic disposition",
             });
         }
         Ok(())
@@ -3898,6 +4061,7 @@ mod tests {
             connection_id: receipt.connection_id.clone(),
             state_fence: receipt.state_fence.clone(),
             kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
+            successor_of: None,
             ticket_sha256: String::new(),
         }
         .with_computed_digest()

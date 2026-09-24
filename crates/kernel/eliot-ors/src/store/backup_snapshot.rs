@@ -116,6 +116,8 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         RowFamilyDisposition::of(RowFamilyKind::CutoverOwnership),
         // Old host routes never re-dispatch.
         RowFamilyDisposition::of(RowFamilyKind::HostRequests),
+        // Old activation lifecycles never re-authorize a claim or Session.
+        RowFamilyDisposition::of(RowFamilyKind::ActivationLifecycle),
         // Old activation results never re-acknowledge.
         RowFamilyDisposition::of(RowFamilyKind::ActivationResultRetention),
         // Old worker claims never re-admit.

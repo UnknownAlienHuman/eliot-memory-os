@@ -231,6 +231,7 @@ mod tests {
                 test_epoch(TEST_LINEAGE_A, 1),
                 ResourceGeneration::new(1).unwrap(),
             ),
+            owner_revision: 1,
             principal_id: "principal-1".to_owned(),
             session_id: "session-1".to_owned(),
             task_id: TaskId::new("task-1").unwrap(),
