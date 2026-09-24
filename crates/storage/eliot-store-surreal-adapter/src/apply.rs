@@ -611,14 +611,17 @@ pub(crate) async fn apply_prepared(
     expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
 ) -> Result<WriteReceipt, AdapterError> {
     let authorities: Vec<Option<ExactJsonBytes>> = vec![None; transition.named_operations.len()];
-    apply_prepared_with_authority(
+    // Boxed: the inner future holds the multi-kilobyte canonical
+    // `PreparedTransition` across provider awaits, exceeding the default
+    // future-size lint.
+    Box::pin(apply_prepared_with_authority(
         adapter,
         ctx,
         transition,
         expected_revision_heads,
         expected_ordering_heads,
         &authorities,
-    )
+    ))
     .await
 }
 
@@ -673,7 +676,10 @@ pub(crate) async fn apply_prepared_with_authority(
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
 
-    apply_with_retry(
+    // Boxed: the retry future holds the multi-kilobyte canonical
+    // `PreparedTransition` across provider awaits, exceeding the default
+    // future-size lint.
+    Box::pin(apply_with_retry(
         adapter,
         db,
         ctx,
@@ -682,7 +688,7 @@ pub(crate) async fn apply_prepared_with_authority(
         expected_ordering_heads,
         authorities,
         TxLane::Facade,
-    )
+    ))
     .await
 }
 

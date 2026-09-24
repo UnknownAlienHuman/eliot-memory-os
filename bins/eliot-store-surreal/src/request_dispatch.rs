@@ -358,7 +358,7 @@ impl StoreDispatchBackend for StoreComposition {
                     request.transition.identity.operation_id.clone(),
                     request.transition.identity.idempotency_key.clone(),
                 );
-                match self.apply_reserved_write(request).await {
+                match Box::pin(self.apply_reserved_write(request)).await {
                     Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
                     Err(error) => map_composition_error(error, failure_context),
                 }

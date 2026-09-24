@@ -531,13 +531,13 @@ impl StoreComposition {
     ) -> Result<WriteReceipt, StoreCompositionError> {
         let authorities: Vec<Option<ExactJsonBytes>> =
             vec![None; transition.named_operations.len()];
-        self.apply_with_authority(
+        Box::pin(self.apply_with_authority(
             context,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
             &authorities,
-        )
+        ))
         .await
     }
 
@@ -583,17 +583,15 @@ impl StoreComposition {
                 crate::task_binding_gate::map_rejection(&rejection),
             ));
         }
-        let outcome = self
-            .store
-            .apply_prepared_with_authority(
-                context,
-                transition,
-                expected_revision_heads,
-                expected_ordering_heads,
-                authorities,
-            )
-            .await
-            .map_err(map_adapter_error);
+        let outcome = Box::pin(self.store.apply_prepared_with_authority(
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            authorities,
+        ))
+        .await
+        .map_err(map_adapter_error);
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
