@@ -26,10 +26,12 @@ use std::sync::Arc;
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
-    AdmissionId, AgentCoordinator, CandidateId, CoordinatorConfig, CoordinatorError,
-    CoordinatorSnapshot, PlanGap, StaffingPlanCandidate, StaffingPlanRequest, WorkClass,
+    AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
+    CoordinatorError, CoordinatorSnapshot, PlanGap, ProviderIdentity, StaffingPlanCandidate,
+    StaffingPlanRequest, WorkClass,
 };
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
+use eliot_kernel_service::ProviderCapabilityExpectation;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -92,6 +94,78 @@ pub fn daemon_coordinator_config() -> Result<CoordinatorConfig, FabricError> {
         capacity_identity: FABRIC_CAPACITY_IDENTITY.to_owned(),
         capacity_revision,
     })
+}
+
+/// Authenticated Kernel claim material for one verified provider binding
+/// (issue #1108, W4/A1/A2).
+///
+/// Resolved by the daemon composition from its authenticated Kernel session:
+/// the durable ORS claim row (exact `claim_id` key lookup plus the
+/// attempt/operation reverse projection yielding claim/attempt/operation
+/// identities and durable binding/executable digests), the Governor
+/// currentness it observed (presented route/capacity revisions plus the
+/// current [`ProviderCapabilityExpectation`]), the live authority epoch it
+/// holds, and the replay floor. M2 (#22): the supplier is Kernel over the
+/// authenticated front-door session plus ORS operation records bound to the
+/// exact attempt; no new signing or token service.
+///
+/// Evidence only, never authority: only [`AdmittedProviderCapability::new`]
+/// plus [`AgentCoordinator::new_with_admitted_provider`] admit effects, and
+/// every proof re-runs the T9-04 pure Kernel verifier. Carries no secret
+/// material (identities, digests, revisions, epoch, sequence only).
+#[derive(Clone, Debug)]
+pub struct VerifiedProviderMaterial {
+    /// Provider identity the binding must match exactly.
+    pub identity: ProviderIdentity,
+    /// Durable claim identity from the ORS claim row.
+    pub claim_id: String,
+    /// Attempt identity from the claim row reverse projection.
+    pub attempt_id: String,
+    /// Exact external-effect operation identity from the claim row.
+    pub operation_id: String,
+    /// Durable claim binding digest (lowercase SHA-256).
+    pub binding_digest: String,
+    /// Durable executable binding digest (lowercase SHA-256).
+    pub executable_digest: String,
+    /// Governor-presented route revision observed by the daemon.
+    pub route_revision: String,
+    /// Governor-presented capacity revision observed by the daemon.
+    pub capacity_revision: String,
+    /// Current Governor/Kernel expectation observed by the daemon.
+    pub expectation: ProviderCapabilityExpectation,
+    /// Live authority epoch held by the daemon.
+    pub live_epoch: EpochId,
+    /// Minimum replayed event sequence for restore.
+    pub minimum_event_sequence: u64,
+}
+
+/// Builds the sealed admission capability from authenticated Kernel claim
+/// material (issue #1108).
+///
+/// Wiring only: forwards the daemon-resolved [`VerifiedProviderMaterial`]
+/// into [`AdmittedProviderCapability::new`], which validates every shape.
+/// Currency is re-checked on every coordinator `verify` call, never cached.
+///
+/// # Errors
+///
+/// Returns [`FabricError::Contract`] for blank or control-bearing text via
+/// the owner validation, or the coordinator owner rejection unchanged.
+pub fn build_admitted_provider_capability(
+    material: VerifiedProviderMaterial,
+) -> Result<AdmittedProviderCapability, FabricError> {
+    Ok(AdmittedProviderCapability::new(
+        material.identity,
+        material.claim_id,
+        material.attempt_id,
+        material.operation_id,
+        material.binding_digest,
+        material.executable_digest,
+        material.route_revision,
+        material.capacity_revision,
+        material.expectation,
+        material.live_epoch,
+        material.minimum_event_sequence,
+    )?)
 }
 
 /// Plans one candidate through the real coordinator owner.
@@ -629,6 +703,50 @@ impl AgentFabric {
             initialized: true,
         };
         fabric.record("coordinator_constructed", "coordinator");
+        Ok(fabric)
+    }
+
+    /// Constructs the one coordinator on a sealed admitted provider
+    /// capability (issue #1108, production composition caller for A1/A2).
+    ///
+    /// The `capability` must be built via
+    /// [`build_admitted_provider_capability`] from claim material the daemon
+    /// resolved over its authenticated Kernel session plus ORS operation
+    /// records bound to the exact attempt (M2). The coordinator performs no
+    /// I/O and launches nothing; stale, revoked, foreign, or conflicting
+    /// evidence fails closed through the T9-04 pure verifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the config is invalid, or the
+    /// coordinator owner rejection (e.g. stale capacity binding) unchanged.
+    pub fn new_with_admitted_provider(
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, FabricError> {
+        config
+            .validate()
+            .map_err(|error| FabricError::Contract(format!("coordinator config: {error}")))?;
+        let coordinator = AgentCoordinator::new_with_admitted_provider(config.clone(), capability)?;
+        let mut fabric = Self {
+            config,
+            coordinator,
+            ports,
+            ledger: Vec::new(),
+            definitions: BTreeMap::new(),
+            definition_bytes: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            admissions: BTreeMap::new(),
+            admission_by_definition: BTreeMap::new(),
+            activations: BTreeMap::new(),
+            intents: BTreeMap::new(),
+            intent_by_operation: BTreeMap::new(),
+            attempt_states: BTreeMap::new(),
+            cancellations: BTreeMap::new(),
+            initialized: true,
+        };
+        fabric.record("coordinator_constructed_verified", "coordinator");
         Ok(fabric)
     }
 
@@ -1450,6 +1568,79 @@ impl AgentFabric {
             initialized: true,
         };
         fabric.record("fabric_restored", "fabric");
+        Ok(fabric)
+    }
+
+    /// Restores the fabric on a freshly supplied admitted provider
+    /// capability (issue #1108, verified restore for A8).
+    ///
+    /// The daemon re-queries Kernel and passes a fresh `capability`; the
+    /// snapshot's stored binding must equal the live binding and every
+    /// replayed event re-verifies through the T9-04 pure verifier, so a
+    /// serialized `Verified` label alone never restores authority and
+    /// missing/stale/revoked evidence stays plan-only/blocked instead of
+    /// silently resuming effecting operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the coordinator owner restore rejection, a stale-config
+    /// conflict, or a stale/revoked binding rejection unchanged.
+    pub fn restore_with_admitted_provider(
+        snapshot: FabricSnapshot,
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, FabricError> {
+        if snapshot.coordinator_snapshot.config != config {
+            return Err(FabricError::IdentityConflict(
+                "restore config does not match the snapshotted coordinator config".to_owned(),
+            ));
+        }
+        let coordinator = AgentCoordinator::restore_with_admitted_provider(
+            snapshot.coordinator_snapshot.clone(),
+            config.clone(),
+            capability,
+        )?;
+        let mut definition_bytes = BTreeMap::new();
+        for (key, definition) in &snapshot.definitions {
+            definition_bytes.insert(key.clone(), definition.definition_digest.clone());
+        }
+        let mut admission_by_definition = BTreeMap::new();
+        for (admission_key, admission) in &snapshot.admissions {
+            admission_by_definition.insert(
+                admission.definition_id.as_str().to_owned(),
+                admission_key.clone(),
+            );
+        }
+        let mut intent_by_operation = BTreeMap::new();
+        for (dispatch_id, intent) in &snapshot.intents {
+            intent_by_operation.insert(
+                dispatch_id.clone(),
+                format!(
+                    "{}/{}",
+                    intent.admission_id.as_str(),
+                    intent.attempt_id.as_str()
+                ),
+            );
+        }
+        let mut fabric = Self {
+            config,
+            coordinator,
+            ports,
+            ledger: snapshot.ledger.clone(),
+            definitions: snapshot.definitions,
+            definition_bytes,
+            reservations: snapshot.reservations,
+            admissions: snapshot.admissions,
+            admission_by_definition,
+            activations: snapshot.activations,
+            intents: snapshot.intents,
+            intent_by_operation,
+            attempt_states: snapshot.attempt_states,
+            cancellations: snapshot.cancellations,
+            initialized: true,
+        };
+        fabric.record("fabric_restored_verified", "fabric");
         Ok(fabric)
     }
 }
