@@ -47,6 +47,10 @@ use eliot_contracts::{
     OperationId, RequestMetadata, StateFence, TaskId, TaskRevision, canonical_json_bytes,
     sha256_hex,
 };
+use eliot_learning_contracts::{
+    CampaignSourceBinding, CampaignSourceRole, LearningStateViewRecipe,
+    TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+};
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
@@ -55,17 +59,18 @@ use eliot_store_api::{
     StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
     WriteReceiptStatus,
 };
-use eliot_learning_contracts::{
-    CampaignSourceBinding, CampaignSourceRole, LearningStateViewRecipe,
-    TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
-};
 use eliot_task::{
     TaskCommand, TaskCommandContext, TaskError, TaskLifecycleEvent, TaskLifecycleOwner,
     TaskProposal, TaskRecord, TaskState,
 };
 use thiserror::Error;
 
-use crate::{CanonicalAdmissionOwner, CompositionError, KernelPortError, KernelTransitionPort};
+use crate::{
+    CanonicalAdmissionOwner, CompositionError, KernelPortError, KernelTransitionPort,
+    campaign_task_sources::{
+        TaskControllerCampaignSources, build_task_controller_campaign_sources,
+    },
+};
 
 /// Production adapter manifest name from the Surreal adapter.
 const PRODUCTION_MANIFEST_NAME: &str = "eliot.storage.store-surreal-adapter";
@@ -244,6 +249,7 @@ fn state_wire(state: TaskState) -> Result<String, TaskLifecycleError> {
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the envelope binds every admitted identity field explicitly; grouping them would hide a binding"
 )]
 fn task_envelope(
@@ -254,6 +260,7 @@ fn task_envelope(
     expected_revision: u64,
     manifest_digest: OperationManifestDigest,
     campaign_recipe: Option<&LearningStateViewRecipe>,
+    campaign_sources: Option<&TaskControllerCampaignSources>,
 ) -> Result<CanonicalWriteEnvelope, TaskLifecycleError> {
     identity
         .validate()
@@ -315,6 +322,13 @@ fn task_envelope(
             ),
         );
     }
+    if let Some(sources) = campaign_sources {
+        parameters.insert(
+            "campaign_source_publications_json".to_owned(),
+            serde_json::to_value(&[sources.objective.clone(), sources.plan.clone()])
+                .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+        );
+    }
     let envelope = CanonicalWriteEnvelope {
         operation_id,
         request: identity.request.metadata.clone(),
@@ -354,6 +368,10 @@ fn task_envelope(
     Ok(envelope)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "TaskLifecycleError is the shared typed task-owner failure contract"
+)]
 fn validate_campaign_recipe_anchor(
     recipe: &LearningStateViewRecipe,
     identity: &eliot_protocol::RequestIdentity,
@@ -367,6 +385,8 @@ fn validate_campaign_recipe_anchor(
     if recipe.binding.task_id != *task_id
         || recipe.binding.request_id != identity.request.metadata.request_id
         || recipe.binding.operation_id != *operation_id
+        || recipe.binding.product_id != identity.request.metadata.product_id
+        || recipe.binding.source.owner != identity.request.metadata.source_id
         || recipe.binding.state_fence != *state_fence
         || identity.request.metadata.task_id.as_ref() != Some(task_id)
     {
@@ -457,13 +477,14 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             1,
             manifest_digest.clone(),
             None,
+            None,
         )?;
         self.commit_envelope(identity, operation_id, envelope, manifest_digest)
             .await
     }
 
     /// Proposes a task while the Task Controller owner atomically declares
-    /// the exact campaign learning-state recipe in the same UpdateTaskState
+    /// the exact campaign learning-state recipe in the same `UpdateTaskState`
     /// transition. The recipe is validated against the admitted task,
     /// request, operation, and fence before canonical commit.
     pub async fn propose_task_with_learning_state_recipe(
@@ -491,6 +512,12 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             )
         })?;
         let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
             identity,
             operation_id.clone(),
@@ -498,7 +525,8 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             &record,
             1,
             manifest_digest.clone(),
-            Some(&recipe),
+            Some(&sources.recipe),
+            Some(&sources),
         )?;
         self.commit_envelope(identity, operation_id, envelope, manifest_digest)
             .await
@@ -561,6 +589,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             expected_revision,
             manifest_digest.clone(),
             None,
+            None,
         )?;
         self.commit_envelope(identity, operation_id, envelope, manifest_digest)
             .await
@@ -568,7 +597,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
 
     /// Applies a guarded task command while the Task Controller owner
     /// atomically declares the exact campaign learning-state recipe in the
-    /// same UpdateTaskState transition.
+    /// same `UpdateTaskState` transition.
     pub async fn apply_task_with_learning_state_recipe(
         &self,
         identity: &eliot_protocol::RequestIdentity,
@@ -604,6 +633,12 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             )
         })?;
         let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
             identity,
             operation_id.clone(),
@@ -611,7 +646,8 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             &record,
             expected_revision,
             manifest_digest.clone(),
-            Some(&recipe),
+            Some(&sources.recipe),
+            Some(&sources),
         )?;
         self.commit_envelope(identity, operation_id, envelope, manifest_digest)
             .await

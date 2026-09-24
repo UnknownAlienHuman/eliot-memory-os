@@ -15,7 +15,18 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-use eliot_contracts::{ArtifactId, ContractVersion, DecisionId, StateFence, TaskRevision, fences_match_exact};
+use crate::campaign_publication::{
+    ContextCampaignRecipeBody, ContextSourceDocument, context_delivery_publication,
+    context_recipe_publication,
+};
+use eliot_context_contracts::{
+    CapacityLimits as CampaignCapacityLimits, ContextRecipe as CampaignContextRecipe,
+    LossPolicy as CampaignLossPolicy, RepresentationKind as CampaignRepresentationKind,
+    SemanticRole, SessionDeliverySnapshot,
+};
+use eliot_contracts::{
+    ArtifactId, ContractVersion, DecisionId, StateFence, TaskRevision, fences_match_exact,
+};
 use eliot_cue_contracts::CueKind;
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceFreshness};
 use eliot_learning_contracts::{
@@ -25,15 +36,6 @@ use eliot_learning_contracts::{
 };
 use eliot_learning_state_view::{
     CampaignHistoryPlanInput, validate_campaign_learning_state_view_current,
-};
-use eliot_context_contracts::{
-    CapacityLimits as CampaignCapacityLimits, ContextRecipe as CampaignContextRecipe,
-    LossPolicy as CampaignLossPolicy, RepresentationKind as CampaignRepresentationKind,
-    SemanticRole, SessionDeliverySnapshot,
-};
-use crate::campaign_publication::{
-    ContextCampaignRecipeBody, ContextSourceDocument, context_delivery_publication,
-    context_recipe_publication,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -523,7 +525,9 @@ impl ContextCompiler {
         context_recipe
             .validate()
             .map_err(|_| ContextError::InvalidCampaignRecipe)?;
-        input.learning_view.validate_against(input.learning_recipe)?;
+        input
+            .learning_view
+            .validate_against(input.learning_recipe)?;
         let context_recipe_source = current_campaign_source(
             input.current_source_resolutions,
             CampaignSourceRole::ContextRecipe,
@@ -564,13 +568,9 @@ impl ContextCompiler {
         // were decoded from the exact typed bodies returned by these current
         // owner reads. Confirm their native identities and original fences
         // agree with the exact references before compiling.
-        if !campaign_source_matches_publication(
-            context_recipe_source,
-            &recipe_publication,
-        ) || !campaign_source_matches_publication(
-            context_delivery_source,
-            &delivery_publication,
-        ) {
+        if !campaign_source_matches_publication(context_recipe_source, &recipe_publication)
+            || !campaign_source_matches_publication(context_delivery_source, &delivery_publication)
+        {
             return Err(ContextError::CampaignSourceMismatch {
                 role: CampaignSourceRole::ContextDelivery,
             }
@@ -777,7 +777,8 @@ fn project_campaign_context_recipe(
         .and_then(|remaining| remaining.checked_sub(recipe.capacity.output_reserve))
         .and_then(|remaining| remaining.checked_sub(recipe.capacity.review_reserve))
         .ok_or(ContextError::InvalidCampaignRecipe)?;
-    let total_cost = u32::try_from(available).map_err(|_| ContextError::CampaignCapacityOutOfRange)?;
+    let total_cost =
+        u32::try_from(available).map_err(|_| ContextError::CampaignCapacityOutOfRange)?;
     if total_cost == 0 {
         return Err(ContextError::CampaignCapacityOutOfRange);
     }
@@ -792,7 +793,10 @@ fn project_campaign_context_recipe(
             | CampaignLossPolicy::Extractive
             | CampaignLossPolicy::Summarizable => CampaignRepresentationKind::Whole,
         };
-        if !rule.allowed_representations.contains(&retained_representation) {
+        if !rule
+            .allowed_representations
+            .contains(&retained_representation)
+        {
             return Err(ContextError::UnsupportedCampaignPolicy(rule.role));
         }
         if let Some((existing_policy, existing_required)) = role_rules.get_mut(&context_role) {
@@ -888,7 +892,9 @@ fn enforce_campaign_loss_policies(
             if policy.loss_policy == CampaignLossPolicy::HandleOnly
                 && decision.disposition == AdmissionDisposition::Included
             {
-                return Err(ContextError::UnsupportedCampaignPolicy(policy.semantic_role));
+                return Err(ContextError::UnsupportedCampaignPolicy(
+                    policy.semantic_role,
+                ));
             }
             match (policy.loss_policy, decision.disposition) {
                 (CampaignLossPolicy::NonDroppable, AdmissionDisposition::Included) => {}
@@ -902,7 +908,9 @@ fn enforce_campaign_loss_policies(
                     .allowed_representations
                     .contains(&CampaignRepresentationKind::Handle) =>
                 {
-                    return Err(ContextError::UnsupportedCampaignPolicy(policy.semantic_role));
+                    return Err(ContextError::UnsupportedCampaignPolicy(
+                        policy.semantic_role,
+                    ));
                 }
                 _ => {}
             }
@@ -938,7 +946,9 @@ fn validate_campaign_context_binding(
         });
     }
     if input.task_id.as_ref() != Some(&recipe.binding.decision_id) {
-        return Err(ContextError::CampaignBindingMismatch { field: "decision_id" });
+        return Err(ContextError::CampaignBindingMismatch {
+            field: "decision_id",
+        });
     }
     if recipe.decision.recipe_revision != input.task_revision {
         return Err(ContextError::RecipeRevisionMismatch {
@@ -958,7 +968,9 @@ fn current_campaign_source(
     resolutions: &[CampaignSourceResolution],
     role: CampaignSourceRole,
 ) -> Result<&CampaignSourceRevisionRef, CampaignContextCompileError> {
-    let mut matches = resolutions.iter().filter(|resolution| resolution.role == role);
+    let mut matches = resolutions
+        .iter()
+        .filter(|resolution| resolution.role == role);
     let resolution = matches
         .next()
         .ok_or(ContextError::CampaignSourceMismatch { role })?;
@@ -1003,6 +1015,18 @@ fn campaign_learning_state_handles(
         handles.extend(history.selected_handles.iter().cloned());
         handles.extend(history.policy_slice_handles.iter().cloned());
     }
+    for resolution in &view.provenance.source_resolutions {
+        if resolution.status != CampaignSourceResolutionStatus::Current {
+            continue;
+        }
+        let Some(reference) = &resolution.reference else {
+            continue;
+        };
+        let CampaignOwnerRecordId::Artifact(handle) = &reference.record_id else {
+            continue;
+        };
+        handles.insert(handle.clone());
+    }
     for position in &view.provenance.positions {
         if let CampaignOwnerRecordId::Artifact(handle) = &position.record_id {
             handles.insert(handle.clone());
@@ -1020,11 +1044,7 @@ fn validate_context_support_handles(
     resolutions: &[CampaignSourceResolution],
 ) -> Result<(), ContextError> {
     let mut retained = BTreeSet::new();
-    retained.extend(
-        view.required_references
-            .iter()
-            .map(ArtifactId::as_str),
-    );
+    retained.extend(view.required_references.iter().map(ArtifactId::as_str));
     for slot in &view.slots {
         retained.extend(slot.evidence.iter().map(ArtifactId::as_str));
         for member in &slot.members {
@@ -1035,14 +1055,11 @@ fn validate_context_support_handles(
         if resolution.status != CampaignSourceResolutionStatus::Current {
             continue;
         }
-        if let Some(reference) = &resolution.reference {
-            retained.insert(match &reference.record_id {
-                CampaignOwnerRecordId::Artifact(value) => value.as_str(),
-                CampaignOwnerRecordId::Contract(value) => value.as_str(),
-                CampaignOwnerRecordId::Decision(value) => value.as_str(),
-                CampaignOwnerRecordId::Task(value) => value.as_str(),
-                CampaignOwnerRecordId::Resource(value) => value.as_str(),
-            });
+        let Some(reference) = &resolution.reference else {
+            continue;
+        };
+        if let CampaignOwnerRecordId::Artifact(value) = &reference.record_id {
+            retained.insert(value.as_str());
         }
     }
     if input

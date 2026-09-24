@@ -12,10 +12,10 @@ use eliot_contracts::{ArtifactId, StateFence};
 use eliot_learning_contracts::identity::SourceLineage;
 use eliot_learning_contracts::{
     CampaignHistoryPlanReference, CampaignLearningStateView, CampaignPositionKind,
-    CampaignPositionRef, CampaignSourceResolution, CampaignSourceRevisionRef,
-    CampaignViewRebuildReason, Completeness, LearningContractError, LearningStateViewRecipe,
-    MemberProjection, OmissionPolicy, OwnerDisagreement, SlotDisposition, SlotProjection,
-    SlotRequirement, SlotSpec, SourceDenominator,
+    CampaignPositionRef, CampaignSourceResolution, CampaignSourceResolutionStatus,
+    CampaignSourceRevisionRef, CampaignViewRebuildReason, Completeness, LearningContractError,
+    LearningStateViewRecipe, MemberProjection, OmissionPolicy, OwnerDisagreement, SlotDisposition,
+    SlotProjection, SlotRequirement, SlotSpec, SourceDenominator,
 };
 use eliot_reactive_context_plan::{CampaignIntent, RetrievalPlan};
 
@@ -93,11 +93,7 @@ pub fn compile_campaign_learning_state_view(
     input: CampaignLearningStateCompilationInput<'_>,
 ) -> Result<CampaignLearningStateView, LearningContractError> {
     validate_compilation_input(&input)?;
-    let compiled = compile_slots(
-        input.recipe,
-        input.projections,
-        input.source_resolutions,
-    )?;
+    let compiled = compile_slots(input.recipe, input.projections, input.source_resolutions)?;
     build_compiled_view(&input, compiled)
 }
 
@@ -271,6 +267,7 @@ pub fn validate_campaign_learning_state_view_current(
     observed_at_ms: i64,
 ) -> Result<(), LearningContractError> {
     view.validate_against(recipe)?;
+    validate_context_partial_eligibility(view, recipe)?;
     if observed_at_ms < 0
         || view.provenance.generated_at_ms > observed_at_ms
         || view
@@ -315,6 +312,75 @@ pub fn validate_campaign_learning_state_view_current(
         return Err(LearningContractError::ScopeMismatch {
             field: "view.current_history_plans",
         });
+    }
+    Ok(())
+}
+
+fn validate_context_partial_eligibility(
+    view: &CampaignLearningStateView,
+    recipe: &LearningStateViewRecipe,
+) -> Result<(), LearningContractError> {
+    if view.completeness != Completeness::Partial {
+        return Ok(());
+    }
+    for slot_id in view.omissions.iter().chain(view.frontier.iter()) {
+        let spec = recipe
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == *slot_id)
+            .ok_or(LearningContractError::IncompleteCoverage)?;
+        let non_load_bearing = match &spec.requirement {
+            SlotRequirement::Optional => true,
+            SlotRequirement::Conditional { depends_on } => {
+                !view.slots.iter().any(|slot| slot.slot_id == *depends_on)
+            }
+            SlotRequirement::Required => false,
+        };
+        if !non_load_bearing {
+            return Err(LearningContractError::IncompleteCoverage);
+        }
+    }
+    for requirement in &recipe.source_requirements {
+        let resolution = view
+            .provenance
+            .source_resolutions
+            .iter()
+            .find(|resolution| resolution.role == requirement.role)
+            .ok_or(LearningContractError::IncompleteCoverage)?;
+        if resolution.status != CampaignSourceResolutionStatus::Current && requirement.load_bearing
+        {
+            return Err(LearningContractError::IncompleteCoverage);
+        }
+    }
+    for spec in &recipe.slots {
+        let active = match &spec.requirement {
+            SlotRequirement::Required => true,
+            SlotRequirement::Optional => false,
+            SlotRequirement::Conditional { depends_on } => {
+                view.slots.iter().any(|slot| slot.slot_id == *depends_on)
+            }
+        };
+        if !active {
+            continue;
+        }
+        let slot = view
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == spec.slot_id)
+            .ok_or(LearningContractError::IncompleteCoverage)?;
+        let evidenced_empty = slot.disposition == SlotDisposition::KnownEmpty
+            && spec.declared_members.is_empty()
+            && !slot.evidence.is_empty();
+        if slot.disposition != SlotDisposition::Current && !evidenced_empty {
+            return Err(LearningContractError::IncompleteCoverage);
+        }
+        if slot
+            .members
+            .iter()
+            .any(|member| member.disposition != SlotDisposition::Current)
+        {
+            return Err(LearningContractError::IncompleteCoverage);
+        }
     }
     Ok(())
 }
@@ -630,6 +696,11 @@ fn validate_history_plan_inputs(
         if query.scope != recipe.campaign_id.as_str()
             || query.intent == CampaignIntent::None
             || &query.fence != current_state_fence
+            || history
+                .plan
+                .source_projection_fences
+                .iter()
+                .any(|source| source.fence != *current_state_fence)
         {
             return Err(LearningContractError::ScopeMismatch {
                 field: "history_plan.campaign_scope_or_fence",
