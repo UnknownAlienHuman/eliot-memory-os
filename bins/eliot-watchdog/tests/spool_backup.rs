@@ -764,6 +764,7 @@ fn purge_revision_and_source_identity_retained() {
 fn failure_closes_owned_resources_and_preserves_source() {
     let (sensor, dir, entries) = seed_mixed("t16");
     let redb = dir.join("watchdog.redb");
+    drop(sensor);
     let before = std::fs::read(&redb).expect("source redb bytes");
     let bad = CaptureFenceParams {
         requester_principal: String::new(),
@@ -777,6 +778,7 @@ fn failure_closes_owned_resources_and_preserves_source() {
         std::fs::read(&redb).expect("source redb after failure"),
         before
     );
+    let sensor = reopen_sensor(&dir);
     let retained = sensor
         .retained_spool_entries_for_export_driver_test()
         .expect("retained after failure");
