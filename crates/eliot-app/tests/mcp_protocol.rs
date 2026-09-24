@@ -4,8 +4,8 @@ use eliot_types::{
     AgentHostId, AgentId, AgentInvocationRequest, AgentResultEnvelope, AgentResultStatus,
     AgentRole, AgentSession, AgentSessionId, AgentSessionStatus, AgentTransport, CommandContext,
     ControlWalConfig, LifecycleStatus, OperationJob, OperationJobState, OperatorControlRequest,
-    ProjectId, SemanticCommand, SessionId, TaintClass, TaskId, ToolObservationRecordCommand,
-    Visibility, WorkItemId, WorkLeaseId, WriteId, WriteReceiptRef,
+    ProjectId, RecallDisposition, SemanticCommand, SessionId, TaintClass, TaskId,
+    ToolObservationRecordCommand, Visibility, WorkItemId, WorkLeaseId, WriteId, WriteReceiptRef,
 };
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
@@ -6667,6 +6667,48 @@ fn recall_l0_mcp_matches_cli() -> TestResult {
     // inserted at injection.rs:437,538, while CLI recall_l0 writes the response directly (data_and_memory.rs:217-232); strip only this key.
     if let Value::Object(ref mut map) = mcp {
         map.remove("ul_boot");
+        // I7.17 (#1940): the MCP live path emits the server-derived verdict
+        // beside the CLI-identical recall body. The verdict fields are
+        // MCP-only delivery augmentation: check their binding, then strip
+        // them before the parity compare below.
+        let disposition = map
+            .remove("disposition")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| std::io::Error::other("recall verdict omitted disposition"))?;
+        assert!(
+            RecallDisposition::canonical_set().contains(&disposition.as_str()),
+            "recall disposition outside the closed set: {disposition}"
+        );
+        let receipt = map
+            .remove("receipt")
+            .ok_or_else(|| std::io::Error::other("recall verdict omitted receipt"))?;
+        let handles = map
+            .get("handles")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            receipt.get("visible_count").and_then(Value::as_u64),
+            Some(handles.len() as u64),
+            "recall receipt visible_count must match the delivered handles"
+        );
+        assert_eq!(
+            receipt.get("scope").and_then(Value::as_str),
+            Some(""),
+            "null recall scope must bind a corpus-wide receipt"
+        );
+        assert_eq!(
+            receipt.get("freshness").and_then(Value::as_str),
+            map.get("projection_state").and_then(Value::as_str),
+            "recall receipt freshness must bind the response projection state"
+        );
+        assert!(
+            map.remove("rank_trace_handle")
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|handle| handle.starts_with("rank-trace:")),
+            "recall verdict must carry a rank-trace handle"
+        );
     }
 
     assert_eq!(mcp, cli);

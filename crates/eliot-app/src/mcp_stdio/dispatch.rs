@@ -846,6 +846,10 @@ pub(super) async fn dispatch_tool(
             if input.query.trim().is_empty() || input.query.len() > 512 {
                 anyhow::bail!("eliot_recall_l0 query must be non-empty and at most 512 bytes");
             }
+            // I7.17 (#1940): the receipt binds the exact scope this recall
+            // ran under; an absent scope is corpus-wide. Captured before the
+            // request below takes ownership of `input.scope`.
+            let receipt_scope = input.scope.clone().unwrap_or_default();
             let mut response = ReadService::new(state.store.clone())
                 .recall_l0(&RecallL0Request {
                     project_id: parse_project_id(&input.project_id)?,
@@ -859,6 +863,40 @@ pub(super) async fn dispatch_tool(
                     concept_refs: input.concept_refs,
                 })
                 .await?;
+            // I7.17 (#1940): live-path caller wiring. The server derives one
+            // closed `RecallDisposition` from retrieval facts and mints the
+            // binding receipt plus rank-trace handle BEFORE the agent-facing
+            // limit truncation below, so the receipt counts describe the full
+            // server-side visible/suppressed totals (bridge projection
+            // semantics: handles truncate, receipt counts do not). The
+            // disposition is derived here, never accepted from bridge or model
+            // output. `corpus_empty` stays false: an L0 read observes query
+            // matches, never corpus cardinality — zero matches cannot
+            // distinguish no-match from empty corpus, and the
+            // stale-projection path deliberately clears candidates, so an
+            // emptiness inference would mislabel STALE_PROJECTION as
+            // EMPTY_CORPUS. `conflicted` stays false: the recall pipeline
+            // tracks no conflict-blocking state (contradiction signals are
+            // per-score ranking penalties, never admission blocks), so no
+            // conflict is observed.
+            let coverage_complete = !response.truncation.truncated;
+            // Server-issued read-fence reference binding this recall to the
+            // exact project revision it read (cf. `packet_revision_fence`: a
+            // MemoryRevision serving as fence); opaque to the agent.
+            let state_fence = format!(
+                "recall-l0:{}:{}",
+                response.project_id,
+                response.at_revision.value()
+            );
+            let verdict = eliot_types::ServerRecallVerdict::issue_for_l0_response(
+                &response,
+                &receipt_scope,
+                &state_fence,
+                false,
+                coverage_complete,
+                false,
+            )
+            .map_err(|error| anyhow::anyhow!("eliot_recall_l0 recall verdict: {error}"))?;
             let limit = input
                 .limit
                 .unwrap_or(response.truncation.limit)
@@ -888,7 +926,15 @@ pub(super) async fn dispatch_tool(
                     .map(|score| score.total)
                     .max(),
             );
-            serde_json::to_value(response)?
+            // I7.17 (#1940): every live recall response carries the
+            // server-derived verdict beside the recall body: the closed
+            // disposition, the scope/revision/fence binding receipt, and the
+            // rank-trace handle resolving to exactly the delivered ranking.
+            let mut value = serde_json::to_value(response)?;
+            value["disposition"] = serde_json::to_value(verdict.disposition)?;
+            value["receipt"] = serde_json::to_value(&verdict.receipt)?;
+            value["rank_trace_handle"] = serde_json::to_value(&verdict.rank_trace_handle)?;
+            value
         }
         "eliot_fetch_l2" => {
             let input: FetchL2ToolInput = serde_json::from_value(arguments)?;
