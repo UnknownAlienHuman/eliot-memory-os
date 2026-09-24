@@ -100,7 +100,7 @@ inputs = ["", "unknown", "FilePath", "FILE_PATH", "file-path", "file path", "cue
 files = ["crates/eliot-app/src/mcp_stdio/verification.rs", "crates/eliot-app/src/ul_cross_agent_runner.rs", "crates/eliot-app/tests/ul_contract_errors.rs", "crates/eliot-app/tests/ul_mvp_done.rs", "crates/eliot-store/src/canonical_store.rs", "crates/eliot-types/tests/cue_kind_legacy_boundary.rs", "crates/eliot-types/tests/ul_cue_normalize.rs"]
 
 [api]
-pub_types = ["CueBinding", "CueBindingError", "CueBindingPage", "CueIndexRow", "CueKind", "CueMatchMode", "CueRecordSource", "CueStrength", "LegacyCueKindV1", "LegacyCueKindV1MigrationDescriptor"]
+pub_types = ["CueBinding", "CueBindingError", "CueBindingPage", "CueIndexRow", "CueMatchMode", "CueRecordSource", "CueStrength", "LegacyCueKindV1", "LegacyCueKindV1MigrationDescriptor"]
 pub_fns = ["as_str", "cue_binding_page_id", "cue_binding_page_set_hash", "cue_row_id", "normalize_binding", "normalize_binding_pages", "normalize_bindings", "ul_token_estimate"]
 pub_consts = ["CUE_BINDING_PAGE_SCHEMA_VERSION_V1", "CUE_BINDING_PAGE_SCHEMA_VERSION_V2", "MAX_CUE_BINDINGS_PER_PAGE", "MAX_CUE_BINDING_PAGE_BYTES"]
 
@@ -113,8 +113,8 @@ owner = "#706"
 migration = 706
 expiry = "frozen-seam; alias removal tracked by #835 which re-derives this row"
 risk = "none"
-match_count = 30
-matched_digest = "b54722106b4306e947c3acde0c0d4bac03a48de7a316109a2d78715b4daa75bd"
+match_count = 27
+matched_digest = "434db8de98a5ee6380ad1da0076aac012f9d41898b363df61604de461eaf649f"
 variants = ["FilePath", "DirPath", "Symbol", "ErrorSignature", "CommandPattern", "Dependency", "ApiSurface", "TaskClass", "Subsystem", "Concept"]
 
 [type_row."crates/eliot-types/src/lib.rs"]
@@ -374,7 +374,7 @@ migration = 831
 expiry = "migrate-under-#831; alias removal #835"
 risk = "none"
 match_count = 80
-matched_digest = "e2a3418aa629e9ad2067ec45529b74c8546e109f718c6fb94e27533a20a21d98"
+matched_digest = "1b108ddae176339123c0a00874faed537b700b331f5f6468a9e0c7af67b4cd73"
 variants = []
 
 [type_row."crates/eliot-store/src/blob_store.rs"]
@@ -404,8 +404,27 @@ migration = 706
 expiry = "frozen-seam-oracle; lexical duplicate scan authorized under #832 coherent join; alias removal tracked by #835"
 risk = "none"
 match_count = 89
-matched_digest = "900a0dd9c388e078baa54925599e6b4f54ef32ad884a73ae28b164c761e4bbec"
+matched_digest = "0c70604cb34d527e18fc68ebb8ebee6bc0e1deab5cf9fe15a02c3e308b280fcd"
 variants = []
+
+[type_row."crates/eliot-types/tests/cue_kind_retirement.rs"]
+role = "test"
+owner = "#835"
+migration = 835
+expiry = "retirement-regression-under-#835; invalid-on-test-change"
+risk = "none"
+match_count = 35
+matched_digest = "4e603eebd05cfb3b827e4b7294e28fb803b587902c563de138dc1e396775e751"
+variants = []
+
+[field_row."crates/eliot-types/tests/cue_kind_retirement.rs"]
+role = "test"
+owner = "#835"
+migration = 835
+expiry = "retirement-regression-under-#835; invalid-on-test-change"
+risk = "none"
+match_count = 3
+matched_digest = "ba1cd0ad758ee131fed9ea92b4b5650a562ee666e65bfecc00fe87b52485135f"
 
 [type_row."crates/smart/eliot-context/src/lib.rs"]
 role = "internal"

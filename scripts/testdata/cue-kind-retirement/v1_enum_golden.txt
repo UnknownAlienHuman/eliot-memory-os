@@ -1,0 +1,16 @@
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyCueKindV1 {
+    FilePath,
+    DirPath,
+    Symbol,
+    ErrorSignature,
+    CommandPattern,
+    Dependency,
+    ApiSurface,
+    TaskClass,
+    Subsystem,
+    Concept,
+}

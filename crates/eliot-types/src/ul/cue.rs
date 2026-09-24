@@ -52,18 +52,6 @@ impl LegacyCueKindV1 {
     }
 }
 
-/// Transitional source-compatible alias for frozen consumers (issue #706).
-///
-/// Only frozen external consumers migrating under #831 (internal/root), #832
-/// (context donor), #833 (cues facade) or #834 (memory donor) may use this
-/// alias temporarily. Removal issue: #835. New code must use
-/// [`LegacyCueKindV1`]. The alias adds no new wire representation or current
-/// authority and is unused by `cue.rs` production code.
-#[deprecated(
-    note = "transitional V1 alias for frozen consumers migrating under #831 (internal/root), #832 (context donor), #833 (cues facade), #834 (memory donor); removal issue #835; new code must use LegacyCueKindV1"
-)]
-pub type CueKind = LegacyCueKindV1;
-
 /// Inert bounded V1 to A-10 migration descriptor (issue #706).
 ///
 /// Descriptive data only. This lower-level crate neither imports nor constructs
