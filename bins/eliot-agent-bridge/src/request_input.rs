@@ -31,7 +31,12 @@
 //! offered for independent re-review and is NOT self-accepted. Issue #77 adds
 //! a third arm, `detach` (bearer-claim shape mirroring `reconnect` minus
 //! `new_connection_id`), tracking the owner-driven `Request::Detach` variant
-//! in `main.rs`; limits, dispositions, and redaction stay unchanged.
+//! in `main.rs`; limits, dispositions, and redaction stay unchanged. Issue
+//! #1942 adds the reactive arms (`reactive_admit`, `reactive_record_use`,
+//! `reactive_record_use_by_handle`, `reactive_record_disposition`,
+//! `reactive_snapshot`), tracking the owner-driven reactive `Request`
+//! variants in `main.rs`; the key allowlist grows with their payload members
+//! and limits, dispositions, and redaction stay unchanged.
 //!
 //! Time bounds (`idle_timeout_ms`, `lifetime_timeout_ms`) are declared here so
 //! the profile is complete, but they are NOT enforced on blocking stdin by
@@ -597,7 +602,7 @@ fn field_between_backticks(message: &str) -> String {
 ///
 /// Derived read-only from `bins/eliot-agent-bridge/src/main.rs` `Request`;
 /// this table moves with that enum when its owner changes the operation set.
-const GLOBAL_ENVELOPE_KEYS: [&str; 12] = [
+const GLOBAL_ENVELOPE_KEYS: [&str; 21] = [
     "op",
     "request",
     "event",
@@ -610,16 +615,31 @@ const GLOBAL_ENVELOPE_KEYS: [&str; 12] = [
     "context",
     "tasks",
     "requested_assessment",
+    "cue",
+    "firing",
+    "relations",
+    "admission",
+    "invalidations",
+    "item_id",
+    "update",
+    "memory_handle",
+    "disposition",
 ];
 
 /// Validates the top-level operation envelope before typed construction.
 ///
-/// Serde unit variants (`status`, `stop`, `reconcile_external`) would silently
+/// Serde unit variants (`status`, `stop`, `reconcile_external`,
+/// `reactive_snapshot`) would silently
 /// ignore extra members, so the exact key set is enforced here per operation:
 /// attach/invoke/cancel carry exactly `request`; forward_hook/forward_event
 /// carry exactly `event`; reconnect carries exactly its seven authority-claim
 /// members; detach carries exactly its six bearer-claim members (the reconnect
-/// set minus `new_connection_id`); the terminal operations carry only `op`. Keys outside the global
+/// set minus `new_connection_id`); `reactive_admit` carries exactly its five
+/// caller-supplied admission members; `reactive_record_use` carries exactly
+/// `item_id` plus `update`; `reactive_record_use_by_handle` carries exactly
+/// `memory_handle` plus `update`; `reactive_record_disposition` carries
+/// exactly `item_id` plus `disposition`; `reactive_snapshot` and the terminal
+/// operations carry only `op`. Keys outside the global
 /// allowlist are unknown protected fields; known keys on the wrong operation
 /// are mismatched payloads. Unknown operation names are rejected with a
 /// bounded control name following the shared-contract precedent, never with
@@ -720,7 +740,18 @@ fn check_operation_shape(operation: &str, keys: &[String]) -> Result<(), DecodeR
         "attach" | "invoke" | "cancel" => &["op", "request"],
         "dry_run_invoke" | "dry_run_cancel" => &["op", "request"],
         "forward_hook" | "forward_event" => &["op", "event"],
-        "reconcile_external" | "status" | "stop" => &["op"],
+        "reconcile_external" | "status" | "stop" | "reactive_snapshot" => &["op"],
+        "reactive_admit" => &[
+            "op",
+            "cue",
+            "firing",
+            "relations",
+            "admission",
+            "invalidations",
+        ],
+        "reactive_record_use" => &["op", "item_id", "update"],
+        "reactive_record_use_by_handle" => &["op", "memory_handle", "update"],
+        "reactive_record_disposition" => &["op", "item_id", "disposition"],
         "bootstrap" => &["op", "context", "tasks", "requested_assessment"],
         "reconnect" => &[
             "op",
