@@ -3253,6 +3253,10 @@ pub enum OrsError {
         operation_id: String,
         request_digest: String,
     },
+    #[error("content-addressed campaign view {view_id} conflicts with retained ORS bytes")]
+    CampaignLearningStateViewConflict { view_id: String },
+    #[error("campaign source publication for {key} conflicts with its current owner head")]
+    CampaignSourcePublicationConflict { key: String },
     #[error(
         "activation result ticket {ticket_id} conflicts with durable ORS state: IDENTITY_CONFLICT"
     )]

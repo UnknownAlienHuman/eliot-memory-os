@@ -2004,6 +2004,23 @@ async fn run_local_read_poll(
     // either submit leg. The Skill borrow spans its IO inside this already
     // polled flight; the loop keeps polling every other flight while it is
     // outstanding instead of queueing behind it in a branch body.
+    //
+    // #1862: campaign packet compilation is a local daemon integration over
+    // authenticated named owner reads. It runs on the reachable poll path and
+    // settles through the same attempt-bound result leg as local Skill work.
+    if eliotd::campaign_packet::is_campaign_packet_tool(&tool) {
+        let body = eliotd::campaign_packet::serve_campaign_packet_pair(
+            kernel, &envelope, &tool, &attempt,
+        )
+        .await
+        .map_err(|error| format!("daemon campaign packet compilation: {error}"))?;
+        let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
+            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
+            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
+        };
+        return Ok(step(outcome, startup_readiness));
+    }
     // #1882: Skill pairs serve locally through the composition Skill driver
     // instead of forwarding on the Kernel `local_read` leg (which serves
     // store reads only). Recognition is the shared Skill tool predicate over
