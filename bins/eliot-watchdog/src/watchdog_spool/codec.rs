@@ -15,12 +15,12 @@ use super::{
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct WatchdogSpoolHeader {
-    pub(crate) schema_version: u16,
-    pub(crate) next_sequence: u64,
-    pub(crate) first_sequence: u64,
-    pub(crate) record_count: u64,
-    pub(crate) bytes: u64,
+pub struct WatchdogSpoolHeader {
+    pub schema_version: u16,
+    pub next_sequence: u64,
+    pub first_sequence: u64,
+    pub record_count: u64,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
