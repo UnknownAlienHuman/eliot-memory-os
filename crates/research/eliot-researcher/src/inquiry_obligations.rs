@@ -329,6 +329,19 @@ pub(crate) fn task_graph_request(
     obligations: &[InquiryObligation],
     task_id: &TaskId,
 ) -> Result<TaskGraphCompilationRequest, InquiryGovernanceError> {
+    task_graph_request_for_binding(profile, obligations, task_id, &profile.digest)
+}
+
+/// Projects the same validated obligation set while binding it to one
+/// complete inquiry execution record. The profile digest is retained as a
+/// compatibility default only for older in-memory callers; production
+/// compilation uses this explicit binding seam.
+pub(crate) fn task_graph_request_for_binding(
+    profile: &InquiryProtocolProfile,
+    obligations: &[InquiryObligation],
+    task_id: &TaskId,
+    inquiry_binding_digest: &str,
+) -> Result<TaskGraphCompilationRequest, InquiryGovernanceError> {
     let mut pairs = obligations
         .iter()
         .map(|obligation| (obligation.obligation_id.clone(), obligation.digest.clone()))
@@ -344,6 +357,7 @@ pub(crate) fn task_graph_request(
         obligation_ids,
         obligation_digests,
         state_fence: profile.state_fence.clone(),
+        inquiry_binding_digest: inquiry_binding_digest.to_owned(),
     };
     request
         .validate()

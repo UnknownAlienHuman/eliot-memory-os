@@ -56,8 +56,9 @@ use eliot_store_api::{
     WriteReceiptStatus,
 };
 use eliot_task::{
-    TaskCommand, TaskCommandContext, TaskError, TaskLifecycleEvent, TaskLifecycleOwner,
-    TaskProposal, TaskRecord, TaskState,
+    TaskCommand, TaskCommandContext, TaskError, TaskGraphCompilationReceipt,
+    TaskGraphCompilationRequest, TaskLifecycleEvent, TaskLifecycleOwner, TaskProposal, TaskRecord,
+    TaskState,
 };
 use thiserror::Error;
 
@@ -354,6 +355,98 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         Ok(self.task.task(task_id).cloned())
     }
 
+    /// Issues the Task Controller's live compilation receipt for one exact
+    /// inquiry/obligation binding. No snapshot reconstruction is permitted:
+    /// the request is checked against the current recovered task record and
+    /// the single retained owner fence.
+    pub fn compile_inquiry_obligations(
+        &self,
+        request: TaskGraphCompilationRequest,
+    ) -> Result<TaskGraphCompilationReceipt, TaskLifecycleError> {
+        self.task.compile_inquiry_obligations(request).map_err(TaskLifecycleError::Owner)
+    }
+
+    /// Persists an owner-issued inquiry compilation receipt through the
+    /// authenticated Canonical→Kernel path. The compiler receipt is retained
+    /// verbatim as bounded candidate/audit material in a `CaptureObservation`
+    /// transition; the returned Store receipt is the durable consumer handle.
+    /// The Researcher never constructs or persists either receipt itself.
+    pub async fn persist_inquiry_compilation(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        request: &TaskGraphCompilationRequest,
+        compilation: &TaskGraphCompilationReceipt,
+    ) -> Result<WriteReceipt, TaskLifecycleError> {
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || request.state_fence != *fence
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        compilation
+            .validate_against(request)
+            .map_err(TaskLifecycleError::Owner)?;
+        let retained = serde_json::to_string(compilation).map_err(|error| {
+            TaskLifecycleError::Serialization(format!(
+                "inquiry compilation receipt serialization failed: {error}"
+            ))
+        })?;
+        if retained.len() > 1024 * 1024 {
+            return Err(TaskLifecycleError::Serialization(
+                "inquiry compilation receipt exceeds the canonical input bound".to_owned(),
+            ));
+        }
+        let mut parameters = BTreeMap::new();
+        parameters.insert("subject".to_owned(), serde_json::Value::String(retained));
+        let envelope = CanonicalWriteEnvelope {
+            operation_id: operation_id.clone(),
+            request: identity.request.metadata.clone(),
+            idempotency_key: identity.idempotency_key.clone(),
+            scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
+                .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+            task_id: Some(request.task_id.as_str().to_owned()),
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: compilation.digest().to_owned(),
+            operation_manifest_digest: production_manifest_digest()?,
+            semantic_commands: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters,
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: vec![compilation.digest().to_owned()],
+            expected_revision_heads: Vec::new(),
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
+                    .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+                expected_sequence: 1,
+                state_fence: fence.clone(),
+            }],
+        };
+        envelope
+            .validate()
+            .map_err(|error| TaskLifecycleError::Composition(error.into()))?;
+        let manifest_digest = envelope.operation_manifest_digest.clone();
+        self.commit_envelope(
+            identity,
+            operation_id,
+            envelope,
+            manifest_digest,
+            TransitionClass::CaptureCandidate,
+        )
+            .await
+    }
+
     /// Admits one task proposal and commits it through the canonical path.
     ///
     /// The proposal is validated against a scratch clone of the single task
@@ -400,7 +493,13 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             1,
             manifest_digest.clone(),
         )?;
-        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+        self.commit_envelope(
+            identity,
+            operation_id,
+            envelope,
+            manifest_digest,
+            TransitionClass::TaskControl,
+        )
             .await
     }
 
@@ -461,7 +560,13 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             expected_revision,
             manifest_digest.clone(),
         )?;
-        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+        self.commit_envelope(
+            identity,
+            operation_id,
+            envelope,
+            manifest_digest,
+            TransitionClass::TaskControl,
+        )
             .await
     }
 
@@ -477,6 +582,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         operation_id: OperationId,
         envelope: CanonicalWriteEnvelope,
         manifest_digest: OperationManifestDigest,
+        expected_transition_class: TransitionClass,
     ) -> Result<WriteReceipt, TaskLifecycleError> {
         let fence = identity.request.metadata.state_fence.clone();
         let ctx = store_failure_ctx(identity, &operation_id);
@@ -510,6 +616,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             &fence,
             &identity.idempotency_key,
             &manifest_digest,
+            expected_transition_class,
             &ctx,
         )?;
         Ok(receipt)
@@ -528,6 +635,7 @@ fn check_committed_receipt(
     fence: &StateFence,
     idempotency_key: &str,
     manifest_digest: &OperationManifestDigest,
+    expected_transition_class: TransitionClass,
     ctx: &StoreFailureIdentityContext,
 ) -> Result<(), TaskLifecycleError> {
     receipt
@@ -547,7 +655,7 @@ fn check_committed_receipt(
         )?;
         return Err(TaskLifecycleError::Store(failure));
     }
-    if receipt.transition_class != TransitionClass::TaskControl
+    if receipt.transition_class != expected_transition_class
         || receipt.operation_manifest_digest != *manifest_digest
     {
         let failure = store_failure(

@@ -9,11 +9,17 @@ use serde::{Deserialize, Serialize};
 
 use eliot_contracts::{StateFence, TaskId, canonical_json_bytes, sha256_hex};
 use eliot_epistemic_contracts::ClaimAuditOutcome;
-use eliot_research_exchange_api::{DisclosureClass, SourceClass};
-use eliot_task::{TaskError, TaskGraphCompilationReceipt, TaskLifecycleOwner};
+use eliot_research_exchange_api::{
+    AllowedReferenceManifest, DisclosureClass, ResearchClaim, ResearchQueryRequest,
+    SourceClass,
+};
+use eliot_task::{
+    TaskError, TaskGraphCompilationReceipt, TaskGraphCompilationRequest, TaskLifecycleOwner,
+};
 
 use super::inquiry_obligations::{
     InquiryObligation, InquiryObligationInput, compile_obligation_inputs, task_graph_request,
+    task_graph_request_for_binding,
 };
 use super::source_admissibility::{SourceAdmissibilityRecord, SourceProposal};
 
@@ -1034,6 +1040,186 @@ impl InquiryProtocolProfile {
     }
 }
 
+/// One complete execution binding presented to the authenticated
+/// Governor/Task Controller owner. The Researcher may construct and validate
+/// this candidate record, but only the owner-issued compilation receipt can
+/// authorize its use. Keeping the profile, query, provider admission,
+/// provenance, coverage, route/privacy, budget and fence dimensions in one
+/// digest prevents a later consumer from swapping any one of them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InquiryExecutionBinding {
+    pub inquiry_id: String,
+    pub profile: InquiryProtocolProfile,
+    pub query: ResearchQueryRequest,
+    pub provider_admission_digest: String,
+    pub bridge_identity_digest: String,
+    pub provenance_digest: String,
+    pub evidence_set_id: String,
+    pub portfolio_digest: String,
+    pub manifest_digest: String,
+    pub routes: Vec<String>,
+    pub source_classes: Vec<SourceClass>,
+    pub disclosure: DisclosureClass,
+    pub budget_units: u64,
+    pub deadline_ms: i64,
+    pub state_fence: StateFence,
+    pub digest: String,
+}
+
+impl InquiryExecutionBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        inquiry_id: impl Into<String>,
+        profile: InquiryProtocolProfile,
+        query: ResearchQueryRequest,
+        provider_admission_digest: impl Into<String>,
+        bridge_identity_digest: impl Into<String>,
+        provenance_digest: impl Into<String>,
+        evidence_set_id: impl Into<String>,
+        portfolio_digest: impl Into<String>,
+        manifest_digest: impl Into<String>,
+        routes: Vec<String>,
+        source_classes: Vec<SourceClass>,
+        disclosure: DisclosureClass,
+        budget_units: u64,
+        deadline_ms: i64,
+        state_fence: StateFence,
+    ) -> Result<Self, InquiryGovernanceError> {
+        let inquiry_id = inquiry_id.into();
+        let provider_admission_digest = provider_admission_digest.into();
+        let bridge_identity_digest = bridge_identity_digest.into();
+        let provenance_digest = provenance_digest.into();
+        let evidence_set_id = evidence_set_id.into();
+        let portfolio_digest = portfolio_digest.into();
+        let manifest_digest = manifest_digest.into();
+        text(&inquiry_id, "execution.inquiry_id")?;
+        profile.validate_integrity()?;
+        query.validate().map_err(|_| InquiryGovernanceError::InvalidField {
+            field: "execution.query",
+        })?;
+        let disclosure_allowed = match (query.disclosure, profile.disclosure_ceiling) {
+            (DisclosureClass::Private, _) => true,
+            (DisclosureClass::ProjectBound, DisclosureClass::Private) => false,
+            (DisclosureClass::ExportableRedacted, DisclosureClass::Private | DisclosureClass::ProjectBound) => false,
+            (DisclosureClass::Public, DisclosureClass::Private | DisclosureClass::ProjectBound | DisclosureClass::ExportableRedacted) => false,
+            _ => true,
+        };
+        if !disclosure_allowed
+            || query.disclosure != disclosure
+            || query.state_fence != profile.state_fence
+            || query.state_fence != state_fence
+            || query.question != profile.question
+            || query.question_scope != profile.scope
+            || query.allowed_references.state_fence != profile.state_fence
+            || query.allowed_references.digest != profile.reference_manifest_digest
+            || query.source_classes != profile.admissible_source_classes
+            || disclosure != profile.disclosure_ceiling
+            || budget_units != profile.budget_and_deadline_and_stop_rule.budget_units
+            || deadline_ms != profile.budget_and_deadline_and_stop_rule.deadline_ms
+            || manifest_digest != profile.reference_manifest_digest
+        {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "execution.profile_query_binding",
+            });
+        }
+        digest(
+            &provider_admission_digest,
+            "execution.provider_admission_digest",
+        )?;
+        digest(&bridge_identity_digest, "execution.bridge_identity_digest")?;
+        digest(&provenance_digest, "execution.provenance_digest")?;
+        digest(&portfolio_digest, "execution.portfolio_digest")?;
+        digest(&manifest_digest, "execution.manifest_digest")?;
+        text(&evidence_set_id, "execution.evidence_set_id")?;
+        unique_texts(&routes, "execution.routes")?;
+        if routes.is_empty() || source_classes.is_empty() {
+            return Err(InquiryGovernanceError::Blank {
+                field: "execution.routes_or_source_classes",
+            });
+        }
+        let mut routes = routes;
+        routes.sort();
+        let mut source_classes = source_classes;
+        source_classes.sort_by_key(|class| format!("{class:?}"));
+        let shape = (
+            &inquiry_id,
+            &profile,
+            &query,
+            &provider_admission_digest,
+            &bridge_identity_digest,
+            &provenance_digest,
+            &evidence_set_id,
+            &portfolio_digest,
+            &manifest_digest,
+            &routes,
+            &source_classes,
+            &disclosure,
+            budget_units,
+            deadline_ms,
+            &state_fence,
+        );
+        let bytes = canonical_json_bytes(&shape).map_err(|_| {
+            InquiryGovernanceError::InvalidField {
+                field: "execution.digest",
+            }
+        })?;
+        Ok(Self {
+            inquiry_id,
+            profile,
+            query,
+            provider_admission_digest,
+            bridge_identity_digest,
+            provenance_digest,
+            evidence_set_id,
+            portfolio_digest,
+            manifest_digest,
+            routes,
+            source_classes,
+            disclosure,
+            budget_units,
+            deadline_ms,
+            state_fence,
+            digest: sha256_hex(&bytes),
+        })
+    }
+
+    pub fn validate_integrity(&self) -> Result<(), InquiryGovernanceError> {
+        self.profile.validate_integrity()?;
+        self.query.validate().map_err(|_| InquiryGovernanceError::InvalidField {
+            field: "execution.query",
+        })?;
+        let shape = (
+            &self.inquiry_id,
+            &self.profile,
+            &self.query,
+            &self.provider_admission_digest,
+            &self.bridge_identity_digest,
+            &self.provenance_digest,
+            &self.evidence_set_id,
+            &self.portfolio_digest,
+            &self.manifest_digest,
+            &self.routes,
+            &self.source_classes,
+            &self.disclosure,
+            self.budget_units,
+            self.deadline_ms,
+            &self.state_fence,
+        );
+        let bytes = canonical_json_bytes(&shape).map_err(|_| {
+            InquiryGovernanceError::InvalidField {
+                field: "execution.digest",
+            }
+        })?;
+        if self.digest != sha256_hex(&bytes) {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "execution.digest",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Governor-addressed request; it is not an admission or canonical receipt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernorProfileAdmissionRequest {
@@ -1133,6 +1319,37 @@ impl InquiryGovernance {
             .filter(|((id, _), _)| id == profile_id)
             .map(|(_, profile)| profile)
             .collect()
+    }
+
+    /// Validates the profile and obligation set, then returns the exact
+    /// owner-port request without compiling it in a caller-owned registry.
+    /// The live authenticated owner must issue and persist the returned
+    /// request; no snapshot or compiler identity is accepted here.
+    pub fn prepare_obligation_compilation(
+        &mut self,
+        profile_id: &str,
+        profile_revision: u64,
+        inputs: &[InquiryObligationInput],
+        inquiry_binding_digest: &str,
+    ) -> Result<TaskGraphCompilationRequest, InquiryGovernanceError> {
+        let profile = self
+            .profile(profile_id, profile_revision)
+            .cloned()
+            .ok_or_else(|| InquiryGovernanceError::UnknownProfile {
+                profile_id: profile_id.to_owned(),
+                revision: profile_revision,
+            })?;
+        profile.validate_integrity()?;
+        let obligations = compile_obligation_inputs(&profile, inputs)?;
+        let request = task_graph_request_for_binding(
+            &profile,
+            &obligations,
+            &profile.task_id,
+            inquiry_binding_digest,
+        )?;
+        self.obligations
+            .insert((profile_id.to_owned(), profile_revision), obligations);
+        Ok(request)
     }
 
     pub fn compile_obligations(
@@ -1593,6 +1810,86 @@ impl ResearchDebt {
     }
 }
 
+/// Problem Registry handoff for one active research debt. This is a
+/// Governor-facing candidate binding, not a second Problem owner or a
+/// canonical write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchDebtProblemBinding {
+    pub problem_id: String,
+    pub debt_id: String,
+    pub inquiry_id: String,
+    pub task_id: TaskId,
+    pub profile_digest: String,
+    pub owner: String,
+    pub review_condition: String,
+    pub expires_at_ms: Option<i64>,
+    pub evidence_refs: Vec<String>,
+    pub state_fence: StateFence,
+    pub active: bool,
+    pub blocks_closure: bool,
+    pub digest: String,
+}
+
+impl ResearchDebt {
+    /// Projects this debt into the existing Problem Registry admission shape.
+    /// The Problem owner remains responsible for lifecycle/persistence.
+    pub fn problem_binding(
+        &self,
+        inquiry_id: &str,
+        task_id: &TaskId,
+        profile_digest: &str,
+        state_fence: &StateFence,
+        evidence_refs: Vec<String>,
+    ) -> Result<ResearchDebtProblemBinding, InquiryGovernanceError> {
+        text(inquiry_id, "research_debt_problem.inquiry_id")?;
+        digest(profile_digest, "research_debt_problem.profile_digest")?;
+        state_fence
+            .validate()
+            .map_err(|_| InquiryGovernanceError::InvalidField {
+                field: "research_debt_problem.state_fence",
+            })?;
+        unique_texts(&evidence_refs, "research_debt_problem.evidence_refs")?;
+        let problem_id = format!("research-debt:{}", self.debt_id);
+        let mut p = String::from("research-debt-problem/v1;");
+        push_field(&mut p, "problem_id", &problem_id);
+        push_field(&mut p, "debt_id", &self.debt_id);
+        push_field(&mut p, "inquiry_id", inquiry_id);
+        push_field(&mut p, "task_id", task_id.as_str());
+        push_field(&mut p, "profile_digest", profile_digest);
+        push_field(&mut p, "owner", &self.owner);
+        push_field(&mut p, "review_condition", &self.review_condition);
+        if let Some(expiry) = self.expires_at_ms {
+            push_field(&mut p, "expires_at_ms", &expiry.to_string());
+        }
+        push_count(&mut p, "evidence_refs", evidence_refs.len());
+        for reference in &evidence_refs {
+            push_field(&mut p, "evidence_ref", reference);
+        }
+        push_field(
+            &mut p,
+            "state_fence_digest",
+            &fence_digest(state_fence)?,
+        );
+        push_field(&mut p, "active", if self.blocks_closure { "true" } else { "false" });
+        push_field(&mut p, "blocks_closure", if self.blocks_closure { "true" } else { "false" });
+        Ok(ResearchDebtProblemBinding {
+            problem_id,
+            debt_id: self.debt_id.clone(),
+            inquiry_id: inquiry_id.to_owned(),
+            task_id: task_id.clone(),
+            profile_digest: profile_digest.to_owned(),
+            owner: self.owner.clone(),
+            review_condition: self.review_condition.clone(),
+            expires_at_ms: self.expires_at_ms,
+            evidence_refs,
+            state_fence: state_fence.clone(),
+            active: self.blocks_closure,
+            blocks_closure: self.blocks_closure,
+            digest: freeze(&p),
+        })
+    }
+}
+
 /// Claim-audit adapter that preserves the Researcher verdict and the canonical
 /// epistemic audit outcome without defining a second claim vocabulary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1659,5 +1956,78 @@ impl ClaimAudit {
             state_fence: profile.state_fence.clone(),
             digest,
         })
+    }
+
+    /// Audits a provider-delivered claim without accepting a caller-supplied
+    /// verdict. Every citation must resolve to the owner-bound manifest and
+    /// exact anchor precision; absent excerpts or unresolved counterclaims
+    /// remain partial/unsupported rather than being promoted.
+    pub fn from_provider_claim(
+        profile: &InquiryProtocolProfile,
+        manifest: &AllowedReferenceManifest,
+        claim: &ResearchClaim,
+    ) -> Result<Self, InquiryGovernanceError> {
+        manifest
+            .validate()
+            .map_err(|_| InquiryGovernanceError::InvalidField {
+                field: "claim_audit.manifest",
+            })?;
+        if claim.claim_id.trim().is_empty() || claim.statement.trim().is_empty() {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "claim_audit.claim",
+            });
+        }
+        let mut complete = !claim.citations.is_empty();
+        for citation in &claim.citations {
+            if !manifest.allows(&citation.source_handle)
+                || citation.anchor.trim().is_empty()
+                || citation.excerpt.as_deref().is_none_or(str::is_empty)
+                || manifest.allowed_anchor_precision < citation.precision
+            {
+                complete = false;
+            }
+        }
+        if !claim.counterclaim_ids.is_empty() {
+            complete = false;
+        }
+        let outcome = if complete {
+            ClaimAuditOutcome::Supported
+        } else if claim.citations.is_empty() {
+            ClaimAuditOutcome::Unsupported
+        } else {
+            ClaimAuditOutcome::PartiallySupported
+        };
+        let verdict = crate::evidence_portfolio::ClaimVerdict {
+            claim_id: claim.claim_id.clone(),
+            outcome: match outcome {
+                ClaimAuditOutcome::Supported => crate::evidence_portfolio::ClaimOutcome::Supported,
+                ClaimAuditOutcome::PartiallySupported => {
+                    crate::evidence_portfolio::ClaimOutcome::PartiallySupported
+                }
+                ClaimAuditOutcome::Unsupported => {
+                    crate::evidence_portfolio::ClaimOutcome::Unsupported
+                }
+                ClaimAuditOutcome::Contradicted => {
+                    crate::evidence_portfolio::ClaimOutcome::Contradicted
+                }
+                ClaimAuditOutcome::NotVerifiableInScope => {
+                    crate::evidence_portfolio::ClaimOutcome::OutsideManifest
+                }
+            },
+            residue: if complete {
+                Vec::new()
+            } else {
+                vec!["provider claim lacks complete manifest-bound support".to_owned()]
+            },
+            counterevidence: claim.counterclaim_ids.clone(),
+            unknowns: Vec::new(),
+            grade_ceiling: None,
+            evidence_map: claim
+                .citations
+                .iter()
+                .map(|citation| citation.source_handle.clone())
+                .collect(),
+        };
+        Self::from_portfolio_verdict(profile, manifest.digest.clone(), verdict)
     }
 }

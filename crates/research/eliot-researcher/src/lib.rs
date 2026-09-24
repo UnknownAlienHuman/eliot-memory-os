@@ -24,10 +24,12 @@ pub use eliot_task::{
 pub use inquiry_governance::{
     BudgetDeadlineStopRule, ClaimAudit, CoverageGoal, EvidenceFreeze, EvidenceGrade,
     GovernorProfileAdmissionRequest, HypothesisPolicy, IndependenceBlindingPolicy,
+    InquiryExecutionBinding,
     InquiryDisposition, InquiryDispositionRecord, InquiryGovernance, InquiryGovernanceError,
     InquiryHorizon, InquiryLane, InquiryProtocol, InquiryProtocolProfile,
     InquiryProtocolProfileParams, InquiryRisk, InquirySelectionFeatures, InquiryUncertainty,
-    OutputContractAndReopenConditions, ResearchDebt, ResearchDebtKind, SpecialistDiscoverability,
+    OutputContractAndReopenConditions, ResearchDebt, ResearchDebtKind,
+    ResearchDebtProblemBinding, SpecialistDiscoverability,
     VerifierStrength, select_protocol,
 };
 pub use inquiry_obligations::{
@@ -82,7 +84,8 @@ impl<B> Researcher<B> {
             governance: InquiryGovernance::new(),
         }
     }
-    pub fn from_exchange(exchange: GovernedExchange<B>) -> Self {
+    #[allow(dead_code, reason = "retained for crate-local recovery composition only")]
+    pub(crate) fn from_exchange(exchange: GovernedExchange<B>) -> Self {
         Self {
             exchange,
             governance: InquiryGovernance::new(),
@@ -120,6 +123,24 @@ impl<B: ResearchBridge> Researcher<B> {
         params: InquiryProtocolProfileParams,
     ) -> Result<InquiryProtocolProfile, InquiryGovernanceError> {
         self.governance.revise_profile(profile_id, params)
+    }
+
+    /// Prepares the exact owner-port compilation request for one complete
+    /// inquiry execution binding. The request is not a receipt and cannot be
+    /// persisted by the Researcher; a live authenticated owner must issue it.
+    pub fn prepare_obligation_compilation(
+        &mut self,
+        profile_id: &str,
+        profile_revision: u64,
+        inputs: &[InquiryObligationInput],
+        inquiry_binding_digest: &str,
+    ) -> Result<TaskGraphCompilationRequest, InquiryGovernanceError> {
+        self.governance.prepare_obligation_compilation(
+            profile_id,
+            profile_revision,
+            inputs,
+            inquiry_binding_digest,
+        )
     }
 
     /// Compiles profile-bound obligations through the existing work-graph port.
@@ -195,6 +216,71 @@ impl<B: ResearchBridge> Researcher<B> {
         )?;
         let job = self.exchange.submit(query)?;
         Ok((job, receipt))
+    }
+
+    /// Submits only after a live owner has issued and durably persisted the
+    /// compilation receipt for this exact profile/obligation/query binding.
+    /// The exchange never accepts a caller-supplied compiler identity or a
+    /// merely well-formed self-asserted receipt.
+    pub fn submit_governed_query_with_receipt(
+        &mut self,
+        profile_id: &str,
+        profile_revision: u64,
+        inputs: &[InquiryObligationInput],
+        inquiry_binding_digest: &str,
+        receipt: &TaskGraphCompilationReceipt,
+        query: ResearchQueryRequest,
+    ) -> Result<(ExchangeJob, TaskGraphCompilationReceipt), GovernedInquiryError> {
+        let profile = self
+            .governance
+            .profile(profile_id, profile_revision)
+            .ok_or_else(|| InquiryGovernanceError::UnknownProfile {
+                profile_id: profile_id.to_owned(),
+                revision: profile_revision,
+            })?
+            .clone();
+        let request = self.governance.prepare_obligation_compilation(
+            profile_id,
+            profile_revision,
+            inputs,
+            inquiry_binding_digest,
+        )?;
+        receipt
+            .validate_against(&request)
+            .map_err(|error| GovernedInquiryError::Governance(
+                InquiryGovernanceError::TaskOwnerRejected { error },
+            ))?;
+        if !profile.matches_binding(&profile.task_definition_digest, &profile.state_fence)
+            || query.state_fence != profile.state_fence
+            || query.question != profile.question
+            || query.question_scope != profile.scope
+            || query.allowed_references.state_fence != profile.state_fence
+            || query.allowed_references.digest != profile.reference_manifest_digest
+        {
+            return Err(InquiryGovernanceError::InvalidField {
+                field: "query.profile_binding",
+            }
+            .into());
+        }
+        let job = self.exchange.submit(query)?;
+        Ok((job, receipt.clone()))
+    }
+
+    /// Imports a provider bundle only through the normal exchange state
+    /// machine. Callers that own an admitted bridge must first validate the
+    /// bundle against that bridge's terminal result frame; an `Accepted` job
+    /// is never treated as completed here.
+    pub fn import_completed_bundle(
+        &mut self,
+        bundle: eliot_research_exchange_api::ResearchEvidenceBundle,
+    ) -> Result<ExchangeJob, GovernedInquiryError> {
+        Ok(self.exchange.import_bundle(bundle)?)
+    }
+
+    /// Reads a completed job with a materialized result, rejecting an
+    /// acknowledgement-only `Accepted` job.
+    pub fn completed_job(&self, job_id: &str) -> Result<ExchangeJob, GovernedInquiryError> {
+        Ok(self.exchange.completed_job(job_id)?)
     }
 
     /// Cancels only a job accepted through the governed composition path.

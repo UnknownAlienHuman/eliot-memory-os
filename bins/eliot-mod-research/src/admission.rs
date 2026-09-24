@@ -12,6 +12,8 @@
 //! one exact [`ResearchQueryRequest`] to one admitted operation before any
 //! executor contact.
 
+use serde::{Deserialize, Serialize};
+
 use eliot_contracts::{ContractVersion, EpochId, StateFence, fences_match_exact};
 use eliot_process::{Generation, OperationId};
 use eliot_research_exchange_api::{DisclosureClass, ResearchQueryRequest};
@@ -60,7 +62,7 @@ impl AdmissionRefusal {
 /// - `operation_id` is the stable identity for cancel/reconcile and the only
 ///   identity the exchange ever keys on; the provider-local job reference
 ///   stays outcome evidence, never canonical identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderAdmission {
     bridge: BridgeIdentity,
     config_digest: String,

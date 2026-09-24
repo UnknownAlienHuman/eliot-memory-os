@@ -526,6 +526,11 @@ pub struct TaskGraphCompilationRequest {
     pub obligation_digests: Vec<String>,
     /// Exact fence at which the task definition and profile are valid.
     pub state_fence: StateFence,
+    /// Digest of the complete owner-issued inquiry execution binding. This
+    /// prevents a caller from pairing an otherwise valid task/profile
+    /// compilation with a different query, provider admission, evidence set,
+    /// or policy record.
+    pub inquiry_binding_digest: String,
 }
 
 impl TaskGraphCompilationRequest {
@@ -541,6 +546,10 @@ impl TaskGraphCompilationRequest {
             return Err(TaskError::InvalidField("task_graph.profile_revision"));
         }
         digest_text(&self.profile_digest, "task_graph.profile_digest")?;
+        digest_text(
+            &self.inquiry_binding_digest,
+            "task_graph.inquiry_binding_digest",
+        )?;
         self.state_fence
             .validate()
             .map_err(|_| TaskError::FenceMismatch)?;
@@ -581,6 +590,7 @@ pub struct TaskGraphCompilationReceipt {
     obligation_ids: Vec<String>,
     obligation_digests: Vec<String>,
     state_fence: StateFence,
+    inquiry_binding_digest: String,
     candidate_only: bool,
     canonical_write_authorized: bool,
     digest: String,
@@ -600,6 +610,7 @@ impl TaskGraphCompilationReceipt {
             &self.obligation_ids,
             &self.obligation_digests,
             &self.state_fence,
+            &self.inquiry_binding_digest,
             &self.candidate_only,
             &self.canonical_write_authorized,
         ))
@@ -673,6 +684,14 @@ impl TaskGraphCompilationReceipt {
         &self.state_fence
     }
 
+    /// Returns the complete inquiry execution binding covered by the owner
+    /// receipt. The digest is deliberately opaque to lower layers; consumers
+    /// validate it against their own immutable execution record.
+    #[must_use]
+    pub fn inquiry_binding_digest(&self) -> &str {
+        &self.inquiry_binding_digest
+    }
+
     /// Receipts are always candidate-only.
     #[must_use]
     pub const fn candidate_only(&self) -> bool {
@@ -706,6 +725,7 @@ impl TaskGraphCompilationReceipt {
             || self.obligation_ids != request.obligation_ids
             || self.obligation_digests != request.obligation_digests
             || !fences_match_exact(&self.state_fence, &request.state_fence)
+            || self.inquiry_binding_digest != request.inquiry_binding_digest
             || !self.candidate_only
             || self.canonical_write_authorized
             || self.digest != self.compute_digest()?
@@ -785,6 +805,7 @@ impl TaskLifecycleOwner {
             obligation_ids,
             obligation_digests,
             state_fence: request.state_fence,
+            inquiry_binding_digest: request.inquiry_binding_digest,
             candidate_only: true,
             canonical_write_authorized: false,
             digest: String::new(),

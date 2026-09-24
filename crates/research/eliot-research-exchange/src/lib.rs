@@ -47,6 +47,8 @@ pub enum ExchangeError {
     IdempotencyConflict,
     #[error("exchange job was not found")]
     NotFound,
+    #[error("exchange job has no completed result bundle")]
+    ResultRequired,
     #[error("exchange job is not accepting this transition")]
     InvalidTransition,
     #[error("state fence is stale")]
@@ -59,6 +61,13 @@ pub trait ResearchBridge {
     type Error: std::error::Error + Send + Sync + 'static;
     fn submit(&mut self, request: &ResearchQueryRequest) -> Result<String, Self::Error>;
     fn cancel(&mut self, job_id: &str) -> Result<(), Self::Error>;
+
+    /// Whether this bridge carries a live, owner-issued provider admission.
+    /// Arbitrary implementations default to false; production construction
+    /// must opt in only after the admission has been authenticated.
+    fn is_admitted(&self) -> bool {
+        false
+    }
 
     /// Whether this bridge is the explicit no-admission provider gap. Other
     /// bridges must leave the default false so an execution/transport failure
@@ -103,6 +112,21 @@ impl<B> GovernedExchange<B> {
         (self.bridge, self.snapshot)
     }
 
+    /// Returns a job only when its terminal result has actually been
+    /// imported. In particular, an `Accepted` acknowledgement is never a
+    /// consumable evidence result.
+    pub fn completed_job(&self, job_id: &str) -> Result<ExchangeJob, ExchangeError> {
+        let job = self
+            .snapshot
+            .jobs
+            .get(job_id)
+            .ok_or(ExchangeError::NotFound)?;
+        if job.status != ExchangeStatus::Completed || job.result.is_none() {
+            return Err(ExchangeError::ResultRequired);
+        }
+        Ok(job.clone())
+    }
+
     /// Read-only resume lookup: returns the durable job bound to one
     /// idempotency key, preserving partial progress across restarts.
     /// Returns `None` when the key was never accepted.
@@ -143,6 +167,9 @@ impl<B: ResearchBridge> GovernedExchange<B> {
     /// per identity.
     pub fn submit(&mut self, request: ResearchQueryRequest) -> Result<ExchangeJob, ExchangeError> {
         request.validate()?;
+        if !self.bridge.is_admitted() && !self.bridge.provider_unavailable() {
+            return Err(ExchangeError::InvalidTransition);
+        }
         if let Some(job_id) = self.snapshot.idempotency.get(&request.idempotency_key) {
             let existing = self
                 .snapshot

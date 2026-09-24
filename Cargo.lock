@@ -2519,11 +2519,15 @@ name = "eliot-mod-research"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-governor",
  "eliot-process",
  "eliot-process-executor",
+ "eliot-protocol",
  "eliot-research-exchange",
  "eliot-research-exchange-api",
  "eliot-researcher",
+ "eliot-store-api",
  "eliot-task",
  "serde",
  "serde_json",
