@@ -54,8 +54,11 @@ static NEXT_TRANSACTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// requires every registry handle to stay short-lived: one bounded read or one
 /// bounded write, never held across polling or waits. The installer already
 /// drops its writer before the SCM start + convergence wait
-/// (`bins/eliot/src/main.rs:2228`); terminal reconcile re-opens short-lived
-/// handles via `open_existing_at` (`bins/eliot/src/main.rs:2416`) while the
+/// (`bins/eliot/src/main.rs:2959`); owner-aware rollback re-opens one
+/// short-lived writer per abort-phase touch and drops it before the
+/// transaction compare-and-save and external rollback effects
+/// (`WindowsInstallationCoordinator::rollback_with_activation_owner`,
+/// `crates/kernel/eliot-installation/src/lib.rs:9344`) while the
 /// Watchdog polls via `inspect_existing_at` on a 250ms/2s cadence.
 ///
 /// redb 4.1.0 takes an exclusive OS file lock for `Database::create`/`open`

@@ -3897,34 +3897,17 @@ fn start_approved_manifest_contour<P: ApprovedHostStartupPort>(
     )
 }
 
-/// Bounded `DatabaseAlreadyOpen` retry budget for the Host registry open
-/// (s37/#1339). Six attempts back off 250ms, 500ms, 1s, then 2s capped, so
-/// the worst-case wait stays near 8s: inside the SCM start-pending window
-/// and always interruptible by process stop.
-const HOST_REGISTRY_OPEN_RETRY_ATTEMPTS: u32 = 6;
-const HOST_REGISTRY_OPEN_RETRY_BASE_MS: u64 = 250;
-const HOST_REGISTRY_OPEN_RETRY_MAX_MS: u64 = 2_000;
-
-/// Returns true when `error` carries redb file-lock contention (a live writer
-/// holds the registry file). This mirrors the Watchdog reader probe
-/// (`FileWatchdogAdmission::is_transient_registry_lock`): matching is
-/// case-insensitive and requires the lock marker so unrelated platform text
-/// that merely mentions an open path stays fail-closed.
-fn installation_registry_lock_contended(error: &InstallationError) -> bool {
-    let folded = error.to_string().to_ascii_lowercase();
-    folded.contains("cannot acquire lock")
-        || ((folded.contains("already open") || folded.contains("alreadyopen"))
-            && folded.contains("lock"))
-}
-
 /// Opens the existing installation registry below `host_state_root`,
 /// tolerating a short writer-release race with bounded backoff.
 ///
 /// The installer staging writer is released before the SCM start +
 /// convergence wait, so lock contention here is a release race, not a held
-/// owner (A13.9). Each attempt opens a fresh short-lived root lease and
-/// re-proves the exact retained-root identity before touching the database;
-/// every non-contention failure still fails closed immediately.
+/// owner (A13.9). The single typed bounded helper `open_existing_at`
+/// (`crates/kernel/eliot-installation/src/redb_state.rs`) already retries
+/// only `DatabaseAlreadyOpen` with bounded backoff; this seam performs one
+/// exact root-lease proof plus that single open and maps the outcome, with no
+/// outer string-matched retry loop. Every non-contention failure still fails
+/// closed immediately.
 ///
 /// # Errors
 ///
@@ -3934,33 +3917,17 @@ fn installation_registry_lock_contended(error: &InstallationError) -> bool {
 pub(crate) fn open_installation_registry_with_transient_retry(
     host_state_root: &Path,
 ) -> Result<Option<RedbInstallationRegistry>, HostError> {
-    let mut attempt = 0_u32;
-    loop {
-        let root_lease = ProtectedRootLease::open_existing(host_state_root)
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        let canonical = root_lease
-            .canonical_path()
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        if canonical.as_path() != host_state_root {
-            return Err(HostError::ProcessContour(
-                "SCM Host state root is not the exact retained installation root".to_owned(),
-            ));
-        }
-        match RedbInstallationRegistry::open_existing_at(root_lease) {
-            Ok(store) => return Ok(store),
-            Err(error)
-                if installation_registry_lock_contended(&error)
-                    && attempt < HOST_REGISTRY_OPEN_RETRY_ATTEMPTS =>
-            {
-                attempt += 1;
-                let shift = attempt.saturating_sub(1).min(3);
-                let backoff_ms = (HOST_REGISTRY_OPEN_RETRY_BASE_MS << shift)
-                    .min(HOST_REGISTRY_OPEN_RETRY_MAX_MS);
-                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-            }
-            Err(error) => return Err(HostError::Installation(error)),
-        }
+    let root_lease = ProtectedRootLease::open_existing(host_state_root)
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    let canonical = root_lease
+        .canonical_path()
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    if canonical.as_path() != host_state_root {
+        return Err(HostError::ProcessContour(
+            "SCM Host state root is not the exact retained installation root".to_owned(),
+        ));
     }
+    RedbInstallationRegistry::open_existing_at(root_lease).map_err(HostError::Installation)
 }
 
 /// Opens one short-lived installation-registry writer below

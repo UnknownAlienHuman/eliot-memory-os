@@ -228,7 +228,7 @@ impl RedbInstallationRegistry {
         // A13.9 short-lived writer: bounded AlreadyOpen retry only
         // (sole-owner contract above, lines 6-13). The installer drops this
         // handle before any SCM start or convergence wait
-        // (bins/eliot/src/main.rs:2228), so contention with the Watchdog poll
+        // (bins/eliot/src/main.rs:2959), so contention with the Watchdog poll
         // reader is transient; non-contention errors return immediately with
         // their cause preserved.
         let database = crate::redb_state::open_registry_writer_create_with_retry(file.path())?;
@@ -276,10 +276,13 @@ impl RedbInstallationRegistry {
         }
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        // A13.9 short-lived terminal-reconcile writer
-        // (bins/eliot/src/main.rs:2416): bounded AlreadyOpen retry only
-        // against live Watchdog poll readers; nothing is held across a wait,
-        // and non-contention errors return immediately with cause preserved.
+        // A13.9 short-lived owner-aware rollback writer
+        // (`WindowsInstallationCoordinator::rollback_with_activation_owner`,
+        // `crates/kernel/eliot-installation/src/lib.rs:9344`): bounded
+        // AlreadyOpen retry only against live Watchdog poll readers; the
+        // handle is dropped before the transaction compare-and-save and the
+        // external rollback effects, and non-contention errors return
+        // immediately with cause preserved.
         let database = crate::redb_state::open_registry_writer_with_retry(file.path())?;
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;

@@ -84,7 +84,7 @@
 //! Real effect callgraph (every call below resolves to an existing owner):
 //! - `HostComposition::ensure_admission_open` (host `lib.rs:7128`, private in
 //!   the crate root, visible to this descendant module): admission guard.
-//! - `super::open_registry_store_at` (host `lib.rs:3954`, `pub(crate)`):
+//! - `super::open_registry_store_at` (host `lib.rs:3944`, `pub(crate)`):
 //!   short-lived registry handle, dropped after one CAS or load; plus
 //!   `RedbInstallationRegistry::load`
 //!   (`crates/kernel/eliot-installation/src/redb_state.rs:275`, inside

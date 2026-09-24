@@ -9368,9 +9368,12 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
     ///
     /// The ordinary `rollback` seam deliberately continues to reject a
     /// transaction carrying an activation intent.  Production recovery callers
-    /// must supply the already-open Host owner capability and registry through
-    /// this explicit owner-aware seam; no caller-supplied approval fields are
-    /// accepted.
+    /// must supply the retained Host state root and the already-open Host
+    /// owner capability through this explicit owner-aware seam;
+    /// no caller-supplied approval fields are accepted.  The root is the
+    /// durable transaction's own candidate-manifest Host root, re-proved by
+    /// `ProtectedRootLease` before redb is opened; it is not a widened or
+    /// caller-chosen path.
     ///
     /// Two pre-no-return first-install contours are admitted.  `Activating`
     /// with the exact pending service-start/credential/Phase-B suffix needs no
@@ -9389,9 +9392,17 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
     /// provider result leaves the intent durable and returns an error.  The
     /// cleared transaction then re-enters the ordinary exact-effect rollback
     /// loop, so only `CreatedByTransaction` identities are removed.
+    ///
+    /// A13.9 short-lived ownership: the registry writer below is opened fresh
+    /// for the abort phase only (one `open_existing_at` with the single typed
+    /// bounded `AlreadyOpen` retry) and is dropped before the transaction CAS
+    /// and the external rollback effects that follow.  The exclusive redb
+    /// writer is therefore never retained across the transaction
+    /// compare-and-save or across effect execution, so a polling Watchdog
+    /// reader is blocked for at most one bounded abort phase.
     pub fn rollback_with_activation_owner(
         &mut self,
-        registry: &RedbInstallationRegistry,
+        host_state_root: &Path,
         host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
@@ -9452,47 +9463,62 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         let manifest_digest = candidate_manifest_digest(&transaction.candidate_manifest)?;
         let activation_intent_digest = activation_projection_intent_digest(&intent)?;
         let expected_transaction = TransactionVersion::of(&transaction)?;
-        let abort_evidence = match registry.read_exact_aborted_activation_ack(
-            host,
-            transaction_id,
-            &transaction.installer_plan_digest,
-            &transaction.candidate_manifest.generation,
-            &manifest_digest,
-            &approval,
-            &activation_intent_digest,
-        )? {
-            Some(evidence) => evidence,
-            None => {
-                let pending_revision = registry.read_exact_pending_activation_revision(
-                    host,
-                    transaction_id,
-                    &transaction.installer_plan_digest,
-                    &approval,
-                    &activation_intent_digest,
-                )?;
-                registry.abort_pending_activation_exact(
-                    host,
-                    pending_revision,
-                    &approval,
-                    &activation_intent_digest,
-                )?;
-                registry
-                    .read_exact_aborted_activation_ack(
+        // One short-lived writer for the registry abort phase only.  The
+        // handle (and its exclusive redb file lock) is dropped before the
+        // transaction compare-and-save and the external rollback effects
+        // below, so neither can be blocked behind a retained writer.
+        let abort_evidence = {
+            let root = ProtectedRootLease::open_existing(host_state_root)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let registry = RedbInstallationRegistry::open_existing_at(root)?.ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "Host activation registry is absent for owner-aware rollback".to_owned(),
+                )
+            })?;
+            let evidence = match registry.read_exact_aborted_activation_ack(
+                host,
+                transaction_id,
+                &transaction.installer_plan_digest,
+                &transaction.candidate_manifest.generation,
+                &manifest_digest,
+                &approval,
+                &activation_intent_digest,
+            )? {
+                Some(evidence) => evidence,
+                None => {
+                    let pending_revision = registry.read_exact_pending_activation_revision(
                         host,
                         transaction_id,
                         &transaction.installer_plan_digest,
-                        &transaction.candidate_manifest.generation,
-                        &manifest_digest,
                         &approval,
                         &activation_intent_digest,
-                    )?
-                    .ok_or_else(|| {
-                        InstallationError::IncompleteObservation(
-                            "Host abort returned without the exact durable ABORTED terminal"
-                                .to_owned(),
-                        )
-                    })?
-            }
+                    )?;
+                    registry.abort_pending_activation_exact(
+                        host,
+                        pending_revision,
+                        &approval,
+                        &activation_intent_digest,
+                    )?;
+                    registry
+                        .read_exact_aborted_activation_ack(
+                            host,
+                            transaction_id,
+                            &transaction.installer_plan_digest,
+                            &transaction.candidate_manifest.generation,
+                            &manifest_digest,
+                            &approval,
+                            &activation_intent_digest,
+                        )?
+                        .ok_or_else(|| {
+                            InstallationError::IncompleteObservation(
+                                "Host abort returned without the exact durable ABORTED terminal"
+                                    .to_owned(),
+                            )
+                        })?
+                }
+            };
+            drop(registry);
+            evidence
         };
         let mut cleared = transaction;
         cleared.prepare_pre_no_return_rollback(abort_evidence, &reconciled_absent)?;

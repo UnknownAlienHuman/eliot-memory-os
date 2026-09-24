@@ -17,6 +17,8 @@ use runtime_loop::run_watchdog;
 
 use eliot_platform_windows::ServiceBootstrapArguments;
 #[cfg(windows)]
+use eliot_platform_windows::scm_entry::ServiceStatusHandle;
+#[cfg(windows)]
 use eliot_platform_windows::scm_entry::{
     DispatcherOutcome, ServiceArgvError, parse_service_main_argv, register_service_control_handler,
     run_service_dispatcher,
@@ -315,10 +317,19 @@ extern "system" fn watchdog_service_main(
         return;
     }
     // Stage 2 validates the captured process bootstrap against the
-    // installer-approved registration with a read-only inspection.
-    let validated_launch = match validate_registered_process_bootstrap() {
-        Ok(launch) => launch,
-        Err(error) => {
+    // installer-approved registration with a read-only inspection. Exact
+    // transient registry-lock contention (a live installer/Host writer holds
+    // the redb file) retries stop-aware below instead of failing into
+    // `ApprovalUnavailable` before the runtime transient loop can run.
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let _ = SERVICE_STOP_REQUESTED.set(stop_signal.clone());
+    let validated_launch = match validate_bootstrap_with_transient_retry(&handle, &stop_signal) {
+        BootstrapValidationOutcome::Validated(launch) => launch,
+        BootstrapValidationOutcome::StopRequested => {
+            set_service_status_stopped();
+            return;
+        }
+        BootstrapValidationOutcome::Failed(error) => {
             let code = classify_bootstrap_launch_error(&error);
             let detail = format!("invalid SCM launch registration: {error}");
             let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
@@ -334,8 +345,6 @@ extern "system" fn watchdog_service_main(
             return;
         }
     };
-    let stop_signal = Arc::new(AtomicBool::new(false));
-    let _ = SERVICE_STOP_REQUESTED.set(stop_signal.clone());
     if let Err(error) = run_watchdog(stop_signal, Some(&validated_launch)) {
         let code = classify_runtime_error(&error);
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {error}");
@@ -376,6 +385,107 @@ fn validate_registered_process_bootstrap()
             "SCM process bootstrap was not captured before dispatch".to_owned(),
         )),
     }
+}
+
+/// Bounded stop-aware retry budget for SCM-bootstrap transient
+/// registry-lock contention (s37/#1339). Each validation attempt already
+/// retries inside the single typed reader open
+/// (`inspect_existing_at`/`open_registry_reader_with_retry`); this outer
+/// loop only covers contention that outlasts that window. Six attempts sleep
+/// 250ms, 500ms, 1s, 2s, 2s capped between tries, and every retry
+/// re-publishes `SERVICE_START_PENDING` so the SCM start window stays armed.
+/// An SCM stop exits cleanly instead of polling.
+#[cfg(windows)]
+const BOOTSTRAP_TRANSIENT_RETRY_ATTEMPTS: u32 = 6;
+#[cfg(windows)]
+const BOOTSTRAP_TRANSIENT_RETRY_BASE_MS: u64 = 250;
+#[cfg(windows)]
+const BOOTSTRAP_TRANSIENT_RETRY_MAX_MS: u64 = 2_000;
+/// SCM start-pending wait hint re-armed on every bootstrap retry, matching
+/// the initial `SERVICE_START_PENDING` publication above.
+#[cfg(windows)]
+const BOOTSTRAP_RETRY_WAIT_HINT_MS: u32 = 10_000;
+/// Stop-poll slice while awaiting the next bootstrap retry, so an SCM stop
+/// during the wait is observed promptly instead of after a full backoff.
+#[cfg(windows)]
+const BOOTSTRAP_RETRY_STOP_POLL_MS: u64 = 50;
+
+/// Outcome of the stop-aware SCM-bootstrap validation.
+#[cfg(windows)]
+enum BootstrapValidationOutcome {
+    Validated(eliot_watchdog::ValidatedWatchdogScmLaunch),
+    StopRequested,
+    Failed(eliot_watchdog::WatchdogScmLaunchError),
+}
+
+/// Validates the captured process bootstrap, retrying only exact transient
+/// registry-lock contention with bounded stop-aware backoff.
+///
+/// Only the redb file-lock signal (`DatabaseAlreadyOpen`, probed by
+/// `FileWatchdogAdmission::is_transient_registry_lock` through the
+/// `ApprovalUnavailable` wrapper) retries: every fence, approval, path, or
+/// platform failure keeps its exact fail-closed taxonomy and cause. The
+/// registration nonce never enters the compared strings.
+#[cfg(windows)]
+fn validate_bootstrap_with_transient_retry(
+    handle: &ServiceStatusHandle,
+    stop_signal: &AtomicBool,
+) -> BootstrapValidationOutcome {
+    let mut attempt = 0_u32;
+    loop {
+        if stop_signal.load(Ordering::Acquire) {
+            return BootstrapValidationOutcome::StopRequested;
+        }
+        match validate_registered_process_bootstrap() {
+            Ok(launch) => return BootstrapValidationOutcome::Validated(launch),
+            Err(error) => {
+                let transient = eliot_watchdog::FileWatchdogAdmission::is_transient_registry_lock(
+                    &error.to_string(),
+                );
+                if !transient || attempt + 1 >= BOOTSTRAP_TRANSIENT_RETRY_ATTEMPTS {
+                    return BootstrapValidationOutcome::Failed(error);
+                }
+                attempt += 1;
+                tracing::debug!(
+                    event = "watchdog.bootstrap_transient_registry_lock",
+                    observation = "attempted",
+                    attempt = attempt,
+                    "transient installation-registry lock during SCM bootstrap, retrying"
+                );
+                publish_service_status(
+                    handle,
+                    SERVICE_START_PENDING,
+                    0,
+                    0,
+                    0,
+                    attempt + 1,
+                    BOOTSTRAP_RETRY_WAIT_HINT_MS,
+                );
+                let shift = (attempt - 1).min(3);
+                let backoff_ms = (BOOTSTRAP_TRANSIENT_RETRY_BASE_MS << shift)
+                    .min(BOOTSTRAP_TRANSIENT_RETRY_MAX_MS);
+                if sleep_until_stop(stop_signal, backoff_ms) {
+                    return BootstrapValidationOutcome::StopRequested;
+                }
+            }
+        }
+    }
+}
+
+/// Sleeps `millis` while an SCM stop is still absent, polling the stop
+/// signal in bounded slices. Returns true when a stop was observed.
+#[cfg(windows)]
+fn sleep_until_stop(stop_signal: &AtomicBool, millis: u64) -> bool {
+    let mut waited = 0_u64;
+    while waited < millis {
+        if stop_signal.load(Ordering::Acquire) {
+            return true;
+        }
+        let slice = (millis - waited).min(BOOTSTRAP_RETRY_STOP_POLL_MS);
+        std::thread::sleep(Duration::from_millis(slice));
+        waited += slice;
+    }
+    stop_signal.load(Ordering::Acquire)
 }
 
 #[cfg(windows)]
